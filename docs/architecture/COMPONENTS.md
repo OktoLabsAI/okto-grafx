@@ -6,7 +6,7 @@ Read `CONTRACT.md` first. This file says **who builds what, in what order, and h
 
 | ID | Component | Owns (write only here) | Realizes |
 |----|-----------|------------------------|----------|
-| **C0** | Foundation | `domain/errors.py`, `domain/ids.py`, `domain/ports/**`, `runtime/**`, `pyproject.toml`, `tests/foundation/**`, `tests/test_import_boundary.py` | TR-1, TR-2, TR-6, TR-9, BR-8, G1–G5 |
+| **C0** | Foundation | `domain/errors.py`, `domain/ids.py`, `domain/ports/**`, `runtime/**`, `pyproject.toml`, `src/okto_grafx/{__init__.py,errors.py,py.typed}`, `tests/conftest.py`, `tests/foundation/**`, `tests/test_import_boundary.py`, `tests/test_language_surface.py`, `tests/test_platform_parity.py` | TR-1, TR-2, TR-6, TR-9, BR-8, G1–G5 |
 | **C1** | Storage core | `domain/model/**`, `domain/page/**`, `engine/buffer_pool.py`, `engine/heap_store.py`, `engine/catalog_store.py`, `adapters/codec_v1.py` | FR-13, BR-8, page/record formats |
 | **C2** | Storage adapters | `adapters/storage_local.py`, `adapters/storage_memory.py`, `adapters/storage_fault.py` | FR-1, FR-5, FR-16, TR-3, AC-9, AC-10, AC-11 |
 | **C3** | Process coordinator | `adapters/coordination_local.py`, `adapters/clock_system.py`, `engine/coordination.py` | FR-7, BR-7, AC-6, AC-7 |
@@ -17,7 +17,7 @@ Read `CONTRACT.md` first. This file says **who builds what, in what order, and h
 | **C8** | Observability | `adapters/metrics_*.py`, `adapters/events_logging.py`, `engine/metrics_catalog.py`, `dashboards/**` | FR-14, TR-7, BR-12, OR-1..OR-6 |
 | **C9** | Vector subsystem | `domain/vector/**`, `adapters/vectormath_pure.py`, `adapters/vectormath_numpy.py`, `engine/vector_engine.py` | VEC FR-1..FR-3, FR-5..FR-7, FR-9, VEC BR-1..BR-5, BR-7 |
 | **C10** | Query engine | `domain/query/**`, `engine/query_engine.py` | D3, VEC FR-4, VEC BR-6, AC-7 |
-| **C11** | Public API | `api/**`, `engine/database.py`, `src/okto_grafx/__init__.py`, `src/okto_grafx/errors.py` | FR-1, FR-11, public surface |
+| **C11** | Public API | `api/**`, `engine/database.py` (may EXTEND `src/okto_grafx/__init__.py` re-exports, which C0 seeded) | FR-1, FR-11, public surface |
 | **C12** | CLI | `cli/**` | operator surface |
 | **C13** | Bench · calibration · CI | `bench/**`, `.github/workflows/**`, `tests/bench/**` | FR-15, FR-16, TR-8, VEC FR-8, AC-14, VTS-9, VTS-10 |
 

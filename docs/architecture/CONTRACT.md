@@ -15,6 +15,7 @@ this contract is the single agreed realization of them.
 |----|------|-------------|
 | G1 | **All product surfaces are en-US**: class names, function names, exception messages, metric names & descriptions, CLI help, docstrings. | Code review + `tests/test_language_surface.py` |
 | G2 | **Hexagonal**: `okto_grafx/domain/**` and `okto_grafx/engine/**` contain NO mechanism. Forbidden: `open()`, `os`, `pathlib` I/O, `mmap`, `socket`, `sys.platform`, `os.name`, `threading`, `time.time`, `time.monotonic`, `random` (unseeded), any third-party import. | `tests/test_import_boundary.py`, budget **ZERO**, fails closed |
+| G2b | **No `random` in the domain.** Anything needing randomness (HNSW level assignment, sampling) uses `okto_grafx.domain.rand.SplitMix64` — an explicitly seeded, deterministic, reproducible PRNG owned by C1. Reproducibility is a spec requirement (seeded interleavings, seeded corpora), not a preference. | `tests/test_import_boundary.py` |
 | G3 | **Pure-Python core, single universal wheel.** Runtime deps: stdlib only. `numpy` only under extra `[accel]`, imported only in `adapters/vectormath_numpy.py`. `ladybug` only under extra `[bench]`. | `pyproject.toml` + import-boundary test |
 | G4 | **Windows and POSIX are equal citizens.** No test may be silently skipped on a family; a family-specific test must be explicitly marked `@pytest.mark.platform_specific` and have a counterpart. | `tests/test_platform_parity.py` |
 | G5 | **Fail-closed ports**: an unfilled port slot refuses startup with `GrafxPortNotConfigured`. No silent default, no no-op fallback (except the explicitly selected `NoOpMetricsSink`). | `runtime/registry.py` + tests |
@@ -340,6 +341,10 @@ class PageCodec(Protocol):
     def decode_page(self, raw: bytes, *, verify: bool = True) -> "Page": ...
 ```
 
+`Page` is owned by C1 and MUST be re-exported from `okto_grafx.domain.page` (i.e.
+`from okto_grafx.domain.page import Page` resolves). `ports/codec.py` forward-references it under
+`TYPE_CHECKING` only.
+
 ### 4.6 `ports/vectormath.py`
 
 ```python
@@ -355,9 +360,9 @@ class VectorMath(Protocol):
     def euclidean(self, a: Sequence[float], b: Sequence[float]) -> float: ...
     def norm(self, a: Sequence[float]) -> float: ...
     def normalize(self, a: Sequence[float]) -> tuple[float, ...]: ...
-    def score(self, a, b, metric: DistanceMetric) -> float:
+    def score(self, a: Sequence[float], b: Sequence[float], metric: DistanceMetric) -> float:
         """HIGHER IS BETTER for every metric: cosine/dot as-is, euclidean returns -distance."""
-    def top_k(self, query, candidates: Sequence[tuple[int, Sequence[float]]], k: int,
+    def top_k(self, query: Sequence[float], candidates: Sequence[tuple[int, Sequence[float]]], k: int,
               metric: DistanceMetric) -> list[tuple[int, float]]:
         """Descending by score; ties broken by ascending candidate id for determinism."""
 ```
@@ -447,6 +452,11 @@ control/commit.state       published {last_committed_lsn, last_csn, checkpoint_l
 
 Slotted layout: payloads grow up from `free_start`; the slot directory grows **down** from
 `page_size`, each slot `(u16 offset, u16 length)`.
+
+**Page 0 of every paged file is a reserved file-header page** (`page_type = 1`). No heap/catalog/index
+record ever lives on page 0. Consequence: a real `RecordRef` can never encode to `0`, so the heap
+`prev_version` field can safely use literal `0` as "no previous version". Write literal `0` for the
+end of a version chain — never `NULL_REF.encode()`.
 
 **Torn-read protocol (readers never block writers):** `read_page` → if `seq` is odd or the checksum
 fails, re-read (bounded retries, default 8, with no sleep in domain). After the budget is exhausted
@@ -806,13 +816,13 @@ M1: `oktografx_lease_wait_seconds`{outcome=granted|timeout|takeover} ·
 
 VEC: `oktografx_vector_recall_ratio` · `oktografx_vector_query_latency_seconds`{regime,phase} ·
 `oktografx_vector_exact_fallback_total` · `oktografx_vector_achieved_k` ·
-`oktografx_vector_filter_selectivity` · `oktografx_vector_tombstone_backlog` ·
+`oktografx_vector_filter_selectivity_ratio` · `oktografx_vector_tombstone_backlog` ·
 `oktografx_vector_reconciliation_total` · `oktografx_vector_index_entries`{space} ·
 `oktografx_vector_space_retired_total` · `oktografx_vector_space_coverage_ratio`{space} ·
 `oktografx_vector_index_age_seconds`{space}
 
 Query: `oktografx_query_phase_duration_seconds`{phase=parse|plan|execute} ·
-`oktografx_query_rows_returned` · `oktografx_query_errors_total`{code}
+`oktografx_query_rows_returned_count` · `oktografx_query_errors_total`{code}
 
 `db` and `space` labels carry a **short hash / catalog name**, never a path or free text (TR-7).
 Every metric here MUST appear in a `dashboards/*.json` panel (OR-5/OR-3) — the CI test asserts it.
@@ -855,3 +865,104 @@ with an open transaction aborts it and never corrupts. Every public method has a
 9. **Windows + POSIX**: no path separator assumptions, no `os.name` outside adapters,
    file names case-insensitive-safe.
 10. **Zero regressions**: the whole suite must stay green, not just the component's own tests.
+
+
+---
+
+## 12. Amendments (applied after C0 delivery — these are part of the frozen contract)
+
+* **A1** `oktografx_vector_filter_selectivity` → `oktografx_vector_filter_selectivity_ratio`;
+  `oktografx_query_rows_returned` → `oktografx_query_rows_returned_count`. Accepted unit suffixes:
+  `_seconds _bytes _total _ratio _count _multiple _k _entries _segments _transactions _backlog _depth`.
+* **A2** Page 0 of every paged file is a reserved header page, so no real `RecordRef` encodes to `0`
+  and the heap `prev_version` sentinel `0` is unambiguous.
+* **A3** `VectorMath.score` / `top_k` take `Sequence[float]` for `a`, `b`, `query`.
+* **A4** `Page` must be importable as `from okto_grafx.domain.page import Page`.
+* **A5** `random` stays forbidden in the domain; use `okto_grafx.domain.rand.SplitMix64` (C1).
+* **A6** Every module declares `__all__` (convention established by C0, enforced by
+  `tests/foundation/test_public_surface.py`). Keep it.
+* **A7** Sources under `src/` are ASCII-only (enforced by `tests/test_language_surface.py`).
+* **A8** `DatabaseConfig` gains `metrics_destination: str | None = None` — required when
+  `metrics == "json"` (a file path) and optional when `metrics == "openmetrics"` (a `host:port`;
+  default `127.0.0.1:0` = ephemeral). C0 owns the field; C11 wires it in `bootstrap`.
+  Rationale: `JsonMetricsSink` needs a writer and the config had no way to express one.
+* **A9** Label name for vector-index metrics is `space` (CONTRACT §9), not `space_id` as SPEC-VEC
+  OR-2 phrases it. The contract is the authoritative realization; the spec's intent (bounded label
+  identifying the embedding space) is preserved exactly.
+* **A10** Ownership reconciliation: C0 owns `src/okto_grafx/{__init__.py,errors.py,py.typed}`,
+  `tests/conftest.py`, `tests/test_language_surface.py` and `tests/test_platform_parity.py` (G4's
+  named enforcement). C11 EXTENDS `__init__.py` with the public facade re-exports; it does not own
+  the file outright.
+* **A11** New error class `GrafxStorageError` (code `storage_error`, `retryable = False`): a device
+  I/O failure that is NOT corruption and NOT disk-full (permission denied after retries, bad
+  descriptor, unreachable path). Rationale: mapping an arbitrary `OSError` to
+  `GrafxCorruptionDetected` is not cosmetic -- in this engine "corruption" drives quarantine and
+  forensic ledger entries (FR-8/FR-10), so misclassifying a permission error manufactures a false
+  integrity incident. SPEC-M1 TR-6 enumerates the REQUIRED classes; it is not a closed set.
+* **A12** The domain may NOT import `engine/**`. §1 has `engine/` orchestrating `domain/` over ports,
+  so the arrow points one way only; the import-boundary gate enforces it.
+* **A13** `PortFactory = Callable[[DatabaseConfig], object]` is insufficient: `ProcessCoordinator`
+  needs the already-built `storage` and `clock` instances plus a real lock directory
+  (`<db path>/control`; `None` for `:memory:`). `build_default_registry` MUST construct ports in
+  dependency order and pass earlier instances to later factories. Config mapping for the
+  coordinator: `ttl_seconds=lease_ttl_seconds`, `owner_stall_threshold=lease_ttl_seconds`,
+  `reader_stall_threshold=reader_stall_threshold_seconds`,
+  `section_timeout=commit_lock_timeout_seconds`. C0 owns the factory shape; C11 owns the wiring.
+* **A14** CRC-32C (Castagnoli) is mandated for **page, WAL and ledger** formats only (§6.3/§6.5/§6.6).
+  Control-plane records (lease, reader registration) may use `zlib.crc32` -- they are adapter-local,
+  never replayed, and never part of the durable data path.
+* **A15** `StorageDevice` implementations MUST open files in binary mode on Windows
+  (`os.O_BINARY`). A file whose last byte is `0x1A` is silently truncated by the CRT text mode,
+  which is a data-loss defect reachable from ordinary record payloads (~1 in 256 records).
+  `create()` creates parent directories; `list_files(prefix)` returns slash-separated names
+  relative to the device root.
+* **A11-revised** `GrafxStorageError` carries **`retryable = True`** by default (not False). It covers
+  transient-but-exhausted device conditions (`EACCES`/`EBUSY`/`EAGAIN`/`EINTR`, winerror 5/32/33, an
+  antivirus or indexer sharing violation) and MUST carry `errno`/`winerror`/`attempts` in `details`.
+  Telling a caller `retryable=False` for a sharing violation forbids the one action that would have
+  worked. Instances may override to `False` for a genuinely permanent condition.
+  `GrafxCorruptionDetected` is reserved for conditions the adapter can attribute to DAMAGED BYTES
+  (short page, unaligned paged file, page not allocated, checksum failure) -- never to access
+  failures, because FR-8/FR-10 turn "corruption" into truncation, quarantine and forensic ledger
+  entries.
+* **A16** On Windows, `LocalStorageDevice` MUST open its files via `ctypes` + `CreateFileW` with
+  `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`. Proven by experiment: with a
+  share-delete holder, `os.replace` and `os.remove` both succeed, NTFS arms the pending delete
+  itself, the name leaves the namespace immediately, and the space returns when the last handle
+  closes -- which is exactly the mechanism FR-6/AC-9 describe, with no rename needed. Opening with
+  plain `os.open` (no `FILE_SHARE_DELETE`) guarantees that Okto Grafx processes block each other's
+  recycling. Stdlib only; no new dependency.
+* **A17** A deferred deletion MUST be keyed on a stable identity that cannot be reused
+  (the pending-delete name, or a device/inode/file-index pair), never on a live logical name, and
+  the deletion pass MUST re-verify identity immediately before unlinking. `recycle()` must also
+  remove the logical name from the namespace at once (`exists()` False, absent from `list_files()`,
+  a subsequent `create()` succeeds) on BOTH families -- otherwise a caller keeps writing to a file
+  the adapter has queued for destruction.
+* **A18** Fault-twin fidelity rules (FR-16): the twin implements the PORT, so it must speak port
+  semantics. (a) `durable_barrier(file)` pins only THAT file's volatile window; `durable_barrier(None)`
+  pins all. (b) An honest barrier flushes the reorder buffer -- real hardware flushes its write cache
+  on fsync; a reordering device that ignores a barrier is lying, not reordering. (c) Reordering is
+  read-coherent: writes apply immediately and the permutation only decides what survives a crash.
+  (d) A partial append still raises `GrafxDeviceFull` -- modelling a short `write(2)` belongs below
+  the port. (e) The call trail records the REAL outcome of every call, including failures.
+  (f) `atomic_replace`, `remove` and `recycle` are tracked write points with undo. (g) The crash path
+  always raises `SimulatedCrash` -- never an ordinary `Exception` a retry loop can swallow.
+* **A19** §8.2/§8.5 contradiction resolved: the visibility predicate is
+  **`Snapshot.visible(xmin: Csn, xmax: Csn) -> bool`** (§8.5 wording wins). `HeapStore.scan`/`lookup`
+  accept any object exposing it (structural `SnapshotLike`), apply the CALLER's predicate, and hold
+  no visibility rule of their own. `HeapStore.scan_all` returns the unfiltered truth for C6's
+  verifier and recovery paths.
+* **A20** `page_size` MUST be a power of two in **[512, 32768]**, not [512, 65536]. `free_start` and
+  `free_end` are `u16`, so a 65536-byte page cannot address its own tail. C0's `DatabaseConfig`
+  validation and C1's page validation MUST agree on this range -- a config accepted by one and
+  refused by the other is an integration failure waiting for the first non-default deployment.
+* **A21** Heap file layout (C1, binding for C4/C5/C6/C7/C9): page 0 is the META header page (A2);
+  heap page 0 slot 0 holds the `FileHeader`, slots 1..n hold per-table extents
+  `(table_id, first_page, last_page, page_count)`; data pages of one table are linked by `next_page`.
+  On a heap DATA page, **slot 0 is a page descriptor carrying `u32 table_id` and records start at
+  slot 1**. An overflow record stores nothing inline: header + `u32 first_overflow_page` with flag
+  bit 1 set. `seq` is incremented by 2 on every write-back, so a durable image always carries an
+  even value; odd means an interrupted write.
+* **A22** `HeapStore` MUST expose `apply_page_image(index, image) -> bool` with the same redo rule as
+  `CatalogStore.apply_page_image` (apply when the resident page is FREE or has a lower `page_lsn`;
+  grow the file when the page is missing). C6's recovery redo needs both. Owner: C1.

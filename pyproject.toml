@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "okto-grafx"
+version = "0.1.0"
+description = "An embedded graph database for Python: correct under multi-process concurrency, verifiable on disk, and recoverable by construction."
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = ["graph", "database", "embedded", "mvcc", "wal", "vector-search"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database :: Database Engines/Servers",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+accel = ["numpy>=1.24"]
+bench = ["ladybug==0.16.0", "numpy>=1.24"]
+dev = ["pytest>=8", "pytest-timeout"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["okto_grafx*"]
+
+[tool.setuptools.package-data]
+okto_grafx = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q --strict-markers"
+markers = [
+    "platform_specific: test that exercises one operating-system family and has a declared counterpart (G4).",
+    "slow: test whose runtime is dominated by volume rather than by logic.",
+    "multiprocess: test that spawns more than one process against the same database.",
+    "bench: benchmark or calibration test that requires the [bench] extra.",
+]
