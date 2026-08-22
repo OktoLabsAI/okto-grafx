@@ -23,13 +23,16 @@ from okto_grafx.domain.errors import (
     GrafxBufferBudgetExceeded,
     GrafxConfigurationError,
     GrafxCorruptionDetected,
+    GrafxDurabilityBarrierFailed,
     GrafxUnsupportedOperation,
 )
-from okto_grafx.domain.ids import NO_PAGE, PageIndex
+from okto_grafx.domain.ids import MAX_PAGE_INDEX, NO_PAGE, PageIndex
 from okto_grafx.domain.page import (
+    HEADER_PAGE_INDEX,
     Page,
     PageType,
     chunk_capacity,
+    is_unwritten_image,
     join_chunks,
     split_payload,
     validate_page_size,
@@ -42,14 +45,24 @@ from okto_grafx.engine.metrics_catalog import metric
 __all__ = [
     "TORN_READ_RETRY_BUDGET",
     "MAX_DB_LABEL_LENGTH",
+    "MAX_REDO_GAP_PAGES",
+    "MAX_SEQ",
     "BUFFER_POOL_METRICS",
     "BUFFER_BUDGET_USED_BYTES",
     "BUFFER_BUDGET_EXCEEDED_TOTAL",
     "CHECKSUM_VERIFICATIONS_TOTAL",
     "CHECKSUM_FAILURES_TOTAL",
+    "FSYNC_DURATION_SECONDS",
+    "BARRIER_FAILURES_TOTAL",
     "BufferPool",
+    "next_seq",
     "write_chain",
+    "build_chain_images",
     "read_chain",
+    "refuse_endless_chain",
+    "visited_pages",
+    "grow_to",
+    "apply_page_image",
 ]
 
 TORN_READ_RETRY_BUDGET: int = 8
@@ -58,10 +71,23 @@ TORN_READ_RETRY_BUDGET: int = 8
 MAX_DB_LABEL_LENGTH: int = 64
 """Characters of the db metric label, which carries a short name or hash and never a path."""
 
+MAX_REDO_GAP_PAGES: int = 4096
+"""Pages a single redo may bridge between what a file holds and what an image names.
+
+A crash between allocating a page and writing it leaves a gap of the pages that one interrupted
+operation had allocated, which is small. A larger gap says the index does not describe this file,
+and honouring it would allocate zero-filled pages that G6 then forbids reclaiming.
+"""
+
+MAX_SEQ: int = 0xFFFFFFFF
+"""The write sequence counter is a 32-bit header field and wraps inside it."""
+
 BUFFER_BUDGET_USED_BYTES: str = "oktografx_buffer_budget_used_bytes"
 BUFFER_BUDGET_EXCEEDED_TOTAL: str = "oktografx_buffer_budget_exceeded_total"
 CHECKSUM_VERIFICATIONS_TOTAL: str = "oktografx_checksum_verifications_total"
 CHECKSUM_FAILURES_TOTAL: str = "oktografx_checksum_failures_total"
+FSYNC_DURATION_SECONDS: str = "oktografx_fsync_duration_seconds"
+BARRIER_FAILURES_TOTAL: str = "oktografx_barrier_failures_total"
 
 BUFFER_POOL_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
@@ -70,12 +96,58 @@ BUFFER_POOL_METRICS: tuple[MetricDescriptor, ...] = tuple(
         BUFFER_BUDGET_EXCEEDED_TOTAL,
         CHECKSUM_VERIFICATIONS_TOTAL,
         CHECKSUM_FAILURES_TOTAL,
+        FSYNC_DURATION_SECONDS,
+        BARRIER_FAILURES_TOTAL,
     )
 )
 """The descriptors the pool registers and emits, taken from the frozen catalog rather than
 declared again. A metric is a contract (G7), so there is exactly one declaration of each name in
 the engine; looking them up at import time also means a name that leaves the catalog breaks the
 import of this module instead of a scrape in production."""
+
+
+def _require_page_index(field: str, page_index: PageIndex) -> PageIndex:
+    """Return the page index after checking it is an unsigned integer the format can address.
+
+    A bool is refused with everything else: True would silently mean page 1, and a caller that
+    passed a flag where an index belongs would grow a file and write a page it never meant to.
+    """
+    if isinstance(page_index, bool) or not isinstance(page_index, int):
+        raise GrafxCorruptionDetected(
+            f"A page index must be an integer; {field} is a {type(page_index).__name__}.",
+            field=field,
+            value=repr(page_index),
+        )
+    if not 0 <= page_index <= MAX_PAGE_INDEX:
+        raise GrafxCorruptionDetected(
+            f"A page index must be between 0 and {MAX_PAGE_INDEX}; {field} is {page_index}.",
+            field=field,
+            value=page_index,
+        )
+    return page_index
+
+
+def _require_image(file: str, page_index: PageIndex, image: object) -> bytes:
+    """Return the page image as bytes, refusing anything that is not a byte buffer."""
+    if isinstance(image, (bytes, bytearray, memoryview)):
+        return bytes(image)
+    raise GrafxCorruptionDetected(
+        f"A page image must be a byte buffer; got {type(image).__name__}.",
+        file=file,
+        page=page_index,
+        value=type(image).__name__,
+    )
+
+
+def next_seq(seq: int) -> int:
+    """Return the next write sequence counter: always even, always ahead of the one given.
+
+    An even counter gains two and an odd one gains one, so the result is even whatever it
+    started from. A durable page image therefore always carries an even counter, and a reader
+    that finds an odd one is looking at a write that did not complete (CONTRACT.md section 6.3,
+    amendment A21).
+    """
+    return ((seq | 1) + 1) & MAX_SEQ
 
 
 class _Frame:
@@ -101,6 +173,11 @@ class BufferPool:
         "_frames",
         "_labels",
         "_page_labels",
+        "_data_labels",
+        "_structure_epochs",
+        "_drop_epochs",
+        "_every_file_drop",
+        "_read_view_token",
     )
 
     def __init__(
@@ -124,6 +201,15 @@ class BufferPool:
         # that two databases could share, which is the structural half of FR-13 and BR-8.
         self._labels: dict[str, str] = {"db": self._db_label}
         self._page_labels: dict[str, str] = {"kind": "page"}
+        self._data_labels: dict[str, str] = {"target": "data"}
+        # Bumped whenever a page of a file is replaced wholesale, or the cache of that
+        # file is dropped. Anything a component derived by walking the pages of that
+        # file -- a chain length, a tail -- was derived before the bump and cannot be
+        # trusted after it.
+        self._structure_epochs: dict[str, int] = {}
+        self._drop_epochs: dict[str, int] = {}
+        self._every_file_drop: int = 0
+        self._read_view_token: object = None
         if metrics.enabled:
             for descriptor in BUFFER_POOL_METRICS:
                 metrics.register(descriptor)
@@ -135,6 +221,67 @@ class BufferPool:
     def storage(self) -> StorageDevice:
         """Return the device this pool caches, for callers that must create or size a file."""
         return self._storage
+
+    def structure_epoch(self, file: str) -> int:
+        """Return how many times the pages of this file have been RELINKED underneath.
+
+        A component that walks a chain and remembers where it ended has derived that answer from
+        the links between pages. Any door that can rewrite those links -- redo installing a page
+        image above all, which can shorten a chain without touching the page the walk stopped at
+        -- makes the derived answer wrong in a way no property of that page can reveal. Reading
+        this counter before deriving, and again before trusting, is how the holder of a derived
+        answer finds out (A40).
+
+        Dropping the cache is NOT one of those doors, and this counter deliberately no longer
+        counts it. invalidate() writes every dirty frame back before it forgets it, so the links
+        on the device afterwards are exactly the links a walk found before it -- and folding the
+        two together made CatalogStore.save() refuse after a plain invalidate(), with a remedy
+        that would have thrown the caller's tables away (D7, round 8). What a caller does about a
+        dropped cache is nothing; what it does about a relink is re-derive. Two statements, two
+        readings.
+        """
+        return self._structure_epochs.get(file, 0)
+
+    def cache_drop_epoch(self, file: str) -> int:
+        """Return how many times cached frames covering this file have been dropped.
+
+        Nothing on the device changed. A holder whose derived answer is only about LINKS may
+        ignore this reading entirely; a holder that also wants to be re-checked against freshly
+        read bytes adds it in, which is what derived_epoch does.
+        """
+        return self._every_file_drop + self._drop_epochs.get(file, 0)
+
+    def derived_epoch(self, file: str) -> int:
+        """Return the conservative reading: relinks plus cache drops.
+
+        This is what a holder reads when a stale answer would be a wrong answer rather than a
+        slow one. The heap's tail cache reads it, because re-walking after a drop costs one walk
+        and trusting wrongly costs an append that lands outside the chain.
+        """
+        return self.structure_epoch(file) + self.cache_drop_epoch(file)
+
+    def _bump_structure_epoch(self, file: str) -> None:
+        """Record that the page structure of this file may no longer be what a walk found."""
+        self._structure_epochs[file] = self._structure_epochs.get(file, 0) + 1
+
+    def _bump_drop_epoch(self, file: str) -> None:
+        """Record that cached frames covering this one file were dropped."""
+        self._drop_epochs[file] = self._drop_epochs.get(file, 0) + 1
+
+    def _bump_every_file_drop_epoch(self) -> None:
+        """Record that cached frames covering EVERY file were dropped.
+
+        Counting per file cannot express this. A file this pool has never touched still has a
+        holder somewhere -- another store, another pool, a component that read it and put the
+        answer away -- and there is no list of those files to iterate. One counter added to every
+        reading covers them all, including the ones that do not exist yet.
+
+        Proven by test_dropping_every_cache_moves_the_epoch_of_a_pool_that_has_never_been_read,
+        test_dropping_every_cache_speaks_for_a_file_this_pool_has_never_touched and
+        test_the_every_file_branch_and_the_one_file_branch_move_a_reading_by_the_same_step, the
+        last of which is what pins the two spellings to one strength (A66.1, A85).
+        """
+        self._every_file_drop += 1
 
     @property
     def codec(self) -> PageCodec:
@@ -184,6 +331,7 @@ class BufferPool:
         A pinned page is never evicted, so the caller must unpin it. Everything that can fail
         fails before the pin count moves.
         """
+        _require_page_index("page_index", page_index)
         key = (file, page_index)
         frame = self._frames.get(key)
         if frame is not None:
@@ -204,6 +352,7 @@ class BufferPool:
         A page also remembers on its own that it was mutated, so a caller that forgets the flag
         still cannot lose a write; passing it is how a caller says so explicitly.
         """
+        _require_page_index("page_index", page_index)
         key = (file, page_index)
         frame = self._frames.get(key)
         if frame is None:
@@ -242,20 +391,23 @@ class BufferPool:
         The page comes back pinned on purpose: an unpinned fresh page could be evicted before
         the caller had written anything into it, and the caller would then be holding a page the
         pool has already forgotten.
+
+        The budget is settled before the device is asked to grow. Doing it the other way round
+        would leave the file one page longer every time the refusal is raised, and the refusal
+        is retryable, so a retry loop would grow the data file once per attempt with no
+        sanctioned way to shrink it back (G6).
         """
+        prospective = self._storage.page_count(file) if self._storage.exists(file) else 0
+        self._make_room(file, prospective)
         page_index = self._storage.allocate(file, 1)
         key = (file, page_index)
         existing = self._frames.get(key)
         if existing is not None:
-            if existing.pins:
-                raise GrafxCorruptionDetected(
-                    f"The device handed out page {page_index} of {file!r}, which this pool "
-                    f"still holds pinned.",
-                    file=file,
-                    page=page_index,
-                )
+            # A stale frame at a freshly allocated index can only mean the file shrank, and no
+            # sanctioned operation shrinks a data file (G6). The frame is dropped rather than
+            # inspected: a branch that asked whether it was pinned could not be reached by any
+            # input, and a guard no input can reach is dead code (A34).
             del self._frames[key]
-        self._make_room(file, page_index)
         page = Page(page_type, page_size=self._page_size, page_index=page_index)
         page.dirty = True
         frame = _Frame(page)
@@ -265,7 +417,13 @@ class BufferPool:
         return page
 
     def flush(self, file: str | None = None) -> int:
-        """Write every dirty page of the file, or of the whole pool, and return how many."""
+        """Write every dirty page of the file, or of the whole pool, and return how many.
+
+        Writing is not making durable. A commit does not come through here to be made safe: the
+        log is the authority on durability and the redo is idempotent, so the commit protocol
+        deliberately does not barrier the data files (CONTRACT.md section 8.5 step 6). The path
+        that does want them on the platter is checkpoint().
+        """
         written = 0
         for (name, page_index), frame in list(self._frames.items()):
             if file is not None and name != file:
@@ -275,6 +433,93 @@ class BufferPool:
             self._write_back(name, page_index, frame.page)
             written += 1
         return written
+
+    def checkpoint(self, file: str | None = None) -> int:
+        """Flush the dirty pages and put them on the platter, returning how many were written.
+
+        This is the data-file half of amendment A25. The device has no metrics slot and cannot
+        tell a log barrier from a data barrier without reading file names, so the caller of
+        durable_barrier is the one that can classify it: the write-ahead log times its own
+        barrier as target wal, and this one times it as target data. A barrier that fails is
+        counted before it is re-raised, because a failed barrier means nothing may be
+        acknowledged as durable.
+        """
+        written = self.flush(file)
+        if self._metrics.enabled:
+            with self._metrics.time(FSYNC_DURATION_SECONDS, self._data_labels):
+                self._barrier(file)
+        else:
+            self._barrier(file)
+        return written
+
+    def _barrier(self, file: str | None) -> None:
+        """Ask the device for a durability barrier, counting a failure before re-raising it."""
+        try:
+            self._storage.durable_barrier(file)
+        except GrafxDurabilityBarrierFailed:
+            if self._metrics.enabled:
+                self._metrics.increment(BARRIER_FAILURES_TOTAL, 1.0, None)
+            raise
+
+    def begin_read_view(self, token: object = None) -> bool:
+        """Start a fresh read view over this database, and say whether anything was dropped.
+
+        THE PROBLEM THIS EXISTS FOR. Every epoch this pool keeps is a PROCESS-LOCAL counter: it
+        moves when this pool relinks pages or drops frames, and nothing moves it when another
+        participant commits. So a participant that had already read a table went on answering
+        from frames it cached before that commit -- no error, no missing file, just fewer rows
+        than exist, which is the worst shape a wrong answer can take. A participant that opened
+        AFTER the commit saw everything, which is why it looked like it worked.
+
+        This is not the snapshot guarantee doing its job. A snapshot is entitled to a stable view
+        for its own lifetime; a NEW read view in the same participant must see what has been
+        committed since and is at or below its snapshot. That is what this door establishes.
+
+        The token is how a caller avoids paying for a drop that nothing needs. C1 cannot see a
+        foreign commit on its own -- the only shared thing it has is the device, and asking the
+        device whether a page changed means reading the page, which is the cost the cache exists
+        to avoid. So the caller passes whatever it already watches that moves when another
+        participant commits: the durable WAL tail, the lease epoch, a control-record counter.
+        Same token as last time means nothing has happened and nothing is dropped. A DIFFERENT
+        token, or no token at all, means assume it has, which is the safe default for a caller
+        that has nothing to watch.
+
+        Dirty frames are written back before they are dropped, exactly as invalidate does: this
+        forgets what was read, never what was written.
+        """
+        if token is not None and token == self._read_view_token:
+            return False
+        self._read_view_token = token
+        self.invalidate()
+        return True
+
+    def discard(self, file: str, page_index: PageIndex) -> bool:
+        """Forget one resident page WITHOUT writing it back, and say whether a frame was dropped.
+
+        This is the opposite of :meth:`invalidate` on purpose. Invalidating forgets what was READ
+        and keeps what was written; discarding forgets what an attempt WROTE that never became a
+        commit. A row written into a page by a commit that was then refused sits in this pool as
+        a dirty frame holding a picture of the page at the moment of the refused attempt. Written
+        back -- by the next flush, or by a read view dropping frames -- it would land over a page
+        another participant has since committed and put on the device, and their rows would be
+        gone with ``verify()`` agreeing. So the frame is dropped unwritten; the device, which
+        never saw the attempt, is the truth the next pin re-reads.
+
+        A pinned frame cannot be dropped: its holder still has the object. It is marked CLEAN
+        instead, which is the half of the guarantee that matters -- nothing will write it back --
+        and the holder keeps a page whose abandoned versions the restamp has already made
+        invisible. Returns True when the frame was actually dropped.
+        """
+        frame = self._frames.get((file, page_index))
+        if frame is None:
+            return False
+        if frame.pins:
+            frame.page.dirty = False
+            return False
+        del self._frames[(file, page_index)]
+        self._bump_drop_epoch(file)
+        self._report_usage()
+        return True
 
     def invalidate(self, file: str | None = None) -> None:
         """Drop the cached pages of the file, or of the whole pool, forcing a re-read.
@@ -302,6 +547,19 @@ class BufferPool:
             if frame.page.dirty:
                 self._write_back(name, page_index, frame.page)
             del self._frames[(name, page_index)]
+        # Announced before anything else could read the epoch, and never derived from what
+        # happened to be resident: a file with no cached page is exactly the case where the next
+        # read comes from the device, so it is the case that needs saying most.
+        #
+        # The two spellings of this argument are two different statements, not one statement with
+        # a parameter (A66.1). Naming a file says that file changed. Naming none says every file
+        # did -- including files this pool has never touched, which a per-file counter cannot
+        # reach and which iterating the frames or the counters silently skipped. Asking for
+        # everything must never be weaker than asking for one thing.
+        if file is None:
+            self._bump_every_file_drop_epoch()
+        else:
+            self._bump_drop_epoch(file)
         self._report_usage()
 
     # --- internals ---------------------------------------------------------------------------
@@ -341,6 +599,14 @@ class BufferPool:
         failure: GrafxCorruptionDetected | None = None
         for attempt in range(TORN_READ_RETRY_BUDGET + 1):
             raw = self._storage.read_page(file, page_index)
+            if is_unwritten_image(raw, self._page_size):
+                # The device zero-fills what it allocates, so an image of nothing but zeros is a
+                # page nobody has written yet: free, not damaged. Spending the retry budget on it
+                # and then declaring corruption would turn the ordinary gap between a page
+                # allocation and the write that follows it into a false integrity incident.
+                return Page(
+                    int(PageType.FREE), page_size=self._page_size, page_index=page_index
+                )
             if self._metrics.enabled:
                 self._metrics.increment(CHECKSUM_VERIFICATIONS_TOTAL, 1.0, self._page_labels)
             try:
@@ -376,11 +642,13 @@ class BufferPool:
     def _write_back(self, file: str, page_index: PageIndex, page: Page) -> None:
         """Encode the page and hand it to the device, advancing its sequence counter.
 
-        The counter moves by two, so an image that reaches the device always carries an even
-        value: a reader that sees an odd one is looking at a write that did not complete.
+        The counter always lands on an even value and always moves forward: from an even one it
+        gains two, from an odd one it gains one. Adding two would have preserved the parity it
+        found, so a page that ever acquired an odd counter would stay unreadable for good, and
+        amendment A21 says a durable image carries an even counter without exception.
         """
         page.page_index = page_index
-        page.seq = (page.seq + 2) & 0xFFFFFFFF
+        page.seq = next_seq(page.seq)
         image = self._codec.encode_page(page)
         self._storage.write_page(file, page_index, image)
         page.dirty = False
@@ -446,6 +714,129 @@ def _validate_db_label(db_label: str) -> str:
     return db_label
 
 
+def _require_reserved_header_page(pool: BufferPool, file: str) -> None:
+    """Refuse a chain in a file whose very first allocation would hand out page 0.
+
+    Page 0 is the reserved header page of every paged file (A2), and a chunk written over it
+    takes the file header with it. A file that exists and holds nothing at all is the one case
+    where an allocation reaches it, so it is closed before anything is touched.
+    """
+    if pool.storage.exists(file) and pool.storage.page_count(file) == 0:
+        raise GrafxCorruptionDetected(
+            f"The file {file!r} has no reserved header page, so the first page a chain "
+            f"allocated would be page {HEADER_PAGE_INDEX}.",
+            file=file,
+            page=HEADER_PAGE_INDEX,
+        )
+
+
+def _require_distinct_reusable_pages(
+    file: str, reuse: tuple[PageIndex, ...]
+) -> None:
+    """Refuse a reuse list that names page 0, or names any page more than once.
+
+    Written once and reached from both chain doors -- the one that writes through the pool and
+    the one that only builds images -- because the harm is a property of the LIST and not of what
+    the caller then does with it. Each door reaches it on its own path, so a mutation that drops
+    the call from either is a failure of that door's own tests (A67).
+    """
+    seen_reuse: set[PageIndex] = set()
+    for candidate in reuse:
+        _require_page_index("reuse", candidate)
+        if candidate in seen_reuse:
+            # Each chunk clears its page before writing, so a page named twice keeps only the
+            # last chunk written to it and the call returns carrying a fraction of the payload
+            # with no error at all. A caller that means to write one chain has to name distinct
+            # pages; anything else is a bug in the caller, not a chain this can write.
+            raise GrafxCorruptionDetected(
+                f"The reuse list for a chain in {file!r} names page {candidate} more than once, "
+                f"so the chain would carry less than it was given.",
+                file=file,
+                page=candidate,
+                field="reuse",
+            )
+        seen_reuse.add(candidate)
+        if candidate == HEADER_PAGE_INDEX:
+            raise GrafxCorruptionDetected(
+                f"Page {HEADER_PAGE_INDEX} of {file!r} is the reserved header page and cannot "
+                f"be reused as a chain page.",
+                file=file,
+                page=candidate,
+            )
+
+
+def _require_chain_file(pool: BufferPool, file: str) -> None:
+    """Refuse a chain in a file that does not exist, whose first page would be page 0."""
+    if not pool.storage.exists(file):
+        raise GrafxCorruptionDetected(
+            f"The file {file!r} does not exist, so a chain written into it would start at page "
+            f"{HEADER_PAGE_INDEX}, which is reserved for the file header.",
+            file=file,
+            page=HEADER_PAGE_INDEX,
+        )
+
+
+def build_chain_images(
+    pool: BufferPool,
+    file: str,
+    payload: bytes,
+    *,
+    page_type: int = int(PageType.OVERFLOW),
+    reuse: tuple[PageIndex, ...] = (),
+) -> tuple[tuple[PageIndex, bytes], ...]:
+    """Return the images a chain of this payload needs, WITHOUT writing or allocating anything.
+
+    The offline twin of :func:`write_chain`. It answers the same question -- which pages does
+    this payload occupy and what does each of them hold -- and answers it as a value the caller
+    can hand to a transaction, discard, or apply later, instead of as a mutation of the file.
+
+    That difference is the whole point. ``write_chain`` makes the change REACHABLE the moment it
+    runs: the pages are in the buffer pool, and the next flush of that file carries them to the
+    device whether or not the caller that asked for them was ever allowed to commit. A change
+    that can still be refused must not be reachable, which is the rule the row path already obeys
+    and the rule a catalog change had no way to obey.
+
+    Pages beyond the reuse list are given the page numbers the next allocations WOULD hand out
+    (``page_count``, ``page_count + 1``, ...) and the file is deliberately NOT grown. Growing it
+    is what makes a refused change visible on the device -- a longer file is a changed file --
+    and it is not needed: the redo rule of :func:`apply_page_image` grows a file to reach a page
+    an image names, so the commit that applies these images allocates exactly the pages the
+    change turned out to need, and a commit that never happens allocates none.
+
+    A page offered for reuse must already exist, because a reuse index at or past the end of the
+    file would collide with one of those prospective numbers: two images for one page, of which
+    the caller keeps whichever it staged last, and the chain would then carry less than it was
+    given. ``write_chain`` cannot reach that shape -- it takes new page numbers from the device --
+    so the guard belongs here rather than in the list check both doors share.
+    """
+    _require_reserved_header_page(pool, file)
+    _require_distinct_reusable_pages(file, reuse)
+    _require_chain_file(pool, file)
+    present = pool.storage.page_count(file)
+    for candidate in reuse:
+        if candidate >= present:
+            raise GrafxCorruptionDetected(
+                f"The reuse list for a chain in {file!r} names page {candidate}, which the file "
+                f"does not have; it holds {present} pages.",
+                file=file,
+                page=candidate,
+                field="reuse",
+                page_count=present,
+            )
+    chunks = split_payload(payload, chunk_capacity(pool.page_size))
+    indices: list[PageIndex] = list(reuse[: len(chunks)])
+    reused = len(indices)
+    while len(indices) < len(chunks):
+        indices.append(present + len(indices) - reused)
+    images: list[tuple[PageIndex, bytes]] = []
+    for position, index in enumerate(indices):
+        page = Page(page_type, page_size=pool.page_size, page_index=index)
+        page.next_page = indices[position + 1] if position + 1 < len(indices) else NO_PAGE
+        page.insert_slot(chunks[position])
+        images.append((index, pool.codec.encode_page(page)))
+    return tuple(images)
+
+
 def write_chain(
     pool: BufferPool,
     file: str,
@@ -459,7 +850,22 @@ def write_chain(
     Pages listed in reuse are overwritten before any new page is allocated, which is how the
     catalog rewrites itself in place instead of growing its file on every save. The chain always
     has at least one page, so an empty payload is still addressable.
+
+    Page 0 can never be part of a chain: it is the reserved header page of every paged file
+    (A2), and a chunk written over it takes the file header with it. Both routes to page 0 are
+    closed before anything is touched -- a page 0 offered for reuse, and a file with no pages at
+    all, where the first allocation would hand out page 0 and leave a stored chain image on it
+    even though the write was going to be refused. A caller that asks for the impossible changes
+    nothing (G6).
     """
+    _require_reserved_header_page(pool, file)
+    _require_distinct_reusable_pages(file, reuse)
+    _require_chain_file(pool, file)
+    if reuse:
+        # Freshly allocated pages belong to no chain, but a page offered for reuse was part of
+        # one until this call took it, and its next_page is rewritten here. Anything derived by
+        # walking this file was derived before that.
+        pool._bump_structure_epoch(file)
     chunks = split_payload(payload, chunk_capacity(pool.page_size))
     indices: list[PageIndex] = list(reuse[: len(chunks)])
     while len(indices) < len(chunks):
@@ -476,6 +882,153 @@ def write_chain(
     return tuple(indices)
 
 
+def grow_to(pool: BufferPool, file: str, page_index: PageIndex) -> int:
+    """Allocate pages until the file has the requested index, and return how many it took.
+
+    Recovery needs this because a crash can happen between the record that allocated a page and
+    the write that was to fill it: the log names a page the file no longer has. That gap is small
+    by construction -- it is the pages one interrupted operation had allocated.
+
+    The index arrives from a log record, so it is disk-sourced, and a damaged one is a number
+    this function would otherwise spend hours honouring: a u32 reaches two tebibytes of
+    zero-filled pages at the smallest page size, and G6 forbids ever shrinking them away. An
+    operation that neither fails nor completes is the shape A42 exists to prevent, so the gap is
+    bounded here and a larger one is refused with both numbers named.
+
+    The bound belongs to C1, not to C6. This is C1's door and C1 is what would do the allocating;
+    C6 decides what a refused redo record MEANS -- truncation, quarantine, a forensic entry --
+    and it can only decide that if this door hands it a typed refusal instead of a full disk.
+
+    Proven by test_a_page_index_far_past_the_end_is_refused_instead_of_allocated and
+    test_the_gap_bound_names_both_numbers_it_compared, with
+    test_a_redo_may_bridge_a_gap_left_by_an_interrupted_allocation holding the other side so the
+    bound cannot be satisfied by refusing the case it exists for (A85).
+    """
+    _require_page_index("page_index", page_index)
+    storage = pool.storage
+    if not storage.exists(file):
+        storage.create(file)
+    present = storage.page_count(file)
+    if page_index >= present + MAX_REDO_GAP_PAGES:
+        raise GrafxCorruptionDetected(
+            f"A page image names page {page_index} of {file!r}, which holds {present} pages; "
+            f"a single redo may bridge at most {MAX_REDO_GAP_PAGES}.",
+            file=file,
+            page=page_index,
+            field="page_index",
+            page_count=present,
+            limit=MAX_REDO_GAP_PAGES,
+        )
+    grown = 0
+    while storage.page_count(file) <= page_index:
+        page = pool.allocate(file, int(PageType.FREE))
+        pool.unpin(file, page.page_index, dirty=True)
+        grown += 1
+    return grown
+
+
+def apply_page_image(
+    pool: BufferPool, file: str, page_index: PageIndex, image: bytes
+) -> bool:
+    """Install a page image if it is newer than the page, and say whether it was applied.
+
+    This is the redo rule of CONTRACT.md section 8.5 step 6 expressed for one page, and it is
+    written once here because both the heap and the catalog owe C6 exactly the same behaviour
+    (amendment A22):
+
+    * a page the file does not have yet is grown into existence first;
+    * a page that was allocated and never written is free, so the image always applies;
+    * a page whose own page_lsn already covers the image is left alone, which is what makes
+      replaying the same log twice produce the same file;
+    * the installed image always carries an even sequence counter (A21), because an odd one
+      would make the page unreadable for good.
+    """
+    # The page index is checked by grow_to below, which every path through here reaches.
+    # Checking it twice with the same predicate and the same message made neither check
+    # demonstrable: break either and the other answers identically (A67).
+    try:
+        decoded = pool.codec.decode_page(_require_image(file, page_index, image), verify=True)
+    except GrafxCorruptionDetected as damaged:
+        # The codec port carries no page index, so a decode failure names no location; the
+        # caller of this door knows both and C6 cannot build a finding without them.
+        details = {
+            key: value
+            for key, value in damaged.details.items()
+            if key not in {"file", "page"}
+        }
+        raise GrafxCorruptionDetected(
+            f"Page {page_index} of {file!r} could not be applied: {damaged.message}",
+            file=file,
+            page=page_index,
+            **details,
+        ) from damaged
+    if not isinstance(decoded, Page):
+        raise GrafxCorruptionDetected(
+            f"The codec returned a {type(decoded).__name__} instead of a page image.",
+            file=file,
+            page=page_index,
+        )
+    # The codec PORT carries no page index (section 4 is frozen and has no room for one), so a
+    # page that comes back from decode_page reports index 0 whatever it was read from. The pool's
+    # read path stamps what it knows; this door did not, and an object that claims to be page 0
+    # while being applied to page 7 has a false field on it.
+    #
+    # Honestly: this stamp is NOT observable from outside C1 today. Nothing surfaces this object
+    # -- replace_with keeps the TARGET page's identity by design, and the decode-failure path
+    # above already re-raises with the right location -- so a mutation removing this line
+    # survives the suite, and it is recorded as a survivor rather than covered by a test that
+    # would only appear to prove it (CONTRACT section 13). It is set because the field is either
+    # true or it is not, and the cost of keeping it true is one assignment.
+    decoded.page_index = page_index
+    if decoded.seq % 2:
+        decoded.seq = next_seq(decoded.seq)
+    grow_to(pool, file, page_index)
+    with pool.pinned(file, page_index) as page:
+        if page.page_type != int(PageType.FREE) and page.page_lsn >= decoded.page_lsn:
+            return False
+        page.replace_with(decoded)
+        # The image carries its own next_page, so applying it can lengthen, shorten or
+        # re-route any chain that runs through this page -- including one whose tail a
+        # store has walked to and remembered. That tail keeps every property it had;
+        # what it loses is reachability, which A40 says only a walk can establish.
+        pool._bump_structure_epoch(file)
+        return True
+
+
+def visited_pages() -> set[PageIndex]:
+    """Return the set a chain walk remembers the pages it has already seen in.
+
+    It is a named factory rather than a set literal so that a test can defeat it on purpose. The
+    termination bound that sits beside every one of these sets exists precisely for the case
+    where the set stops working, and while the set works the bound can never fire -- which is the
+    masked-guard shape A34 is about. Defeating the set is the only way to give the bound a test
+    that nothing else can satisfy.
+    """
+    return set()
+
+
+def refuse_endless_chain(file: str, steps: int, limit: int) -> None:
+    """Refuse a chain walk that has taken more steps than the file could possibly justify.
+
+    A chain visits distinct pages, so it can never be longer than the file that holds them. This
+    bound therefore cannot refuse a walk that is merely unusual, and it is not the hint-derived
+    bound A40 removed: it comes from the device, which cannot be stale.
+
+    It exists so that termination does not rest on the visited set alone. A guard that is the only
+    thing ending a walk turns its own removal into a hang, and a hang is worse than a failure: it
+    blocks the machine rather than the build. Because the two guards can refuse the same input,
+    this one is tested at its own level, where nothing else can answer for it (A34).
+    """
+    if steps > limit:
+        raise GrafxCorruptionDetected(
+            f"The page chain of {file!r} passed {steps} pages in a file that holds "
+            f"{max(limit - 1, 0)}, so it does not end.",
+            file=file,
+            field="chain_length",
+            steps=steps,
+        )
+
+
 def read_chain(
     pool: BufferPool,
     file: str,
@@ -489,15 +1042,21 @@ def read_chain(
     the walk keeps what it has seen and names the page that closed the cycle.
     """
     chunks: list[bytes] = []
-    visited: set[PageIndex] = set()
+    visited: set[PageIndex] = visited_pages()
+    # A chain visits distinct pages, so it can never be longer than the file. The bound is what
+    # keeps the walk terminating even if the visited set stops working, so a broken guard is a
+    # test failure rather than a hung process.
+    limit = pool.storage.page_count(file) + 1
     index = first_page
     while index != NO_PAGE:
+        refuse_endless_chain(file, len(chunks) + 1, limit)
         if index in visited:
             raise GrafxCorruptionDetected(
                 f"The page chain of {file!r} returns to page {index}, so it is a cycle.",
                 file=file,
                 page=index,
                 visited=len(visited),
+                field="cycle",
             )
         visited.add(index)
         with pool.pinned(file, index) as page:

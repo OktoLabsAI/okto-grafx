@@ -150,10 +150,20 @@ class PortRegistry:
         adapter which synthesises its members through ``__getattr__`` must declare them, on
         every interpreter version.
 
+        A class object is refused outright: its methods are unbound functions, so the shape
+        check would pass and every later call would be missing its instance.
+
         A later bind on the same slot replaces the previous one, so a caller can override a
         default adapter it does not want.
         """
         protocol = self._protocol_for(slot)
+        if isinstance(instance, type):
+            raise GrafxConfigurationError(
+                f"Port slot {slot!r} takes an instance, not the class itself; "
+                f"pass {instance.__name__}(...) rather than {instance.__name__}.",
+                slot=slot,
+                protocol=protocol.__name__,
+            )
         try:
             defects = _member_defects(protocol, instance)
         except Exception as failure:  # an exotic object must never escape as a foreign error

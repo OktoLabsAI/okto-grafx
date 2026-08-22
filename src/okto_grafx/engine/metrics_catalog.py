@@ -193,15 +193,20 @@ _ERROR_CODE = LabelSpec(
             "configuration_error",
             "unsupported_operation",
             "storage_error",
+            "page_full",
+            "schema_mismatch",
         }
     ),
-    max_cardinality=32,
+    max_cardinality=48,
 )
-"""The closed error taxonomy of CONTRACT.md section 2.
+"""Every error code a query can end with, which is every GrafxError code in the package.
 
-A code that reaches this label without being declared here would be refused at emission time,
-in production, which is exactly what TR-7 forbids; the catalog test asserts this domain covers
-every code the public error module exports, so a new error class fails the build instead.
+The public re-export list of CONTRACT.md section 2 is not the whole taxonomy: a component may
+declare an internal GrafxError subclass with its own code, and the moment a query boundary writes
+``except GrafxError as failure: ... {"code": failure.code}`` that code arrives here. A code that
+is not declared would then be refused at emission time, in production, which is exactly what TR-7
+forbids. The catalog test therefore walks every module of the package and asserts this domain
+covers every reachable subclass, so a new error class fails the build instead of a scrape.
 """
 
 METRIC_CATALOG: tuple[MetricDescriptor, ...] = (

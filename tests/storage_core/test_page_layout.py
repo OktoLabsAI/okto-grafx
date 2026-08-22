@@ -35,6 +35,7 @@ from okto_grafx.domain.page import (
     PageType,
     decode_slot_entry,
     encode_slot_entry,
+    is_unwritten_image,
     validate_page_size,
 )
 
@@ -167,7 +168,7 @@ def test_an_accepted_page_size_is_returned_unchanged(page_size: int) -> None:
 
 @pytest.mark.parametrize(
     "page_size",
-    [0, -8192, MIN_PAGE_SIZE - 1, MAX_PAGE_SIZE + 1, 8191, 65536, 3000],
+    [0, -8192, 256, MIN_PAGE_SIZE - 1, MAX_PAGE_SIZE + 1, 8191, 65536, 3000],
 )
 def test_a_page_size_the_layout_cannot_address_is_refused(page_size: int) -> None:
     with pytest.raises(GrafxConfigurationError):
@@ -255,3 +256,91 @@ def test_a_header_page_of_the_wrong_page_size_is_refused() -> None:
 def test_the_default_next_page_is_the_end_of_a_chain() -> None:
     assert PageHeader().next_page == NO_PAGE
     assert Page(page_size=512).next_page == NO_PAGE
+
+
+# --- amendment A20: one page size range, agreed on both sides ------------------------------------
+
+
+def test_the_page_size_range_is_the_one_amendment_a20_froze() -> None:
+    assert MIN_PAGE_SIZE == 512
+    assert MAX_PAGE_SIZE == 32768
+
+
+def test_the_composition_root_and_the_layout_accept_exactly_the_same_sizes() -> None:
+    # A size accepted by one and refused by the other is an integration failure waiting for the
+    # first non-default deployment, so the two are compared directly rather than by eye.
+    from okto_grafx.runtime.config import DatabaseConfig
+
+    for candidate in (128, 256, 511, 512, 1024, 4096, 8192, 32768, 65536, 3000):
+        layout_accepts = True
+        try:
+            validate_page_size(candidate)
+        except GrafxConfigurationError:
+            layout_accepts = False
+        config_accepts = True
+        try:
+            DatabaseConfig(path=":memory:", page_size=candidate)
+        except Exception:  # noqa: BLE001 - any refusal counts as a refusal here
+            config_accepts = False
+        assert layout_accepts == config_accepts, candidate
+
+
+def test_the_smallest_accepted_page_still_holds_a_header_and_a_slot() -> None:
+    page = Page(int(PageType.HEAP), page_size=MIN_PAGE_SIZE)
+    assert page.free_space() == MIN_PAGE_SIZE - PAGE_HEADER_SIZE
+    page.insert_slot(b"x" * 64)
+    assert len(page.to_bytes()) == MIN_PAGE_SIZE
+
+
+# --- an allocated page nobody has written --------------------------------------------------------
+
+
+def test_a_page_of_zeros_is_recognised_as_never_written() -> None:
+    assert is_unwritten_image(bytes(512), 512)
+    assert is_unwritten_image(bytes(8192), 8192)
+
+
+def test_a_buffer_of_the_wrong_length_is_never_an_unwritten_page() -> None:
+    assert not is_unwritten_image(bytes(511), 512)
+    assert not is_unwritten_image(bytes(513), 512)
+    assert not is_unwritten_image(b"", 512)
+    assert not is_unwritten_image(bytes(512), 0)
+
+
+def test_a_page_with_any_content_at_all_is_not_unwritten() -> None:
+    for position in (0, 4, 16, 31, 32, 200, 511):
+        raw = bytearray(512)
+        raw[position] = 1
+        assert not is_unwritten_image(bytes(raw), 512)
+
+
+def test_a_slot_directory_entry_is_never_unpacked_out_of_a_short_buffer() -> None:
+    """D1, the same shape in the other exported decoder.
+
+    struct answers a short buffer with a raw struct.error, which carries no code, no retry flag
+    and no location. This function is public, so any caller can reach it with any bytes.
+    """
+    entry = encode_slot_entry(32, 8)
+    assert decode_slot_entry(entry, 0) == (32, 8)
+    for raw, position in ((b"", 0), (entry[:3], 0), (entry, 1), (entry, -1), (entry, 4)):
+        with pytest.raises(GrafxCorruptionDetected) as raised:
+            decode_slot_entry(raw, position)
+        assert raised.value.details["field"] == "slot_entry"
+
+
+def test_a_page_size_stored_in_a_file_header_is_damage_and_not_configuration() -> None:
+    """The page size of a file is stored IN that file, so a value the layout cannot encode is
+    damaged bytes.
+
+    Delegating the classification along with the predicate made every door answer
+    configuration_error for a corrupt header, and FR-8/FR-10 route quarantine off
+    corruption_detected -- so the one state that most needs quarantining could never reach it.
+    """
+    for stored in (0, 100, 3000, 1 << 40):
+        with pytest.raises(GrafxCorruptionDetected) as raised:
+            FileHeader(kind=FileKind.HEAP, page_size=stored)
+        assert raised.value.details["field"] == "page_size", stored
+        assert raised.value.code == "corruption_detected", stored
+    # The same predicate answering for a CONFIGURED page size stays a configuration error.
+    with pytest.raises(GrafxConfigurationError):
+        validate_page_size(100)

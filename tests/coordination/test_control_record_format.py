@@ -120,20 +120,72 @@ def test_a_truncated_record_is_refused_rather_than_guessed() -> None:
             decode_lease_record(raw[:length])
 
 
+@pytest.mark.parametrize("length", [0, 1, 32, 67])
+def test_a_lease_shorter_than_its_own_header_says_which_guard_refused(length: int) -> None:
+    """The class alone cannot tell these two guards apart.
+
+    Unpacking a buffer that is too short raises inside struct one line later, and that is caught
+    and re-raised as the same class -- so a test asserting only the type passes whether or not
+    the length guard exists. The message and the ``length`` detail are emitted by this guard and
+    by nothing else, which is what makes them the assertion.
+    """
+    truncated = encode_lease_record(LEASE)[:length]
+    with pytest.raises(GrafxCorruptionDetected) as failure:
+        decode_lease_record(truncated)
+    assert "shorter than its own header" in failure.value.message
+    assert failure.value.details["length"] == length
+
+
+@pytest.mark.parametrize("length", [0, 1, 32, 51])
+def test_a_reader_shorter_than_its_own_header_says_which_guard_refused(length: int) -> None:
+    # The same invariant at the second site (A66): one rule, two decoders, two assertions.
+    truncated = encode_reader_record(READER)[:length]
+    with pytest.raises(GrafxCorruptionDetected) as failure:
+        decode_reader_record(truncated)
+    assert "shorter than its own header" in failure.value.message
+    assert failure.value.details["length"] == length
+
+
 def test_trailing_bytes_are_refused() -> None:
     with pytest.raises(GrafxCorruptionDetected):
         decode_lease_record(encode_lease_record(LEASE) + b"\x00")
 
 
+def _resealed(raw: bytes) -> bytes:
+    """Return the record with its checksum recomputed over the bytes as they now stand.
+
+    Without this the checksum guard refuses first and the guard under test never runs -- and
+    since both raise the same class, the test passes either way. Resealing makes the magic the
+    only thing that can refuse.
+    """
+    body = bytearray(raw)
+    struct.pack_into("<I", body, len(body) - 4, zlib.crc32(bytes(body[:-4])) & 0xFFFFFFFF)
+    return bytes(body)
+
+
 def test_a_foreign_magic_is_refused() -> None:
     raw = bytearray(encode_lease_record(LEASE))
     raw[0:8] = b"NOTOURS!"
-    with pytest.raises(GrafxCorruptionDetected):
-        decode_lease_record(bytes(raw))
+    with pytest.raises(GrafxCorruptionDetected) as failure:
+        decode_lease_record(_resealed(bytes(raw)))
+    assert "magic" in failure.value.message
+
     reader = bytearray(encode_reader_record(READER))
     reader[0:8] = b"NOTOURS!"
+    with pytest.raises(GrafxCorruptionDetected) as reader_failure:
+        decode_reader_record(_resealed(bytes(reader)))
+    assert "magic" in reader_failure.value.message
+
+
+def test_an_internally_consistent_foreign_record_is_still_refused() -> None:
+    # The case the magic guard exists for: bytes that pass every other check because whoever
+    # wrote them sealed them properly, and are simply not this format.
+    raw = bytearray(encode_lease_record(LEASE))
+    raw[0:8] = b"OKTOGRFX"
+    sealed = _resealed(bytes(raw))
+    assert zlib.crc32(sealed[:-4]) & 0xFFFFFFFF == struct.unpack_from("<I", sealed, len(sealed) - 4)[0]
     with pytest.raises(GrafxCorruptionDetected):
-        decode_reader_record(bytes(reader))
+        decode_lease_record(sealed)
 
 
 def test_a_newer_format_version_is_a_typed_refusal_not_a_guess() -> None:
@@ -188,18 +240,34 @@ def test_a_record_ending_in_the_dos_end_of_file_byte_survives_the_device(
 
     The C runtime opens a file in text mode unless O_BINARY is given, and committing a text-mode
     handle truncates the file at a trailing 0x1A. One record in every 256 ends that way by pure
-    arithmetic, so a device that forgets the flag loses a lease at a predictable rate. This walks
-    the heartbeat until such a record is published and proves it reads back whole.
+    arithmetic, so a device that forgets the flag loses a lease at a predictable rate. The record
+    is constructed rather than walked into: searching a live heartbeat for the byte makes the
+    coverage depend on where the checksums happen to land.
     """
-    coordinator = make_coordinator(owner_id="p1-aaaa")
-    lease = coordinator.acquire_writer_lease(timeout=1.0)
-    target = database_root / "control" / "writer.lease"
-    seen_end_of_file_byte = False
-    for _renewal in range(64):
-        lease = coordinator.renew_lease(lease)
-        raw = target.read_bytes()
-        record = decode_lease_record(raw)
-        assert record.heartbeat_seq == lease.heartbeat_seq
-        assert len(raw) == 64 + len(record.owner_id) + 4
-        seen_end_of_file_byte = seen_end_of_file_byte or raw[-1] == 0x1A
-    assert seen_end_of_file_byte, "the walk never produced the byte this test is about"
+    from coordination_support import DirectoryStorageDevice
+
+    candidate = None
+    for sequence in range(1, 4_000):
+        record = LeaseRecord(
+            owner_id="p1-aaaa-0123abcd",
+            epoch=1,
+            heartbeat_seq=sequence,
+            ttl_seconds=5.0,
+            wall_stamp=1_700_000_000.0,
+            held=True,
+            superseded_epoch=0,
+        )
+        raw = encode_lease_record(record)
+        if raw[-1] == 0x1A:
+            candidate = (record, raw)
+            break
+    assert candidate is not None, "no record in the search space ended with the byte under test"
+    record, raw = candidate
+
+    device = DirectoryStorageDevice(database_root)
+    device.create("control/writer.lease")
+    device.append_log("control/writer.lease", raw)
+    device.durable_barrier("control/writer.lease")
+    stored = device.read_log("control/writer.lease", 0, device.log_size("control/writer.lease"))
+    assert len(stored) == len(raw), "the device lost the trailing end-of-file byte"
+    assert decode_lease_record(stored) == record

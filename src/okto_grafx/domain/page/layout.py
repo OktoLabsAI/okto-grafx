@@ -51,6 +51,7 @@ __all__ = [
     "PageType",
     "PageHeader",
     "validate_page_size",
+    "is_unwritten_image",
     "encode_slot_entry",
     "decode_slot_entry",
 ]
@@ -61,8 +62,9 @@ PAGE_HEADER_SIZE: int = 32
 SLOT_ENTRY_SIZE: int = 4
 """Bytes of one slot directory entry: a 16-bit offset followed by a 16-bit length."""
 
-MIN_PAGE_SIZE: int = 256
-"""Smallest page the layout accepts: enough for the header, a directory and a real payload."""
+MIN_PAGE_SIZE: int = 512
+"""Smallest page the layout accepts (amendment A20). DatabaseConfig imports this constant, so
+the engine and the composition root cannot disagree about which sizes exist."""
 
 MAX_PAGE_SIZE: int = 32768
 """Largest page the layout accepts, because free_start and free_end are 16-bit counters."""
@@ -100,6 +102,27 @@ class PageType(IntEnum):
     INDEX_HASH = 4
     INDEX_HNSW = 5
     OVERFLOW = 6
+
+
+def is_unwritten_image(raw: bytes, page_size: int) -> bool:
+    """Return True when these bytes are an allocated page that no write has ever reached.
+
+    The length is part of the question, not a detail: a short buffer of zeros is a damaged read,
+    not an untouched page, and the two must not be confused.
+
+    ``StorageDevice.allocate`` grows a file with zero-filled pages, and the port has no
+    positional write primitive, so the only way a page image can be nothing but zeros is that
+    nobody has written it yet. That state is reachable in ordinary operation: a crash between the
+    PAGE_ALLOC record and the WRITE_PAGE record that was to follow it leaves exactly this.
+
+    A written page can never look like this. Its first four bytes hold the CRC-32C of everything
+    after them, and for those to be zero the rest would have to checksum to zero while also being
+    zero, which requires ``free_end == 0``; a valid header needs ``free_end == page_size -
+    slot_count * 4`` with ``32 <= free_start <= free_end``, and no page size in the accepted range
+    satisfies both. The two states are therefore disjoint, which is what makes reading zeros as
+    "free" safe rather than a way of hiding damage.
+    """
+    return len(raw) == page_size > 0 and not any(raw)
 
 
 def validate_page_size(page_size: int) -> int:
@@ -226,6 +249,20 @@ def encode_slot_entry(offset: int, length: int) -> bytes:
 
 
 def decode_slot_entry(raw: bytes, position: int) -> tuple[int, int]:
-    """Return the offset and length of the slot directory entry at the given byte position."""
+    """Return the offset and length of the slot directory entry at the given byte position.
+
+    The buffer is checked before it is unpacked. This function is public, so a caller can reach
+    it with any bytes at all, and struct answers a short buffer with a raw struct.error that
+    carries no code, no retry flag and no location.
+    """
+    if position < 0 or position + SLOT_ENTRY_SIZE > len(raw):
+        raise GrafxCorruptionDetected(
+            f"A slot directory entry needs {SLOT_ENTRY_SIZE} bytes at offset {position}, but "
+            f"the buffer holds {len(raw)}.",
+            field="slot_entry",
+            offset=position,
+            needed=SLOT_ENTRY_SIZE,
+            available=max(len(raw) - max(position, 0), 0),
+        )
     offset, length = _SLOT_STRUCT.unpack_from(raw, position)
     return int(offset), int(length)

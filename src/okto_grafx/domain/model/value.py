@@ -19,10 +19,19 @@ can always answer "which space am I in" without a catalog lookup.
     TIMESTAMP  i64 microseconds since the Unix epoch
     UUID       16 raw bytes
 
-Vector validation happens here, on the way in, and never on the way out (SPEC-VEC BR-5): a
-dimension of zero, a space_ref of zero, a NaN or an infinity is refused at encode time with
-GrafxVectorValidationError and nothing is persisted, so a read never has to defend itself
-against a malformed vector.
+Whatever this module checks about a vector, it checks on the way in and never on the way out
+(SPEC-VEC BR-5), so a read never has to defend itself against a malformed vector. What it can
+check is exactly what a value knows about itself, with no catalog in reach:
+
+* the dimension is at least one and at most MAX_VECTOR_DIMENSION;
+* the space reference is a real one, so neither zero nor beyond 32 bits;
+* every component is finite, and is representable in the storage dtype of the value.
+
+What it CANNOT check, and does not: that the dimension matches the dimension declared by the
+embedding space the column points at, that the space exists, or that it still accepts writes.
+Those need the catalog, a ColumnDef carries no dimension, and VEC FR-1 assigns them to the
+vector engine of C9. A caller that has only passed through here has not yet satisfied the vector
+contract, and this module is not the place that will tell it so.
 """
 
 from __future__ import annotations
@@ -37,12 +46,15 @@ from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxVectorValidat
 from okto_grafx.domain.model.errors import SchemaMismatchError
 
 __all__ = [
+    "MAX_VALUE_DEPTH",
     "MAX_VECTOR_DIMENSION",
     "MAX_STRING_LENGTH",
     "VECTOR_DTYPES",
     "VECTOR_VALUE_TYPES",
     "INT64_MIN",
     "INT64_MAX",
+    "MAX_FLOAT32",
+    "FLOAT32_OVERFLOW_THRESHOLD",
     "ValueType",
     "Timestamp",
     "Uuid",
@@ -55,6 +67,17 @@ __all__ = [
     "decode_values",
 ]
 
+MAX_VALUE_DEPTH: int = 64
+"""How deeply a list or a map may nest before the encoding refuses to go further.
+
+Both directions need the bound. A payload of nothing but list tags is a few kilobytes that
+unwinds into thousands of nested calls, and the interpreter answers that with a RecursionError,
+which is not a Grafx error and carries no location: a corrupt payload would leave the read door
+as something C6 could not classify as a corruption incident at all. Real data nests a handful of
+levels, so the limit is far above anything a caller means and far below what the interpreter can
+take.
+"""
+
 MAX_VECTOR_DIMENSION: int = 16384
 """Components one vector may carry. It is far above every published embedding model."""
 
@@ -63,6 +86,18 @@ MAX_STRING_LENGTH: int = 0xFFFFFFFF
 
 INT64_MIN: int = -(1 << 63)
 INT64_MAX: int = (1 << 63) - 1
+
+MAX_FLOAT32: float = (2.0 - 2.0**-23) * 2.0**127
+"""The largest finite value a 32-bit float can hold."""
+
+FLOAT32_OVERFLOW_THRESHOLD: float = (2.0 - 2.0**-24) * 2.0**127
+"""Where a double stops fitting in a 32-bit float.
+
+Below this magnitude a double rounds to a finite 32-bit float; at it and above it rounds to
+infinity, which is a value the vector contract forbids. The threshold is the midpoint between
+MAX_FLOAT32 and the next binade, and the tie rounds away from MAX_FLOAT32 because infinity is
+the even alternative, so the boundary itself already overflows.
+"""
 
 _TAG = struct.Struct("<B")
 _U32 = struct.Struct("<I")
@@ -262,6 +297,26 @@ Value: TypeAlias = (
 """Every Python shape the value system can store. Lists decode to tuples and maps to dicts."""
 
 
+def _utf8(text: str) -> bytes:
+    """Return the UTF-8 bytes of a string, refusing one that has no encoding at all.
+
+    A Python string may hold a lone surrogate, which no UTF-8 encoder can represent. Such a
+    string arrives from a lenient decoder or from parsed input, never from a keyboard, and it
+    must not leave the write path as a raw UnicodeEncodeError: only a Grafx error is allowed to
+    escape the engine (CONTRACT.md section 11 item 5).
+    """
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError as failure:
+        raise SchemaMismatchError(
+            f"A stored string must be encodable as UTF-8; the character at position "
+            f"{failure.start} cannot be: {failure.reason}.",
+            field="value",
+            position=failure.start,
+            reason=failure.reason,
+        ) from failure
+
+
 def value_type_of(value: Value) -> ValueType:
     """Return the value type a Python object encodes to, refusing anything with no encoding."""
     if value is None:
@@ -293,12 +348,21 @@ def value_type_of(value: Value) -> ValueType:
     )
 
 
-def encode_value(value: Value) -> bytes:
+def encode_value(value: Value, *, depth: int = 0) -> bytes:
     """Return the tagged encoding of one value.
 
-    A vector is validated here and nowhere else: dimension, space reference and the finiteness
-    of every component are checked before a single byte is produced (SPEC-VEC BR-5).
+    A vector is checked before a single byte is produced: its dimension is within the bounds of
+    the format, its space reference is a real one, and every component is finite and fits the
+    storage dtype (SPEC-VEC BR-5). The check against the DECLARED dimension of the embedding
+    space is not here and cannot be: this function is given a value, not a catalog. C9 owns it.
     """
+    if depth > MAX_VALUE_DEPTH:
+        raise SchemaMismatchError(
+            f"A value may nest at most {MAX_VALUE_DEPTH} levels deep; this one goes further.",
+            field="depth",
+            value=depth,
+            limit=MAX_VALUE_DEPTH,
+        )
     kind = value_type_of(value)
     if kind is ValueType.NULL:
         return _TAG.pack(int(kind))
@@ -316,7 +380,7 @@ def encode_value(value: Value) -> bytes:
     if kind is ValueType.DOUBLE:
         return _TAG.pack(int(kind)) + _F64.pack(float(value))  # type: ignore[arg-type]
     if kind is ValueType.STRING:
-        body = str(value).encode("utf-8")
+        body = _utf8(str(value))
         return _TAG.pack(int(kind)) + _U32.pack(len(body)) + body
     if kind is ValueType.BYTES:
         body = bytes(value)  # type: ignore[arg-type]
@@ -328,14 +392,14 @@ def encode_value(value: Value) -> bytes:
     if kind is ValueType.LIST:
         elements = tuple(value)  # type: ignore[arg-type]
         parts = [_TAG.pack(int(kind)), _U32.pack(len(elements))]
-        parts.extend(encode_value(element) for element in elements)
+        parts.extend(encode_value(element, depth=depth + 1) for element in elements)
         return b"".join(parts)
     if kind is ValueType.MAP:
         pairs = tuple(value.items())  # type: ignore[union-attr]
         parts = [_TAG.pack(int(kind)), _U32.pack(len(pairs))]
         for key, item in pairs:
-            parts.append(encode_value(key))
-            parts.append(encode_value(item))
+            parts.append(encode_value(key, depth=depth + 1))
+            parts.append(encode_value(item, depth=depth + 1))
         return b"".join(parts)
     return _encode_vector(value, kind)  # type: ignore[arg-type]
 
@@ -368,6 +432,7 @@ def _encode_vector(vector: VectorValue, kind: ValueType) -> bytes:
             field="space_ref",
             value=vector.space_ref,
         )
+    single = kind is ValueType.VECTOR_F32
     for position, component in enumerate(vector.values):
         if not isfinite(component):
             raise GrafxVectorValidationError(
@@ -376,14 +441,38 @@ def _encode_vector(vector: VectorValue, kind: ValueType) -> bytes:
                 position=position,
                 value=repr(component),
             )
-    body = struct.pack(
-        f"<{dimension}{'f' if kind is ValueType.VECTOR_F32 else 'd'}", *vector.values
-    )
+        if single and not -FLOAT32_OVERFLOW_THRESHOLD < component < FLOAT32_OVERFLOW_THRESHOLD:
+            # A double the target dtype cannot hold would become an infinity on the way to the
+            # page, and an infinity is exactly what the vector contract refuses to store. The
+            # range is a property of the space, not of the number, so the check belongs here and
+            # not next to the finiteness test above (SPEC-VEC BR-5).
+            raise GrafxVectorValidationError(
+                f"A component of a float32 vector must be within "
+                f"{MAX_FLOAT32!r} in magnitude; component {position} is {component!r}.",
+                field="values",
+                position=position,
+                value=repr(component),
+                dtype=vector.dtype,
+                limit=MAX_FLOAT32,
+            )
+    body = struct.pack(f"<{dimension}{'f' if single else 'd'}", *vector.values)
     return _TAG.pack(int(kind)) + _U32.pack(dimension) + _U32.pack(vector.space_ref) + body
 
 
-def decode_value(buf: bytes, offset: int = 0) -> tuple[Value, int]:
-    """Decode one value starting at the offset and return it with the offset that follows it."""
+def decode_value(buf: bytes, offset: int = 0, *, depth: int = 0) -> tuple[Value, int]:
+    """Decode one value starting at the offset and return it with the offset that follows it.
+
+    The depth budget is part of the format, not a safety net: stored bytes that nest deeper than
+    an encoder was ever allowed to write are corrupt, and they are reported as corrupt with the
+    offset that carried them rather than as an interpreter failure with no location at all.
+    """
+    if depth > MAX_VALUE_DEPTH:
+        raise GrafxCorruptionDetected(
+            f"A stored value nests deeper than the {MAX_VALUE_DEPTH} levels the format allows.",
+            field="depth",
+            offset=offset,
+            limit=MAX_VALUE_DEPTH,
+        )
     _require(buf, offset, 1, "tag")
     tag = buf[offset]
     offset += 1
@@ -445,7 +534,7 @@ def decode_value(buf: bytes, offset: int = 0) -> tuple[Value, int]:
         offset += _U32.size
         elements: list[Value] = []
         for _ in range(count):
-            element, offset = decode_value(buf, offset)
+            element, offset = decode_value(buf, offset, depth=depth + 1)
             elements.append(element)
         return tuple(elements), offset
     if kind is ValueType.MAP:
@@ -454,8 +543,8 @@ def decode_value(buf: bytes, offset: int = 0) -> tuple[Value, int]:
         offset += _U32.size
         mapping: dict[Value, Value] = {}
         for _ in range(count):
-            key, offset = decode_value(buf, offset)
-            item, offset = decode_value(buf, offset)
+            key, offset = decode_value(buf, offset, depth=depth + 1)
+            item, offset = decode_value(buf, offset, depth=depth + 1)
             try:
                 mapping[key] = item
             except TypeError as failure:

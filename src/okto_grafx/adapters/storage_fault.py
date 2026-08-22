@@ -45,7 +45,13 @@ from dataclasses import dataclass, replace
 from types import TracebackType
 from typing import TypeVar
 
-from okto_grafx.domain.errors import GrafxDeviceFull, GrafxError, GrafxUnsupportedOperation
+from okto_grafx.adapters.storage_local import barrier_failure_from, refuse_missing_file
+from okto_grafx.domain.errors import (
+    GrafxDeviceFull,
+    GrafxDurabilityBarrierFailed,
+    GrafxError,
+    GrafxUnsupportedOperation,
+)
 from okto_grafx.domain.ids import PageIndex
 from okto_grafx.domain.ports.storage import StorageDevice
 
@@ -232,14 +238,6 @@ class _SplitMix64:
     def below(self, bound: int) -> int:
         """Return a value in the half-open range from zero to bound."""
         return self.next_word() % bound if bound > 0 else 0
-
-    def permutation(self, count: int) -> tuple[int, ...]:
-        """Return a shuffled range of the given length, reproducible for the seed."""
-        order = list(range(count))
-        for index in range(count - 1, 0, -1):
-            target = self.below(index + 1)
-            order[index], order[target] = order[target], order[index]
-        return tuple(order)
 
 
 class FaultInjectingStorageDevice:
@@ -440,7 +438,6 @@ class FaultInjectingStorageDevice:
         previous_reordering = self._reordering
         previous_volatile = list(self._volatile)
         self._plan = FaultPlan()
-        self._reordering = False
         self._volatile = []
         self.clear_trail()
         try:
@@ -546,14 +543,22 @@ class FaultInjectingStorageDevice:
 
     def write_page(self, file: str, page_index: PageIndex, data: bytes) -> None:
         """Write one page, possibly tearing it the way a power loss does."""
-        sequence = self._enter("write_page", file, f"page={page_index},bytes={len(data)}")
+        sequence = self._enter(
+            "write_page", file, f"page={page_index},bytes={_payload_length(data)}"
+        )
         self._before(sequence, "write_page", file)
         stored = self._partial_limit(sequence, "write_page")
+        if stored is not None and _payload_length(data) == "?":
+            # A payload with no length is the wrapped device's business, not the bench's.
+            stored = None
         self._capture_page(file, page_index)
         if stored is None:
             self._run(sequence, lambda: self._inner.write_page(file, page_index, data))
         else:
-            torn = bytes(data[:stored]) + self._inner.read_page(file, page_index)[stored:]
+            # The read that builds the torn image is part of serving this call, so a failure of
+            # that read is the real outcome of the call and must replace the injected label.
+            previous = self._run(sequence, lambda: self._inner.read_page(file, page_index))
+            torn = bytes(memoryview(data)[:stored]) + previous[stored:]
             self._run(sequence, lambda: self._inner.write_page(file, page_index, torn))
         self._after(sequence, "write_page", file)
 
@@ -561,9 +566,13 @@ class FaultInjectingStorageDevice:
 
     def append_log(self, file: str, payload: bytes) -> int:
         """Append to a log; a partial append stores its prefix and then refuses the write."""
-        sequence = self._enter("append_log", file, f"bytes={len(payload)}")
+        sequence = self._enter("append_log", file, f"bytes={_payload_length(payload)}")
         self._before(sequence, "append_log", file)
         stored = self._partial_limit(sequence, "append_log")
+        if stored is not None and _payload_length(payload) == "?":
+            # Let the wrapped device answer for a payload that is not bytes at all: the bench
+            # never turns a typed refusal into a bare TypeError of its own.
+            stored = None
         size_before = self._size_of(file)
         if stored is None:
             size = self._run(sequence, lambda: self._inner.append_log(file, payload))
@@ -597,14 +606,22 @@ class FaultInjectingStorageDevice:
         return answer
 
     def truncate_log(self, file: str, size: int) -> None:
-        """Shrink a log on the wrapped device."""
+        """Shrink a log on the wrapped device.
+
+        The undo image is read before the call and kept only once the call succeeded, so an
+        argument the wrapped device refuses is answered by the device itself, with its own type
+        and its own trail entry, whether or not a fault is armed.
+        """
         sequence = self._enter("truncate_log", file, f"size={size}")
         self._before(sequence, "truncate_log", file)
-        if self._tracking():
-            current = self._size_of(file)
-            tail = self._inner.read_log(file, size, current - size) if current > size else b""
-            self._record(_VolatileWrite("truncate", file, size_before=size, image=tail, reordered=self._reordering))
+        removed = self._capture_truncation(file, size)
         self._run(sequence, lambda: self._inner.truncate_log(file, size))
+        if removed is not None:
+            self._record(
+                _VolatileWrite(
+                    "truncate", file, size_before=int(size), image=removed, reordered=self._reordering
+                )
+            )
         self._after(sequence, "truncate_log", file)
 
     # --- durability ---------------------------------------------------------------------
@@ -618,14 +635,33 @@ class FaultInjectingStorageDevice:
         """
         sequence = self._enter("durable_barrier", file, "")
         self._before(sequence, "durable_barrier", file)
+        try:
+            self._serve_barrier(sequence, file)
+        except GrafxDurabilityBarrierFailed:
+            raise
+        except GrafxError as failure:
+            # A28: one type leaves this door whatever went wrong, lying or honest, because the
+            # caller counts exactly that type into oktografx_barrier_failures_total.
+            self._mark(sequence, "durability_barrier_failed")
+            raise barrier_failure_from(failure) from failure
+        self._after(sequence, "durable_barrier", file)
+
+    def _serve_barrier(self, sequence: int, file: str | None) -> None:
+        """Flush the wrapped device, or acknowledge without flushing when the plan says to lie."""
         if self._plan.lying_barrier:
-            # The lie: the caller is told the bytes are safe. They stay in the volatile window
-            # instead, and the next crash makes them disappear.
-            self._after(sequence, "durable_barrier", file)
+            # The lie is about persistence only. Everything else the door would have refused it
+            # still refuses: a device that cannot serve at all, and a file it does not hold. The
+            # failure itself is raised in the canonical shape of the wrapped device, so the
+            # conversion above gives it the very details an honest barrier would carry (H6, H7).
+            if file is None:
+                self._run(sequence, lambda: self._inner.list_files())
+            elif not self._run(sequence, lambda: self._inner.exists(file)):
+                raise refuse_missing_file(file, "open")
+            # The caller is told the bytes are safe. They stay in the volatile window instead,
+            # and the next crash makes them disappear.
             return
         self._run(sequence, lambda: self._inner.durable_barrier(file))
         self._pin(file)
-        self._after(sequence, "durable_barrier", file)
 
     # --- lifecycle ----------------------------------------------------------------------
 
@@ -709,6 +745,22 @@ class FaultInjectingStorageDevice:
         self._volatile.append(
             _VolatileWrite("page", file, page_index=page_index, image=image, reordered=self._reordering)
         )
+
+    def _capture_truncation(self, file: str, size: object) -> bytes | None:
+        """Return the bytes a truncation would remove, or None when it cannot be undone.
+
+        Nothing here decides whether the truncation is legal: a size the device would refuse is
+        simply not captured, and the device answers with its own typed failure.
+        """
+        if not self._tracking():
+            return None
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            return None
+        try:
+            current = self._inner.log_size(file)
+            return self._inner.read_log(file, size, current - size) if current > size else b""
+        except GrafxError:
+            return None
 
     def _capture_state(self, file: str) -> None:
         """Keep the whole state of one file so a namespace change can be undone (A18f)."""
@@ -847,6 +899,19 @@ class FaultInjectingStorageDevice:
             return None
         self._mark(sequence, "partial_write")
         return plan.partial_write_bytes
+
+
+def _payload_length(payload: object) -> object:
+    """Return the length of a payload for the trail, or a marker when it has none.
+
+    The trail is written before the wrapped device sees the call, so a payload that is not a
+    byte sequence must not make the bench raise a bare TypeError of its own: the device answers
+    with its own typed refusal, and the trail keeps the entry that refusal belongs to.
+    """
+    try:
+        return len(payload)  # type: ignore[arg-type]
+    except TypeError:
+        return "?"
 
 
 def _refuse(field: str, value: object, reason: str) -> GrafxUnsupportedOperation:

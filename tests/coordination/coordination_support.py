@@ -24,7 +24,9 @@ from okto_grafx.domain.errors import (
 
 __all__ = [
     "BINARY",
+    "owned_by",
     "DirectoryStorageDevice",
+    "sharing_violation",
     "HookStorageDevice",
     "ManualClock",
     "RecordingMetricsSink",
@@ -48,6 +50,27 @@ WRITE_OPERATIONS: frozenset[str] = frozenset(
     }
 )
 """Every device call that can change a byte on the device or force one out to it."""
+
+
+def owned_by(stored: str, configured: str) -> bool:
+    """Return whether a stored identity was composed from this configured owner name.
+
+    The identity that reaches the record carries a per-instance nonce, so a test that pins the
+    configured name has to ask about composition rather than equality -- and asking this way also
+    keeps it honest, because two coordinators built with one configured name answer differently.
+    """
+    return stored.startswith(f"{configured}-") and len(stored) > len(configured) + 1
+
+
+def sharing_violation(name: str) -> PermissionError:
+    """Return the error a scanner or an indexer produces while it holds a file open.
+
+    On Windows the interesting part is ``winerror`` 32, which is what the adapter classifies as
+    transient; on POSIX the same situation surfaces as EACCES with no winerror at all.
+    """
+    if os.name == "nt":
+        return PermissionError(13, "The process cannot access the file.", name, 32)
+    return PermissionError(13, "Permission denied.", name)
 
 
 class ManualClock:
@@ -85,10 +108,6 @@ class ManualClock:
         self.slept.append(float(seconds))
         self.advance(seconds)
 
-    def freeze_sleep(self, seconds: float) -> None:
-        """Stand in for a sleep that does not advance time, to exercise the wait bounds."""
-        self.slept.append(float(seconds))
-
 
 class RecordingMetricsSink:
     """A metrics sink that keeps every observation so a test can assert on it."""
@@ -104,7 +123,15 @@ class RecordingMetricsSink:
         return self._enabled
 
     def register(self, descriptor: object) -> None:
-        """Accept a descriptor without validating it; C8 owns the catalog."""
+        """Accept a descriptor without validating it.
+
+        LOOSER THAN THE REAL SINK: ``OpenMetricsSink`` refuses to emit a name it has never been
+        given (A51), refuses a label value outside the domain declared at registration, and
+        refuses a second registration of one name with a different descriptor. This double does
+        none of that, so a component that emits without registering passes here and fails the
+        moment the stack is assembled -- which is how the unregistered lease-wait metric reached
+        C11. ``test_real_metrics_sink.py`` drives the real sink so that gap has somewhere to show.
+        """
         self.registered.append(descriptor)
 
     def increment(self, name: str, value: float = 1.0, labels: dict[str, str] | None = None) -> None:
@@ -155,7 +182,11 @@ class DirectoryStorageDevice:
         return self._path(file).exists()
 
     def create(self, file: str, *, exclusive: bool = True) -> None:
-        """Create the file, making its parent directories on the way."""
+        """Create the file, making its parent directories on the way.
+
+        LOOSER THAN THE REAL DEVICE: the real one refuses an inadmissible or colliding name with
+        GrafxUnsupportedOperation. This double accepts any name the file system accepts.
+        """
         path = self._path(file)
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
@@ -187,13 +218,26 @@ class DirectoryStorageDevice:
         return self._path(file).stat().st_size
 
     def atomic_replace(self, source: str, target: str) -> None:
-        """Replace the target with the source in one step."""
+        """Replace the target with the source in one step.
+
+        LOOSER THAN THE REAL DEVICE: the real one retries a sharing violation on a short backoff
+        (TR-3) before reporting it. This one lets the platform error through immediately, which
+        is deliberate -- it is what makes the adapter's own retry the thing under test rather
+        than the device's.
+        """
         target_path = self._path(target)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         os.replace(self._path(source), target_path)
 
     def recycle(self, file: str) -> bool:
-        """Release the file, reporting False when the platform deferred the deletion."""
+        """Release the file, reporting False when the platform deferred the deletion.
+
+        LOOSER THAN THE REAL DEVICE: ``LocalStorageDevice`` opens with FILE_SHARE_DELETE and
+        arms the NTFS pending delete (A16/A17), so the name leaves the namespace at once even
+        with a reader holding a handle. This double just unlinks and reports False on a
+        PermissionError, so a caller that depends on the name disappearing promptly would look
+        correct here.
+        """
         path = self._path(file)
         if not path.exists():
             return True
@@ -263,7 +307,13 @@ class DirectoryStorageDevice:
             handle.truncate(size)
 
     def durable_barrier(self, file: str | None = None) -> None:
-        """Force the named file out to the device."""
+        """Force the named file out to the device.
+
+        LOOSER THAN THE REAL DEVICE: the real one also flushes the containing directory on POSIX,
+        which is what makes a rename durable, and it folds every failure into
+        GrafxDurabilityBarrierFailed with the access classification in the details (A28). This
+        one flushes the file alone and lets the platform error through.
+        """
         if file is None:
             return
         path = self._path(file)
@@ -308,6 +358,9 @@ class HookStorageDevice:
         self.touched: list[tuple[str, str]] = []
         self._inside_hook = False
         self.hook_fired = False
+        self.fail_next: dict[str, int] = {}
+        self.failure: BaseException | None = None
+        self.short_read_next: int = 0
 
     @property
     def name(self) -> str:
@@ -333,6 +386,10 @@ class HookStorageDevice:
     def _record(self, operation: str, file: str | None = None) -> None:
         self.calls.append(operation)
         self.touched.append((operation, "" if file is None else file))
+        remaining = self.fail_next.get(operation, 0)
+        if remaining > 0:
+            self.fail_next[operation] = remaining - 1
+            raise self.failure or sharing_violation("" if file is None else file)
         if operation in WRITE_OPERATIONS:
             self.write_calls.append(operation)
             if self.forbid_writes:
@@ -409,9 +466,17 @@ class HookStorageDevice:
         return self._inner.append_log(file, payload)
 
     def read_log(self, file: str, offset: int, length: int) -> bytes:
-        """Delegate after recording the call."""
+        """Delegate after recording the call, optionally returning a short buffer.
+
+        A short read is what a reader sees when another participant replaces the file between
+        the size call and the bytes call: benign, and the signature the retry exists for.
+        """
         self._record("read_log", file)
-        return self._inner.read_log(file, offset, length)
+        raw = self._inner.read_log(file, offset, length)
+        if self.short_read_next > 0:
+            self.short_read_next -= 1
+            return raw[:-1]
+        return raw
 
     def log_size(self, file: str) -> int:
         """Delegate after recording the call."""

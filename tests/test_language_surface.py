@@ -27,7 +27,7 @@ import pytest
 
 from okto_grafx import errors as public_errors
 from okto_grafx.domain.errors import GrafxError
-from okto_grafx.domain.ports.metrics import NON_EN_US_MARKERS
+from okto_grafx.domain.ports.metrics import NON_EN_US_MARKERS, NON_EN_US_WORDS
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT: Path = PROJECT_ROOT / "src" / "okto_grafx"
@@ -37,7 +37,7 @@ PORTUGUESE_MARKERS: tuple[str, ...] = NON_EN_US_MARKERS
 """The marker list is owned by ``domain/ports/metrics.py`` so the registration-time check
 on a metric description and this source-tree gate can never drift apart."""
 
-MARKER_DEFINITION_NAME: str = "NON_EN_US_MARKERS"
+MARKER_DEFINITION_NAMES: frozenset[str] = frozenset({"NON_EN_US_MARKERS", "NON_EN_US_WORDS"})
 """The one assignment whose own string literals are the markers, and so are not evidence."""
 
 MARKER_DEFINITION_MODULE: Path = PACKAGE_ROOT / "domain" / "ports" / "metrics.py"
@@ -45,35 +45,10 @@ MARKER_DEFINITION_MODULE: Path = PACKAGE_ROOT / "domain" / "ports" / "metrics.py
 other module can smuggle a pt-BR message past this gate by naming a constant NON_EN_US_MARKERS."""
 
 
-PORTUGUESE_WORDS: frozenset[str] = frozenset(
-    {
-        "ainda", "antes", "apenas", "aberto", "aqui", "arquivo", "atualizar", "banco", "buscar",
-        "cabecalho", "cada", "campo", "chave", "cheio", "coluna", "consulta", "contagem",
-        "criar", "dados", "depois", "deve", "devem", "entao", "entrada", "entre", "erro",
-        "escrita", "espaco", "esta", "estao", "excluir", "falso", "fechado", "gravado",
-        "gravar", "indice", "inicio", "leitura", "linha", "lista", "memoria", "mesmo", "muito",
-        "nao", "nome", "novo", "nunca", "onde", "pagina", "pela", "pelo", "porque", "pouco",
-        "primeiro", "processo", "quando", "quantidade", "recuperacao", "registro", "resultado",
-        "retorno", "saida", "salvar", "sao", "sempre", "sobre", "tabela", "tamanho", "tipo",
-        "todas", "todos", "transacao", "ultimo", "uma", "umas", "usuario", "validacao", "valor",
-        "vazio", "verdadeiro",
-    }
-)
-"""Curated pt-BR words used to keep identifiers en-US (guideline G1, first surface named).
-
-Heuristic, and its limits. Identifiers are split on underscores and then on CamelCase
-boundaries, lowercased, and each token is looked up in this list; a hit fails the gate. The list
-is deliberately small and curated: every word was checked against the complete identifier
-vocabulary of ``src/`` (716 distinct tokens at the time of writing, across every delivered
-component) and against ordinary English, so a hit means Portuguese rather than a coincidence.
-Words of one or two letters are excluded entirely, and the only three-letter words kept are
-those with no plausible reading as an English abbreviation ("nao", "sao", "uma"); words such as
-"fim", "uso" and "dos" are left out for that reason, as is "tempo", which is also English.
-
-What it does not catch: a Portuguese word absent from the list, a single-token identifier whose
-spelling is also English, and local variable names, which are not a product surface. The gate is
-a floor, not a proof; code review remains the ceiling.
-"""
+PORTUGUESE_WORDS: frozenset[str] = NON_EN_US_WORDS
+"""The word list is owned by ``domain/ports/metrics.py`` so the identifier scan, the string
+literal scan and the registration-time description check are one rule with one vocabulary
+(amendment A57)."""
 
 IDENTIFIER_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+")
 """Splits CamelCase and acronyms, so a class name is examined word by word like a snake_case one."""
@@ -133,7 +108,42 @@ def _surface_identifiers(tree: ast.Module) -> list[tuple[str, str, int]]:
 
 
 def _relative(path: Path) -> str:
-    return str(path.relative_to(PROJECT_ROOT)).replace("\\", "/")
+    """Return a project-relative label, or the plain path for a synthetic probe module."""
+    try:
+        return str(path.relative_to(PROJECT_ROOT)).replace("\\", "/")
+    except ValueError:
+        return str(path).replace("\\", "/")
+
+
+def _words_of(text: str) -> set[str]:
+    """Return the lowercase word tokens of a sentence, with a naive plural stripped.
+
+    "registros" and "registro" are the same word for this purpose, and an English token that
+    happens to end in s ("pages" -> "page") is checked in both forms too; neither form is in the
+    word list, so the leniency costs nothing and the plural catch is worth it.
+    """
+    tokens: set[str] = set()
+    for raw in re.split(r"[^A-Za-z]+", text.lower()):
+        if not raw:
+            continue
+        tokens.add(raw)
+        if raw.endswith("s") and len(raw) > 3:
+            tokens.add(raw[:-1])
+    return tokens
+
+
+def _portuguese_in_text(text: str) -> list[str]:
+    """Return the pt-BR evidence in a sentence: fragment markers and whole words alike (A57).
+
+    The fragment list catches function words in running prose; the word list catches the nouns
+    and verbs an error message is actually built from. Using only the first let
+    "Contagem de registros gravados." through the source gate AND through the registration-time
+    description check, which is the surface G1 names first.
+    """
+    haystack = f" {text.lower()} "
+    found = [marker for marker in PORTUGUESE_MARKERS if marker in haystack]
+    found.extend(sorted(_words_of(text) & PORTUGUESE_WORDS))
+    return found
 
 
 def _string_constants(tree: ast.AST, *, exclude: set[int] | None = None) -> list[str]:
@@ -177,9 +187,8 @@ def test_every_public_error_has_an_en_us_docstring(name: str, symbol: type) -> N
     ("name", "symbol"), PUBLIC_ERROR_SYMBOLS, ids=[name for name, _ in PUBLIC_ERROR_SYMBOLS]
 )
 def test_every_public_error_docstring_is_free_of_portuguese(name: str, symbol: type) -> None:
-    text = f" {(symbol.__doc__ or '').lower()} "
-    for marker in PORTUGUESE_MARKERS:
-        assert marker not in text, f"{name} docstring matches the marker {marker!r}"
+    found = _portuguese_in_text(symbol.__doc__ or "")
+    assert not found, f"{name} docstring carries pt-BR {found}"
 
 
 def test_the_public_module_and_its_symbols_are_documented() -> None:
@@ -230,12 +239,13 @@ def _marker_definition_literals(tree: ast.AST, path: Path | None = None) -> set[
     if path is not None and path.resolve() != MARKER_DEFINITION_MODULE.resolve():
         return set()
     excluded: set[int] = set()
-    for node in ast.walk(tree):
+    body = tree.body if isinstance(tree, ast.Module) else []
+    for node in body:
         if not isinstance(node, (ast.Assign, ast.AnnAssign)):
             continue
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
         if not any(
-            isinstance(target, ast.Name) and target.id == MARKER_DEFINITION_NAME
+            isinstance(target, ast.Name) and target.id in MARKER_DEFINITION_NAMES
             for target in targets
         ):
             continue
@@ -251,11 +261,10 @@ def _marker_definition_literals(tree: ast.AST, path: Path | None = None) -> set[
 def test_no_string_literal_in_the_source_reads_as_portuguese(path: Path) -> None:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for literal in _string_constants(tree, exclude=_marker_definition_literals(tree, path)):
-        haystack = f" {literal.lower()} "
-        for marker in PORTUGUESE_MARKERS:
-            assert marker not in haystack, (
-                f"{_relative(path)} has a string matching the marker {marker!r}: {literal[:80]!r}"
-            )
+        found = _portuguese_in_text(literal)
+        assert not found, (
+            f"{_relative(path)} has a string carrying pt-BR {found}: {literal[:80]!r}"
+        )
 
 
 @pytest.mark.parametrize("path", SOURCE_FILES, ids=_relative)
@@ -263,7 +272,9 @@ def test_every_module_and_public_definition_is_documented(path: Path) -> None:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     assert ast.get_docstring(tree), f"{_relative(path)} has no module docstring"
     for node in ast.walk(tree):
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and not node.name.startswith("_"):
+        if isinstance(
+            node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ) and not node.name.startswith("_"):
             assert ast.get_docstring(node), (
                 f"{_relative(path)} has no docstring for {node.name} at line {node.lineno}"
             )
@@ -429,3 +440,94 @@ def test_the_word_list_carries_no_english_word_of_this_codebase() -> None:
     assert vocabulary & PORTUGUESE_WORDS == set()
     assert all(word.isascii() and word.islower() for word in PORTUGUESE_WORDS)
     assert all(len(word) >= 3 for word in PORTUGUESE_WORDS)
+
+
+def test_an_async_definition_needs_a_docstring_like_any_other() -> None:
+    # The rule used to look at FunctionDef only, so a public coroutine slipped through while the
+    # annotation and identifier rules next to it already handled both.
+    undocumented = ast.parse("async def start() -> None:\n    return None\n")
+    node = undocumented.body[0]
+    assert isinstance(node, ast.AsyncFunctionDef)
+    assert ast.get_docstring(node) is None
+
+    documented = ast.parse('async def start() -> None:\n    """Begin."""\n    return None\n')
+    assert ast.get_docstring(documented.body[0]) == "Begin."
+
+
+def test_an_undocumented_async_definition_fails_the_rule(tmp_path: Path) -> None:
+    module = tmp_path / "probe.py"
+    module.write_text(
+        '"""A module."""\n\nfrom __future__ import annotations\n\n'
+        "__all__ = [\"start\"]\n\n\n"
+        "async def start() -> None:\n    return None\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="start"):
+        test_every_module_and_public_definition_is_documented(module)
+
+
+def test_the_exemption_covers_only_a_module_level_assignment() -> None:
+    # The docstring promises one assignment; a copy inside a function used to inherit it.
+    nested = ast.parse(
+        "def build() -> tuple[str, ...]:\n"
+        '    NON_EN_US_MARKERS = ("a validacao nao ocorre.",)\n'
+        "    return NON_EN_US_MARKERS\n"
+    )
+    literals = _string_constants(
+        nested, exclude=_marker_definition_literals(nested, MARKER_DEFINITION_MODULE)
+    )
+    assert "a validacao nao ocorre." in literals
+
+
+def test_the_owning_module_declares_each_list_exactly_once() -> None:
+    tree = ast.parse(MARKER_DEFINITION_MODULE.read_text(encoding="utf-8"))
+    for name in sorted(MARKER_DEFINITION_NAMES):
+        assignments = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            if isinstance(target, ast.Name) and target.id == name
+        ]
+        assert len(assignments) == 1, name
+
+
+AUDIT_SAMPLES: tuple[str, ...] = (
+    "Contagem de registros gravados.",
+    "Erro ao validar a pagina do banco de dados.",
+    "Numero de bytes escritos no disco.",
+)
+
+
+@pytest.mark.parametrize("sample", AUDIT_SAMPLES)
+def test_an_ordinary_portuguese_message_is_caught_by_the_word_list(sample: str) -> None:
+    # A57: these three passed the literal scan AND the registration check, because the literal
+    # scan used only the 18 fragments while the 80-word list sat next door serving identifiers.
+    # They carry no fragment marker at all, so only the word half can catch them.
+    assert not [marker for marker in PORTUGUESE_MARKERS if marker in f" {sample.lower()} "]
+    assert _portuguese_in_text(sample), sample
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        "Commits refused by optimistic validation because partition sets intersect.",
+        "Total size of the write-ahead log on disk.",
+        "Records discarded by recovery, by origin class.",
+        "Pages resident in the buffer pool of this database.",
+        "Transactions currently open, by mode.",
+        "Time a durability barrier took, by target.",
+    ],
+)
+def test_an_ordinary_english_message_is_spared_by_both_halves(sample: str) -> None:
+    assert _portuguese_in_text(sample) == [], sample
+
+
+def test_the_two_halves_are_one_rule() -> None:
+    # The literal scan and the identifier scan draw on the same vocabulary, which is the whole
+    # of A57: one list, so a message and a variable name are judged by the same standard.
+    assert PORTUGUESE_WORDS is NON_EN_US_WORDS
+    assert PORTUGUESE_MARKERS is NON_EN_US_MARKERS
+    sample = "Contagem de registros gravados."
+    assert _portuguese_in_text(sample)
+    assert _portuguese_tokens("contagem_de_registros")

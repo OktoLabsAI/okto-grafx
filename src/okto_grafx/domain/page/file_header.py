@@ -18,7 +18,11 @@ import struct
 from dataclasses import dataclass
 from enum import IntEnum
 
-from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxSchemaVersionMismatch
+from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
+    GrafxCorruptionDetected,
+    GrafxSchemaVersionMismatch,
+)
 from okto_grafx.domain.ids import NO_PAGE, PageIndex, SlotId
 from okto_grafx.domain.page.layout import MAX_U32, MAX_U64, PageType, validate_page_size
 from okto_grafx.domain.page.slotted import Page
@@ -83,7 +87,21 @@ class FileHeader:
                 field="kind",
                 value=repr(self.kind),
             )
-        validate_page_size(self.page_size)
+        try:
+            validate_page_size(self.page_size)
+        except GrafxConfigurationError as failure:
+            # The page size of a file is stored IN that file, so a value the layout cannot encode
+            # is damaged bytes, not a configuration mistake. Delegating the classification along
+            # with the predicate made every door answer configuration_error for a corrupt header,
+            # and FR-8/FR-10 route quarantine off corruption_detected -- so the one state that
+            # most needs quarantining was the one state that could never reach it (D5, round 8).
+            # The predicate is still asked once, in one place: only its verdict is re-dressed.
+            raise GrafxCorruptionDetected(
+                f"The page size stored in a file header is outside what the layout can encode: "
+                f"{failure}",
+                field="page_size",
+                value=repr(self.page_size),
+            ) from failure
         for field, value, maximum in (
             ("format_version", self.format_version, 0xFFFF),
             ("root_page", self.root_page, MAX_U32),

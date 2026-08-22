@@ -18,7 +18,11 @@ from collections.abc import Callable, Iterator, Mapping
 import pytest
 
 from okto_grafx.adapters.codec_v1 import PageCodecV1
-from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxUnsupportedOperation
+from okto_grafx.domain.errors import (
+    GrafxCorruptionDetected,
+    GrafxError,
+    GrafxUnsupportedOperation,
+)
 from okto_grafx.domain.ids import PageIndex
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import ValueType
@@ -34,15 +38,26 @@ SMALL_PAGE_SIZE: int = 512
 class MemoryDevice:
     """An in-memory StorageDevice with the append-only and paged semantics of the port."""
 
-    def __init__(self, page_size: int = SMALL_PAGE_SIZE, *, name: str = "memory") -> None:
+    def __init__(
+        self,
+        page_size: int = SMALL_PAGE_SIZE,
+        *,
+        name: str = "memory",
+        trace: list[str] | None = None,
+    ) -> None:
         self._page_size = page_size
         self._name = name
+        self.trace: list[str] = [] if trace is None else trace
         self._pages: dict[str, list[bytes]] = {}
         self._logs: dict[str, bytearray] = {}
         self.read_calls: list[tuple[str, PageIndex]] = []
         self.write_calls: list[tuple[str, PageIndex]] = []
         self.barriers: list[str | None] = []
         self.page_reader: Callable[[str, PageIndex, bytes], bytes] | None = None
+        self.writes_attempted: int = 0
+        self._refuse_at_write: int | None = None
+        self._refusal: GrafxError | None = None
+        self.refused_writes: list[tuple[str, PageIndex]] = []
 
     @property
     def name(self) -> str:
@@ -106,8 +121,37 @@ class MemoryDevice:
             raise GrafxCorruptionDetected(
                 f"Refused a page write to {file!r} at {page_index}.", file=file, page=page_index
             )
+        # The one refusal route the whole C1 suite never had. LocalStorageDevice.write_page
+        # answers GrafxDeviceFull for a partial write or a full volume and GrafxStorageError for
+        # a sharing violation, and BOTH are retryable -- so this is where a caller is told to try
+        # again. Every door that writes reaches the device through here, and until this hook
+        # existed no test could put a retryable failure in front of one (D2, round 8).
+        self.writes_attempted += 1
+        if self.writes_attempted == self._refuse_at_write and self._refusal is not None:
+            self.refused_writes.append((file, page_index))
+            self._refuse_at_write = None
+            raise self._refusal
         self.write_calls.append((file, page_index))
         pages[page_index] = bytes(data)
+
+    def refuse_write_number(self, number: int, error: GrafxError) -> None:
+        """Arm one refusal for the Nth write-back this device is asked to perform.
+
+        Counting writes rather than naming a page is what makes the sweep possible: which page a
+        door writes back is an eviction decision, and a test that named one would prove the
+        property at whichever step that page happened to fall. Numbering lets a test walk the
+        refusal through EVERY step of an operation and assert the same invariant at each, which
+        is the only way to state "nothing becomes reachable before the last step that can
+        refuse" as a test rather than as a claim about one step.
+        """
+        self.writes_attempted = 0
+        self._refuse_at_write = number
+        self._refusal = error
+
+    def disarm(self) -> None:
+        """Stop refusing, which is what a caller retrying after a transient failure meets."""
+        self._refuse_at_write = None
+        self._refusal = None
 
     def raw_page(self, file: str, page_index: PageIndex) -> bytes:
         """Return the stored bytes of a page without going through the read hooks."""
@@ -135,16 +179,20 @@ class MemoryDevice:
         del log[size:]
 
     def durable_barrier(self, file: str | None = None) -> None:
+        self.trace.append("barrier")
         self.barriers.append(file)
 
 
 class RecordingMetrics:
     """A MetricsSink that keeps every registration and every emission with its labels."""
 
-    def __init__(self, *, enabled: bool = True) -> None:
+    def __init__(
+        self, *, enabled: bool = True, trace: list[str] | None = None
+    ) -> None:
         self._enabled = enabled
         self.registered: dict[str, MetricDescriptor] = {}
         self.calls: list[tuple[str, str, float, dict[str, str]]] = []
+        self.trace: list[str] = [] if trace is None else trace
 
     @property
     def enabled(self) -> bool:
@@ -171,7 +219,19 @@ class RecordingMetrics:
     def time(
         self, name: str, labels: Mapping[str, str] | None = None
     ) -> contextlib.AbstractContextManager[None]:
-        return contextlib.nullcontext()
+        return self._timed(name, dict(labels or {}))
+
+    @contextlib.contextmanager
+    def _timed(self, name: str, labels: dict[str, str]) -> Iterator[None]:
+        # The exit is recorded whatever happens inside. A real sink that only observed the happy
+        # path would never time the operation a caller most wants timed, the one that failed.
+        self.trace.append(f"time_enter:{name}")
+        self.calls.append(("time_enter", name, 0.0, labels))
+        try:
+            yield
+        finally:
+            self.trace.append(f"time_exit:{name}")
+            self.calls.append(("time_exit", name, 0.0, labels))
 
     def snapshot(self) -> Mapping[str, object]:
         return {name: descriptor.kind.value for name, descriptor in self.registered.items()}
@@ -183,6 +243,14 @@ class RecordingMetrics:
     def labels_of(self, name: str) -> list[dict[str, str]]:
         """Return the labels of every emission of that metric name, in order."""
         return [labels for _kind, emitted, _value, labels in self.calls if emitted == name]
+
+    def timed(self, name: str) -> list[dict[str, str]]:
+        """Return the labels of every completed timed block of that metric name, in order."""
+        return [
+            labels
+            for kind, emitted, _value, labels in self.calls
+            if emitted == name and kind == "time_exit"
+        ]
 
 
 class SnapshotDouble:
@@ -213,15 +281,26 @@ def make_pool(
 
 
 @pytest.fixture
-def device() -> MemoryDevice:
-    """Return a fresh in-memory device with small pages."""
-    return MemoryDevice()
+def trace() -> list[str]:
+    """Return the ordered trace the device and the metrics sink of one test both write to.
+
+    Timing a block is a claim about what happened INSIDE it. A test that only sees that a block
+    was entered and left cannot tell a barrier that was timed from one that was moved out of the
+    timer, so both parties append to one list and the test reads the order.
+    """
+    return []
 
 
 @pytest.fixture
-def metrics() -> RecordingMetrics:
-    """Return a metrics sink that records everything the engine emits."""
-    return RecordingMetrics()
+def device(trace: list[str]) -> MemoryDevice:
+    """Return a fresh in-memory device with small pages, writing into the shared trace."""
+    return MemoryDevice(trace=trace)
+
+
+@pytest.fixture
+def metrics(trace: list[str]) -> RecordingMetrics:
+    """Return a metrics sink that records everything, writing into the shared trace."""
+    return RecordingMetrics(trace=trace)
 
 
 @pytest.fixture

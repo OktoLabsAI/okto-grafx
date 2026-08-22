@@ -25,7 +25,10 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, replace
 
-from okto_grafx.domain.errors import GrafxCorruptionDetected
+from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
+    GrafxCorruptionDetected,
+)
 from okto_grafx.domain.ids import Csn, RecordId, RecordRef
 from okto_grafx.domain.model.value import Value
 
@@ -66,15 +69,23 @@ _MAX_U64 = 0xFFFFFFFFFFFFFFFF
 
 
 def _require_unsigned(field: str, value: int, maximum: int) -> int:
-    """Return the value after checking that it fits the unsigned field it is written to."""
+    """Return the value after checking that it fits the unsigned field it is written to.
+
+    This runs on the ENCODE path, so every value it sees came from a caller: a header decoded
+    from a page was unpacked by struct and cannot be out of range by construction. That makes
+    every refusal here a caller error, and it must not answer corruption_detected -- FR-8 and
+    FR-10 route truncation, quarantine and a forensic ledger entry off that code, so a typed
+    record id or an oversized commit number became an integrity incident about a database that
+    was never touched (A11-revised, D5 round 8).
+    """
     if isinstance(value, bool) or not isinstance(value, int):
-        raise GrafxCorruptionDetected(
+        raise GrafxConfigurationError(
             f"Record header field {field!r} must be an integer; got {type(value).__name__}.",
             field=field,
             value=repr(value),
         )
     if not 0 <= value <= maximum:
-        raise GrafxCorruptionDetected(
+        raise GrafxConfigurationError(
             f"Record header field {field!r} is outside its width: {value} exceeds {maximum}.",
             field=field,
             value=value,
@@ -184,7 +195,7 @@ def encode_overflow_pointer(first_page: int) -> bytes:
 
 def decode_overflow_pointer(raw: bytes, offset: int = 0) -> int:
     """Return the first overflow page recorded after the header of a record."""
-    if offset + _POINTER_STRUCT.size > len(raw):
+    if offset < 0 or offset + _POINTER_STRUCT.size > len(raw):
         raise GrafxCorruptionDetected(
             f"A record with an overflow chain needs {_POINTER_STRUCT.size} bytes for its first "
             f"page at offset {offset}; the slot holds {len(raw)}.",

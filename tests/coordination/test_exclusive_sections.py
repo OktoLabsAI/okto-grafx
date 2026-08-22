@@ -251,24 +251,28 @@ def test_a_busy_lock_file_is_retried_before_it_is_reported(
     assert clock.slept == [0.01, 0.01, 0.01]
 
 
-def test_a_lock_file_that_never_opens_times_out_as_retryable(
+def test_a_lock_file_that_never_opens_is_not_reported_as_a_busy_section(
     make_coordinator: CoordinatorFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Nobody holds the section: the file itself cannot be opened. The typed answer for that is a
+    # device failure, and the classification of the two cases lives in the regression module.
     import os
+
+    from okto_grafx.domain.errors import GrafxStorageError
 
     real_open = os.open
 
     def refuse(path, flags, mode=0o777, *, dir_fd=None):
         if str(path).endswith(".lock"):
-            raise PermissionError(32, "The process cannot access the file.")
+            raise PermissionError(13, "The process cannot access the file.")
         return real_open(path, flags, mode, dir_fd=dir_fd)
 
     clock = ManualClock(monotonic=1_000.0)
     coordinator = make_coordinator(owner_id="p1-aaaa", clock=clock, poll_interval=0.25)
     monkeypatch.setattr(os, "open", refuse)
-    with pytest.raises(GrafxLeaseTimeout) as failure:
+    with pytest.raises(GrafxStorageError) as failure:
         with coordinator.exclusive("commit", timeout=1.0):
             pass
     monkeypatch.undo()
-    assert failure.value.retryable is True
-    assert "cannot access" in str(failure.value.details["reason"])
+    assert not isinstance(failure.value, GrafxLeaseTimeout)
+    assert "cannot access" in str(failure.value.details["detail"])

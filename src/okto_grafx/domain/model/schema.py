@@ -15,8 +15,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from math import isfinite
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxCorruptionDetected
+from okto_grafx.domain.ids import RecordId
 from okto_grafx.domain.model.errors import SchemaMismatchError
 from okto_grafx.domain.model.value import (
     MAX_VECTOR_DIMENSION,
@@ -33,6 +35,13 @@ from okto_grafx.domain.ports.vectormath import DistanceMetric
 __all__ = [
     "MAX_IDENTIFIER_LENGTH",
     "TABLE_KINDS",
+    "relationship_row",
+    "relationship_columns",
+    "endpoint_column_defs",
+    "ENDPOINT_COLUMN_COUNT",
+    "ENDPOINT_COLUMNS",
+    "TARGET_COLUMN",
+    "SOURCE_COLUMN",
     "SPACE_STATES",
     "SPACE_STATE_ACTIVE",
     "SPACE_STATE_RETIRED",
@@ -49,6 +58,30 @@ MAX_IDENTIFIER_LENGTH: int = 128
 """Characters a table, column or space name may have."""
 
 TABLE_KINDS: tuple[str, ...] = ("node", "rel")
+
+SOURCE_COLUMN: str = "_from"
+"""The reserved column that carries the RecordId of the row an edge starts at."""
+
+TARGET_COLUMN: str = "_to"
+"""The reserved column that carries the RecordId of the row an edge ends at."""
+
+ENDPOINT_COLUMNS: tuple[str, str] = (SOURCE_COLUMN, TARGET_COLUMN)
+"""The two reserved columns of every relationship table, in their stored order.
+
+They are RecordIds and not RecordRefs, and that is the whole point. Section 3 calls a RecordId
+"a stable logical identity across versions", which is exactly what an endpoint needs: an edge
+must still name the same node after that node has been updated, and an update writes a NEW
+version at a new page and slot. A RecordRef names a page and a slot, and both move, so an edge
+holding one would silently come to point at whatever later occupied that slot -- or at nothing.
+
+They lead the stored tuple rather than trailing it so that their position never depends on how
+many properties the user declared: source is always value 0 and target is always value 1, in
+every relationship table of every schema version.
+"""
+
+ENDPOINT_COLUMN_COUNT: int = len(ENDPOINT_COLUMNS)
+"""How many values of a relationship tuple belong to the layout rather than to the user."""
+
 """A table describes either the nodes of a label or the relationships of a type."""
 
 SPACE_STATE_ACTIVE: str = "active"
@@ -147,7 +180,20 @@ class TableDef:
     schema_version: int = 1
 
     def __post_init__(self) -> None:
-        """Refuse a table whose shape contradicts the kind it declares."""
+        """Refuse a table whose shape contradicts the kind it declares.
+
+        A relationship table has its two endpoint columns put in front of its properties here,
+        rather than being refused for not having them. Refusing would be the stricter rule and
+        the worse one: every caller that builds a relationship table from DDL would have to
+        remember the layout, and the first one to forget would produce a table that stores edges
+        with nowhere to say what they join. Normalising makes the layout impossible to get wrong
+        and impossible to disagree about, which is what C5 and C10 need from it.
+
+        It is idempotent, so a table read back out of the catalog -- which already carries the
+        columns -- comes back unchanged.
+        """
+        if self.kind == "rel" and isinstance(self.columns, tuple):
+            object.__setattr__(self, "columns", relationship_columns(self.columns))
         if isinstance(self.table_id, bool) or not isinstance(self.table_id, int):
             raise GrafxConfigurationError(
                 f"Table {self.name!r} needs an integer table_id; got {self.table_id!r}.",
@@ -189,6 +235,41 @@ class TableDef:
                     value=column.name,
                 )
             seen.add(column.name)
+        reserved_positions = {
+            position
+            for position, column in enumerate(self.columns)
+            if column.name in ENDPOINT_COLUMNS
+        }
+        if self.kind == "rel":
+            if reserved_positions != set(range(ENDPOINT_COLUMN_COUNT)):
+                # Normalisation put them at 0 and 1, so reaching here means the caller supplied
+                # a column of a reserved NAME somewhere else -- a property called _to, three
+                # columns in. Its values would be read as an endpoint by every consumer of this
+                # layout, so it is refused rather than shadowed.
+                raise GrafxConfigurationError(
+                    f"Relationship table {self.name!r} uses a reserved endpoint column name "
+                    f"outside positions 0 and 1; {ENDPOINT_COLUMNS} are the layout's own.",
+                    field="columns",
+                    value=sorted(reserved_positions),
+                )
+            for position, column in enumerate(self.columns[:ENDPOINT_COLUMN_COUNT]):
+                expected = endpoint_column_defs()[position]
+                if column != expected:
+                    raise GrafxConfigurationError(
+                        f"Relationship table {self.name!r} declares {column.name!r} as "
+                        f"{column.type.name}"
+                        f"{'' if column.nullable else ' not null'}, but the layout stores it as "
+                        f"{expected.type.name} not null.",
+                        field="columns",
+                        value=column.name,
+                    )
+        elif reserved_positions:
+            raise GrafxConfigurationError(
+                f"Node table {self.name!r} uses {ENDPOINT_COLUMNS}, which are reserved for the "
+                f"endpoints of a relationship table.",
+                field="columns",
+                value=sorted(reserved_positions),
+            )
         if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int):
             raise GrafxConfigurationError(
                 f"Table {self.name!r} needs an integer schema_version; got "
@@ -237,8 +318,64 @@ class TableDef:
 
     @property
     def arity(self) -> int:
-        """Return the number of columns a tuple of this table must carry."""
+        """Return the number of columns a tuple of this table must carry.
+
+        For a relationship table that is the two endpoints PLUS the properties, so a caller
+        staging an edge passes relationship_row(source, target, properties) and the arity check
+        in encode_tuple catches anyone who forgot an end.
+        """
         return len(self.columns)
+
+    @property
+    def endpoint_columns(self) -> tuple[ColumnDef, ...]:
+        """Return the reserved endpoint columns, which only a relationship table has."""
+        if self.kind != "rel":
+            return ()
+        return tuple(self.columns[:ENDPOINT_COLUMN_COUNT])
+
+    @property
+    def property_columns(self) -> tuple[ColumnDef, ...]:
+        """Return the columns the user declared, without the layout's own."""
+        if self.kind != "rel":
+            return tuple(self.columns)
+        return tuple(self.columns[ENDPOINT_COLUMN_COUNT:])
+
+    def source_of(self, values: Sequence[Value]) -> RecordId:
+        """Return the row identity an edge tuple starts at."""
+        return self._endpoint_of(values, 0, SOURCE_COLUMN)
+
+    def target_of(self, values: Sequence[Value]) -> RecordId:
+        """Return the row identity an edge tuple ends at."""
+        return self._endpoint_of(values, 1, TARGET_COLUMN)
+
+    def _endpoint_of(self, values: Sequence[Value], position: int, name: str) -> RecordId:
+        """Return one endpoint of an edge tuple, refusing a tuple that cannot carry one."""
+        if self.kind != "rel":
+            raise GrafxConfigurationError(
+                f"Table {self.name!r} is a {self.kind} table and has no endpoints.",
+                field="kind",
+                value=self.kind,
+            )
+        if len(values) != self.arity:
+            raise SchemaMismatchError(
+                f"Table {self.name!r} has {self.arity} columns, but the tuple carries "
+                f"{len(values)} values.",
+                table=self.name,
+                table_id=self.table_id,
+                expected_arity=self.arity,
+                observed_arity=len(values),
+            )
+        endpoint = values[position]
+        if isinstance(endpoint, bool) or not isinstance(endpoint, int):
+            raise SchemaMismatchError(
+                f"The {name!r} endpoint of an edge in {self.name!r} must be a row identity; got "
+                f"{type(endpoint).__name__}.",
+                table=self.name,
+                table_id=self.table_id,
+                column=name,
+                value=repr(endpoint),
+            )
+        return endpoint
 
     def column(self, name: str) -> ColumnDef:
         """Return the column with that name."""
@@ -348,6 +485,13 @@ class EmbeddingSpaceDef:
                 field="created_at_wall",
                 value=repr(self.created_at_wall),
             )
+        if not isfinite(float(self.created_at_wall)):
+            raise GrafxConfigurationError(
+                f"Embedding space {self.name!r} needs a finite creation reading; got "
+                f"{self.created_at_wall!r}.",
+                field="created_at_wall",
+                value=repr(self.created_at_wall),
+            )
         object.__setattr__(self, "created_at_wall", float(self.created_at_wall))
 
     @property
@@ -391,6 +535,55 @@ def _check_column_value(table: TableDef, position: int, column: ColumnDef, value
             position,
             f"a {observed.name} value cannot be stored in a {column.type.name} column.",
         )
+
+
+def endpoint_column_defs() -> tuple[ColumnDef, ColumnDef]:
+    """Return the two reserved endpoint columns, exactly as a relationship table stores them.
+
+    INT64 because section 7.1 fixes the value taxonomy and INT64 is the only 64-bit integer in
+    it. That makes the reachable endpoint space 1..INT64_MAX rather than the allocator's full
+    unsigned range; the difference begins at 2**63 rows in one table, which is past the point at
+    which the counter's own exhausted marker becomes reachable, and HeapStore refuses an endpoint
+    outside it by name rather than letting a raw struct error out (A41).
+
+    Not nullable: an edge with no source is not an edge. The refusal for a null endpoint is
+    therefore the ordinary column refusal, raised while the tuple is being encoded -- which is
+    before anything is pinned, staged or made reachable.
+    """
+    return (
+        ColumnDef(name=SOURCE_COLUMN, type=ValueType.INT64, nullable=False),
+        ColumnDef(name=TARGET_COLUMN, type=ValueType.INT64, nullable=False),
+    )
+
+
+def relationship_columns(properties: Sequence[ColumnDef]) -> tuple[ColumnDef, ...]:
+    """Return the full column tuple of a relationship table: the endpoints, then the properties.
+
+    Idempotent, so a caller may pass a tuple that already carries them -- which is what a table
+    read back out of the catalog does.
+    """
+    columns = tuple(properties)
+    if _leads_with_endpoints(columns):
+        return columns
+    return (*endpoint_column_defs(), *columns)
+
+
+def relationship_row(
+    source: RecordId, target: RecordId, properties: Sequence[Value]
+) -> tuple[Value, ...]:
+    """Return the stored tuple of one edge: source, target, then the user's property values.
+
+    The one place the order is written down for callers. C5 stages the result like any other row
+    and C10 encodes against it, and neither has to remember which end comes first.
+    """
+    return (source, target, *tuple(properties))
+
+
+def _leads_with_endpoints(columns: Sequence[ColumnDef]) -> bool:
+    """Return True when these columns already start with the reserved endpoint pair."""
+    if len(columns) < ENDPOINT_COLUMN_COUNT:
+        return False
+    return tuple(column.name for column in columns[:ENDPOINT_COLUMN_COUNT]) == ENDPOINT_COLUMNS
 
 
 def encode_tuple(table: TableDef, values: Sequence[Value]) -> bytes:

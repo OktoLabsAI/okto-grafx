@@ -15,11 +15,18 @@ import math
 
 import pytest
 
-from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxVectorValidationError
+from okto_grafx.domain.errors import (
+    GrafxCorruptionDetected,
+    GrafxError,
+    GrafxVectorValidationError,
+)
 from okto_grafx.domain.model.errors import SchemaMismatchError
 from okto_grafx.domain.model.value import (
+    FLOAT32_OVERFLOW_THRESHOLD,
     INT64_MAX,
     INT64_MIN,
+    MAX_FLOAT32,
+    MAX_VALUE_DEPTH,
     MAX_VECTOR_DIMENSION,
     Timestamp,
     Uuid,
@@ -45,7 +52,7 @@ ROUND_TRIP_CASES: tuple[tuple[str, object], ...] = (
     ("negative zero", -0.0),
     ("empty string", ""),
     ("string", "Ada Lovelace"),
-    ("unicode string", "graphs → vectors"),
+    ("unicode string", "graphs \u2192 vectors"),
     ("long string", "x" * 70000),
     ("empty bytes", b""),
     ("bytes", bytes(range(256))),
@@ -348,3 +355,344 @@ def test_an_identifier_survives_a_round_trip_through_bytes() -> None:
     decoded, _offset = decode_value(encode_value(identifier))
     assert decoded == identifier
     assert decoded.raw == identifier.raw
+
+
+def test_a_string_with_no_utf8_encoding_is_refused_as_a_grafx_error() -> None:
+    # A lone surrogate arrives from a lenient decoder, never from a keyboard: json.loads of an
+    # escaped surrogate, or bytes.decode with errors set to surrogateescape. It must not leave
+    # the write path as a raw UnicodeEncodeError (CONTRACT.md section 11 item 5).
+    import json
+
+    for text in (
+        "\ud800",
+        json.loads('"\ud800"'),
+        b"caf\xe9".decode("utf-8", errors="surrogateescape"),
+        "prefix\udfffsuffix",
+    ):
+        with pytest.raises(SchemaMismatchError) as raised:
+            encode_value(text)
+        assert raised.value.code == "schema_mismatch"
+        assert "position" in raised.value.details
+
+
+def test_a_surrogate_inside_a_container_is_refused_the_same_way() -> None:
+    with pytest.raises(SchemaMismatchError):
+        encode_value(("ok", "\ud800"))
+    with pytest.raises(SchemaMismatchError):
+        encode_value({"key": "\ud800"})
+    with pytest.raises(SchemaMismatchError):
+        encode_value({"\ud800": "value"})
+
+
+def test_every_other_string_still_encodes() -> None:
+    for text in ("", "ascii", "graphs and vectors", "\u00e9\u4e2d\U0001f600"):
+        decoded, _offset = decode_value(encode_value(text))
+        assert decoded == text
+
+
+# --- a component the target dtype cannot hold ---------------------------------------------------
+
+
+def test_a_component_too_large_for_a_float32_space_is_refused() -> None:
+    # A float32 space is the default dtype (SPEC-VEC TR-4), and a finite double far above the
+    # float32 range passes every other guard: it is not NaN, not an infinity and not out of
+    # dimension. It would become an infinity on the page, which is exactly what BR-5 forbids,
+    # and packing it raises a bare OverflowError from struct if nothing checks first.
+    for component in (1e300, -1e39, 1e39, 3.5e38):
+        with pytest.raises(GrafxVectorValidationError) as raised:
+            encode_value(VectorValue((1.0, component), space_ref=1))
+        assert raised.value.details["position"] == 1
+        assert raised.value.details["dtype"] == "float32"
+        assert raised.value.retryable is False
+
+
+def test_the_same_component_is_fine_in_a_float64_space() -> None:
+    vector = VectorValue((1e300, -1e39), space_ref=1, dtype="float64")
+    decoded, _offset = decode_value(encode_value(vector))
+    assert decoded.values == (1e300, -1e39)
+
+
+def test_the_float32_boundary_is_exactly_where_struct_puts_it() -> None:
+    # The limit is derived rather than guessed, so it is checked against the packer itself.
+    import struct
+
+    for candidate, packs in (
+        (MAX_FLOAT32, True),
+        (math.nextafter(FLOAT32_OVERFLOW_THRESHOLD, 0.0), True),
+        (FLOAT32_OVERFLOW_THRESHOLD, False),
+        (math.nextafter(FLOAT32_OVERFLOW_THRESHOLD, math.inf), False),
+    ):
+        for value in (candidate, -candidate):
+            packed = True
+            try:
+                struct.pack("<f", value)
+            except OverflowError:
+                packed = False
+            assert packed is packs, value
+            accepted = True
+            try:
+                encode_value(VectorValue((value,), space_ref=1))
+            except GrafxVectorValidationError:
+                accepted = False
+            assert accepted is packs, value
+
+
+def test_a_vector_at_the_float32_maximum_still_round_trips() -> None:
+    decoded, _offset = decode_value(encode_value(VectorValue((MAX_FLOAT32,), space_ref=1)))
+    assert decoded.values == (MAX_FLOAT32,)
+
+
+def test_a_row_with_an_unstorable_vector_component_never_reaches_a_page() -> None:
+    from okto_grafx.domain.model.schema import ColumnDef, TableDef, encode_tuple
+
+    table = TableDef(
+        table_id=1,
+        name="Chunk",
+        kind="node",
+        columns=(ColumnDef(name="embedding", type=ValueType.VECTOR_F32, vector_space="small"),),
+    )
+    with pytest.raises(GrafxVectorValidationError):
+        encode_tuple(table, (VectorValue((1e300,), space_ref=1),))
+
+
+# --- what this module does NOT check, stated so C9 can rely on it -------------------------------
+
+
+def test_the_declared_dimension_of_a_space_is_not_checked_here() -> None:
+    """A vector value carries no knowledge of the space it claims to belong to.
+
+    The space really is declared here, with a dimension of four, and a table column really does
+    point at it: that is the whole point, because the mismatch has to be built out of the real
+    objects to show that nothing on this path can see it. VEC FR-1 assigns the check to the
+    vector engine of C9. The test exists so the boundary is a decision on record rather than an
+    oversight, and so a docstring here can never quietly claim it.
+    """
+    from okto_grafx.domain.model.catalog import Catalog
+    from okto_grafx.domain.model.schema import (
+        ColumnDef,
+        EmbeddingSpaceDef,
+        TableDef,
+        decode_tuple,
+        encode_tuple,
+    )
+    from okto_grafx.domain.ports.vectormath import DistanceMetric
+
+    catalog = Catalog()
+    space = catalog.add_space(
+        EmbeddingSpaceDef(
+            space_id=1,
+            name="four_dimensional",
+            dimension=4,
+            metric=DistanceMetric.COSINE,
+            normalized=False,
+        )
+    )
+    table = catalog.add_table(
+        TableDef(
+            table_id=1,
+            name="Chunk",
+            kind="node",
+            columns=(
+                ColumnDef(
+                    name="embedding",
+                    type=ValueType.VECTOR_F32,
+                    vector_space="four_dimensional",
+                ),
+            ),
+        )
+    )
+    assert space.dimension == 4
+    assert catalog.space(str(table.column("embedding").vector_space)).dimension == 4
+
+    wrong_width = VectorValue((1.0, 2.0, 3.0), space_ref=space.space_id)
+    payload = encode_tuple(table, (wrong_width,))
+    restored = decode_tuple(table, payload)[0]
+    assert restored.dimension == 3, "three components stored against a four-dimensional space"
+    assert restored.space_ref == space.space_id
+
+
+def test_the_module_never_claims_to_check_the_space() -> None:
+    from okto_grafx.domain.model import value as module
+
+    for text in (module.__doc__ or "", encode_value.__doc__ or ""):
+        lowered = " ".join(text.lower().split())
+        assert "validated here and nowhere else" not in lowered
+        assert "cannot" in lowered or "not here" in lowered
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "the dimension is at least one",
+        "MAX_VECTOR_DIMENSION",
+        "space reference",
+        "finite",
+        "storage dtype",
+    ],
+)
+def test_the_module_says_exactly_what_it_does_check(claim: str) -> None:
+    from okto_grafx.domain.model import value as module
+
+    assert claim.lower() in " ".join((module.__doc__ or "").lower().split())
+
+
+# --- the nesting budget --------------------------------------------------------------------------
+
+
+def test_a_payload_of_nothing_but_container_tags_is_corruption_not_a_crash() -> None:
+    """A few kilobytes of list tags unwind into thousands of nested calls.
+
+    The interpreter answers that with a RecursionError, which is not a GrafxError, carries no
+    location, and would leave C6 unable to classify the payload as a corruption incident at all
+    (CONTRACT.md section 11 item 5).
+    """
+    blob = (bytes([int(ValueType.LIST)]) + (1).to_bytes(4, "little")) * 2000 + b"\x00"
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        decode_value(blob)
+    assert raised.value.details["limit"] == MAX_VALUE_DEPTH
+    assert "offset" in raised.value.details
+    assert isinstance(raised.value, GrafxError)
+
+
+def test_a_map_nested_past_the_budget_is_corruption_too() -> None:
+    tag = bytes([int(ValueType.MAP)]) + (1).to_bytes(4, "little")
+    blob = tag * 2000 + b"\x00"
+    with pytest.raises(GrafxCorruptionDetected):
+        decode_value(blob)
+
+
+def test_nesting_up_to_the_budget_still_round_trips() -> None:
+    value: object = 7
+    for _ in range(MAX_VALUE_DEPTH - 1):
+        value = (value,)
+    decoded, _offset = decode_value(encode_value(value))
+    assert decoded == value
+
+
+def test_encoding_past_the_budget_is_refused_before_the_interpreter_gives_out() -> None:
+    value: object = 7
+    for _ in range(1500):
+        value = (value,)
+    with pytest.raises(SchemaMismatchError) as raised:
+        encode_value(value)
+    assert raised.value.details["limit"] == MAX_VALUE_DEPTH
+    assert isinstance(raised.value, GrafxError)
+
+
+def test_a_deeply_nested_map_key_is_refused_on_the_encode_side() -> None:
+    key: object = 7
+    for _ in range(1500):
+        key = (key,)
+    with pytest.raises(SchemaMismatchError):
+        encode_value({key: "value"})
+
+
+def test_a_corrupt_record_payload_surfaces_as_corruption_through_the_heap() -> None:
+    # The read door of the heap, not just the value decoder: only a Grafx error may leave it.
+    from okto_grafx.domain.model.schema import ColumnDef, TableDef
+
+    from .conftest import MemoryDevice, RecordingMetrics, make_pool
+    from okto_grafx.engine.catalog_store import CatalogStore
+    from okto_grafx.engine.heap_store import HeapStore
+
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    catalog = CatalogStore(pool)
+    catalog.bootstrap()
+    table = TableDef(
+        table_id=1,
+        name="Blob",
+        kind="node",
+        columns=(ColumnDef(name="body", type=ValueType.LIST),),
+    )
+    catalog.catalog.add_table(table)
+    catalog.save()
+    heap = HeapStore(pool, catalog)
+    heap.bootstrap()
+    ref = heap.insert(table, 1, ((1, 2, 3),), xmin=5)
+
+    nested = (bytes([int(ValueType.LIST)]) + (1).to_bytes(4, "little")) * 70 + b"\x00"
+    with pool.pinned(heap.file, ref.page) as page:
+        content = bytearray(page.read_slot(ref.slot))
+        header = content[:40]
+        header[4:8] = len(nested).to_bytes(4, "little")
+        page.update_slot(ref.slot, bytes(header) + nested)
+    with pytest.raises(GrafxCorruptionDetected):
+        heap.read(ref)
+
+
+@pytest.mark.parametrize("component", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_component_is_refused_in_a_double_precision_space(
+    component: float,
+) -> None:
+    # The float32 range check happens to reject non-finite values as a side effect, so the
+    # finiteness rule was only ever exercised through single precision. A float64 space has no
+    # range to fall back on: without the explicit check a NaN is packed and persisted, which is
+    # exactly what SPEC-VEC BR-5 forbids.
+    vector = VectorValue((1.0, component, 3.0), space_ref=1, dtype="float64")
+    with pytest.raises(GrafxVectorValidationError) as raised:
+        encode_value(vector)
+    assert raised.value.details["position"] == 1
+    assert raised.value.details["field"] == "values"
+
+
+def test_a_double_precision_vector_of_finite_components_still_encodes() -> None:
+    vector = VectorValue((1e300, -1e300, 0.0), space_ref=1, dtype="float64")
+    decoded, _offset = decode_value(encode_value(vector))
+    assert decoded.values == (1e300, -1e300, 0.0)
+
+
+# --- boundaries, not distant approximations -------------------------------------------------------
+
+
+def nested(depth: int) -> object:
+    """Return a list nested exactly that many levels deep."""
+    value: object = 7
+    for _ in range(depth):
+        value = (value,)
+    return value
+
+
+def test_the_nesting_budget_accepts_exactly_the_depth_it_allows() -> None:
+    # A test that stops well short of the boundary cannot tell 64 from 63 or from 6400, so it
+    # cannot see the budget move. These two sit on either side of it.
+    value = nested(MAX_VALUE_DEPTH)
+    decoded, _offset = decode_value(encode_value(value))
+    assert decoded == value
+
+
+def test_the_nesting_budget_refuses_exactly_one_level_past_it() -> None:
+    with pytest.raises(SchemaMismatchError) as raised:
+        encode_value(nested(MAX_VALUE_DEPTH + 1))
+    assert raised.value.details["limit"] == MAX_VALUE_DEPTH
+
+
+def test_the_decoder_accepts_the_deepest_payload_an_encoder_could_write() -> None:
+    payload = encode_value(nested(MAX_VALUE_DEPTH))
+    decoded, offset = decode_value(payload)
+    assert offset == len(payload)
+    assert decoded == nested(MAX_VALUE_DEPTH)
+
+
+def test_the_decoder_refuses_a_payload_one_level_deeper_than_that() -> None:
+    # Built by hand, because the encoder will not produce it: one more list tag than the budget.
+    payload = (
+        (bytes([int(ValueType.LIST)]) + (1).to_bytes(4, "little")) * (MAX_VALUE_DEPTH + 2)
+        + bytes([int(ValueType.INT64)])
+        + (7).to_bytes(8, "little", signed=True)
+    )
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        decode_value(payload)
+    assert raised.value.details["limit"] == MAX_VALUE_DEPTH
+
+
+def test_a_negative_offset_never_decodes_from_the_end_of_the_buffer() -> None:
+    # Without the lower bound a negative offset indexes backwards from the end and decodes
+    # whatever happens to be there, which is a wrong answer rather than an error.
+    payload = encode_value("abcdef")
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        decode_value(payload, -len(payload))
+    assert raised.value.details["offset"] == -len(payload)
+    for offset in (-1, -100):
+        with pytest.raises(GrafxCorruptionDetected):
+            decode_value(payload, offset)

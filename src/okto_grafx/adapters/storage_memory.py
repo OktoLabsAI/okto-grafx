@@ -19,11 +19,10 @@ import threading
 from types import TracebackType
 
 from okto_grafx.adapters.storage_local import (
-    DEFAULT_PAGE_SIZE,
     as_payload,
     find_case_conflict,
     normalize_logical_name,
-    refuse_missing_barrier,
+    barrier_failure_from,
     refuse_missing_file,
     refuse_not_a_directory,
     refuse_not_a_file,
@@ -32,11 +31,15 @@ from okto_grafx.adapters.storage_local import (
     refuse_page_payload,
     refuse_unaligned_file,
     validate_allocation,
-    validate_page_size,
     validate_read_range,
 )
-from okto_grafx.domain.errors import GrafxDeviceFull
+from okto_grafx.domain.errors import (
+    GrafxDeviceFull,
+    GrafxDurabilityBarrierFailed,
+    GrafxError,
+)
 from okto_grafx.domain.ids import PageIndex
+from okto_grafx.domain.page import DEFAULT_PAGE_SIZE, validate_page_size
 
 __all__ = ["MemoryStorageDevice"]
 
@@ -49,6 +52,7 @@ class MemoryStorageDevice:
         self._page_size = validate_page_size(page_size)
         self._capacity = _validate_capacity(capacity_bytes)
         self._files: dict[str, bytearray] = {}
+        self._directories: set[str] = set()
         self._lock = threading.RLock()
         self._closed = False
 
@@ -95,9 +99,9 @@ class MemoryStorageDevice:
                     )
                 return
             self._require_directory_parents(name)
-            if self._entries_at(f"{name}/"):
-                raise refuse_not_a_file(name)
+            self._require_not_a_directory(name)
             self._files[name] = bytearray()
+            self._remember_directories(name)
 
     def remove(self, file: str) -> None:
         """Delete the named file. Removing a file the device does not hold is a failure."""
@@ -110,12 +114,12 @@ class MemoryStorageDevice:
 
     def list_files(self, prefix: str = "") -> tuple[str, ...]:
         """Return every logical name starting with the prefix, sorted."""
+        if not isinstance(prefix, str):
+            raise refuse_operation(
+                "not_a_string", f"A name prefix must be a string, got {type(prefix).__name__}."
+            )
         with self._lock:
             self._require_open()
-            if not isinstance(prefix, str):
-                raise refuse_operation(
-                    "not_a_string", f"A name prefix must be a string, got {type(prefix).__name__}."
-                )
             return tuple(sorted(name for name in self._files if name.startswith(prefix)))
 
     def file_size(self, file: str) -> int:
@@ -139,7 +143,9 @@ class MemoryStorageDevice:
             # name only by case is not, which is what this resolution refuses.
             self._resolve_identity(target_name)
             self._require_directory_parents(target_name)
+            self._require_not_a_directory(target_name)
             self._files[target_name] = self._files.pop(source_name)
+            self._remember_directories(target_name)
 
     def recycle(self, file: str) -> bool:
         """Release a file. No handle can hold a name here, so the space is always reclaimed."""
@@ -251,14 +257,24 @@ class MemoryStorageDevice:
     # --- durability ---------------------------------------------------------------------
 
     def durable_barrier(self, file: str | None = None) -> None:
-        """Prove the named file exists. There is no stable storage behind this device to flush."""
+        """Prove the named file exists. There is no stable storage behind this device to flush.
+
+        A28: like the local device, every failure of this door is a GrafxDurabilityBarrierFailed
+        carrying the classification in its details, so a caller cannot tell the two families
+        apart by the type it has to count.
+        """
         with self._lock:
-            self._require_open()
-            if file is None:
-                return
-            name = normalize_logical_name(file)
-            if not self._resolve_identity(name):
-                raise refuse_missing_barrier(name)
+            try:
+                self._require_open()
+                if file is None:
+                    return
+                name = normalize_logical_name(file)
+                if not self._resolve_identity(name):
+                    raise refuse_missing_file(name, "open")
+            except GrafxDurabilityBarrierFailed:
+                raise
+            except GrafxError as failure:
+                raise barrier_failure_from(failure) from failure
 
     # --- lifecycle ----------------------------------------------------------------------
 
@@ -293,12 +309,31 @@ class MemoryStorageDevice:
             raise refuse_operation("device_closed", "This storage device is closed.")
 
     def _entries_at(self, prefix: str) -> tuple[str, ...]:
-        """Return every name that directly follows the prefix in the stored namespace."""
+        """Return every name that directly follows the prefix in the stored namespace.
+
+        Directories are part of the answer even when they hold no file any more: a real
+        directory outlives the files that were created in it, so the twin keeps it too and both
+        devices go on refusing a name that differs from it only by case.
+        """
         entries: set[str] = set()
         for stored in self._files:
             if stored.startswith(prefix):
                 entries.add(stored[len(prefix) :].split("/", 1)[0])
+        for directory in self._directories:
+            if directory.startswith(prefix) and len(directory) > len(prefix):
+                entries.add(directory[len(prefix) :].split("/", 1)[0])
         return tuple(sorted(entries))
+
+    def _remember_directories(self, name: str) -> None:
+        """Keep every directory a name implies, the way a file system keeps a real directory."""
+        segments = name.split("/")[:-1]
+        for depth in range(1, len(segments) + 1):
+            self._directories.add("/".join(segments[:depth]))
+
+    def _require_not_a_directory(self, name: str) -> None:
+        """Refuse a name that already denotes a directory of this namespace."""
+        if name in self._directories:
+            raise refuse_not_a_file(name)
 
     def _resolve_identity(self, name: str) -> bool:
         """Return True when the exact name exists; refuse a stored name that differs only by case.

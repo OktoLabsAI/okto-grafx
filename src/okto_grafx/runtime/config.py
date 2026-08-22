@@ -29,19 +29,20 @@ __all__ = [
     "DatabaseConfig",
 ]
 
-MIN_PAGE_SIZE: int = 512
-"""Smallest page a database may be configured with (amendment A20).
+MIN_PAGE_SIZE: int = CORE_MIN_PAGE_SIZE
+"""Smallest page a database may be configured with, owned by the storage core (A20, A24).
 
-The storage core accepts smaller pages, but a database page that small cannot hold its 32-byte
-header and a useful payload, so the configuration is deliberately stricter than the format.
+Derived, never repeated: a page below this size cannot hold its 32-byte header and a useful
+payload, and the component that has to lay the page out is the one that knows it.
 """
 
 MAX_PAGE_SIZE: int = CORE_MAX_PAGE_SIZE
-"""Largest page a database may be configured with, owned by the storage core (amendment A20).
+"""Largest page a database may be configured with, owned by the storage core (A20, A24).
 
-The bound is imported rather than repeated: ``free_start`` and ``free_end`` are 16-bit fields,
-so a 65536-byte page could not address its own tail, and a configuration that accepted one would
-be refused later by the very component that has to write it.
+Derived for the same reason as the floor: ``free_start`` and ``free_end`` are 16-bit fields, so
+a 65536-byte page could not address its own tail. Two same-named constants that agree today are
+a divergence waiting for someone to edit one of them, which is why both bounds and the validator
+have exactly one definition, in :mod:`okto_grafx.domain.page`.
 """
 
 MAX_PARTITIONS_PER_TABLE: int = 65535
@@ -55,6 +56,19 @@ METRICS_SINKS: frozenset[str] = frozenset({"noop", "openmetrics", "json"})
 
 VECTOR_MATH_SELECTORS: frozenset[str] = frozenset({"auto", "pure", "numpy"})
 """Which vector math adapter to bind: detect, force the pure oracle, or force the accelerator."""
+
+CHECKSUM_SELECTORS: frozenset[str] = frozenset({"auto", "pure", "native"})
+"""Which CRC-32C implementation to install: detect, force the reference, or force the accelerator.
+
+``"auto"`` accelerates when a provider is installed, and that is the OPPOSITE of what
+``vector_math`` does with the same word. The difference is not a matter of taste: two vector math
+adapters agree only to a stated tolerance, so binding whichever happened to be present would make
+the ranking of a query depend on the machine. A checksum has no tolerance -- ``install_crc32c``
+replays the acceptance corpus against ``crc32c_reference`` and REFUSES a candidate that disagrees
+on any input, before it is installed -- so the bytes on disk are the same whichever is running,
+and the only thing the selector changes is how long they take to compute.
+"""
+
 
 MEMORY_PATH: str = ":memory:"
 """The path that selects the in-memory storage device with identical transactional semantics."""
@@ -128,6 +142,7 @@ class DatabaseConfig:
     metrics: str = "noop"
     metrics_destination: str | None = None
     vector_math: str = "auto"
+    checksum: str = "auto"
     vector_exact_scan_threshold: int = 4096
     vector_recall_target: float = 0.90
     read_only: bool = False
@@ -189,6 +204,7 @@ class DatabaseConfig:
         _require_choice("recovery_policy", self.recovery_policy, RECOVERY_POLICIES)
         _require_choice("metrics", self.metrics, METRICS_SINKS)
         _require_choice("vector_math", self.vector_math, VECTOR_MATH_SELECTORS)
+        _require_choice("checksum", self.checksum, CHECKSUM_SELECTORS)
         self._validate_metrics_destination()
 
         if not isinstance(self.read_only, bool):

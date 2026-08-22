@@ -15,6 +15,7 @@ from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxLeaseStolen,
     GrafxLeaseTimeout,
+    GrafxStorageError,
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ports.coordination import Lease, ProcessCoordinator, ReaderHandle
@@ -153,7 +154,7 @@ def test_no_live_reader_does_not_mean_recycle_everything() -> None:
     # The trap BR-10 names: with no reader the horizon is the checkpoint, never the end of the
     # log, and certainly never "whatever is there".
     assert recyclable_horizon(None, 900) == 900
-    assert recyclable_horizon(None, 900) != 0
+    assert recyclable_horizon(None, 0) == 0
 
 
 def test_a_reader_behind_the_checkpoint_decides_the_horizon() -> None:
@@ -271,7 +272,7 @@ def test_a_released_guard_refuses_to_be_used_again() -> None:
     with pytest.raises(GrafxUnsupportedOperation):
         guard.validate()
     with pytest.raises(GrafxUnsupportedOperation):
-        guard.renew()
+        guard.renew(200.0)
 
 
 def test_the_guard_reports_the_failure_to_acquire() -> None:
@@ -351,3 +352,49 @@ def test_the_horizon_of_several_registrations_is_the_minimum() -> None:
     assert recyclable_horizon(coordinator.reader_horizon(), 5_000) == 900
     first.close()
     assert recyclable_horizon(coordinator.reader_horizon(), 5_000) == 5_000
+
+
+# --- the closing path never masks the failure it is unwinding ---------------------------------
+
+
+class BrittleCoordinator(SpyCoordinator):
+    """A coordinator whose control plane has become unreachable at exactly the wrong moment."""
+
+    def release_lease(self, lease: Lease) -> None:
+        """Fail the way a device does when the control file cannot be written."""
+        self.calls.append(("release", lease.epoch))
+        raise GrafxStorageError("The control plane is unreachable.", attempts=5)
+
+    def unregister_reader(self, handle: ReaderHandle) -> None:
+        """Fail the same way for a reader registration."""
+        self.calls.append(("unregister", handle.reader_id))
+        raise GrafxStorageError("The control plane is unreachable.", attempts=5)
+
+
+def test_the_guard_does_not_mask_the_exception_it_is_unwinding() -> None:
+    coordinator = BrittleCoordinator()
+    with pytest.raises(RuntimeError, match="the work failed"):
+        with LeaseGuard.acquire(coordinator, timeout=1.0):
+            raise RuntimeError("the work failed")
+    assert [call for call in coordinator.calls if call[0] == "release"] == [("release", 4)]
+
+
+def test_the_guard_reports_a_release_failure_of_a_clean_block() -> None:
+    coordinator = BrittleCoordinator()
+    with pytest.raises(GrafxStorageError):
+        with LeaseGuard.acquire(coordinator, timeout=1.0):
+            pass
+
+
+def test_the_registration_does_not_mask_the_exception_it_is_unwinding() -> None:
+    coordinator = BrittleCoordinator()
+    with pytest.raises(RuntimeError, match="the read failed"):
+        with ReaderRegistration.open(coordinator, 5):
+            raise RuntimeError("the read failed")
+
+
+def test_the_registration_reports_a_close_failure_of_a_clean_block() -> None:
+    coordinator = BrittleCoordinator()
+    with pytest.raises(GrafxStorageError):
+        with ReaderRegistration.open(coordinator, 5):
+            pass

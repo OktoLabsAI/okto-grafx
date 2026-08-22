@@ -19,7 +19,11 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from okto_grafx.domain.errors import GrafxCorruptionDetected
+from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
+    GrafxCorruptionDetected,
+    GrafxUnsupportedOperation,
+)
 from okto_grafx.domain.ids import NO_LSN, NO_PAGE, PageIndex, SlotId
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.page.errors import PageFullError
@@ -82,7 +86,7 @@ class Page:
         """Build an empty page of the given type and size."""
         self._page_size: int = validate_page_size(page_size)
         self._page_index: PageIndex = _check_unsigned("page_index", page_index, MAX_U32)
-        self._page_type: int = _check_unsigned("page_type", int(page_type), MAX_U16)
+        self._page_type: int = int(_check_unsigned("page_type", page_type, MAX_U16))
         self._flags: int = _check_unsigned("flags", flags, MAX_U16)
         self._page_lsn: int = _check_unsigned("page_lsn", page_lsn, MAX_U64)
         self._seq: int = _check_unsigned("seq", seq, MAX_U32)
@@ -122,7 +126,7 @@ class Page:
     @page_type.setter
     def page_type(self, value: int) -> None:
         """Change the kind of content this page carries and mark it dirty."""
-        self._page_type = _check_unsigned("page_type", int(value), MAX_U16)
+        self._page_type = int(_check_unsigned("page_type", value, MAX_U16))
         self._dirty = True
 
     @property
@@ -237,20 +241,11 @@ class Page:
         different record.
         """
         content = _as_bytes("payload", payload)
-        if len(content) > MAX_U16:
-            raise PageFullError(
-                f"A slot payload may not exceed {MAX_U16} bytes; got {len(content)}.",
-                requested=len(content),
-                available=self.free_space(),
-                page=self._page_index,
-            )
-        if len(self._slots) >= MAX_U16:
-            raise PageFullError(
-                f"A page may hold at most {MAX_U16} slots; page {self._page_index} is full.",
-                requested=len(content),
-                available=self.free_space(),
-                page=self._page_index,
-            )
+        # There is deliberately no check that the payload or the slot count fits its 16-bit
+        # field. The largest legal page is MAX_PAGE_SIZE, so a payload can never reach 65535
+        # bytes and a directory can never reach 65535 entries: can_fit refuses first, in every
+        # case, on every accepted page size. A branch no input can reach is not a guard, it is
+        # dead code that no test could defend (A31).
         if not self.can_fit(len(content)):
             # The directory grows by one entry, so the payload area loses those bytes too.
             capacity = self.compactable_space() - SLOT_ENTRY_SIZE
@@ -294,14 +289,6 @@ class Page:
         """
         offset, length = self._entry(slot)
         content = _as_bytes("payload", payload)
-        if len(content) > MAX_U16:
-            raise PageFullError(
-                f"A slot payload may not exceed {MAX_U16} bytes; got {len(content)}.",
-                requested=len(content),
-                available=self.free_space(),
-                page=self._page_index,
-                slot=slot,
-            )
         if len(content) <= length:
             self._data[offset : offset + len(content)] = content
             # Zero the tail that the shorter payload no longer covers, so the encoded image
@@ -384,6 +371,29 @@ class Page:
             self._dirty = True
         return reclaimed
 
+    def is_pristine(self) -> bool:
+        """Return True when nothing has ever been placed on this page.
+
+        A page the device allocated and nobody wrote decodes to exactly this shape: free, no
+        slots, the payload area untouched, no chain, no log position and no flags. Anything else
+        that merely happens to have no live slot has been written to, and a caller that reserves
+        or reinitialises a page must be able to tell the two apart, because one is absence and
+        the other is damage. A page carrying a page_lsn has had a log record applied to it, which
+        is the loudest possible statement that it is not untouched.
+
+        The write counter is deliberately not part of the question. A page the pool allocated and
+        flushed carries seq 2 while holding nothing at all, and refusing to reserve that page
+        would wedge exactly the recovery-grown file this predicate exists to repair.
+        """
+        return (
+            self._page_type == int(PageType.FREE)
+            and not self._slots
+            and self._free_start == PAGE_HEADER_SIZE
+            and self._next_page == NO_PAGE
+            and self._page_lsn == NO_LSN
+            and self._flags == 0
+        )
+
     def clear(self) -> None:
         """Drop every slot and every payload byte, keeping the header fields."""
         self._slots = []
@@ -438,7 +448,7 @@ class Page:
         raw: bytes,
         *,
         page_size: int | None = None,
-        page_index: PageIndex = 0,
+        page_index: PageIndex | None = None,
         verify: bool = True,
     ) -> Page:
         """Parse a page image, checking its structure and, when asked, its checksum.
@@ -447,31 +457,43 @@ class Page:
         directory whose entries leave the payload area or overlap one another, describes bytes
         that cannot be interpreted at all, and reading them as if they made sense is how a
         corruption becomes a wrong answer instead of an error.
+
+        The page index is optional because the codec port carries none: only the buffer pool
+        that issued the read knows where the bytes came from. Without it these failures say
+        nothing about which page it was, rather than claiming page zero, and the caller that
+        does know the location names it in the error it raises in turn.
         """
-        size = validate_page_size(len(raw) if page_size is None else page_size)
-        if len(raw) != size:
-            raise GrafxCorruptionDetected(
-                f"A page image must be exactly {size} bytes; got {len(raw)}.",
-                field="page_image",
-                value=len(raw),
-                page=page_index,
-            )
+        located = _location(page_index)
+        if page_size is None:
+            # With no size declared, the image defines it, so there is nothing to compare it
+            # against: validate_page_size is the whole check, and it refuses a length that is not
+            # a legal page size at all.
+            size = validate_page_size(len(raw))
+        else:
+            size = validate_page_size(page_size)
+            if len(raw) != size:
+                raise GrafxCorruptionDetected(
+                    f"A page image must be exactly {size} bytes; got {len(raw)}.",
+                    field="page_image",
+                    value=len(raw),
+                    **located,
+                )
         header = PageHeader.decode(raw)
         if verify:
             expected = crc32c(bytes(raw[CHECKSUM_SIZE:size]))
             if expected != header.checksum:
                 raise GrafxCorruptionDetected(
-                    f"Page {page_index} failed its checksum: stored 0x{header.checksum:08x}, "
-                    f"computed 0x{expected:08x}.",
+                    f"{_subject(page_index)} failed its checksum: stored "
+                    f"0x{header.checksum:08x}, computed 0x{expected:08x}.",
                     field="checksum",
-                    page=page_index,
                     stored_checksum=header.checksum,
                     computed_checksum=expected,
+                    **located,
                 )
         page = cls(
             page_type=header.page_type,
             page_size=size,
-            page_index=page_index,
+            page_index=0 if page_index is None else page_index,
             page_lsn=header.page_lsn,
             seq=header.seq,
             flags=header.flags,
@@ -517,15 +539,28 @@ class Page:
     # --- internals ------------------------------------------------------------------------
 
     def _check_slot_range(self, slot: SlotId) -> None:
+        """Refuse a slot id this page cannot serve, without calling the page damaged.
+
+        A slot id is an ARGUMENT. A page decoded from an image has exactly as many directory
+        entries as the image carried, so no id out of that range can have come from the page --
+        it came from the caller, out of a stale reference, an index entry, or a typo. The page
+        cannot know which, so it classifies by what it does know: this is a refusal about the
+        request, not a finding about the bytes (A11-revised).
+
+        A caller that knows its id came off a page -- following a prev_version pointer, reading
+        a structural slot it wrote itself -- knows the provenance the page does not, and turns
+        this refusal into corruption_detected at its own boundary. HeapStore._require_data_page
+        is the worked example.
+        """
         if isinstance(slot, bool) or not isinstance(slot, int):
-            raise GrafxCorruptionDetected(
+            raise GrafxConfigurationError(
                 f"A slot id must be an integer; got {type(slot).__name__}.",
                 field="slot",
                 value=repr(slot),
                 page=self._page_index,
             )
         if not 0 <= slot < len(self._slots):
-            raise GrafxCorruptionDetected(
+            raise GrafxUnsupportedOperation(
                 f"Slot {slot} does not exist on page {self._page_index}, which has "
                 f"{len(self._slots)} slots.",
                 field="slot",
@@ -535,16 +570,41 @@ class Page:
             )
 
     def _entry(self, slot: SlotId) -> tuple[int, int]:
+        """Return the directory entry of a LIVE slot, refusing a freed one as an ordinary state.
+
+        Freeing a slot is a sanctioned operation -- C7's index manager does it on purpose -- so a
+        freed slot is an ordinary state of an ordinary page, and reading one must not be able to
+        start a quarantine. corruption_detected is not a severity, it is a ROUTE: FR-8 and FR-10
+        turn it into truncation, quarantine and a forensic ledger entry, and this door was
+        putting a normal state onto that route. C6 could not trust the exception and had to guard
+        every read with is_slot_free instead, which is what a wrong contract looks like from the
+        outside.
+
+        Still a refusal and not an absence: page 236's rule is that a reference naming a freed
+        slot must FAIL to resolve rather than quietly resolve to a neighbour, and returning None
+        would put the burden of remembering that on every caller. What changes is the route, and
+        field="freed_slot" is what a caller routes on.
+        """
         self._check_slot_range(slot)
         entry = self._slots[slot]
         if entry == FREE_SLOT:
-            raise GrafxCorruptionDetected(
-                f"Slot {slot} of page {self._page_index} has been freed.",
-                field="slot",
+            raise GrafxUnsupportedOperation(
+                f"Slot {slot} of page {self._page_index} has been freed and holds no payload.",
+                field="freed_slot",
                 page=self._page_index,
                 slot=slot,
             )
         return entry
+
+
+def _location(page_index: PageIndex | None) -> dict[str, int]:
+    """Return the page detail of an error, empty when the caller did not say which page."""
+    return {} if page_index is None else {"page": page_index}
+
+
+def _subject(page_index: PageIndex | None) -> str:
+    """Return how an error should name the page it is about."""
+    return "A page image" if page_index is None else f"Page {page_index}"
 
 
 def _check_unsigned(field: str, value: int, maximum: int) -> int:
@@ -565,10 +625,16 @@ def _check_unsigned(field: str, value: int, maximum: int) -> int:
 
 
 def _as_bytes(field: str, payload: bytes) -> bytes:
-    """Return the payload as immutable bytes, refusing anything that is not a byte buffer."""
+    """Return the payload as immutable bytes, refusing anything that is not a byte buffer.
+
+    An argument of the wrong type, classified the way the slot id beside it is: a caller handing
+    a str where bytes belong has said nothing about any byte on any page, and corruption_detected
+    is the route to truncation and quarantine. Leaving this one as damage while its neighbour
+    became a configuration error would have made the same mistake, spelled differently.
+    """
     if isinstance(payload, (bytes, bytearray, memoryview)):
         return bytes(payload)
-    raise GrafxCorruptionDetected(
+    raise GrafxConfigurationError(
         f"A slot {field} must be a byte buffer; got {type(payload).__name__}.",
         field=field,
         value=type(payload).__name__,
@@ -576,35 +642,37 @@ def _as_bytes(field: str, payload: bytes) -> bytes:
 
 
 def _decode_directory(
-    raw: bytes, header: PageHeader, size: int, page_index: PageIndex
+    raw: bytes, header: PageHeader, size: int, page_index: PageIndex | None
 ) -> list[tuple[int, int]]:
     """Return the slot directory of a page image after proving that it is self-consistent."""
+    located = _location(page_index)
+    subject = _subject(page_index)
     directory_bytes = header.slot_count * SLOT_ENTRY_SIZE
     if PAGE_HEADER_SIZE + directory_bytes > size:
         raise GrafxCorruptionDetected(
-            f"Page {page_index} declares {header.slot_count} slots, which do not fit in "
-            f"{size} bytes.",
+            f"{subject} declares {header.slot_count} slots, which do not fit in {size} bytes.",
             field="slot_count",
-            page=page_index,
             slot_count=header.slot_count,
+            directory_bytes=directory_bytes,
+            **located,
         )
     if header.free_end != size - directory_bytes:
         raise GrafxCorruptionDetected(
-            f"Page {page_index} declares free_end {header.free_end}, but {header.slot_count} "
+            f"{subject} declares free_end {header.free_end}, but {header.slot_count} "
             f"slots put the directory at {size - directory_bytes}.",
             field="free_end",
-            page=page_index,
             free_end=header.free_end,
             slot_count=header.slot_count,
+            **located,
         )
     if not PAGE_HEADER_SIZE <= header.free_start <= header.free_end:
         raise GrafxCorruptionDetected(
-            f"Page {page_index} declares free_start {header.free_start}, which is outside the "
+            f"{subject} declares free_start {header.free_start}, which is outside the "
             f"payload area that ends at {header.free_end}.",
             field="free_start",
-            page=page_index,
             free_start=header.free_start,
             free_end=header.free_end,
+            **located,
         )
     entries: list[tuple[int, int]] = []
     occupied: list[tuple[int, int]] = []
@@ -616,13 +684,13 @@ def _decode_directory(
             continue
         if offset < PAGE_HEADER_SIZE or offset + length > header.free_start:
             raise GrafxCorruptionDetected(
-                f"Slot {slot} of page {page_index} spans bytes {offset} to {offset + length}, "
-                f"which leaves the payload area that ends at {header.free_start}.",
+                f"Slot {slot} spans bytes {offset} to {offset + length}, which leaves the "
+                f"payload area that ends at {header.free_start}.",
                 field="slot_entry",
-                page=page_index,
                 slot=slot,
                 offset=offset,
                 length=length,
+                **located,
             )
         occupied.append((offset, offset + length))
         entries.append((offset, length))
@@ -630,11 +698,11 @@ def _decode_directory(
     for (start, end), (next_start, _) in zip(occupied, occupied[1:]):
         if end > next_start:
             raise GrafxCorruptionDetected(
-                f"Page {page_index} has overlapping payloads: one ends at {end} and the next "
+                f"{subject} has overlapping payloads: one ends at {end} and the next "
                 f"starts at {next_start}.",
                 field="slot_entry",
-                page=page_index,
                 offset=start,
                 overlap=end - next_start,
+                **located,
             )
     return entries

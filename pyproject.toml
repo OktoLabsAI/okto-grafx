@@ -23,7 +23,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-accel = ["numpy>=1.24"]
+accel = ["numpy>=1.24", "google-crc32c>=1.5"]
 bench = ["ladybug==0.16.0", "numpy>=1.24"]
 dev = ["pytest>=8", "pytest-timeout"]
 
@@ -37,10 +37,18 @@ okto_grafx = ["py.typed"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-q --strict-markers"
+# A42: a per-test timeout, so a regression that loops forever is a red build rather than an
+# indefinite stall. 60 s is roughly twice the slowest test measured on this tree (the wheel
+# build, about 25 s) and far above the multi-process and race tests (under 5 s each), while
+# still catching a genuine hang inside a minute. Anything legitimately slower carries its own
+# @pytest.mark.timeout rather than raising this bound. The thread method is required: the
+# signal method needs SIGALRM, which Windows does not have, and G4 makes both families equal.
+addopts = "-q --strict-markers --timeout=60 --timeout-method=thread"
 markers = [
     "platform_specific: test that exercises one operating-system family and has a declared counterpart (G4).",
     "slow: test whose runtime is dominated by volume rather than by logic.",
     "multiprocess: test that spawns more than one process against the same database.",
     "bench: benchmark or calibration test that requires the [bench] extra.",
+    "pending: declared, registered debt; one of the three markers that can attribute a skip (A54).",
+    "optional_dependency(module): the test declares the optional dependency it needs; the gate verifies that module really is absent (A54).",
 ]

@@ -14,6 +14,7 @@ from okto_grafx.domain.ports.metrics import (
     METRIC_NAME_PREFIX,
     METRIC_UNIT_SUFFIXES,
     NON_EN_US_MARKERS,
+    NON_EN_US_WORDS,
     UNBOUNDED_LABEL_CARDINALITY_LIMIT,
     LabelSpec,
     MetricDescriptor,
@@ -205,12 +206,27 @@ def test_a_label_name_that_is_not_snake_case_is_rejected(name: object) -> None:
     assert raised.value.details["field"] == "name"
 
 
+def test_the_unbounded_cardinality_limit_is_the_number_the_contract_names() -> None:
+    # A68: asserted as a literal. Writing LIMIT + 1 made the expectation slide with the
+    # constant, so widening 64 to 640 left the suite green and the guardrail gone.
+    assert UNBOUNDED_LABEL_CARDINALITY_LIMIT == 64
+
+
 def test_an_unenumerated_label_may_not_exceed_the_cardinality_limit() -> None:
-    accepted = LabelSpec(name="db", max_cardinality=UNBOUNDED_LABEL_CARDINALITY_LIMIT)
+    accepted = LabelSpec(name="db", max_cardinality=64)
     assert accepted.allowed_values is None
     with pytest.raises(GrafxConfigurationError) as raised:
-        LabelSpec(name="db", max_cardinality=UNBOUNDED_LABEL_CARDINALITY_LIMIT + 1)
+        LabelSpec(name="db", max_cardinality=65)
     assert raised.value.details["field"] == "max_cardinality"
+
+
+def test_a_widened_cardinality_limit_would_admit_a_series_explosion() -> None:
+    # The independent consequence, so the rule is pinned by what it protects and not only by
+    # its own number: an unenumerated label is a series count nobody bounded, and TR-7 rejects
+    # it at registration rather than in production.
+    for cardinality in (65, 128, 640, 65_536):
+        with pytest.raises(GrafxConfigurationError):
+            LabelSpec(name="db", max_cardinality=cardinality)
 
 
 def test_an_enumerated_label_may_declare_a_large_bound() -> None:
@@ -359,6 +375,15 @@ def test_descriptors_are_frozen_and_hashable() -> None:
 # --- the description must be en-US (G1, G7) ---------------------------------------------------
 
 
+def _portuguese_free(text: str) -> bool:
+    """Return True when a sample trips no pt-BR rule, so only the ASCII guard can reject it."""
+    haystack = f" {text.lower()} "
+    if any(marker in haystack for marker in NON_EN_US_MARKERS):
+        return False
+    words = {token.strip(".,;:") for token in text.lower().split()}
+    return not (words & NON_EN_US_WORDS)
+
+
 def _descriptor(description: str) -> MetricDescriptor:
     """Build a valid counter carrying the description under test."""
     return MetricDescriptor(
@@ -400,9 +425,16 @@ def test_a_pt_br_description_is_rejected_at_registration(description: str) -> No
 
 
 def test_a_description_outside_ascii_is_rejected() -> None:
+    # A62: English prose with one non-ASCII character, so only the ASCII guard can reject it.
+    # The previous sample was also Portuguese, which meant deleting the isascii() check left
+    # the suite green -- a test that cannot tell which guard fired pins neither.
+    sample = "Time a durability barrier took \u2014 measured in seconds."
+    assert not sample.isascii()
+    assert _portuguese_free(sample)
     with pytest.raises(GrafxConfigurationError) as raised:
-        _descriptor("Numero de commits recusados pela valida\u00e7\u00e3o.")
+        _descriptor(sample)
     assert raised.value.details["field"] == "description"
+    assert "ASCII" in raised.value.message
 
 
 @pytest.mark.parametrize("description", [".", "..", "Conflicts.", "   Total.  "])

@@ -74,8 +74,8 @@ def test_a_second_posix_open_file_description_is_excluded(
 
 
 def test_exactly_one_family_is_selected() -> None:
-    assert PLATFORM_FAMILY in {"windows", "posix"}
     assert (PLATFORM_FAMILY == "windows") is WINDOWS
+    assert (PLATFORM_FAMILY == "posix") is not WINDOWS
     assert LOCK_MECHANISM == ("msvcrt.locking" if WINDOWS else "fcntl.flock")
 
 

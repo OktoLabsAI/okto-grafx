@@ -19,6 +19,12 @@ as a query, a path or a free-text message -- are replaced by a fixed marker. Ope
 that carries no personal data, such as an LSN, an epoch or a reason code, passes through: the
 rule is about content, not about cardinality.
 
+The matching is **exact and case sensitive**, by deliberate choice: a substring rule would redact
+``reason_code`` for containing ``code`` and a folded one would hide which spelling a component
+actually emitted. The consequence is that ``file_path`` and ``Path`` are not the same key as
+``path`` and are not redacted, so a component that emits its first event either uses one of the
+declared names or passes its own set to the constructor.
+
 *Incapable of raising.* An event is a side effect of an operation that has already succeeded or
 already failed. A broken handler, a payload whose values explode when rendered, or a logger that
 throws must never change the outcome of a transaction, so ``emit()`` swallows everything.

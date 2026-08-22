@@ -19,6 +19,7 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.model.catalog import CATALOG_FORMAT_VERSION, CATALOG_MAGIC, Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import ValueType
+from okto_grafx.domain.page import crc32c
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 
 
@@ -334,3 +335,157 @@ def test_the_repr_says_how_much_it_holds() -> None:
 def test_a_catalog_is_never_equal_to_something_else() -> None:
     assert Catalog() != "catalog"
     assert Catalog() == Catalog()
+
+
+# --- the load path upholds the invariants the write path enforces --------------------------------
+
+
+def forge(
+    tables: tuple[TableDef, ...], spaces: tuple[EmbeddingSpaceDef, ...]
+) -> bytes:
+    """Return catalog bytes as a foreign or version-skewed writer could have produced them.
+
+    The checksum is correct, so nothing about these bytes is damaged: they are exactly what a
+    writer that did not share this build's invariants would have stored, which is the case the
+    load path has to answer for.
+    """
+    from okto_grafx.domain.model import catalog as module
+
+    body = module._PREAMBLE.pack(
+        CATALOG_MAGIC,
+        CATALOG_FORMAT_VERSION,
+        0,
+        len(tables),
+        len(spaces),
+        max((entry.table_id for entry in tables), default=0) + 1,
+        max((entry.space_id for entry in spaces), default=0) + 1,
+    )
+    body += b"".join(module._encode_table(entry) for entry in tables)
+    body += b"".join(module._encode_space(entry) for entry in spaces)
+    return body + module._CHECKSUM.pack(crc32c(body))
+
+
+def test_the_forge_is_faithful_to_the_real_encoder() -> None:
+    catalog = populated()
+    assert Catalog.deserialize(forge(catalog.tables(), catalog.spaces())) == catalog
+
+
+def test_a_stored_catalog_with_two_tables_of_the_same_name_is_refused() -> None:
+    raw = forge((table("Person", 1), table("Person", 2)), ())
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        Catalog.deserialize(raw)
+    assert raised.value.details["field"] == "name"
+
+
+def test_a_stored_catalog_with_two_tables_of_the_same_id_is_refused() -> None:
+    raw = forge((table("Person", 1), table("Company", 1)), ())
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        Catalog.deserialize(raw)
+    assert raised.value.details["field"] == "table_id"
+
+
+def test_a_stored_catalog_with_two_spaces_of_the_same_name_is_refused() -> None:
+    raw = forge((), (space("minilm", 1), space("minilm", 2)))
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        Catalog.deserialize(raw)
+    assert raised.value.details["field"] == "name"
+
+
+def test_a_stored_catalog_with_two_spaces_of_the_same_id_is_refused() -> None:
+    raw = forge((), (space("minilm", 1), space("e5", 1)))
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        Catalog.deserialize(raw)
+    assert raised.value.details["field"] == "space_id"
+
+
+def test_a_stored_vector_column_pointing_at_a_space_that_is_not_there_is_refused() -> None:
+    ghost = table(
+        name="Chunk",
+        table_id=1,
+        columns=(
+            ColumnDef(name="embedding", type=ValueType.VECTOR_F32, vector_space="ghost"),
+        ),
+        primary_key=None,
+    )
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        Catalog.deserialize(forge((ghost,), (space("minilm", 1),)))
+    assert raised.value.details["field"] == "vector_space"
+    assert raised.value.details["value"] == "ghost"
+
+
+def test_a_stored_vector_column_of_the_wrong_precision_is_refused() -> None:
+    mismatched = table(
+        name="Chunk",
+        table_id=1,
+        columns=(
+            ColumnDef(name="embedding", type=ValueType.VECTOR_F32, vector_space="minilm"),
+        ),
+        primary_key=None,
+    )
+    raw = forge((mismatched,), (space("minilm", 1, storage_dtype="float64"),))
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        Catalog.deserialize(raw)
+    assert raised.value.details["field"] == "storage_dtype"
+
+
+def test_a_table_pointing_at_a_retired_space_still_loads() -> None:
+    # Retiring a space after its columns were created is the sanctioned path (SPEC-VEC FR-3), so
+    # the load path enforces the invariants and not the creation rules.
+    chunk = table(
+        name="Chunk",
+        table_id=1,
+        columns=(
+            ColumnDef(name="embedding", type=ValueType.VECTOR_F32, vector_space="minilm"),
+        ),
+        primary_key=None,
+    )
+    loaded = Catalog.deserialize(forge((chunk,), (space("minilm", 1, state="retired"),)))
+    assert not loaded.space("minilm").is_active
+    assert loaded.table("Chunk").column("embedding").vector_space == "minilm"
+
+
+def test_a_loaded_catalog_never_disagrees_with_itself_about_its_size() -> None:
+    catalog = Catalog.deserialize(populated().serialize())
+    assert len(catalog.tables()) == len(populated().tables())
+    assert len(catalog.spaces()) == len(populated().spaces())
+
+
+def with_nullable_byte(value: int) -> bytes:
+    """Return catalog bytes whose one column carries that byte where nullable belongs.
+
+    The checksum is recomputed, so nothing here is damaged in the CRC sense: these are the bytes
+    a foreign writer that did not share this build's invariants would have stored.
+    """
+    from okto_grafx.domain.model import catalog as module
+
+    definition = table(
+        name="Person",
+        table_id=1,
+        columns=(ColumnDef(name="id", type=ValueType.INT64, nullable=False),),
+        primary_key="id",
+    )
+    encoded = module._encode_table(definition)
+    # One column, encoded last, and its final three bytes are the type tag, the nullable byte
+    # and the presence byte of its vector space. The two neighbours are asserted so that a
+    # change to the layout fails this helper instead of quietly forging the wrong byte.
+    position = len(encoded) - 2
+    assert encoded[position - 1] == int(ValueType.INT64), "the type tag is not where it was"
+    assert encoded[position + 1] == 0, "the vector-space presence byte is not where it was"
+    forged = encoded[:position] + bytes((value,)) + encoded[position + 1 :]
+    body = module._PREAMBLE.pack(CATALOG_MAGIC, CATALOG_FORMAT_VERSION, 0, 1, 0, 2, 1) + forged
+    return body + module._CHECKSUM.pack(crc32c(body))
+
+
+def test_a_nullable_byte_that_is_neither_zero_nor_one_is_refused() -> None:
+    """Its neighbour, the optional-string presence byte, has always refused this.
+
+    The nullable byte read every other value as False, so a column a foreign writer had marked
+    nullable came back required -- and the difference only shows the first time a null is stored.
+    """
+    assert Catalog.deserialize(with_nullable_byte(1)).table("Person").column("id").nullable
+    assert not Catalog.deserialize(with_nullable_byte(0)).table("Person").column("id").nullable
+    for value in (2, 3, 255):
+        with pytest.raises(GrafxCorruptionDetected) as raised:
+            Catalog.deserialize(with_nullable_byte(value))
+        assert raised.value.details["field"] == "nullable"
+        assert raised.value.details["value"] == value

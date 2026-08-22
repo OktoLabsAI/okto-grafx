@@ -12,8 +12,12 @@ from pathlib import Path
 import pytest
 
 from conftest import CoordinatorFactory
-from coordination_support import DirectoryStorageDevice, ManualClock
-from okto_grafx.adapters.coordination_local import decode_lease_record
+from coordination_support import DirectoryStorageDevice, ManualClock, owned_by
+from okto_grafx.adapters.coordination_local import (
+    LeaseRecord,
+    decode_lease_record,
+    encode_lease_record,
+)
 from okto_grafx.domain.ports.coordination import DeadOwnerReport
 
 HOUR: float = 3_600.0
@@ -43,7 +47,7 @@ def test_a_stalled_heartbeat_is_reported_after_the_threshold(
     observer_clock.advance(0.2)
     report = observer.detect_dead_owner(stall_threshold=5.0)
     assert isinstance(report, DeadOwnerReport)
-    assert report.owner_id == "p1-aaaa"
+    assert owned_by(report.owner_id, "p1-aaaa")
     assert report.last_heartbeat_seq == 1
     assert report.observed_stall_seconds == pytest.approx(5.1)
 
@@ -126,8 +130,27 @@ def test_no_monotonic_reading_ever_reaches_the_device(tmp_path: Path) -> None:
         lease = coordinator.acquire_writer_lease(timeout=1.0)
         coordinator.renew_lease(lease)
         files.append((root / "control" / "writer.lease").read_bytes())
-    assert files[0] == files[1]
-    assert decode_lease_record(files[0]).wall_stamp == pytest.approx(1_700_000_000.25)
+    # Every field but the identity is identical, and the identity differs only by the instance
+    # nonce -- so re-encoding both under one name gives the same bytes. Two origins nine billion
+    # seconds apart producing one record is what says no monotonic reading reached the device.
+    records = [decode_lease_record(raw) for raw in files]
+    assert records[0].owner_id != records[1].owner_id
+    normalised = [
+        encode_lease_record(
+            LeaseRecord(
+                owner_id="p1-aaaa",
+                epoch=record.epoch,
+                heartbeat_seq=record.heartbeat_seq,
+                ttl_seconds=record.ttl_seconds,
+                wall_stamp=record.wall_stamp,
+                held=record.held,
+                superseded_epoch=record.superseded_epoch,
+            )
+        )
+        for record in records
+    ]
+    assert normalised[0] == normalised[1]
+    assert records[0].wall_stamp == pytest.approx(1_700_000_000.25)
 
 
 def test_an_absent_or_vacant_lease_reports_nobody_dead(make_coordinator: CoordinatorFactory) -> None:

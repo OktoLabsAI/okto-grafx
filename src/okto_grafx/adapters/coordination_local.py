@@ -30,11 +30,13 @@ unlikely.
 
 from __future__ import annotations
 
+import errno
 import os
 import struct
 import threading
 import time
 import uuid
+import weakref
 import zlib
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -49,12 +51,15 @@ from okto_grafx.domain.errors import (
     GrafxLeaseTimeout,
     GrafxSchemaVersionMismatch,
     GrafxStaleEpoch,
+    GrafxStorageError,
+    GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import Epoch, Lsn
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.coordination import DeadOwnerReport, Lease, ReaderHandle
 from okto_grafx.domain.ports.metrics import MetricsSink
 from okto_grafx.domain.ports.storage import StorageDevice
+from okto_grafx.engine.metrics_catalog import metric
 
 __all__ = [
     "CONTROL_DIRECTORY",
@@ -64,6 +69,7 @@ __all__ = [
     "LEASE_SECTION",
     "LEASE_WAIT_METRIC",
     "LOCK_FILE_SUFFIX",
+    "TEMPORARY_SUFFIX",
     "LOCK_MECHANISM",
     "PLATFORM_FAMILY",
     "READERS_DIRECTORY_NAME",
@@ -122,6 +128,9 @@ READERS_DIRECTORY_NAME: str = "readers"
 READER_FILE_SUFFIX: str = ".reader"
 """Suffix that makes a reader registration recognisable and separates it from a temporary file."""
 
+TEMPORARY_SUFFIX: str = ".tmp"
+"""Suffix of the file a control record is written to before it replaces its target."""
+
 LOCK_FILE_SUFFIX: str = ".lock"
 """Suffix of the advisory lock file that backs one named section."""
 
@@ -143,6 +152,15 @@ LEASE_SECTION: str = "writer.lease"
 LEASE_WAIT_METRIC: str = "oktografx_lease_wait_seconds"
 """Metric this adapter observes on every acquisition attempt (CONTRACT.md section 9)."""
 
+EMITTED_METRICS: tuple[str, ...] = (LEASE_WAIT_METRIC,)
+"""Every metric this component emits, on every path including the error and takeover paths.
+
+A sink that enforces registration refuses a name it has never seen, so a component that emits
+without registering fails the moment it meets the real sink rather than a permissive double. The
+descriptors come from the frozen catalog, which is what keeps them from drifting away from the
+ones a dashboard and the continuous integration gate read.
+"""
+
 _LEASE_HEADER: str = "<8sHHIQQddQII"
 _LEASE_HEADER_SIZE: int = struct.calcsize(_LEASE_HEADER)
 _READER_HEADER: str = "<8sHHIQQdII"
@@ -161,11 +179,62 @@ bytes in two calls can straddle a replacement and see a length that no longer ma
 resolves that benign race; only a persistent mismatch is real damage.
 """
 
-_MAX_WAIT_ITERATIONS: int = 1_000_000
-"""Defensive bound on any wait loop, so an injected clock that never advances cannot hang a host."""
+_PUBLISH_ATTEMPTS: int = 5
+"""How many times a control record is published before the device failure is reported.
+
+A sharing violation from an antivirus scanner or a search indexer lasts milliseconds; the whole
+budget here is tens of milliseconds, which is short enough to stay inside a commit window and
+long enough to cover the overwhelming majority of them (TR-3).
+"""
+
+_MAX_PUBLISH_BACKOFF: float = 0.04
+"""Ceiling of the exponential backoff between two publish attempts, in seconds."""
+
+_WAIT_ITERATION_FLOOR: int = 1_000
+"""Smallest iteration budget any wait gets, so a tiny timeout still polls a few times."""
+
+_WAIT_ITERATION_MARGIN: int = 4
+"""How many times the expected iteration count a wait may spend before it gives up.
+
+The bound exists for one case only: an injected clock that does not advance, where the deadline
+never arrives and the loop would spin for ever. Four times the expected count cannot be reached
+by a wait whose clock moves, and it stops one whose clock does not in milliseconds rather than
+in minutes.
+"""
 
 _MAX_IDENTIFIER_LENGTH: int = 96
-"""Longest accepted participant identifier. It has to fit in a file name on every platform."""
+"""Longest accepted identifier of any kind. It has to fit in a file name on every platform."""
+
+_READER_SUFFIX_BUDGET: int = 8
+"""Room a reader identifier needs on top of the stored owner identifier, as in ``-r0001``."""
+
+_INSTANCE_NONCE_LENGTH: int = 8
+"""Hex characters of the per-instance nonce that makes a reader identifier unique.
+
+The owner identifier can be supplied by the caller and two coordinators can therefore be built
+with the same one. That is a configuration mistake rather than an attack, and it used to make
+both instances mint the same reader identifier: the second registration silently replaced the
+first, the horizon jumped forward, and C4 would have recycled segments a live reader still
+needed with nothing raised anywhere (BR-10, AC-8). The nonce is what makes that impossible.
+"""
+
+_MAX_STORED_OWNER_LENGTH: int = _MAX_IDENTIFIER_LENGTH - _READER_SUFFIX_BUDGET
+"""Longest owner identifier that may reach the record.
+
+Shorter than the identifier ceiling on purpose: every reader identifier is built from the stored
+owner identifier plus a counter, so an owner accepted at the ceiling would make
+``register_reader`` fail forever. The two doors have to agree.
+"""
+
+_MAX_CONFIGURED_OWNER_LENGTH: int = _MAX_STORED_OWNER_LENGTH - _INSTANCE_NONCE_LENGTH - 1
+"""Longest owner identifier a CALLER may configure.
+
+The instance nonce and its separator are added before the identity reaches the disk, so the
+caller budget is the stored budget less the room that composition needs.
+"""
+
+_MAX_UINT64: int = 0xFFFFFFFFFFFFFFFF
+"""Largest value any counter of these records can carry. Above it the record cannot be encoded."""
 
 _IDENTIFIER_EXTRA_CHARACTERS: frozenset[str] = frozenset({".", "-", "_"})
 """Punctuation accepted inside an identifier, all of it safe in a file name."""
@@ -174,24 +243,189 @@ _Record = TypeVar("_Record", "LeaseRecord", "ReaderRecord")
 """Either control record, so one retrying reader serves both without losing its type."""
 
 
-def _reject(reason: str, **details: object) -> GrafxConfigurationError:
-    """Build the typed configuration error used for every constructor and argument refusal."""
-    return GrafxConfigurationError(reason, **details)
+_TRANSIENT_ERRNOS: frozenset[int] = frozenset(
+    {errno.EACCES, errno.EBUSY, errno.EAGAIN, errno.EINTR, errno.EWOULDBLOCK}
+)
+"""Error numbers that mean "somebody is in the way right now", not "this will never work"."""
+
+_TRANSIENT_WINERRORS: frozenset[int] = frozenset({5, 32, 33})
+"""Access denied and the two sharing violations. An antivirus scan produces all three."""
+
+_CONTENTION_ERRNOS: frozenset[int] = frozenset(
+    {
+        errno.EWOULDBLOCK,
+        errno.EAGAIN,
+        errno.EACCES,
+        getattr(errno, "EDEADLOCK", errno.EDEADLK),
+        errno.EDEADLK,
+    }
+)
+"""Error numbers an advisory-lock primitive uses to say "somebody else holds it right now".
+
+Everything else those primitives can answer -- no lock support on the mount, a bad descriptor,
+an argument the platform refuses -- never clears by waiting, so reporting it as a busy section
+blames a holder that does not exist and invites a caller to retry a path that cannot work.
+"""
+
+_MISSING_WINERRORS: frozenset[int] = frozenset({2, 3})
+"""The file and the path were not found. On POSIX the same condition arrives as ENOENT."""
 
 
-def _validate_identifier(label: str, value: str) -> str:
+def _is_transient(failure: OSError) -> bool:
+    """Return whether a device failure is the kind that improves on its own (A11-revised).
+
+    The classification decides the ``retryable`` flag a caller branches on, so the default has
+    to be the honest one: a sharing violation reported as permanent forbids the one action that
+    would have worked, and an unreachable path reported as retryable invites an endless loop.
+    """
+    winerror = getattr(failure, "winerror", None)
+    if winerror is not None:
+        return winerror in _TRANSIENT_WINERRORS
+    return failure.errno in _TRANSIENT_ERRNOS
+
+
+def _storage_failure(
+    message: str, failure: OSError, *, attempts: int, **details: object
+) -> GrafxStorageError:
+    """Give a RAW platform failure a type, classified from its own errno.
+
+    Only an ``OSError`` reaches here. A device failure that already carries a Grafx class keeps
+    it -- the class is part of the answer, and inventing a retry flag for a failure this adapter
+    has itself decided not to retry is a contradiction a caller cannot see through.
+    """
+    built = GrafxStorageError(
+        message,
+        retryable=_is_transient(failure),
+        attempts=attempts,
+        errno=failure.errno,
+        winerror=getattr(failure, "winerror", None),
+        detail=str(failure),
+        **details,
+    )
+    # A47 again, from the other side: whoever retries around THIS error reads the details.
+    built.details["retryable"] = built.retryable
+    return built
+
+
+def _classified_retryable(failure: BaseException) -> bool | None:
+    """Return the retry classification a device failure carries, or None when it carries none.
+
+    Amendment A47: the classification travels in ``details["retryable"]``, never in the exception
+    class. A28 folded EVERY barrier failure into one class and put the access classification in
+    the details, so a predicate that switched on the class would report the transient antivirus
+    touch TR-3 names as permanent on the barrier while riding out the identical condition on the
+    call before it.
+    """
+    if isinstance(failure, GrafxError):
+        classification = failure.details.get("retryable")
+        if isinstance(classification, bool):
+            return classification
+    return None
+
+
+def _worth_retrying(failure: BaseException) -> bool:
+    """Return whether a device failure is the kind another attempt might survive.
+
+    The classification in the details decides whenever the device provided one. Without one there
+    is no information to act on, so the answer is the conservative one: a raw platform error is
+    read for a transient errno, a storage error is trusted with its own flag, and anything else
+    is an answer rather than an obstacle and is reported at once.
+    """
+    classified = _classified_retryable(failure)
+    if classified is not None:
+        return classified
+    if isinstance(failure, GrafxStorageError):
+        return failure.retryable
+    return isinstance(failure, OSError) and _is_transient(failure)
+
+
+def _is_missing(failure: BaseException) -> bool:
+    """Return whether a failure says the file simply is not there."""
+    if not isinstance(failure, OSError):
+        return False
+    winerror = getattr(failure, "winerror", None)
+    if winerror is not None:
+        return winerror in _MISSING_WINERRORS
+    return failure.errno == errno.ENOENT
+
+
+def _worth_publishing_again(failure: BaseException) -> bool:
+    """Return whether a failed publication is worth another attempt.
+
+    Publishing builds its own temporary file from nothing, so a temporary that went missing
+    underneath it is not an obstacle at all: the next attempt makes a new one. That is the single
+    condition where a retry is a certainty rather than a hope, and reporting it as permanent is
+    exactly the refusal A11-revised names -- forbidding the one action that would have worked.
+    """
+    return _is_missing(failure) or _worth_retrying(failure)
+
+
+_SHARED_SECTIONS: dict[int, dict[str, threading.Lock]] = {}
+"""Section locks shared by every coordinator over one storage namespace, for the lockless mode.
+
+This is the one piece of module-level state in the adapter, and it is what makes the mode without
+a lock directory honest. Sections have to be at least PROCESS wide: an in-memory device is never
+shared between processes, but it is routinely shared between two coordinator objects, and a lock
+that lives inside one object excludes nobody. The table is keyed by the identity of the namespace
+object, so two databases never serialise against each other, and a finaliser drops the entry when
+the namespace is collected, so the identity can never be reused underneath a live table.
+"""
+
+_SHARED_SECTIONS_GUARD: threading.Lock = threading.Lock()
+"""Guards the registry above. Held only long enough to hand out one lock."""
+
+
+def _shared_section_lock(namespace: object, key: str) -> threading.Lock:
+    """Return the process-wide lock of one section within one storage namespace."""
+    token = id(namespace)
+    with _SHARED_SECTIONS_GUARD:
+        table = _SHARED_SECTIONS.get(token)
+        if table is None:
+            table = {}
+            _SHARED_SECTIONS[token] = table
+            try:
+                weakref.finalize(namespace, _SHARED_SECTIONS.pop, token, None)
+            except TypeError:
+                # A namespace that cannot be referenced weakly keeps its table for the life of
+                # the process. That leaks one small dictionary and never a correctness property.
+                pass
+        lock = table.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            table[key] = lock
+        return lock
+
+
+def _reject(message: str, **details: object) -> GrafxConfigurationError:
+    """Build the typed configuration error used for every constructor and argument refusal.
+
+    The parameter is named ``message`` so that ``reason`` stays available as a detail key: a
+    call that passes both must not collide with the positional parameter of this helper.
+    """
+    return GrafxConfigurationError(message, **details)
+
+
+def _validate_identifier(label: str, value: str, *, limit: int = _MAX_IDENTIFIER_LENGTH) -> str:
     """Return the identifier when it is safe as a file name, else raise a configuration error.
 
     Identifiers become file names, and file identity must never depend on case (CONTRACT.md
-    section 11 item 9), so an upper-case character is refused rather than silently folded.
+    section 11 item 9), so an upper-case character is refused rather than silently folded. A
+    relative traversal is refused for the same family of reasons: a control directory of ``..``
+    would put the lease outside the database it is supposed to protect.
     """
     if not isinstance(value, str) or not value:
         raise _reject(f"The {label} must be a non-empty string.", field=label, value=repr(value))
-    if len(value) > _MAX_IDENTIFIER_LENGTH:
+    if len(value) > limit:
         raise _reject(
-            f"The {label} must be at most {_MAX_IDENTIFIER_LENGTH} characters long.",
+            f"The {label} must be at most {limit} characters long.",
             field=label,
             length=len(value),
+        )
+    if value in {".", ".."} or ".." in value:
+        raise _reject(
+            f"The {label} must not name a relative path, so it cannot leave the database.",
+            field=label,
+            value=value,
         )
     if not value.isascii():
         raise _reject(f"The {label} must be ASCII.", field=label, value=value)
@@ -238,6 +472,12 @@ def _require_index(label: str, value: int) -> int:
         raise _reject(f"The {label} must be an integer.", field=label, value=repr(value))
     if value < 0:
         raise _reject(f"The {label} must not be negative.", field=label, value=value)
+    if value > _MAX_UINT64:
+        raise _reject(
+            f"The {label} must fit in the 64 bits the record reserves for it.",
+            field=label,
+            value=value,
+        )
     return value
 
 
@@ -288,7 +528,9 @@ def encode_lease_record(record: LeaseRecord) -> bytes:
     total_length u32 | reserved u32`` (64 bytes), then the ASCII owner identifier, then
     ``crc32 u32`` over everything before it. ``wall_stamp`` is diagnostic only.
     """
-    owner = _validate_identifier("owner_id", record.owner_id).encode("ascii")
+    owner = _validate_identifier(
+        "owner_id", record.owner_id, limit=_MAX_STORED_OWNER_LENGTH
+    ).encode("ascii")
     total = _LEASE_HEADER_SIZE + len(owner) + _CHECKSUM_SIZE
     header = struct.pack(
         _LEASE_HEADER,
@@ -331,18 +573,30 @@ def encode_reader_record(record: ReaderRecord) -> bytes:
     return _finish(header, record.reader_id)
 
 
-def _decoded_identifier(raw: bytes, start: int, length: int, file: str) -> str:
-    """Return the ASCII identifier stored at the given offset, or report corruption."""
+def _decoded_identifier(raw: bytes, start: int, length: int, file: str, limit: int) -> str:
+    """Return the ASCII identifier stored at the given offset, or report corruption.
+
+    The decoder accepts exactly what the encoder can produce and nothing else: a stored
+    identifier carrying a separator, a NUL or an upper-case letter was not written by this build,
+    and letting it through would turn a damaged record into a file name somewhere else.
+    """
+    # No length check here: the envelope has already established that the record is exactly
+    # header + identifier + checksum bytes long, so this slice always has the length it asked
+    # for. A guard for a case the caller has made impossible is a guard no input can reach.
     chunk = raw[start : start + length]
-    if len(chunk) != length:
-        raise GrafxCorruptionDetected(
-            "The control record ends before its identifier is complete.", file=file
-        )
     try:
-        return chunk.decode("ascii")
+        text = chunk.decode("ascii")
     except UnicodeDecodeError as failure:
         raise GrafxCorruptionDetected(
             "The control record carries an identifier outside ASCII.", file=file
+        ) from failure
+    try:
+        return _validate_identifier("stored identifier", text, limit=limit)
+    except GrafxConfigurationError as failure:
+        raise GrafxCorruptionDetected(
+            "The control record carries an identifier this build could not have written.",
+            file=file,
+            identifier=repr(text),
         ) from failure
 
 
@@ -399,7 +653,9 @@ def decode_lease_record(raw: bytes, *, file: str = LEASE_FILE_NAME) -> LeaseReco
         expected=_LEASE_HEADER_SIZE + owner_len + _CHECKSUM_SIZE,
         file=file,
     )
-    owner = _decoded_identifier(raw, _LEASE_HEADER_SIZE, owner_len, file)
+    owner = _decoded_identifier(
+        raw, _LEASE_HEADER_SIZE, owner_len, file, _MAX_STORED_OWNER_LENGTH
+    )
     return LeaseRecord(
         owner_id=owner,
         epoch=epoch,
@@ -434,7 +690,9 @@ def decode_reader_record(raw: bytes, *, file: str = READERS_DIRECTORY_NAME) -> R
         expected=_READER_HEADER_SIZE + reader_len + _CHECKSUM_SIZE,
         file=file,
     )
-    reader = _decoded_identifier(raw, _READER_HEADER_SIZE, reader_len, file)
+    reader = _decoded_identifier(
+        raw, _READER_HEADER_SIZE, reader_len, file, _MAX_IDENTIFIER_LENGTH
+    )
     return ReaderRecord(
         reader_id=reader,
         snapshot_lsn=snapshot,
@@ -444,28 +702,36 @@ def decode_reader_record(raw: bytes, *, file: str = READERS_DIRECTORY_NAME) -> R
     )
 
 
-class _Section:
-    """One entered critical section: how deep the re-entry counter is and what holds the lock."""
-
-    __slots__ = ("depth", "handle")
-
-    def __init__(self, handle: object) -> None:
-        self.depth: int = 1
-        self.handle: object = handle
-
-
 class LocalProcessCoordinator:
     """Cross-process agreement on the writer epoch, on live readers and on short critical sections.
 
     Construction takes the two ports it needs plus the one thing a port cannot express: the real
-    directory that holds the advisory lock files. Pass ``lock_directory`` for any database backed
-    by a real file system; leave it None for the in-memory device, whose namespace is not shared
-    with another process anyway, and the sections degrade to process-local locks.
+    directory that holds the advisory lock files.
+
+    Two modes, and the difference is exactly how far a section reaches:
+
+    * ``lock_directory`` set -- the production mode for any database backed by a real file
+      system. Sections are operating-system advisory locks, so they exclude across **processes**,
+      across coordinator instances and across threads, and the kernel releases them when a
+      participant dies without cleanup.
+    * ``lock_directory=None`` -- the mode amendment A13 selects for ``:memory:``. Sections are
+      **process-wide** locks keyed by the identity of the storage namespace: two coordinators
+      over one in-memory device contend for real, two coordinators over two different devices do
+      not, and nothing crosses a process boundary. That is the whole truth for this mode, and it
+      is sound because a memory device is never shared between processes in the first place.
+      Passing None while the device IS shared between processes would leave the epoch unguarded.
+
+    The namespace of that second mode is the storage object itself, which is the right answer
+    whenever two coordinators are given the same device. When they reach one namespace through
+    different objects -- a wrapper, a recording decorator -- pass the same ``namespace`` token to
+    both, because no port can tell the adapter that two device objects are the same store. The
+    token is matched by IDENTITY, so it must be the same OBJECT: two equal strings built at
+    runtime are two namespaces, and the coordinators holding them would not contend.
 
     Re-entrancy of ``exclusive()``: **allowed and counted**. The same coordinator, the same
-    thread and the same section name may nest; the operating-system lock is taken once and
-    released when the outermost block exits. A different thread, a different coordinator instance
-    or a different process always contends for real.
+    thread and the same section name may nest; the lock is taken once and released when the
+    outermost block exits. A different thread, a different coordinator instance or a different
+    process always contends for real, in both modes.
     """
 
     def __init__(
@@ -475,13 +741,13 @@ class LocalProcessCoordinator:
         *,
         owner_id: str | None = None,
         lock_directory: str | None = None,
+        namespace: object | None = None,
         control_directory: str = CONTROL_DIRECTORY,
         ttl_seconds: float = 5.0,
         owner_stall_threshold: float = 5.0,
         reader_stall_threshold: float = 15.0,
         section_timeout: float = 10.0,
         poll_interval: float = 0.005,
-        epoch_cache_seconds: float = 0.0,
         metrics: MetricsSink | None = None,
         sleeper: Callable[[float], None] | None = None,
     ) -> None:
@@ -489,13 +755,29 @@ class LocalProcessCoordinator:
         self._storage = storage
         self._clock = clock
         self._metrics = metrics
+        if metrics is not None:
+            # Registering is the emitter's job. Leaving it to the composition root works only
+            # until the next component emits something the root did not know about, and the root
+            # cannot know which metrics a component intends to emit.
+            for name in EMITTED_METRICS:
+                metrics.register(metric(name))
         self._sleeper: Callable[[float], None] = time.sleep if sleeper is None else sleeper
-        self._owner: str = (
-            _validate_identifier("owner_id", owner_id)
+        configured = (
+            _validate_identifier("owner_id", owner_id, limit=_MAX_CONFIGURED_OWNER_LENGTH)
             if owner_id is not None
             else f"p{os.getpid():d}-{uuid.uuid4().hex[:12]}"
         )
+        self._nonce: str = uuid.uuid4().hex[:_INSTANCE_NONCE_LENGTH]
+        # The identity that reaches the disk carries the instance nonce. A configured owner name
+        # can be repeated by a caller, and the lease record is the evidence BR-7 rests on: with a
+        # shared name two coordinators answer to each other's record, and an out-of-band deletion
+        # then lets both install the same epoch and both be told yes. The reader registry was
+        # hardened this way already; the lease is where the harm is worse.
+        self._configured_owner: str = configured
+        self._owner: str = f"{configured}-{self._nonce}"
+        self._reader_prefix: str = f"{self._owner}-r"
         control = _validate_identifier("control_directory", control_directory)
+        self._control: str = control
         self._lease_file: str = f"{control}/{LEASE_FILE_NAME}"
         self._readers_prefix: str = f"{control}/{READERS_DIRECTORY_NAME}/"
         self._ttl: float = _require_positive("ttl_seconds", ttl_seconds)
@@ -505,24 +787,22 @@ class LocalProcessCoordinator:
         )
         self._section_timeout: float = _require_non_negative("section_timeout", section_timeout)
         self._poll: float = _require_positive("poll_interval", poll_interval)
-        self._epoch_cache_seconds: float = _require_non_negative(
-            "epoch_cache_seconds", epoch_cache_seconds
-        )
         self._lock_directory: str | None = self._prepare_lock_directory(lock_directory)
+        self._namespace: object = storage if namespace is None else namespace
 
         self._state_lock = threading.RLock()
-        self._sections: dict[tuple[int, str], _Section] = {}
-        self._local_locks: dict[str, threading.Lock] = {}
+        self._sections: dict[tuple[int, str], object] = {}
         self._held: Lease | None = None
+        self._installed: Lease | None = None
+        self._installed_epochs: set[Epoch] = set()
         self._basis: LeaseRecord | None = None
         self._basis_seen: bool = False
         self._owner_key: tuple[str, int, int] | None = None
         self._owner_key_at: float = clock.monotonic()
-        self._epoch_cache: tuple[float, Epoch] | None = None
-        self._epoch_ceiling: Epoch = 0
         self._readers: dict[str, ReaderHandle] = {}
         self._reader_sequences: dict[str, int] = {}
         self._reader_samples: dict[str, tuple[int, float]] = {}
+        self._stray_samples: dict[str, float] = {}
         self._reader_counter: int = 0
 
     def __repr__(self) -> str:
@@ -537,28 +817,36 @@ class LocalProcessCoordinator:
 
     def current_epoch(self) -> Epoch:
         """Return the epoch published by the lease file; 0 when none was ever published."""
-        return self._published_epoch(force=True)
+        return self._published_epoch()
 
     def validate_epoch(self, epoch: Epoch) -> None:
         """Raise GrafxStaleEpoch unless this exact epoch is the published one and is still held.
 
         Three conditions, all necessary and all checked before the caller can reach the device
         (BR-7, AC-6): a lease record exists, it is held, and its epoch is the one offered. The
-        first test is free: epochs never decrease, so an epoch below the highest one this
-        coordinator has ever observed is refused without touching the device at all. Inside an
-        ``exclusive()`` section the published epoch is always re-read, which is what makes the
-        optional staleness window of the cache safe for the commit protocol, whose only device
-        writes happen inside that section.
+        published record is read every time. There is deliberately no staleness window, no cache
+        and no remembered high-water mark: CONTRACT.md section 4.3 states the guarantee
+        unconditionally and section 8.5 step 2 places a validation OUTSIDE the commit section
+        precisely as the guard that runs before any device call, so anything that answered from
+        memory would turn that step into a no-op for the one caller it exists to stop.
+
+        A remembered ceiling did live here, refusing an epoch below the highest ever observed
+        without touching the device. It was removed rather than repaired. Epochs only rise within
+        ONE control plane, and C6 restoring from quarantine is the sanctioned way a control plane
+        is replaced; because steps 2 and 3.1 make a committing writer a validate-only caller, a
+        guard that refused from memory and never re-read wedged that writer for the life of the
+        process. A read of a small file is cheap; being wrong about who may write is not.
         """
         offered = _require_index("epoch", epoch)
-        if offered < self._epoch_ceiling:
+        held = self._held
+        if held is None or held.epoch != offered:
             raise GrafxStaleEpoch(
-                "The offered epoch is below an epoch already observed on this database.",
+                "This participant does not hold the lease whose epoch it offered.",
                 epoch=offered,
-                observed_epoch=self._epoch_ceiling,
+                held_epoch=None if held is None else held.epoch,
                 owner_id=self._owner,
             )
-        record = self._published_record(force=self._inside_section())
+        record = self._published_record()
         if record is None:
             raise GrafxStaleEpoch(
                 "No writer epoch is published for this database.",
@@ -580,6 +868,13 @@ class LocalProcessCoordinator:
                 published_owner=record.owner_id,
                 owner_id=self._owner,
             )
+        if record.owner_id != self._owner:
+            raise GrafxStaleEpoch(
+                "The published lease at this epoch belongs to another participant.",
+                epoch=offered,
+                published_owner=record.owner_id,
+                owner_id=self._owner,
+            )
 
     # --- writer lease --------------------------------------------------------------------------
 
@@ -593,6 +888,7 @@ class LocalProcessCoordinator:
         budget = _require_non_negative("timeout", timeout)
         started = self._clock.monotonic()
         deadline = started + budget
+        allowance = self._iteration_budget(budget)
         iterations = 0
         while True:
             iterations += 1
@@ -616,7 +912,7 @@ class LocalProcessCoordinator:
                     self._observe_wait("takeover" if stalled else "granted", claimed[1] - started)
                     return claimed[0]
             now = self._clock.monotonic()
-            if now >= deadline or iterations >= _MAX_WAIT_ITERATIONS:
+            if now >= deadline or iterations >= allowance:
                 self._observe_wait("timeout", now - started)
                 raise GrafxLeaseTimeout(
                     "The writer lease was not granted before the timeout elapsed.",
@@ -627,14 +923,36 @@ class LocalProcessCoordinator:
             self._sleep(min(self._poll, deadline - now))
 
     def renew_lease(self, lease: Lease) -> Lease:
-        """Advance the heartbeat of a held lease, or raise GrafxLeaseStolen when it moved on."""
+        """Advance the heartbeat of a lease THIS participant holds, or raise GrafxLeaseStolen.
+
+        The identity that decides is this participant own, never the one the argument claims. A
+        lease is a durable statement about a process, so honouring somebody else lease would let
+        a participant that holds nothing forge the heartbeat of another owner -- and one forged
+        heartbeat resets the stall baseline of every observer, which is exactly how a dead owner
+        would be kept alive forever against FR-7 and AC-7.
+        """
+        if lease.owner_id != self._owner:
+            raise GrafxLeaseStolen(
+                "This lease belongs to another participant and cannot be renewed here.",
+                owner_id=self._owner,
+                lease_owner=lease.owner_id,
+                epoch=lease.epoch,
+            )
         with self.exclusive(LEASE_SECTION, timeout=self._section_timeout):
             now = self._clock.monotonic()
+            held = self._held
+            if held is None or held.epoch != lease.epoch:
+                raise GrafxLeaseStolen(
+                    "This participant does not hold the lease it was asked to renew.",
+                    owner_id=self._owner,
+                    epoch=lease.epoch,
+                    held_epoch=None if held is None else held.epoch,
+                )
             record = self._observe_lease(self._read_lease_record(), now)
             if (
                 record is None
                 or not record.held
-                or record.owner_id != lease.owner_id
+                or record.owner_id != self._owner
                 or record.epoch != lease.epoch
             ):
                 self._held = None
@@ -665,16 +983,39 @@ class LocalProcessCoordinator:
     def release_lease(self, lease: Lease) -> None:
         """Give the writer role up so the next participant does not have to wait out the stall.
 
-        Releasing a lease that was already taken over is a no-op: closing a database must never
-        raise because somebody else already won the epoch.
+        Releasing a lease of THIS participant that was already taken over is a no-op: closing a
+        database must never raise because somebody else already won the epoch. Releasing a lease
+        this participant never held is refused outright, because disowning a lease nobody asked
+        to give up hands the writer role to whoever asks next, with no stall to wait out.
+
+        The identity that decides is the same one the renewal uses: not the owner name the
+        argument carries, which two participants can share by a configuration mistake, but the
+        lease this coordinator itself installed.
         """
+        if lease.owner_id != self._owner:
+            raise GrafxLeaseStolen(
+                "This lease belongs to another participant and cannot be released here.",
+                owner_id=self._owner,
+                lease_owner=lease.owner_id,
+                epoch=lease.epoch,
+            )
+        with self._state_lock:
+            held_here = lease.epoch in self._installed_epochs
+            installed = self._installed
+        if not held_here:
+            raise GrafxLeaseStolen(
+                "This participant never held the lease it was asked to release.",
+                owner_id=self._owner,
+                epoch=lease.epoch,
+                last_installed_epoch=None if installed is None else installed.epoch,
+            )
         with self.exclusive(LEASE_SECTION, timeout=self._section_timeout):
             now = self._clock.monotonic()
             record = self._observe_lease(self._read_lease_record(), now)
             if (
                 record is not None
                 and record.held
-                and record.owner_id == lease.owner_id
+                and record.owner_id == self._owner
                 and record.epoch == lease.epoch
             ):
                 self._publish_lease(
@@ -685,8 +1026,8 @@ class LocalProcessCoordinator:
                         wall_stamp=self._clock.wall(),
                     )
                 )
-            held = self._held
-            if held is not None and held.epoch == lease.epoch and held.owner_id == lease.owner_id:
+            current = self._held
+            if current is not None and current.epoch == lease.epoch:
                 self._held = None
 
     def detect_dead_owner(self, *, stall_threshold: float) -> DeadOwnerReport | None:
@@ -723,8 +1064,28 @@ class LocalProcessCoordinator:
         participant has itself observed the heartbeat stall beyond its configured threshold; an
         owner that is merely inconvenient raises the retryable GrafxLeaseTimeout, and so does an
         owner that advanced its heartbeat after the observation, because it is demonstrably alive.
+
+        The threshold applied here is ``owner_stall_threshold`` from construction, never the one
+        passed to ``detect_dead_owner``. The two can therefore disagree, and the divergence is
+        deliberately one-way: asking ``detect_dead_owner`` for a SHORTER threshold cannot lower
+        the bar this method sets, so a caller can be more cautious than the configuration but
+        never less. Amendment A13 maps both from ``lease_ttl_seconds``, so a wired database has
+        them equal.
+
+        The wait is reported through oktografx_lease_wait_seconds, which is the metric TS-7 reads
+        to see how long the surviving participant took to replace a killed one.
         """
-        now = self._clock.monotonic()
+        started = self._clock.monotonic()
+        try:
+            lease = self._perform_takeover(started)
+        except GrafxLeaseTimeout:
+            self._observe_wait("timeout", self._clock.monotonic() - started)
+            raise
+        self._observe_wait("takeover", self._clock.monotonic() - started)
+        return lease
+
+    def _perform_takeover(self, now: float) -> Lease:
+        """Run the compare-and-set of the takeover, without reporting anything about the wait."""
         if not self._basis_seen:
             self._observe_lease(self._read_lease_record(), now)
         basis = self._basis
@@ -774,7 +1135,7 @@ class LocalProcessCoordinator:
         pinned = _require_index("snapshot_lsn", snapshot_lsn)
         with self._state_lock:
             self._reader_counter += 1
-            reader_id = f"{self._owner}-r{self._reader_counter:04d}"
+            reader_id = f"{self._reader_prefix}{self._reader_counter:04d}"
         record = ReaderRecord(
             reader_id=reader_id,
             snapshot_lsn=pinned,
@@ -799,6 +1160,16 @@ class LocalProcessCoordinator:
         reader_id = _validate_identifier("reader_id", handle.reader_id)
         pinned = _require_index("snapshot_lsn", handle.snapshot_lsn)
         with self._state_lock:
+            known = reader_id in self._readers
+        if not known:
+            raise GrafxUnsupportedOperation(
+                "This coordinator did not issue that reader registration, or already withdrew "
+                "it, so it cannot prove anything about whether it is alive.",
+                reader_id=reader_id,
+                owner_id=self._owner,
+                issued_here=self._issued_here(reader_id),
+            )
+        with self._state_lock:
             sequence = self._reader_sequences.get(reader_id, 0) + 1
             self._reader_sequences[reader_id] = sequence
             self._readers[reader_id] = handle
@@ -817,6 +1188,13 @@ class LocalProcessCoordinator:
     def unregister_reader(self, handle: ReaderHandle) -> None:
         """Remove a registration and release the snapshot it pinned. Repeating it is a no-op."""
         reader_id = _validate_identifier("reader_id", handle.reader_id)
+        if not self._issued_here(reader_id):
+            raise GrafxUnsupportedOperation(
+                "This coordinator did not issue that reader registration, so withdrawing it "
+                "here would end a snapshot another participant is still reading under.",
+                reader_id=reader_id,
+                owner_id=self._owner,
+            )
         with self._state_lock:
             self._readers.pop(reader_id, None)
             self._reader_sequences.pop(reader_id, None)
@@ -835,7 +1213,11 @@ class LocalProcessCoordinator:
         now = self._clock.monotonic()
         horizon: Lsn | None = None
         observed: set[str] = set()
-        for name in self._storage.list_files(self._readers_prefix):
+        strays: list[str] = []
+        for name in self._list_files(self._readers_prefix):
+            if name.endswith(TEMPORARY_SUFFIX):
+                strays.append(name)
+                continue
             if not name.endswith(READER_FILE_SUFFIX):
                 continue
             record = self._read_reader_record(name)
@@ -848,6 +1230,7 @@ class LocalProcessCoordinator:
                 continue
             if horizon is None or record.snapshot_lsn < horizon:
                 horizon = record.snapshot_lsn
+        self._sweep_reader_temporaries(strays, now)
         with self._state_lock:
             for reader_id in [key for key in self._reader_samples if key not in observed]:
                 if reader_id not in self._readers:
@@ -874,19 +1257,15 @@ class LocalProcessCoordinator:
         budget = _require_non_negative("timeout", timeout)
         key = (threading.get_ident(), name)
         with self._state_lock:
-            entered = self._sections.get(key)
-            if entered is not None:
-                entered.depth += 1
-        if entered is not None:
-            try:
-                yield
-            finally:
-                with self._state_lock:
-                    entered.depth -= 1
+            reentered = key in self._sections
+        if reentered:
+            # The frame that took the lock is the frame that releases it, so a nested frame has
+            # nothing to do on the way in or on the way out.
+            yield
             return
         handle = self._take_lock(name, budget)
         with self._state_lock:
-            self._sections[key] = _Section(handle)
+            self._sections[key] = handle
         try:
             yield
         finally:
@@ -909,6 +1288,7 @@ class LocalProcessCoordinator:
             superseded_epoch=previous,
         )
         self._publish_lease(record)
+        self._sweep_lease_temporaries()
         lease = Lease(
             owner_id=self._owner,
             epoch=record.epoch,
@@ -917,6 +1297,12 @@ class LocalProcessCoordinator:
             ttl_seconds=record.ttl_seconds,
         )
         self._held = lease
+        # Kept after the lease is given up or taken away, so that releasing a lease this
+        # participant really did hold stays quiet while releasing one it never held is refused.
+        # The set holds every epoch this instance installed, which is one entry per takeover and
+        # therefore one entry per death of another participant: a handful over a process life.
+        self._installed = lease
+        self._installed_epochs.add(lease.epoch)
         return lease
 
     def _try_claim(self, basis: LeaseRecord | None, *, budget: float) -> tuple[Lease, float] | None:
@@ -940,51 +1326,74 @@ class LocalProcessCoordinator:
         """Return how long the heartbeat has been still, when that exceeds the threshold."""
         with self._state_lock:
             if self._owner_key is None:
+                # Defensive: every caller checks that the record is held before asking, so this
+                # is unreachable today. It stays because the alternative to returning "no stall"
+                # for an unobserved lease is measuring one against a baseline that was never set.
                 return None
             stall = now - self._owner_key_at
         return stall if stall > threshold else None
 
     def _observe_lease(self, record: LeaseRecord | None, now: float) -> LeaseRecord | None:
         """Record one observation of the lease file and return the record that was observed."""
-        epoch = 0 if record is None else record.epoch
-        key = record.liveness_key() if record is not None and record.held else None
+        # No held term here: every caller establishes that the lease is held before it asks
+        # about a stall, and the 2x2 shows either check alone holds the property. Keeping
+        # both would be a guard no input can distinguish from its neighbour.
+        key = record.liveness_key() if record is not None else None
         with self._state_lock:
             self._basis = record
             self._basis_seen = True
-            self._epoch_cache = (now, epoch)
-            if epoch > self._epoch_ceiling:
-                self._epoch_ceiling = epoch
             if key != self._owner_key:
                 self._owner_key = key
                 self._owner_key_at = now
         return record
 
-    def _published_record(self, *, force: bool) -> LeaseRecord | None:
-        """Return the published lease record, honouring the staleness window of the cache."""
-        now = self._clock.monotonic()
-        with self._state_lock:
-            cache = self._epoch_cache
-            basis = self._basis
-            window = self._epoch_cache_seconds
-            # A window of zero means "never reuse": a frozen or coarse clock must not turn a
-            # zero-width window into an unbounded one, which is what a non-strict test would do.
-            fresh = cache is not None and window > 0.0 and (now - cache[0]) < window
-        if not force and fresh and self._basis_seen:
-            return basis
-        return self._observe_lease(self._read_lease_record(), now)
+    def _published_record(self) -> LeaseRecord | None:
+        """Return the lease record as the device holds it right now, with no cache in between."""
+        return self._observe_lease(self._read_lease_record(), self._clock.monotonic())
 
-    def _published_epoch(self, *, force: bool) -> Epoch:
+    def _published_epoch(self) -> Epoch:
         """Return the epoch of the published lease record, or 0 when no record exists."""
-        record = self._published_record(force=force)
+        record = self._published_record()
         return 0 if record is None else record.epoch
 
-    def _inside_section(self) -> bool:
-        """Return True when this thread of this coordinator currently holds any named section."""
-        thread = threading.get_ident()
-        with self._state_lock:
-            return any(owner == thread for owner, _name in self._sections)
-
     # --- internals: reader state ------------------------------------------------------------------
+
+    def _sweep_reader_temporaries(self, strays: list[str], now: float) -> None:
+        """Release the temporaries of publications that will never finish, and only those.
+
+        A temporary is evidence of nothing on its own: the one being written right now by another
+        participant looks exactly like the one a process left behind when it died, and a first
+        registration has no record yet to prove it is alive. So the rule is the same one this
+        component uses everywhere else -- evidence measured over time on the local monotonic
+        clock. A publication lives for microseconds; a temporary still present after a reader is
+        allowed to stay silent belongs to nobody. Sweeping by anything else deletes another
+        participant registration mid-flight, which is the eviction BR-10 forbids.
+        """
+        with self._state_lock:
+            for name in strays:
+                first_seen = self._stray_samples.setdefault(name, now)
+                if (now - first_seen) > self._reader_stall:
+                    self._discard(name)
+                    self._stray_samples.pop(name, None)
+            for name in [key for key in self._stray_samples if key not in strays]:
+                self._stray_samples.pop(name, None)
+
+    def _issued_here(self, reader_id: str) -> bool:
+        """Return whether this coordinator instance minted that reader identifier.
+
+        Identity is decided by what this coordinator issued, never by what the argument claims,
+        which is the same rule the lease uses. The per-instance nonce in the prefix is what makes
+        the answer exact even when two coordinators share an owner identifier, and the counter is
+        checked as well so the answer means "I minted this one" rather than "this looks like
+        something I could have minted".
+        """
+        if not reader_id.startswith(self._reader_prefix):
+            return False
+        suffix = reader_id[len(self._reader_prefix) :]
+        if not suffix.isdigit():
+            return False
+        with self._state_lock:
+            return 0 < int(suffix) <= self._reader_counter
 
     def _reader_file(self, reader_id: str) -> str:
         """Return the storage name of one reader registration."""
@@ -1005,13 +1414,17 @@ class LocalProcessCoordinator:
 
     def _read_lease_record(self) -> LeaseRecord | None:
         """Read and decode the lease file, returning None when nothing is published yet."""
-        return self._read_record(self._lease_file, decode_lease_record)
+        return self._read_record(
+            self._lease_file, decode_lease_record, empty_is_absent=False
+        )
 
     def _read_reader_record(self, name: str) -> ReaderRecord | None:
         """Read and decode one reader registration, returning None when the file went away."""
-        return self._read_record(name, decode_reader_record)
+        return self._read_record(name, decode_reader_record, empty_is_absent=True)
 
-    def _read_record(self, name: str, decode: Callable[..., _Record]) -> _Record | None:
+    def _read_record(
+        self, name: str, decode: Callable[..., _Record], *, empty_is_absent: bool
+    ) -> _Record | None:
         """Read and decode a whole control record, retrying across a concurrent replacement.
 
         Reading takes two calls, the size and the bytes, and another participant may publish a
@@ -1021,15 +1434,28 @@ class LocalProcessCoordinator:
         registration is.
         """
         storage = self._storage
-        failure: GrafxError | None = None
-        reason: str | None = None
-        for _attempt in range(_READ_ATTEMPTS):
-            if not storage.exists(name):
-                return None
+        damage: GrafxError | None = None
+        attempts = 0
+        backoff = self._poll
+        while True:
+            attempts += 1
             try:
+                # The probe is a device call like any other: it can fail for the same transient
+                # reasons as the read that follows it, and leaving it outside this guard made a
+                # sharing violation on the probe fatal where one line later it was ridden out.
+                if not storage.exists(name):
+                    return None
                 size = storage.log_size(name)
                 if size == 0:
-                    return None
+                    if empty_is_absent:
+                        return None
+                    # The file existing is itself evidence that something was published, and
+                    # every other malformed shape of it fails closed. Read as absence, an empty
+                    # lease restarts the epoch lineage at 1 and re-issues a number a live
+                    # participant may still hold.
+                    raise GrafxCorruptionDetected(
+                        "The control file exists but holds no record at all.", file=name
+                    )
                 raw = storage.read_log(name, 0, size)
                 if len(raw) != size:
                     raise GrafxCorruptionDetected(
@@ -1040,18 +1466,72 @@ class LocalProcessCoordinator:
                     )
                 return decode(raw, file=name)
             except GrafxCorruptionDetected as error:
-                failure = error
+                # A length that does not match is the signature of a replacement between the two
+                # calls, so the immediate retry is the fix; only damage survives all of them.
+                damage = error
+            except GrafxError as error:
+                # A typed failure already carries the answer the device chose, and that class is
+                # part of the answer: a version mismatch is permanent, a storage error may not be,
+                # and a caller obeying A47 branches on what arrives. Re-labelling it here is how
+                # the publish path used to tell callers to retry a condition it had itself given
+                # up on after one attempt.
+                if attempts >= _READ_ATTEMPTS or not _worth_retrying(error):
+                    error.details.setdefault("file", name)
+                    error.details["attempts"] = attempts
+                    raise
+                self._sleep(backoff)
+                backoff = min(backoff * 2.0, _MAX_PUBLISH_BACKOFF)
+                continue
             except OSError as error:
-                # A device that lets a platform failure through must still not reach the caller
-                # as anything other than a typed error (CONTRACT.md section 11 item 5).
-                reason = str(error)
-        if failure is not None:
-            raise failure
-        if reason is not None:
-            raise GrafxCorruptionDetected(
-                "The control file could not be read.", file=name, reason=reason
-            )
-        return None
+                # Being unable to READ a file says nothing about the bytes in it. Reporting that
+                # as corruption would manufacture an integrity incident, and in this engine an
+                # integrity incident means truncation, quarantine and forensic ledger entries
+                # (A11-revised, FR-8, FR-10).
+                if attempts >= _READ_ATTEMPTS or not _worth_retrying(error):
+                    # A straddle seen on an earlier attempt is NOT evidence against the bytes:
+                    # this module calls it a benign race, and only a mismatch that survives every
+                    # attempt is damage. Raising it here because a later attempt failed to reach
+                    # the file manufactures the integrity incident FR-8 and FR-10 act on.
+                    raise _storage_failure(
+                        "The control file could not be read.",
+                        error,
+                        attempts=attempts,
+                        file=name,
+                    ) from error
+                self._sleep(backoff)
+                backoff = min(backoff * 2.0, _MAX_PUBLISH_BACKOFF)
+                continue
+            if attempts >= _READ_ATTEMPTS:
+                # Reaching here means the corruption arm caught the last attempt, and that arm
+                # always records what it caught -- so there is exactly one thing to raise. An
+                # alternative branch here would be one no input can take.
+                raise damage
+
+    def _list_files(self, prefix: str) -> tuple[str, ...]:
+        """List control files under a prefix, riding out a transient failure of the device."""
+        attempts = 0
+        backoff = self._poll
+        while True:
+            attempts += 1
+            try:
+                return self._storage.list_files(prefix)
+            except GrafxError as failure:
+                if attempts >= _READ_ATTEMPTS or not _worth_retrying(failure):
+                    failure.details.setdefault("file", prefix)
+                    failure.details["attempts"] = attempts
+                    raise
+                self._sleep(backoff)
+                backoff = min(backoff * 2.0, _MAX_PUBLISH_BACKOFF)
+            except OSError as failure:
+                if attempts >= _READ_ATTEMPTS or not _worth_retrying(failure):
+                    raise _storage_failure(
+                        "The control directory could not be listed.",
+                        failure,
+                        attempts=attempts,
+                        file=prefix,
+                    ) from failure
+                self._sleep(backoff)
+                backoff = min(backoff * 2.0, _MAX_PUBLISH_BACKOFF)
 
     def _publish_lease(self, record: LeaseRecord) -> None:
         """Write the lease record atomically and adopt it as this participant own observation."""
@@ -1063,7 +1543,44 @@ class LocalProcessCoordinator:
         self._publish(self._reader_file(record.reader_id), encode_reader_record(record))
 
     def _publish(self, target: str, payload: bytes) -> None:
-        """Publish a whole control record through the port: write a temporary file, then replace."""
+        """Publish a whole control record, riding out the access failures of a shared file system.
+
+        Another participant reading the lease file, an antivirus scanner or a search indexer can
+        make the replacement fail with a sharing violation on Windows (TR-3). That is transient,
+        and every attempt starts from a fresh temporary file, so repeating the sequence is safe.
+        A full device, a failed barrier or damaged bytes are answers rather than obstacles and
+        are reported at once.
+        """
+        attempts = 0
+        backoff = self._poll
+        while True:
+            attempts += 1
+            try:
+                self._publish_once(target, payload)
+                return
+            except GrafxError as failure:
+                if attempts >= _PUBLISH_ATTEMPTS or not _worth_publishing_again(failure):
+                    # The class the device chose is part of the answer and is kept: A25 counts
+                    # exactly GrafxDurabilityBarrierFailed into the barrier metric, and a device
+                    # that is full has to reach the caller as a device that is full.
+                    failure.details.setdefault("file", target)
+                    failure.details["attempts"] = attempts
+                    raise
+                self._sleep(backoff)
+                backoff = min(backoff * 2.0, _MAX_PUBLISH_BACKOFF)
+            except OSError as failure:
+                if attempts >= _PUBLISH_ATTEMPTS or not _worth_publishing_again(failure):
+                    raise _storage_failure(
+                        "The control record could not be published.",
+                        failure,
+                        attempts=attempts,
+                        file=target,
+                    ) from failure
+                self._sleep(backoff)
+                backoff = min(backoff * 2.0, _MAX_PUBLISH_BACKOFF)
+
+    def _publish_once(self, target: str, payload: bytes) -> None:
+        """Write the temporary file and replace the target with it, exactly once."""
         storage = self._storage
         temporary = f"{target}.{self._owner}.tmp"
         if storage.exists(temporary):
@@ -1073,6 +1590,23 @@ class LocalProcessCoordinator:
         storage.durable_barrier(temporary)
         storage.atomic_replace(temporary, target)
         storage.durable_barrier(target)
+
+    def _sweep_lease_temporaries(self) -> None:
+        """Release every stray temporary of the lease file left behind by a crashed participant.
+
+        Safe precisely here and nowhere else: every publication of the lease happens inside the
+        lease section, and this runs while that section is held, so no live participant can have
+        a temporary of its own outstanding. Without the sweep the strays of every crash stay for
+        the life of the database.
+        """
+        prefix = f"{self._lease_file}."
+        try:
+            names = self._list_files(prefix)
+        except (GrafxError, OSError):
+            return
+        for name in names:
+            if name.startswith(prefix) and name.endswith(TEMPORARY_SUFFIX):
+                self._discard(name)
 
     def _discard(self, name: str) -> None:
         """Release a control file that describes no live participant, tolerating deferral."""
@@ -1093,11 +1627,28 @@ class LocalProcessCoordinator:
             raise _reject("The lock_directory must be a non-empty string or None.")
         try:
             os.makedirs(lock_directory, exist_ok=True)
-        except OSError as failure:
+        except (FileExistsError, NotADirectoryError) as failure:
             raise _reject(
-                "The lock directory could not be created.",
+                "The lock directory path is taken by something that is not a directory.",
                 lock_directory=lock_directory,
-                reason=str(failure),
+                detail=str(failure),
+            ) from failure
+        except ValueError as failure:
+            # An embedded NUL is not an OSError on any platform, and it never becomes valid.
+            raise _reject(
+                "The lock directory path is not a usable path.",
+                lock_directory=lock_directory,
+                detail=str(failure),
+            ) from failure
+        except OSError as failure:
+            # Through the one builder, so the classification is mirrored into the details here
+            # exactly as it is everywhere else: a caller obeying A47 reads the details, and this
+            # is the database-open path (A13).
+            raise _storage_failure(
+                "The lock directory could not be created.",
+                failure,
+                attempts=1,
+                lock_directory=lock_directory,
             ) from failure
         return lock_directory
 
@@ -1108,17 +1659,17 @@ class LocalProcessCoordinator:
         return self._take_file_lock(name, timeout)
 
     def _take_local_lock(self, name: str, timeout: float) -> object:
-        """Take the process-local lock that stands in for a section with no lock directory."""
-        with self._state_lock:
-            lock = self._local_locks.setdefault(name, threading.Lock())
+        """Take the process-wide lock that stands in for a section with no lock directory."""
+        lock = _shared_section_lock(self._namespace, f"{self._control}/{name}")
         deadline = self._clock.monotonic() + timeout
+        allowance = self._iteration_budget(timeout)
         iterations = 0
         while True:
             iterations += 1
             if lock.acquire(blocking=False):
                 return lock
             now = self._clock.monotonic()
-            if now >= deadline or iterations >= _MAX_WAIT_ITERATIONS:
+            if now >= deadline or iterations >= allowance:
                 raise GrafxLeaseTimeout(
                     "The section was still held when the timeout elapsed.",
                     section=name,
@@ -1146,16 +1697,30 @@ class LocalProcessCoordinator:
         return handle
 
     def _wait_for_os_lock(self, handle: int, name: str, timeout: float, deadline: float) -> None:
-        """Take the advisory lock on an open handle, waiting on the injected clock until expiry."""
+        """Take the advisory lock on an open handle, waiting on the injected clock until expiry.
+
+        Only contention is a busy section. A mount without advisory locking answers ENOLCK for
+        ever, and a bad descriptor answers EBADF for ever; both are device failures, and the
+        sibling that opens this same file already says so.
+        """
+        allowance = self._iteration_budget(timeout)
         iterations = 0
         while True:
             iterations += 1
             try:
                 _acquire_os_lock(handle)
                 return
-            except OSError:
+            except OSError as failure:
+                if failure.errno not in _CONTENTION_ERRNOS:
+                    raise _storage_failure(
+                        "The advisory lock of the section could not be taken.",
+                        failure,
+                        attempts=iterations,
+                        section=name,
+                        owner_id=self._owner,
+                    ) from failure
                 now = self._clock.monotonic()
-                if now >= deadline or iterations >= _MAX_WAIT_ITERATIONS:
+                if now >= deadline or iterations >= allowance:
                     raise GrafxLeaseTimeout(
                         "The section was still held when the timeout elapsed.",
                         section=name,
@@ -1171,6 +1736,7 @@ class LocalProcessCoordinator:
         milliseconds and answer a second open with a sharing violation (TR-3). That is transient,
         so it is retried inside the budget of the caller rather than reported as a broken setup.
         """
+        allowance = self._iteration_budget(max(deadline - self._clock.monotonic(), 0.0))
         iterations = 0
         while True:
             iterations += 1
@@ -1178,11 +1744,15 @@ class LocalProcessCoordinator:
                 return os.open(path, os.O_RDWR | os.O_CREAT | _BINARY_FLAG, 0o600)
             except OSError as failure:
                 now = self._clock.monotonic()
-                if now >= deadline or iterations >= _MAX_WAIT_ITERATIONS:
-                    raise GrafxLeaseTimeout(
-                        "The lock file of the section could not be opened before the timeout.",
+                if now >= deadline or iterations >= allowance:
+                    # Nobody holds this section: the file itself cannot be opened. Reporting a
+                    # lease timeout would blame a holder that does not exist and would tell a
+                    # caller to retry a path that may never work (A11-revised).
+                    raise _storage_failure(
+                        "The lock file of the section could not be opened.",
+                        failure,
+                        attempts=iterations,
                         section=name,
-                        reason=str(failure),
                         owner_id=self._owner,
                     ) from failure
                 self._sleep(min(self._poll, deadline - now))
@@ -1207,6 +1777,10 @@ class LocalProcessCoordinator:
             release()
 
     # --- internals: timing and metrics ---------------------------------------------------------
+
+    def _iteration_budget(self, timeout: float) -> int:
+        """Return how many polls a wait of this length may spend before it gives up."""
+        return _WAIT_ITERATION_FLOOR + int(_WAIT_ITERATION_MARGIN * timeout / self._poll)
 
     def _sleep(self, seconds: float) -> None:
         """Wait for the given interval through the injected sleeper, never below zero."""

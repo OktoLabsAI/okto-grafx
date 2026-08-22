@@ -48,6 +48,14 @@ def _load(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+NON_QUERYING_PANEL_TYPES: frozenset[str] = frozenset({"row", "text", "dashlist", "news"})
+"""Panel types that render no query at all, whatever their targets happen to contain.
+
+Grafana keeps the old targets when a panel type changes, so a metric named inside a text panel
+is not plotted anywhere. Counting it would let a dashboard claim coverage it does not have.
+"""
+
+
 def _panels(dashboard: dict[str, Any]) -> list[dict[str, Any]]:
     """Return every panel, including the ones nested inside a collapsed row."""
     found: list[dict[str, Any]] = []
@@ -57,13 +65,25 @@ def _panels(dashboard: dict[str, Any]) -> list[dict[str, Any]]:
     return found
 
 
+def _is_executed(panel: dict[str, Any], target: dict[str, Any]) -> bool:
+    """Return True when Grafana would actually run this target.
+
+    A target carrying ``hide: true`` is one a user toggled off before re-exporting the
+    dashboard, which is an accident waiting rather than an attack: the JSON still names the
+    metric and the graph still has no line on it.
+    """
+    if panel.get("type") in NON_QUERYING_PANEL_TYPES:
+        return False
+    return not target.get("hide", False)
+
+
 def _expressions(dashboard: dict[str, Any]) -> list[tuple[str, str]]:
-    """Return every PromQL expression with the title of the panel it belongs to."""
+    """Return every PromQL expression Grafana would run, with the title of its panel."""
     return [
         (panel.get("title", "<untitled>"), _strip_comments(target["expr"]))
         for panel in _panels(dashboard)
         for target in panel.get("targets", [])
-        if isinstance(target.get("expr"), str)
+        if isinstance(target.get("expr"), str) and _is_executed(panel, target)
     ]
 
 
@@ -238,3 +258,46 @@ def test_no_panel_expression_of_the_shipped_dashboards_hides_behind_a_comment() 
                 expression = target.get("expr")
                 if isinstance(expression, str):
                     assert "#" not in expression, f"{name}: {panel['title']!r} comments its query"
+
+
+def test_a_hidden_target_does_not_count_as_covered() -> None:
+    # hide: true is what Grafana writes when a user toggles a query off and re-exports.
+    known = metric_names()
+    dashboard = {
+        "panels": [
+            {
+                "title": "probe",
+                "type": "timeseries",
+                "targets": [
+                    {"expr": "sum(rate(oktografx_write_conflicts_total[5m]))"},
+                    {"expr": "sum(oktografx_wal_size_bytes)", "hide": True},
+                ],
+            }
+        ]
+    }
+    assert _referenced(dashboard, known) == {"oktografx_write_conflicts_total"}
+
+
+def test_a_panel_type_that_runs_no_query_does_not_count_as_covered() -> None:
+    known = metric_names()
+    for panel_type in sorted(NON_QUERYING_PANEL_TYPES):
+        dashboard = {
+            "panels": [
+                {
+                    "title": "probe",
+                    "type": panel_type,
+                    "targets": [{"expr": "sum(oktografx_wal_size_bytes)"}],
+                }
+            ]
+        }
+        assert _referenced(dashboard, known) == set(), panel_type
+
+
+def test_no_shipped_target_is_hidden_or_on_a_panel_that_runs_nothing() -> None:
+    for name, dashboard in ALL_DASHBOARDS.items():
+        for panel in _panels(dashboard):
+            for target in panel.get("targets", []):
+                assert not target.get("hide", False), f"{name}: {panel['title']!r} hides a query"
+                assert panel.get("type") not in NON_QUERYING_PANEL_TYPES, (
+                    f"{name}: {panel['title']!r} carries a query on a panel that runs none"
+                )

@@ -26,10 +26,13 @@ difference in the measurements.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
+
+from math import isfinite
 
 from okto_grafx.adapters.metrics_openmetrics import (
     MetricAggregator,
@@ -56,6 +59,26 @@ DOCUMENT_VERSION: int = 1
 """The version of the document shape, incremented whenever the shape stops being compatible."""
 
 
+def _number(value: float) -> float | str:
+    """Return a number JSON can carry, or the text form the exposition already uses.
+
+    Emission refuses a non-finite value, so one can only arrive by accumulation overflowing.
+    ``json.dumps`` would then write the bare token ``Infinity``, which is not JSON and which a
+    strict parser rejects outright, while the text adapter renders the same number as ``+Inf``
+    and stays valid. Both adapters are built from one ``collect()`` and they should not differ
+    in whether their output can be read back, so this borrows the exposition spelling.
+    """
+    if isfinite(value):
+        return value
+    return format_number(value)
+
+
+# One mechanism, not two. An earlier version also passed allow_nan=False to json.dumps as a
+# second line of defence, but with every number already passing through _number() that argument
+# can never fire: reverting it left the suite green, which is the definition of untested. A
+# guard that cannot be shown to do anything is removed rather than kept for reassurance.
+
+
 def build_document(
     collected: tuple[tuple[MetricDescriptor, tuple[MetricSample, ...]], ...],
 ) -> dict[str, object]:
@@ -71,16 +94,16 @@ def build_document(
                 entries.append(
                     {
                         "labels": labels,
-                        "count": sample.count,
-                        "sum": sample.total,
+                        "count": _number(sample.count),
+                        "sum": _number(sample.total),
                         "buckets": [
-                            {"le": boundary, "count": cumulative}
+                            {"le": boundary, "count": _number(cumulative)}
                             for boundary, cumulative in zip(boundaries, sample.buckets, strict=True)
                         ],
                     }
                 )
             else:
-                entries.append({"labels": labels, "value": sample.value})
+                entries.append({"labels": labels, "value": _number(sample.value)})
         metrics.append(
             {
                 "name": descriptor.name,
@@ -93,16 +116,60 @@ def build_document(
     return {"format": DOCUMENT_FORMAT, "version": DOCUMENT_VERSION, "metrics": metrics}
 
 
+_ADOPTION_READ_LIMIT: int = 4096
+"""How much of an existing destination is read to decide whether this writer wrote it."""
+
+_FORMAT_TAG: str = '"format": "' + DOCUMENT_FORMAT + '"'
+"""The tag this writer emits first in every document, and the only thing it recognises by."""
+
+
+def _is_our_document(prefix: str) -> bool:
+    """Return True when the start of a file is a document this class wrote.
+
+    A closed-world test: the format tag is one we define and emit first, so recognising it needs
+    no guess about what any other file might contain. The inverse test -- deciding whether a
+    file belongs to somebody else -- has no finite answer and is not attempted.
+
+    Only the beginning is read, because a document of the full catalogue is far longer than any
+    prefix worth reading, so parsing is not an option and the tag is matched where it is written.
+    Both the compact and the indented spellings put it there.
+    """
+    text = prefix.lstrip()
+    if not text.startswith("{"):
+        return False
+    return _FORMAT_TAG in text
+
+
 class RotatingFileWriter:
     """Append JSON documents to a file, one document per line, rotating on size.
 
     Rotation is the plain scheme an operator can reason about without a manual: when the file
     would grow past ``max_bytes`` it becomes ``<path>.1``, the previous ``<path>.1`` becomes
-    ``<path>.2`` and so on up to ``backups``, and the oldest one is dropped. Nothing here ever
-    touches a database file, so G6 is safe by construction.
-    """
+    ``<path>.2`` and so on up to ``backups``, and the oldest one is dropped.
 
-    __slots__ = ("_path", "_max_bytes", "_backups", "_encoding")
+    The destination is host-supplied, so "nothing here touches a database file" cannot be
+    asserted -- it has to be made true. Pointed at ``heap.dat`` an earlier version of this class
+    appended JSON to it and then renamed it to ``heap.dat.1``, and with ``backups=0`` removed it
+    outright: three of the operations G6 says no sanctioned path performs.
+
+    So this writer only ever writes, rotates or removes a file it recognises as its own. A path
+    that does not exist is created here and is ours from then on. A path that does exist is
+    adopted only if its first line is a document this class wrote, which is a closed-world test
+    of a format we define rather than a guess about what somebody else's file might be -- there
+    is no attempt to detect a database, because the set of things that are not ours is not
+    enumerable. Anything else is refused before a single byte is written. The identity of the
+    file is captured when it is opened and re-checked before it is renamed or unlinked, so a
+    path swapped underneath the writer is not followed.
+        The message of any failure here is ours, in en-US. The text the platform supplies is
+    localized -- on a non-English system ``strerror`` is neither en-US nor ASCII -- so it travels
+    in ``details["platform_message"]`` beside the numeric codes, where a human can still read it
+    and no gate has to pretend a runtime string is ASCII (G1, A7). The source gate cannot catch
+    this on its own: the literal is ASCII in the file and only becomes localized when the
+    operating system fills it in, so the test that holds it forces a non-ASCII ``strerror``.
+
+"""
+
+    __slots__ = ("_path", "_max_bytes", "_backups", "_encoding", "_identity", "_handle")
 
     def __init__(
         self, path: str, *, max_bytes: int = 1_048_576, backups: int = 1, encoding: str = "utf-8"
@@ -129,6 +196,8 @@ class RotatingFileWriter:
         self._max_bytes = max_bytes
         self._backups = backups
         self._encoding = encoding
+        self._identity: tuple[int, int] | None = None
+        self._handle: int | None = None
 
     @property
     def path(self) -> str:
@@ -136,22 +205,185 @@ class RotatingFileWriter:
         return self._path
 
     def __call__(self, document: str) -> None:
-        """Append one document and rotate the file when it has grown past the bound."""
+        """Append one document to a file of ours, and rotate it when it outgrows the bound."""
         payload = document if document.endswith("\n") else document + "\n"
+        handle = self._claim()
         try:
-            with open(self._path, "a", encoding=self._encoding, newline="\n") as handle:
-                handle.write(payload)
-            if os.path.getsize(self._path) >= self._max_bytes:
+            self._write_everything(handle, payload.encode(self._encoding))
+            if os.fstat(handle).st_size >= self._max_bytes:
                 self._rotate()
         except OSError as failure:
             raise GrafxConfigurationError(
-                f"The metrics writer could not write to its destination: {failure.strerror}.",
+                "The metrics writer could not write to its destination.",
                 field="path",
                 value=self._path,
+                errno=failure.errno,
+                winerror=getattr(failure, "winerror", None),
+                platform_message=failure.strerror,
             ) from failure
+
+    def _write_everything(self, handle: int, payload: bytes) -> None:
+        """Store every byte of one document, or refuse. A short write is not a written document.
+
+        ``os.write`` is permitted to store fewer bytes than it was handed, and it reports that by
+        its RETURN VALUE rather than by raising -- a device that fills up mid-document is the
+        ordinary way it happens, which is the condition ``GrafxDeviceFull`` exists for. Ignoring
+        the count appended half a JSON document, returned normally, and let ``publish()`` hand the
+        caller the whole document as though it had been stored; the next document was then
+        appended straight behind the fragment, so the file gained a line that is two half
+        documents. That is corruption of the one file this adapter exists to produce, and it is
+        silent, which is worse than the failure it hides. Measured before the fix: 8 of 62 bytes
+        stored, no error raised.
+
+        Looping is also what makes the ordinary full-device path visible at all. The first short
+        write reports its count and the next one raises ``ENOSPC``, which the caller above turns
+        into a Grafx refusal; without the loop that second call never happens.
+
+        The zero-progress refusal is the loop's bound, not decoration: a device that accepts
+        nothing and raises nothing would otherwise spin here for ever, and a hang is the one
+        outcome worse than a refusal. C2's ``storage_local`` writes its pages under the same rule;
+        this is that rule at this adapter's only device write.
+        """
+        view = memoryview(payload)
+        stored = 0
+        while stored < len(payload):
+            written = os.write(handle, view[stored:])
+            if written <= 0:
+                raise GrafxConfigurationError(
+                    f"The metrics writer stored {stored} of {len(payload)} bytes and the "
+                    f"destination accepted no more; a partial document is not a document.",
+                    field="path",
+                    value=self._path,
+                    stored=stored,
+                    expected=len(payload),
+                )
+            stored += written
+
+    def close(self) -> None:
+        """Release the destination. The next write claims it again."""
+        self._release()
+
+    def _release(self) -> None:
+        """Close the held descriptor, if there is one."""
+        handle, self._handle, self._identity = self._handle, None, None
+        if handle is not None:
+            with contextlib.suppress(OSError):
+                os.close(handle)
+
+    def _claim(self) -> int:
+        """Make the destination ours, hold it open and return its descriptor, or refuse it.
+
+        The descriptor is RETURNED rather than left for the write path to read back off the
+        instance. That path used to narrow the field with ``assert self._handle is not None``,
+        which is not a guard in a shipped adapter: ``python -O`` deletes it, and what followed
+        would have been a ``TypeError`` out of ``os.write`` -- not a ``Grafx*`` error, out of a
+        public door. Returning the descriptor removes the question instead of answering it.
+
+        The descriptor is kept, not reopened per write, because it is the only identity the two
+        families agree on. A stat comparison is not one: unlinking a file and creating another at
+        the same path reuses the inode on POSIX, and every timestamp with it -- measured, a
+        swapped file matched on st_dev, st_ino, st_ctime_ns and st_mtime_ns together, while an
+        ordinary append changed two of them. Holding the descriptor pins the inode so the reuse
+        cannot happen, which turns the comparison back into an identity; on Windows it goes
+        further and stops the swap outright, because the file cannot be unlinked while it is open.
+
+        Holding it also closes the window between deciding the destination is ours and writing to
+        it: the write goes to the descriptor that was checked, not to whatever the path resolves
+        to afterwards.
+        """
+        if self._handle is not None and self._still_ours():
+            return self._handle
+        self._release()
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0)
+        try:
+            handle = os.open(self._path, flags)
+        except FileExistsError:
+            return self._adopt()
+        except OSError as failure:
+            raise GrafxConfigurationError(
+                "The metrics writer could not create its destination.",
+                field="path",
+                value=self._path,
+                errno=failure.errno,
+                winerror=getattr(failure, "winerror", None),
+                platform_message=failure.strerror,
+            ) from failure
+        self._handle = handle
+        self._identity = self._identity_of_handle()
+        return handle
+
+    def _adopt(self) -> int:
+        """Adopt an existing destination only if this class wrote its first line."""
+        try:
+            with open(self._path, "r", encoding=self._encoding, errors="replace") as handle:
+                first = handle.read(_ADOPTION_READ_LIMIT)
+        except OSError as failure:
+            raise GrafxConfigurationError(
+                "The metrics writer could not read its destination.",
+                field="path",
+                value=self._path,
+                errno=failure.errno,
+                winerror=getattr(failure, "winerror", None),
+                platform_message=failure.strerror,
+            ) from failure
+        if first.strip() and not _is_our_document(first):
+            raise GrafxConfigurationError(
+                f"The metrics writer refuses {self._path!r}: the file exists and was not "
+                f"written by this writer. It only ever writes, rotates or removes files of its "
+                f"own, so a destination that already holds something else is never adopted.",
+                field="path",
+                value=self._path,
+            )
+        flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0)
+        try:
+            handle = os.open(self._path, flags)
+        except OSError as failure:
+            raise GrafxConfigurationError(
+                "The metrics writer could not open its destination.",
+                field="path",
+                value=self._path,
+                errno=failure.errno,
+                winerror=getattr(failure, "winerror", None),
+                platform_message=failure.strerror,
+            ) from failure
+        self._handle = handle
+        self._identity = self._identity_of_handle()
+        return handle
+
+    def _identity_of_handle(self) -> tuple[int, int] | None:
+        """Return the (device, inode) of the file the held descriptor refers to."""
+        if self._handle is None:
+            return None
+        try:
+            status = os.fstat(self._handle)
+        except OSError:
+            return None
+        return (status.st_dev, status.st_ino)
+
+    def _current_identity(self) -> tuple[int, int] | None:
+        """Return the (device, inode) the destination path resolves to right now."""
+        try:
+            status = os.stat(self._path)
+        except OSError:
+            return None
+        return (status.st_dev, status.st_ino)
+
+    def _still_ours(self) -> bool:
+        """Return True when the path still resolves to the file this writer is holding."""
+        if self._handle is None or self._identity is None:
+            return False
+        return self._current_identity() == self._identity_of_handle() == self._identity
 
     def _rotate(self) -> None:
         """Shift the backups by one and move the current file into the first backup slot."""
+        if not self._still_ours():
+            raise GrafxConfigurationError(
+                f"The metrics writer will not rotate {self._path!r}: it is not the file this "
+                f"writer created. A file it did not make is not its to rename or unlink.",
+                field="path",
+                value=self._path,
+            )
+        self._release()
         if self._backups == 0:
             os.remove(self._path)
             return

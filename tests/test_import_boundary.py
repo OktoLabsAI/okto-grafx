@@ -45,6 +45,7 @@ ALLOWED_STDLIB_MODULES: frozenset[str] = frozenset(
         "__future__",
         "abc",
         "array",
+        "bisect",
         "collections",
         "collections.abc",
         "contextlib",
@@ -59,6 +60,10 @@ ALLOWED_STDLIB_MODULES: frozenset[str] = frozenset(
     }
 )
 """The only modules the pure core may import. Anything else is mechanism or a dependency.
+
+``bisect`` is an algorithm over a list the caller already holds -- no clock, no randomness,
+no device, no platform -- and the WALs LSN index rests on it (D5 item 1); it is pure in
+exactly the sense ``math`` and ``itertools`` are.
 
 ``uuid`` is deliberately absent: ``uuid4`` is unseeded randomness and ``uuid1`` reads the wall
 clock, both of which G2b and amendment A5 keep out of the domain. The identifier type is still
@@ -262,6 +267,7 @@ def scan_source(module_name: str, source: str) -> list[str]:
             ):
                 violations.append(f"{module_name}:{node.lineno} imports from {imported!r}")
                 continue
+            before = len(violations)
             for alias in node.names:
                 if alias.name == "*":
                     if imported == PACKAGE_NAME:
@@ -274,6 +280,14 @@ def scan_source(module_name: str, source: str) -> list[str]:
                     candidate, type_checking=type_checking, forbidden=forbidden
                 ):
                     violations.append(f"{module_name}:{node.lineno} imports {candidate!r}")
+            if imported == PACKAGE_NAME and len(violations) == before:
+                # Importing anything FROM the package root executes okto_grafx/__init__.py,
+                # which C11 extends with connect and Database (section 10, A10). Reported only
+                # when the name is not already a forbidden layer, whose message says more.
+                violations.append(
+                    f"{module_name}:{node.lineno} imports from the package root; "
+                    f"import the concrete module instead"
+                )
         elif isinstance(node, ast.Attribute):
             value = node.value
             if isinstance(value, ast.Name) and (value.id, node.attr) in FORBIDDEN_ATTRIBUTES:
@@ -434,6 +448,13 @@ VIOLATING_SOURCES: tuple[tuple[str, str, str], ...] = (
     ("dotted statement import", DOMAIN_MODULE, "import okto_grafx.domain.ids\n"),
     ("runtime statement import", DOMAIN_MODULE, "import okto_grafx.runtime.registry\n"),
     ("star import of the package root", DOMAIN_MODULE, "from okto_grafx import *\n"),
+    ("version from the package root", DOMAIN_MODULE, "from okto_grafx import __version__\n"),
+    ("facade from the package root", DOMAIN_MODULE, "from okto_grafx import connect\n"),
+    (
+        "aliased facade from the package root",
+        DOMAIN_MODULE,
+        "from okto_grafx import Database as _Database\n",
+    ),
     # TYPE_CHECKING may not be forged.
     (
         "forged guard by assignment",

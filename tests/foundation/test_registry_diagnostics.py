@@ -290,3 +290,30 @@ def test_none_is_refused_for_a_property_backed_member_too(
     with pytest.raises(GrafxConfigurationError) as raised:
         registry.bind("storage", NamelessStorage())
     assert raised.value.details["reasons"] == {"name": "bound to None"}
+
+
+def test_a_class_object_is_refused_where_an_instance_is_required() -> None:
+    # The methods of a class are unbound functions, so the shape check passes and every later
+    # call arrives without its instance. The slot takes an object, not the type of one.
+    class TinyClock:
+        def monotonic(self) -> float:
+            return 1.0
+
+        def wall(self) -> float:
+            return 2.0
+
+    registry = PortRegistry()
+    with pytest.raises(GrafxConfigurationError) as raised:
+        registry.bind("clock", TinyClock)
+    assert raised.value.details["slot"] == "clock"
+    assert "instance" in raised.value.message
+
+    registry.bind("clock", TinyClock())
+    assert isinstance(registry.get("clock"), Clock)
+
+
+@pytest.mark.parametrize("slot", sorted(PortRegistry.REQUIRED))
+def test_no_slot_accepts_a_class_object(slot: str, fake_ports: dict[str, object]) -> None:
+    registry = PortRegistry()
+    with pytest.raises(GrafxConfigurationError):
+        registry.bind(slot, type(fake_ports[slot]))

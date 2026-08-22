@@ -16,34 +16,76 @@ from okto_grafx.adapters.metrics_openmetrics import OpenMetricsSink
 from okto_grafx.domain.errors import GrafxBufferBudgetExceeded
 from okto_grafx.domain.page import PageType
 from okto_grafx.engine.buffer_pool import (
+    BARRIER_FAILURES_TOTAL,
     BUFFER_BUDGET_EXCEEDED_TOTAL,
     BUFFER_BUDGET_USED_BYTES,
     BUFFER_POOL_METRICS,
     CHECKSUM_FAILURES_TOTAL,
     CHECKSUM_VERIFICATIONS_TOTAL,
+    FSYNC_DURATION_SECONDS,
 )
 from okto_grafx.engine.metrics_catalog import metric, metric_names, register_catalog
 
-from .conftest import MemoryDevice, make_pool
+from .conftest import MemoryDevice, RecordingMetrics, make_pool
 
 EMITTED_NAMES: tuple[str, ...] = (
     BUFFER_BUDGET_USED_BYTES,
     BUFFER_BUDGET_EXCEEDED_TOTAL,
     CHECKSUM_VERIFICATIONS_TOTAL,
     CHECKSUM_FAILURES_TOTAL,
+    FSYNC_DURATION_SECONDS,
+    BARRIER_FAILURES_TOTAL,
 )
-"""Every metric the storage core emits."""
+"""Every metric the storage core emits.
+
+The last two are the data-file half of amendment A25. They are listed here because a roster that
+omits a metric a component owns does not merely fail to test it: it ratifies the gap, and the
+dashboard gate cannot catch it, because that gate checks that a panel exists and not that a
+series is ever populated.
+"""
 
 
 @pytest.mark.parametrize("name", EMITTED_NAMES)
 def test_every_metric_the_pool_emits_is_in_the_frozen_catalog(name: str) -> None:
     assert name in metric_names()
-    assert metric(name) in BUFFER_POOL_METRICS
+    assert name in {descriptor.name for descriptor in BUFFER_POOL_METRICS}
 
 
-def test_the_pool_declares_the_catalog_descriptor_and_not_a_copy() -> None:
-    for descriptor in BUFFER_POOL_METRICS:
-        assert descriptor is metric(descriptor.name)
+def test_every_name_the_pool_actually_emits_was_declared_first() -> None:
+    """Run a workload and check what came out, rather than what the module says will come out.
+
+    Comparing the declared tuple against the catalog it was built from proves nothing: it is the
+    same objects on both sides. What can actually be wrong is an emission under a name nobody
+    registered, which a recording sink refuses in production and which only a workload can find.
+    """
+    device = MemoryDevice()
+    sink = RecordingMetrics()
+    pool = make_pool(device, sink, budget_pages=2, db_label="alpha")
+    device.create("heap.dat")
+    first = pool.allocate("heap.dat", int(PageType.HEAP))
+    first.insert_slot(b"payload")
+    pool.unpin("heap.dat", first.page_index, dirty=True)
+    pool.checkpoint()
+    pool.invalidate()
+    pool.pin("heap.dat", 0)
+    pool.unpin("heap.dat", 0)
+    second = pool.allocate("heap.dat", int(PageType.HEAP))
+    pool.unpin("heap.dat", second.page_index, dirty=True)
+    pool.pin("heap.dat", 0)
+    pool.pin("heap.dat", 1)
+    with pytest.raises(GrafxBufferBudgetExceeded):
+        pool.allocate("heap.dat", int(PageType.HEAP))
+
+    emitted = {name for _kind, name, _value, _labels in sink.calls}
+    assert emitted, "the workload emitted nothing at all"
+    assert emitted <= metric_names(), sorted(emitted - metric_names())
+    assert emitted <= set(EMITTED_NAMES), sorted(emitted - set(EMITTED_NAMES))
+    assert {
+        BUFFER_BUDGET_USED_BYTES,
+        BUFFER_BUDGET_EXCEEDED_TOTAL,
+        CHECKSUM_VERIFICATIONS_TOTAL,
+        FSYNC_DURATION_SECONDS,
+    } <= emitted
 
 
 def test_a_pool_and_the_catalog_can_be_registered_on_the_same_sink() -> None:

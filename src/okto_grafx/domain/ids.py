@@ -55,10 +55,18 @@ NO_CSN: Csn = 0
 NO_PAGE: PageIndex = 0xFFFFFFFF
 
 MAX_PAGE_INDEX: PageIndex = 0xFFFFFFFF
-"""Largest encodable page index. It is the same value as :data:`NO_PAGE` by construction."""
+"""Largest encodable page index. It is the same value as :data:`NO_PAGE` by construction.
+
+Section 3 of the contract does not list this constant, and it is not a second identifier: it
+names the bound that :meth:`RecordRef.encode` already enforces, so a component validating a page
+index reads the limit instead of repeating the literal. The buffer pool does exactly that.
+"""
 
 MAX_SLOT_ID: SlotId = 0xFFFF
-"""Largest encodable slot id: the slot directory stores 16-bit entries."""
+"""Largest encodable slot id: the slot directory stores 16-bit entries.
+
+The companion of :data:`MAX_PAGE_INDEX`, and the reason a slot cannot address a 65536-byte page.
+"""
 
 _SLOT_BITS: int = 16
 _MAX_ENCODED: int = (MAX_PAGE_INDEX << _SLOT_BITS) | MAX_SLOT_ID

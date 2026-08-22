@@ -1,0 +1,1083 @@
+"""Recovery at open (CONTRACT.md section 8.6, SPEC-M1 FR-8, BR-1, BR-2, BR-3, AC-4, AC-5).
+
+This is the component every other component hands its damage to, and the whole of it is the
+frozen algorithm of section 8.6 with one refinement stated out loud below.
+
+    1. read the meta identity; a format this build cannot read stops the run;
+    2. scan the log from the published checkpoint and stop believing it at the first stretch of
+       bytes that is not a record, or the first record that breaks sequence contiguity;
+    3. if a tail is discarded, copy the affected ranges into quarantine WITH A MANIFEST and then
+       truncate. ``heap.dat``, ``catalog.dat`` and ``index/*`` are never touched (G6, BR-1);
+    4. write exactly one ledger entry per discarded item, classified by SD-4 (G8, BR-3);
+    5. redo the page writes of committed transactions, idempotently, through ``page_lsn``;
+    6. uncommitted transactions need no undo, because pages are written only at commit;
+    7. ``recovery_policy="refuse"`` raises ``recovery_refused`` INSTEAD of step 3, and leaves
+       everything on disk exactly as it was -- including the ledger's own repair, which is a
+       write like any other and therefore waits for a policy that permits writing.
+
+**The refinement: quarantine, then ledger, then truncate.** Section 8.6 fixes quarantine before
+truncation and leaves the ledger's position open. Writing the ledger entries before the cut is
+strictly stronger: at every instant, the evidence for a byte that is about to disappear is
+already durable. It is also the order carried finding CF-1 states for retirement -- quarantine
+the record, write the forensic entry, retire the name, report it -- so the two paths of this
+component destroy things the same way round.
+
+**Running twice produces the same state.** Every step is keyed on what is on the device rather
+than on what this pass has done: a quarantine capture of a range already captured returns the
+entry that exists, a ledger entry is written only for damage still present, redo is idempotent
+through ``page_lsn``, and a second run over a repaired log finds nothing to do and reports
+``clean``. Interrupting recovery anywhere and re-running it converges on the same place, which is
+what AC-4 asks for at every injected crash point.
+
+**After replaying catalog pages, the catalog is re-derived and adopted, never loaded** (carried
+finding CF-4). ``load()`` is destructive by definition -- it throws away the in-memory tables --
+so recovery takes ``read_from_pages()`` and ``adopt()``: the store then holds what the replayed
+pages actually say, and its structure epoch is current, so the caller's next ``save()`` is
+accepted rather than refused. Recovery does not ``save()`` itself: a save writes pages the log
+never covered, and nothing at this point wants the catalog written back -- what the route has to
+achieve is a store that is not left refusing, and adopt is what achieves it. Proven by
+``test_the_catalog_can_save_after_recovery_replayed_its_pages``.
+
+**Nothing here holds a lock** (A91, LESSONS L2): the engine layer has no locks at all, so the
+ports it calls -- every one of them host-supplied -- can never be re-entered under one.
+
+**What this component needs from the log, stated as a dependency rather than assumed.** The only
+truncation door is ``WalManager.truncate_after``, and it is reachable only through a manager that
+opened. So a damaged log MUST still open: ``open()`` has to record what it found in ``damage``
+and leave the manager usable, because a log that refuses to open is a log whose repair door
+cannot be called -- and this component would then have no way to quarantine, record and cut the
+very damage it exists for. C4's P2a is exactly that case (a checksum-valid record with an
+oversized descriptor length) and is being fixed to record rather than raise. Recovery deliberately
+does NOT call ``open()`` itself: ``open()`` clears the manager's unflushed set, and a pass run
+against a manager with appends still waiting for a barrier would drop them from that set. Opening
+the log is the caller's step; repairing it is this one's.
+
+The second half of the same dependency: **``scan_all`` must answer from the device, not from an
+index cached before another participant wrote.** The whole plan of a pass -- where the good work
+ended, what is discarded, what is replayed -- is derived from that one walk, so a stale answer is
+a stale decision about what to destroy. C4 is re-deriving these doors as part of CF-6, and this
+component is written against that: it takes the walk once, at the start of the pass, and it never
+caches anything across passes of its own. Every re-run re-derives, which is also what makes a
+re-run converge.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Protocol, runtime_checkable
+
+from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
+    GrafxCorruptionDetected,
+    GrafxError,
+    GrafxPortNotConfigured,
+    GrafxRecoveryRefused,
+    GrafxSchemaVersionMismatch,
+)
+from okto_grafx.domain.ids import NO_LSN, Lsn
+from okto_grafx.domain.ledger.classification import classify_failure, classify_record
+from okto_grafx.domain.ledger.entry import LedgerOriginClass, LedgerReason
+from okto_grafx.domain.ledger.payload import LedgerPayload
+from okto_grafx.domain.page.file_header import FileHeaderPage
+from okto_grafx.domain.page.layout import is_unwritten_image
+from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
+from okto_grafx.domain.ports.storage import StorageDevice
+from okto_grafx.domain.recovery.decision import (
+    DiscardedRange,
+    DiscardedRecord,
+    RecoveryPlan,
+    plan_recovery,
+    redo_order,
+)
+from okto_grafx.domain.recovery.report import (
+    OUTCOME_CLEAN,
+    OUTCOME_QUARANTINED,
+    OUTCOME_REFUSED,
+    OUTCOME_TRUNCATED,
+    POLICY_REFUSE,
+    POLICY_REPLAY,
+    RECOVERY_POLICIES,
+    FindingKind,
+    RecoveryFinding,
+    RecoveryReport,
+    stronger_outcome,
+)
+from okto_grafx.domain.recovery.retry import RETRYABLE_KEY, is_retryable
+from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE, CommitState
+from okto_grafx.domain.txn.records import decode_page_write
+from okto_grafx.engine.buffer_pool import BufferPool, apply_page_image
+from okto_grafx.engine.ledger_store import LedgerStore
+from okto_grafx.engine.metrics_catalog import metric
+from okto_grafx.engine.quarantine import QuarantineStore, is_protected
+
+__all__ = [
+    "MAX_LEDGER_BODY_BYTES",
+    "META_FILE",
+    "RECOVERIES_TOTAL",
+    "RECOVERY_DISCARDED_RECORDS_TOTAL",
+    "RECOVERY_METRICS",
+    "RECOVERY_REPLAYS_TOTAL",
+    "STORAGE_PORT_METHODS",
+    "TRUNCATION_ATTEMPTS",
+    "ControlRecordProbe",
+    "RecoveryManager",
+]
+
+META_FILE: str = "grafx.meta"
+"""The identity page of a database (CONTRACT.md section 6.1)."""
+
+TRUNCATION_ATTEMPTS: int = 3
+"""How many times a truncation is retried when the platform defers releasing a segment."""
+
+MAX_LEDGER_BODY_BYTES: int = 1 << 20
+"""Largest damaged range copied INTO a ledger entry as well as into quarantine.
+
+A damaged range can be a whole segment, and an entry that carried one would put megabytes into an
+append-only file every reader of the ledger has to walk. Past this size the entry keeps its
+provenance and names the quarantine entry that holds the bytes, which is where the evidence lives
+in either case -- the copy in the ledger is a convenience for small ranges, never the record of
+truth. ``LedgerStore.export`` refuses such an entry by naming the quarantine entry rather than
+returning a partial range, because half of a damaged range is worse evidence than none.
+"""
+
+RECOVERY_REPLAYS_TOTAL: str = "oktografx_recovery_replays_total"
+"""Counter of records replayed by recovery (CONTRACT.md section 9)."""
+
+RECOVERY_DISCARDED_RECORDS_TOTAL: str = "oktografx_recovery_discarded_records_total"
+"""Counter of records discarded by recovery, by ledger origin class (section 9)."""
+
+RECOVERIES_TOTAL: str = "oktografx_recoveries_total"
+"""Counter of recovery runs completed, by outcome (section 9)."""
+
+RECOVERY_METRICS: tuple[MetricDescriptor, ...] = (
+    metric(RECOVERY_REPLAYS_TOTAL),
+    metric(RECOVERY_DISCARDED_RECORDS_TOTAL),
+    metric(RECOVERIES_TOTAL),
+)
+"""Every metric this manager emits, taken from the frozen catalogue by name and never invented."""
+
+STORAGE_PORT_METHODS: tuple[str, ...] = (
+    "exists",
+    "read_page",
+    "page_count",
+    "log_size",
+    "read_log",
+    "recycle",
+    "remove",
+)
+"""The storage doors this manager opens directly. Everything else goes through the other stores."""
+
+_ORIGIN_LABELS: dict[LedgerOriginClass, dict[str, str]] = {
+    LedgerOriginClass.REAPPLICABLE: {"origin_class": "reapplicable"},
+    LedgerOriginClass.FORENSIC: {"origin_class": "forensic"},
+}
+
+_CONTROL_PREFIX: str = "control/"
+
+
+@runtime_checkable
+class ControlRecordProbe(Protocol):
+    """Whoever can tell this component that a control-plane record is damaged.
+
+    Carried finding CF-1 makes retirement of a damaged reader or lease record C6's act. C6 cannot
+    decide damage for itself: those records belong to the coordination adapter, whose decoders the
+    engine may not import (G2 keeps the layers apart). So the evidence is INJECTED, and a manager
+    with no probe refuses to retire anything at all -- which is the fail-closed direction, and the
+    one that cannot be talked into deleting a healthy lease.
+    """
+
+    def read_control_record(self, file: str) -> None:
+        """Read one control record, raising when it is damaged and returning when it is not."""
+        ...
+
+
+class RecoveryManager:
+    """Runs the frozen recovery algorithm of CONTRACT.md section 8.6 over one database."""
+
+    __slots__ = (
+        "_storage",
+        "_wal",
+        "_ledger",
+        "_quarantine",
+        "_pool",
+        "_catalog",
+        "_metrics",
+        "_policy",
+        "_probe",
+        "_coordinator",
+        "_meta_file",
+    )
+
+    def __init__(
+        self,
+        storage: StorageDevice,
+        wal: object,
+        ledger: LedgerStore,
+        quarantine: QuarantineStore,
+        pool: BufferPool,
+        metrics: MetricsSink,
+        *,
+        catalog: object = None,
+        recovery_policy: str | None = None,
+        control_probe: ControlRecordProbe | None = None,
+        coordinator: object = None,
+        meta_file: str = META_FILE,
+        policy: str | None = None,
+    ) -> None:
+        """Build the manager over the stores and ports one recovery pass needs.
+
+        ``catalog``, ``control_probe`` and ``coordinator`` are optional because a database can be
+        recovered without any of them: a catalog store is needed only to complete the CF-4 route,
+        a probe only to retire a damaged control record, and a coordinator only to re-derive the
+        reader horizon C4 asks about after a retirement. Each absent one disables exactly its own
+        step and says so in the report rather than guessing.
+
+        **The policy is spelled ``recovery_policy``**, the name ``DatabaseConfig`` and section 5
+        give it, so the composition root passes one word through rather than translating it.
+        ``policy`` is still accepted, because the assembly already written against it belongs to
+        another component and a silent rename would break it -- but the two may not DISAGREE.
+        Naming the same setting twice with two different values has no correct reading, so it is
+        refused rather than resolved by an ordering rule nobody can see from the call site.
+        """
+        _require_port("storage", storage, STORAGE_PORT_METHODS)
+        _require_port("wal", wal, ("scan_all", "truncate_after", "open", "damage", "segments"))
+        _require_port("metrics", metrics, ("enabled", "register", "increment"))
+        if not isinstance(ledger, LedgerStore):
+            raise GrafxConfigurationError(
+                f"Recovery needs a LedgerStore; got {type(ledger).__name__}.",
+                field="ledger",
+                value=type(ledger).__name__,
+            )
+        if not isinstance(quarantine, QuarantineStore):
+            raise GrafxConfigurationError(
+                f"Recovery needs a QuarantineStore; got {type(quarantine).__name__}.",
+                field="quarantine",
+                value=type(quarantine).__name__,
+            )
+        if not isinstance(pool, BufferPool):
+            raise GrafxConfigurationError(
+                f"Recovery needs a BufferPool to replay pages through; got "
+                f"{type(pool).__name__}.",
+                field="pool",
+                value=type(pool).__name__,
+            )
+        self._storage: StorageDevice = storage
+        self._wal = wal
+        self._ledger: LedgerStore = ledger
+        self._quarantine: QuarantineStore = quarantine
+        self._pool: BufferPool = pool
+        self._catalog = catalog
+        self._metrics: MetricsSink = metrics
+        self._policy: str = _validate_policy(_one_policy(recovery_policy, policy))
+        self._probe: ControlRecordProbe | None = control_probe
+        self._coordinator = coordinator
+        self._meta_file: str = _require_text("meta_file", meta_file)
+        if self._metrics.enabled:
+            for declared in RECOVERY_METRICS:
+                self._metrics.register(declared)
+
+    @property
+    def recovery_policy(self) -> str:
+        """Return the recovery policy this manager runs under: replay or refuse."""
+        return self._policy
+
+    @property
+    def policy(self) -> str:
+        """Return the recovery policy, under the shorter name. Reading cannot be ambiguous."""
+        return self._policy
+
+    # --- the pass ----------------------------------------------------------------------------
+
+    def run(self) -> RecoveryReport:
+        """Recover the database and return what was done (CONTRACT.md section 8.6)."""
+        findings: list[RecoveryFinding] = []
+        self._check_meta()
+        plan = self._scan(findings)
+        if plan.unsupported is not None:
+            raise GrafxSchemaVersionMismatch(
+                f"The log holds a record this build cannot read at byte {plan.unsupported.offset} "
+                f"of {plan.unsupported.segment!r}: {plan.unsupported.detail} Nothing was "
+                "discarded, because those bytes are intact and belong to a newer build.",
+                file=plan.unsupported.segment,
+                offset=plan.unsupported.offset,
+                field="format_version",
+            )
+        outcome = OUTCOME_CLEAN
+        entries_created = 0
+        if plan.damaged:
+            if self._policy == POLICY_REFUSE:
+                self._count_outcome(OUTCOME_REFUSED)
+                raise GrafxRecoveryRefused(
+                    f"The log is damaged and the recovery policy is {POLICY_REFUSE!r}, so nothing "
+                    "was quarantined, discarded or replayed. Reopen with the replay policy to "
+                    "recover to the last intact record.",
+                    field="recovery_policy",
+                    last_good_lsn=plan.last_good_lsn,
+                    discards=plan.discards,
+                )
+            self._repair_ledger(findings)
+            entries_created = self._preserve(plan, findings)
+            self._truncate(plan, findings)
+            outcome = stronger_outcome(outcome, OUTCOME_TRUNCATED)
+        else:
+            # A clean log still owes the ledger its repair: an append interrupted by the previous
+            # crash would otherwise leave the ledger unwritable for good. Under the refuse policy
+            # it is skipped with everything else, because step 7 says that policy leaves the disk
+            # untouched and an operator picks it precisely for that -- and a CLEAN log is the
+            # only shape in which this branch is the thing being tested, because the damaged-log
+            # branch above raises before it can be reached. Pinned by
+            # ``test_a_clean_log_under_refuse_leaves_a_damaged_ledger_exactly_as_it_was``.
+            if self._policy != POLICY_REFUSE:
+                self._repair_ledger(findings)
+        replayed = self._redo(plan, findings)
+        self._count_outcome(outcome)
+        report = RecoveryReport(
+            outcome=outcome,
+            records_replayed=replayed,
+            records_discarded=plan.discards,
+            ledger_entries_created=entries_created,
+            last_good_lsn=plan.last_good_lsn,
+            findings=tuple(findings),
+        )
+        return report
+
+    def retire_control_record(self, file: str) -> RecoveryReport:
+        """Retire a damaged control-plane record, in the order carried finding CF-1 fixes.
+
+        Quarantine the record with a manifest, write the forensic ledger entry, retire the name,
+        report it. Never as a side effect of a hot path: this is a door an operator or the open
+        sequence calls deliberately, and it refuses in three ways rather than guessing.
+
+        * With no ``control_probe`` configured it refuses outright. Retiring a control record
+          needs EVIDENCE that it is damaged, and this component cannot produce that evidence
+          itself -- the records belong to the coordination adapter and the engine may not import
+          it (G2). A manager that would retire on request alone is a delete button.
+        * A record the probe reads successfully is refused. Failing closed on a damaged reader
+          blocks reclamation and failing closed on a damaged lease blocks writing; neither is a
+          reason to remove a HEALTHY record, and C4's position is explicit that a writer must
+          never delete the file that is refusing it.
+        * A file outside ``control/`` is refused, so this door can never be aimed at the log, the
+          heap or anything else.
+        * **Only a non-retryable ``GrafxCorruptionDetected`` from the probe counts as evidence.**
+          Section 2 freezes exactly one damage class and this is it. A retryable failure is an
+          ACCESS failure -- a sharing violation from an antivirus or an indexer -- and says
+          nothing about the bytes; ``stale_epoch`` and ``lease_stolen`` are what the coordination
+          adapter raises about a HEALTHY lease when the READER is the stale one, so retiring on
+          them is the stale writer deleting the live writer's lease; ``port_not_configured`` is
+          the probe failing to run at all; ``schema_version_mismatch`` is intact bytes from a
+          newer build, which ``run()`` already refuses to call damage. All of them refuse, and
+          the retryable case declares itself retryable so the caller knows to try again (A47,
+          A11-revised, CF-1). Proven by
+          ``test_a_retryable_access_failure_is_never_evidence_of_damage``,
+          ``test_a_probe_that_fails_with_a_foreign_exception_retires_nothing`` and
+          ``test_only_corruption_detected_is_evidence_a_control_record_is_damaged``.
+
+        C4 asks for the reader horizon to be re-derived after any retirement, because it caches
+        none across a pass. When a coordinator is configured that happens here and the result is
+        reported; when one is not, the report says the caller owes the re-derivation.
+        """
+        name = _require_text("file", file)
+        if self._probe is None:
+            raise GrafxRecoveryRefused(
+                "Retiring a control record needs a probe that can prove the record is damaged, "
+                "and none is configured; nothing was touched.",
+                field="control_probe",
+                file=name,
+            )
+        if not name.startswith(_CONTROL_PREFIX) or is_protected(name):
+            raise GrafxRecoveryRefused(
+                f"{name!r} is not a control-plane record, so it is not this door's to retire.",
+                field="file",
+                file=name,
+            )
+        if not self._storage.exists(name):
+            raise GrafxRecoveryRefused(
+                f"There is no control record {name!r} to retire.", field="file", file=name
+            )
+        damage = self._probe_damage(name)
+        if damage is None:
+            raise GrafxRecoveryRefused(
+                f"The control record {name!r} reads cleanly, so retiring it would remove a "
+                "healthy registration and the participant it belongs to would lose its place.",
+                field="file",
+                file=name,
+            )
+        findings: list[RecoveryFinding] = []
+        size = self._storage.log_size(name)
+        entry = self._quarantine.capture(
+            origin=name,
+            offset=0,
+            length=size,
+            reason=LedgerReason.QUARANTINED_SEGMENT.name.lower(),
+            detail=damage,
+        )
+        findings.append(
+            RecoveryFinding(
+                kind=FindingKind.QUARANTINED_RANGE,
+                detail=f"The control record {name!r} was copied into quarantine before retiring.",
+                file=name,
+                length=size,
+                quarantine=entry.name,
+            )
+        )
+        # Counted rather than assumed. ``record_retirement`` is idempotent on the damage
+        # identity, so a retry after an interrupted retirement returns the identifier of the
+        # entry that already exists and creates NOTHING -- and a report that says one entry was
+        # created either way is a report that cannot be added up across retries (G8/BR-3 asks for
+        # exactly one entry per discard, and this number is how a caller checks that).
+        entries_before = len(self._ledger.entries())
+        entry_id = self._ledger.record_retirement(
+            payload=LedgerPayload(
+                origin=name,
+                offset=0,
+                length=size,
+                failure=LedgerReason.QUARANTINED_SEGMENT.name.lower(),
+                detail=damage,
+                quarantine=entry.name,
+                body=self._quarantine.read(entry.name),
+            )
+        )
+        entries_created = len(self._ledger.entries()) - entries_before
+        # The name goes last, and only after the copy and the entry are durable. A platform that
+        # defers the release is reported rather than retried into a loop: the evidence is already
+        # kept, so a name that lingers is bounded and visible, which is the honest outcome C4 asks
+        # for when it says an unknown horizon is not a horizon.
+        released = self._storage.recycle(name)
+        lingering = ""
+        if not released and self._storage.exists(name):
+            try:
+                self._storage.remove(name)
+            except GrafxError as failure:
+                lingering = str(failure)
+        if self._storage.exists(name):
+            detail = (
+                f"The damaged control record {name!r} was quarantined as {entry.name!r} and "
+                f"recorded in ledger entry {entry_id}, and the platform has not released its "
+                f"name yet. {lingering} Retry the retirement; nothing was lost."
+            )
+        else:
+            detail = (
+                f"The damaged control record {name!r} was retired after being quarantined "
+                f"as {entry.name!r} and recorded in ledger entry {entry_id}. The reader "
+                "horizon must be re-derived before the log is recycled again."
+            )
+        findings.append(
+            RecoveryFinding(
+                kind=FindingKind.CONTROL_RECORD_RETIRED,
+                detail=detail,
+                file=name,
+                entry_id=entry_id,
+                quarantine=entry.name,
+            )
+        )
+        findings.append(self._rederive_horizon())
+        self._count_outcome(OUTCOME_QUARANTINED)
+        return RecoveryReport(
+            outcome=OUTCOME_QUARANTINED,
+            records_replayed=0,
+            records_discarded=1,
+            ledger_entries_created=entries_created,
+            last_good_lsn=NO_LSN,
+            findings=tuple(findings),
+        )
+
+    # --- steps -------------------------------------------------------------------------------
+
+    def _check_meta(self) -> None:
+        """Step 1: read the identity page and refuse a format this build cannot read.
+
+        A database with no meta page yet is not a mismatch -- it is a database being created, and
+        FR-1 puts recovery in the reopen path. Neither is a page 0 of nothing but zeros: C1's
+        ``is_unwritten_image`` establishes that an all-zero image is an allocated page nobody has
+        written, which is what a crash between creating the file and stamping it leaves. A meta
+        page whose format is NEWER than this build does stop the run, before anything is scanned,
+        because every later step would be deciding what to discard using rules that do not apply
+        to it.
+        """
+        if not self._storage.exists(self._meta_file):
+            return
+        if self._storage.page_count(self._meta_file) < 1:
+            return
+        raw = self._storage.read_page(self._meta_file, 0)
+        if is_unwritten_image(raw, self._pool.page_size):
+            return
+        # FileHeaderPage.read is the whole check. It refuses a page that is not of type META,
+        # a page with no header record, a file that is not this engine's, and a format newer
+        # than this build reads -- with the same class and the same ``field`` a second check
+        # here would use. A mutation battery proved that second check untestable: deleting it
+        # left the suite green because C1's answered in its place (A62, A67a). One mechanism,
+        # independently observable, beats two that alibi each other.
+        page = self._pool.codec.decode_page(raw, verify=True)
+        FileHeaderPage.read(page)
+
+    def _repair_ledger(self, findings: list[RecoveryFinding]) -> None:
+        """Make the ledger writable again after a crash during one of its own appends (TR-5).
+
+        The interrupted bytes are quarantined before they are cut, exactly like a damaged log
+        tail, so even the ledger's own repair leaves evidence. Without this the whole pass would
+        fail on its first append, and G8 would be unsatisfiable for the run that most needs it.
+
+        The preservation is the ledger store's own, not a step performed here: preserve and
+        destroy are one door there, so this component cannot skip the first half by editing the
+        second. What is left here is the reporting.
+        """
+        damage = self._ledger.damage
+        if damage is None:
+            return
+        discard = self._ledger.discard_damaged_tail()
+        findings.append(
+            RecoveryFinding(
+                kind=FindingKind.QUARANTINED_RANGE,
+                detail=(
+                    f"An interrupted ledger append left {discard.removed_bytes} unreadable bytes "
+                    f"at byte {discard.offset}; they were quarantined as {discard.quarantine!r} "
+                    "and then cut so the ledger could take this pass's entries."
+                ),
+                file=self._ledger.file,
+                offset=discard.offset,
+                length=discard.removed_bytes,
+                quarantine=discard.quarantine,
+            )
+        )
+
+    def _scan(self, findings: list[RecoveryFinding]) -> RecoveryPlan:
+        """Step 2: walk the log and decide where the good work ended."""
+        floor = self._checkpoint_lsn()
+        plan = plan_recovery(self._wal.scan_all(), floor_lsn=floor)
+        for discontinuity in plan.discontinuities:
+            findings.append(
+                RecoveryFinding(
+                    kind=FindingKind.LSN_DISCONTINUITY,
+                    detail=(
+                        f"The log expected sequence number {discontinuity.expected_lsn} at byte "
+                        f"{discontinuity.offset} of {discontinuity.segment!r} and found a record "
+                        "carrying another, so everything from there on is discarded."
+                    ),
+                    file=discontinuity.segment,
+                    offset=discontinuity.offset,
+                    lsn=discontinuity.expected_lsn,
+                )
+            )
+        return plan
+
+    def _preserve(self, plan: RecoveryPlan, findings: list[RecoveryFinding]) -> int:
+        """Steps 3 and 4: quarantine every discarded range, then write one ledger entry each.
+
+        The order inside one item is copy, then record, then (later) cut. Across items it is all
+        copies and all records before any cut, so an interruption at any point leaves a log that
+        still holds the damage and a quarantine that already holds the evidence -- and a re-run
+        recognises both instead of duplicating either.
+
+        The count returned is the number of entries this pass ENSURED EXIST, one per discarded
+        item, and it stays one per item on a re-run that finds the entry an interrupted pass
+        already wrote. That is deliberate: ``records_discarded == ledger_entries_created`` is the
+        equality G8 and BR-3 want a caller to be able to assert, and it would be false exactly
+        when recovery was interrupted -- the case where the trace matters most.
+        """
+        created = 0
+        for damaged in plan.ranges:
+            created += self._record_range(damaged, findings)
+        for discarded in plan.records:
+            created += self._record_record(discarded, findings)
+        return created
+
+    def _record_range(self, damaged: DiscardedRange, findings: list[RecoveryFinding]) -> int:
+        """Quarantine one undecodable range and write its forensic ledger entry."""
+        origin_class, reason = classify_failure(damaged.reason)
+        entry = self._quarantine.capture(
+            origin=damaged.segment,
+            offset=damaged.offset,
+            length=damaged.length,
+            reason=reason.name.lower(),
+            detail=damaged.detail,
+            expected_lsn=damaged.expected_lsn,
+        )
+        body, detail = _carried_body(self._quarantine.read(entry.name), entry.name, damaged.detail)
+        entry_id = self._ledger.record_discard(
+            origin_class=origin_class,
+            reason=reason,
+            lsn_start=damaged.expected_lsn,
+            lsn_end=damaged.expected_lsn,
+            payload=LedgerPayload(
+                origin=damaged.segment,
+                offset=damaged.offset,
+                length=damaged.length,
+                expected_lsn=damaged.expected_lsn,
+                failure=str(damaged.reason.value),
+                detail=detail,
+                quarantine=entry.name,
+                body=body,
+            ),
+        )
+        findings.append(
+            RecoveryFinding(
+                kind=FindingKind.DAMAGED_RANGE,
+                detail=(
+                    f"{damaged.length} bytes at byte {damaged.offset} of "
+                    f"{damaged.segment!r} are not a record ({damaged.reason.value}); they were "
+                    f"quarantined as {entry.name!r} and recorded as forensic ledger entry "
+                    f"{entry_id}."
+                ),
+                file=damaged.segment,
+                offset=damaged.offset,
+                length=damaged.length,
+                lsn=damaged.expected_lsn,
+                entry_id=entry_id,
+                quarantine=entry.name,
+            )
+        )
+        self._count_discard(origin_class)
+        return 1
+
+    def _record_record(
+        self, discarded: DiscardedRecord, findings: list[RecoveryFinding]
+    ) -> int:
+        """Quarantine one decodable record that sits above the cut, and record it as reapplicable.
+
+        The bytes are copied as well as decoded. A reapplicable entry carries the encoded record
+        so an applier can be handed the operation itself, and quarantining the same range means
+        the range is recoverable even if this build's decoder is the thing that turns out to be
+        wrong.
+        """
+        segment = discarded.segment
+        offset = discarded.offset
+        record = discarded.record
+        length = record.encoded_length()
+        origin_class, reason = classify_record()
+        entry = self._quarantine.capture(
+            origin=segment,
+            offset=offset,
+            length=length,
+            reason=reason.name.lower(),
+            detail=(
+                f"A record with sequence number {record.lsn} decoded cleanly and sits above the "
+                "last intact record, so it cannot be applied."
+            ),
+            expected_lsn=record.lsn,
+        )
+        body, detail = _carried_body(
+            self._quarantine.read(entry.name),
+            entry.name,
+            (
+                f"Record {record.lsn} of transaction {record.txn_id} in epoch "
+                f"{record.epoch} was discarded with the truncated tail."
+            ),
+        )
+        entry_id = self._ledger.record_discard(
+            origin_class=origin_class,
+            reason=reason,
+            lsn_start=record.lsn,
+            lsn_end=record.lsn,
+            epoch=record.epoch,
+            payload=LedgerPayload(
+                origin=segment,
+                offset=offset,
+                length=length,
+                expected_lsn=record.lsn,
+                record_type=record.record_type,
+                failure=reason.name.lower(),
+                detail=detail,
+                quarantine=entry.name,
+                body=body,
+            ),
+        )
+        findings.append(
+            RecoveryFinding(
+                kind=FindingKind.DISCARDED_RECORD,
+                detail=(
+                    f"Record {record.lsn} at byte {offset} of {segment!r} decoded cleanly and sat "
+                    f"above the cut; it was quarantined as {entry.name!r} and recorded as "
+                    f"reapplicable ledger entry {entry_id}."
+                ),
+                file=segment,
+                offset=offset,
+                length=length,
+                lsn=record.lsn,
+                entry_id=entry_id,
+                quarantine=entry.name,
+            )
+        )
+        self._count_discard(origin_class)
+        return 1
+
+    def _truncate(self, plan: RecoveryPlan, findings: list[RecoveryFinding]) -> None:
+        """Step 3, second half: cut the log back to the last intact record.
+
+        C4 leaves a log LONGER than asked when the platform will not release a segment, which is
+        a valid log rather than one with a hole in it, so an incomplete truncation is retried
+        inside a small budget and then reported. Reporting it is not a formality: until the cut
+        completes the log still refuses appends, and the operator needs to know why.
+        """
+        attempt = 1
+        while True:
+            report = self._wal.truncate_after(plan.last_good_lsn)
+            if report.completed or attempt >= TRUNCATION_ATTEMPTS:
+                break
+            attempt += 1
+        if report.completed:
+            kind = FindingKind.LOG_TRUNCATED
+            detail = (
+                f"The log was cut back to sequence number {plan.last_good_lsn}: "
+                f"{report.removed_records} records and {report.removed_bytes} bytes went."
+            )
+        else:
+            kind = FindingKind.TRUNCATION_DEFERRED
+            detail = (
+                f"The log could not be cut back to sequence number {plan.last_good_lsn}: the "
+                f"platform still holds {len(report.deferred_segments)} segments after "
+                f"{attempt} attempts. The bytes are quarantined and recorded; retry the open."
+            )
+        findings.append(
+            RecoveryFinding(
+                kind=kind,
+                detail=detail,
+                lsn=plan.last_good_lsn,
+                length=report.removed_bytes,
+            )
+        )
+
+    def _redo(self, plan: RecoveryPlan, findings: list[RecoveryFinding]) -> int:
+        """Step 5: reapply the page writes of committed transactions, idempotently.
+
+        The redo door is C1's ``apply_page_image``, and using it rather than writing the rule
+        again is deliberate: the same rule decides here and in the commit path, so the two cannot
+        drift into disagreeing about which image wins. It applies when the resident page is free
+        or older, grows the file when the page is missing, and leaves a newer page alone -- which
+        is what makes replaying the same log twice produce the same file.
+
+        The count returned is the number of records REPLAYED -- offered to that rule and not
+        refused -- and not the number of pages it changed. The two differ exactly when a page is
+        already at or above the image's sequence number, which is the ordinary case for a database
+        that closed cleanly; reporting zero there would say recovery did not look at the log.
+        """
+        replayed = 0
+        touched_catalog = False
+        for record in redo_order(plan.replayable):
+            write = decode_page_write(record.payload)
+            if not _is_redoable(write.file):
+                findings.append(
+                    RecoveryFinding(
+                        kind=FindingKind.REDO_REFUSED,
+                        detail=(
+                            f"Record {record.lsn} names {write.file!r}, which is not a paged "
+                            "file of this database; no page image was applied to it."
+                        ),
+                        file=write.file,
+                        lsn=record.lsn,
+                    )
+                )
+                continue
+            try:
+                apply_page_image(self._pool, write.file, write.page_index, write.image)
+            except GrafxCorruptionDetected as damaged:
+                findings.append(
+                    RecoveryFinding(
+                        kind=FindingKind.REDO_REFUSED,
+                        detail=(
+                            f"The page image of record {record.lsn} for page "
+                            f"{write.page_index} of {write.file!r} was refused: {damaged.message}"
+                        ),
+                        file=write.file,
+                        page=write.page_index,
+                        lsn=record.lsn,
+                    )
+                )
+                continue
+            replayed += 1
+            if write.file == _CATALOG_FILE:
+                touched_catalog = True
+        if replayed and self._metrics.enabled:
+            self._metrics.increment(RECOVERY_REPLAYS_TOTAL, float(replayed))
+        if touched_catalog:
+            self._adopt_catalog(findings)
+        return replayed
+
+    def _adopt_catalog(self, findings: list[RecoveryFinding]) -> None:
+        """Complete the CF-4 route after catalog pages were replayed: read, then adopt.
+
+        Never ``load()``. C1 measured what that costs -- a store holding ``['Person','Second']``
+        came back holding ``['Person']`` -- and the guard exists to prevent exactly that loss.
+        ``read_from_pages()`` says what the replayed pages hold, ``adopt()`` states that the store
+        now describes those pages, and the store's next ``save()`` is then accepted instead of
+        being refused for an epoch that moved under it.
+        """
+        if self._catalog is None:
+            findings.append(
+                RecoveryFinding(
+                    kind=FindingKind.CATALOG_ADOPTED,
+                    detail=(
+                        "Catalog pages were replayed and no catalog store is wired to this "
+                        "recovery, so the caller must read its catalog from the pages and adopt "
+                        "it before saving; a plain save would be refused."
+                    ),
+                    file=_CATALOG_FILE,
+                )
+            )
+            return
+        try:
+            adopted = self._catalog.adopt(self._catalog.read_from_pages())
+        except GrafxError as failure:
+            findings.append(
+                RecoveryFinding(
+                    kind=FindingKind.CATALOG_UNREADABLE,
+                    detail=(
+                        "Catalog pages were replayed and the catalog could not be read back from "
+                        f"them: {failure}"
+                    ),
+                    file=_CATALOG_FILE,
+                )
+            )
+            return
+        findings.append(
+            RecoveryFinding(
+                kind=FindingKind.CATALOG_ADOPTED,
+                detail=(
+                    f"The catalog was re-derived from the replayed pages and adopted, holding "
+                    f"{len(adopted.tables())} tables; the store is not left refusing its next "
+                    "save."
+                ),
+                file=_CATALOG_FILE,
+            )
+        )
+
+    # --- helpers -----------------------------------------------------------------------------
+
+    def _checkpoint_lsn(self) -> Lsn:
+        """Return the published checkpoint, or zero when there is none to read.
+
+        A commit state that will not parse is not a reason to refuse: it is a control-plane hint
+        about how much of the log is already on the pages, and treating it as absent only makes
+        recovery redo more, which is idempotent. Refusing here would wedge the database on a file
+        that no data depends on.
+        """
+        if not self._storage.exists(COMMIT_STATE_FILE):
+            return NO_LSN
+        try:
+            size = self._storage.log_size(COMMIT_STATE_FILE)
+            state = CommitState.decode(self._storage.read_log(COMMIT_STATE_FILE, 0, size))
+        except GrafxError:
+            return NO_LSN
+        return state.checkpoint_lsn
+
+    def _probe_damage(self, file: str) -> str | None:
+        """Return why the probe says a control record is damaged, or None when it reads cleanly.
+
+        **The taxonomy of section 2 freezes exactly ONE damage class, and this door accepts
+        exactly that one.** ``GrafxCorruptionDetected`` is the class A11-revised reserves for
+        conditions attributable to DAMAGED BYTES, and it is the class FR-8/FR-10 turn into
+        truncation, quarantine and a forensic ledger entry. Every other class says something
+        about the reader, the caller or the build -- never about the bytes:
+
+        * ``stale_epoch`` and ``lease_stolen`` are what the coordination adapter raises about a
+          perfectly HEALTHY lease when the reader is the stale one. Retiring on those is a stale
+          writer deleting the live writer's lease and filing it as forensic damage, which is
+          carried finding CF-1 point 4 inverted: *never for letting a writer delete the file that
+          is refusing it*.
+        * ``port_not_configured`` is G5 saying the probe could not run at all -- the same "it
+          said nothing about the bytes" the foreign-exception branch below refuses on.
+        * ``schema_version_mismatch`` is a record from a NEWER build, and ``run()`` already
+          states the opposite position for the log: *nothing was discarded, because those bytes
+          are intact and belong to a newer build*. Two doors of one component may not disagree
+          about whether intact bytes are damage.
+        * a retryable failure is an ACCESS failure -- a sharing violation from an antivirus or an
+          indexer -- and it declares itself retryable so the caller knows to try again (A47).
+
+        Everything that is not the one damage class therefore refuses in the same direction the
+        healthy case and the foreign-exception case already refuse, and says which class it saw.
+        The probe is host-supplied code and is called with nothing of this component in flight
+        (A91).
+        """
+        probe = self._probe
+        if probe is None:  # pragma: no cover - the caller refuses before reaching here
+            return None
+        try:
+            probe.read_control_record(file)
+        except GrafxCorruptionDetected as damaged:
+            if is_retryable(damaged):
+                # A corruption class that declares itself retryable is not the settled evidence
+                # this door destroys a name on; it is a reader asking to be called again.
+                raise self._busy_refusal(file, damaged) from damaged
+            return damaged.message
+        except GrafxError as failure:
+            if is_retryable(failure):
+                # A47 and A11-revised, on the one door of this component that destroys a name.
+                # A sharing violation from an antivirus or an indexer is an ACCESS failure: it
+                # says the record could not be read now, and nothing whatever about the bytes.
+                # Treating it as damage quarantines and retires a HEALTHY lease -- which is C4's
+                # position inverted, and it is the exact condition A11-revised was written about.
+                # Retirement needs evidence of DAMAGE, so this refuses and says to try again.
+                raise self._busy_refusal(file, failure) from failure
+            raise GrafxRecoveryRefused(
+                f"The probe for control record {file!r} refused with {failure.code!r}, which is "
+                f"not evidence that its bytes are damaged -- only "
+                f"{GrafxCorruptionDetected.code!r} is: {failure.message} Nothing was quarantined "
+                "or retired.",
+                file=file,
+                field="control_probe",
+                cause=failure.code,
+                probe_error=type(failure).__name__,
+            ) from failure
+        except Exception as failure:  # noqa: BLE001 - only Grafx errors leave a public door
+            # An unclassifiable failure is evidence of nothing either. The probe broke; whether
+            # the RECORD is damaged is exactly what it failed to say, and guessing in the
+            # destructive direction is the wrong way to be wrong.
+            raise GrafxRecoveryRefused(
+                f"The probe for control record {file!r} failed with "
+                f"{type(failure).__name__}: {failure} That says nothing about the bytes, so "
+                "nothing was quarantined or retired.",
+                file=file,
+                field="control_probe",
+                probe_error=type(failure).__name__,
+            ) from failure
+        return None
+
+    @staticmethod
+    def _busy_refusal(file: str, failure: GrafxError) -> GrafxRecoveryRefused:
+        """Return the retryable refusal for a probe that says the file is busy, not damaged."""
+        refusal = GrafxRecoveryRefused(
+            f"The control record {file!r} could not be read, and the failure declares "
+            f"itself retryable, so it is evidence that the file is busy rather than "
+            f"damaged: {failure.message} Nothing was quarantined or retired; retry.",
+            retryable=True,
+            file=file,
+            field="control_probe",
+            cause=failure.code,
+        )
+        refusal.details[RETRYABLE_KEY] = True
+        return refusal
+
+    def _rederive_horizon(self) -> RecoveryFinding:
+        """Ask the coordinator for the reader horizon again, as C4 requires after a retirement."""
+        if self._coordinator is None:
+            return RecoveryFinding(
+                kind=FindingKind.READER_HORIZON_REDERIVED,
+                detail=(
+                    "No coordinator is wired to this recovery, so the caller must re-derive the "
+                    "reader horizon before the log is recycled again; the log manager caches "
+                    "none across a pass."
+                ),
+            )
+        try:
+            horizon = self._coordinator.reader_horizon()
+        except GrafxError as failure:
+            return RecoveryFinding(
+                kind=FindingKind.READER_HORIZON_REDERIVED,
+                detail=(
+                    f"The reader horizon still cannot be derived after the retirement: {failure} "
+                    "Nothing may be recycled until it can."
+                ),
+            )
+        return RecoveryFinding(
+            kind=FindingKind.READER_HORIZON_REDERIVED,
+            detail=(
+                "The reader horizon was re-derived after the retirement and is "
+                f"{'unset, so no live reader holds the log back' if horizon is None else horizon}."
+            ),
+            lsn=NO_LSN if horizon is None else horizon,
+        )
+
+    def _count_discard(self, origin_class: LedgerOriginClass) -> None:
+        """Count one discarded item under its origin class (CONTRACT.md section 9)."""
+        if self._metrics.enabled:
+            self._metrics.increment(
+                RECOVERY_DISCARDED_RECORDS_TOTAL, 1.0, _ORIGIN_LABELS[origin_class]
+            )
+
+    def _count_outcome(self, outcome: str) -> None:
+        """Count one completed recovery run under its outcome (CONTRACT.md section 9)."""
+        if self._metrics.enabled:
+            self._metrics.increment(RECOVERIES_TOTAL, 1.0, {"outcome": outcome})
+
+    def __repr__(self) -> str:
+        """Return a short description naming the policy this manager runs under."""
+        return f"RecoveryManager(recovery_policy={self._policy!r})"
+
+
+_CATALOG_FILE: str = "catalog.dat"
+_REDOABLE_FILES: frozenset[str] = frozenset({"heap.dat", _CATALOG_FILE})
+_REDOABLE_PREFIXES: tuple[str, ...] = ("index/",)
+
+
+def _carried_body(body: bytes, entry_name: str, detail: str) -> tuple[bytes, str]:
+    """Return the bytes a ledger entry may carry, and the detail that explains what it carries.
+
+    Past ``MAX_LEDGER_BODY_BYTES`` the entry carries none and says where they are instead. Half a
+    damaged range in the ledger and the whole of it in quarantine would be two answers to one
+    question, and the smaller one wears the same digest as if it were complete.
+    """
+    if len(body) <= MAX_LEDGER_BODY_BYTES:
+        return body, detail
+    return b"", (
+        f"{detail} The range is {len(body)} bytes, past the {MAX_LEDGER_BODY_BYTES} an entry "
+        f"carries, so the bytes are preserved in quarantine entry {entry_name!r}."
+    )
+
+
+def _is_redoable(file: str) -> bool:
+    """Return whether a page image may be applied to this file.
+
+    G6 protects the main data files from being MOVED, renamed or deleted; writing a logged page
+    into one is not that -- it is the redo those files exist for. What is refused here is a record
+    naming anything that is not a paged file of this database: a control record, a log segment or
+    a quarantine copy. Applying a page image to one of those would be this component manufacturing
+    the corruption it exists to answer.
+    """
+    if not isinstance(file, str) or not file:
+        return False
+    normalised = file.replace("\\", "/")
+    if normalised in _REDOABLE_FILES:
+        return True
+    return any(normalised.startswith(prefix) for prefix in _REDOABLE_PREFIXES)
+
+
+def _require_port(slot: str, instance: object, methods: Sequence[str]) -> None:
+    """Refuse a port or collaborator that cannot answer the doors recovery opens (G5)."""
+    missing = [name for name in methods if not hasattr(instance, name)]
+    if missing:
+        raise GrafxPortNotConfigured(
+            f"The {slot} port of recovery is missing {', '.join(missing)}.",
+            slot=slot,
+            missing=tuple(missing),
+        )
+
+
+def _one_policy(recovery_policy: object, policy: object) -> object:
+    """Return the single policy the caller named, refusing two spellings that disagree.
+
+    Section 5 and ``DatabaseConfig`` call this setting ``recovery_policy``; the assembly written
+    against this manager calls it ``policy``. Accepting both keeps that assembly working through
+    the rename, and refusing a DISAGREEMENT is what stops the alias from becoming a place where a
+    caller's stated policy is silently discarded -- which on the ``refuse`` policy would mean
+    quarantining and truncating a log the operator asked nobody to touch.
+    """
+    if recovery_policy is not None and policy is not None and recovery_policy != policy:
+        raise GrafxConfigurationError(
+            f"The recovery policy was given twice and the two disagree: recovery_policy="
+            f"{recovery_policy!r} and policy={policy!r}. Name it once.",
+            field="recovery_policy",
+            value=repr((recovery_policy, policy)),
+        )
+    chosen = recovery_policy if recovery_policy is not None else policy
+    return POLICY_REPLAY if chosen is None else chosen
+
+
+def _validate_policy(policy: object) -> str:
+    """Return the recovery policy, refusing a word that is not one of the two FR-8 defines."""
+    if policy not in RECOVERY_POLICIES:
+        raise GrafxConfigurationError(
+            f"A recovery policy is one of {RECOVERY_POLICIES}; got {policy!r}.",
+            field="recovery_policy",
+            value=repr(policy),
+        )
+    return str(policy)
+
+
+def _require_text(field: str, value: object) -> str:
+    """Return a non-empty string argument, refusing anything else."""
+    if not isinstance(value, str) or not value:
+        raise GrafxConfigurationError(
+            f"The {field} of a recovery operation must be a non-empty string; got {value!r}.",
+            field=field,
+            value=repr(value),
+        )
+    return value

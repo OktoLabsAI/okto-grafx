@@ -1,0 +1,280 @@
+# Okto Grafx continuous integration (component C13).
+#
+# SPEC-M1 TR-8 and decision D9: Windows and POSIX are equal citizens, so the whole bench runs on
+# both families and the aggregate is green only when BOTH are. SPEC-VEC TR-6 and VTS-9 add the
+# second axis: the suite must also run WITHOUT the optional extras, so four jobs -- two families
+# times two installation profiles.
+#
+# The matrix is not only a way to run tests twice. It is the input to the cross-family coverage
+# check (LESSONS L4): every job writes pytest's own junit report, uploads it, and a final job
+# intersects them and fails when any test was observed to run on NO job. That is a question no
+# single session can answer, which is why it lives here and not in a conftest.
+#
+# Four rules this file must keep, because they are the difference between a gate and a decoration:
+#
+#   * `fail-fast: false` and `if: always()` on every upload. A job that stops early or a report
+#     that never arrives makes the coverage check UNMEASURED, and UNMEASURED is red (A75.2). It
+#     must never be able to look like "nothing to report". C0 measured the failure mode this
+#     guards against: under contention its wheel-building fixture exceeded the session timeout and
+#     pytest died WITHOUT writing any junit, and three whole-repo readings were lost. So a leg
+#     that produced no report says so in its own step, by name, instead of surfacing later as a
+#     confusing missing artefact -- and the checker merges one report per shard, so a leg may be
+#     split without any shard being able to take the whole reading down with it.
+#   * pytest is invoked with APPENDED options only. `addopts` in pyproject.toml carries
+#     `--timeout=60 --timeout-method=thread`; re-spelling it here would disarm the hang guard and
+#     turn an infinite loop into a stalled runner instead of a red build (A61, A42, A88).
+#   * The extras are installed from the manifest, never re-pinned here, so `[accel]` and `[bench]`
+#     have one home (A52). An extra that has no wheel for a platform is allowed to be absent: the
+#     tests that need it declare it, skip on that job, and the coverage check then requires them
+#     to have run on another one.
+#   * pytest's own EXIT STATUS is recorded and it decides the leg alongside the junit counts. A
+#     session can be failed by something that writes no junit at all -- C0's per-session gate does
+#     exactly that -- so a leg judged from `failures`/`errors` alone discards the gate it took ten
+#     rounds to harden. The status is written to a file by the suite step and read by the next one.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    name: suite (${{ matrix.family }} / ${{ matrix.profile }})
+    runs-on: ${{ matrix.os }}
+    # Generous, but bounded: an unbounded job that hangs reports nothing at all, and a hang must
+    # always become a red result rather than a wait (A42/A88).
+    timeout-minutes: 90
+    strategy:
+      # Every job must produce a report, including the ones that fail: the coverage check reads
+      # what the matrix observed, and a cancelled sibling is a hole in the observation.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            family: windows
+            profile: bare
+            extras: ""
+          - os: windows-latest
+            family: windows
+            profile: extras
+            extras: "accel,bench"
+          - os: ubuntu-latest
+            family: posix
+            profile: bare
+            extras: ""
+          - os: ubuntu-latest
+            family: posix
+            profile: extras
+            extras: "accel,bench"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install the project and its test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # setuptools and wheel are needed in the environment itself: the packaging suite builds
+          # a wheel with --no-build-isolation to assert what ships (TR-9).
+          python -m pip install "setuptools>=68" wheel
+          python -m pip install -e ".[dev]"
+
+      - name: Install the optional extras for this profile
+        if: matrix.extras != ''
+        shell: bash
+        # An extra with no wheel for this platform must not kill the job. The tests that need it
+        # declare it with @pytest.mark.optional_dependency and skip; the coverage check then
+        # demands they ran on some other job, so an absence here can never become a silent hole.
+        run: python -m pip install -e ".[${{ matrix.extras }}]" || echo "an extra of [${{ matrix.extras }}] has no wheel for this platform; continuing without it"
+
+      - name: Record what actually ran this job
+        shell: bash
+        # The family label above is a claim made by this file. The coverage check compares it
+        # with what the interpreter reports, so a mislabelled matrix entry cannot let one family
+        # stand in for two.
+        run: |
+          python -c "import json, sys, platform; print(json.dumps({'sys_platform': sys.platform, 'python': sys.version.split()[0], 'platform': platform.platform()}))" > report.xml.env.json
+          cat report.xml.env.json
+
+      - name: Run the whole suite
+        shell: bash
+        # Options are APPENDED. addopts stays exactly as pyproject declares it (A61).
+        # junit_family=xunit1 keeps the file and line attributes. They are not decoration: the
+        # cross-family check resolves a collection-level entry against the module's own file,
+        # because a dotted name cannot tell a class inside a module from a different module in a
+        # directory of the same stem. Without them the check reports UNMEASURED.
+        # The session is allowed to exit non-zero without aborting the step: a failing test must
+        # still be reported as EXECUTED to the coverage check, and the artefacts below must be
+        # uploaded either way. But the status is RECORDED rather than thrown away. pytest can
+        # fail a session WITHOUT writing a failure or an error into junit -- C0's per-session
+        # gate names unattributed skips and vanished modules in a terminal section and then sets
+        # `session.exitstatus = 1` -- so a leg judged from junit counts alone reads GREEN on a
+        # session pytest itself failed. The next step reads both.
+        run: |
+          status=0
+          python -m pytest -p no:cacheprovider -o junit_family=xunit1 --junitxml=report.xml || status=$?
+          echo "$status" > pytest-status.txt
+          echo "pytest exited with status $status; this leg's verdict is taken in the next step"
+
+      - name: This leg must have produced a readable junit, and it decides the leg's result
+        if: always()
+        shell: bash
+        # The suite's verdict is taken from pytest's own report AND from pytest's own exit status,
+        # not from a wrapper's (A75). A missing or unparseable report fails HERE, naming itself,
+        # rather than becoming an unexplained gap in the matrix an hour later.
+        #
+        # Junit alone is not the whole verdict. A pytest session can fail without writing a single
+        # <failure> or <error>: C0's per-session gate prints its offenders as a terminal section
+        # and sets `session.exitstatus = 1`, and a plugin or a conftest hook may do the same. A leg
+        # judged only by `failures`/`errors` therefore reads GREEN on a session pytest failed, and
+        # ten rounds of hardening that gate would buy nothing here. So the recorded exit status is
+        # read too: a non-zero status that junit does not explain fails the leg, and says why.
+        run: |
+          python - <<'PYTHON'
+          import sys, xml.etree.ElementTree as ET
+          from pathlib import Path
+          report = Path("report.xml")
+          if not report.is_file() or not report.read_bytes().strip():
+              sys.exit("this leg wrote no junit report: the session died before writing one, "
+                       "so nothing it ran can be counted (UNMEASURED, never zero)")
+          try:
+              root = ET.fromstring(report.read_bytes())
+          except ET.ParseError as error:
+              sys.exit(f"this leg's junit report does not parse: {error}")
+          recorded = Path("pytest-status.txt")
+          if not recorded.is_file() or not recorded.read_text().strip():
+              sys.exit("the suite step recorded no pytest exit status, so this leg cannot be "
+                       "judged: a status that was not written is not a status of zero (A75.2)")
+          try:
+              status = int(recorded.read_text().strip())
+          except ValueError:
+              sys.exit(f"the recorded pytest exit status is not a number: "
+                       f"{recorded.read_text().strip()!r}")
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", "0")) for s in suites)
+          failures = sum(int(s.get("failures", "0")) for s in suites)
+          errors = sum(int(s.get("errors", "0")) for s in suites)
+          skipped = sum(int(s.get("skipped", "0")) for s in suites)
+          print(f"pytest exit status={status} "
+                f"tests={tests} failures={failures} errors={errors} skipped={skipped}")
+          if tests == 0:
+              sys.exit("this leg collected nothing, which certifies nothing")
+          if failures or errors:
+              sys.exit(f"the suite is red on this leg: {failures} failure(s), {errors} error(s)")
+          if status != 0:
+              sys.exit(f"pytest exited {status} on this leg while its junit report shows 0 "
+                       "failures and 0 errors, so the session was failed by something that does "
+                       "not write junit -- C0's per-session gate (unattributed skips, vanished "
+                       "modules) sets session.exitstatus that way. Read the terminal sections of "
+                       "the 'Run the whole suite' step; a session pytest failed is never green.")
+          PYTHON
+
+      - name: Upload this job's junit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.family }}-${{ matrix.profile }}
+          path: |
+            report.xml
+            report.xml.env.json
+            pytest-status.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  coverage:
+    name: cross-family coverage (LESSONS L4, TR-8)
+    needs: suite
+    # `always()`: the check must run even when a suite job failed. A red suite and a test that
+    # ran nowhere are different defects and both must be reported.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Download every job's report
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Every test must have been observed to run on at least one family
+        run: |
+          python -m bench.coverage \
+            --reports-dir artifacts \
+            --debt bench/coverage_debt.txt \
+            --json coverage.json
+
+      - name: Upload the coverage verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-family-coverage
+          path: coverage.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  calibration:
+    name: D5 ceilings (${{ matrix.family }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            family: windows
+          - os: ubuntu-latest
+            family: posix
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install the project, the test dependencies and the bench extra
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip install -e ".[bench]" || echo "the [bench] extra has no wheel for this platform; the baseline will report UNMEASURED"
+
+      - name: Measure both engines and publish the three multiples
+        shell: bash
+        # A missing baseline is UNMEASURED and the gate refuses it; it is never a pass. The
+        # iteration counts are smaller than a bench run on a quiet machine, and the artefact
+        # records them, because a number without its method is not reproducible.
+        run: |
+          python -m bench.harness \
+            --iterations 20 --warmup 5 --records 1000 --rows 512 \
+            --out calibration-${{ matrix.family }}.json \
+            --metrics metrics-${{ matrix.family }}.json || true
+
+      - name: Apply the D5 ceilings to the PUBLISHED metric
+        shell: bash
+        # OR-4: the gate reads oktografx_baseline_ceiling_multiple, not a log. A durable-commit
+        # multiple above 10x is the 'consult JP' state of FR-15 and stops the pipeline.
+        run: python -m bench.harness.gate --metrics metrics-${{ matrix.family }}.json
+
+      - name: Upload the calibration artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: calibration-${{ matrix.family }}
+          path: |
+            calibration-${{ matrix.family }}.json
+            metrics-${{ matrix.family }}.json
+          if-no-files-found: warn
+          retention-days: 14

@@ -22,6 +22,7 @@ __all__ = [
     "FORBIDDEN_LABEL_NAMES",
     "UNBOUNDED_LABEL_CARDINALITY_LIMIT",
     "NON_EN_US_MARKERS",
+    "NON_EN_US_WORDS",
     "MetricKind",
     "LabelSpec",
     "MetricDescriptor",
@@ -101,13 +102,54 @@ same tuple is the single source of truth for ``tests/test_language_surface.py``.
 """
 
 
+
+NON_EN_US_WORDS: frozenset[str] = frozenset(
+    {
+    "aberto", "ainda", "antes", "apenas", "aqui", "armazenamento", "arquivo", "atual", 
+    "atualizar", "aviso", "banco", "buscar", "cabecalho", "cada", "campo", "chamada", "chave", 
+    "cheio", "coluna", "concluido", "consulta", "contagem", "criar", "dados", "depois", "deve", 
+    "devem", "encontrado", "entao", "entrada", "entre", "erro", "escrita", "escrito", "espaco", 
+    "esperado", "esta", "estao", "excluir", "executado", "falha", "falso", "fechado", "gerado", 
+    "gravacao", "gravado", "gravar", "indice", "iniciado", "inicio", "leitura", "linha", 
+    "lista", "memoria", "mesmo", "momento", "motivo", "muito", "nao", "nome", "novo", "numero", 
+    "nunca", "obtido", "onde", "pagina", "pela", "pelo", "porque", "pouco", "primeiro", 
+    "processo", "proximo", "quando", "quantidade", "recuperacao", "registro", "resultado", 
+    "retorno", "saida", "salvar", "sao", "sempre", "sobre", "sucesso", "tabela", "tamanho", 
+    "tentativa", "tipo", "todas", "todos", "transacao", "ultimo", "uma", "umas", "usuario", 
+    "validacao", "valor", "vazio", "verdadeiro"
+    }
+)
+"""Curated pt-BR words, the companion of :data:`NON_EN_US_MARKERS` (amendment A57).
+
+The markers catch function words in running prose; these catch the nouns and verbs an error
+message or a metric description is actually built from. Using only the markers let an ordinary
+three-word pt-BR metric description pass the source gate AND this registration check, which is
+the surface guideline G1 names first. Every word was checked against the complete identifier and
+literal vocabulary of ``src/``, so a hit means Portuguese rather than a coincidence.
+"""
+
+
+def _words_of(text: str) -> set[str]:
+    """Return the lowercase word tokens of a sentence, with a naive plural stripped."""
+    tokens: set[str] = set()
+    for raw in text.lower().split():
+        cleaned = "".join(character for character in raw if character.isalpha())
+        if not cleaned:
+            continue
+        tokens.add(cleaned)
+        if cleaned.endswith("s") and len(cleaned) > 3:
+            tokens.add(cleaned[:-1])
+    return tokens
+
+
 def _first_non_en_us_marker(text: str) -> str | None:
     """Return the first pt-BR marker found in the text, or None when it reads as en-US."""
     haystack = f" {text.lower()} "
     for marker in NON_EN_US_MARKERS:
         if marker in haystack:
             return marker
-    return None
+    shared = sorted(_words_of(text) & NON_EN_US_WORDS)
+    return shared[0] if shared else None
 
 
 def _is_snake_case(value: str) -> bool:

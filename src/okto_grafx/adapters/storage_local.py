@@ -12,15 +12,21 @@ current end of file, and which proves afterwards that the file did not grow. The
 path that seeks past the end and writes, so the beyond end of file zero fill signature of the
 reference engine cannot be produced by this adapter even by a caller that tries.
 
+The page size vocabulary belongs to C1 (A24): this module imports MIN_PAGE_SIZE, MAX_PAGE_SIZE
+and validate_page_size from okto_grafx.domain.page instead of stating bounds of its own.
+
 *Identity never depends on case (TR-3).* A logical name is matched segment by segment against
 the real directory entries, so ``HEAP.DAT`` never resolves to ``heap.dat`` on a case insensitive
 volume. A request that differs from a stored name only by case is refused with a typed error
 instead of silently overwriting the stored file.
 
-*A queued deletion is never keyed on a live name (A17).* Recycling frees the logical name at
-once and remembers the file by an identity that cannot be reused, and the deletion pass proves
-that identity again immediately before it unlinks anything. A file published later under a name
-that was once recycled is therefore never destroyed by a late deletion pass.
+*A queued deletion is never keyed on a live name (A27).* Recycling frees the logical name, and a
+deletion is queued only under the reserved pending delete name the file was moved to, which no
+logical name may ever carry. When the name cannot be freed at all, the device queues nothing and
+says so, because it has no reliable way to notice later that somebody re-claimed the name: an
+identity stamp was measured and cannot see a size preserving page write, since the modification
+time of a file only advances once per tick. A file published later under a name that was once
+recycled is therefore never destroyed by a late deletion pass.
 
 *Nothing but a Grafx error leaves this module (TR-6).* Every OSError is classified and
 translated. The translation table is deliberate and documented here:
@@ -67,15 +73,22 @@ from okto_grafx.domain.errors import (
     GrafxCorruptionDetected,
     GrafxDeviceFull,
     GrafxDurabilityBarrierFailed,
+    GrafxError,
     GrafxStorageError,
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import PageIndex
+# A24: the page size vocabulary has exactly one owner. The bounds are imported rather than
+# restated, and MIN_PAGE_SIZE and MAX_PAGE_SIZE are carried here only so a reader of this module
+# resolves them to the very objects C1 defines, never to a second opinion.
+from okto_grafx.domain.page import (
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
+    MIN_PAGE_SIZE,
+    validate_page_size,
+)
 
 __all__ = [
-    "DEFAULT_PAGE_SIZE",
-    "MIN_PAGE_SIZE",
-    "MAX_PAGE_SIZE",
     "MAX_LOGICAL_NAME_LENGTH",
     "MAX_NAME_SEGMENT_LENGTH",
     "MAX_OPEN_FILES",
@@ -91,7 +104,6 @@ __all__ = [
     "SHARE_DELETE_AVAILABLE",
     "normalize_logical_name",
     "find_case_conflict",
-    "validate_page_size",
     "validate_allocation",
     "validate_read_range",
     "as_payload",
@@ -100,20 +112,12 @@ __all__ = [
     "refuse_unaligned_file",
     "refuse_page_not_allocated",
     "refuse_page_payload",
-    "refuse_missing_barrier",
+    "barrier_failure",
+    "barrier_failure_from",
     "refuse_not_a_directory",
     "refuse_not_a_file",
     "LocalStorageDevice",
 ]
-
-DEFAULT_PAGE_SIZE: int = 8192
-"""Page size used when the caller does not state one; the same default as DatabaseConfig."""
-
-MIN_PAGE_SIZE: int = 512
-"""Smallest page this device accepts: a page must hold its 32-byte header and a payload."""
-
-MAX_PAGE_SIZE: int = 65536
-"""Largest page this device accepts: slot offsets inside a page are 16-bit."""
 
 MAX_LOGICAL_NAME_LENGTH: int = 255
 """Longest logical name, chosen so the resulting path stays portable across both families."""
@@ -131,7 +135,7 @@ PENDING_DELETE_MARKER: str = ".pending-delete-"
 """Reserved infix of a file that was renamed out of the way while a handle still held it.
 
 A logical name may never carry this infix, which is what makes a pending delete name an identity
-that no future file can take over (A17).
+that no future file can take over (A17, A27).
 """
 
 RESERVED_DEVICE_NAMES: frozenset[str] = frozenset(
@@ -189,6 +193,45 @@ _TRANSIENT_ERRNOS: frozenset[int] = frozenset(
 _TRANSIENT_WINERRORS: frozenset[int] = frozenset({5, 32, 33})
 """ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION."""
 
+_PERMANENT_ERRNOS: frozenset[int] = frozenset(
+    code
+    for code in (
+        getattr(errno, "EEXIST", None),
+        getattr(errno, "ENOTDIR", None),
+        getattr(errno, "EISDIR", None),
+        getattr(errno, "ENAMETOOLONG", None),
+        getattr(errno, "EINVAL", None),
+        getattr(errno, "ENOENT", None),
+        getattr(errno, "EBADF", None),
+        getattr(errno, "EROFS", None),
+        getattr(errno, "ELOOP", None),
+        getattr(errno, "EPERM", None),
+        getattr(errno, "ENODEV", None),
+        getattr(errno, "ENXIO", None),
+    )
+    if isinstance(code, int)
+)
+"""Conditions that cannot clear on their own, so a caller reading ``retryable`` must not spin.
+
+The transient table above answers "can a scanner be holding this for a moment?"; this one answers
+the other half of the same question, per A66.1: **can this condition clear if the caller simply
+waits?** A regular file where a directory belongs, a name that is too long, a bad descriptor, a
+read-only volume: none of these resolve by retrying, and A47 tells callers to retry whatever says
+it is retryable. Anything in neither table keeps the retryable default, which is the safe answer
+for a condition nobody has classified -- ``EMFILE`` and ``ENFILE`` really do clear as other
+handles close, and an unexplained ``EIO`` may be a transient bus error.
+"""
+
+_PERMANENT_WINERRORS: frozenset[int] = frozenset({2, 3, 80, 87, 123, 161, 183, 206, 267})
+"""FILE_NOT_FOUND, PATH_NOT_FOUND, FILE_EXISTS, INVALID_PARAMETER, INVALID_NAME, BAD_PATHNAME,
+ALREADY_EXISTS, FILENAME_EXCED_RANGE and DIRECTORY.
+
+Measured on this build: CPython derives ``errno`` from ``winerror``, and every number here maps
+to one already listed above -- 183 and 80 to EEXIST, 2, 3, 161 and 206 to ENOENT, 87 and 123 to
+EINVAL, 267 to ENOTDIR. So this set classifies nothing the errno set does not, and it exists to
+keep the answer right if that mapping ever changes. It is documentation of intent with a guard
+attached, not a load-bearing branch, and the punch list says so."""
+
 _BINARY_FLAG: int = getattr(os, "O_BINARY", 0)
 """O_BINARY exists only on Windows; it is zero elsewhere, which keeps the open flags uniform.
 
@@ -196,6 +239,10 @@ A15: a file opened in text mode on Windows stops at the first 0x1A byte, which o
 payloads contain about once every 256 bytes. Every descriptor of this device is binary.
 """
 
+_DELETE_ACCESS: int = 0x00010000
+_FILE_RENAME_INFO_EX: int = 22
+_RENAME_REPLACE_IF_EXISTS: int = 0x00000001
+_RENAME_POSIX_SEMANTICS: int = 0x00000002
 _GENERIC_READ: int = 0x80000000
 _GENERIC_WRITE: int = 0x40000000
 _FILE_SHARE_READ: int = 0x00000001
@@ -216,6 +263,9 @@ def _load_windows_opener() -> tuple[object, object, int] | None:
     bit lets a holder keep reading a segment while the owner deletes it, which is exactly the
     mechanism FR-6 and AC-9 describe. Returns None on every other family, and also when the
     call cannot be prepared, in which case the device falls back to os.open.
+
+    The same entry point also prepares SetFileInformationByHandle, which is what CF-5 needs to
+    publish over a file another participant is holding open.
     """
     if not IS_WINDOWS:
         return None
@@ -237,6 +287,13 @@ def _load_windows_opener() -> tuple[object, object, int] | None:
         library.CreateFileW.restype = wintypes.HANDLE
         library.CloseHandle.argtypes = [wintypes.HANDLE]
         library.CloseHandle.restype = wintypes.BOOL
+        library.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        library.SetFileInformationByHandle.restype = wintypes.BOOL
         invalid = ctypes.c_void_p(-1).value
     except (ImportError, AttributeError, OSError, ValueError):  # pragma: no cover - hostile host
         return None
@@ -317,12 +374,29 @@ def refuse_not_a_file(file: str) -> GrafxUnsupportedOperation:
     )
 
 
-def refuse_missing_barrier(file: str) -> GrafxDurabilityBarrierFailed:
-    """Build the failure raised when a durability barrier names a file the device does not hold."""
-    return GrafxDurabilityBarrierFailed(
-        f"A durability barrier named {file!r}, which does not exist on this device.",
-        reason="missing_file",
-        file=file,
+def barrier_failure(message: str, *, reason: str, retryable: bool = False, **details: object) -> GrafxDurabilityBarrierFailed:
+    """Build the one failure type a durability barrier is allowed to raise (A28).
+
+    The access classification of A11-revised travels in ``details`` rather than in the class,
+    because the caller counts exactly this type into ``oktografx_barrier_failures_total``: an
+    access failure that escaped as another class would keep that metric silent for the very
+    case A11-revised was written about.
+    """
+    failure = GrafxDurabilityBarrierFailed(message, reason=reason, **details)
+    failure.details["retryable"] = retryable
+    return failure
+
+
+def barrier_failure_from(failure: GrafxError) -> GrafxDurabilityBarrierFailed:
+    """Convert any failure met while serving a barrier into the type that door must raise."""
+    return barrier_failure(
+        f"A durability barrier could not be served: {failure.message}",
+        reason=str(failure.details.get("reason", failure.code)),
+        retryable=failure.retryable,
+        file=failure.details.get("file"),
+        errno=failure.details.get("errno"),
+        winerror=failure.details.get("winerror"),
+        attempts=failure.details.get("attempts", 1),
     )
 
 
@@ -404,12 +478,21 @@ def _validate_segment(file: str, segment: str) -> None:
             "A logical file name must not resolve to a reserved character device.",
             file=file,
         )
-    if PENDING_DELETE_MARKER in segment:
+    if _is_pending_delete(segment):
         raise refuse_operation(
             "reserved_infix",
             f"A logical file name must not hold the reserved infix {PENDING_DELETE_MARKER!r}.",
             file=file,
         )
+
+
+def _is_pending_delete(entry: str) -> bool:
+    """Return True when a real name belongs to the reserved pending delete space.
+
+    The comparison ignores case, because a case insensitive volume would otherwise let a
+    logical name shadow a queued deletion by spelling the reserved infix differently.
+    """
+    return PENDING_DELETE_MARKER in entry.lower()
 
 
 def find_case_conflict(requested: str, existing: Iterable[str]) -> str | None:
@@ -433,25 +516,32 @@ def _is_transient(failure: OSError) -> bool:
     return failure.errno in _TRANSIENT_ERRNOS or winerror in _TRANSIENT_WINERRORS
 
 
+def _is_permanent(failure: OSError) -> bool:
+    """Return True when waiting cannot change the answer, so the caller must not retry.
+
+    There is no precedence rule here because the two classifications cannot both match: the
+    transient and permanent sets are disjoint, which
+    test_the_two_classifications_of_a_failure_cannot_both_claim_it pins so that an editor who
+    lists a number in both is told at once rather than falling into whichever branch came first.
+    """
+    winerror = getattr(failure, "winerror", None)
+    return failure.errno in _PERMANENT_ERRNOS or winerror in _PERMANENT_WINERRORS
+
+
 def _remove_file(path: str) -> None:
     """Delete one real path. Isolated so a test can make deletion fail on any platform."""
     os.remove(path)
 
 
-def _identity_of(path: str) -> tuple[int, int] | None:
-    """Return the device and index pair that identifies a real file, or None when unknowable.
+def _is_queueable(relative: str) -> bool:
+    """Return True only for a name a deletion may be queued under (A27).
 
-    On both families ``st_dev`` and ``st_ino`` name the file itself rather than the path, so a
-    file replaced under the same name gets a different pair. A file system that reports no index
-    yields None, and a deletion pass refuses to unlink a live name it cannot identify (A17).
+    A deferred deletion may only ever be keyed on a name no logical name can collide with, so
+    the queue holds pending delete names and nothing else. Identity stamps were tried and do not
+    work: a size preserving page write leaves device, index, size and modification time
+    unchanged on NTFS, because the timestamp only advances once per tick.
     """
-    try:
-        info = os.stat(path)
-    except OSError:
-        return None
-    if not info.st_ino:
-        return None
-    return (info.st_dev, info.st_ino)
+    return _is_pending_delete(relative)
 
 
 class LocalStorageDevice:
@@ -475,7 +565,7 @@ class LocalStorageDevice:
         self._lock = threading.RLock()
         self._handles: dict[str, int] = {}
         self._dirty: set[str] = set()
-        self._deferred: dict[str, tuple[int, tuple[int, int] | None]] = {}
+        self._deferred: dict[str, int] = {}
         self._pending_serial = 0
         self._closed = False
         try:
@@ -515,12 +605,14 @@ class LocalStorageDevice:
         name = normalize_logical_name(file)
         with self._lock:
             self._require_open()
-            self.retry_pending_deletes()
             if self._resolve_identity(name):
                 if exclusive:
                     raise refuse_operation(
                         "file_exists", f"File {name!r} already exists on this device.", file=name
                     )
+                # A23: the caller now owns this name again, so whatever deletion was queued for
+                # it is abandoned. The device never destroys bytes it acknowledged.
+                self._forget_deferred(name)
                 return
             self._require_directory_parents(name)
             path = self._physical_path(name)
@@ -533,14 +625,16 @@ class LocalStorageDevice:
             self._forget_deferred(name)
             descriptor = self._retry("create", name, lambda: _open_descriptor(path, create_new=True))
             self._admit(name, descriptor)
-            self._dirty.add(name)
+            self._acknowledge(name)
+            # Draining afterwards keeps this door an independent trigger for the deletion queue
+            # without letting a pass destroy the very file the caller just asked about.
+            self.retry_pending_deletes()
 
     def remove(self, file: str) -> None:
         """Delete the named file. Removing a file the device does not hold is a failure."""
         name = normalize_logical_name(file)
         with self._lock:
             self._require_open()
-            self.retry_pending_deletes()
             if not self._resolve_identity(name):
                 raise refuse_missing_file(name, "remove")
             self._release(name)
@@ -548,6 +642,9 @@ class LocalStorageDevice:
             path = self._physical_path(name)
             self._retry("remove", name, lambda: _remove_file(path))
             self._forget_deferred(name)
+            # Draining afterwards keeps this door an independent trigger for the deletion queue
+            # without letting a pass take the very file the caller asked about.
+            self.retry_pending_deletes()
 
     def list_files(self, prefix: str = "") -> tuple[str, ...]:
         """Return every logical name starting with the prefix, sorted, deferred deletions apart."""
@@ -566,7 +663,12 @@ class LocalStorageDevice:
             return self._size(name)
 
     def atomic_replace(self, source: str, target: str) -> None:
-        """Move source onto target so a reader observes either the old or the new content."""
+        """Move source onto target so a reader observes either the old or the new content.
+
+        This holds while other processes hold the target open, which is what publishing the
+        control files of section 6.1 needs, and is proved by
+        test_a_control_file_is_published_over_a_reader_in_another_process.
+        """
         source_name = normalize_logical_name(source)
         target_name = normalize_logical_name(target)
         with self._lock:
@@ -585,15 +687,18 @@ class LocalStorageDevice:
             self._release(target_name)
             source_path = self._physical_path(source_name)
             target_path = self._physical_path(target_name)
+            if os.path.isdir(target_path):
+                raise refuse_not_a_file(target_name)
             try:
                 os.makedirs(os.path.dirname(target_path), exist_ok=True)
             except OSError as failure:
                 raise self._device_failure("atomic_replace", target_name, failure) from failure
-            # os.replace is the only move that overwrites an existing target on both families;
-            # os.rename fails on Windows the moment the target exists.
-            self._retry("atomic_replace", target_name, lambda: os.replace(source_path, target_path))
+            # _publish_over is the only move that overwrites an existing target on both
+            # families: os.rename fails on Windows the moment the target exists, and os.replace
+            # fails there whenever another participant holds the target open (CF-5).
+            self._retry("atomic_replace", target_name, lambda: _publish_over(source_path, target_path))
             self._dirty.discard(source_name)
-            self._dirty.add(target_name)
+            self._acknowledge(target_name)
             # Any deletion still queued for either name refers to a file that is now gone or
             # replaced: dropping it here is what keeps a late pass from destroying live data.
             self._forget_deferred(source_name)
@@ -602,15 +707,16 @@ class LocalStorageDevice:
     def recycle(self, file: str) -> bool:
         """Release a file, deferring the deletion when the platform cannot complete it now.
 
-        The logical name leaves the namespace before this call returns (A17): POSIX unlinks the
-        file, and Windows renames it to a reserved pending delete name first, so a later create
-        under the same name always succeeds. The answer is True when the space is already back
-        and False when the platform still holds it, in which case a later pass reclaims it.
+        Whenever the platform allows it, the logical name leaves the namespace before this call
+        returns (A17, A23): POSIX unlinks the file, and Windows renames it to a reserved pending
+        delete name first, so a later create under the same name succeeds. The answer is True
+        when the space is already back and False when the platform still holds it.
 
         This never raises because somebody holds a handle. When the holder denies both deletion
         and rename, which only a handle opened without delete sharing can do, the file keeps its
-        name, the answer is False and the queued deletion is keyed on the identity of that exact
-        file, so a file published later under the same name is never destroyed.
+        name, the answer is False and NOTHING is queued (A27): the device refuses to carry a
+        deletion intent across a window in which another instance could re-claim the name, so
+        reclaiming that space becomes the business of the caller, which asks again.
         """
         name = normalize_logical_name(file)
         with self._lock:
@@ -622,16 +728,7 @@ class LocalStorageDevice:
                 return True
             self._release(name)
             self._dirty.discard(name)
-            path = self._physical_path(name)
-            identity = _identity_of(path)
-            if not IS_WINDOWS:
-                try:
-                    _remove_file(path)
-                except OSError:
-                    return self._defer(path, identity)
-                self._forget_deferred(name)
-                return True
-            return self._recycle_on_windows(name, path, identity)
+            return self._free_the_name(name, self._physical_path(name))
 
     def pending_deletes(self) -> tuple[str, ...]:
         """Return the device relative names whose deletion the platform deferred, sorted."""
@@ -647,25 +744,22 @@ class LocalStorageDevice:
         MAX_PENDING_DELETE_ATTEMPTS passes is left alone until the caller asks with force, which
         is the bounded attempt rule of FR-6; pending_deletes() keeps reporting it either way.
 
-        Nothing is unlinked before its identity is proved again (A17): a pending delete name can
-        never belong to a live file, and a deferral that still carries a live name is only acted
-        on when the file at that name is still the very file that was recycled.
+        Nothing in the queue can collide with a logical name (A27), so a pass can never destroy
+        a file another instance re-claimed: the queue holds reserved pending delete names only.
         """
         with self._lock:
             if not self._deferred:
                 return 0
             reclaimed = 0
-            for relative, state in tuple(self._deferred.items()):
-                attempts, identity = state
-                if attempts >= MAX_PENDING_DELETE_ATTEMPTS and not force:
-                    continue
+            for relative, attempts in tuple(self._deferred.items()):
                 path = os.path.join(self._root, *relative.split("/"))
                 if not self._entry_present(path):
+                    # Checked before the attempt cap: a file that is already gone must be
+                    # retired from the queue, otherwise an operator reads a phantom forever.
                     del self._deferred[relative]
                     reclaimed += 1
                     continue
-                if not _may_unlink(relative, identity, path):
-                    self._deferred[relative] = (attempts + 1, identity)
+                if attempts >= MAX_PENDING_DELETE_ATTEMPTS and not force:
                     continue
                 try:
                     _remove_file(path)
@@ -673,12 +767,12 @@ class LocalStorageDevice:
                     del self._deferred[relative]
                     reclaimed += 1
                 except OSError:
-                    self._deferred[relative] = (attempts + 1, identity)
+                    self._deferred[relative] = attempts + 1
                 else:
                     if self._entry_present(path):
                         # The platform armed its own pending delete: the entry disappears when
                         # the last handle closes, and the next pass will see it gone.
-                        self._deferred[relative] = (attempts + 1, identity)
+                        self._deferred[relative] = attempts + 1
                     else:
                         del self._deferred[relative]
                         reclaimed += 1
@@ -697,7 +791,7 @@ class LocalStorageDevice:
         name = normalize_logical_name(file)
         validate_allocation(name, count)
         with self._lock:
-            descriptor = self._descriptor(name)
+            descriptor = self._descriptor(name, "write")
             size = self._descriptor_size(name, descriptor)
             first = self._page_count(name, size)
             remaining = count * self._page_size
@@ -712,7 +806,7 @@ class LocalStorageDevice:
         """Return exactly page_size bytes from an already allocated page."""
         name = normalize_logical_name(file)
         with self._lock:
-            descriptor = self._descriptor(name)
+            descriptor = self._descriptor(name, "read")
             size = self._descriptor_size(name, descriptor)
             offset = self._page_offset(name, page_index, size, "read_page")
             try:
@@ -736,7 +830,7 @@ class LocalStorageDevice:
         if len(payload) != self._page_size:
             raise refuse_page_payload(name, page_index, len(payload), self._page_size)
         with self._lock:
-            descriptor = self._descriptor(name)
+            descriptor = self._descriptor(name, "write")
             size = self._descriptor_size(name, descriptor)
             offset = self._page_offset(name, page_index, size, "write_page")
             # The offset was proved to sit entirely inside the current end of file, so this write
@@ -746,7 +840,6 @@ class LocalStorageDevice:
                 written = _write_everything(descriptor, payload)
             except OSError as failure:
                 raise self._device_failure("write_page", name, failure, page=page_index) from failure
-            self._dirty.add(name)
             if written != len(payload):
                 raise GrafxDeviceFull(
                     f"A page write to {name!r} stored {written} of {len(payload)} bytes.",
@@ -762,7 +855,7 @@ class LocalStorageDevice:
         name = normalize_logical_name(file)
         data = as_payload(name, payload)
         with self._lock:
-            descriptor = self._descriptor(name)
+            descriptor = self._descriptor(name, "write")
             size = self._descriptor_size(name, descriptor)
             if not data:
                 return size
@@ -773,7 +866,7 @@ class LocalStorageDevice:
         name = normalize_logical_name(file)
         validate_read_range(name, offset, length)
         with self._lock:
-            descriptor = self._descriptor(name)
+            descriptor = self._descriptor(name, "read")
             if length == 0:
                 return b""
             try:
@@ -796,7 +889,7 @@ class LocalStorageDevice:
                 "invalid_size", "truncate_log needs a size of zero or more.", file=name, size=size
             )
         with self._lock:
-            descriptor = self._descriptor(name)
+            descriptor = self._descriptor(name, "write")
             current = self._descriptor_size(name, descriptor)
             if size > current:
                 raise refuse_operation(
@@ -810,7 +903,6 @@ class LocalStorageDevice:
                 os.ftruncate(descriptor, size)
             except OSError as failure:
                 raise self._device_failure("truncate_log", name, failure) from failure
-            self._dirty.add(name)
 
     # --- durability ---------------------------------------------------------------------
 
@@ -825,29 +917,38 @@ class LocalStorageDevice:
         just created is only reachable after its directory entry is itself durable. Windows has
         no directory handle to flush and does not need one, which is the single platform branch
         of the durability path (TR-3).
+
+        A28: every failure of this door is a GrafxDurabilityBarrierFailed, whatever caused it.
+        The caller counts exactly that type into oktografx_barrier_failures_total, so an access
+        failure that escaped as another class would make the metric silent for the very case
+        A11-revised was written about; the classification travels in ``details`` instead
+        (``reason``, ``errno``, ``winerror``, ``attempts``, ``retryable``).
         """
+        names: tuple[str, ...] = ()
         with self._lock:
-            self._require_open()
-            if file is None:
-                names = tuple(sorted(self._dirty | set(self._handles)))
-            else:
-                names = (normalize_logical_name(file),)
-            for name in names:
-                try:
-                    descriptor = self._descriptor(name)
-                except GrafxCorruptionDetected as failure:
-                    raise refuse_missing_barrier(name) from failure
-                try:
-                    os.fsync(descriptor)
-                except OSError as failure:
-                    raise GrafxDurabilityBarrierFailed(
-                        f"The durability barrier of {name!r} did not complete.",
-                        reason="fsync_failed",
-                        file=name,
-                        errno=failure.errno,
-                    ) from failure
-            if not IS_WINDOWS:
-                self._synchronize_directories(names)
+            try:
+                self._require_open()
+                names = self._barrier_targets(file)
+                for name in names:
+                    descriptor = self._descriptor(name, "read")
+                    try:
+                        os.fsync(descriptor)
+                    except OSError as failure:
+                        raise barrier_failure(
+                            f"The durability barrier of {name!r} did not complete.",
+                            reason="fsync_failed",
+                            retryable=_is_transient(failure),
+                            file=name,
+                            errno=failure.errno,
+                            winerror=getattr(failure, "winerror", None),
+                            attempts=1,
+                        ) from failure
+                if not IS_WINDOWS:
+                    self._synchronize_directories(names)
+            except GrafxDurabilityBarrierFailed:
+                raise
+            except GrafxError as failure:
+                raise barrier_failure_from(failure) from failure
             self._dirty.difference_update(names)
 
     # --- lifecycle ----------------------------------------------------------------------
@@ -864,8 +965,6 @@ class LocalStorageDevice:
                     os.close(descriptor)
             self._handles.clear()
             self._closed = True
-            with contextlib.suppress(OSError):
-                self._sweep_pending_deletes()
 
     def __enter__(self) -> LocalStorageDevice:
         """Return the device itself so it can be used as a context manager."""
@@ -882,48 +981,51 @@ class LocalStorageDevice:
 
     # --- internals ----------------------------------------------------------------------
 
-    def _sweep_pending_deletes(self) -> None:
-        """Try the queued deletions once more after the descriptors of this device are gone."""
-        for relative, state in tuple(self._deferred.items()):
-            path = os.path.join(self._root, *relative.split("/"))
-            if not self._entry_present(path):
-                del self._deferred[relative]
-                continue
-            if not _may_unlink(relative, state[1], path):
-                continue
-            with contextlib.suppress(OSError):
-                _remove_file(path)
-                if not self._entry_present(path):
-                    del self._deferred[relative]
+    def _barrier_targets(self, file: object) -> tuple[str, ...]:
+        """Return the names one barrier has to flush: the one it names, or everything unflushed."""
+        if file is None:
+            return tuple(sorted(self._dirty | set(self._handles)))
+        return (normalize_logical_name(file),)
 
-    def _recycle_on_windows(self, name: str, path: str, identity: tuple[int, int] | None) -> bool:
-        """Free the logical name first, then delete the file behind it (FR-6, AC-9, A17).
+    def _free_the_name(self, name: str, path: str) -> bool:
+        """Take a logical name out of the namespace and report whether the space is already back.
 
-        Renaming before deleting is what makes the name free at once: a Windows deletion of a
-        held file only arms a pending delete, and the directory entry stays until the last
-        handle closes, which would make a later create under the same name fail.
+        POSIX unlinks in one step, which frees the name even while another process reads the
+        file. Windows cannot: deleting a held file only arms a pending delete and the directory
+        entry lingers, so the file is renamed to a reserved name first and deleted behind it.
+        The rename is the fallback on POSIX too, for the rare directory that refuses an unlink,
+        so an injected refusal behaves the same way on both families.
+
+        A27: a deletion is queued only when the rename succeeded, because only then does it
+        carry a name no future file can take over. When the name cannot be freed at all, the
+        device queues NOTHING and simply says so; reclaiming that space is then the business of
+        the caller, which knows whether the name is still garbage and asks again.
         """
+        if not IS_WINDOWS:
+            try:
+                _remove_file(path)
+            except OSError:
+                pass
+            else:
+                return True
         pending = self._pending_path(path)
         try:
             os.replace(path, pending)
         except OSError:
             # A holder that denies delete sharing refuses the rename as well; the direct
-            # deletion is the only thing left to try.
+            # deletion is the only thing left to try, and it may not leave an entry behind.
             try:
                 _remove_file(path)
             except OSError:
-                return self._defer(path, identity)
-            if self._entry_present(path):
-                return self._defer(path, identity)
-            self._forget_deferred(name)
-            return True
+                return False
+            return not self._entry_present(path)
         self._forget_deferred(name)
         try:
             _remove_file(pending)
         except OSError:
-            return self._defer(pending, identity)
+            return self._defer(pending)
         if self._entry_present(pending):
-            return self._defer(pending, identity)
+            return self._defer(pending)
         return True
 
     def _pending_path(self, path: str) -> str:
@@ -934,11 +1036,21 @@ class LocalStorageDevice:
             if not os.path.lexists(candidate):
                 return candidate
 
-    def _defer(self, path: str, identity: tuple[int, int] | None) -> bool:
-        """Queue one real path for a later deletion pass and report the deferral."""
+    def _defer(self, path: str) -> bool:
+        """Queue one real path for a later deletion pass and report the deferral (A27).
+
+        Only a pending delete name may be queued: it cannot collide with any logical name, so a
+        later pass can never destroy a file somebody re-claimed in the meantime. Anything else
+        is a bug in this module and is refused rather than queued.
+        """
         relative = self._relative(path)
-        attempts = self._deferred.get(relative, (0, None))[0]
-        self._deferred[relative] = (attempts, identity if identity is not None else _identity_of(path))
+        if not _is_queueable(relative):
+            raise refuse_operation(
+                "unqueueable_deletion",
+                f"A deletion may only be queued under a reserved name, not {relative!r}.",
+                file=relative,
+            )
+        self._deferred.setdefault(relative, 0)
         return False
 
     def _forget_deferred(self, name: str) -> None:
@@ -979,11 +1091,11 @@ class LocalStorageDevice:
             relative = os.path.relpath(directory, self._root)
             prefix = "" if relative == "." else relative.replace(os.sep, "/") + "/"
             for entry in files:
-                marker = entry.rfind(PENDING_DELETE_MARKER)
+                marker = entry.lower().rfind(PENDING_DELETE_MARKER)
                 if marker < 0:
                     continue
                 name = prefix + entry
-                self._deferred.setdefault(name, (0, _identity_of(os.path.join(directory, entry))))
+                self._deferred.setdefault(name, 0)
                 tail = entry[marker + len(PENDING_DELETE_MARKER) :]
                 if tail.isdigit():
                     self._pending_serial = max(self._pending_serial, int(tail))
@@ -1026,23 +1138,51 @@ class LocalStorageDevice:
             relative = os.path.relpath(directory, self._root)
             prefix = "" if relative == "." else relative.replace(os.sep, "/") + "/"
             for entry in files:
-                if PENDING_DELETE_MARKER in entry:
+                if _is_pending_delete(entry):
                     continue
                 yield prefix + entry
 
-    def _descriptor(self, name: str) -> int:
-        """Return the cached descriptor of a file, opening and admitting it when it is not cached."""
+    def _descriptor(self, name: str, intent: str) -> int:
+        """Return the cached descriptor of a file, opening and admitting it when it is not cached.
+
+        ``intent`` is the single choke point of A26.1: it is a required argument, so a write
+        method cannot be added without stating that it acknowledges bytes, and stating it is
+        what makes the device owe that name a barrier. A read states ``"read"`` and changes
+        nothing; a barrier reads, because flushing a name is not acknowledging new bytes (A29).
+        """
+        if intent not in ("read", "write"):
+            raise refuse_operation(
+                "invalid_intent", f"A descriptor is taken to read or to write, not to {intent!r}."
+            )
         self._require_open()
         cached = self._handles.pop(name, None)
         if cached is not None:
             self._handles[name] = cached
+            if intent == "write":
+                self._acknowledge(name)
             return cached
         if not self._resolve_identity(name):
             raise refuse_missing_file(name, "open")
         path = self._physical_path(name)
         descriptor = self._retry("open", name, lambda: _open_descriptor(path, create_new=False))
         self._admit(name, descriptor)
+        # A29: the name joins the unflushed set only now, once it is known to be valid and open.
+        # A refused write that recorded a name would make every later global barrier fail, and
+        # under FR-5 that means no commit on this device could ever succeed again.
+        if intent == "write":
+            self._acknowledge(name)
         return descriptor
+
+    def _acknowledge(self, name: str) -> None:
+        """Record that this device is acknowledging bytes for a logical name (A26).
+
+        The device owes the name a durability barrier from now on. It also abandons any deletion
+        queued for that name: under A27 the queue can only hold reserved names, so this can
+        never match, and it stays as the guard that makes the rule true by construction rather
+        than by argument.
+        """
+        self._dirty.add(name)
+        self._forget_deferred(name)
 
     def _admit(self, name: str, descriptor: int) -> None:
         """Cache one descriptor, evicting the least recently used one when the cache is full."""
@@ -1065,7 +1205,7 @@ class LocalStorageDevice:
 
     def _size(self, name: str) -> int:
         """Return the current size of a file in bytes."""
-        descriptor = self._descriptor(name)
+        descriptor = self._descriptor(name, "read")
         return self._descriptor_size(name, descriptor)
 
     def _descriptor_size(self, name: str, descriptor: int) -> int:
@@ -1117,7 +1257,6 @@ class LocalStorageDevice:
         except OSError as failure:
             self._undo_append(descriptor, rollback_to)
             raise self._device_failure("append", name, failure) from failure
-        self._dirty.add(name)
         if written != len(payload):
             self._undo_append(descriptor, rollback_to)
             raise GrafxDeviceFull(
@@ -1145,18 +1284,24 @@ class LocalStorageDevice:
             try:
                 descriptor = os.open(directory, os.O_RDONLY)
             except OSError as failure:
-                raise GrafxDurabilityBarrierFailed(
+                raise barrier_failure(
                     "A durability barrier could not open the directory that holds the file.",
                     reason="directory_open_failed",
+                    retryable=_is_transient(failure),
                     errno=failure.errno,
+                    winerror=getattr(failure, "winerror", None),
+                    attempts=1,
                 ) from failure
             try:
                 os.fsync(descriptor)
             except OSError as failure:
-                raise GrafxDurabilityBarrierFailed(
+                raise barrier_failure(
                     "A durability barrier could not flush the directory that holds the file.",
                     reason="directory_fsync_failed",
+                    retryable=_is_transient(failure),
                     errno=failure.errno,
+                    winerror=getattr(failure, "winerror", None),
+                    attempts=1,
                 ) from failure
             finally:
                 with contextlib.suppress(OSError):
@@ -1198,9 +1343,16 @@ class LocalStorageDevice:
         """Translate an operating system failure into the typed error of the taxonomy.
 
         A11-revised: only damaged bytes are corruption. A sharing violation, a permission
-        failure or any other access failure is a retryable storage error, because reporting it
-        as corruption would send recovery into truncation, quarantine and a forensic ledger
-        entry for a file whose bytes are perfect.
+        failure or any other access failure is a storage error, because reporting it as
+        corruption would send recovery into truncation, quarantine and a forensic ledger entry
+        for a file whose bytes are perfect.
+
+        Two details of that error are load-bearing for the caller. ``retryable`` is advice A47
+        acts on, so a condition that cannot clear -- a regular file where the database directory
+        belongs -- says False and stops the caller spinning forever. And the message is ours, in
+        en-US: the text the platform supplies is localized, so it travels in
+        ``details["platform_message"]`` where a human can still read it and no gate has to
+        pretend a runtime string is ASCII (G1, A7).
         """
         if _is_device_full(failure):
             return GrafxDeviceFull(
@@ -1209,34 +1361,23 @@ class LocalStorageDevice:
                 operation=operation,
                 errno=failure.errno,
                 winerror=getattr(failure, "winerror", None),
+                platform_message=failure.strerror,
                 **details,
             )
         details.setdefault("attempts", 1)
+        permanent = _is_permanent(failure)
         return GrafxStorageError(
-            f"The device failed {operation} on {name!r}: {failure.strerror or 'unspecified failure'}.",
-            retryable=True,
-            reason="access_failed",
+            f"The device failed {operation} on {name!r}, and the condition is "
+            f"{'permanent' if permanent else 'worth retrying'}.",
+            retryable=not permanent,
+            reason="permanently_refused" if permanent else "access_failed",
             file=name,
             operation=operation,
             errno=failure.errno,
             winerror=getattr(failure, "winerror", None),
+            platform_message=failure.strerror,
             **details,
         )
-
-
-def _may_unlink(relative: str, identity: tuple[int, int] | None, path: str) -> bool:
-    """Return True when this exact file may still be unlinked by a deletion pass (A17).
-
-    A pending delete name can never belong to a live file, because no logical name may carry
-    the reserved infix. Any other name has to prove that the file behind it is still the very
-    file that was recycled; a file replaced in the meantime has a different identity and is left
-    alone, which is what keeps a late pass from destroying published data.
-    """
-    if PENDING_DELETE_MARKER in relative:
-        return True
-    if identity is None:
-        return False
-    return _identity_of(path) == identity
 
 
 def _open_descriptor(path: str, *, create_new: bool) -> int:
@@ -1262,6 +1403,99 @@ def _open_descriptor(path: str, *, create_new: bool) -> int:
     except OSError:
         library.CloseHandle(handle)  # type: ignore[attr-defined]
         raise
+
+
+def _publish_over(source: str, target: str) -> None:
+    """Move source onto target so a reader observes either the old or the new content (CF-5).
+
+    Measured on Windows, and this is the whole of the defect: ``os.replace`` onto a target that
+    any process holds open fails with ERROR_ACCESS_DENIED **even when every holder shares delete
+    access**, because MoveFileEx frees the target's directory entry eagerly and an open handle
+    forbids that. Sharing delete is necessary for ``remove`` and it is not sufficient here, so
+    the share mode was never the missing piece: the primitive was.
+
+    Renaming with POSIX semantics is the primitive that has the behaviour the port describes.
+    The directory entry is replaced in one step, a reader that already opened the old file goes
+    on reading it to the end, and a reader that opens the name afterwards sees the new content
+    whole. That is what proves multi-process publication of the control files of section 6.1.
+
+    Where the platform cannot do it -- a build older than the one that introduced the flag, a
+    file system that does not implement it, or a holder that denies delete access -- this falls
+    back to os.replace, which is what every POSIX family uses in the first place.
+    """
+    if _WINDOWS_OPENER is None:
+        os.replace(source, target)
+        return
+    try:
+        _windows_posix_replace(source, target)
+    except (OSError, ValueError):
+        # A request this platform cannot even express is a reason to use the ordinary
+        # primitive, not a reason to let a non-Grafx failure out of a port door.
+        os.replace(source, target)
+
+
+def _windows_posix_replace(source: str, target: str) -> None:
+    """Replace target with source through SetFileInformationByHandle, POSIX style."""
+    library, modules, invalid = _WINDOWS_OPENER  # type: ignore[misc]
+    ctypes_module, _ = modules  # type: ignore[misc]
+    handle = library.CreateFileW(  # type: ignore[attr-defined]
+        source,
+        _DELETE_ACCESS | _GENERIC_READ,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        None,
+        _OPEN_EXISTING,
+        _FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle is None or handle == invalid:
+        raise ctypes_module.WinError(ctypes_module.get_last_error())
+    try:
+        request = _rename_request(ctypes_module, target)
+        moved = library.SetFileInformationByHandle(  # type: ignore[attr-defined]
+            handle, _FILE_RENAME_INFO_EX, ctypes_module.byref(request), ctypes_module.sizeof(request)
+        )
+        if not moved:
+            raise ctypes_module.WinError(ctypes_module.get_last_error())
+    finally:
+        library.CloseHandle(handle)  # type: ignore[attr-defined]
+
+
+def _rename_request(ctypes_module: object, target: str) -> object:
+    """Return a FILE_RENAME_INFO asking for a POSIX style replacement of target.
+
+    The offsets are computed by ctypes rather than by hand. Writing them by hand is how the
+    first version of this function produced a file whose NAME was garbage while the call still
+    reported success, which no assertion about content would have caught.
+
+    The name is measured in UTF-16 CODE UNITS, not in code points. ``c_wchar`` is one unit and
+    ``len()`` counts code points, so every character outside the basic plane costs one unit more
+    than a length in characters accounts for. A logical name can never carry one, but the
+    database root is an arbitrary string the caller chooses, and sizing this buffer from ``len``
+    made a root holding an emoji either overflow the array or fill it with no room for the
+    terminator -- and with no terminator the kernel takes the name from whatever follows.
+    Proved by test_a_control_record_is_published_through_a_root_outside_the_ascii_plane.
+    """
+    from ctypes import wintypes  # noqa: PLC0415 - Windows only, and only on this path
+
+    units = len(target.encode("utf-16-le")) // 2
+
+    class _FileRenameInfo(ctypes_module.Structure):  # type: ignore[attr-defined, misc]
+        """FILE_RENAME_INFO with the name sized for this one call."""
+
+        _fields_ = [
+            ("Flags", wintypes.DWORD),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", ctypes_module.c_wchar * (units + 1)),  # type: ignore[attr-defined]
+        ]
+
+    request = _FileRenameInfo()
+    request.Flags = _RENAME_REPLACE_IF_EXISTS | _RENAME_POSIX_SEMANTICS
+    request.RootDirectory = None
+    # The length is in bytes and excludes the terminator, which the buffer still carries.
+    request.FileNameLength = units * 2
+    request.FileName = target
+    return request
 
 
 def validate_allocation(file: str, count: object) -> int:
@@ -1290,24 +1524,6 @@ def _validate_root(root: object) -> str:
             field="root",
             value=repr(root),
         ) from failure
-
-
-def validate_page_size(page_size: object) -> int:
-    """Return a usable page size, refusing anything the on-disk format cannot carry."""
-    if isinstance(page_size, bool) or not isinstance(page_size, int):
-        raise GrafxConfigurationError(
-            f"Invalid configuration for 'page_size': an integer is required. Got {page_size!r}.",
-            field="page_size",
-            value=page_size,
-        )
-    if page_size & (page_size - 1) or not MIN_PAGE_SIZE <= page_size <= MAX_PAGE_SIZE:
-        raise GrafxConfigurationError(
-            f"Invalid configuration for 'page_size': a power of two between {MIN_PAGE_SIZE} and "
-            f"{MAX_PAGE_SIZE} is required. Got {page_size!r}.",
-            field="page_size",
-            value=page_size,
-        )
-    return page_size
 
 
 def _validate_positive(field: str, value: object) -> int:

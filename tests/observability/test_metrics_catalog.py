@@ -8,19 +8,20 @@ a metric the contract requires and the code never declared.
 
 from __future__ import annotations
 
+import contextlib
+import importlib
+import pkgutil
 import re
 from pathlib import Path
 
 import pytest
 
+import okto_grafx
 from okto_grafx import errors as public_errors
 from okto_grafx.adapters.metrics_noop import NoOpMetricsSink
 from okto_grafx.adapters.metrics_openmetrics import OpenMetricsSink
-from okto_grafx.domain.errors import GrafxConfigurationError
+from okto_grafx.domain.errors import GrafxConfigurationError, GrafxError
 from okto_grafx.domain.ports.metrics import (
-    FORBIDDEN_LABEL_NAMES,
-    METRIC_NAME_PREFIX,
-    METRIC_UNIT_SUFFIXES,
     UNBOUNDED_LABEL_CARDINALITY_LIMIT,
     MetricDescriptor,
     MetricKind,
@@ -87,6 +88,157 @@ EXPECTED_METRIC_NAMES: frozenset[str] = frozenset(
     }
 )
 """Transcribed from CONTRACT.md section 9 with the renames of amendment A1 applied."""
+
+EXPECTED_METRICS: dict[str, tuple[str, str]] = {
+    'oktografx_lease_wait_seconds': (
+        'histogram',
+        'Time a writer waited for the coordination lease, by outcome.',
+    ),
+    'oktografx_write_conflicts_total': (
+        'counter',
+        'Transactions refused by optimistic partition validation.',
+    ),
+    'oktografx_commit_retries_total': (
+        'counter',
+        'Commit attempts retried after a write conflict.',
+    ),
+    'oktografx_active_transactions': (
+        'gauge',
+        'Transactions currently open, by mode.',
+    ),
+    'oktografx_fsync_duration_seconds': (
+        'histogram',
+        'Duration of a durability barrier, by target file class.',
+    ),
+    'oktografx_barrier_failures_total': (
+        'counter',
+        'Durability barriers that failed.',
+    ),
+    'oktografx_wal_size_bytes': (
+        'gauge',
+        'Total size of the live write-ahead log.',
+    ),
+    'oktografx_wal_segments': (
+        'gauge',
+        'Live write-ahead log segments on disk.',
+    ),
+    'oktografx_wal_truncation_lag_segments': (
+        'gauge',
+        'Segments held back from recycling, by presence of a live reader.',
+    ),
+    'oktografx_checksum_verifications_total': (
+        'counter',
+        'Checksum verifications performed, by verified object.',
+    ),
+    'oktografx_checksum_failures_total': (
+        'counter',
+        'Checksum verifications that failed, by verified object.',
+    ),
+    'oktografx_recovery_replays_total': (
+        'counter',
+        'Write-ahead log records replayed by recovery.',
+    ),
+    'oktografx_recovery_discarded_records_total': (
+        'counter',
+        'Records discarded by recovery, by ledger origin class.',
+    ),
+    'oktografx_ledger_depth': (
+        'gauge',
+        'Number of unapplied-work ledger entries by origin class.',
+    ),
+    'oktografx_ledger_oldest_entry_age_seconds': (
+        'gauge',
+        'Age of the oldest unapplied-work ledger entry, by origin class.',
+    ),
+    'oktografx_quarantine_entries': (
+        'gauge',
+        'Quarantined byte ranges kept for forensic inspection.',
+    ),
+    'oktografx_buffer_budget_used_bytes': (
+        'gauge',
+        'Buffer pool memory currently held, by database.',
+    ),
+    'oktografx_buffer_budget_exceeded_total': (
+        'counter',
+        'Page pins refused because the buffer budget was exhausted, by database.',
+    ),
+    'oktografx_database_opens_total': (
+        'counter',
+        'Database open operations completed.',
+    ),
+    'oktografx_recoveries_total': (
+        'counter',
+        'Recovery runs completed, by outcome.',
+    ),
+    'oktografx_baseline_ceiling_multiple': (
+        'gauge',
+        'Measured multiple of the calibrated baseline ceiling, by ceiling.',
+    ),
+    'oktografx_vector_recall_ratio': (
+        'gauge',
+        'Recall of the most recent calibrated vector search measurement.',
+    ),
+    'oktografx_vector_query_latency_seconds': (
+        'histogram',
+        'Duration of one vector search phase, by regime and phase.',
+    ),
+    'oktografx_vector_exact_fallback_total': (
+        'counter',
+        'Vector searches answered by an exact scan of the filtered set.',
+    ),
+    'oktografx_vector_achieved_k': (
+        'histogram',
+        'Neighbors actually returned by a vector search.',
+    ),
+    'oktografx_vector_filter_selectivity_ratio': (
+        'histogram',
+        'Fraction of an embedding space that survived the candidate filter.',
+    ),
+    'oktografx_vector_tombstone_backlog': (
+        'gauge',
+        'Vector index tombstones awaiting reconciliation.',
+    ),
+    'oktografx_vector_reconciliation_total': (
+        'counter',
+        'Vector index reconciliation passes completed.',
+    ),
+    'oktografx_vector_index_entries': (
+        'gauge',
+        'Live vector index entries, by embedding space.',
+    ),
+    'oktografx_vector_space_retired_total': (
+        'counter',
+        'Embedding spaces moved to the retired state.',
+    ),
+    'oktografx_vector_space_coverage_ratio': (
+        'gauge',
+        'Fraction of the rows of an embedding space that carry an index entry.',
+    ),
+    'oktografx_vector_index_age_seconds': (
+        'gauge',
+        'Time since the last vector index build or reconciliation, by space.',
+    ),
+    'oktografx_query_phase_duration_seconds': (
+        'histogram',
+        'Duration of one query phase.',
+    ),
+    'oktografx_query_rows_returned_count': (
+        'histogram',
+        'Rows returned by one query.',
+    ),
+    'oktografx_query_errors_total': (
+        'counter',
+        'Queries that ended in an error, by error code.',
+    ),
+}
+"""Pinned by hand: the kind and the en-US description of every metric.
+
+The name alone is not the contract. The kind is what the ``# TYPE`` line publishes and what
+decides whether ``rate()`` over a series means anything, and the description is the ``# HELP``
+line an operator reads at three in the morning. Both were flipping freely with a green suite,
+because only the handful of metrics some test happens to emit were protected incidentally.
+"""
+
 
 EXPECTED_LABELS: dict[str, tuple[str, ...]] = {
     "oktografx_lease_wait_seconds": ("outcome",),
@@ -166,50 +318,101 @@ def test_the_catalog_matches_section_nine_of_the_contract_itself() -> None:
     }
 
 
-@pytest.mark.parametrize(
-    "descriptor", METRIC_CATALOG, ids=[descriptor.name for descriptor in METRIC_CATALOG]
-)
-def test_every_descriptor_is_a_validated_metric_descriptor(descriptor: MetricDescriptor) -> None:
-    assert isinstance(descriptor, MetricDescriptor)
-    assert descriptor.name.startswith(METRIC_NAME_PREFIX)
-    assert any(descriptor.name.endswith(suffix) for suffix in METRIC_UNIT_SUFFIXES)
-    assert isinstance(descriptor.kind, MetricKind)
-    # Rebuilding it re-runs the whole frozen validator, which is what makes this a real check.
-    assert MetricDescriptor(
-        name=descriptor.name,
-        kind=descriptor.kind,
-        description=descriptor.description,
-        unit=descriptor.unit,
-        labels=descriptor.labels,
-        buckets=descriptor.buckets,
-    ) == descriptor
+# The descriptor validator of the port already enforces the prefix, the unit suffix, the shape of
+# the name and the type of the kind: a catalog that broke any of them would fail at import, so a
+# test asserting them again can only ever pass. What the validator cannot know is which kind and
+# which words this project chose, and that is what the pinned table above holds.
+@pytest.mark.parametrize("name", sorted(EXPECTED_METRICS), ids=sorted(EXPECTED_METRICS))
+def test_the_kind_and_description_of_a_metric_are_frozen(name: str) -> None:
+    kind, description = EXPECTED_METRICS[name]
+    descriptor = metric(name)
+    assert descriptor.kind.value == kind, (
+        f"{name} is declared as a {descriptor.kind.value} but the contract pins it as a {kind}; "
+        f"the kind is what the # TYPE line publishes"
+    )
+    assert descriptor.description == description, (
+        f"{name} changed the # HELP line an operator reads"
+    )
+
+
+def test_the_pinned_table_covers_the_catalog_exactly() -> None:
+    # A pin that drifts out of step with the catalog protects nothing.
+    assert set(EXPECTED_METRICS) == metric_names()
+    assert set(EXPECTED_METRICS) == EXPECTED_METRIC_NAMES
+
+
+def test_every_metric_kind_is_one_the_exposition_can_render() -> None:
+    kinds = {kind for kind, _ in EXPECTED_METRICS.values()}
+    assert kinds == {"counter", "gauge", "histogram"}
+    assert all(descriptor.kind.value in kinds for descriptor in METRIC_CATALOG)
 
 
 @pytest.mark.parametrize(
     "descriptor", METRIC_CATALOG, ids=[descriptor.name for descriptor in METRIC_CATALOG]
 )
 def test_every_description_is_an_en_us_sentence(descriptor: MetricDescriptor) -> None:
+    # ASCII, the trailing period and the two-word minimum are enforced by the descriptor
+    # validator, so only the two rules this project adds on top of it are asserted here.
     description = descriptor.description
-    assert description.isascii()
-    assert description[0].isupper()
-    assert description.endswith(".")
-    assert len(description.split()) >= 3
+    assert description[0].isupper(), f"{descriptor.name} does not start its help text with a capital"
+    assert len(description.split()) >= 3, f"{descriptor.name} has a help text that says too little"
+
+
+UNENUMERATED_LABEL_BOUNDS: dict[str, int] = {"db": 64, "space": 64}
+"""The declared ceiling of every label that does not enumerate its values.
+
+For an enumerated label the value domain is the bound. For these two it is this integer and
+nothing else, so it is the single place an unbounded label is stopped (G7, TR-7). Checking the
+names without the numbers leaves the number free to change in one token.
+"""
+
+
+@pytest.mark.parametrize(
+    ("label_name", "bound"),
+    sorted(UNENUMERATED_LABEL_BOUNDS.items()),
+    ids=sorted(UNENUMERATED_LABEL_BOUNDS),
+)
+def test_the_bound_of_each_unenumerated_label_is_frozen(label_name: str, bound: int) -> None:
+    found = [
+        (descriptor.name, label)
+        for descriptor in METRIC_CATALOG
+        for label in descriptor.labels
+        if label.name == label_name
+    ]
+    assert found, f"no metric declares the label {label_name!r} any more"
+    for metric_name, label in found:
+        assert label.allowed_values is None, (
+            f"{metric_name} now enumerates {label_name!r}; the pinned bound no longer applies"
+        )
+        assert label.max_cardinality == bound, (
+            f"{metric_name} declares at most {label.max_cardinality} values for {label_name!r}, "
+            f"but the catalogue pins {bound}"
+        )
+        assert label.max_cardinality <= UNBOUNDED_LABEL_CARDINALITY_LIMIT
+
+
+def test_no_other_label_is_left_unenumerated() -> None:
+    unenumerated = {
+        label.name
+        for descriptor in METRIC_CATALOG
+        for label in descriptor.labels
+        if label.allowed_values is None
+    }
+    assert unenumerated == set(UNENUMERATED_LABEL_BOUNDS)
 
 
 @pytest.mark.parametrize(
     "descriptor", METRIC_CATALOG, ids=[descriptor.name for descriptor in METRIC_CATALOG]
 )
-def test_every_label_declares_a_bounded_domain(descriptor: MetricDescriptor) -> None:
+def test_only_the_two_free_form_labels_are_left_unenumerated(descriptor: MetricDescriptor) -> None:
+    # The forbidden names and the bound of an unenumerated label are refused by the LabelSpec
+    # validator at import. What it cannot know is that this catalog allows exactly two labels to
+    # go unenumerated, db and space, because those two carry a short hash or a catalog name.
     for label in descriptor.labels:
-        assert label.name not in FORBIDDEN_LABEL_NAMES
         if label.allowed_values is None:
-            assert label.max_cardinality <= UNBOUNDED_LABEL_CARDINALITY_LIMIT
             assert label.name in {"db", "space"}, (
                 f"{descriptor.name} leaves the label {label.name!r} unenumerated"
             )
-        else:
-            assert label.allowed_values
-            assert len(label.allowed_values) <= label.max_cardinality
 
 
 @pytest.mark.parametrize(
@@ -231,20 +434,20 @@ def test_no_other_metric_carries_a_label() -> None:
 @pytest.mark.parametrize(
     "descriptor", METRIC_CATALOG, ids=[descriptor.name for descriptor in METRIC_CATALOG]
 )
-def test_buckets_belong_to_histograms_and_are_strictly_increasing(
+def test_every_histogram_uses_one_of_the_four_declared_ladders(
     descriptor: MetricDescriptor,
 ) -> None:
+    # That buckets exist on a histogram, are absent elsewhere and increase strictly is the
+    # descriptor validator's job. That a histogram uses one of the four ladders this module
+    # documents, rather than an ad-hoc list, is this project's rule and only this test holds it.
     if descriptor.kind is not MetricKind.HISTOGRAM:
-        assert descriptor.buckets == ()
         return
-    assert descriptor.buckets
-    assert list(descriptor.buckets) == sorted(set(descriptor.buckets))
     assert descriptor.buckets in {
         LATENCY_BUCKETS_SECONDS,
         RATIO_BUCKETS,
         NEIGHBOR_COUNT_BUCKETS,
         ROW_COUNT_BUCKETS,
-    }
+    }, f"{descriptor.name} declares an ad-hoc bucket ladder"
 
 
 def test_the_latency_ladder_spans_microseconds_to_half_a_minute() -> None:
@@ -284,14 +487,67 @@ def test_the_unit_agrees_with_the_name_suffix(descriptor: MetricDescriptor) -> N
         assert descriptor.unit == ""
 
 
-def test_the_error_code_label_covers_every_code_of_the_taxonomy() -> None:
+def _every_reachable_error_class() -> set[type[GrafxError]]:
+    """Return every GrafxError subclass in the package, not only the publicly re-exported ones.
+
+    The public list is the taxonomy an application sees; it is not the set of codes that can
+    reach a metric label. A component may declare its own internal subclass, and a query
+    boundary that writes ``{"code": failure.code}`` will hand that code straight to the sink.
+    Importing every module is what makes those visible to ``__subclasses__``.
+    """
+    for module in pkgutil.walk_packages(okto_grafx.__path__, f"{okto_grafx.__name__}."):
+        # A module of another component that cannot be imported right now also cannot raise
+        # anything in production; the walk is a superset finder, never a build gate for others.
+        with contextlib.suppress(Exception):
+            importlib.import_module(module.name)
+
+    found: set[type[GrafxError]] = set()
+    pending: list[type[GrafxError]] = [GrafxError]
+    while pending:
+        current = pending.pop()
+        for subclass in current.__subclasses__():
+            if subclass not in found:
+                found.add(subclass)
+                pending.append(subclass)
+    return found | {GrafxError}
+
+
+def test_the_error_code_label_covers_every_reachable_error_code() -> None:
     # A code that escapes a query and is not in the domain would be refused in production, which
     # is exactly what TR-7 forbids; the drift is caught here instead.
+    label = metric("oktografx_query_errors_total").labels[0]
+    declared = label.allowed_values
+    assert declared is not None
+
+    reachable = {error.code for error in _every_reachable_error_class()}
+    assert reachable <= declared, sorted(reachable - declared)
+    assert len(declared) <= label.max_cardinality
+
+    # The public taxonomy is a subset of the walk; asserting it separately keeps the gate honest
+    # if the walk ever finds nothing.
+    public = {getattr(public_errors, name).code for name in public_errors.__all__}
+    assert public <= declared, sorted(public - declared)
+    assert len(reachable) > len(public), (
+        "the subclass walk found no internal error class, so it is not proving anything"
+    )
+
+
+def test_the_internal_error_codes_the_walk_is_there_to_catch_are_declared() -> None:
+    # These two are owned by C1 and are not in the public re-export list, which is exactly why
+    # a gate built on that list could not see them.
     declared = metric("oktografx_query_errors_total").labels[0].allowed_values
     assert declared is not None
-    taxonomy = {getattr(public_errors, name).code for name in public_errors.__all__}
-    assert taxonomy <= declared, sorted(taxonomy - declared)
-    assert len(declared) <= metric("oktografx_query_errors_total").labels[0].max_cardinality
+    assert {"page_full", "schema_mismatch"} <= declared
+
+
+def test_every_reachable_error_code_can_actually_be_emitted() -> None:
+    # The end-to-end statement of the same property: the sink accepts every one of them.
+    sink = OpenMetricsSink()
+    register_catalog(sink)
+    for error in sorted(_every_reachable_error_class(), key=lambda item: item.code):
+        sink.increment("oktografx_query_errors_total", 1.0, {"code": error.code})
+    with pytest.raises(GrafxConfigurationError, match="is not one of them"):
+        sink.increment("oktografx_query_errors_total", 1.0, {"code": "not_a_declared_code"})
 
 
 def test_metric_returns_the_frozen_descriptor_and_refuses_a_stranger() -> None:
@@ -351,6 +607,61 @@ def test_the_emitter_forwards_and_keeps_the_guard_visible() -> None:
     assert sink.sample_value("oktografx_wal_size_bytes") == 4096.0
     assert sink.sample_value("oktografx_vector_achieved_k") == 1.0
     assert sink.sample_value("oktografx_query_phase_duration_seconds", {"phase": "parse"}) == 1.0
+
+
+class _RefusingSink:
+    """A disabled sink that would notice being called, which is what makes the guard visible.
+
+    Every sink the other tests use drops the call itself when it is not recording, so the guard
+    inside the emitter is invisible: removing it changes nothing anybody can see. This one
+    reports itself disabled and then raises if anyone emits to it anyway.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    @property
+    def enabled(self) -> bool:
+        return False
+
+    def register(self, descriptor: MetricDescriptor) -> None:
+        self.calls.append("register")
+
+    def increment(self, name: str, value: float = 1.0, labels: object = None) -> None:
+        raise AssertionError("increment reached a sink that reported itself disabled")
+
+    def set_gauge(self, name: str, value: float, labels: object = None) -> None:
+        raise AssertionError("set_gauge reached a sink that reported itself disabled")
+
+    def observe(self, name: str, value: float, labels: object = None) -> None:
+        raise AssertionError("observe reached a sink that reported itself disabled")
+
+    def time(self, name: str, labels: object = None) -> object:
+        self.calls.append("time")
+        return contextlib.nullcontext()
+
+    def snapshot(self) -> dict[str, object]:
+        return {}
+
+
+def test_the_emitter_does_not_forward_to_a_sink_that_reports_itself_disabled() -> None:
+    sink = _RefusingSink()
+    emitter = MetricEmitter(sink)
+    assert emitter.enabled is False
+    # None of these may reach the sink: the emitter reads the flag before it forwards.
+    emitter.increment("oktografx_write_conflicts_total")
+    emitter.set_gauge("oktografx_wal_size_bytes", 1.0)
+    emitter.observe("oktografx_vector_achieved_k", 3.0)
+    assert sink.calls == []
+
+
+def test_the_emitter_still_hands_back_the_timer_of_a_disabled_sink() -> None:
+    # time() is the one call that must go through even when nothing is recorded, because the
+    # caller needs a context manager to enter either way.
+    sink = _RefusingSink()
+    with MetricEmitter(sink).time("oktografx_fsync_duration_seconds", {"target": "wal"}):
+        pass
+    assert sink.calls == ["time"]
 
 
 def test_the_emitter_over_a_no_op_sink_reports_disabled_and_forwards_nothing() -> None:

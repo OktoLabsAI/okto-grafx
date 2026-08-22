@@ -12,10 +12,11 @@ import pytest
 
 from conftest import CoordinatorFactory
 from coordination_support import (
-    WRITE_OPERATIONS,
     DirectoryStorageDevice,
     HookStorageDevice,
     ManualClock,
+    WRITE_OPERATIONS,
+    owned_by,
 )
 from okto_grafx.adapters.coordination_local import LocalProcessCoordinator
 from okto_grafx.domain.errors import GrafxStaleEpoch
@@ -23,20 +24,12 @@ from okto_grafx.domain.ports.coordination import Lease
 
 
 def _overthrown(
-    make_coordinator: CoordinatorFactory,
-    database_root: object,
-    *,
-    epoch_cache_seconds: float = 0.0,
+    make_coordinator: CoordinatorFactory, database_root: object
 ) -> tuple[LocalProcessCoordinator, Lease, HookStorageDevice]:
     """Return a participant whose epoch was taken over, with a device that records every call."""
     device = HookStorageDevice(DirectoryStorageDevice(database_root))
     stale_clock = ManualClock(monotonic=1_000.0)
-    stale = make_coordinator(
-        owner_id="p1-stale",
-        clock=stale_clock,
-        storage=device,
-        epoch_cache_seconds=epoch_cache_seconds,
-    )
+    stale = make_coordinator(owner_id="p1-stale", clock=stale_clock, storage=device)
     lease = stale.acquire_writer_lease(timeout=1.0)
 
     successor_clock = ManualClock(monotonic=6_000_000.0)
@@ -51,6 +44,18 @@ def _overthrown(
     return stale, lease, device
 
 
+def _successor_of(
+    make_coordinator: CoordinatorFactory, database_root: object
+) -> LocalProcessCoordinator:
+    """Return a participant that has watched the current owner stall and may take over."""
+    clock = ManualClock(monotonic=9_000_000.0)
+    successor = make_coordinator(owner_id="p3-third", clock=clock)
+    assert successor.detect_dead_owner(stall_threshold=5.0) is None
+    clock.advance(6.0)
+    assert successor.detect_dead_owner(stall_threshold=5.0) is not None
+    return successor
+
+
 def test_the_stale_holder_is_refused_and_writes_nothing(
     make_coordinator: CoordinatorFactory, database_root: object
 ) -> None:
@@ -61,16 +66,18 @@ def test_the_stale_holder_is_refused_and_writes_nothing(
     assert failure.value.code == "stale_epoch"
     assert failure.value.details["epoch"] == 1
     assert failure.value.details["published_epoch"] == 2
-    assert device.write_calls == []
+    assert device.forbid_writes is True, "the device was not armed, so nothing was proved"
+    assert device.calls, "the guard did read the published record"
     assert set(device.calls) <= {"exists", "log_size", "read_log", "file_size"}
-    assert set(device.calls) & WRITE_OPERATIONS == set()
 
 
-def test_the_refusal_repeats_without_touching_the_device_at_all(
+def test_the_refusal_repeats_and_reads_the_record_every_time(
     make_coordinator: CoordinatorFactory, database_root: object
 ) -> None:
-    # Once the higher epoch has been observed, the guard is free: epochs never decrease, so an
-    # epoch below the highest one ever seen is refused with no device call whatsoever.
+    # The guard used to answer a repeat refusal from a remembered high-water mark, with no device
+    # call at all. That shortcut is gone: it could not see a control plane restored from
+    # quarantine, and a committing writer only ever validates. Reading a small record is the
+    # price of being right about who may write.
     stale, lease, device = _overthrown(make_coordinator, database_root)
     with pytest.raises(GrafxStaleEpoch):
         stale.validate_epoch(lease.epoch)
@@ -78,7 +85,8 @@ def test_the_refusal_repeats_without_touching_the_device_at_all(
     for _attempt in range(10):
         with pytest.raises(GrafxStaleEpoch):
             stale.validate_epoch(lease.epoch)
-    assert device.calls == []
+    assert device.calls, "the refusal must rest on the published record, not on memory"
+    assert set(device.calls) & WRITE_OPERATIONS == set()
 
 
 def test_the_commit_shaped_double_validation_refuses_and_writes_nothing(
@@ -93,42 +101,48 @@ def test_the_commit_shaped_double_validation_refuses_and_writes_nothing(
             reached_the_section = True
             stale.validate_epoch(lease.epoch)
     assert reached_the_section is False
-    assert device.write_calls == []
+    assert device.forbid_writes is True
+    assert set(device.calls) & WRITE_OPERATIONS == set()
 
 
-def test_a_cached_epoch_window_never_survives_the_commit_section(
+def test_no_setting_can_put_a_staleness_window_in_front_of_the_guard(
     make_coordinator: CoordinatorFactory, database_root: object
 ) -> None:
-    # With a staleness window configured, a validation outside a section may answer from the
-    # cache. Inside a section the published epoch is always re-read, which is what makes the
-    # window safe: every device write of the commit protocol happens inside that section.
-    stale, lease, device = _overthrown(
-        make_coordinator, database_root, epoch_cache_seconds=60.0
-    )
-    stale.validate_epoch(lease.epoch)  # the cache still says epoch one
-    assert device.write_calls == []
+    # There is no cache and no knob that introduces one. The validation that CONTRACT.md section
+    # 8.5 places BEFORE the commit section is the guard that matters for a stale holder: it reads
+    # the published record whenever the free ceiling refusal cannot already answer, and no
+    # setting can put a staleness window in front of either.
+    stale, lease, device = _overthrown(make_coordinator, database_root)
+    for _attempt in range(5):
+        with pytest.raises(GrafxStaleEpoch):
+            stale.validate_epoch(lease.epoch)
     with pytest.raises(GrafxStaleEpoch):
         with stale.exclusive("commit", timeout=1.0):
             stale.validate_epoch(lease.epoch)
-    assert device.write_calls == []
-    # Having seen the truth once, the cheap path refuses from then on.
-    with pytest.raises(GrafxStaleEpoch):
-        stale.validate_epoch(lease.epoch)
+    assert device.forbid_writes is True
+    assert set(device.calls) & WRITE_OPERATIONS == set()
 
 
 def test_the_successor_passes_its_own_validation(
     make_coordinator: CoordinatorFactory, database_root: object
 ) -> None:
+    # The successor is the participant that took the lease over, which is what its name says and
+    # what A74 requires: validation asks "may I commit", so the answer belongs to a holder.
     stale, lease, _device = _overthrown(make_coordinator, database_root)
-    successor = make_coordinator(owner_id="p3-third", monotonic_origin=10.0)
-    assert successor.current_epoch() == 2
+    successor = _successor_of(make_coordinator, database_root)
+    held = successor.acquire_writer_lease(timeout=1.0)
+    assert held.epoch == successor.current_epoch()
+
+    successor.validate_epoch(held.epoch)
     with pytest.raises(GrafxStaleEpoch):
-        successor.validate_epoch(1)
+        successor.validate_epoch(held.epoch - 1)
     with pytest.raises(GrafxStaleEpoch):
-        successor.validate_epoch(3)
-    successor.validate_epoch(2)
-    assert stale.owner_id() == "p1-stale"
-    assert lease.epoch == 1
+        successor.validate_epoch(held.epoch + 1)
+
+    # And the participant it replaced is refused at the epoch it still remembers holding.
+    with pytest.raises(GrafxStaleEpoch):
+        stale.validate_epoch(lease.epoch)
+    assert owned_by(stale.owner_id(), "p1-stale")
 
 
 def test_no_epoch_is_valid_before_one_is_published(make_coordinator: CoordinatorFactory) -> None:

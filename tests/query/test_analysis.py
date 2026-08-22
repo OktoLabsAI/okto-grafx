@@ -1,0 +1,363 @@
+"""Semantic analysis: what a statement means, decided with no catalog in reach."""
+
+from __future__ import annotations
+
+import pytest
+
+from okto_grafx.domain.errors import GrafxPlanError
+from okto_grafx.domain.query.analysis import (
+    ENTITY_NODE,
+    ENTITY_RELATIONSHIP,
+    analyze,
+    contains_aggregate,
+    is_aggregate,
+)
+from okto_grafx.domain.query.ast import Literal, Parameter
+from okto_grafx.domain.query.limits import MAX_PARAMETERS
+from okto_grafx.domain.query.parser import parse
+
+
+def analysis_of(text: str):
+    """Return the analysis of one query text."""
+    return analyze(parse(text))
+
+
+# --- bindings -------------------------------------------------------------------------------
+
+
+def test_a_pattern_binds_its_nodes_and_relationships_by_kind() -> None:
+    found = analysis_of("MATCH (a:Person)-[r:Knows]->(b:Person) RETURN a.id")
+    assert found.variables(ENTITY_NODE) == ("a", "b")
+    assert found.variables(ENTITY_RELATIONSHIP) == ("r",)
+
+
+def test_bindings_keep_the_order_they_were_written_in() -> None:
+    found = analysis_of("MATCH (z:Person), (a:Person) RETURN z.id, a.id")
+    assert [binding.name for binding in found.bindings] == ["z", "a"]
+
+
+def test_a_variable_used_by_no_pattern_is_refused_and_names_what_is_bound() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) RETURN q.name")
+    assert failure.value.details["value"] == "q"
+    assert "p" in failure.value.message
+
+
+def test_a_variable_cannot_be_a_node_and_a_relationship() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (a:Person)-[a:Knows]->(b:Person) RETURN b.id")
+    assert failure.value.details["field"] == "variable"
+
+
+def test_a_variable_cannot_carry_two_different_labels() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (a:Person), (a:Doc) RETURN a.id")
+    assert failure.value.details["value"] == "a"
+
+
+def test_a_second_mention_may_add_the_label_the_first_left_out() -> None:
+    found = analysis_of("MATCH (a:Person)-[:Knows]->(b) MATCH (b:Person) RETURN b.id")
+    binding = found.binding("b")
+    assert binding is not None
+    assert binding.labels == ("Person",)
+
+
+# --- parameters -----------------------------------------------------------------------------
+
+
+def test_parameters_are_collected_once_each_in_first_appearance_order() -> None:
+    found = analysis_of(
+        "MATCH (p:Person) WHERE p.id = $id AND p.age = $age OR p.city = $id RETURN p.name"
+    )
+    assert found.parameters == ("id", "age")
+
+
+def test_a_row_window_may_be_a_parameter() -> None:
+    found = analysis_of("MATCH (p:Person) RETURN p.id SKIP $offset LIMIT $count")
+    assert found.parameters == ("offset", "count")
+
+
+def test_too_many_parameters_are_refused() -> None:
+    # The parameters go inside ONE list literal on purpose: a RETURN clause is bounded at the
+    # same 256 items, so projecting them one per column would be refused by the projection rule
+    # and this guard would never fire (amendment A34).
+    items = ", ".join(f"$p{index}" for index in range(MAX_PARAMETERS + 1))
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of(f"RETURN [{items}]")
+    assert failure.value.details["field"] == "parameters"
+
+
+def test_a_schema_statement_may_not_carry_a_parameter() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("CREATE VECTOR SPACE s {dimension: $d, metric: 'cosine'}")
+    assert failure.value.details["field"] == "parameter"
+
+
+# --- aggregation ----------------------------------------------------------------------------
+
+
+def test_a_clause_with_an_aggregate_groups_by_everything_else() -> None:
+    found = analysis_of("MATCH (p:Person) RETURN p.city AS city, count(*) AS total")
+    assert found.aggregated is True
+    assert found.grouping_positions == (0,)
+    assert [item.function for item in found.aggregations] == ["COUNT"]
+
+
+def test_a_clause_with_no_aggregate_does_not_group() -> None:
+    found = analysis_of("MATCH (p:Person) RETURN p.city")
+    assert found.aggregated is False
+    assert found.grouping_positions == (0,)
+
+
+def test_an_aggregate_in_where_is_refused() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) WHERE count(p.id) > 1 RETURN p.id")
+    assert failure.value.details["field"] == "predicate"
+
+
+def test_an_aggregate_inside_an_aggregate_is_refused() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) RETURN sum(count(p.id))")
+    assert failure.value.details["field"] == "function"
+
+
+def test_an_aggregate_in_a_written_property_is_refused() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) CREATE (q:Person {age: count(p.id)})")
+    assert failure.value.details["field"] == "expression"
+
+
+def test_an_aggregate_in_a_set_value_is_refused() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) SET p.age = count(p.id)")
+    assert failure.value.details["field"] == "expression"
+
+
+def test_an_aggregate_takes_exactly_one_argument() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) RETURN sum(p.age, p.id)")
+    assert failure.value.details["field"] == "function"
+
+
+def test_only_count_is_written_with_a_star() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) RETURN sum(*)")
+    assert failure.value.details["value"] == "sum"
+
+
+def test_the_aggregate_predicates_agree_with_each_other() -> None:
+    call = parse("MATCH (p:Person) RETURN count(p.id)").return_clause.items[0].expression
+    assert is_aggregate(call) is True
+    assert contains_aggregate(call) is True
+    assert is_aggregate(Literal(value=1)) is False
+    assert contains_aggregate(Literal(value=1)) is False
+
+
+# --- ordering -------------------------------------------------------------------------------
+
+
+def test_an_order_by_key_may_name_an_alias() -> None:
+    found = analysis_of("MATCH (p:Person) RETURN p.age AS a ORDER BY a DESC")
+    assert found.output_columns == ("a",)
+
+
+def test_an_order_by_key_may_repeat_a_projected_expression() -> None:
+    found = analysis_of("MATCH (p:Person) RETURN DISTINCT p.age ORDER BY p.age")
+    assert found.output_columns == ("p.age",)
+
+
+def test_an_order_by_key_that_distinct_dropped_is_refused() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) RETURN DISTINCT p.age ORDER BY p.name")
+    assert failure.value.details["field"] == "sort_item"
+
+
+def test_an_order_by_key_that_a_group_dropped_is_refused() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) RETURN count(*) AS total ORDER BY p.name")
+    assert failure.value.details["field"] == "sort_item"
+
+
+def test_an_aggregate_written_directly_in_order_by_is_refused() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) RETURN p.city ORDER BY count(*)")
+    assert failure.value.details["field"] == "sort_item"
+
+
+def test_an_order_by_key_over_a_bound_variable_is_allowed_without_aggregation() -> None:
+    found = analysis_of("MATCH (p:Person) RETURN p.age ORDER BY p.name")
+    assert found.output_columns == ("p.age",)
+
+
+def test_two_items_may_not_be_given_the_same_name() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) RETURN p.age AS x, p.name AS x")
+    assert failure.value.details["value"] == "x"
+
+
+@pytest.mark.parametrize("keyword", ["SKIP", "LIMIT"])
+def test_a_row_window_that_is_not_a_count_is_refused(keyword: str) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of(f"MATCH (p:Person) RETURN p.id {keyword} 'two'")
+    assert failure.value.details["field"] == keyword.lower()
+
+
+@pytest.mark.parametrize("keyword", ["SKIP", "LIMIT"])
+def test_a_negative_row_window_is_refused(keyword: str) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of(f"MATCH (p:Person) RETURN p.id {keyword} -1")
+    assert failure.value.details["field"] == keyword.lower()
+
+
+# --- similarity -----------------------------------------------------------------------------
+
+
+def test_the_similarity_call_is_taken_apart_for_the_planner() -> None:
+    found = analysis_of(
+        "MATCH (n:Chunk) WHERE similarity(n.embedding, $q, space => 'minilm_v2') > 0.7 "
+        "RETURN n.id"
+    )
+    assert found.similarity is not None
+    assert found.similarity.variable == "n"
+    assert found.similarity.property_key == "embedding"
+    assert found.similarity.space == Literal(value="minilm_v2")
+    assert found.similarity.query_vector == Parameter(name="q")
+
+
+def test_the_space_may_be_named_by_a_parameter() -> None:
+    found = analysis_of(
+        "MATCH (n:Chunk) WHERE similarity(n.embedding, $q, space => $space) > 0.7 RETURN n.id"
+    )
+    assert found.similarity is not None
+    assert found.similarity.space == Parameter(name="space")
+
+
+def test_the_same_call_written_twice_is_one_search() -> None:
+    found = analysis_of(
+        "MATCH (n:Chunk) WHERE similarity(n.embedding, $q, space => 's') > 0.1 "
+        "RETURN similarity(n.embedding, $q, space => 's') AS score"
+    )
+    assert found.similarity is not None
+
+
+def test_two_different_searches_in_one_query_are_refused() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of(
+            "MATCH (n:Chunk) WHERE similarity(n.embedding, $q, space => 'a') > 0.1 "
+            "AND similarity(n.embedding, $q, space => 'b') > 0.1 RETURN n.id"
+        )
+    assert failure.value.details["field"] == "function"
+
+
+def test_a_search_that_names_no_space_is_refused() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (n:Chunk) WHERE similarity(n.embedding, $q) > 0.1 RETURN n.id")
+    assert failure.value.details["field"] == "space"
+
+
+def test_a_search_whose_space_is_computed_is_refused() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of(
+            "MATCH (n:Chunk) WHERE similarity(n.embedding, $q, space => n.layer) > 0.1 "
+            "RETURN n.id"
+        )
+    assert failure.value.details["field"] == "space"
+
+
+def test_a_search_with_an_unknown_named_argument_is_refused() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of(
+            "MATCH (n:Chunk) WHERE similarity(n.embedding, $q, space => 's', k => 3) > 0.1 "
+            "RETURN n.id"
+        )
+    assert failure.value.details["field"] == "argument"
+
+
+def test_a_search_whose_first_argument_is_not_a_property_is_refused() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (n:Chunk) WHERE similarity($a, $q, space => 's') > 0.1 RETURN n.id")
+    assert failure.value.details["field"] == "argument"
+
+
+def test_a_search_with_the_wrong_number_of_arguments_is_refused() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (n:Chunk) WHERE similarity(n.embedding, space => 's') > 0.1 RETURN n.id")
+    assert failure.value.details["field"] == "function"
+
+
+def test_the_score_projection_needs_a_search_to_report() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (n:Chunk) RETURN similarity_score()")
+    assert failure.value.details["value"] == "similarity_score"
+
+
+def test_the_score_projection_takes_no_arguments() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (n:Chunk) RETURN similarity_score(n.embedding)")
+    assert failure.value.details["field"] == "function"
+
+
+def test_the_score_projection_is_recorded_when_a_search_exists() -> None:
+    found = analysis_of(
+        "MATCH (n:Chunk) WHERE similarity(n.embedding, $q, space => 's') > 0.1 "
+        "RETURN similarity_score() AS score"
+    )
+    assert found.scores_similarity is True
+
+
+# --- writes ---------------------------------------------------------------------------------
+
+
+def test_a_written_node_needs_exactly_one_label() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("CREATE (n)")
+    assert failure.value.details["field"] == "labels"
+
+
+def test_a_written_relationship_needs_exactly_one_type() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("CREATE (a:Person)-[:Knows|Likes]->(b:Person)")
+    assert failure.value.details["field"] == "types"
+
+
+def test_a_written_relationship_needs_a_direction() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("CREATE (a:Person)-[:Knows]-(b:Person)")
+    assert failure.value.details["field"] == "direction"
+
+
+def test_a_written_relationship_may_not_span_a_hop_range() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("CREATE (a:Person)-[:Knows*1..2]->(b:Person)")
+    assert failure.value.details["field"] == "hops"
+
+
+def test_a_written_node_that_reuses_a_binding_needs_no_label() -> None:
+    found = analysis_of("MATCH (a:Person) CREATE (a)-[:Knows]->(b:Person)")
+    assert found.variables(ENTITY_NODE) == ("a", "b")
+
+
+def test_delete_needs_a_bound_variable() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) DELETE q")
+    assert failure.value.details["value"] == "q"
+
+
+def test_set_needs_a_bound_subject() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) SET q.age = 1")
+    assert failure.value.details["value"] == "q"
+
+
+def test_an_unknown_function_names_the_ones_that_exist() -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of("MATCH (p:Person) RETURN nosuch(p.id)")
+    assert failure.value.details["value"] == "nosuch"
+    assert "similarity" in failure.value.message
+
+
+def test_a_schema_statement_analyses_to_an_empty_analysis() -> None:
+    found = analysis_of("CREATE NODE TABLE T(a INT64)")
+    assert found.bindings == ()
+    assert found.parameters == ()
+    assert found.aggregated is False

@@ -16,6 +16,9 @@ import pytest
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxCorruptionDetected
 from okto_grafx.domain.model.errors import SchemaMismatchError
 from okto_grafx.domain.model.schema import (
+    SOURCE_COLUMN,
+    TARGET_COLUMN,
+    relationship_row,
     MAX_IDENTIFIER_LENGTH,
     SPACE_STATE_ACTIVE,
     SPACE_STATE_RETIRED,
@@ -376,3 +379,177 @@ def test_a_vector_of_the_wrong_precision_does_not_fit_the_column() -> None:
     )
     with pytest.raises(SchemaMismatchError):
         encode_tuple(table, (VectorValue((1.0,), space_ref=1, dtype="float64"),))
+
+
+def test_a_row_with_an_unencodable_string_never_reaches_a_payload() -> None:
+    table = person_table()
+    with pytest.raises(SchemaMismatchError):
+        encode_tuple(table, (7, "\ud800", 9.5))
+
+
+def test_a_space_created_at_a_non_finite_reading_is_refused() -> None:
+    # A NaN creation reading makes a catalog unequal to its own reload, because NaN is unequal
+    # to itself, so every "did the reload match" check reports a difference that is not there.
+    for reading in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(GrafxConfigurationError) as raised:
+            EmbeddingSpaceDef(
+                space_id=1,
+                name="minilm",
+                dimension=8,
+                metric=DistanceMetric.COSINE,
+                normalized=False,
+                created_at_wall=reading,
+            )
+        assert raised.value.details["field"] == "created_at_wall"
+
+
+def test_a_space_at_an_ordinary_reading_equals_itself() -> None:
+    space = EmbeddingSpaceDef(
+        space_id=1,
+        name="minilm",
+        dimension=8,
+        metric=DistanceMetric.COSINE,
+        normalized=False,
+        created_at_wall=1_700_000_000.5,
+    )
+    assert space == space
+
+
+# --- W5c: the two reserved endpoint columns of a relationship table -----------------------------
+
+
+def knows(properties: tuple[ColumnDef, ...] = ()) -> TableDef:
+    """Return a relationship table with those property columns and nothing else declared."""
+    return TableDef(
+        table_id=2,
+        name="Knows",
+        kind="rel",
+        columns=properties or (ColumnDef(name="since", type=ValueType.INT64),),
+        from_table="Person",
+        to_table="Person",
+    )
+
+
+def test_a_relationship_table_stores_its_endpoints_ahead_of_its_properties() -> None:
+    """The layout, stated once so C5 and C10 encode against the same thing.
+
+    Ahead rather than behind so the positions never depend on how many properties the user
+    declared: source is value 0 and target is value 1 in every relationship table of every
+    schema version.
+    """
+    table = knows()
+    assert [column.name for column in table.columns] == [SOURCE_COLUMN, TARGET_COLUMN, "since"]
+    assert [column.name for column in table.endpoint_columns] == [SOURCE_COLUMN, TARGET_COLUMN]
+    assert [column.name for column in table.property_columns] == ["since"]
+    assert table.arity == 3
+
+
+def test_the_endpoint_columns_are_int64_and_not_nullable() -> None:
+    """INT64 because section 7.1 fixes the taxonomy and it is the only 64-bit integer in it; not
+    nullable because an edge with no source is not an edge."""
+    for column in knows().endpoint_columns:
+        assert column.type is ValueType.INT64
+        assert column.nullable is False
+
+
+def test_normalising_the_columns_is_idempotent() -> None:
+    """A table read back out of the catalog already carries them, and must come back unchanged."""
+    once = knows()
+    twice = TableDef(
+        table_id=2, name="Knows", kind="rel", columns=once.columns,
+        from_table="Person", to_table="Person",
+    )
+    assert twice.columns == once.columns
+    assert twice.arity == once.arity
+
+
+def test_a_node_table_may_not_use_the_reserved_names() -> None:
+    """The layout owns those two names, so a node column called _from would be read as an
+    endpoint by every consumer of a relationship tuple."""
+    with pytest.raises(GrafxConfigurationError) as raised:
+        TableDef(
+            table_id=1,
+            name="Person",
+            kind="node",
+            columns=(ColumnDef(name=SOURCE_COLUMN, type=ValueType.INT64),),
+        )
+    assert raised.value.details["field"] == "columns"
+
+
+def test_a_relationship_property_may_not_take_a_reserved_name() -> None:
+    """Normalisation puts them at 0 and 1, so a reserved name anywhere else is a collision."""
+    with pytest.raises(GrafxConfigurationError):
+        TableDef(
+            table_id=2,
+            name="Knows",
+            kind="rel",
+            columns=(
+                ColumnDef(name="since", type=ValueType.INT64),
+                ColumnDef(name=TARGET_COLUMN, type=ValueType.INT64),
+            ),
+            from_table="Person",
+            to_table="Person",
+        )
+
+
+def test_a_relationship_that_declares_the_endpoints_with_a_different_shape_is_refused() -> None:
+    """Same names, wrong type or nullability, is not the layout -- and silently accepting it
+    would store an edge whose endpoints no consumer could read."""
+    with pytest.raises(GrafxConfigurationError) as raised:
+        TableDef(
+            table_id=2,
+            name="Knows",
+            kind="rel",
+            columns=(
+                ColumnDef(name=SOURCE_COLUMN, type=ValueType.STRING),
+                ColumnDef(name=TARGET_COLUMN, type=ValueType.INT64, nullable=False),
+            ),
+            from_table="Person",
+            to_table="Person",
+        )
+    assert raised.value.details["value"] == SOURCE_COLUMN
+
+
+def test_an_edge_tuple_is_built_and_read_through_one_place() -> None:
+    table = knows()
+    row = relationship_row(7, 9, (2020,))
+    assert row == (7, 9, 2020)
+    assert table.source_of(row) == 7
+    assert table.target_of(row) == 9
+    assert decode_tuple(table, encode_tuple(table, row)) == row
+
+
+def test_an_edge_that_is_missing_an_end_is_refused_before_it_is_encoded() -> None:
+    """The arity check already there does the work, which is the point of putting the endpoints
+    in the columns rather than beside them."""
+    table = knows()
+    with pytest.raises(SchemaMismatchError) as raised:
+        encode_tuple(table, (7, 2020))
+    assert raised.value.details["expected_arity"] == 3
+
+
+def test_a_null_endpoint_is_refused() -> None:
+    table = knows()
+    with pytest.raises(SchemaMismatchError):
+        encode_tuple(table, relationship_row(None, 9, (2020,)))
+
+
+def test_an_endpoint_that_is_not_a_row_identity_is_refused() -> None:
+    table = knows()
+    for bad in ("7", 7.0, True):
+        with pytest.raises(SchemaMismatchError):
+            table.source_of(relationship_row(bad, 9, (2020,)))
+
+
+def test_a_node_table_has_no_endpoints_to_read() -> None:
+    node = TableDef(
+        table_id=1,
+        name="Person",
+        kind="node",
+        columns=(ColumnDef(name="id", type=ValueType.INT64, nullable=False),),
+        primary_key="id",
+    )
+    assert node.endpoint_columns == ()
+    assert [column.name for column in node.property_columns] == ["id"]
+    with pytest.raises(GrafxConfigurationError):
+        node.source_of((1,))

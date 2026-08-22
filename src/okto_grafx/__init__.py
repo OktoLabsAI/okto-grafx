@@ -2,13 +2,42 @@
 
 Correct under multi-process concurrency, verifiable on disk and recoverable by construction.
 
-This module is the public entry point of the package. The foundation build exposes the version
-only; the public facade (connect, Database, Transaction, QueryResult) is added by C11 once the
-engine exists. Errors already have their supported import path in :mod:`okto_grafx.errors`.
+This module is the public entry point of the package (CONTRACT.md section 10)::
+
+    from okto_grafx import connect, Database, Transaction
+
+    db = connect("./mydb", partitions_per_table=64)      # or ":memory:"
+    with db.begin("write") as txn:
+        txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
+    report = db.recover()
+    db.close()
+
+Errors keep their own supported import path in :mod:`okto_grafx.errors`, so the taxonomy of
+section 2 is reachable without importing the engine. A database composed without a given engine
+refuses the door that needs it with a typed GrafxUnsupportedOperation naming the missing
+component, rather than pretending to answer.
+
+Every name below is re-exported, never redefined: the definition of each lives in the component
+that owns it (A24), and this module only makes it reachable by its supported path (A10).
 """
 
 from __future__ import annotations
 
-__all__ = ["__version__"]
+from okto_grafx.api import connect
+from okto_grafx.engine.database import Database, DatabaseIdentity, Transaction
+from okto_grafx.engine.query_engine import QueryResult
+from okto_grafx.runtime.config import DatabaseConfig
+from okto_grafx.runtime.registry import PortRegistry
+
+__all__ = [
+    "Database",
+    "DatabaseConfig",
+    "DatabaseIdentity",
+    "PortRegistry",
+    "QueryResult",
+    "Transaction",
+    "__version__",
+    "connect",
+]
 
 __version__: str = "0.1.0"

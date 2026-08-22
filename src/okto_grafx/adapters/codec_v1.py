@@ -68,6 +68,7 @@ class PageCodecV1:
                 field="page_size",
                 value=page.page_size,
                 page=page.page_index,
+                codec_page_size=self._page_size,
             )
         image = page.to_bytes()
         if len(image) != self._page_size:
@@ -81,7 +82,7 @@ class PageCodecV1:
         return image
 
     def decode_page(
-        self, raw: bytes, *, verify: bool = True, page_index: PageIndex = 0
+        self, raw: bytes, *, verify: bool = True, page_index: PageIndex | None = None
     ) -> Page:
         """Parse a page image into a page, proving its structure and, when asked, its checksum.
 
@@ -92,9 +93,16 @@ class PageCodecV1:
         damaged page still needs to see what is inside it.
 
         The page index is not part of the port: the port has no room for it, and only the buffer
-        pool that issued the read knows it. It is accepted here as a keyword so that the pool can
-        name the location in any error the decode raises, and it defaults to the reserved header
-        page, which is never a record location.
+        pool that issued the read knows it. It is accepted here as a keyword so a caller that
+        does know the location can have it named in the failure. Without it the failure says
+        nothing about which page it was, which is better than claiming a page it cannot know.
+
+        That covers the FAILURE. A page that decodes successfully through the port carries index
+        zero -- Page has to store some number and zero is the only one available -- so every
+        refusal it raises afterwards names page zero, which is a real page and a wrong answer. A
+        caller reaching this through the PageCodec port cannot pass the keyword at all, so it
+        must stamp what it knows: `page.page_index = index` immediately after decoding. Both of
+        C1's own decode sites do exactly that, and a caller that forgets is the defect C6 found.
         """
         return Page.from_bytes(
             bytes(raw), page_size=self._page_size, page_index=page_index, verify=verify

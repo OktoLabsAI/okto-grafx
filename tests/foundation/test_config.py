@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
 import pytest
 
@@ -109,8 +110,19 @@ def test_a_valid_partition_count_is_accepted(partitions: int) -> None:
     assert config.partitions_per_table == partitions
 
 
+def test_the_partition_ceiling_is_the_number_the_format_can_store() -> None:
+    # A68: a literal, not MAX + 1. The independent consequence is the format itself -- section
+    # 6.2 stores partitions_per_table as u16, so 65535 is the largest value the meta page can
+    # hold and 70000 would be accepted by a config the page cannot represent.
+    assert MAX_PARTITIONS_PER_TABLE == 65535
+    assert MAX_PARTITIONS_PER_TABLE == 2**16 - 1
+    for unstorable in (65536, 70000, 2**17):
+        with pytest.raises(GrafxConfigurationError):
+            DatabaseConfig(path=":memory:", partitions_per_table=unstorable)
+
+
 @pytest.mark.parametrize(
-    "partitions", [0, -1, MAX_PARTITIONS_PER_TABLE + 1, "64", 64.0, None, True]
+    "partitions", [0, -1, 65536, 70000, "64", 64.0, None, True]
 )
 def test_an_invalid_partition_count_is_rejected(partitions: object) -> None:
     with pytest.raises(GrafxConfigurationError) as raised:
@@ -335,13 +347,17 @@ def test_a_destination_that_is_not_a_string_is_refused(destination: object) -> N
 
 # --- the page size the config accepts is a page the storage core can address (A20) ------------
 
-CANDIDATE_PAGE_SIZES: tuple[int, ...] = tuple(2**exponent for exponent in range(6, 21)) + (
-    0,
-    -8192,
-    3000,
-    4097,
-    12288,
+CANDIDATE_PAGE_SIZES: tuple[int, ...] = (
+    tuple(2**exponent for exponent in range(0, 21))
+    + tuple(range(500, 601))
+    + tuple(range(32700, 32801))
+    + (0, -8192, 3000, 4097, 12288)
 )
+"""Every power of two up to a million, plus dense ranges around both bounds and a few odd sizes.
+
+The dense ranges matter: an off-by-one in either definition shows up as one size accepted on one
+side of the boundary and refused on the other, which a sparse list of powers of two would miss.
+"""
 
 
 def _config_accepts(page_size: int) -> bool:
@@ -360,22 +376,47 @@ def _storage_core_accepts(page_size: int) -> bool:
     return True
 
 
-def test_the_upper_bound_is_the_storage_core_definition() -> None:
-    # Imported, not repeated: free_start and free_end are 16-bit, so 65536 cannot be addressed.
-    assert MAX_PAGE_SIZE == CORE_MAX_PAGE_SIZE == 32768
-    assert MIN_PAGE_SIZE == 512
-    assert MIN_PAGE_SIZE >= CORE_MIN_PAGE_SIZE
+def test_both_page_size_bounds_are_the_storage_core_definitions() -> None:
+    # Amendment A24: one definition, owned by C1. Both bounds are the imported objects, not
+    # literals that happen to agree, so nobody can edit one of a pair into a divergence.
+    assert MIN_PAGE_SIZE is CORE_MIN_PAGE_SIZE
+    assert MAX_PAGE_SIZE is CORE_MAX_PAGE_SIZE
+    assert (MIN_PAGE_SIZE, MAX_PAGE_SIZE) == (512, 32768)
 
 
-def test_the_config_never_accepts_a_page_size_the_storage_core_refuses() -> None:
-    # The integration failure amendment A20 closes: a size accepted here and refused on the
-    # first page write. The configuration may be stricter, never looser.
+def test_the_config_and_the_storage_core_accept_exactly_the_same_page_sizes() -> None:
+    # Amendments A20 and A24: one accepted set, checked from both sides. A size accepted here
+    # and refused on the first page write is the integration failure; a size accepted by the
+    # core and refused here is the drift that shows the two definitions have parted company.
     accepted_here = {size for size in CANDIDATE_PAGE_SIZES if _config_accepts(size)}
     accepted_by_core = {size for size in CANDIDATE_PAGE_SIZES if _storage_core_accepts(size)}
-    assert accepted_here <= accepted_by_core
+    assert accepted_here - accepted_by_core == set(), "the config accepts a page the core refuses"
+    assert accepted_by_core - accepted_here == set(), "the core accepts a page the config refuses"
     assert accepted_here == {512, 1024, 2048, 4096, 8192, 16384, 32768}
-    # The only sizes the two disagree on are below the configuration floor, on purpose.
-    assert all(size < MIN_PAGE_SIZE for size in accepted_by_core - accepted_here)
+
+
+def test_the_cross_check_really_exercises_both_boundaries() -> None:
+    # Guards the comparison above against passing on a candidate list that never touches an edge.
+    assert 512 in CANDIDATE_PAGE_SIZES and 511 in CANDIDATE_PAGE_SIZES
+    assert 32768 in CANDIDATE_PAGE_SIZES and 32769 in CANDIDATE_PAGE_SIZES
+    assert 256 in CANDIDATE_PAGE_SIZES and 65536 in CANDIDATE_PAGE_SIZES
+    assert len(CANDIDATE_PAGE_SIZES) >= 200
+
+
+def test_the_configuration_defers_to_the_storage_core_validator() -> None:
+    # A34: the local range check masks this call behaviourally, so deleting it survives every
+    # behavioural test -- and it is the single line that would catch C0 and C1 drifting apart,
+    # which is its entire purpose under A20/A24. Pinned structurally, for want of a behavioural
+    # signal that could exist while the two agree.
+    config_module = (
+        Path(__file__).resolve().parents[2] / "src" / "okto_grafx" / "runtime" / "config.py"
+    )
+    source = config_module.read_text(encoding="utf-8")
+    body = source[source.index("def __post_init__") : source.index("def _validate_metrics")]
+    assert "validate_page_size(page_size)" in body, (
+        "__post_init__ must put the surviving size to the storage core, so a disagreement "
+        "between the two bounds is impossible rather than merely untested"
+    )
 
 
 def test_the_default_page_size_is_valid_for_both() -> None:

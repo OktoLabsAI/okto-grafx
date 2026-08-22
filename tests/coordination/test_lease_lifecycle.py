@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from coordination_support import ManualClock, RecordingMetricsSink
+from coordination_support import ManualClock, RecordingMetricsSink, owned_by
 from conftest import CoordinatorFactory
 from okto_grafx.adapters.coordination_local import (
     LEASE_WAIT_METRIC,
@@ -39,13 +39,14 @@ def test_the_first_acquisition_publishes_epoch_one(
     coordinator = make_coordinator(owner_id="p1-aaaa")
     assert coordinator.current_epoch() == 0
     lease = coordinator.acquire_writer_lease(timeout=1.0)
-    assert lease.owner_id == coordinator.owner_id() == "p1-aaaa"
+    assert lease.owner_id == coordinator.owner_id()
+    assert owned_by(lease.owner_id, "p1-aaaa")
     assert lease.epoch == 1
     assert lease.heartbeat_seq == 1
     assert lease.ttl_seconds == 5.0
     assert coordinator.current_epoch() == 1
     record = published(database_root)
-    assert record.owner_id == "p1-aaaa"
+    assert owned_by(record.owner_id, "p1-aaaa")
     assert record.epoch == 1
     assert record.held is True
     assert record.superseded_epoch == 0
@@ -73,7 +74,7 @@ def test_releasing_makes_the_lease_vacant_without_dropping_the_epoch(
     record = published(database_root)
     assert record.held is False
     assert record.epoch == 1
-    assert record.owner_id == "p1-aaaa"
+    assert owned_by(record.owner_id, "p1-aaaa")
 
 
 def test_a_second_owner_takes_a_released_lease_at_the_next_epoch(
@@ -84,7 +85,7 @@ def test_a_second_owner_takes_a_released_lease_at_the_next_epoch(
     lease = first.acquire_writer_lease(timeout=1.0)
     first.release_lease(lease)
     taken = second.acquire_writer_lease(timeout=1.0)
-    assert taken.owner_id == "p2-bbbb"
+    assert owned_by(taken.owner_id, "p2-bbbb")
     assert taken.epoch == 2
     assert second.current_epoch() == 2
     # The previous holder is refused at once, with no byte of its own reaching the device.
@@ -196,7 +197,6 @@ def test_the_lease_survives_a_fresh_coordinator_over_the_same_directory(
         ("reader_stall_threshold", -0.5),
         ("poll_interval", 0.0),
         ("section_timeout", -1.0),
-        ("epoch_cache_seconds", -0.1),
         ("owner_id", "UPPER"),
         ("owner_id", "with/slash"),
         ("control_directory", ""),

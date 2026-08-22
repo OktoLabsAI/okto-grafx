@@ -210,3 +210,61 @@ def test_the_codec_refuses_an_unusable_page_size() -> None:
 
     with pytest.raises(GrafxConfigurationError):
         PageCodecV1(1000)
+
+
+def test_a_decode_that_was_not_told_the_index_never_claims_one() -> None:
+    # The port carries no page index, so a codec that defaults it to zero puts a page number it
+    # cannot know into the failure, and every unlocated decode blames page 0.
+    codec = PageCodecV1(PAGE_SIZE)
+    image = bytearray(codec.encode_page(sample_page()))
+    image[PAGE_HEADER_SIZE] ^= 0xFF
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        codec.decode_page(bytes(image))
+    assert "page" not in raised.value.details
+    assert "Page 0" not in raised.value.message
+    assert "A page image failed its checksum" in raised.value.message
+
+
+def test_a_structural_failure_that_was_not_located_names_no_page_either() -> None:
+    codec = PageCodecV1(PAGE_SIZE)
+    image = bytearray(codec.encode_page(sample_page()))
+    struct.pack_into("<H", image, 20, 999)
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        codec.decode_page(reseal(image))
+    assert "page" not in raised.value.details
+    assert "Page 0" not in raised.value.message
+
+
+def test_the_pool_still_names_the_true_location_it_knows() -> None:
+    from .conftest import MemoryDevice, RecordingMetrics, make_pool
+
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    device.create("heap.dat")
+    page = pool.allocate("heap.dat", 2)
+    page.insert_slot(b"payload")
+    pool.unpin("heap.dat", 0, dirty=True)
+    pool.flush()
+    pool.invalidate()
+    damaged = bytearray(device.raw_page("heap.dat", 0))
+    damaged[PAGE_HEADER_SIZE] ^= 0xFF
+    device.poke_page("heap.dat", 0, bytes(damaged))
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        pool.pin("heap.dat", 0)
+    assert raised.value.details["page"] == 0
+    assert raised.value.details["file"] == "heap.dat"
+    assert "Page 0" not in str(raised.value.details["cause"])
+
+
+def test_a_page_of_another_size_is_refused_by_the_guard_that_names_the_codec() -> None:
+    """D6: the length check that follows raises the same type for the same input.
+
+    Only the size guard names the size the codec was built for, so asserting the type alone let
+    it be deleted with the suite still green.
+    """
+    codec = PageCodecV1(PAGE_SIZE)
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        codec.encode_page(Page(page_size=1024))
+    assert raised.value.details["field"] == "page_size"
+    assert raised.value.details["value"] == 1024
+    assert raised.value.details["codec_page_size"] == PAGE_SIZE

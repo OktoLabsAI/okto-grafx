@@ -127,9 +127,33 @@ def test_the_timer_nests_and_never_swallows_an_error() -> None:
     sink = NoOpMetricsSink()
     with sink.time(HISTOGRAM), sink.time(HISTOGRAM):
         pass
-    with pytest.raises(ValueError):
+
+    raised = ValueError("propagated")
+    with pytest.raises(ValueError) as failure:
         with sink.time(HISTOGRAM):
-            raise ValueError("propagated")
+            raise raised
+    # The shared timer must not swallow, replace, or chain anything onto the error it saw.
+    assert failure.value is raised
+    assert failure.value.__context__ is None
+    assert failure.value.__cause__ is None
+    assert failure.value.__suppress_context__ is False
+
+
+def test_the_timer_reports_that_it_did_not_handle_the_error() -> None:
+    # __exit__ returning anything truthy would swallow the exception silently.
+    assert NULL_TIMER.__exit__(ValueError, ValueError("x"), None) is False
+    assert NULL_TIMER.__exit__(None, None, None) is False
+
+
+def test_a_nested_failure_is_not_altered_by_the_shared_timer() -> None:
+    sink = NoOpMetricsSink()
+    inner = KeyError("inner")
+    with pytest.raises(KeyError) as failure:
+        with sink.time(HISTOGRAM):
+            with sink.time(GAUGE):
+                raise inner
+    assert failure.value is inner
+    assert failure.value.__context__ is None
 
 
 def test_the_timer_yields_nothing() -> None:

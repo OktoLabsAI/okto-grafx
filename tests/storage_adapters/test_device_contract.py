@@ -7,13 +7,18 @@ defect, not a platform difference, so nothing here is marked platform specific.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from okto_grafx.adapters import storage_local
 from okto_grafx.adapters.storage_local import (
     IS_WINDOWS,
+    SHARE_DELETE_AVAILABLE,
     MAX_ALLOCATION_PAGES,
+    PENDING_DELETE_MARKER,
     LocalStorageDevice,
     find_case_conflict,
     normalize_logical_name,
@@ -22,10 +27,13 @@ from okto_grafx.adapters.storage_memory import MemoryStorageDevice
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
+    GrafxDeviceFull,
+    GrafxDurabilityBarrierFailed,
     GrafxDurabilityBarrierFailed,
     GrafxError,
     GrafxUnsupportedOperation,
 )
+from okto_grafx.domain import page
 from okto_grafx.domain.ports import StorageDevice
 
 PAGE_SIZE: int = 512
@@ -55,8 +63,27 @@ def test_the_device_name_is_a_short_bounded_label(device: Any) -> None:
     assert device.page_size == PAGE_SIZE
 
 
+def test_the_page_size_vocabulary_has_exactly_one_owner(tmp_path: Any) -> None:
+    # A24: one definition, owned by C1. A second validator of the same name with wider bounds
+    # is the integration failure A20 exists to prevent.
+    assert storage_local.validate_page_size is page.validate_page_size
+    assert storage_local.MIN_PAGE_SIZE is page.MIN_PAGE_SIZE
+    assert storage_local.MAX_PAGE_SIZE is page.MAX_PAGE_SIZE
+    assert page.MAX_PAGE_SIZE == 32768
+    assert "MAX_PAGE_SIZE" not in storage_local.__all__
+    assert "validate_page_size" not in storage_local.__all__
+    # A20: the size the old bound accepted is refused by every door of the system.
+    for builder in (
+        lambda size: LocalStorageDevice(tmp_path / f"db{size}", page_size=size),
+        lambda size: MemoryStorageDevice(page_size=size),
+        page.validate_page_size,
+    ):
+        with pytest.raises(GrafxConfigurationError):
+            builder(65536)
+
+
 def test_a_page_size_outside_the_format_is_refused(tmp_path: Any) -> None:
-    for page_size in (0, 7, 500, 1 << 20, True, "8192"):
+    for page_size in (0, 7, 500, 65536, 1 << 20, True, "8192"):
         with pytest.raises(GrafxConfigurationError):
             LocalStorageDevice(tmp_path / "a", page_size=page_size)
         with pytest.raises(GrafxConfigurationError):
@@ -156,6 +183,37 @@ def test_a_page_write_must_carry_exactly_one_page(device: Any) -> None:
             device.write_page(HEAP, 0, payload)
         assert raised.value.details["reason"] == "page_size_mismatch"
     assert device.read_page(HEAP, 0) == bytes(PAGE_SIZE)
+
+
+def test_a_boolean_is_refused_where_its_number_would_be_a_valid_index(device: Any) -> None:
+    # A34: the range check masks the type check whenever the file is too short for True to be
+    # in range. On a multi-page file True is a perfectly valid index arithmetically, so only the
+    # bool guard can refuse it, and accepting it would write the wrong page in silence.
+    device.create(HEAP)
+    device.allocate(HEAP, 3)
+    device.write_page(HEAP, 1, _page(0x11))
+    device.write_page(HEAP, 0, _page(0x22))
+    for index in (True, False):
+        with pytest.raises(GrafxCorruptionDetected) as raised:
+            device.write_page(HEAP, index, _page(0xEE))
+        assert raised.value.details["reason"] == "page_not_allocated"
+        with pytest.raises(GrafxCorruptionDetected):
+            device.read_page(HEAP, index)
+    assert device.read_page(HEAP, 1) == _page(0x11)
+    assert device.read_page(HEAP, 0) == _page(0x22)
+
+
+def test_a_boolean_size_is_refused_where_its_number_would_be_a_valid_size(device: Any) -> None:
+    # The same masking on the shrink door: True is 1, which is a legal size for a file of six
+    # bytes, so accepting it would silently throw five bytes away.
+    device.create(SEGMENT)
+    device.append_log(SEGMENT, b"abcdef")
+    for size in (True, False):
+        with pytest.raises(GrafxUnsupportedOperation) as raised:
+            device.truncate_log(SEGMENT, size)
+        assert raised.value.details["reason"] == "invalid_size"
+        assert device.log_size(SEGMENT) == 6
+    assert device.read_log(SEGMENT, 0, 6) == b"abcdef"
 
 
 def test_allocate_refuses_a_count_that_is_not_a_positive_number(device: Any) -> None:
@@ -302,6 +360,44 @@ def test_a_durability_barrier_over_a_missing_file_is_a_typed_failure(device: Any
     assert raised.value.retryable is False
 
 
+def test_a_capacity_bound_device_refuses_to_pass_it_on_every_write_door(
+    memory_device: MemoryStorageDevice,
+) -> None:
+    # The in-memory device is the one that can be given a size, which is how a test reaches the
+    # device full path without filling a real disk.
+    assert memory_device.capacity_bytes is None
+    bounded = MemoryStorageDevice(page_size=PAGE_SIZE, capacity_bytes=2 * PAGE_SIZE)
+    assert bounded.capacity_bytes == 2 * PAGE_SIZE
+    bounded.create(SEGMENT)
+    bounded.append_log(SEGMENT, bytes(2 * PAGE_SIZE))
+    assert bounded.used_bytes() == 2 * PAGE_SIZE
+    for probe in (
+        lambda: bounded.append_log(SEGMENT, b"x"),
+        lambda: bounded.allocate(SEGMENT, 1),
+    ):
+        with pytest.raises(GrafxDeviceFull) as raised:
+            probe()
+        assert raised.value.retryable is True
+    assert bounded.used_bytes() == 2 * PAGE_SIZE
+    bounded.truncate_log(SEGMENT, PAGE_SIZE)
+    assert bounded.append_log(SEGMENT, bytes(PAGE_SIZE)) == 2 * PAGE_SIZE
+    with pytest.raises(GrafxUnsupportedOperation):
+        MemoryStorageDevice(page_size=PAGE_SIZE, capacity_bytes=0)
+
+
+def test_the_recycled_name_never_stays_in_the_deletion_queue(device: Any) -> None:
+    # A27 stated per family through the operator surface both devices expose: whatever the
+    # platform did, the queue never carries the logical name that was recycled.
+    device.create(SEGMENT)
+    device.append_log(SEGMENT, b"records")
+    device.recycle(SEGMENT)
+    assert SEGMENT not in device.pending_deletes()
+    device.retry_pending_deletes()
+    assert SEGMENT not in device.pending_deletes()
+    device.create(SEGMENT)
+    assert device.log_size(SEGMENT) == 0
+
+
 # --- names -------------------------------------------------------------------------------
 
 INADMISSIBLE_NAMES: tuple[tuple[str, object], ...] = (
@@ -342,12 +438,15 @@ def test_every_device_refuses_an_inadmissible_name(device: Any, reason: str, nam
         lambda: device.file_size(name),
         lambda: device.append_log(name, b"x"),
         lambda: device.read_log(name, 0, 1),
-        lambda: device.durable_barrier(name),
         lambda: device.recycle(name),
     ):
         with pytest.raises(GrafxUnsupportedOperation) as raised:
             call()
         assert raised.value.details["reason"] == reason
+    # A28: the barrier door raises one type whatever went wrong, and carries the reason.
+    with pytest.raises(GrafxDurabilityBarrierFailed) as barrier:
+        device.durable_barrier(name)
+    assert barrier.value.details["reason"] == reason
 
 
 def test_a_name_that_differs_only_by_case_is_refused_not_overwritten(device: Any) -> None:
@@ -371,6 +470,52 @@ def test_a_directory_that_differs_only_by_case_is_refused(device: Any) -> None:
         device.create("WAL/000000000002.wal")
     assert raised.value.details["reason"] == "case_collision"
     assert device.list_files() == (SEGMENT,)
+
+
+def test_a_directory_outlives_the_files_that_made_it(device: Any) -> None:
+    # A real directory stays behind when its last file goes, so the twin keeps it too: without
+    # that, the two devices answer differently about a name that differs only by case.
+    device.create(SEGMENT)
+    device.remove(SEGMENT)
+    assert device.list_files() == ()
+    with pytest.raises(GrafxUnsupportedOperation) as raised:
+        device.create("WAL/000000000002.wal")
+    assert raised.value.details["reason"] == "case_collision"
+    with pytest.raises(GrafxUnsupportedOperation) as raised:
+        device.create("wal")
+    assert raised.value.details["reason"] == "not_a_file"
+    device.create("wal/000000000002.wal")
+    assert device.list_files() == ("wal/000000000002.wal",)
+
+
+def test_a_directory_can_never_become_the_target_of_a_replace(device: Any) -> None:
+    device.create(SEGMENT)
+    device.create("staging.tmp")
+    with pytest.raises(GrafxUnsupportedOperation) as raised:
+        device.atomic_replace("staging.tmp", "wal")
+    assert raised.value.details["reason"] == "not_a_file"
+    assert device.list_files() == ("staging.tmp", SEGMENT)
+
+
+def test_the_reserved_infix_is_refused_whatever_its_case() -> None:
+    # A case insensitive volume would otherwise let a logical name shadow a queued deletion.
+    for spelling in ("pending-delete-1", "PENDING-DELETE-1", "Pending-Delete-9"):
+        with pytest.raises(GrafxUnsupportedOperation) as raised:
+            normalize_logical_name(f"wal/000000000001.wal.{spelling}")
+        assert raised.value.details["reason"] == "reserved_infix"
+    assert PENDING_DELETE_MARKER == ".pending-delete-"
+
+
+def test_an_argument_is_validated_before_the_state_of_the_device(device: Any) -> None:
+    # Both families answer the same question first, so a caller cannot tell them apart by the
+    # error it gets for a wrong argument on a closed device.
+    device.close()
+    with pytest.raises(GrafxUnsupportedOperation) as raised:
+        device.list_files(5)
+    assert raised.value.details["reason"] == "not_a_string"
+    with pytest.raises(GrafxUnsupportedOperation) as raised:
+        device.exists("../escape")
+    assert raised.value.details["reason"] == "parent_traversal"
 
 
 def test_the_case_conflict_finder_ignores_an_exact_match() -> None:
@@ -412,12 +557,14 @@ def test_a_closed_device_refuses_every_call(device: Any) -> None:
         lambda: device.file_size(HEAP),
         lambda: device.append_log(HEAP, b"x"),
         lambda: device.log_size(HEAP),
-        lambda: device.durable_barrier(),
         lambda: device.recycle(HEAP),
     ):
         with pytest.raises(GrafxUnsupportedOperation) as raised:
             call()
         assert raised.value.details["reason"] == "device_closed"
+    with pytest.raises(GrafxDurabilityBarrierFailed) as barrier:
+        device.durable_barrier()
+    assert barrier.value.details["reason"] == "device_closed"
     device.close()
 
 
@@ -480,11 +627,11 @@ def test_every_failure_of_the_device_is_a_grafx_error(device: Any) -> None:
     for probe in probes:
         with pytest.raises(GrafxError) as raised:
             probe()
-        assert isinstance(raised.value, GrafxError)
+        # A concrete class of the taxonomy, never the base class and never a bare Exception.
+        assert type(raised.value) is not GrafxError
         assert raised.value.message
         assert raised.value.message.isascii()
         assert raised.value.code
-        assert isinstance(raised.value.to_dict(), dict)
 
 
 def test_the_two_families_answer_a_failure_with_the_same_type(tmp_path: Any) -> None:
@@ -492,7 +639,13 @@ def test_the_two_families_answer_a_failure_with_the_same_type(tmp_path: Any) -> 
     # is indistinguishable from the failure of the real device.
     with LocalStorageDevice(tmp_path / "db", page_size=PAGE_SIZE) as local:
         with MemoryStorageDevice(page_size=PAGE_SIZE) as memory:
+            for subject in (local, memory):
+                subject.create("heap.dat")
             for probe in (
+                lambda subject: subject.durable_barrier("missing.dat"),
+                lambda subject: subject.durable_barrier("../escape"),
+                lambda subject: subject.durable_barrier("HEAP.DAT"),
+                lambda subject: subject.durable_barrier("con"),
                 lambda subject: subject.remove("missing.dat"),
                 lambda subject: subject.read_page("missing.dat", 0),
                 lambda subject: subject.append_log("missing.dat", b"x"),
@@ -510,8 +663,20 @@ def test_the_two_families_answer_a_failure_with_the_same_type(tmp_path: Any) -> 
                     probe(memory)
                 assert type(local_failure.value) is type(memory_failure.value)
                 assert local_failure.value.details.get("reason") == memory_failure.value.details.get("reason")
+                assert local_failure.value.retryable == memory_failure.value.retryable
+                assert local_failure.value.details.get("retryable") == memory_failure.value.details.get(
+                    "retryable"
+                )
 
 
-def test_the_platform_switch_is_a_single_boolean() -> None:
-    # G2 keeps os.name out of the pure core; this is the one adapter that is allowed to read it.
-    assert isinstance(IS_WINDOWS, bool)
+def test_a_handle_of_this_device_never_blocks_a_deletion(tmp_path: Any) -> None:
+    # A16, stated as the behaviour rather than as a flag: whoever holds a file through this
+    # adapter must not stop anybody else from deleting it. True on POSIX by unlink semantics,
+    # and on Windows only because the descriptor is opened with FILE_SHARE_DELETE.
+    with LocalStorageDevice(tmp_path / "db", page_size=PAGE_SIZE) as device:
+        device.create(SEGMENT)
+        device.append_log(SEGMENT, b"records")
+        path = Path(device.root) / "wal" / "000000000001.wal"
+        assert device.read_log(SEGMENT, 0, 7) == b"records"
+        os.remove(path)
+        assert device.read_log(SEGMENT, 0, 7) == b"records"

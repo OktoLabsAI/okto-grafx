@@ -313,12 +313,29 @@ class Catalog:
             )
         catalog = cls()
         offset = _PREAMBLE.size
-        for _ in range(table_count):
-            table, offset = _decode_table(raw, offset)
-            catalog._install_table(table)
-        for _ in range(space_count):
-            space, offset = _decode_space(raw, offset)
-            catalog._install_space(space)
+        tables: list[TableDef] = []
+        spaces: list[EmbeddingSpaceDef] = []
+        # A schema value validates itself when it is built, and on the CREATE path a refusal is a
+        # configuration mistake: a caller named an impossible table. Here the caller is a stored
+        # file, and the same refusal means something else entirely -- the bytes do not describe a
+        # catalog this build can serve. It is reported as what it is, so that C6 can classify it
+        # and record it, and so that this path speaks with one voice: the cross-record invariants
+        # below already raise corruption for the same class of damage (A11-revised, G8).
+        try:
+            for _ in range(table_count):
+                table, offset = _decode_table(raw, offset)
+                tables.append(table)
+            for _ in range(space_count):
+                space, offset = _decode_space(raw, offset)
+                spaces.append(space)
+        except GrafxConfigurationError as invalid:
+            raise GrafxCorruptionDetected(
+                f"A stored catalog describes something this build cannot serve: "
+                f"{invalid.message}",
+                field=str(invalid.details.get("field", "catalog")),
+                value=invalid.details.get("value"),
+            ) from invalid
+        catalog._install_loaded(tables, spaces)
         if offset != body_end:
             raise GrafxCorruptionDetected(
                 f"A serialised catalog decoded {offset} of {body_end} body bytes.",
@@ -356,10 +373,92 @@ class Catalog:
         self._spaces[space.name] = space
         self._spaces_by_id[space.space_id] = space
 
+    def _install_loaded(
+        self, tables: list[TableDef], spaces: list[EmbeddingSpaceDef]
+    ) -> None:
+        """Install a decoded catalog, holding it to the invariants the write path enforces.
+
+        The checksum only proves the bytes are the ones that were written; it says nothing about
+        whether they were written by a build that agreed with this one. A stored catalog with two
+        tables of the same name, or with a vector column pointing at a space that is not there,
+        describes a database this engine cannot serve, and accepting it would push the failure
+        into the first query instead of the load.
+
+        The rules are the invariants, not the creation rules: a space is allowed to arrive
+        retired, and a table is allowed to point at a retired space, because retiring a space
+        after its columns were created is the sanctioned path (SPEC-VEC FR-3).
+        """
+        for space in spaces:
+            if space.name in self._spaces:
+                raise GrafxCorruptionDetected(
+                    f"The stored catalog declares the embedding space {space.name!r} more than "
+                    f"once.",
+                    field="name",
+                    value=space.name,
+                )
+            if space.space_id in self._spaces_by_id:
+                raise GrafxCorruptionDetected(
+                    f"The stored catalog gives the id {space.space_id} to both "
+                    f"{self._spaces_by_id[space.space_id].name!r} and {space.name!r}.",
+                    field="space_id",
+                    value=space.space_id,
+                )
+            self._install_space(space)
+        for table in tables:
+            if table.name in self._tables:
+                raise GrafxCorruptionDetected(
+                    f"The stored catalog declares the table {table.name!r} more than once.",
+                    field="name",
+                    value=table.name,
+                )
+            if table.table_id in self._tables_by_id:
+                raise GrafxCorruptionDetected(
+                    f"The stored catalog gives the id {table.table_id} to both "
+                    f"{self._tables_by_id[table.table_id].name!r} and {table.name!r}.",
+                    field="table_id",
+                    value=table.table_id,
+                )
+            for column in table.columns:
+                if not column.is_vector:
+                    continue
+                space_name = str(column.vector_space)
+                stored = self._spaces.get(space_name)
+                if stored is None:
+                    raise GrafxCorruptionDetected(
+                        f"Column {column.name!r} of the stored table {table.name!r} points at "
+                        f"the embedding space {space_name!r}, which the catalog does not hold.",
+                        field="vector_space",
+                        value=space_name,
+                        table=table.name,
+                    )
+                if stored.value_type is not column.type:
+                    raise GrafxCorruptionDetected(
+                        f"Column {column.name!r} of the stored table {table.name!r} is a "
+                        f"{column.type.name} column, but the space {space_name!r} stores "
+                        f"{stored.value_type.name}.",
+                        field="storage_dtype",
+                        value=stored.storage_dtype,
+                        table=table.name,
+                    )
+            self._install_table(table)
+
 
 def _encode_text(text: str) -> bytes:
-    """Return a length-prefixed UTF-8 string as the catalog stores it."""
-    body = text.encode("utf-8")
+    """Return a length-prefixed UTF-8 string as the catalog stores it.
+
+    Schema names are validated identifiers and are therefore always encodable, but the guard
+    stays: a string with no UTF-8 encoding must leave as a Grafx error and never as a raw
+    UnicodeEncodeError (CONTRACT.md section 11 item 5).
+    """
+    try:
+        body = text.encode("utf-8")
+    except UnicodeEncodeError as failure:
+        raise GrafxConfigurationError(
+            f"A catalog string must be encodable as UTF-8; the character at position "
+            f"{failure.start} cannot be: {failure.reason}.",
+            field="text",
+            position=failure.start,
+        ) from failure
     if len(body) > _MAX_TEXT:
         raise GrafxConfigurationError(
             f"A catalog string may be at most {_MAX_TEXT} bytes; got {len(body)}.",
@@ -464,6 +563,16 @@ def _decode_table(raw: bytes, offset: int) -> tuple[TableDef, int]:
                 field="type",
                 value=type_tag,
             ) from failure
+        if nullable > 1:
+            # Its neighbour, the optional-string presence byte, refuses anything but 0 or 1;
+            # this one silently read every other value as False.
+            raise GrafxCorruptionDetected(
+                f"Column {column_name!r} of table {name!r} declares the nullable byte "
+                f"{nullable}, which is neither 0 nor 1.",
+                field="nullable",
+                value=nullable,
+                table=name,
+            )
         columns.append(
             ColumnDef(
                 name=column_name,

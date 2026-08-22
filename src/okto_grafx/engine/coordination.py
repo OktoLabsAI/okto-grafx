@@ -20,6 +20,7 @@ from typing import Self
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
+    GrafxError,
     GrafxLeaseStolen,
     GrafxUnsupportedOperation,
 )
@@ -161,21 +162,33 @@ class LeaseGuard:
         now = float(now_monotonic)
         if now < self.due_at():
             return False
-        self.renew(now_monotonic=now)
+        self.renew(now)
         return True
 
-    def renew(self, *, now_monotonic: float | None = None) -> Lease:
-        """Renew the lease now, marking the guard released when another owner took it over."""
+    def renew(self, now_monotonic: float) -> Lease:
+        """Renew the lease at the caller monotonic reading, and reschedule from that reading.
+
+        The reading is required rather than optional. A lease carries the moment it was
+        ACQUIRED, which the port keeps unchanged across renewals on purpose, so a renewal with
+        nothing else to go on would reschedule from the original acquisition and leave every
+        later tick due -- turning a heartbeat into a full control-record replacement per tick.
+        This layer owns no clock, so the caller is the only place the answer can come from.
+
+        The guard is marked released when the renewal reports that another owner took over, so
+        no later call pretends the lease is still held.
+
+        A reading that goes backwards breaks the contract of the port, which is why it can only
+        ever move the schedule forwards here: honouring it would bring the next renewal closer
+        and turn a caller mistake into extra load on the control plane.
+        """
         self._require_live()
         try:
             self._lease = self._coordinator.renew_lease(self._lease)
         except GrafxLeaseStolen:
             self._released = True
             raise
-        if now_monotonic is not None:
-            self._last_renewal = float(now_monotonic)
-        else:
-            self._last_renewal = float(self._lease.acquired_monotonic)
+        reading = float(now_monotonic)
+        self._last_renewal = reading if reading > self._last_renewal else self._last_renewal
         return self._lease
 
     def validate(self) -> None:
@@ -209,8 +222,20 @@ class LeaseGuard:
         exc: BaseException | None,
         traceback: object,
     ) -> None:
-        """Release the lease on the way out, whether the block succeeded or raised."""
-        self.release()
+        """Release the lease on the way out, whether the block succeeded or raised.
+
+        A release that fails while the block is already unwinding is swallowed: replacing the
+        failure the caller is handling with a failure of the closing path hides the reason the
+        block is being left at all. On a clean exit the failure is reported, because then it is
+        the only thing that went wrong.
+        """
+        if exc_type is None:
+            self.release()
+            return
+        try:
+            self.release()
+        except GrafxError:
+            return
 
     def __repr__(self) -> str:
         """Return a representation naming the owner, the epoch and whether the guard is live."""
@@ -283,8 +308,18 @@ class ReaderRegistration:
         exc: BaseException | None,
         traceback: object,
     ) -> None:
-        """Withdraw the registration on the way out, whether the block succeeded or raised."""
-        self.close()
+        """Withdraw the registration on the way out, whether the block succeeded or raised.
+
+        As with the lease guard, a failure to withdraw never replaces the failure that is already
+        unwinding through this block.
+        """
+        if exc_type is None:
+            self.close()
+            return
+        try:
+            self.close()
+        except GrafxError:
+            return
 
     def __repr__(self) -> str:
         """Return a representation naming the reader, its snapshot and whether it is closed."""

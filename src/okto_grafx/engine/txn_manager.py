@@ -1,0 +1,1768 @@
+"""The transaction manager (CONTRACT.md section 8.5; SPEC-M1 FR-2, FR-3, FR-4, BR-6, BR-9).
+
+This is the component that decides what a transaction sees and whether it may commit. Two rules
+carry everything else.
+
+**Nothing reaches a data file before the commit.** A write transaction stages page images; the
+commit appends them to the log, barriers, and only then applies them. That is why an aborted
+transaction needs no undo (CONTRACT.md section 8.6 step 6). Proved by
+``test_a_rollback_leaves_no_trace_anywhere``,
+``test_no_page_is_written_before_the_log_barrier_returns`` and
+``test_a_crash_at_every_write_point_leaves_a_recoverable_database``.
+
+**The published state is the only snapshot source.** ``control/commit.state`` is written as the
+LAST act of a commit, after the pages of that commit are in place. A reader picks its snapshot
+from that file, so on every path where a commit completes, a number it can read is a number
+whose pages already exist: a partially applied commit is not merely hidden by the visibility
+predicate, it is unreachable as a snapshot. Proved by
+``test_no_instant_of_a_commit_offers_a_snapshot_of_half_of_it`` and
+``test_the_published_state_is_replaced_only_after_every_page_is_in_place``.
+
+The claim is deliberately not absolute, and the exception is recorded as punch-list item P4:
+when applying the pages FAILS after the barrier, the commit is durable and unapplied, and a
+later commit publishes a number at or above it. Recovery is what closes that window -- the log
+holds every page of both commits and FR-1 runs recovery before a reopened database accepts a
+transaction -- but until it runs, that one path can offer a snapshot whose pages are still only
+in the log. Saying otherwise here would be prose no test backs (A85).
+
+Two decisions carried from the review record are worth stating where they are implemented.
+
+*Amendment A74 -- validate with the coordinator that granted the lease.* A transaction is bound
+to the manager that opened it and is refused by any other, and the lease guard validates through
+the coordinator it acquired from. Proved by
+``test_a_transaction_cannot_be_committed_through_another_manager`` and
+``test_the_epoch_is_validated_before_any_byte_reaches_the_device``.
+
+*Carried finding CF-2 -- register before selecting.* ``register_reader`` publishes before the
+registration is visible elsewhere, so a horizon pass in that window can miss a brand-new reader.
+:meth:`TransactionManager.begin` therefore reads the published LSN, registers the reader at that
+value, and only then selects the snapshot from a second reading. Every horizon computed during
+the window is bounded by the published LSN of that moment, which is bounded by the snapshot the
+reader ends up with -- so no horizon can ever have passed a snapshot this manager hands out.
+Proved by ``test_a_reader_pins_its_snapshot_before_the_snapshot_is_chosen``.
+
+*The writer lease is held for a COMMIT, not for a transaction.* FR-3 says N processes hold write
+transactions at the same time and CONTRACT.md section 4.3 says the lease identifies the epoch
+holder rather than serialising transactions -- yet only one participant can hold that lease, and
+A74 requires a committing writer to hold the one it validates. Both are satisfied by taking the
+lease for the commit window: transactions stage their work with nothing on the device and under
+no lease at all, and a commit acquires the lease, validates, writes and releases. Disjoint
+writers are then ordered at the commit section of step 3, which they already share, and are
+never refused merely because another writer exists, which is what BR-6 forbids. Proved by
+``test_two_processes_writing_disjoint_partitions_both_commit`` and
+``test_a_takeover_inside_the_commit_window_refuses_before_the_first_byte``.
+
+Lock order, because a commit takes two cross-process sections: the lease section is entered and
+LEFT before the commit section is entered, and the lease is released only after the commit
+section has been left. No path here holds the commit section while asking for the lease, so two
+participants cannot hold one section each and wait for the other. Proved by
+``test_the_lease_is_released_only_after_the_commit_section_is_left``.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from contextlib import AbstractContextManager
+from dataclasses import dataclass, is_dataclass, replace
+from typing import Any
+
+from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
+    GrafxLeaseStolen,
+    GrafxError,
+    GrafxTransactionStateError,
+    GrafxWriteConflict,
+)
+from okto_grafx.domain.ids import (
+    NO_CSN,
+    NO_LSN,
+    Csn,
+    Epoch,
+    Lsn,
+    PageIndex,
+    RecordRef,
+    TxnId,
+)
+from okto_grafx.domain.ports.clock import Clock
+from okto_grafx.domain.ports.coordination import ProcessCoordinator
+from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
+from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
+from okto_grafx.domain.page import HEADER_PAGE_INDEX
+from okto_grafx.domain.page.checksum import crc32c
+from okto_grafx.domain.ports.storage import StorageDevice
+from okto_grafx.domain.txn.commit_record import CommitPayload, FileIdMap, PageTouch
+from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE, CommitState
+from okto_grafx.domain.txn.context import (
+    CommitReport,
+    RowIntent,
+    RowOperation,
+    TransactionContext,
+    TransactionMode,
+    TransactionState,
+)
+from okto_grafx.domain.txn.partitions import (
+    page_partition,
+    partition_of,
+    validate_partitions_per_table,
+)
+from okto_grafx.domain.txn.records import (
+    WalRecord,
+    WalRecordLike,
+    WalRecordType,
+    decode_page_write,
+    encode_page_write,
+)
+from okto_grafx.domain.wal.replay import RecycleReport
+from okto_grafx.domain.txn.snapshot import Snapshot
+from okto_grafx.engine.buffer_pool import BufferPool, apply_page_image
+from okto_grafx.engine.coordination import (
+    DEFAULT_RENEWAL_FRACTION,
+    LeaseGuard,
+    ReaderRegistration,
+    recyclable_horizon,
+)
+from okto_grafx.engine.metrics_catalog import metric
+
+__all__ = [
+    "ACTIVE_TRANSACTIONS",
+    "COMMIT_RETRIES_TOTAL",
+    "COMMIT_SECTION",
+    "PARTICIPANT_SECTION_PREFIX",
+    "COMMIT_STATE_READ_ATTEMPTS",
+    "TRANSACTION_MANAGER_METRICS",
+    "WRITE_CONFLICTS_TOTAL",
+    "TransactionManager",
+]
+
+WRITE_CONFLICTS_TOTAL: str = "oktografx_write_conflicts_total"
+COMMIT_RETRIES_TOTAL: str = "oktografx_commit_retries_total"
+ACTIVE_TRANSACTIONS: str = "oktografx_active_transactions"
+
+TRANSACTION_MANAGER_METRICS: tuple[MetricDescriptor, ...] = tuple(
+    metric(name) for name in (WRITE_CONFLICTS_TOTAL, COMMIT_RETRIES_TOTAL, ACTIVE_TRANSACTIONS)
+)
+"""The descriptors this component registers and emits, taken from the frozen catalog (G7).
+
+A metric is a contract, so the name is looked up rather than declared a second time: a name that
+is not in CONTRACT.md section 9 cannot be emitted from here at all.
+"""
+
+COMMIT_SECTION: str = "commit"
+"""Name of the cross-process critical section of CONTRACT.md section 8.5 step 3."""
+
+PARTICIPANT_SECTION_PREFIX: str = "txn-"
+"""Prefix of the section that serialises the THREADS of one participant.
+
+The name carries a digest of the owner identity, so the section belongs to one participant
+and one participant only: two processes never contend on it, and two threads of one process
+always do. A digest collision between two participants costs them a serialisation neither
+needed and can never cost a correctness property, which is why 32 bits are enough here.
+"""
+
+COMMIT_STATE_READ_ATTEMPTS: int = 4
+"""How many times a read of the published state rides out a concurrent replacement.
+
+Reading takes two device calls, the size and the bytes, and another process may publish a record
+between them. That is a benign race and not damage, so it is repeated. There is no sleep between
+attempts because the domain and the engine own no clock they may wait on (G2); the window being
+ridden out is one ``atomic_replace``, not a slow device.
+"""
+
+_NO_EPOCH: Epoch = 0
+
+_LIVE_FLAGS: int = ~1
+"""Mask that clears the deleted bit of a record header, from CONTRACT.md section 6.4."""
+
+
+@dataclass(frozen=True, slots=True)
+class _RowWrite:
+    """One heap change a commit made: the version it created and the version it ended.
+
+    An insert is a birth alone, a delete an ending alone, and an update is both -- which is why
+    they travel together. Both halves carry the same commit number, so a snapshot below it finds
+    exactly one live version and a snapshot at or above it finds exactly one.
+
+    The table and the two value tuples travel with the refs because the secondary indexes are
+    keyed on the VALUES, not on the reference: ending the entry a version had needs the values
+    that version carried, and they are gone from the caller's hands by the time the commit runs.
+    ``ended_values`` is read from the heap rather than taken from the caller, because the heap is
+    the authority inside the commit section and a caller's copy can be one version stale.
+    """
+
+    born: RecordRef | None
+    ended: RecordRef | None
+    table: object = None
+    born_values: tuple[object, ...] = ()
+    ended_values: tuple[object, ...] = ()
+
+
+class _ReaderPin:
+    """One live reader registration together with the reading at which it was last refreshed."""
+
+    __slots__ = ("registration", "last_refresh")
+
+    def __init__(self, registration: ReaderRegistration, last_refresh: float) -> None:
+        self.registration: ReaderRegistration = registration
+        self.last_refresh: float = last_refresh
+
+
+class TransactionManager:
+    """Opens transactions, decides what they see, and runs the frozen commit protocol."""
+
+    __slots__ = (
+        "_wal",
+        "_pool",
+        "_heap",
+        "_catalog",
+        "_coordinator",
+        "_clock",
+        "_metrics",
+        "_index_manager",
+        "_partitions_per_table",
+        "_commit_lock_timeout",
+        "_lease_timeout",
+        "_reader_stall_threshold",
+        "_refresh_interval",
+        "_descriptor",
+        "_file_ids",
+        "_participant_section_name",
+        "_retain_lease",
+        "_lease_guard",
+        "_next_txn_id",
+        "_open",
+        "_pins",
+        "_published_high_water",
+        "_mode_counts",
+    )
+
+    def __init__(
+        self,
+        wal: Any,
+        pool: BufferPool,
+        heap: Any,
+        catalog: Any,
+        coordinator: ProcessCoordinator,
+        clock: Clock,
+        metrics: MetricsSink,
+        index_manager: Any,
+        *,
+        partitions_per_table: int,
+        commit_lock_timeout: float,
+        lease_timeout: float | None = None,
+        reader_stall_threshold: float | None = None,
+        descriptor: str = "",
+        retain_lease: bool = False,
+    ) -> None:
+        """Build a manager over one database.
+
+        The three keyword arguments after the two the contract names are configuration this
+        component cannot invent and must not guess:
+
+        * ``lease_timeout`` -- how long a commit waits for the writer lease. It defaults to
+          ``commit_lock_timeout`` so a manager built exactly as CONTRACT.md section 8.5 spells
+          it still works; the composition root passes ``lease_timeout_seconds``.
+        * ``reader_stall_threshold`` -- the threshold C3 prunes a quiet reader at, which is what
+          amendment A46 makes this component schedule against. ``None`` means "refresh at every
+          opportunity", the conservative reading: a manager that was told nothing about the
+          threshold must never be the reason a reader misses it.
+        * ``descriptor`` -- the granularity descriptor of SD-1. It is passed in rather than
+          rebuilt here because ``DatabaseConfig`` already produces that exact string and two
+          places producing one format string is how the two stop agreeing (amendment A24).
+        """
+        self._wal: Any = wal
+        self._pool: BufferPool = pool
+        self._heap: Any = heap
+        self._catalog: Any = catalog
+        self._coordinator: ProcessCoordinator = coordinator
+        self._clock: Clock = clock
+        self._metrics: MetricsSink = metrics
+        self._index_manager: Any = index_manager
+        self._partitions_per_table: int = validate_partitions_per_table(partitions_per_table)
+        self._commit_lock_timeout: float = _require_timeout(
+            "commit_lock_timeout", commit_lock_timeout
+        )
+        self._lease_timeout: float = (
+            self._commit_lock_timeout
+            if lease_timeout is None
+            else _require_timeout("lease_timeout", lease_timeout)
+        )
+        self._reader_stall_threshold: float | None = (
+            None
+            if reader_stall_threshold is None
+            else _require_timeout("reader_stall_threshold", reader_stall_threshold)
+        )
+        self._refresh_interval: float = (
+            0.0
+            if self._reader_stall_threshold is None
+            else self._reader_stall_threshold * DEFAULT_RENEWAL_FRACTION
+        )
+        if not isinstance(descriptor, str):
+            raise GrafxConfigurationError(
+                f"The granularity descriptor must be a string; got {type(descriptor).__name__}.",
+                field="descriptor",
+                value=type(descriptor).__name__,
+            )
+        self._descriptor: str = descriptor
+        self._file_ids: FileIdMap = FileIdMap(
+            heap_file=_file_name_of(heap, "heap.dat"),
+            catalog_file=_file_name_of(catalog, "catalog.dat"),
+        )
+        if not isinstance(retain_lease, bool):
+            raise GrafxConfigurationError(
+                f"retain_lease is a policy flag; got {type(retain_lease).__name__}.",
+                field="retain_lease",
+                value=type(retain_lease).__name__,
+            )
+        self._retain_lease: bool = retain_lease
+        self._lease_guard: LeaseGuard | None = None
+        self._participant_section_name: str = (
+            f"{PARTICIPANT_SECTION_PREFIX}"
+            f"{crc32c(coordinator.owner_id().encode('utf-8')):08x}"
+        )
+        self._next_txn_id: TxnId = 1
+        self._open: dict[TxnId, TransactionContext] = {}
+        self._pins: dict[TxnId, _ReaderPin] = {}
+        self._published_high_water: Lsn = NO_LSN
+        self._mode_counts: dict[str, int] = {
+            TransactionMode.READ.value: 0,
+            TransactionMode.WRITE.value: 0,
+        }
+        if metrics.enabled:
+            for descriptor_value in TRANSACTION_MANAGER_METRICS:
+                metrics.register(descriptor_value)
+            for mode_name in self._mode_counts:
+                metrics.set_gauge(ACTIVE_TRANSACTIONS, 0.0, {"mode": mode_name})
+
+    # --- identity ---------------------------------------------------------------------------
+
+    @property
+    def partitions_per_table(self) -> int:
+        """Return the conflict granularity this manager validates at."""
+        return self._partitions_per_table
+
+    @property
+    def commit_lock_timeout(self) -> float:
+        """Return how long a commit waits for the cross-process commit section."""
+        return self._commit_lock_timeout
+
+    @property
+    def lease_timeout(self) -> float:
+        """Return how long a commit waits for the writer lease."""
+        return self._lease_timeout
+
+    @property
+    def reader_stall_threshold(self) -> float | None:
+        """Return the reader stall threshold this manager schedules refreshes against (A46)."""
+        return self._reader_stall_threshold
+
+    @property
+    def refresh_interval(self) -> float:
+        """Return how much monotonic time may pass between two refreshes of one reader."""
+        return self._refresh_interval
+
+    @property
+    def index_manager(self) -> Any:
+        """Return the index manager this database was built with, or None when there is none.
+
+        BR-11 has two halves and this component owes both. The records an index stages are
+        appended inside the same commit as the heap write they belong to, which is what
+        ``pending_records`` carries; and the changes those records describe are applied to the
+        index itself once the commit is durable, which is what :meth:`_apply_index_changes` and
+        the rollback path do. Logging an index change and never applying it leaves a committed
+        row in the heap and in the log and invisible to every lookup until something rebuilds --
+        a missing row for an exact index, a silently short answer for a proximity one.
+        """
+        return self._index_manager
+
+    @property
+    def open_transactions(self) -> int:
+        """Return how many transactions this manager currently has open."""
+        return len(self._open)
+
+    # --- snapshots --------------------------------------------------------------------------
+
+    def partition_of(self, table_id: int, key: bytes) -> int:
+        """Return the partition key a row of this table with this key belongs to (FR-4)."""
+        return partition_of(table_id, key, self._partitions_per_table)
+
+    def published_state(self) -> CommitState:
+        """Return the published commit state, or an empty one when nothing was ever published."""
+        durable = self._read_commit_state()
+        if durable.last_committed_lsn >= self._published_high_water:
+            return durable
+        # This process committed durably and then failed to publish. The log is the authority on
+        # what is committed (section 8.5 step 3.5), so the number this manager knows outranks the
+        # file it could not write -- otherwise its own next transaction would be handed a
+        # snapshot below a commit it has already acknowledged.
+        return CommitState(
+            last_committed_lsn=self._published_high_water,
+            last_csn=self._published_high_water,
+            checkpoint_lsn=durable.checkpoint_lsn,
+        )
+
+    def recyclable_horizon(self) -> Lsn:
+        """Return the LSN below which a WAL segment may be recycled (BR-10, CF-11).
+
+        This is the one expression BR-10 is, wired to the two things only this component has
+        both of: the reader horizon the coordinator reports and the checkpoint this manager
+        publishes. C3 owns the arithmetic and C4 owns the recycling; what was missing was
+        anybody joining them, which is why ``WalManager.recycle`` had no caller anywhere and the
+        log grew without bound.
+
+        It deliberately does not recycle anything. Choosing WHEN to reclaim is a lifecycle
+        decision -- on a checkpoint, on close, on a maintenance pass -- and that belongs to
+        whoever owns the lifecycle. This is the number that decision needs.
+        """
+        return recyclable_horizon(
+            self._coordinator.reader_horizon(), self.published_state().checkpoint_lsn
+        )
+
+    def published_lsn(self) -> Lsn:
+        """Return the LSN of the last commit this database has published (section 8.5 step 3.2)."""
+        return self.published_state().last_committed_lsn
+
+    # --- life of a transaction ----------------------------------------------------------------
+
+    def begin(self, mode: str) -> TransactionContext:
+        """Open a transaction in ``"read"`` or ``"write"`` mode and fix the view it reads under.
+
+        The order of the three steps is the answer to carried finding CF-2 and is not
+        interchangeable:
+
+        1. read the published LSN -- a floor, and a lower bound on the snapshot this call ends up
+           with;
+        2. register the reader AT that floor, so the pin is visible to every other process before
+           any snapshot is handed out;
+        3. read the published LSN again and take the larger of the two as the snapshot.
+
+        A horizon pass that ran during step 2 could not see this reader, but every horizon it
+        could have computed is bounded by the published LSN of that instant, and every such value
+        is at most the reading taken in step 3. So the horizon can never have passed the snapshot
+        that is returned, which is exactly what CF-2 asks C5 to guarantee. Registering AFTER
+        selecting -- the obvious order -- gives that guarantee away.
+        """
+        parsed = TransactionMode.parse(mode)
+        with self._participant_section():
+            self._refresh_due_readers()
+            floor = self.published_lsn()
+            registration = ReaderRegistration.open(self._coordinator, floor)
+            try:
+                selected = self.published_lsn()
+                read_lsn = selected if selected > floor else floor
+                # L22: derived state needs a SHARED signal to invalidate it, and the published
+                # commit number is the one this component already watches -- it moves whenever any
+                # participant commits and nowhere else. Without this, a transaction opened in a
+                # participant that had already read a table answers from frames cached before
+                # somebody else committed: no error, no missing file, just fewer rows than exist.
+                self._pool.begin_read_view(read_lsn)
+                txn = TransactionContext(
+                    txn_id=self._next_txn_id,
+                    mode=parsed,
+                    snapshot=Snapshot(read_lsn),
+                    epoch=_NO_EPOCH,
+                    owner=self,
+                )
+            except BaseException:
+                # Everything from the registration onwards is inside the guard: a pin that
+                # outlived the call that made it would hold the horizon down for the life of
+                # the database, with no caller holding anything to withdraw it with.
+                _close_quietly(registration)
+                raise
+            self._next_txn_id += 1
+            self._open[txn.txn_id] = txn
+            self._pins[txn.txn_id] = _ReaderPin(registration, self._clock.monotonic())
+            self._mode_counts[parsed.value] += 1
+            open_now = self._mode_counts[parsed.value]
+        # A91: the metrics sink is host code and is called with nothing of this component held.
+        self._publish_gauge(parsed.value, open_now)
+        return txn
+
+    def rollback(self, txn: TransactionContext) -> None:
+        """Abandon a transaction, leaving no trace of it anywhere.
+
+        There is nothing to undo and nothing to log. A transaction's pages live in its own
+        staging map until the commit appends them, so a rollback drops that map and withdraws the
+        reader registration. No ABORT record is written: BR-2 says a path that can fail
+        synchronously does so instead of writing, and a record describing work that never reached
+        the device would be a discard with a trace of its own to explain.
+
+        Rolling back a transaction that is already rolled back is a no-op, because closing a
+        database must be able to abandon whatever is open without first asking what state it is
+        in (CONTRACT.md section 10).
+        """
+        self._require_owned(txn)
+        with self._participant_section():
+            if txn.state is TransactionState.ABORTED:
+                return
+            self._require_active(txn)
+            self._refresh_due_readers(skip=txn.txn_id)
+            mode = txn.mode.value
+            self._drop_index_changes(txn)
+            txn.mark_aborted()
+            self._release_reader(txn)
+            open_now = self._forget(txn, mode)
+        self._publish_gauge(mode, open_now)
+
+    def commit(self, txn: TransactionContext) -> CommitReport:
+        """Run the frozen commit protocol of CONTRACT.md section 8.5 and report the outcome."""
+        self._require_owned(txn)
+        self._require_active(txn)
+        if txn.mode is TransactionMode.READ or not txn.wrote:
+            return self._commit_without_writing(txn)
+        return self._commit_with_writing(txn)
+
+    def retry(self, txn: TransactionContext) -> TransactionContext:
+        """Abandon a transaction that optimistic validation refused and open its successor.
+
+        A refused transaction is left ACTIVE and free of side effects, which is what
+        ``retryable`` promises -- but committing it again would compare the same snapshot against
+        the same record and be refused for the same reason, forever. The retry that BR-6 and
+        TS-2 describe is a fresh transaction at a fresh snapshot, above the commit that won, and
+        this is the one door that produces one.
+
+        The successor carries the refusal count, so the commit that finally succeeds is the one
+        that reports ``oktografx_commit_retries_total``. Without that the counter would have
+        nobody who could honestly emit it: a manager cannot tell a caller's second attempt from
+        its first unless the two are linked.
+        """
+        self._require_owned(txn)
+        if txn.conflicts <= 0:
+            raise GrafxTransactionStateError(
+                "Only a transaction that optimistic validation refused can be retried through "
+                "this door; nothing has refused this one.",
+                txn_id=txn.txn_id,
+                conflicts=txn.conflicts,
+            )
+        carried = txn.conflicts
+        mode = txn.mode
+        if txn.active:
+            self.rollback(txn)
+        successor = self.begin(mode.value)
+        successor.adopt_conflicts(carried)
+        return successor
+
+    # --- reader scheduling (amendment A46) -----------------------------------------------------
+
+    def refresh_due_readers(self, now_monotonic: float | None = None) -> int:
+        """Refresh every reader registration whose interval has elapsed; return how many moved.
+
+        Amendment A46 puts this here rather than in the coordination layer: ``ReaderRegistration``
+        has no ``renew_if_due`` counterpart to ``LeaseGuard``, a reader that misses the stall
+        threshold is pruned, and nothing in C3 reminds anybody. A long read transaction that never
+        refreshed would lose the pin that keeps its own log segments alive.
+
+        The reading comes from the injected clock, or from the caller when it has one -- the same
+        shape lease renewal uses, and for the same reason: a monotonic reading is local to a
+        process and this layer owns no clock of its own.
+        """
+        with self._participant_section():
+            return self._refresh_due_readers(now_monotonic, skip=None)
+
+    def _refresh_due_readers(
+        self, now_monotonic: float | None = None, *, skip: TxnId | None = None
+    ) -> int:
+        """Refresh every due registration except the one named, and return how many moved.
+
+        ``skip`` names a transaction that is being finished. Proving a reader alive one call
+        before withdrawing it is a control-file write nobody reads, and this component is called
+        on every begin, commit and rollback.
+        """
+        if not self._pins:
+            return 0
+        now = self._clock.monotonic() if now_monotonic is None else float(now_monotonic)
+        interval = self._refresh_interval
+        refreshed = 0
+        for txn_id, pin in list(self._pins.items()):
+            if txn_id == skip or pin.registration.closed:
+                continue
+            if now < pin.last_refresh + interval:
+                continue
+            pin.registration.refresh()
+            pin.last_refresh = now
+            refreshed += 1
+        return refreshed
+
+    def checkpoint(self) -> RecycleReport:
+        """Put the committed state on the platter, publish the checkpoint, and reclaim the log behind it.
+
+        This is the lifecycle door BR-10 was waiting for (CF-11): ``WalManager.recycle`` and
+        ``recyclable_horizon`` existed and nothing called either, so the log grew without bound.
+        The checkpoint is also what lets recovery start somewhere other than the first record.
+
+        Three steps, in this order, under the commit section so no commit is half-published while
+        the checkpoint decides what is safe:
+
+        1. **Redo the log onto the device from the old checkpoint.** This is not optional and it
+           is not a performance choice. The commit protocol applies a commit's page images to the
+           committing process's OWN pool and deliberately does not put them on the platter
+           (section 8.5 step 6: the log is the authority). Another participant's committed pages
+           may therefore exist only in the log and in that participant's memory. A checkpoint
+           that flushed only this pool and then recycled the segments would destroy the only
+           durable copy of those pages; if that participant then crashed, its acknowledged commits
+           would be gone. Replaying the images here through the same idempotent door recovery
+           uses (``apply_page_image``) makes the device complete for EVERY commit at or below the
+           number about to be published, whatever any other process holds in memory.
+        2. **Flush and barrier every dirty page of this pool** (``BufferPool.checkpoint``), which
+           now includes the pages the redo installed.
+        3. **Publish** ``checkpoint_lsn = last_committed_lsn`` beside the unchanged commit numbers.
+
+        Only then is the log asked to recycle, up to the horizon the reader registry and the new
+        checkpoint allow together. A reader still pinned below the checkpoint holds the horizon
+        back on its own account; nothing here evicts it.
+        """
+        with self._participant_section():
+            lease = self._hold_lease()
+            try:
+                lease.validate()
+                with self._coordinator.exclusive(
+                    COMMIT_SECTION, timeout=self._commit_lock_timeout
+                ):
+                    lease.validate()
+                    state = self.published_state()
+                    self._pool.begin_read_view(state.last_committed_lsn)
+                    self._redo_onto_device(state.checkpoint_lsn, state.last_committed_lsn)
+                    self._pool.checkpoint()
+                    self._publish(
+                        CommitState(
+                            last_committed_lsn=state.last_committed_lsn,
+                            last_csn=state.last_csn,
+                            checkpoint_lsn=state.last_committed_lsn,
+                        )
+                    )
+            except BaseException:
+                self._drop_lease(lease)
+                raise
+            self._drop_lease(lease)
+        reader_present = self._coordinator.reader_horizon() is not None
+        return self._wal.recycle(self.recyclable_horizon(), reader_present=reader_present)
+
+    def _redo_onto_device(self, checkpoint: Lsn, through: Lsn) -> int:
+        """Install every logged page image above the checkpoint and at or below ``through``.
+
+        The redo rule is C1's ``apply_page_image``: an image whose number the page already carries
+        is left alone, so replaying what this process applied itself changes nothing, and an image
+        another process committed lands exactly as recovery would land it. Returns how many images
+        were installed.
+        """
+        installed = 0
+        for record in self._wal.read_from(checkpoint + 1):
+            if record.lsn > through:
+                break
+            if record.record_type != WalRecordType.WRITE_PAGE:
+                continue
+            write = decode_page_write(record.payload)
+            if apply_page_image(self._pool, write.file, write.page_index, write.image):
+                installed += 1
+        return installed
+
+    def close(self) -> None:
+        """Abandon every open transaction and withdraw every reader registration.
+
+        CONTRACT.md section 10 says closing a database with an open transaction aborts it and
+        never corrupts. Nothing of an open transaction is on the device, so abandoning it is the
+        whole of that promise.
+        """
+        with self._participant_section():
+            for txn in list(self._open.values()):
+                try:
+                    self.rollback(txn)
+                except GrafxError:
+                    # A rollback that cannot withdraw its registration must not stop the next
+                    # one from being withdrawn: the pins that remain are what a horizon pass
+                    # would carry forever.
+                    continue
+            for pin in list(self._pins.values()):
+                _close_quietly(pin.registration)
+            self._pins.clear()
+            self._open.clear()
+            for mode_name in self._mode_counts:
+                self._mode_counts[mode_name] = 0
+        guard = self._lease_guard
+        self._lease_guard = None
+        if guard is not None and not guard.released:
+            # A retained lease outliving its manager would make every other participant wait out
+            # the stall threshold before it could write at all.
+            _release_quietly(guard)
+        for mode_name in self._mode_counts:
+            self._publish_gauge(mode_name, 0)
+
+    # --- the commit protocol -------------------------------------------------------------------
+
+    def _commit_without_writing(self, txn: TransactionContext) -> CommitReport:
+        """Finish a transaction that put nothing in the log (section 8.5 step 1).
+
+        A read transaction is one. So is a write transaction that staged nothing: it has no
+        partition to validate and no bytes to append, so appending a COMMIT record for it would
+        add a record whose only content is that nothing happened.
+        """
+        csn: Csn = txn.snapshot.read_lsn
+        mode = txn.mode.value
+        with self._participant_section():
+            self._refresh_due_readers(skip=txn.txn_id)
+            txn.mark_committed(csn)
+            self._release_reader(txn)
+            open_now = self._forget(txn, mode)
+        self._publish_gauge(mode, open_now)
+        return CommitReport(csn=csn, durable=True, wrote=False)
+
+    def _commit_with_writing(self, txn: TransactionContext) -> CommitReport:
+        """Run steps 2 to 4 for a transaction that has work to append.
+
+        The whole acquire-commit-release window is inside the participant section, so the
+        threads of one participant take their turns at it rather than ending one another's
+        epoch (see :meth:`_participant_section`). Another PROCESS is not held up by it: its
+        section carries a different name and it contends only where CONTRACT.md section 8.5
+        already says it must, at the commit section of step 3.
+        """
+        retried = txn.conflicts > 0
+        conflict: tuple[int, ...] | None = None
+        committed: Csn = NO_CSN
+        mode = txn.mode.value
+        # Assigned inside the section on every path that publishes it; the name exists here only
+        # so no path can read it before the section has settled it.
+        open_now = 0
+        post_barrier_failure: GrafxError | None = None
+        with self._participant_section():
+            self._refresh_due_readers(skip=txn.txn_id)
+            lease = self._hold_lease()
+            try:
+                # Step 2: the epoch is confirmed before any byte can reach the device (BR-7,
+                # AC-6), through the coordinator that granted this very lease (A74).
+                lease.validate()
+                with self._coordinator.exclusive(
+                    COMMIT_SECTION, timeout=self._commit_lock_timeout
+                ):
+                    lease.validate()                                 # step 3.1
+                    current = self.published_lsn()                   # step 3.2
+                    # The commit decides against the picture as it is NOW, not as this pool last
+                    # cached it. Optimistic validation reads the log, but everything else the commit
+                    # consults -- the catalog, the pages a row will land on -- comes through the pool,
+                    # and a stale one makes a correct predicate decide against the wrong picture
+                    # (defect E1, second half; LESSONS L22).
+                    self._pool.begin_read_view(current)
+                    # The rows go in BEFORE validation, because the pages they land on are
+                    # part of what this commit will overwrite and therefore part of what it must
+                    # declare. Nothing of them is durable yet, and a refusal below puts them
+                    # beyond the reach of every snapshot (defect E1, carried finding CF-A).
+                    # Validation runs TWICE, and the first pass is not redundant. The pages a
+                    # row lands on are only known after the row is written, so the page half of
+                    # the interest set cannot exist before then -- but writing the row first
+                    # means the heap gets to refuse a version another participant has already
+                    # ended, and it refuses with transaction_state, which tells a caller to stop
+                    # where write_conflict would tell it to retry. Comparing what the caller
+                    # declared BEFORE touching the heap keeps a real conflict reported as one.
+                    conflict = self._find_conflict(txn)              # step 3.3
+                    rows: tuple[_RowWrite, ...] = ()
+                    staging_mark = len(txn.pending_records)
+                    try:
+                        if conflict is None:
+                            # Inside the guard, not before it: a refusal on the SECOND intent
+                            # of a batch used to leave the first one written and never
+                            # abandoned -- a phantom row the next commit of anyone flushed and
+                            # published (C5 round-2 B1).
+                            rows = self._write_rows(txn)
+                            self._declare_page_interest(txn, rows)
+                            conflict = self._find_conflict(txn)      # step 3.3, page half
+                        if conflict is None:
+                            records, images = self._build_records(txn, lease.epoch, rows)
+                            committed = self._wal.append_many(records)   # step 3.4
+                            _require_forward_commit(committed, current)
+                            self._wal.barrier()                      # step 3.5 -- durable here
+                    except BaseException:
+                        self._abandon_rows(rows)
+                        self._unstage_index_changes(txn, staging_mark)
+                        raise
+                    if conflict is not None:
+                        self._abandon_rows(rows)
+                        self._unstage_index_changes(txn, staging_mark)
+                    else:
+                        self._published_high_water = _larger(
+                            self._published_high_water, committed
+                        )
+                        try:
+                            self._apply_images(images)               # step 3.6
+                            self._apply_index_changes(txn, committed)   # step 3.6
+                            self._publish_commit_state(current, committed)   # step 3.7
+                        except GrafxError as failure:
+                            post_barrier_failure = failure
+            except BaseException:
+                self._drop_lease(lease)
+                raise
+            self._drop_lease(lease)
+            if conflict is None:
+                txn.bind_epoch(lease.epoch)
+                txn.mark_committed(committed)
+                self._release_reader(txn)
+                open_now = self._forget(txn, mode)
+            else:
+                txn.mark_conflicted()
+        # Everything below runs with no section and no lease held. A metrics sink is supplied by
+        # the host and may do anything at all, including re-entering this API, so it is called
+        # only once every invariant this component owns has been settled (amendment A91).
+        if retried and self._metrics.enabled:
+            self._metrics.increment(COMMIT_RETRIES_TOTAL)
+        if conflict is not None:
+            if self._metrics.enabled:
+                self._metrics.increment(WRITE_CONFLICTS_TOTAL)
+            raise GrafxWriteConflict(
+                "This transaction read or wrote a partition that another commit wrote after "
+                "its snapshot was taken.",
+                txn_id=txn.txn_id,
+                snapshot_lsn=txn.snapshot.read_lsn,
+                partitions=list(conflict),
+            )
+        self._publish_gauge(mode, open_now)
+        if post_barrier_failure is not None:
+            raise _already_committed(post_barrier_failure, committed)
+        return CommitReport(csn=committed, durable=True, wrote=True)
+
+    def _declare_page_interest(
+        self, txn: TransactionContext, rows: Sequence[tuple[object, RecordRef]]
+    ) -> None:
+        """Declare interest in every page this commit is about to overwrite, then refuse silence.
+
+        Two things happen here, and the second is the one defect E1 was about.
+
+        First, every page the commit will write gets a partition naming it. A page image replaces
+        the whole page, so two commits that write the same page conflict however disjoint the
+        rows they thought they were touching were -- and the pages a row write lands on are only
+        known now, which is why this runs inside the commit section rather than at staging time.
+        Without it, three participants each creating a table all reported ``durable=True`` and
+        two of them were lying: the third catalog image replaced the other two, the log still
+        held every record, and ``verify`` called it clean.
+
+        Second, a commit that has staged durable state and declares interest in NOTHING is
+        refused outright. The predicate short-circuits on an empty set -- correctly, since an
+        empty set intersects nothing -- so "I touched nothing" and "I forgot to say what I
+        touched" were the same value, and only one of them is safe. They are now different: a
+        transaction with nothing to write still commits through the read-only path, and one with
+        something to write must say what.
+        """
+        for file, page_index in txn.staged_pages():
+            txn.write_partitions.add(page_partition(file, page_index))
+        for page_index in self._pages_touched_by(rows):
+            txn.write_partitions.add(page_partition(self._heap_file, page_index))
+        if txn.wrote and not (txn.read_partitions or txn.write_partitions):
+            raise GrafxTransactionStateError(
+                "This transaction staged durable work and declared interest in no partition, so "
+                "optimistic validation could never refuse it and a concurrent commit could "
+                "replace what it wrote. Record what it touched with note_read or note_write.",
+                txn_id=txn.txn_id,
+                field="write_partitions",
+                pending_records=len(txn.pending_records),
+                page_images=len(txn.page_images),
+                row_intents=len(txn.row_intents),
+            )
+
+    def _find_conflict(self, txn: TransactionContext) -> tuple[int, ...] | None:
+        """Return the partitions that make this commit conflict, or None when none do.
+
+        The predicate is the one CONTRACT.md section 8.5 step 3.3 states and nothing more: a
+        conflict exists when a COMMIT record appended after this transaction's snapshot WROTE a
+        partition this transaction read or wrote.
+
+        Both halves matter. Dropping the read set would let a transaction that decided something
+        from a row commit after that row changed underneath it. Adding the other side's READ set
+        would refuse two transactions that merely looked at the same partition, which BR-6 calls
+        out by name: conflict is intersection, never the existence of another writer.
+        """
+        interested = txn.read_partitions | txn.write_partitions
+        if not interested:
+            # Nothing to intersect with. Skipping the scan cannot change the answer, because the
+            # intersection of an empty set with anything is empty.
+            return None
+        floor = txn.snapshot.read_lsn
+        self._require_log_retains_from(floor + 1)
+        for record in self._wal.read_from(floor + 1):
+            if record.record_type != WalRecordType.COMMIT:
+                continue
+            if record.lsn <= floor:
+                # The authority on the range is this comparison, not the argument passed to
+                # read_from: a log that answers a start LSN generously must not be able to turn
+                # a commit that this transaction has already seen into a conflict.
+                continue
+            payload = CommitPayload.decode(record.payload)
+            overlap = interested.intersection(payload.write_partitions)
+            if overlap:
+                return tuple(sorted(overlap))
+        return None
+
+    def _require_log_retains_from(self, start: Lsn) -> None:
+        """Refuse optimistic validation when the log has recycled records it would have to read.
+
+        The predicate of step 3.3 is an intersection with every COMMIT above the snapshot. A
+        checkpoint in another participant can recycle segments up to the horizon, and the horizon
+        can pass this transaction's snapshot when its reader pin has gone stale -- idle longer
+        than the stall threshold -- and was pruned. ``read_from`` then silently starts at the
+        first retained segment, the conflicting COMMIT is simply not there, and a stale
+        transaction commits over it: write skew, and step 3.3 not evaluated (C5 round-2 B4).
+
+        A refusal here is retryable: a fresh snapshot sits above the horizon by construction.
+        The log double used by part of the suite has no segments; the real log always does.
+        """
+        segments = getattr(self._wal, "segments", None)
+        if segments is None:
+            return
+        retained = [info for info in segments() if info.first_lsn != NO_LSN]
+        if not retained:
+            return
+        lowest = retained[0].first_lsn
+        if lowest > start and self._wal.last_lsn >= start:
+            raise GrafxWriteConflict(
+                "Optimistic validation cannot run: the log no longer holds the commits above "
+                "this transaction's snapshot (they were recycled by a checkpoint), so the "
+                "conflict check would be answered from a log with a hole in it. Retry from a "
+                "fresh snapshot.",
+                snapshot_lsn=start - 1,
+                lowest_retained_lsn=lowest,
+            )
+
+    def _build_records(
+        self,
+        txn: TransactionContext,
+        epoch: Epoch,
+        rows: Sequence[_RowWrite] = (),
+    ) -> tuple[list[WalRecordLike], list[tuple[str, PageIndex, bytes]]]:
+        """Return the records this commit appends and the page images it will then apply.
+
+        Each image is stamped ONCE, here, and the very same bytes are what the log carries and
+        what the page ends up holding. The number is ``last_lsn + len(batch)``: the sequence
+        number the COMMIT record gets whenever the log numbers a batch contiguously, which is the
+        model CONTRACT.md section 8.3 describes and what step 6 means by "page_lsn = lsn".
+
+        Two properties are what the redo rule of step 6 actually rests on, and both hold even
+        when a log inserts records of its own into the batch -- C4's does, a SEGMENT_HEADER when
+        a segment rolls, which makes the COMMIT land one number higher than this:
+
+        * the stamp is strictly above every sequence number the log had assigned BEFORE this
+          batch, so it is strictly above the page_lsn any earlier commit left on these pages, so
+          a replay after a crash between the barrier and the apply installs the image rather than
+          skipping it. An image stamped with zero would be skipped and the page lost, on exactly
+          the crash the log exists for;
+        * the bytes on the page and the bytes in the log are identical, so replaying the record
+          reproduces the page exactly and replaying it twice changes nothing.
+
+        Stamping the log with one number and the page with another satisfied neither: it was safe
+        by the first property and broke the second, and a replay then left the page carrying a
+        different number from the run it was reproducing. Proved by
+        ``test_the_page_on_the_device_is_byte_identical_to_the_image_in_the_log``.
+        """
+        base = _require_lsn("last_lsn", self._wal.last_lsn)
+        staged = list(txn.staged_pages())
+        for page_index in self._pages_touched_by(rows):
+            if (self._heap_file, page_index) not in txn.page_images:
+                staged.append((self._heap_file, page_index))
+        staged = sorted(set(staged))
+        # The index changes are staged HERE, between knowing the batch length and building the
+        # records, because they are part of that batch: they lengthen it, and the number they
+        # carry is the number the lengthened batch gives the COMMIT record. Counting them first
+        # is what breaks that circle; `_stage_index_changes` refuses if the count was wrong.
+        predicted = (
+            base
+            + len(staged)
+            + len(txn.pending_records)
+            + self._index_record_count(rows)
+            + 1
+        )
+        self._stage_index_changes(txn, rows, predicted)
+        pending = list(txn.pending_records)
+        self._stamp_rows(rows, predicted)
+        images: list[tuple[str, PageIndex, bytes]] = []
+        records: list[WalRecordLike] = []
+        for file, page_index in staged:
+            image = txn.page_images.get((file, page_index))
+            if image is None:
+                image = self._read_image(file, page_index)
+            stamped = self._stamp(image, predicted)
+            images.append((file, page_index, stamped))
+            records.append(
+                WalRecord(
+                    record_type=int(WalRecordType.WRITE_PAGE),
+                    epoch=epoch,
+                    txn_id=txn.txn_id,
+                    payload=encode_page_write(file, page_index, stamped),
+                    descriptor=self._descriptor,
+                )
+            )
+        records.extend(self._with_commit_epoch(record, epoch) for record in pending)
+        payload = CommitPayload.build(
+            snapshot_lsn=txn.snapshot.read_lsn,
+            read_partitions=txn.read_partitions,
+            write_partitions=txn.write_partitions,
+            page_touches=[
+                PageTouch(file_id=self._file_ids.id_of(file), page_index=page_index)
+                for file, page_index in staged
+            ],
+        )
+        records.append(
+            WalRecord(
+                record_type=int(WalRecordType.COMMIT),
+                epoch=epoch,
+                txn_id=txn.txn_id,
+                payload=payload.encode(),
+                descriptor=self._descriptor,
+            )
+        )
+        return records, images
+
+    def _with_commit_epoch(self, record: WalRecordLike, epoch: Epoch) -> WalRecordLike:
+        """Return the staged record carrying the epoch that is COMMITTING it.
+
+        A record is staged when the work is done and appended when the commit runs, and the two
+        are different instants: this component takes the writer lease for the commit window, so
+        at staging time there is no epoch to carry. Section 6.5 says the header field names the
+        epoch of the bearer, and the bearer is the writer that put the record in the log -- which
+        makes staging time the wrong instant to stamp, and an unstamped record worse than wrong:
+        C4 refuses a batch carrying an epoch older than the log already holds, so a record staged
+        with a zero would take the whole commit down with it.
+
+        A staged record that is not a dataclass is appended exactly as it came. This component
+        does not own the record type and will not rebuild one it does not recognise.
+        """
+        if getattr(record, "epoch", None) == epoch:
+            return record
+        if is_dataclass(record) and not isinstance(record, type):
+            return replace(record, epoch=epoch)  # type: ignore[type-var]
+        return record
+
+    def _values_at(self, reference: RecordRef) -> tuple[object, ...]:
+        """Return the values the version at this reference carries, for the index to key on.
+
+        Read from the heap rather than taken from the caller: inside the commit section the heap
+        is the authority, and a caller's copy of a row can be one version behind. A reference the
+        heap cannot read yields nothing, and the index staging then has no key to end -- which is
+        the same outcome as a table with no index, and strictly better than ending the wrong one.
+        """
+        if self._index_manager is None:
+            return ()
+        try:
+            return tuple(self._heap.read(reference).values)
+        except GrafxError:
+            return ()
+
+    def _index_record_count(self, rows: Sequence[_RowWrite]) -> int:
+        """Return how many log records the index staging of these rows will produce.
+
+        The number is needed BEFORE the staging happens, because the commit number every index
+        change carries is the sequence number of the COMMIT record, and that number depends on
+        how long the batch is -- which these very records lengthen. Counting first breaks the
+        circle without a provisional stamp to correct afterwards.
+
+        Keeping the count and the staging in step is an invariant in two places (A66), so
+        :meth:`_stage_index_changes` re-counts what it actually staged and refuses when the two
+        disagree, rather than letting a silent drift put a wrong commit number on an entry.
+        """
+        manager = self._index_manager
+        if manager is None:
+            return 0
+        total = 0
+        for row in rows:
+            table_id = getattr(row.table, "table_id", None)
+            if table_id is None:
+                continue
+            covering = len(manager.indexes_for(table_id))
+            if row.ended is not None:
+                total += covering
+            if row.born is not None:
+                total += covering
+        return total
+
+    def _stage_index_changes(
+        self, txn: TransactionContext, rows: Sequence[_RowWrite], csn: Csn
+    ) -> None:
+        """Stage, on every index covering each written row, the entries that row owes it.
+
+        This is the seam that makes a secondary index real. Without it ``IndexManager``'s three
+        staging doors have no caller at all: a commit writes rows to the heap, applies whatever
+        was staged into the indexes, and nothing between the two ever stages anything -- so every
+        index stays empty for ever, a lookup answers nothing, and a similarity search returns no
+        hits for rows that are visible in the heap. It is not specific to the vector subsystem;
+        an ordinary hash index is equally empty.
+
+        The order is delete-then-insert for an update, and both halves always run even when the
+        key did not change: an update writes a new version at a NEW location, so the entry that
+        pointed at the old one has to end whatever its key looks like.
+        """
+        manager = self._index_manager
+        if manager is None:
+            return
+        before = len(txn.pending_records)
+        expected = self._index_record_count(rows)
+        for row in rows:
+            table_id = getattr(row.table, "table_id", None)
+            if table_id is None:
+                continue
+            if row.ended is not None:
+                manager.stage_row_delete(txn, table_id, row.ended, row.ended_values, csn)
+            if row.born is not None:
+                manager.stage_row_insert(txn, table_id, row.born, row.born_values, csn)
+        produced = len(txn.pending_records) - before
+        if produced != expected:
+            raise GrafxTransactionStateError(
+                f"The index staging produced {produced} log records where the commit number was "
+                f"computed for {expected}, so the entries would carry a number the log did not "
+                f"assign.",
+                txn_id=txn.txn_id,
+                expected=expected,
+                produced=produced,
+            )
+
+    def _apply_index_changes(self, txn: TransactionContext, csn: Csn) -> int:
+        """Apply what this transaction staged into the indexes, and return how many moved.
+
+        It runs in the step 6 region, after the barrier of step 3.5 and beside the page images,
+        because that is where C7 says the call belongs: the number handed over is the one the log
+        assigned, and no index page is touched before the commit is durable.
+
+        A database built with no index manager has nothing to apply, which is the ordinary state
+        of this component's own suite and of any database with no secondary index.
+        """
+        manager = self._index_manager
+        if manager is None:
+            return 0
+        return int(manager.commit(txn, csn))
+
+    def _drop_index_changes(self, txn: TransactionContext) -> int:
+        """Drop what this transaction staged into the indexes, and return how many were dropped.
+
+        An abandoned transaction leaves nothing anywhere, and the index staging is part of
+        anywhere: a change left staged under a transaction number that will never commit would be
+        applied by whatever reused that number next.
+        """
+        manager = self._index_manager
+        if manager is None:
+            return 0
+        return int(manager.rollback(txn))
+
+    @property
+    def _heap_file(self) -> str:
+        """Return the file the heap of this database writes."""
+        return self._file_ids.heap_file
+
+    def _write_rows(self, txn: TransactionContext) -> tuple[_RowWrite, ...]:
+        """Write the rows this transaction staged and return where each one landed.
+
+        The staged intents are settled first (see :func:`_settled_intents`), because a stored row
+        can be named more than once by one transaction and every version may be ended exactly
+        once. Settling is not an optimisation: without it, a transaction that updates a row and
+        then deletes it asks the heap to end the same version twice, and the heap refuses -- so a
+        perfectly ordinary pair of statements fails inside the commit section, where the only
+        refusals still meant to be possible are device failures.
+
+        This runs inside the commit section, after optimistic validation has passed, so the only
+        refusals still ahead are device failures. The identity of a row with none is allocated
+        here for the same reason: an id burned by a commit that then fails leaves a GAP in the
+        sequence, which no reader can observe, where an id handed out twice would put two rows
+        under one identity.
+
+        The rows are written with a provisional birth stamp and corrected to the real commit
+        number by :meth:`_stamp_rows` before a single byte of them is logged or applied. The
+        provisional value never leaves this process: the pages it touched are overwritten by the
+        corrected images at step 3.6, which is the same door recovery replays them through, and
+        nothing is flushed in between.
+        """
+        if not txn.row_intents:
+            return ()
+        heap = self._heap
+        provisional = _require_lsn("last_lsn", self._wal.last_lsn) + 1
+        written: list[_RowWrite] = []
+        try:
+            self._write_intents(txn, heap, provisional, written)
+        except BaseException:
+            # The intents already written are abandoned HERE, by the one frame that knows
+            # about them. The caller sees only what this method returns, and a refusal on the
+            # second intent of a batch returned nothing -- so the first intent stayed written,
+            # unabandoned, and the next commit of anyone flushed and published it as a row no
+            # transaction ever committed (C5 round-2 B1).
+            self._abandon_rows(tuple(written))
+            raise
+        txn.row_refs = [item.born for item in written if item.born is not None]
+        return tuple(written)
+
+    def _write_intents(
+        self,
+        txn: TransactionContext,
+        heap: object,
+        provisional: Csn,
+        written: list[_RowWrite],
+    ) -> None:
+        """Write each settled intent into the heap, appending to ``written`` as each one lands."""
+        for intent in _settled_intents(txn.row_intents):
+            if intent.operation is RowOperation.DELETE:
+                ending = self._values_at(intent.reference)
+                heap.delete(intent.table, intent.reference, provisional)
+                written.append(
+                    _RowWrite(
+                        born=None,
+                        ended=intent.reference,
+                        table=intent.table,
+                        ended_values=ending,
+                    )
+                )
+                continue
+            if intent.operation is RowOperation.UPDATE:
+                ending = self._values_at(intent.reference)
+                reference = heap.update(
+                    intent.table, intent.reference, intent.values, provisional
+                )
+                written.append(
+                    _RowWrite(
+                        born=reference,
+                        ended=intent.reference,
+                        table=intent.table,
+                        born_values=tuple(intent.values),
+                        ended_values=ending,
+                    )
+                )
+                continue
+            record_id = intent.record_id
+            if record_id is None:
+                record_id = heap.allocate_record_id(intent.table)
+            else:
+                heap.observe_record_id(intent.table, record_id)
+            reference = heap.insert(intent.table, record_id, intent.values, provisional)
+            written.append(
+                _RowWrite(
+                    born=reference,
+                    ended=None,
+                    table=intent.table,
+                    born_values=tuple(intent.values),
+                )
+            )
+
+    def _unstage_index_changes(self, txn: TransactionContext, mark: int) -> None:
+        """Undo what :meth:`_stage_index_changes` staged for an attempt that did not commit.
+
+        Staging appends to ``txn.pending_records`` and to every index's own staging area. An
+        attempt refused AFTER staging -- the log refusing the batch, a lease stolen between
+        validate and append -- must leave neither behind: the next ``commit(txn)`` would stage
+        again and carry BOTH sets, the first stamped with a number the log never assigned, and
+        apply live index entries for versions that were abandoned (C5 round-2 B3).
+        """
+        del txn.pending_records[mark:]
+        self._drop_index_changes(txn)
+
+    def _abandon_rows(
+        self, rows: Sequence[_RowWrite]
+    ) -> None:
+        """Make rows written by a commit that then failed unreachable to every snapshot.
+
+        The rows are in the buffer pool by the time the log is asked for anything, and the pool
+        is shared: the next commit that succeeds flushes that file, and it would carry these
+        rows to the device with it. They would then be readable, under the provisional stamp, by
+        any snapshot at or above it -- a row no transaction ever committed, visible.
+
+        Setting the birth stamp to NO_CSN is what removes them: the visibility predicate refuses
+        a version with no commit number outright, so the version cannot be seen whatever happens
+        to the page afterwards. It is left in place rather than removed because removing it would
+        be a second write with its own failure mode, and an unreachable version is the same shape
+        as the page C1 leaks when an append is refused -- space, not a result.
+
+        This must not raise. It runs while a failure is already unwinding, and replacing that
+        failure with one about cleaning up after it would hide the reason the commit is being
+        abandoned at all.
+        """
+        for item in rows:
+            try:
+                if item.born is not None:
+                    # A version nobody committed carries no commit number, and the visibility
+                    # predicate refuses one outright.
+                    self._restamp(item.born, xmin=NO_CSN)
+                if item.ended is not None:
+                    # The version this commit was going to end is live again: it was only ever
+                    # ended on behalf of a commit that did not happen.
+                    self._restamp(item.ended, xmax=NO_CSN, flags=_LIVE_FLAGS)
+            except GrafxError:
+                pass
+        # The restamp keeps any live holder of these pages coherent; the DISCARD is what keeps
+        # them off the device. The frames hold the page as it looked during the refused attempt,
+        # and written back -- by the next flush, or by a read view dropping them -- they would
+        # land over pages another participant has since committed (C5 round-2 B2: rows lost,
+        # verify clean). Dropped unwritten, the device is the truth the next pin re-reads.
+        touched = set(self._pages_touched_by(rows))
+        if rows:
+            touched.add(HEADER_PAGE_INDEX)
+        for page_index in touched:
+            try:
+                self._pool.discard(self._heap_file, page_index)
+            except GrafxError:
+                continue
+
+    def _restamp(
+        self,
+        reference: RecordRef,
+        *,
+        xmin: Csn | None = None,
+        xmax: Csn | None = None,
+        flags: int | None = None,
+    ) -> None:
+        """Rewrite the commit numbers of one stored version, through C1's own header value.
+
+        The record header is C1's format and is read and written as a value, never by reaching
+        into the bytes. Everything not named here -- the identity, the payload, the chain -- is
+        carried through exactly as it was.
+        """
+        with self._pool.pinned(self._heap_file, reference.page) as page:
+            payload = page.read_slot(reference.slot)
+            header = RecordHeader.decode(payload[:RECORD_HEADER_SIZE])
+            corrected = RecordHeader(
+                record_id=header.record_id,
+                xmin=header.xmin if xmin is None else xmin,
+                xmax=header.xmax if xmax is None else xmax,
+                prev_version=header.prev_version,
+                payload_len=header.payload_len,
+                schema_version=header.schema_version,
+                flags=header.flags if flags is None else header.flags & flags,
+                reserved=header.reserved,
+            )
+            if corrected == header:
+                return
+            page.update_slot(
+                reference.slot, corrected.encode() + payload[RECORD_HEADER_SIZE:]
+            )
+
+    def _pages_touched_by(
+        self, rows: Sequence[_RowWrite]
+    ) -> tuple[PageIndex, ...]:
+        """Return every heap page a row write can have changed, in a fixed order.
+
+        The reserved header page is always included: it carries the table directory, and every
+        insert can move the extent hint and the identity counter on it. Including a page that did
+        not change costs one image in the log and changes nothing else; missing one that did
+        would leave a change with no record to redo it, which is the failure the log exists to
+        prevent.
+        """
+        if not rows:
+            return ()
+        touched = {HEADER_PAGE_INDEX}
+        for item in rows:
+            if item.born is not None:
+                touched.add(item.born.page)
+            if item.ended is not None:
+                # The page of the version being ENDED changes too: its header now says when it
+                # stopped being current. A commit that logged the new version and not the end of
+                # the old one would replay into two live versions of one record.
+                touched.add(item.ended.page)
+        return tuple(sorted(touched))
+
+    def _stamp_rows(
+        self, rows: Sequence[_RowWrite], csn: Csn
+    ) -> None:
+        """Correct the birth stamp of every row just written to the real commit number.
+
+        The version header is C1's format and is read and written through C1's own value type,
+        never by reaching into the bytes: the header is decoded, its commit number replaced, and
+        the record put back in the slot it came from. Everything else about the version -- its
+        identity, its payload, its chain -- is carried through untouched.
+        """
+        for item in rows:
+            if item.born is not None:
+                self._restamp(item.born, xmin=csn)
+            if item.ended is not None:
+                self._restamp(item.ended, xmax=csn)
+
+    def _read_image(self, file: str, page_index: PageIndex) -> bytes:
+        """Return the current image of one resident page, as the log will carry it."""
+        with self._pool.pinned(file, page_index) as page:
+            return self._pool.codec.encode_page(page)
+
+    def _stamp(self, image: bytes, lsn: Lsn) -> bytes:
+        """Return the image with its page LSN raised to this commit's number.
+
+        The page goes through the codec rather than having eight bytes overwritten in place,
+        because the checksum of a page is the codec's business and a page whose header was
+        rewritten behind the codec's back is a page that fails its own verification.
+        """
+        page = self._pool.codec.decode_page(image, verify=True)
+        if page.page_lsn < lsn:
+            page.page_lsn = lsn
+        return self._pool.codec.encode_page(page)
+
+    def _apply_images(self, images: Sequence[tuple[str, PageIndex, bytes]]) -> None:
+        """Apply the staged pages under the redo rule of step 6, then put them on the device.
+
+        The apply door is C1's, and deliberately: the rule -- grow the file if the page is
+        missing, apply when the resident page is free or older, leave it alone when it is not --
+        is the same rule recovery replays with (amendment A22), and writing it twice would give
+        this component and recovery two chances to disagree about one invariant.
+
+        The flush is not optional and it is not a performance choice. A page applied into this
+        process's buffer pool is invisible to every OTHER process until it reaches the device,
+        and the commit is about to publish a state that tells those processes the page is there.
+        Publishing a number whose pages only exist in one process's memory is exactly the
+        partial commit AC-3 forbids. It is a flush and NOT a barrier: section 8.5 step 6 says
+        the data files are not fsynced here, because the log is the authority on durability and
+        the redo is idempotent.
+
+        The images arrive already stamped by :meth:`_build_records` and are installed exactly as
+        the log carries them, byte for byte. Re-stamping them here with the number the log
+        actually returned would leave the page and the record disagreeing about the page, and a
+        later replay would then produce a page that is not the one this commit wrote.
+        """
+        touched: set[str] = set()
+        for file, page_index, image in images:
+            apply_page_image(self._pool, file, page_index, image)
+            touched.add(file)
+        for file in sorted(touched):
+            self._pool.flush(file)
+
+    def _publish_commit_state(self, previous: Lsn, committed: Csn) -> None:
+        """Publish the new commit state, preserving the checkpoint another component set.
+
+        The checkpoint LSN is read and written back rather than replaced. It belongs to whoever
+        checkpoints, and a commit that reset it to zero would tell recovery to replay the whole
+        log and tell the recycler that nothing may ever be released.
+
+        The number published is the commit number itself, with no comparison against what is
+        already there. That used to be a three-way maximum, and the maximum is now provably
+        dead: ``_require_forward_commit`` has refused this commit before the barrier unless its
+        number is ABOVE ``previous``, and nothing else can publish while the commit section is
+        held. A battery confirmed it -- with the guard in place, replacing the maximum with the
+        commit number could not be made to fail. A second mechanism that no input can distinguish
+        from the first is not defence in depth, it is a guarantee nobody can prove (A67, A83),
+        so it is gone and the guard is the one answer.
+
+        ``previous`` stays in the signature because it is what the guard compared against and
+        what a reader of this method needs in order to see why no comparison is left here.
+        """
+        durable = self._read_commit_state()
+        state = CommitState(
+            last_committed_lsn=committed,
+            last_csn=committed,
+            checkpoint_lsn=durable.checkpoint_lsn,
+        )
+        self._publish(state)
+
+    def _publish(self, state: CommitState) -> None:
+        """Write the state to a temporary of this participant and replace the published file."""
+        storage = self._storage
+        payload = state.encode()
+        temporary = f"{COMMIT_STATE_FILE}.{self._coordinator.owner_id()}.tmp"
+        if storage.exists(temporary):
+            storage.remove(temporary)
+        storage.create(temporary, exclusive=True)
+        storage.append_log(temporary, payload)
+        storage.durable_barrier(temporary)
+        storage.atomic_replace(temporary, COMMIT_STATE_FILE)
+        storage.durable_barrier(COMMIT_STATE_FILE)
+
+    def _read_commit_state(self) -> CommitState:
+        """Read the published state, riding out a device condition that is worth trying again.
+
+        The read takes two device calls, the size and the bytes, and another participant may
+        publish between them. That is a benign race and NOT a reason to retry: every published
+        record is the same fixed size and arrives whole through ``atomic_replace``, so a stale
+        size larger than the file yields the complete record anyway and decodes. A branch that
+        re-read on a length mismatch was here and was removed rather than kept: the full matrix
+        of (guard, no guard) x (stale size, damaged bytes) gives the same answer in all four
+        cells, so nothing could ever have shown it working (A67, A93).
+
+        What IS worth trying again is a transient device condition, and the decision reads
+        ``details["retryable"]`` rather than the class of the failure, because A28 put the
+        classification in the details and A47 makes every retry predicate read it there.
+
+        There is no sleep between attempts: this layer owns no clock it may wait on (G2), and
+        the condition being ridden out is a sharing violation of a few milliseconds that the
+        device below has already backed off for.
+        """
+        storage = self._storage
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                if not storage.exists(COMMIT_STATE_FILE):
+                    return CommitState()
+                size = storage.log_size(COMMIT_STATE_FILE)
+                return CommitState.decode(storage.read_log(COMMIT_STATE_FILE, 0, size))
+            except GrafxError as failure:
+                retryable = failure.details.get("retryable", failure.retryable)
+                if attempts < COMMIT_STATE_READ_ATTEMPTS and retryable is True:
+                    continue
+                raise
+
+    # --- internals ---------------------------------------------------------------------------
+
+    @property
+    def _storage(self) -> StorageDevice:
+        """Return the device under the buffer pool, which is the one this database was built on."""
+        return self._pool.storage
+
+    def _hold_lease(self) -> LeaseGuard:
+        """Return the writer lease this commit will validate under, acquiring one if needed.
+
+        A retained lease is renewed rather than re-acquired, on the schedule C3 sets from the
+        time to live: two renewals may fail before any other participant would call this owner
+        stalled. A renewal that reports the lease was taken over is not an error to propagate --
+        the successor is legitimate and this participant simply needs a current epoch -- so the
+        guard is dropped and a fresh lease acquired, which is exactly what the per-commit
+        placement did every time.
+        """
+        if not self._retain_lease:
+            return LeaseGuard.acquire(self._coordinator, timeout=self._lease_timeout)
+        guard = self._lease_guard
+        if guard is not None and not guard.released:
+            try:
+                guard.renew_if_due(self._clock.monotonic())
+                return guard
+            except GrafxLeaseStolen:
+                self._lease_guard = None
+        guard = LeaseGuard.acquire(self._coordinator, timeout=self._lease_timeout)
+        self._lease_guard = guard
+        return guard
+
+    def _drop_lease(self, lease: LeaseGuard) -> None:
+        """Give the lease up, unless this manager is holding it across commits."""
+        if self._retain_lease and lease is self._lease_guard and not lease.released:
+            return
+        _release_quietly(lease)
+
+    def _participant_section(self) -> AbstractContextManager[None]:
+        """Enter the section that serialises the THREADS of this participant.
+
+        FR-3 asks for N processes AND N threads holding write transactions, and for every commit
+        whose partition sets are disjoint to CONFIRM. The processes half falls out of the lease
+        being per participant; the threads half does not, and cannot: a participant holds ONE
+        lease, so two threads that each acquire and release "it" end each other's epoch and the
+        loser is refused with a non-retryable stale_epoch. What FR-3 requires is that they all
+        confirm, not that they run at the same instant, so the threads of one participant are
+        serialised here and every one of them confirms.
+
+        The mutex is the coordinator's own section rather than a lock built here, because the
+        engine owns no mechanism (G2) and may not import threading. The name carries a digest of
+        this participant's identity, so the section is participant-local: another PROCESS never
+        waits on it, which is what keeps the processes half of FR-3 concurrent.
+
+        It is re-entrant from the same thread, so a door that takes it may call another that
+        does. Lock order is participant -> lease -> commit on every path, and nothing anywhere
+        takes them the other way round.
+
+        Proved by test_every_thread_of_one_participant_confirms_on_disjoint_partitions,
+        test_threads_opening_and_abandoning_transactions_never_report_damage and
+        test_readers_and_writers_of_one_participant_share_the_pin_table_safely; that it does not
+        hold another participant up is proved by the two-process tests, which still run
+        concurrently with it in place.
+        """
+        return self._coordinator.exclusive(
+            self._participant_section_name, timeout=self._commit_lock_timeout
+        )
+
+    def _require_owned(self, txn: TransactionContext) -> None:
+        """Refuse a transaction this manager did not open (amendment A74).
+
+        The lease that authorises a commit is installed by one coordinator, and C3's
+        ``validate_epoch`` answers about the lease IT installed. So a transaction committed
+        through a different manager would be validated against a lease that has nothing to do
+        with the work it is about to write. Binding the transaction to its manager makes that
+        unrepresentable rather than merely discouraged.
+        """
+        if not isinstance(txn, TransactionContext):
+            raise GrafxConfigurationError(
+                f"A transaction must be a TransactionContext; got {type(txn).__name__}.",
+                field="txn",
+                value=type(txn).__name__,
+            )
+        if txn.owner is not self:
+            raise GrafxTransactionStateError(
+                "This transaction was opened by another transaction manager and cannot be "
+                "committed or rolled back here.",
+                txn_id=txn.txn_id,
+            )
+
+    def _require_active(self, txn: TransactionContext) -> None:
+        """Refuse a transaction that has already committed or rolled back."""
+        if not txn.active:
+            raise GrafxTransactionStateError(
+                f"Transaction {txn.txn_id} is {txn.state.value} and cannot be used again.",
+                txn_id=txn.txn_id,
+                state=txn.state.value,
+            )
+
+    def _release_reader(self, txn: TransactionContext) -> None:
+        """Withdraw the reader registration of one transaction and release its snapshot pin."""
+        pin = self._pins.pop(txn.txn_id, None)
+        if pin is not None:
+            pin.registration.close()
+
+    def _forget(self, txn: TransactionContext, mode: str) -> int:
+        """Drop a finished transaction and return how many of its mode are still open.
+
+        The count is RETURNED rather than published here so the caller can emit it once the
+        participant section is released: a metrics sink is host code and must never be called
+        while this component holds anything (A91).
+        """
+        self._open.pop(txn.txn_id, None)
+        if self._mode_counts[mode] > 0:
+            self._mode_counts[mode] -= 1
+        return self._mode_counts[mode]
+
+    def _publish_gauge(self, mode: str, open_now: int) -> None:
+        """Publish how many transactions of one mode are open."""
+        if self._metrics.enabled:
+            self._metrics.set_gauge(ACTIVE_TRANSACTIONS, float(open_now), {"mode": mode})
+
+    def __repr__(self) -> str:
+        """Return a representation naming the granularity and how many transactions are open."""
+        return (
+            f"TransactionManager(partitions_per_table={self._partitions_per_table}, "
+            f"open_transactions={len(self._open)})"
+        )
+
+
+def _settled_intents(intents: Sequence[RowIntent]) -> tuple[RowIntent, ...]:
+    """Return what one transaction does to each row, with every stored row named at most once.
+
+    A transaction may name one stored row more than once -- update it and then delete it, or set
+    two different properties in two statements -- and the two stamps a change writes are only
+    correct once each: the version it replaces ends at the commit number, and a version cannot
+    end twice. Asking the heap to end it again is refused, correctly, and that refusal would
+    arrive inside the commit section, where the only failures still meant to be possible are the
+    device's.
+
+    So the intents are read in order and reduced to the OUTCOME per stored row: the last thing
+    the transaction said about it. A delete wins over the updates before it, because ending a row
+    and also leaving a new version of it behind is not a state any snapshot rule can make sense
+    of. Updates collapse to the last values for the same reason a single statement collapses its
+    own assignments -- the transaction's answer about a row is one row.
+
+    Inserts pass through untouched and keep their order among themselves: they name no stored
+    row, so nothing about them can collide, and two inserts are two rows however alike they look.
+    Each settled outcome keeps the position of the FIRST intent that named its row, so the order
+    a caller sees does not depend on which statement happened to finish the row off.
+    """
+    settled: dict[object, RowIntent] = {}
+    order: list[object] = []
+    passthrough: list[tuple[int, RowIntent]] = []
+    for position, intent in enumerate(intents):
+        if intent.operation is RowOperation.INSERT or intent.reference is None:
+            passthrough.append((position, intent))
+            continue
+        key = intent.reference
+        if key not in settled:
+            order.append(key)
+        settled[key] = intent
+    if not settled:
+        return tuple(intents)
+    placed: list[tuple[int, RowIntent]] = list(passthrough)
+    first_seen: dict[object, int] = {}
+    for position, intent in enumerate(intents):
+        reference = intent.reference
+        if reference is not None and reference not in first_seen:
+            first_seen[reference] = position
+    for key in order:
+        placed.append((first_seen[key], settled[key]))
+    placed.sort(key=lambda item: item[0])
+    return tuple(intent for _position, intent in placed)
+
+
+def _require_timeout(label: str, value: float) -> float:
+    """Return the timeout when it is a positive, finite number of seconds."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise GrafxConfigurationError(
+            f"{label} must be a number of seconds; got {type(value).__name__}.",
+            field=label,
+            value=repr(value),
+        )
+    seconds = float(value)
+    if seconds != seconds or seconds <= 0.0 or seconds == float("inf"):
+        raise GrafxConfigurationError(
+            f"{label} must be a positive, finite number of seconds; got {value!r}.",
+            field=label,
+            value=repr(value),
+        )
+    return seconds
+
+
+def _require_forward_commit(committed: Csn, published: Lsn) -> Csn:
+    """Refuse a commit number the log put at or below what the database has already published.
+
+    A fresh commit is appended after everything the log holds, so its sequence number is above
+    the published one by construction -- inside the commit section nothing else can have moved
+    either. A log that answers otherwise is numbering two commits the same, and carrying on
+    would barrier a record that overwrites one already acknowledged and publish a state that
+    moves backwards; every reader that then took a snapshot would be reading a database that had
+    forgotten a commit it confirmed.
+
+    The check runs BEFORE the barrier, which is what makes the refusal clean: the records are in
+    the log but nothing was made durable and nothing was acknowledged, so the tail is exactly
+    the uncommitted tail recovery truncates.
+
+    This is defence in depth for carried finding CF-6, where a real log holding its segment
+    index in memory issued one number to two participants. Fixing that belongs to the log; this
+    comparison costs nothing and turns the next variant of it into a typed refusal instead of a
+    silent overwrite.
+    """
+    if committed > published:
+        return committed
+    raise GrafxTransactionStateError(
+        f"The log assigned commit number {committed} to a commit appended after commit number "
+        f"{published} was already published; a fresh commit is always above it.",
+        field="csn",
+        value=committed,
+        published_lsn=published,
+    )
+
+
+def _require_lsn(label: str, value: object) -> Lsn:
+    """Return the value when the log answered with a usable sequence number."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise GrafxTransactionStateError(
+            f"The log reported {label} as {type(value).__name__}; an integer is required.",
+            field=label,
+            value=repr(value),
+        )
+    if value < NO_LSN:
+        raise GrafxTransactionStateError(
+            f"The log reported {label} as {value}, which is not a sequence number.",
+            field=label,
+            value=value,
+        )
+    return value
+
+
+def _file_name_of(store: object, fallback: str) -> str:
+    """Return the file a store writes, or the well-known name when it does not say."""
+    name = getattr(store, "file", None)
+    return name if isinstance(name, str) and name else fallback
+
+
+def _larger(left: int, right: int) -> int:
+    """Return the larger of two numbers without importing anything to do it."""
+    return left if left > right else right
+
+
+def _release_quietly(lease: LeaseGuard) -> None:
+    """Release a lease, never letting the release replace what the caller is already handling.
+
+    A commit that reached the barrier is durable whatever happens to the lease afterwards, and a
+    commit that failed before it has a failure of its own to report. Either way the lease is
+    reclaimed by the stall threshold, which is the mechanism FR-7 already relies on.
+    """
+    try:
+        lease.release()
+    except GrafxError:
+        return
+
+
+def _close_quietly(registration: ReaderRegistration) -> None:
+    """Withdraw a registration without letting the withdrawal replace a failure in flight."""
+    try:
+        registration.close()
+    except GrafxError:
+        return
+
+
+def _already_committed(failure: GrafxError, csn: Csn) -> GrafxError:
+    """Return the failure marked as one that happened AFTER the commit became durable.
+
+    The barrier of step 3.5 has returned by the time this is reached, so the transaction is
+    committed no matter what failed next: applying its pages and publishing the state are both
+    work that recovery redoes from the log. Reporting a plain failure here would invite the one
+    response that causes real harm -- a caller retrying work the database has already accepted --
+    so the classification says exactly that, in the field amendment A47 makes every retry
+    predicate read.
+    """
+    failure.retryable = False
+    failure.details["committed"] = True
+    failure.details["csn"] = csn
+    failure.details["retryable"] = False
+    return failure

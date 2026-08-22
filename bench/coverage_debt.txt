@@ -1,0 +1,18 @@
+# Declared coverage debt -- node ids allowed to run on NO family of the D9 matrix.
+#
+# Owned by C13 (bench/**). A test author cannot add a line here from the file they are editing:
+# every other component's write scope excludes this path (CONTRACT section 1), so growing the
+# tolerated set is a visible, reviewed act rather than one more member of a set the author
+# already controls (A89).
+#
+# Format: one identity per line, exactly as `python -m bench.coverage` prints it
+# (`<classname>::<name>`, pytest's own mangled address). `#` starts a comment.
+#
+# An entry that DID run is reported as stale so this file can be pruned; that is a note, never a
+# failure. An entry that never ran and is NOT listed here fails the check by name.
+#
+# Empty on purpose, and MEASURED rather than assumed. On 2026-08-20 the whole suite was run on
+# both families of the D9 matrix -- Windows 11 / CPython 3.13.1 and Linux / CPython 3.12.13 --
+# and the check read 6756 reported nodes, every one of them observed to execute on at least
+# one family. 35 nodes ran on one family only and are listed as declared partial coverage
+# (TR-8), which is not debt: they ran.

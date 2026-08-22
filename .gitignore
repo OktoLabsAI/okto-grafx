@@ -13,3 +13,4 @@ htmlcov/
 *.db/
 bench/results/
 .grafx-tmp/
+*.stackdump

@@ -9,12 +9,13 @@ decided its outcome, so a failure here would corrupt a result that was already c
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 
 import pytest
 
 from okto_grafx.adapters.events_logging import (
     DEFAULT_LOGGER_NAME,
+    MAX_KEY_LENGTH,
     MAX_VALUE_LENGTH,
     REDACTED_MARKER,
     REDACTED_PAYLOAD_KEYS,
@@ -96,7 +97,45 @@ def test_an_event_with_no_payload_still_logs_its_name(
     assert capture.records[0].okto_payload == {}
 
 
-@pytest.mark.parametrize("key", sorted(REDACTED_PAYLOAD_KEYS))
+EXPECTED_REDACTED_KEYS: frozenset[str] = frozenset(
+    {
+        "credential",
+        "email",
+        "embedding",
+        "key",
+        "message",
+        "password",
+        "path",
+        "payload",
+        "query",
+        "secret",
+        "text",
+        "token",
+        "user",
+        "username",
+        "value",
+        "values",
+        "vector",
+    }
+)
+"""The redaction set, pinned by hand (A56/A68).
+
+Parametrising over the constant alone made the suite complicit: dropping "password" from it
+removed the case that would have caught the drop, and the only visible symptom was the test
+count falling by one. A count nobody asserts is not a signal, so the set is written out here and
+compared, and the parametrised cases are driven from this copy rather than from the constant.
+"""
+
+
+def test_the_redaction_set_is_exactly_the_pinned_one() -> None:
+    assert REDACTED_PAYLOAD_KEYS == EXPECTED_REDACTED_KEYS, {
+        "dropped": sorted(EXPECTED_REDACTED_KEYS - REDACTED_PAYLOAD_KEYS),
+        "added": sorted(REDACTED_PAYLOAD_KEYS - EXPECTED_REDACTED_KEYS),
+    }
+    assert len(REDACTED_PAYLOAD_KEYS) == 17
+
+
+@pytest.mark.parametrize("key", sorted(EXPECTED_REDACTED_KEYS))
 def test_every_declared_key_is_redacted(
     logger: logging.Logger, capture: _Capture, key: str
 ) -> None:
@@ -126,6 +165,22 @@ def test_the_redaction_set_can_be_chosen_by_the_host(
     sink.emit("lease.taken", {"owner_id": "host-a", "path": "/var/data"})
     assert capture.records[0].okto_payload == {"owner_id": REDACTED_MARKER, "path": "/var/data"}
     assert sink.redacted_keys == frozenset({"owner_id"})
+
+
+def test_the_value_and_key_bounds_are_the_pinned_ones() -> None:
+    # A68: the numbers that decide how much of a payload reaches a log file are the contract,
+    # and widening either of them is a change nobody would otherwise see.
+    assert MAX_VALUE_LENGTH == 256
+    assert MAX_KEY_LENGTH == 64
+
+
+def test_a_key_longer_than_the_bound_is_truncated(
+    logger: logging.Logger, capture: _Capture
+) -> None:
+    LoggingEventSink(logger).emit("probe", {"k" * 5_000: 1})
+    key = next(iter(capture.records[0].okto_payload))
+    assert len(key) == MAX_KEY_LENGTH
+    assert key.endswith("...")
 
 
 def test_a_long_string_is_truncated(logger: logging.Logger, capture: _Capture) -> None:
@@ -168,12 +223,55 @@ def test_the_level_is_respected(logger: logging.Logger, capture: _Capture) -> No
     assert capture.records[0].levelno == logging.WARNING
 
 
+class _CountingPayload(Mapping[str, object]):
+    """A payload that records every time it is read.
+
+    Asserting that no record was emitted proves nothing about the guard: Logger.log performs its
+    own level check, so a sink with the guard removed emits nothing either. The property the
+    guard exists for is that the payload is never *read* when nobody is listening, and only the
+    payload can report that.
+    """
+
+    def __init__(self, contents: dict[str, object]) -> None:
+        self._contents = contents
+        self.reads = 0
+
+    def __getitem__(self, key: str) -> object:
+        self.reads += 1
+        return self._contents[key]
+
+    def __iter__(self) -> Iterator[str]:
+        self.reads += 1
+        return iter(self._contents)
+
+    def __len__(self) -> int:
+        return len(self._contents)
+
+    def items(self):  # type: ignore[override]
+        self.reads += 1
+        return self._contents.items()
+
+
 def test_nothing_is_built_when_the_level_is_disabled(
     logger: logging.Logger, capture: _Capture
 ) -> None:
     logger.setLevel(logging.CRITICAL)
-    LoggingEventSink(logger, level=logging.DEBUG).emit("probe", {"a": 1})
+    payload = _CountingPayload({"a": 1, "detail": "x" * 4000})
+    LoggingEventSink(logger, level=logging.DEBUG).emit("probe", payload)
     assert capture.records == []
+    assert payload.reads == 0, (
+        f"the payload was read {payload.reads} time(s) for an event nobody is listening to"
+    )
+
+
+def test_the_payload_is_read_when_somebody_is_listening(
+    logger: logging.Logger, capture: _Capture
+) -> None:
+    # The control: the same payload, a level that is enabled, and the read does happen.
+    payload = _CountingPayload({"a": 1})
+    LoggingEventSink(logger, level=logging.INFO).emit("probe", payload)
+    assert payload.reads >= 1
+    assert capture.records[0].okto_payload == {"a": 1}
 
 
 def test_a_payload_whose_values_explode_is_still_an_event(
