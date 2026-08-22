@@ -66,6 +66,7 @@ def test_a_search_never_escapes_while_another_thread_commits_vectors(tmp_path: P
 
         stop = threading.Event()
         escapes: list[tuple[str, str]] = []
+        refusals: list[str] = []
         answered = [0]
         committed = [0]
         guard = threading.Lock()
@@ -99,8 +100,12 @@ def test_a_search_never_escapes_while_another_thread_commits_vectors(tmp_path: P
                             txn.execute(f"MATCH (c:Chunk {{id: {identity - 30}}}) DELETE c")
                     with guard:
                         committed[0] += 1
-                except GrafxError:
-                    pass
+                except GrafxError as refused:
+                    # A typed refusal is legal under contention -- but it is KEPT, because a
+                    # commit refused AFTER the log barrier is durable and may have been applied
+                    # to the heap and not to the index, which verify() then reports.
+                    with guard:
+                        refusals.append(f"{type(refused).__name__}: {refused.message[:160]}")
                 except BaseException as escaped:  # noqa: BLE001
                     with guard:
                         escapes.append(("writer:" + type(escaped).__name__, repr(escaped)[:120]))
@@ -116,7 +121,13 @@ def test_a_search_never_escapes_while_another_thread_commits_vectors(tmp_path: P
             thread.join(timeout=60)
         assert escapes == [], escapes
         assert answered[0] > 10 and committed[0] > 3, (answered[0], committed[0])
-        assert database.verify("all").findings == ()
+        findings = database.verify("all").findings
+        assert findings == (), (
+            [(finding.kind, finding.detail[:160]) for finding in findings[:4]],
+            refusals[:6],
+            answered[0],
+            committed[0],
+        )
     finally:
         database.close()
 

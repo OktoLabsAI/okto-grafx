@@ -963,3 +963,55 @@ commit/redo, and a search compares it with the header on the device (fresh after
 view): a foreign commit that touched the index moves it, the graph is discarded and rebuilt. Test:
 `test_a_warm_graph_learns_what_another_process_committed` (child inserts 8 / deletes 4; reverted: the
 approximate regime returns deleted row 2). Unmasked by CF-12 (the descriptor identity fix in C2).
+
+### C10 round 3 — B1, B2, R01 CLOSED (coordinator)
+
+**B1**: a refusal INSIDE `release()` (a DELETE of a row the same statement created reached the
+transaction's door with no reference) left the statement's other rows staged, and a commit made half
+a statement durable. Three fixes: a DELETE of a statement-created row takes the held insert back (net
+no-op, Cypher's reading); `release()` is all-or-nothing on the transaction (`staging_mark` /
+`discard_since` around the handover); a MERGE-matched row this transaction UPDATED comes back WITH its
+reference (the latest values on a real `RowBinding`) so later clauses work. A DELETE of a row created
+by an EARLIER statement refuses with a typed error naming W5b (E4's family).
+
+**B2**: the held insert was identified by VALUES; two created rows with identical values (a table
+without a primary key) sent a second SET clause to the wrong row. Now each held insert carries a token
+tied to the pending binding's version object; `_rewrite_held_insert`, `_current_values` and the
+pending DELETE all resolve by token.
+
+**R01**: the key check inside the rewrite is pinned (`MERGE (a {id:1}) SET a.id = 5` with 5 taken).
+
+Tests: 7 new in `tests/query/test_round_two_regressions.py` (+ the read-side ended-row test pinning
+N01/E01 independently of C5's settle); counterfactual with all five fixes reverted: 6/6 fail. The
+critic's rewrite probe: 9/10 (the 10th is a cross-statement MERGE-SET on an earlier-created row, a
+typed refusal recorded under E4).
+
+### CF-13 — the buffer pool was not safe across the threads of one participant (C1; CLOSED)
+
+Found by the coordinator's own thread-concurrency test under suite load, and confirmed by
+experiment: readers on a SECOND handle -> 0 findings; no readers -> 0; readers on the SAME handle
+-> `index_entry_missing` in 2 of 2 runs, with no refusal anywhere. The participant section IS
+thread-exclusive (measured), so `begin()` and a commit never interleave -- but searches and scans pin
+pages OUTSIDE any section, and the pool's doors were sequences of dictionary steps that were
+individually atomic and jointly not: a reader's eviction between a writer's lookup and its pin
+handed the same page out twice as two objects; the writer's entry landed in the orphan and was
+never written back. Silent loss.
+
+**Fix (C1 + C11):** `BufferPool(guard=...)` -- a re-entrant lock INJECTED by the composition root
+(the pure core imports no mechanism; the default is a no-op context), every door decorated
+`@_guarded`; `pinned()` runs its body outside the guard (A91). Measured: 0 findings in 3/3 runs.
+
+**Second half, surfaced by the first:** with the guard in place a reader's pin made the writer's
+`begin()` REFUSE (`begin_read_view` -> `invalidate` -> "pinned and cannot be invalidated"). A read
+view now DOOMS a pinned frame instead: it leaves the table so the next pin reads the device, the
+holder releases exactly the object it pinned (`unpin(page=)`), the last release drops it
+unwritten; explicit `invalidate()` keeps refusing. Tests: `test_every_door_of_the_pool_runs_under_
+the_injected_guard`, `test_a_read_view_dooms_a_pinned_frame_instead_of_refusing_the_begin`, and the
+probabilistic `tests/api/test_vector_concurrency.py` thread test (now with the writer's refusals
+recorded in the assertion message).
+
+Also closed on the way: the P4 window's INDEX half -- a commit whose apply fails after the barrier
+is REDONE from the log (`_recover_post_barrier`: drop the index staging, redo WRITE_PAGE and
+INDEX_WRITE records of this commit through the idempotent doors, publish; failing that, mark the
+covering indexes stale). Test `test_a_commit_whose_index_apply_fails_after_the_barrier_is_redone_
+from_the_log`; reverted: `assert 0 == 2`.

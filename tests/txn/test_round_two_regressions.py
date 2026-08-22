@@ -312,3 +312,70 @@ def test_validation_refuses_rather_than_reading_a_log_a_checkpoint_recycled(
     with pytest.raises(GrafxWriteConflict) as refusal:
         p1.manager.commit(stale)
     assert "lowest_retained_lsn" in refusal.value.details
+
+
+# --- the P4 window, index half: a commit refused after the barrier is redone, not left behind ----
+
+
+def test_a_commit_whose_index_apply_fails_after_the_barrier_is_redone_from_the_log(
+    tmp_path: Path,
+) -> None:
+    """The index apply raises once, post-barrier. The rows are durable; the index must not lag.
+
+    Left to a later commit's publication, the rows became visible with no index entry behind
+    them -- a lookup answering fewer rows than exist, and ``verify()`` reporting
+    ``index_entry_missing``. The commit is redone from the log through the idempotent doors
+    recovery uses, and published.
+    """
+    root = tmp_path / "db"
+    clock = ManualClock()
+    base = build_stack(root, clock=clock, wal_factory=_real_wal(1 << 20), owner_id="p4")
+    blown = {"left": 1}
+
+    class RefusingOnce(IndexManager):
+        """The real manager, whose first commit-time apply refuses after the barrier."""
+
+        def commit(self, txn: object, csn: object) -> int:
+            if blown["left"]:
+                blown["left"] -= 1
+                raise GrafxError("simulated post-barrier failure of the index apply")
+            return super().commit(txn, csn)
+
+    indexes = RefusingOnce(base.pool, base.heap, base.metrics)
+    manager = TransactionManager(
+        base.wal, base.pool, base.heap, base.catalog, base.coordinator, base.clock,
+        base.metrics, indexes, partitions_per_table=8, commit_lock_timeout=5.0,
+    )
+    table = _registered(base, _table())
+    index = indexes.register(
+        ProximityIndex(
+            IndexDefinition(
+                name="p_prox", table_id=table.table_id, table_name=table.name,
+                positions=(0,), visibility=IndexVisibility.PROXIMITY,
+            ),
+            base.pool, base.metrics,
+        )
+    )
+    txn = manager.begin("write")
+    txn.stage_row_insert(table, (1, "a"))
+    txn.stage_row_insert(table, (2, "b"))
+    txn.note_write(manager.partition_of(1, b"1"))
+    txn.note_write(manager.partition_of(1, b"2"))
+    with pytest.raises(GrafxError) as refusal:
+        manager.commit(txn)
+    assert refusal.value.details.get("committed") is True or "committed" in refusal.value.message
+
+    # Durable AND applied: both entries are live in the index, the state is published, and the
+    # verifier agrees on the whole database.
+    assert sum(1 for entry in index.walk() if not entry.dead_csn) == 2
+    assert manager.published_lsn() >= 1
+    verifier = Verifier(
+        base.pool, base.metrics, heap=base.heap, catalog=base.catalog, indexes=indexes.indexes()
+    )
+    assert verifier.verify("all").findings == ()
+    # And the next commit is ordinary.
+    later = manager.begin("write")
+    later.stage_row_insert(table, (3, "c"))
+    later.note_write(manager.partition_of(1, b"3"))
+    manager.commit(later)
+    assert sum(1 for entry in index.walk() if not entry.dead_csn) == 3

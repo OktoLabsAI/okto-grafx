@@ -645,9 +645,17 @@ class TransactionManager:
         were installed.
         """
         installed = 0
+        manager = self._index_manager
         for record in self._wal.read_from(checkpoint + 1):
             if record.lsn > through:
                 break
+            if record.record_type == WalRecordType.INDEX_WRITE:
+                # The index half of the same redo: C7's apply is idempotent by construction, so a
+                # record already applied by the commit changes nothing and one the commit never
+                # reached lands now.
+                if manager is not None and manager.apply(record):
+                    installed += 1
+                continue
             if record.record_type != WalRecordType.WRITE_PAGE:
                 continue
             write = decode_page_write(record.payload)
@@ -785,6 +793,7 @@ class TransactionManager:
                             self._publish_commit_state(current, committed)   # step 3.7
                         except GrafxError as failure:
                             post_barrier_failure = failure
+                            self._recover_post_barrier(txn, current, committed, rows)
             except BaseException:
                 self._drop_lease(lease)
                 raise
@@ -1106,6 +1115,51 @@ class TransactionManager:
                 expected=expected,
                 produced=produced,
             )
+
+    def _recover_post_barrier(
+        self,
+        txn: TransactionContext,
+        previous: Lsn,
+        committed: Csn,
+        rows: Sequence[_RowWrite],
+    ) -> None:
+        """Close the P4 window for THIS commit as far as it can be closed from here.
+
+        The commit is durable: the barrier returned. What failed is the apply -- page images,
+        index changes, or the publication -- and left to a later commit's publication, the rows
+        would become visible with the index behind them: a lookup answering fewer rows than exist,
+        which is the wrong answer this component's index seam exists to prevent (found by the
+        thread-concurrency test under suite load: ``index_entry_missing`` after a commit refused
+        post-barrier with a retryable budget error).
+
+        So the commit is REDONE from the log through the idempotent doors recovery uses -- page
+        images and index records alike -- and published. Only if the redo itself fails are the
+        indexes that cover this commit's tables marked STALE, durably: a lookup then refuses
+        until a rebuild, which is honest where a short answer is not. Nothing here raises; the
+        failure that got us here is the one the caller reports.
+        """
+        try:
+            self._drop_index_changes(txn)
+            self._redo_onto_device(previous, committed)
+            self._publish_commit_state(previous, committed)
+            return
+        except GrafxError:
+            pass
+        manager = self._index_manager
+        if manager is None:
+            return
+        tables = {getattr(row.table, "table_id", None) for row in rows}
+        for table_id in tables:
+            if table_id is None:
+                continue
+            for index in manager.indexes_for(table_id):
+                try:
+                    index.mark_stale(
+                        f"commit {committed} was durable but could not be applied to this index "
+                        f"and the redo from the log failed too"
+                    )
+                except GrafxError:
+                    continue
 
     def _apply_index_changes(self, txn: TransactionContext, csn: Csn) -> int:
         """Apply what this transaction staged into the indexes, and return how many moved.

@@ -1364,3 +1364,73 @@ def test_an_empty_payload_still_gets_one_image() -> None:
     for index, image in images:
         apply_page_image(pool, FILE, index, _later(pool, image))
     assert read_chain(pool, FILE, images[0][0]) == b""
+
+
+# --- threads of one participant: the guard, and frames doomed by a read view ---------------------
+
+
+def test_every_door_of_the_pool_runs_under_the_injected_guard() -> None:
+    """The pool imports no mechanism; the composition root hands the lock in. Every door enters it.
+
+    The doors are sequences of dictionary steps that are individually atomic and jointly not: a
+    reader's eviction between a writer's lookup and its pin handed the same page out twice as two
+    objects, and the writer's change landed in the orphan -- an index entry lost with nobody
+    refused. The guard is what makes the doors atomic against each other.
+    """
+    entered = {"n": 0}
+
+    class CountingGuard:
+        def __enter__(self) -> None:
+            entered["n"] += 1
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+    device = MemoryDevice()
+    pool = BufferPool(
+        device,
+        PageCodecV1(device.page_size),
+        RecordingMetrics(),
+        budget_bytes=device.page_size * 4,
+        db_label="guarded",
+        guard=CountingGuard(),
+    )
+    seed_pages(pool, 2)
+    before = entered["n"]
+    pool.pin(FILE, 0)
+    pool.is_resident(FILE, 0)
+    pool.pin_count(FILE, 0)
+    pool.unpin(FILE, 0)
+    pool.flush()
+    pool.begin_read_view("t1")
+    pool.discard(FILE, 1)
+    assert entered["n"] - before >= 7
+
+
+def test_a_read_view_dooms_a_pinned_frame_instead_of_refusing_the_begin() -> None:
+    """A searching thread holds a page pinned while another thread's begin() takes a read view.
+
+    Refusing failed that begin -- and every thread's next begin -- for as long as anyone was
+    reading, which turned a concurrent reader into a writer's refusal. The pinned frame is
+    DOOMED instead: it leaves the table so the next pin reads the device, the holder keeps its
+    object and releases exactly that object, and the last release drops it unwritten.
+    """
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics(), budget_pages=4)
+    seed_pages(pool, 2)
+    held = pool.pin(FILE, 0)  # a reader, outside any section
+    assert pool.begin_read_view("another participant committed") is True
+    # The frame left the table; the holder's object is still the holder's.
+    assert not pool.is_resident(FILE, 0)
+    fresh = pool.pin(FILE, 0)  # the next pin reads the device into a NEW frame
+    assert fresh is not held
+    assert pool.pin_count(FILE, 0) == 1
+    pool.unpin(FILE, 0, page=held)  # releases the doomed one, not the fresh one
+    assert pool.pin_count(FILE, 0) == 1
+    pool.unpin(FILE, 0, page=fresh)
+    assert pool.pin_count(FILE, 0) == 0
+    # And an explicit invalidate still refuses over a pinned page: its callers mean it.
+    pool.pin(FILE, 1)
+    with pytest.raises(GrafxUnsupportedOperation):
+        pool.invalidate()
+    pool.unpin(FILE, 1)

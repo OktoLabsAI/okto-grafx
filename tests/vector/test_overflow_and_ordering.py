@@ -447,3 +447,41 @@ def test_a_search_finishes_on_the_picture_it_started_with_when_the_graph_is_disc
     assert result.regime == "approximate"
     assert result.achieved_k == 8
     assert calls["n"] >= 1
+
+
+def test_a_node_has_its_entry_before_the_graph_can_reach_it(
+    metrics: RecordingMetrics, clock: StepClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deterministic half of C9 round-3 B5: the entry is registered BEFORE ``graph.insert``.
+
+    ``graph.insert`` links the node into the connectivity chain; from that instant a traversal on
+    another thread can reach it and ask for its entry. Registering after the insert left a window
+    in which a reachable node had no entry -- a bare ``KeyError`` out of the section 8.8 door --
+    and that window is the thread test's probabilistic catch. Here the graph class itself is
+    instrumented: inside ``insert``, before linking, the entry must already be there.
+    """
+    from okto_grafx.domain.vector.hnsw import HnswGraph
+    from okto_grafx.engine import vector_engine as engine_module
+
+    observed: list[bool] = []
+    owner: dict[str, object] = {}
+
+    class ObservingGraph(HnswGraph):
+        def insert(self, node: int, components: object) -> None:  # type: ignore[override]
+            index = owner.get("index")
+            if index is not None:
+                observed.append(node in index._entry_of_node)  # noqa: SLF001 - the ordering
+            return super().insert(node, components)
+
+    monkeypatch.setattr(engine_module, "HnswGraph", ObservingGraph)
+    database = VectorFixture(metrics=metrics, clock=clock, exact_scan_threshold=0)
+    space = database.create_space(
+        "space", 3, metric=DistanceMetric.DOT, storage_dtype="float64"
+    )
+    table = database.create_table("Chunk", "space")
+    database.insert_row(table, 1, 0, space, (1.0, 1.0, 1.0), csn=10)
+    index = database.engine.index("space")
+    index.graph()  # warm: the next insert goes through the live graph's insert
+    owner["index"] = index
+    database.insert_row(table, 2, 0, space, (2.0, 1.0, 1.0), csn=11)
+    assert observed == [True], observed

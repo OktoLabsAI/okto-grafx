@@ -6,6 +6,7 @@ through the statement's own report (LESSONS L16, L23). The shapes are the critic
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -194,5 +195,144 @@ def test_a_zero_hop_pattern_is_refused_at_the_door(fan: str) -> None:
     try:
         with pytest.raises(GrafxParseError):
             handle.execute("MATCH (x:P {id: 1})-[:R*0..1]->(y:P) RETURN y.id")
+    finally:
+        handle.close()
+
+
+# --- the ended-row rule holds on every read path, not only the scan -----------------------------
+
+
+def test_a_row_this_transaction_deleted_is_invisible_through_a_traversal_too(fan: str) -> None:
+    """The scan learned to skip rows this transaction ended; the traversal's landing and the
+    index seek are the other two read paths, and a rule that holds on one of three is a rule a
+    caller finds by accident. Delete node 2, then traverse from 1: 2 is not a landing any more."""
+    handle = okto_grafx.connect(fan)
+    try:
+        with handle.begin("write") as txn:
+            txn.execute("MATCH (y:P {id: 2}) DELETE y")
+            rows = txn.execute("MATCH (x:P {id: 1})-[:R]->(y:P) RETURN y.id").rows
+            assert sorted(rows) == [(3,)]
+    finally:
+        handle.close()
+    assert [row[0] for row in _live(fan)] == [1, 3]
+
+
+def test_a_match_after_a_delete_in_the_same_transaction_does_not_return_the_row(path: str) -> None:
+    """The read-side half of the ended-row rule, pinned on its own.
+
+    The write-side half (a later bulk SET must not resurrect the row) is also held by the
+    transaction manager's settle, so a test of the outcome cannot tell the two lines apart. A
+    RETURN inside the transaction has no second line: if the scan hands out the deleted row, the
+    caller sees a row it has just asked to be rid of.
+    """
+    _write(path, "CREATE (:P {id: 1, a: 0})", "CREATE (:P {id: 2, a: 0})")
+    handle = okto_grafx.connect(path)
+    try:
+        with handle.begin("write") as txn:
+            txn.execute("MATCH (n:P {id: 1}) DELETE n")
+            assert sorted(txn.execute("MATCH (n:P) RETURN n.id").rows) == [(2,)]
+    finally:
+        handle.close()
+    assert [row[0] for row in _live(path)] == [2]
+
+
+def test_a_set_that_moves_a_statement_created_row_onto_a_taken_key_is_refused(path: str) -> None:
+    """The key check on the rewrite of a held insert, pinned on its own (round-3 survivor R01).
+
+    MERGE creates row 1 in this statement; the SET in the same statement moves it onto key 5,
+    which another row already holds. Without the check inside ``_rewrite_held_insert`` two live
+    rows commit under primary key 5.
+    """
+    _write(path, "CREATE (:P {id: 5, a: 0})")
+    handle = okto_grafx.connect(path)
+    try:
+        with handle.begin("write") as txn:
+            with pytest.raises(GrafxQueryError) as refusal:
+                txn.execute("MERGE (a:P {id: 1}) SET a.id = 5")
+            assert refusal.value.details["constraint"] == "primary_key"
+    finally:
+        handle.close()
+    assert [row[0] for row in _live(path)] == [5]
+
+
+# --- round 3, B1: a refused statement leaves NOTHING staged, on every shape ---------------------
+
+
+@pytest.mark.parametrize(
+    ("statement", "expected"),
+    [
+        ("MERGE (n:P {id: 9}) DELETE n", [1, 2]),
+        ("CREATE (n:P {id: 9}) DELETE n", [1, 2]),
+        ("MATCH (m:P {id: 2}) MERGE (n:P {id: 9}) DELETE m, n", [1]),
+    ],
+    ids=["merge-delete", "create-delete", "match-merge-delete-both"],
+)
+def test_deleting_a_row_the_statement_created_creates_nothing_and_loses_nothing(
+    path: str, statement: str, expected: list[int]
+) -> None:
+    """Creating a row and deleting it in one statement is creating nothing.
+
+    The delete of a statement-created row used to reach the transaction's door with no
+    reference and be refused THERE, after the statement's other rows were already staged. A
+    commit after the refusal made the rest durable: a refused DELETE that deleted row 2, a refused
+    MERGE that created row 9. Now the held insert is simply taken back, the statement succeeds,
+    and what it says happened is what happened.
+    """
+    _write(path, "CREATE (:P {id: 1, a: 0})", "CREATE (:P {id: 2, a: 0})")
+    _write(path, statement)
+    assert [row[0] for row in _live(path)] == expected
+
+
+def test_a_refusal_while_handing_held_rows_to_the_transaction_unwinds_all_of_them(
+    path: str,
+) -> None:
+    """The second line: release() is all-or-nothing on the transaction itself.
+
+    Driven through a row the engine cannot take back -- a delete of a row created by an EARLIER
+    statement, which is refused with a typed error -- the statement's other held rows must not
+    reach the transaction, and a commit afterwards must not carry them.
+    """
+    from okto_grafx.domain.errors import GrafxUnsupportedOperation
+
+    _write(path, "CREATE (:P {id: 1, a: 0})", "CREATE (:P {id: 2, a: 0})")
+    handle = okto_grafx.connect(path)
+    try:
+        with handle.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 9, a: 0})")
+            with pytest.raises(GrafxUnsupportedOperation):
+                txn.execute("MATCH (m:P {id: 2}) MERGE (n:P {id: 9}) DELETE m, n")
+    finally:
+        handle.close()
+    # Row 9 was committed by its own statement; row 2 survived the refused one.
+    assert [row[0] for row in _live(path)] == [1, 2, 9]
+
+
+def test_a_merge_matched_row_this_transaction_updated_can_be_set_and_deleted(path: str) -> None:
+    """A row the transaction already updated comes back from MERGE WITH its reference."""
+    _write(path, "CREATE (:P {id: 1, a: 0})")
+    _write(path, "MATCH (n:P {id: 1}) SET n.a = 5", "MERGE (n:P {id: 1}) SET n.b = 7")
+    assert _live(path) == [(1, 5, 7, None)]
+    _write(path, "MATCH (n:P {id: 1}) SET n.a = 6", "MERGE (n:P {id: 1}) DELETE n")
+    assert _live(path) == []
+
+
+# --- round 3, B2: the held insert is identified by the binding, never by its values --------------
+
+
+def test_two_created_rows_with_identical_values_are_set_independently(tmp_path: Path) -> None:
+    """A node table without a primary key can hold two identical rows; SET must hit the right one."""
+    root = str(tmp_path / "nopk")
+    handle = okto_grafx.connect(root)
+    try:
+        with handle.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE T(x INT64, y INT64)")
+        with handle.begin("write") as txn:
+            txn.execute("CREATE (a:T {x: 1}), (b:T {x: 1}) SET a.x = 2 SET a.y = 5")
+        rows = handle.execute("MATCH (t:T) RETURN t.x, t.y").rows
+        assert Counter(rows) == Counter([(1, None), (2, 5)])
+        with handle.begin("write") as txn:
+            txn.execute("CREATE (a:T {x: 8}), (b:T {x: 8}) SET a.y = 5 SET a.y = 7")
+        rows = handle.execute("MATCH (t:T) WHERE t.x = 8 RETURN t.x, t.y").rows
+        assert Counter(rows) == Counter([(8, None), (8, 7)])
     finally:
         handle.close()

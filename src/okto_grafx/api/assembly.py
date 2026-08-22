@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import uuid
 from collections.abc import Callable
 from typing import TypeVar, cast
@@ -195,6 +196,12 @@ def assemble_database(
             metrics,
             budget_bytes=config.buffer_budget_bytes,
             db_label=label,
+            # The pool is reached by every thread of this participant -- a commit applying pages
+            # in the participant section, searches and scans pinning outside it -- and its doors
+            # must be atomic against each other. The lock is mechanism, so it is handed in here
+            # rather than imported by the pool (the pure core imports none), and it is
+            # re-entrant because a checkpoint flushes and an invalidation writes back.
+            guard=threading.RLock(),
         )
         identity = _open_identity(config, pool, clock)
 

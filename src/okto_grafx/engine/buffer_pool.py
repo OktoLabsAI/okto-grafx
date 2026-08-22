@@ -16,8 +16,9 @@ declared corrupt and the location is named.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Iterator
-from contextlib import AbstractContextManager, contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from functools import wraps
 
 from okto_grafx.domain.errors import (
     GrafxBufferBudgetExceeded,
@@ -153,11 +154,39 @@ def next_seq(seq: int) -> int:
 class _Frame:
     """One resident page together with how many callers currently hold it pinned."""
 
-    __slots__ = ("page", "pins")
+    __slots__ = ("page", "pins", "doomed")
 
     def __init__(self, page: Page) -> None:
         self.page: Page = page
         self.pins: int = 0
+        self.doomed: bool = False
+
+
+def _guarded(method: Callable[..., object]) -> Callable[..., object]:
+    """Run one pool door under the pool's guard.
+
+    The pool is process-wide state that several threads of one participant reach at once -- a
+    commit applying pages in the participant section, and searches and scans pinning pages
+    outside any section (SPEC-M1 FR-3 names N threads). Its doors were sequences of dictionary
+    steps that were individually atomic and jointly not: a reader's eviction could take a frame
+    between a writer's lookup and its pin, hand the same page out twice as two objects, and the
+    writer's entry landed in the orphan -- an index entry lost with nobody refused (found by the
+    thread-concurrency test under suite load: ``index_entry_missing``, no error anywhere).
+
+    The guard is INJECTED, not created here: the pure core imports no mechanism, so the
+    composition root hands in the re-entrant lock and the default is a no-op context. The body
+    of ``pinned()`` runs outside the guard -- only the pin and the unpin are inside -- so a
+    caller working with a page never holds the pool's lock, and no host code ever runs under it
+    (A91).
+    """
+
+    @wraps(method)
+    def wrapper(self: object, *args: object, **kwargs: object) -> object:
+        """Enter the pool's guard, run the door, leave the guard."""
+        with self._guard:  # type: ignore[attr-defined]
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class BufferPool:
@@ -169,6 +198,8 @@ class BufferPool:
         "_metrics",
         "_budget_bytes",
         "_db_label",
+        "_guard",
+        "_doomed",
         "_page_size",
         "_frames",
         "_labels",
@@ -188,12 +219,17 @@ class BufferPool:
         *,
         budget_bytes: int,
         db_label: str,
+        guard: AbstractContextManager[object] | None = None,
     ) -> None:
         """Build a pool over one device, with its own budget and its own metric label."""
         self._storage: StorageDevice = storage
         self._codec: PageCodec = codec
         self._metrics: MetricsSink = metrics
         self._page_size: int = validate_page_size(storage.page_size)
+        self._guard: AbstractContextManager[object] = (
+            nullcontext() if guard is None else guard
+        )
+        self._doomed: dict[tuple[str, PageIndex], list[_Frame]] = {}
         self._budget_bytes: int = _validate_budget(budget_bytes, self._page_size)
         self._db_label: str = _validate_db_label(db_label)
         self._frames: OrderedDict[tuple[str, PageIndex], _Frame] = OrderedDict()
@@ -314,10 +350,12 @@ class BufferPool:
         """Return the bytes currently resident in this pool."""
         return len(self._frames) * self._page_size
 
+    @_guarded
     def is_resident(self, file: str, page_index: PageIndex) -> bool:
         """Return True when the page is currently cached by this pool."""
         return (file, page_index) in self._frames
 
+    @_guarded
     def pin_count(self, file: str, page_index: PageIndex) -> int:
         """Return how many callers hold the page pinned; zero when it is not resident."""
         frame = self._frames.get((file, page_index))
@@ -325,6 +363,7 @@ class BufferPool:
 
     # --- the four operations -----------------------------------------------------------------
 
+    @_guarded
     def pin(self, file: str, page_index: PageIndex) -> Page:
         """Return the page, reading it from the device when it is not resident, and pin it.
 
@@ -346,15 +385,38 @@ class BufferPool:
         self._report_usage()
         return page
 
-    def unpin(self, file: str, page_index: PageIndex, *, dirty: bool = False) -> None:
+    @_guarded
+    def unpin(
+        self, file: str, page_index: PageIndex, *, dirty: bool = False, page: Page | None = None
+    ) -> None:
         """Release one pin on the page, marking it dirty when the caller changed it.
 
         A page also remembers on its own that it was mutated, so a caller that forgets the flag
         still cannot lose a write; passing it is how a caller says so explicitly.
+
+        ``page`` names the object the caller pinned. While it was held, a read view may have
+        DOOMED its frame -- another participant committed and this frame is no longer what the
+        name holds on the device -- and a fresh frame may stand under the same key. The holder
+        releases the doomed one; the last release drops it, unwritten (a doomed frame is a
+        reader's, and clean: a writer's pins happen inside the participant section that read
+        views are taken in, so the two never overlap).
         """
         _require_page_index("page_index", page_index)
         key = (file, page_index)
         frame = self._frames.get(key)
+        if page is not None and (frame is None or frame.page is not page):
+            doomed = self._doomed.get(key, [])
+            for position, candidate in enumerate(doomed):
+                if candidate.page is page:
+                    candidate.pins -= 1
+                    if candidate.pins <= 0:
+                        if candidate.page.dirty:
+                            self._write_back(file, page_index, candidate.page)
+                        del doomed[position]
+                        if not doomed:
+                            del self._doomed[key]
+                        self._bump_drop_epoch(file)
+                    return
         if frame is None:
             raise GrafxUnsupportedOperation(
                 f"Page {page_index} of {file!r} is not resident, so it cannot be unpinned.",
@@ -382,9 +444,12 @@ class BufferPool:
             yield page
         finally:
             # The page carries its own dirty flag, so an exception in the body cannot lose a
-            # change that had already been applied to it.
-            self.unpin(file, page_index, dirty=page.dirty)
+            # change that had already been applied to it. The OBJECT is named, because a read
+            # view taken while this page was pinned may have doomed the frame and a fresh one
+            # may now stand under the same key.
+            self.unpin(file, page_index, dirty=page.dirty, page=page)
 
+    @_guarded
     def allocate(self, file: str, page_type: int) -> Page:
         """Grow the file by one page and return it pinned, empty and of the requested type.
 
@@ -416,6 +481,7 @@ class BufferPool:
         self._report_usage()
         return page
 
+    @_guarded
     def flush(self, file: str | None = None) -> int:
         """Write every dirty page of the file, or of the whole pool, and return how many.
 
@@ -434,6 +500,7 @@ class BufferPool:
             written += 1
         return written
 
+    @_guarded
     def checkpoint(self, file: str | None = None) -> int:
         """Flush the dirty pages and put them on the platter, returning how many were written.
 
@@ -461,6 +528,7 @@ class BufferPool:
                 self._metrics.increment(BARRIER_FAILURES_TOTAL, 1.0, None)
             raise
 
+    @_guarded
     def begin_read_view(self, token: object = None) -> bool:
         """Start a fresh read view over this database, and say whether anything was dropped.
 
@@ -490,9 +558,10 @@ class BufferPool:
         if token is not None and token == self._read_view_token:
             return False
         self._read_view_token = token
-        self.invalidate()
+        self._invalidate(None, doom_pinned=True)
         return True
 
+    @_guarded
     def discard(self, file: str, page_index: PageIndex) -> bool:
         """Forget one resident page WITHOUT writing it back, and say whether a frame was dropped.
 
@@ -510,6 +579,8 @@ class BufferPool:
         and the holder keeps a page whose abandoned versions the restamp has already made
         invisible. Returns True when the frame was actually dropped.
         """
+        for doomed in self._doomed.pop((file, page_index), ()):
+            doomed.page.dirty = False  # an abandoned attempt's bytes, never written back
         frame = self._frames.get((file, page_index))
         if frame is None:
             return False
@@ -521,6 +592,7 @@ class BufferPool:
         self._report_usage()
         return True
 
+    @_guarded
     def invalidate(self, file: str | None = None) -> None:
         """Drop the cached pages of the file, or of the whole pool, forcing a re-read.
 
@@ -529,21 +601,40 @@ class BufferPool:
         all, because its holder still has the object in its hands, and the refusal comes before
         anything is dropped, so a pool that refuses to invalidate is left exactly as it was.
         """
+        self._invalidate(file, doom_pinned=False)
+
+    def _invalidate(self, file: str | None, *, doom_pinned: bool) -> None:
+        """Forget cached pages; refuse a pinned one, or DOOM it, as the caller decided.
+
+        A read view is the caller that dooms. It is taken at ``begin()``, inside the participant
+        section, and a searching or scanning thread of the same participant may be holding a
+        page pinned outside any section at that moment. Refusing would fail that ``begin`` --
+        and every thread's next ``begin`` -- for as long as anyone is reading, which turned a
+        concurrent reader into a writer's refusal. Dooming keeps the holder's object for the
+        holder alone: the frame leaves the table so the next pin reads the device, and the last
+        release drops it. Explicit ``invalidate`` keeps refusing, because its callers mean it.
+        """
         targets = [
             (key, frame)
             for key, frame in self._frames.items()
             if file is None or key[0] == file
         ]
+        if not doom_pinned:
+            for (name, page_index), frame in targets:
+                if frame.pins:
+                    raise GrafxUnsupportedOperation(
+                        f"Page {page_index} of {name!r} is pinned {frame.pins} times and cannot "
+                        f"be invalidated.",
+                        file=name,
+                        page=page_index,
+                        pins=frame.pins,
+                    )
         for (name, page_index), frame in targets:
             if frame.pins:
-                raise GrafxUnsupportedOperation(
-                    f"Page {page_index} of {name!r} is pinned {frame.pins} times and cannot be "
-                    f"invalidated.",
-                    file=name,
-                    page=page_index,
-                    pins=frame.pins,
-                )
-        for (name, page_index), frame in targets:
+                frame.doomed = True
+                self._doomed.setdefault((name, page_index), []).append(frame)
+                del self._frames[(name, page_index)]
+                continue
             if frame.page.dirty:
                 self._write_back(name, page_index, frame.page)
             del self._frames[(name, page_index)]
