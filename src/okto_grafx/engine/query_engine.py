@@ -316,11 +316,27 @@ class _Context:
         self.staged_partitions.append((table.table_id, key))
 
     def hold_update(
-        self, table: TableDef, reference: object, values: tuple[Value, ...], key: bytes
+        self,
+        table: TableDef,
+        reference: object,
+        values: tuple[Value, ...],
+        key: bytes,
+        *,
+        previous_keys: Sequence[bytes] = (),
     ) -> None:
-        """Hold a new version of an existing row under the same statement discipline."""
+        """Hold a new version of an existing row under the same statement discipline.
+
+        ``previous_keys`` are the partition keys of the versions this update REPLACES. An update
+        that changes the primary key used to declare only the new key's partition, so a
+        concurrent writer of the same row -- which conflicts on the OLD key -- passed optimistic
+        validation, and the heap refused it inside the commit section instead (C10 round-2 B2).
+        Declaring both makes the two commits meet where step 3.3 can see them.
+        """
         self.staged_rows.append(_HeldRow(_HELD_UPDATE, table, values, None, reference))
         self.staged_partitions.append((table.table_id, key))
+        for previous in previous_keys:
+            if previous != key:
+                self.staged_partitions.append((table.table_id, previous))
 
     def hold_delete(self, table: TableDef, reference: object, key: bytes) -> None:
         """Hold the end of an existing row under the same statement discipline."""
@@ -766,8 +782,15 @@ def _node_scan(
 ) -> Iterator[_Row]:
     """Produce one row per visible version of the table, per incoming row."""
     snapshot = context.snapshot
+    ended = _ended_by_this_transaction(context)
     for row in engine._rows(node.child, context):
         for ref, version in engine.heap.scan(node.table, snapshot):
+            if ref in ended:
+                # The snapshot still shows it -- its end stamp is the commit number, which does
+                # not exist yet -- but this transaction has already said it wants the row gone.
+                # Matching it again let a later bulk SET stage an update that the settle then
+                # let win over the delete: an acknowledged delete silently lost (C10 round-2 B3).
+                continue
             bindings = dict(row.bindings)
             bindings[node.variable] = RowBinding(
                 variable=node.variable, table=node.table, ref=ref, version=version
@@ -1356,25 +1379,84 @@ def _write_assignments(
     projects the values the statement matched. That is openCypher's rule: the projection reads
     the row as the statement saw it, and the new version becomes visible at the commit number.
     """
-    updated: dict[str, tuple[RowBinding, list[Value]]] = {}
+    # Keyed by the stored ROW, not by the variable: `MATCH (n {id:1}), (m {id:1}) SET n.a = 1,
+    # m.b = 2` names one row twice, and one version per variable made the last one win (C10
+    # round-2 B4). The base is this transaction's latest staged version of the row, else the
+    # snapshot's, so a second SET clause -- or a second statement -- builds on the first.
+    updated: dict[object, tuple[RowBinding, list[Value]]] = {}
     for assignment in node.assignments:
         binding, position, value = _prepare_assignment(engine, assignment, row, context)
-        held = updated.get(binding.variable)
+        row_key = binding.ref if binding.ref is not None else ("pending", id(binding.version))
+        held = updated.get(row_key)
         if held is None:
             held = (binding, list(_current_values(context, binding)))
-            updated[binding.variable] = held
+            updated[row_key] = held
         held[1][position] = value
     for binding, values in updated.values():
         settled = tuple(values)
+        if binding.ref is None:
+            # A row THIS statement created (MERGE ... SET, CREATE ... SET): there is no stored
+            # version to replace, so the held insert itself is rewritten. Checking the new key
+            # against the statement's own held copy of the row would refuse the row for being
+            # itself, which is what happened (C10 round-2 B5, the MERGE-then-SET shape).
+            _rewrite_held_insert(engine, context, binding, settled)
+            context.count("properties_set", len(node.assignments))
+            context.count("rows_updated")
+            continue
         _require_unique_primary_key(
             engine, binding.table, settled, context, replacing=binding.ref
         )
+        previous_keys = [_partition_key(binding.table, binding.version.values)]
+        current = _current_values(context, binding)
+        if current != binding.version.values:
+            previous_keys.append(_partition_key(binding.table, current))
         context.hold_update(
-            binding.table, binding.ref, settled, _partition_key(binding.table, settled)
+            binding.table,
+            binding.ref,
+            settled,
+            _partition_key(binding.table, settled),
+            previous_keys=previous_keys,
         )
         context.count("properties_set", len(node.assignments))
         context.count("rows_updated")
     return row
+
+
+def _rewrite_held_insert(
+    engine: QueryEngine, context: _Context, binding: RowBinding, settled: tuple[Value, ...]
+) -> None:
+    """Replace the values of a row this statement holds as an insert, keeping it an insert.
+
+    The held copy is taken out before the key check runs, so the check compares the new values
+    against everything EXCEPT the row being rewritten, and is put back rewritten afterwards. The
+    partition of the new key is declared beside the old one, for the same reason an update
+    declares both.
+    """
+    for position, held in enumerate(context.staged_rows):
+        if (
+            held.operation is _HELD_INSERT
+            and held.table.table_id == binding.table.table_id
+            and held.values == binding.version.values
+        ):
+            del context.staged_rows[position]
+            try:
+                _require_unique_primary_key(engine, binding.table, settled, context)
+            except GrafxError:
+                context.staged_rows.insert(position, held)
+                raise
+            context.staged_rows.insert(
+                position, _HeldRow(_HELD_INSERT, held.table, settled, held.identity, None)
+            )
+            new_key = _partition_key(binding.table, settled)
+            if (binding.table.table_id, new_key) not in context.staged_partitions:
+                context.staged_partitions.append((binding.table.table_id, new_key))
+            return
+    raise GrafxPlanError(
+        f"SET names {binding.variable!r}, a row this statement created, but the statement no "
+        f"longer holds it.",
+        field="variable",
+        value=binding.variable,
+    )
 
 
 def _write_deletions(node: DeleteEntities, row: _Row, context: _Context) -> _Row:
@@ -1518,6 +1600,57 @@ def _pending_binding(variable: str, table: TableDef, values: tuple[Value, ...]) 
     )
 
 
+def _transaction_row_view(
+    context: _Context, table: TableDef
+) -> tuple[dict[object, tuple[Value, ...] | None], list[tuple[Value, ...]]]:
+    """Return what this transaction has done to each stored row of a table, in order, settled.
+
+    Two things come back. ``state`` maps the reference of every stored row this transaction
+    touched to the values it now holds -- or to None when the transaction ended it. ``inserted``
+    lists the rows it created, which name no stored row yet. Earlier statements' intents come
+    first and this statement's held rows after, so the LAST thing said about a row is what the
+    view reports: an update after an update builds on the first, a delete after an update ends
+    the row, and an update after a delete does not resurrect it (the row cannot be matched once
+    ended, see :func:`_node_scan`).
+
+    Every question of the form "what exists, as far as this transaction is concerned" must be
+    answered from this one view. Three separate readers used to answer it three different ways:
+    MERGE matched a version this transaction had already replaced, the primary-key check refused
+    a key the transaction had just freed by changing it, and a bulk SET resurrected a row the
+    transaction had deleted (C10 round-2 B3, B4, B5).
+    """
+    state: dict[object, tuple[Value, ...] | None] = {}
+    inserted: list[tuple[Value, ...]] = []
+
+    def note(operation: str, reference: object, values: object) -> None:
+        """Fold one staged change into the view, in the order the transaction made it."""
+        if reference is None:
+            if values:
+                inserted.append(tuple(values))  # type: ignore[arg-type]
+            return
+        if operation == "DELETE":
+            state[reference] = None
+        elif reference in state and state[reference] is None:
+            return  # ended already: a later update does not bring the row back
+        elif values is not None:
+            state[reference] = tuple(values)  # type: ignore[arg-type]
+
+    for intent in getattr(context.txn, "row_intents", ()):
+        intent_table = getattr(intent, "table", None)
+        if getattr(intent_table, "table_id", None) != table.table_id:
+            continue
+        operation = getattr(getattr(intent, "operation", None), "name", "INSERT")
+        note(operation, getattr(intent, "reference", None), getattr(intent, "values", None))
+    for held in context.staged_rows:
+        if held.table.table_id != table.table_id:
+            continue
+        operation = {_HELD_INSERT: "INSERT", _HELD_UPDATE: "UPDATE", _HELD_DELETE: "DELETE"}[
+            held.operation
+        ]
+        note(operation, held.reference, held.values)
+    return state, inserted
+
+
 def _require_unique_primary_key(
     engine: QueryEngine,
     table: TableDef,
@@ -1552,15 +1685,18 @@ def _require_unique_primary_key(
     for other in also:
         if _equal(other[position], key):
             raise _duplicate_key(table, key)
-    for reference, pending in _uncommitted_rows_with_refs(context, table):
-        if replacing is not None and reference is not None and reference == replacing:
-            continue  # an earlier statement's update of this very row is not another row
+    state, inserted = _transaction_row_view(context, table)
+    for pending in inserted:
         if len(pending) > position and _equal(pending[position], key):
             raise _duplicate_key(table, key)
-    ended = _ended_by_this_transaction(context)
+    for reference, latest in state.items():
+        if latest is None or (replacing is not None and reference == replacing):
+            continue  # ended, or this very row being updated again
+        if len(latest) > position and _equal(latest[position], key):
+            raise _duplicate_key(table, key)
     for ref, version in engine.heap.scan(table, context.snapshot):
-        if ref in ended or (replacing is not None and ref == replacing):
-            continue
+        if ref in state or (replacing is not None and ref == replacing):
+            continue  # replaced or ended by this transaction: the view above is its truth
         if _equal(version.values[position], key):
             raise _duplicate_key(table, key)
 
@@ -1588,16 +1724,12 @@ def _uncommitted_rows_with_refs(
     of this transaction updating the very row being updated again" -- the second is the ordinary
     shape of two SETs on one row and must not refuse itself.
     """
-    for held in context.staged_rows:
-        if held.table.table_id == table.table_id and held.values is not None:
-            yield held.reference, held.values
-    for intent in getattr(context.txn, "row_intents", ()):
-        intent_table = getattr(intent, "table", None)
-        if getattr(intent_table, "table_id", None) != table.table_id:
-            continue
-        values = getattr(intent, "values", None)
-        if values:
-            yield getattr(intent, "reference", None), tuple(values)
+    state, inserted = _transaction_row_view(context, table)
+    for values in inserted:
+        yield None, values
+    for reference, latest in state.items():
+        if latest is not None:
+            yield reference, latest
 
 
 def _uncommitted_rows(context: _Context, table: TableDef) -> Iterator[tuple[Value, ...]]:
@@ -1619,17 +1751,8 @@ def _uncommitted_rows(context: _Context, table: TableDef) -> Iterator[tuple[Valu
     is the absence of a row rather than the presence of one, so it has to remove a heap answer
     rather than add a staged one.
     """
-    for held in context.staged_rows:
-        if held.table.table_id == table.table_id and held.values is not None:
-            yield held.values
-    intents = getattr(context.txn, "row_intents", ())
-    for intent in intents:
-        intent_table = getattr(intent, "table", None)
-        if getattr(intent_table, "table_id", None) != table.table_id:
-            continue
-        values = getattr(intent, "values", None)
-        if values:
-            yield tuple(values)
+    for _reference, values in _uncommitted_rows_with_refs(context, table):
+        yield values
 
 
 def _current_values(context: _Context, binding: RowBinding) -> tuple[Value, ...]:
@@ -1646,19 +1769,9 @@ def _current_values(context: _Context, binding: RowBinding) -> tuple[Value, ...]
     reads the same two places for the same reason: what this statement has held, and what earlier
     statements of this transaction handed over.
     """
-    latest = binding.version.values
-    for held in context.staged_rows:
-        if held.operation is _HELD_UPDATE and held.reference == binding.ref:
-            if held.values is not None:
-                latest = held.values
-    for intent in getattr(context.txn, "row_intents", ()):
-        if getattr(getattr(intent, "operation", None), "name", "") != "UPDATE":
-            continue
-        if getattr(intent, "reference", None) == binding.ref:
-            values = getattr(intent, "values", None)
-            if values:
-                latest = tuple(values)
-    return latest
+    state, _inserted = _transaction_row_view(context, binding.table)
+    latest = state.get(binding.ref)
+    return binding.version.values if latest is None else latest
 
 
 def _ended_by_this_transaction(context: _Context) -> set[object]:
@@ -1669,16 +1782,17 @@ def _ended_by_this_transaction(context: _Context) -> set[object]:
     not exist yet -- so the scan will find it and would answer "this row already exists" about a
     row the caller has just said it wants gone.
     """
-    ended: set[object] = {
-        held.reference
-        for held in context.staged_rows
-        if held.operation is _HELD_DELETE and held.reference is not None
-    }
+    ended: set[object] = set()
+    tables: dict[int, TableDef] = {}
+    for held in context.staged_rows:
+        tables[held.table.table_id] = held.table
     for intent in getattr(context.txn, "row_intents", ()):
-        operation = getattr(getattr(intent, "operation", None), "name", "")
-        reference = getattr(intent, "reference", None)
-        if operation == "DELETE" and reference is not None:
-            ended.add(reference)
+        intent_table = getattr(intent, "table", None)
+        if getattr(intent_table, "table_id", None) is not None:
+            tables[intent_table.table_id] = intent_table  # type: ignore[union-attr]
+    for table in tables.values():
+        state, _inserted = _transaction_row_view(context, table)
+        ended.update(reference for reference, latest in state.items() if latest is None)
     return ended
 
 
@@ -1713,10 +1827,10 @@ def _matching_row(
             _equal(pending[at], values[at]) for at in positions
         ):
             return _pending_binding(written.variable, table, pending)
-    ended = _ended_by_this_transaction(context)
+    state, _inserted = _transaction_row_view(context, table)
     for ref, version in engine.heap.scan(table, context.snapshot):
-        if ref in ended:
-            continue
+        if ref in state:
+            continue  # replaced or ended by this transaction; _uncommitted_rows spoke for it
         if all(_equal(version.values[at], values[at]) for at in positions):
             return RowBinding(
                 variable=written.variable, table=table, ref=ref, version=version

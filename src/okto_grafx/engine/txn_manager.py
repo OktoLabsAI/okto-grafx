@@ -1639,6 +1639,12 @@ def _settled_intents(intents: Sequence[RowIntent]) -> tuple[RowIntent, ...]:
         key = intent.reference
         if key not in settled:
             order.append(key)
+        elif settled[key].operation is RowOperation.DELETE:
+            # Ended is ended. An update staged after the delete of the same version does not
+            # bring the row back: the engine no longer matches an ended row, and this is the
+            # second line of the same defence (C10 round-2 B3). A delete after an update still
+            # wins, as the docstring says.
+            continue
         settled[key] = intent
     if not settled:
         return tuple(intents)

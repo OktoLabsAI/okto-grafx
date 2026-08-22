@@ -540,6 +540,12 @@ class _Planner:
         for position, relationship in enumerate(pattern.relationships):
             target_pattern = pattern.nodes[position + 1]
             pipeline, source = self._traverse(pipeline, source, relationship, target_pattern)
+            if target_pattern.properties is not None:
+                # The inline map on a TARGET node is the same shorthand it is on the first node,
+                # and it used to be dropped here: `(x)-[:R]->(y:P {id: 2})` matched every
+                # neighbour of x, and a SET or DELETE above it touched all of them (C10 round-2
+                # B1). The terms become a filter above the traversal, where the target is bound.
+                terms = terms + list(self._property_terms(source, target_pattern.properties))
         return pipeline, terms
 
     def _match_node(

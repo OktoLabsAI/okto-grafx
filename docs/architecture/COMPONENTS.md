@@ -884,3 +884,38 @@ seam for W6. Until then the internal option stays internal and the default lease
 Remaining D5 levers that are NOT policy: the pure-Python CRC when no provider is installed (the
 adapter is wired; install `okto-grafx[accel]`), and 69 `os.listdir` per commit in
 `storage_local._resolve_identity` (C2, ~1.04x).
+
+### Round-2 blind reviews of the coordinator's own work — C5 (4 blockers), C10 (6), C9 (1): ALL CLOSED
+
+Every fix carries a proving test whose counterfactual was run in a private fork with the fix reverted.
+
+**C5** (`txn_manager.py`, `buffer_pool.py`): B1 a refusal inside `_write_rows` now abandons the
+intents already written (the frame that wrote them is the one that abandons them); B2 `BufferPool.
+discard` drops an abandoned attempt's dirty frames WITHOUT write-back (a pinned frame is marked clean
+instead) -- the stale picture can no longer land over another participant's committed page; B3 a
+refusal after index staging unstages (`_unstage_index_changes`: trims `pending_records`, drops the
+index staging) so a re-commit carries one set with the log's number; B4 `_require_log_retains_from`
+refuses optimistic validation (retryable) when the log has recycled the records above the snapshot.
+Tests: `tests/txn/test_round_two_regressions.py` (4) -- with all four reverted, 4/4 fail and the rest
+of `tests/txn` passes. The critic's own four attack drivers re-run against the fixed tree: PHANTOM
+gone (both scenarios), LOST ROWS none, index recommit 9 records / 0 csn mismatches, pruned-pin commit
+refused.
+
+**C10** (`query_engine.py`, `planner.py`, `parser.py`): B1 target-node inline properties become
+filter terms above the traversal; B2 a key-changing SET declares the partitions of the keys the row
+HAD (`hold_update(previous_keys=)`); B3 `_node_scan` skips rows this transaction ended, and C5's
+settle treats a delete as terminal (second line); B4 `_write_assignments` keyed by the stored ROW,
+building on this transaction's latest version; B5 one ordered `_transaction_row_view` answers "what
+exists" for MERGE, the key check, `_current_values` and `_uncommitted_rows` -- replaced versions are
+not rows, ended rows are not rows, and a SET on a row the same statement created rewrites the held
+insert; B6 `*0` refused at parse. Tests: `tests/query/test_round_two_regressions.py` (11) + parser
+(3) -- with all reverted, 10/10 positive tests fail and the rest of `tests/query` passes. The
+critic's 13-check reproduction: 12 PASS, the 13th ends in the parse refusal its text accepts.
+
+**C9** (`vector_engine.py`): B4 the WARM path (`_note` -> `_install`) discards the graph on ANY
+refusal, not only the late one -- `_install_fresh` wrapped. Test
+`test_a_refusal_on_a_WARM_graph_discards_it_too`; reverted: `assert HnswGraph(nodes=5) is None`.
+
+Punch list from the reviews recorded in PUNCHLIST.md (segment-roll stamp = COMMIT-1; BR-6 for rows
+via the heap header page; relationship DELETE unsupported; RETURN after SET projects pre-SET values;
+non-DETACH DELETE leaves orphan edges; `SET` on `_from`/`_to` accepted; undirected self-loop twice).
