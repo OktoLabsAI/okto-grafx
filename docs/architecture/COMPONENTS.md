@@ -919,3 +919,47 @@ refusal, not only the late one -- `_install_fresh` wrapped. Test
 Punch list from the reviews recorded in PUNCHLIST.md (segment-roll stamp = COMMIT-1; BR-6 for rows
 via the heap header page; relationship DELETE unsupported; RETURN after SET projects pre-SET values;
 non-DETACH DELETE leaves orphan edges; `SET` on `_from`/`_to` accepted; undirected self-loop twice).
+
+### CF-12 — a long-lived participant never saw another process's commits (C2; CLOSED)
+
+Found by C9's round-3 blind critic while chasing a vector defect, and it is the most serious finding
+of the build: `LocalStorageDevice` cached the descriptor of every file it had opened, and another
+process's `atomic_replace` (the CF-5 POSIX-semantics rename) moved the directory entry from under it.
+The cached handle kept reading the REPLACED file. A participant that had once read
+`control/commit.state` kept reading the number it saw first, never learned of anyone else's commits,
+answered stale rows for ever, and had every commit of its own refused as a write conflict with a
+world it could not see. A fresh process saw everything -- which is why every multi-process test in
+the repository, all of which used a fresh process for the read, passed (L23/L24: the safe regime).
+
+Measured before the fix, one parent process and one child: parent `published=5`, child publishes 17,
+parent still `[(1,)]` / `published=5`, parent commit `GrafxWriteConflict`, fresh process `[1..5]`.
+
+**Fix (C2):** `_descriptor` re-checks, on every cached hit, that the name still names the file the
+descriptor holds -- identity `(st_dev, st_ino)` from `os.stat(path)` vs `os.fstat(fd)`, which on
+Windows is the volume serial and the 64-bit file index -- and closes and reopens when it does not.
+CF-5's rename was only ever half of publication; this is the reader's half.
+
+Four adapter tests had pinned the defect as the property ("the reader that opened the file before it
+happened keeps reading what it opened"): rewritten to assert the published content. One test asserted
+an unlinked file still readable through the held descriptor: now refuses missing, which is the same
+honesty. New: `tests/api/test_cross_process_visibility.py` (fails with the check reverted).
+
+### C9 round 3 — B5 and B6 CLOSED (coordinator)
+
+**B5 (threads):** a traversal could reach a node whose entry was not registered yet (`graph.insert`
+links before the maps were written), and a graph discarded under a search in flight replaced the maps
+the traversal was reading: bare `KeyError` out of the §8.8 door, 1 in 173 answers under two readers
+and one writer. Now: the entry and record are registered BEFORE the node becomes reachable; a search
+fixes its picture (graph + maps) at its start and finishes on it; `invalidate_graph` replaces the maps
+rather than clearing them; a REMOVE discards the graph instead of editing it under a traversal.
+Tests: `tests/api/test_vector_concurrency.py::test_a_search_never_escapes_while_another_thread_commits_vectors`
+(probabilistic net, 2 readers + 1 writer, 8 s) and the deterministic
+`test_a_search_finishes_on_the_picture_it_started_with_when_the_graph_is_discarded_under_it`
+(the host's own filter discards the graph mid-traversal; reverted: `KeyError: 1`).
+
+**B6 (processes):** the warm graph's only invalidation signals were this process's own commits --
+L22 again. Now the graph records the index header's `built_through_lsn` at build and after each local
+commit/redo, and a search compares it with the header on the device (fresh after `begin()`'s read
+view): a foreign commit that touched the index moves it, the graph is discarded and rebuilt. Test:
+`test_a_warm_graph_learns_what_another_process_committed` (child inserts 8 / deletes 4; reverted: the
+approximate regime returns deleted row 2). Unmasked by CF-12 (the descriptor identity fix in C2).

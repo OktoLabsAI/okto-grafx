@@ -1156,6 +1156,17 @@ class LocalStorageDevice:
             )
         self._require_open()
         cached = self._handles.pop(name, None)
+        if cached is not None and not self._still_names(name, cached):
+            # The directory entry moved from under the handle: another participant published
+            # over this name with atomic_replace, and the cached descriptor now reads the OLD
+            # file -- forever. A long-lived process that had once read control/commit.state kept
+            # reading the number it saw first, never learned of anyone else's commits, and had
+            # every commit of its own refused as a conflict with a world it could not see. The
+            # handle is closed and the name re-opened from the directory (C9 round-3 finding,
+            # routed to C2; the CF-5 rename was only ever half of publication).
+            with contextlib.suppress(OSError):
+                os.close(cached)
+            cached = None
         if cached is not None:
             self._handles[name] = cached
             if intent == "write":
@@ -1190,6 +1201,22 @@ class LocalStorageDevice:
         while len(self._handles) > self._max_open_files:
             oldest = next(iter(self._handles))
             self._release(oldest)
+
+    def _still_names(self, name: str, descriptor: int) -> bool:
+        """Return True when the directory entry for the name is still the file the descriptor holds.
+
+        Identity is ``(st_dev, st_ino)`` on both families -- on Windows Python reports the volume
+        serial and the 64-bit file index there, so a file published over the name by another
+        process shows a different identity even though the name is unchanged. A path that cannot
+        be examined at all (gone, unreadable) is not the held file either, and the caller then
+        re-resolves the name and refuses it honestly.
+        """
+        try:
+            current = os.stat(self._physical_path(name))
+            held = os.fstat(descriptor)
+        except OSError:
+            return False
+        return (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino)
 
     def _release(self, name: str) -> None:
         """Close and forget the cached descriptor of one file, if there is one.

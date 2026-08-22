@@ -382,9 +382,13 @@ def test_a_control_file_is_published_over_a_reader_in_another_process(
         # reports success while writing a garbled directory entry passes every content
         # assertion and fails this one.
         assert device.list_files() == (name,)
-        # And the reader that opened the file before it happened keeps reading what it opened,
-        # whole: old or new, never a mix.
-        assert reader.release() == "len=4096,bytes=A"
+        # And the reader that opened the file before it happened reads the PUBLISHED content on
+        # its next read, whole: never a mix, and never the old file for ever. A descriptor cached
+        # across a publication used to keep reading the replaced file -- a long-lived participant
+        # that had once read control/commit.state never learned of anyone else's commits and had
+        # every commit of its own refused. The device now re-checks that the name still names the
+        # file it holds, and reopens when it does not.
+        assert reader.release() == "len=4096,bytes=B"
     finally:
         device.close()
 
@@ -486,7 +490,10 @@ def test_a_publication_survives_a_reader_in_this_process_holding_another_device(
 
         assert publisher.read_log("control/commit.state", 0, 512) == b"B" * 512
         assert publisher.list_files() == ("control/commit.state",)
-        assert reader.read_log("control/commit.state", 0, 512) == b"A" * 512
+        # The other device in this process held a descriptor from before the publication; it
+        # must read what is PUBLISHED now, not the file that was replaced (see the cross-process
+        # test above for why a stale descriptor is a whole-database defect).
+        assert reader.read_log("control/commit.state", 0, 512) == b"B" * 512
         with LocalStorageDevice(root, page_size=PAGE_SIZE) as fresh:
             assert fresh.read_log("control/commit.state", 0, 512) == b"B" * 512
     finally:

@@ -329,6 +329,7 @@ class VectorHnswIndex(ProximityIndex):
         "_ef_construction",
         "_ef_search",
         "_graph",
+        "_graph_mark",
         "_node_of_ref",
         "_entry_of_node",
         "_record_of_node",
@@ -366,6 +367,7 @@ class VectorHnswIndex(ProximityIndex):
         self._ef_construction = ef_construction
         self._ef_search = ef_search
         self._graph: HnswGraph | None = None
+        self._graph_mark: Lsn | None = None
         self._node_of_ref: dict[int, int] = {}
         self._entry_of_node: dict[int, IndexEntry] = {}
         self._record_of_node: dict[int, RecordId] = {}
@@ -477,11 +479,35 @@ class VectorHnswIndex(ProximityIndex):
     # --- the derived graph ------------------------------------------------------------------
 
     def invalidate_graph(self) -> None:
-        """Drop the graph, so the next search rebuilds it from the entries the store holds."""
+        """Drop the graph, so the next search rebuilds it from the entries the store holds.
+
+        The three maps are REPLACED, never cleared in place: a search in flight on another thread
+        holds references to the graph and the maps it started with and finishes on that
+        consistent picture, stale by at most one commit, rather than on a picture that changes
+        under it (C9 round-3 B5).
+        """
         self._graph = None
+        self._graph_mark = None
         self._node_of_ref = {}
         self._entry_of_node = {}
         self._record_of_node = {}
+
+    def _graph_is_current(self) -> bool:
+        """Return True when the warm graph still reflects what the store holds on the device.
+
+        The graph is derived state over a file other PROCESSES write. Its only invalidation signals
+        used to be this process's own commits, so a participant with a warm graph answered from it
+        for ever while another process inserted, updated and deleted rows underneath: the
+        approximate regime returned deleted rows and scored updated rows against old vectors, with
+        ``stale`` False and ``verify()`` clean (C9 round-3 B6 -- LESSONS L22, a process-local
+        signal speaking for a shared file). Every commit that touches this index advances the
+        header's ``built_through_lsn`` on the device, and a read view taken at ``begin()`` drops
+        the cached header page when the published state moved, so comparing that number with the
+        one the graph was built at is the shared signal this derived state needs.
+        """
+        if self._graph is None:
+            return False
+        return self._graph_mark == self.built_through_lsn
 
     def graph(self) -> HnswGraph:
         """Return the graph over the current entries, building it when there is none.
@@ -508,6 +534,7 @@ class VectorHnswIndex(ProximityIndex):
                 self.walk(), key=lambda item: (item.born_csn, item.ref.encode())
             ):
                 self._install(entry)
+            self._graph_mark = self.built_through_lsn
         except BaseException:
             # A build that does not finish must leave NOTHING cached. The graph is published
             # before the loop because `_install` reaches it through `self._graph`, and the two
@@ -582,10 +609,15 @@ class VectorHnswIndex(ProximityIndex):
         # The graph itself can be left half-linked by that refusal, so it is DISCARDED rather
         # than repaired. It is derived state: throwing it away costs nothing durable and the
         # rebuild is deterministic, which is a cheaper correctness argument than a partial undo.
-        graph.insert(node, components)
-        self._node_of_ref[encoded] = node
+        # The entry and the record are registered BEFORE the node becomes reachable. graph.insert
+        # links the node into the connectivity chain, and a traversal on another thread can reach
+        # it the moment it does; a node it can reach must have an entry to answer with, or the
+        # traversal dies with a bare KeyError (C9 round-3 B5). A failure inside insert is handled
+        # by the caller, which discards the whole graph and these maps with it.
         self._entry_of_node[node] = entry
         self._record_of_node[node] = record_id
+        graph.insert(node, components)
+        self._node_of_ref[encoded] = node
 
     def _note(self, change: IndexChange) -> None:
         """Bring the graph in line with one change the store has just applied."""
@@ -612,10 +644,11 @@ class VectorHnswIndex(ProximityIndex):
         if change.operation is IndexOperation.TOMBSTONE:
             self._entry_of_node[node] = self._entry_of_node[node].ended_at(change.csn)
             return
-        self._graph.remove(node)
-        del self._entry_of_node[node]
-        del self._record_of_node[node]
-        del self._node_of_ref[encoded]
+        # A removal mutates the graph's neighbour lists and unlinks a node; done in place under
+        # a traversal on another thread, that traversal can step onto a node that is no longer
+        # there. Derived state is discarded rather than edited, and rebuilt on the next search
+        # (a reconcile pass removes many entries in one go and pays one rebuild for all of them).
+        self.invalidate_graph()
 
     # --- the write path ---------------------------------------------------------------------
 
@@ -625,6 +658,8 @@ class VectorHnswIndex(ProximityIndex):
         applied = super().commit(txn, csn)
         for change in staged:
             self._note(change)
+        if self._graph is not None:
+            self._graph_mark = self.built_through_lsn
         return applied
 
     def apply(self, record: WalRecord) -> None:
@@ -635,6 +670,8 @@ class VectorHnswIndex(ProximityIndex):
         super().apply(record)
         if change.index == self.name:
             self._note(change)
+            if self._graph is not None:
+                self._graph_mark = self.built_through_lsn
 
     def mark_stale(self, reason: str) -> None:
         """Record staleness durably, and drop the graph derived from the entries it doubts."""
@@ -671,25 +708,31 @@ class VectorHnswIndex(ProximityIndex):
         width = self._ef_search if ef is None else ef
         if width < k:
             width = k
+        if self._graph is not None and not self._graph_is_current():
+            self.invalidate_graph()
         graph = self.graph()
+        # The picture this search answers from is fixed HERE. A commit on another thread may
+        # replace the graph and the maps while the traversal runs; the traversal keeps these
+        # references and finishes on one consistent picture. A node that vanished from the
+        # picture it holds (removed concurrently) is simply not visible.
+        entries = self._entry_of_node
+        records = self._record_of_node
 
         def visible_and_admitted(node: int) -> bool:
             """Return True when this snapshot may see the entry and the filter admits it."""
-            entry = self._entry_of_node[node]
-            if not entry_visible(entry, predicate):
+            entry = entries.get(node)
+            if entry is None or not entry_visible(entry, predicate):
                 return False
             if admits is None:
                 return True
-            return bool(admits(self._record_of_node[node]))
+            record = records.get(node)
+            return record is not None and bool(admits(record))
 
         ranked, stats = graph.search(query, width, visible_and_admitted)
         scored = [
-            ScoredEntry(
-                entry=self._entry_of_node[node],
-                record_id=self._record_of_node[node],
-                score=score,
-            )
+            ScoredEntry(entry=entries[node], record_id=records[node], score=score)
             for score, node in ranked
+            if node in entries and node in records
         ]
         scored.sort(key=lambda item: (-item.score, item.record_id))
         return tuple(scored[:k]), stats

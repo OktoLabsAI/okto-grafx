@@ -403,3 +403,47 @@ def test_a_refusal_on_a_WARM_graph_discards_it_too(
     )
     assert after.regime == "approximate"
     assert after.achieved_k == index.live_count()
+
+
+def test_a_search_finishes_on_the_picture_it_started_with_when_the_graph_is_discarded_under_it(
+    metrics: RecordingMetrics, clock: StepClock
+) -> None:
+    """Deterministic half of C9 round-3 B5: the maps are replaced, never edited, under a search.
+
+    A commit on another thread discards and rebuilds the graph while a traversal runs. The
+    traversal used to read ``self._entry_of_node[node]`` on every step, so the moment the maps
+    were replaced it died with a bare ``KeyError`` out of the section 8.8 door. Here the host's
+    own candidate filter -- code the traversal calls DURING expansion -- discards the graph on
+    its first call, which is the same interleaving made deterministic. The search must finish,
+    on the picture it started with.
+    """
+    database = VectorFixture(metrics=metrics, clock=clock, exact_scan_threshold=0)
+    space = database.create_space(
+        "space", 3, metric=DistanceMetric.DOT, storage_dtype="float64"
+    )
+    table = database.create_table("Chunk", "space")
+    for record_id in range(1, 9):
+        database.insert_row(table, record_id, 0, space, (float(record_id), 1.0, 1.0), csn=10)
+    index = database.engine.index("space")
+    calls = {"n": 0}
+
+    class DiscardingFilter:
+        def admits(self, record_id: object) -> bool:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                index.invalidate_graph()
+            return True
+
+        def cardinality(self) -> int:
+            return 8
+
+    result = database.engine.search(
+        space="space",
+        query=(4.0, 1.0, 1.0),
+        k=8,
+        snapshot=SnapshotDouble(1000),
+        candidate_filter=DiscardingFilter(),
+    )
+    assert result.regime == "approximate"
+    assert result.achieved_k == 8
+    assert calls["n"] >= 1

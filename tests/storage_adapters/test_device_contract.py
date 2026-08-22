@@ -678,5 +678,9 @@ def test_a_handle_of_this_device_never_blocks_a_deletion(tmp_path: Any) -> None:
         device.append_log(SEGMENT, b"records")
         path = Path(device.root) / "wal" / "000000000001.wal"
         assert device.read_log(SEGMENT, 0, 7) == b"records"
-        os.remove(path)
-        assert device.read_log(SEGMENT, 0, 7) == b"records"
+        os.remove(path)  # not blocked by the descriptor this device holds: that is the property
+        # The name no longer names a file, and the device says so rather than serving the
+        # unlinked bytes through the descriptor it still holds: a name that reads as present
+        # after its deletion is the same lie as a descriptor that reads a replaced file.
+        with pytest.raises(GrafxCorruptionDetected):
+            device.read_log(SEGMENT, 0, 7)
