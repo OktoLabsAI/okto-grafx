@@ -1330,7 +1330,10 @@ door on C9's enumerated surface).
 **Behavior change, deliberate and recorded:** a table is visible to OTHER transactions only once
 its declaring transaction commits. Statement-time visibility was not a feature; it was the leak.
 
-**Tests:** `tests/query/test_schema_transactionality.py` -- six, five failing against the pre-fix
+**Tests:** `tests/query/test_schema_transactionality.py` -- six, and measured by the round-6
+review ALL SIX fail against the pre-fix tree (the compatibility guard too, through its reopen
+assertion on the endpoint indexes); five were written as regressions and one as a guard, and the
+guard's docstring still says so. Originally recorded as: six, five failing against the pre-fix
 tree (rollback leaves nothing anywhere; the vector map is pruned; an uncommitted table is invisible
 to others; the catalog HEADER page is in the commit's WAL batch; two schema transactions allocate
 distinct ids), one compatibility guard that passes both ways and says so (the one-block
@@ -1368,6 +1371,63 @@ Index-vs-scan equality asserted by test on every shape.
 one scan of the landing table per traversal (edges store record identities, and no identity index
 exists); and the planner does not reorder a pattern to start from its seekable side, so
 `MATCH (c)-[:M]->(e {id: k})` still walks from `c`. Both in PUNCHLIST as the next levers.
+
+### CF-18 — round-6 reviews: the schema statement did not hold until complete, and a hostile
+### metrics sink could turn a durable commit into a reported failure (C10/C5/C8; CLOSED)
+
+Two blind critics ran against `9348a2b` — one over the production delta, one auditing C8/C12/C13
+for sign-off. Three blocking defects between them, all closed here.
+
+**R5-B1 (C10).** A refused schema STATEMENT left the transaction poisoned: `add_table` mutated the
+remembered working copy in place, and the vector attach — which has no decline guard by design —
+raised after the mutation. Reproduced through `connect()` alone with two tables differing only by
+case: the refused statement left the phantom in the copy, `CREATE (:person {id: 1})` was ACCEPTED,
+and the commit made durable rows for a table no catalog would ever describe — unreachable,
+unreported, `verify()` clean. **Fix:** the statement works on a CLONE adopted only at the end, and
+every out-of-transaction effect is journalled — index registered, space attached, skip reported,
+index FILE created — with a refusal replaying the journal in reverse. The journal is by NAME:
+pruning by table id was tried first and fails exactly when it matters, because a loser's ids and
+the winner's ids come from the same committed pages.
+
+**R5-B2 (C10/C11).** `Database.retry()` never settled the conflicted loser, so the successor's
+re-executed DDL was refused by its own predecessor's leftovers — first the registration, then the
+orphan index FILE, whose digest can never match the successor's definition. The documented BR-6
+retry loop could not succeed for a schema change, and continuing anyway reached R5-B1's orphan
+rows. A third route: the read door (`db.execute("CREATE TABLE ...")`) passed the callable guard and
+registered indexes BEFORE its refusal. **Fix:** `retry` settles the loser (its whole journal, files
+included); the mode is refused up front; rollback replays the transaction journal — which also
+closes the recorded "orphan index files are harmless" residue, whose harmless-ness was false.
+
+**C8-B1 (C8/C5/C1).** A host-supplied metrics sink that raises — the registry validates shape, not
+behaviour — escaped public doors raw, and raising on the POST-COMMIT gauge made a durably
+committed transaction report failure; the caller's ordinary retry then duplicated the row.
+**Fix:** `ContainedMetricsSink` wraps whatever sink the composition resolves: every recording door
+absorbs what the inner sink raises (telemetry is never load-bearing — G7 freezes the catalogue,
+not the delivery), and `publish` — the one door a caller acts on — stays typed. Measured: a sink
+raising on every door, and one raising only after durability, both leave commits truthful and rows
+single.
+
+**Also landed from the same reviews:** `Database.unindexed_tables` is now real (it was referenced
+in comments and existed nowhere — the open-time twin of `skipped_indexes`); `metrics="json"` now
+actually writes its file, at `close()` (nothing ever called `publish()`, so the documented outcome
+was unreachable and the flag silently inert); the decline guards accept the storage device's
+case-collision refusal (`GrafxUnsupportedOperation`), which the pre-register file probe surfaced.
+
+**Verdicts elsewhere in the same round:** **C13 SIGNED OFF** (skip-attribution gate proven both
+ways, platform parity verified, battery lock exclusion and stale-break proven, ci.yml matches its
+obligations, the D5 gate exercised at every exit). **C12: no code defect found** across ~70
+subprocess invocations of every documented command — the one §14 gap is that its mutation battery
+was never completed or reported (a mid-run "20/42" note is all that exists), which is recorded in
+PUNCHLIST as an open obligation. **C8 otherwise sound** (catalogue exact both ways, disabled sink
+allocation-free, OpenMetrics scrape strict-parsed clean, JSON rotation and typed refusals, events
+sanitised and bounded under hostile payloads).
+
+**A fleet report was voided, and the voiding is the record:** a background battery re-score and a
+determinism probe were launched over the WORKING TREE while it was being edited. Every battery
+verdict was the same collection error (the fork lacked `bench/` — a mutant that does not run is
+not a kill, L7), and the determinism hash was the sha256 of EMPTY input (L28). Both debts are
+re-run against an immutable `git archive` of this commit instead; L26's rule — instruments and
+work must not share a mutable substrate — now includes the author's own background jobs.
 
 ### D5 durable_commit — 'consult JP' DISCHARGED: the ceiling stands, W6 owns the Windows gap
 

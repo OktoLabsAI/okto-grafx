@@ -357,6 +357,10 @@ def test_the_engine_exposes_nothing_that_could_generate_an_embedding(
         "commit",
         "coverage",
         "create_space",
+        # Forgets per-space state for ONE space, by name -- the undo of a refused schema
+        # STATEMENT is the caller, and by-name is the point: pruning by catalog would also drop
+        # another open transaction's attachments. Produces nothing, generates nothing (BR-4).
+        "detach",
         # Takes a catalog and drops per-space state for spaces it does not know -- the rollback
         # of a schema transaction is the caller. Produces nothing, generates nothing (BR-4).
         "discard_unknown",

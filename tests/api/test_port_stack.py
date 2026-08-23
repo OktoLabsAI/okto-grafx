@@ -293,7 +293,10 @@ def test_the_composition_hands_the_caller_its_own_adapter_instances_through(
             assert database.storage is bound["storage"]
             assert database.clock is bound["clock"]
             assert database.codec is bound["codec"]
-            assert database.metrics is bound["metrics"]
+            # The metrics slot is the one deliberate exception: the engine sees a containment
+            # shell (a raise on the post-commit gauge made a durable commit report failure),
+            # and the caller's sink -- identity preserved -- is what the shell contains.
+            assert database.metrics.inner is bound["metrics"]
             assert database.events is bound["events"]
             assert database.vector_math is bound["vector_math"]
             assert database.coordinator is bound["coordinator"]

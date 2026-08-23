@@ -247,7 +247,11 @@ def test_a_statement_that_writes_without_the_write_flag_is_pointed_at_the_right_
     # them. Nothing here is reworded or replaced.
     assert "transaction_state" in run.err
     assert "GrafxTransactionStateError" in run.err
-    assert "A read transaction cannot stage" in run.err
+    # The message moved when the schema door gained its up-front MODE refusal (round 6): a DDL
+    # through the read door used to be refused late, by staging, AFTER it had registered
+    # indexes. The class and code are the stable surface the hint keys on; the message is the
+    # engine's and says what was wrong with the mode.
+    assert "opened 'read'" in run.err
     # And the hint is an extra line, naming the flag and both doors.
     assert "hint" in run.err
     assert "--write" in run.err

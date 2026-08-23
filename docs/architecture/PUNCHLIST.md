@@ -1100,7 +1100,9 @@ carries this key". They stay because the doors are public.
 
 ## Schema transactionality after CF-16: residues (C10; recorded)
 
-- **Index FILES of a rolled-back DDL stay on the device.** The registration is pruned; the file an
+- **CLOSED in CF-18** — the statement/transaction journal now records the files its registrations
+  created and the unwind removes exactly those, frames first. Kept for the record; it originally
+  said: **Index FILES of a rolled-back DDL stay on the device.** The registration is pruned; the file an
   `IndexStore.create()` wrote at statement time is not removed (a device operation inside an
   unwind). Harmless: the next registration under the name either adopts the empty file or declines.
 - **`QueryEngine._working` entries leak for callers that drive the TransactionManager directly**
@@ -1113,3 +1115,35 @@ carries this key". They stay because the doors are public.
   before CF-16 than after); recorded, not closed.
 - **`CatalogStore.save()` keeps its old shape for `bootstrap()` and recovery adoption**, per the
   original W6 record. No transactional caller remains.
+
+
+## Round-6 mutation survivors on the schema/traversal surface (C10; recorded under 14.1.5)
+
+From the delta critic's 15-mutant battery (8 killed): `_txn_stages_catalog` forced True (a
+defensive guard with no reachable divergence); prune by table_name instead of id (equivalent in
+every reachable state — the case-fold decline blocks the divergence upstream); fan limit 64→63
+(cost-only, same class as the recorded "nothing asserts the index path is USED"); `by_index`
+skipping the `ended` filter, both directions (investigated as blocking and refuted: `ended` holds
+only DELETEd refs, edge deletion refuses, and an in-transaction SET keeps the old version visible
+in both regimes — **the day edge deletion lands, those two lines have no witness**).
+
+## C12 — the mutation battery is an open obligation (14.1.5)
+
+The sign-off audit found no code defect across every documented command, exit code, and
+concurrency shape — and found that the battery recorded as "20/42 killed" mid-session was never
+completed or reported. Until a battery over the CLI surface is run and reported with survivors
+dispositioned, C12 is not DONE under the frozen criterion. Everything else about C12 in that audit
+is a sign-off in waiting.
+
+## C8/C12 observations from the sign-off audit (recorded, not defects)
+
+- `VectorEngine.retire_space` increments a metric outside both the enabled guard and containment;
+  `_EXACT_FALLBACK`'s increment runs its lambda before the enabled check (C9's file, cost only).
+- `LoggingEventSink` bounds key and value lengths but not the number of payload keys; unreachable
+  through any engine payload today.
+- `ledger export` / `quarantine read` without `--output` answer 3 rather than 2 (the parser does
+  not model required options); scripts should know.
+- ci.yml pins Python 3.13 only while the metadata claims 3.11-3.13; 3.11 was verified manually
+  (C0 round 10) and is not continuously verified.
+- The registered `bench` marker is carried by no test; the [bench]-absent behavior rides
+  `optional_dependency`. Use it or retire it.

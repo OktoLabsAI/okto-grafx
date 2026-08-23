@@ -49,6 +49,11 @@ all change, and there is no migration path yet.
   with counts, so a caller can tell "nothing was wrong" from "nothing was checked".
 - **Observability**: a frozen metric catalogue with no-op, OpenMetrics and JSON sinks, and a
   sanitised, bounded event sink.
+- **A host-supplied metrics sink cannot break the engine**: every recording call is contained, so
+  a sink that raises — even after a commit's barrier — leaves the commit truthful and the rows
+  single, and `publish` stays typed. `metrics="json"` now writes its file at `close()`.
+- **`Database.unindexed_tables`** reports, at open, the tables whose automatic indexes declined —
+  the open-time twin of statement-time `skipped_indexes`.
 - **Seven ports with default adapters** (`storage`, `clock`, `coordinator`, `codec`, `metrics`,
   `events`, `vector_math`), a fail-closed registry that names every missing slot in one error, and an
   enforced import boundary that keeps `domain/` and `engine/` mechanism-free.

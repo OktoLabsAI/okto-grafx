@@ -104,7 +104,16 @@ def test_open_database_with_a_complete_registry_assembles_on_the_caller_ports(
     )
     try:
         for slot in PortRegistry.REQUIRED:
-            assert getattr(database, slot) is complete_registry.get(slot), slot
+            held = getattr(database, slot)
+            if slot == "metrics":
+                # The one slot that is deliberately NOT the caller's object: a host-supplied
+                # sink may do anything at all, and a raise on the post-commit gauge made a
+                # durable commit report failure -- so the engine sees a containment shell, and
+                # the caller's sink is what it contains.
+                assert type(held).__name__ == "ContainedMetricsSink", slot
+                assert held.inner is complete_registry.get(slot), slot
+                continue
+            assert held is complete_registry.get(slot), slot
     finally:
         database.close()
 
