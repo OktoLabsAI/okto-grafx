@@ -1916,9 +1916,13 @@ def _rows_carrying_key(
     except GrafxError:
         return None  # no index covers this table's key
     if index.definition.table_id != table.table_id or index.definition.positions != (position,):
-        # A name collision rather than this table's index. Two tables whose names differ only by
-        # case become one file name, and the catalog is what refuses that -- but this reads the
-        # index by name, so it checks that what it found is what it asked for.
+        # A name collision rather than this table's index, and this guard is load-bearing rather
+        # than defensive. An earlier version of this comment claimed "the catalog is what refuses
+        # that"; measured, the catalog does NOT. It compares table names case-SENSITIVELY, so
+        # `Person` and `person` are two legal tables, while an index name is case-FOLDED because
+        # it becomes a file name -- so the two want one index. The second table goes without one
+        # (see `_attach_primary_key_index`), and this check is what stops it reading the FIRST
+        # table's index and answering "no row holds this key" for a key that table does hold.
         return None
     if getattr(index, "stale", False):
         return None

@@ -1023,3 +1023,54 @@ than covering, and if a path is ever found the entry becomes a defect.
 Also recorded, and it is the more useful number: `tests/storage_core/test_buffer_pool.py` and
 `test_heap_store.py` kill NONE of the 34. The whole new surface is held by one file,
 `tests/txn/test_chain_relink_regressions.py`.
+
+
+## Mutation survivors on the primary-key index (C7/C10; recorded under 14.1.5)
+
+A 33-mutant battery over the CF-15 surface. 13 killed, 20 survived; 6 of the survivors change no
+behaviour on any reachable input and are neither kills nor survivors (L18), so the kill rate is
+13 of 27 = 48%, reported and not gated. Two of the survivors were the blocking defects of CF-15
+round 2 and are closed. These are what remain.
+
+**Unreachable through `connect()` — guards on an operator door, not on a caller path.** Each is a
+validation on `db.indexes.commit` or on `QueryEngine(indexes=None)`, which `assemble_database` never
+produces: `_tables_written_by` returning None for absent intents; the same for an intent whose table
+cannot be named; accepting a `bool` table id; treating "cannot say" as "wrote nothing"; the
+`callable()` guard in `_rows_carrying_key`; and the "no framework" branch that answers "no row
+carries this key". They stay because the doors are public.
+
+**Reachable and measured correctness-neutral.**
+
+- **Keying the index on column 0 instead of the declared primary key.** Reachable with a `PRIMARY
+  KEY` on a non-first column, and measured over 400 differential observations with 0 mismatches:
+  the seek moves to the wrong column and the uniqueness check falls back to a scan, so the answers
+  stay right and only the acceleration is lost. **A real coverage gap sits behind it**: no test
+  declares a primary key on a non-first column end to end. `test_parser.py` and `test_planner.py`
+  cover the syntax; neither executes DDL against an engine.
+- **Advancing an index's position UNCONDITIONALLY** in `IndexManager.commit`, rather than only when
+  the transaction wrote no row of that index's table. The narrowness is what keeps defect E3's alarm
+  alive, and it was verified by counterfactual — neuter the staging seam and an index whose table
+  WAS written still goes stale — but nothing in the suite asserts it. Same for the mutant that never
+  records a written table.
+- **`advance_built_through` → `_advance`,** losing the flush. L23 shape: the un-logged advance costs
+  a rebuild nobody needed, never a wrong answer, which is what the method's own docstring argues.
+- **Dropping either half of the `table_id`/`positions` re-check** in `_rows_carrying_key`. The
+  `table_id` half is now reachable only through the state CF-15 round 2 closed; the `positions` half
+  is redundant with it plus the definition digest an index file carries.
+
+**Coverage gaps named by the review and not yet closed.**
+
+- No test declares a `PRIMARY KEY` on a column other than the first, end to end.
+- No test drives a long-lived reader's index seek against a concurrent delete or key rewrite from
+  another process. The superset property was verified by hand and holds; it is not in the suite.
+- `stale` is a process-local flag over a durable header, refreshed only at `open()`. Another process
+  marking an index stale mid-life is invisible to a long-lived reader, which goes on planning seeks
+  on it. Reaching a WRONG ANSWER that way needs a device or budget failure in the other process, so
+  it is a fault-injection regime; the design predates CF-15, but CF-15 is what put a primary-key
+  index on that path. Worth a fault-injection test in W6.
+- A transaction that creates a table and then rolls back leaves the table in the live in-memory
+  catalog, and now also leaves an index registered and its file created. Pre-existing (it reproduces
+  on the parent commit), and the sharp edge of it was CF-15 round 2's defect 1. The blunt edge
+  remains: a retry of the same `CREATE` fails with `GrafxConfigurationError`.
+- `IndexManager.register` flushes a header during a DDL statement, which puts a device write outside
+  the transaction that may then roll back.

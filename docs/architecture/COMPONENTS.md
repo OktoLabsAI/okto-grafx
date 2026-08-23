@@ -1248,6 +1248,60 @@ every commit costs about **6.6%** of the suite, and the 52% figure an earlier dr
 carried was almost entirely the other agent. Recorded because it is the kind of number that gets
 quoted: a measurement taken on a loaded machine is a measurement of the load.
 
+### CF-15 round 2 — the index could refuse a DDL, and then refuse every later open (C7/C10; CLOSED)
+
+CF-15 above was recorded as CLOSED and was not. A blind review of `3f0a10e` found two blocking
+defects, both reachable through `connect()` alone -- no concurrency, no fault injection.
+
+**1. A DDL that could not create its index bricked the database.** `catalog.add_table` mutates the
+live catalog BEFORE the attach runs, so a refusal there left the table INSTALLED and the statement
+REFUSED. The next committed schema change wrote that table to disk, and the re-adoption at every
+later open raised the same refusal: every row unreachable through the only door there is. Two
+ordinary inputs reach it -- a table name of 126 characters or more (`pk_` plus 126 exceeds the
+128-character identifier budget), and two tables whose names differ only by case, which the catalog
+accepts as two tables and which fold to one index file name. **A regression introduced by CF-15**:
+the parent commit accepts both and reopens.
+
+**2. `_published_lsn_for_new_index` could only ever return 0.** It tested `callable()` on
+`IndexManager.published_lsn`, which is a PROPERTY, so the test was always False and
+`advance_built_through(0)` was a no-op. Every table declared in a session after the first got an
+index that registered behind the published position, was marked stale on the spot, and could never
+be lifted -- `_advance` refuses to move a stale index. **Exactly the failure the code's own
+docstring says it prevents.** Answers stayed correct, because a stale index is withheld and the
+query falls back to a scan, so the only symptom was that the feature silently did nothing for that
+entire regime.
+
+**Why the tests missed both.** Every test of the feature created its table in the FIRST session,
+where the published position is 0 and defect 2 cannot show; none used a table name near the
+identifier budget or two names differing by case. L24/L30 again.
+
+**Fix.** Defect 1 by the rule the code's own docstring already stated and the code did not honour:
+an index is an ACCELERATOR, not a semantic -- it may not fail a statement and may never make a
+database unopenable. It declines instead, the table works with a scan, and the name is reported
+through `QueryEngine.skipped_indexes`. Defect 2 by reading the property, and by moving the advance
+inside `IndexManager.register` via `complete_through=` so it lands BEFORE freshness is judged; an
+advance after the check is a no-op, which is why the first attempt at this fix did not work.
+
+**Tests:** three regressions that fail against `3f0a10e` and pass now (`..._leaves_no_room_for_an_
+index_name_is_still_created`, `..._differing_only_by_case_do_not_brick_the_database`,
+`..._declared_in_a_later_session_gets_a_FRESH_index`), plus one guard that passes both ways and
+says so (`..._every_primary_keyed_table_gets_its_index_back_on_reopen`, which kills the surviving
+mutant "re-adopt only the first table's index").
+
+**Two corrections to what was written about round 1**, recorded because the register is read as
+fact:
+
+* The commit message for `b94a4cf` says "Five regressions added". It is **four**, and one of them
+  is a guard rather than a regression.
+* The commit message for `3f0a10e` says each of the seven edited tests "still fails if an index
+  nobody asked for appears". Measured by the review: **six of seven**.
+  `tests/query/test_lifecycle.py::test_verify_keys_a_row_the_way_the_index_it_checks_keys_it` now
+  looks the index up by name, and a lookup by name cannot notice an extra index. The change is the
+  better test of the vector index's key derivation; the claim about it was wrong.
+* The docstring of `_rows_carrying_key` claimed "the catalog is what refuses" two table names
+  differing only by case. Measured: it does not. That false claim is what made defect 1 look
+  impossible.
+
 ### D5 durable_commit — 'consult JP' DISCHARGED: the ceiling stands, W6 owns the Windows gap
 
 SPEC-M1 `fr_18f8eff7` anticipated this: *"se o multiplo de commit exceder 10x, o pipeline PARA em

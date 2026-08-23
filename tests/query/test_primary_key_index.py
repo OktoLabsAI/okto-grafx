@@ -71,7 +71,10 @@ def test_declaring_a_primary_key_creates_the_index_that_covers_it(database) -> N
     assert definition.table_id == table.table_id
     assert definition.positions == (table.column_index("id"),)
     assert definition.visibility.value == "exact"
-    assert database.stale_indexes == ()
+    # The index's own flag, not `Database.stale_indexes`: that attribute is the verdict taken at
+    # OPEN and does not move afterwards, so asserting it on a database created in this session
+    # asserts a value that could not have changed (L28).
+    assert not database.indexes.index("pk_Person").stale
 
 
 def test_a_relationship_table_declares_no_primary_key_and_gets_no_index(database) -> None:
@@ -112,8 +115,15 @@ def test_a_keyed_read_is_planned_as_a_seek_and_an_unkeyed_one_as_a_scan(database
 
 
 def test_a_seek_and_a_scan_return_the_same_rows(database) -> None:
-    """The index is an accelerator, so the two plans must agree on every row -- including one
-    the same transaction has just written, which is in no index at all."""
+    """The index is an accelerator, so the two plans must agree on every row.
+
+    An earlier docstring here claimed it also covered "a row the same transaction has just
+    written, which is in no index at all". It does not: every read below is a separate autocommit
+    read after the write transaction closed. The claim was doubly wrong -- this engine has no
+    read-your-own-writes at all, so a MATCH inside the writing transaction returns nothing for
+    BOTH plans and the case is vacuous rather than uncovered. Recorded here rather than quietly
+    deleted, because the next reader would otherwise trust it.
+    """
     with database.begin("write") as txn:
         txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
     with database.begin("write") as txn:
@@ -419,8 +429,14 @@ def test_a_table_declared_in_a_later_session_gets_a_FRESH_index(tmp_path: Path) 
 
 
 def test_every_primary_keyed_table_gets_its_index_back_on_reopen(tmp_path: Path) -> None:
-    """All of them, not the first one. A loop that stopped early would be invisible to a
-    single-table test, and correctness-neutral -- which is exactly why nothing would notice."""
+    """All of them, not the first one.
+
+    Measured and recorded: this one PASSES against the pre-fix tree too, so it is a guard rather
+    than a regression -- the three above it are the ones that fail without the fix. It earns its
+    place by killing the mutant "re-adopt only the first table's index", which a blind review
+    found surviving the whole suite: correctness-neutral (the un-registered index only costs the
+    seek), which is exactly why nothing would have noticed.
+    """
     root = tmp_path / "db"
     with okto_grafx.connect(root, page_size=512) as db:
         with db.begin("write") as txn:
@@ -431,3 +447,52 @@ def test_every_primary_keyed_table_gets_its_index_back_on_reopen(tmp_path: Path)
     with okto_grafx.connect(root, page_size=512) as reopened:
         assert reopened.attached_indexes == ("pk_A", "pk_B", "pk_C")
         assert reopened.stale_indexes == ()
+
+
+@pytest.mark.parametrize("position", [0, 1, 2])
+def test_the_index_keys_on_the_declared_column_wherever_it_sits(
+    tmp_path: Path, position: int
+) -> None:
+    """A primary key is not always column 0, and the index must key on the one that was declared.
+
+    Closes a gap a blind review named: the syntax was covered by the parser and planner tests, and
+    nothing executed the DDL against an engine with the key anywhere but first. The mutant that
+    keys the index on column 0 regardless survives the whole suite without this, and it is
+    measurably correctness-NEUTRAL -- the seek looks under the wrong column and the uniqueness
+    check falls back to a scan, so the answers stay right and only the acceleration is lost. That
+    is exactly the shape of defect nothing notices.
+    """
+    columns = ["a STRING", "b STRING", "c STRING"]
+    key = "abc"[position]
+    columns[position] = f"{key} INT64"
+    root = tmp_path / "db"
+    with okto_grafx.connect(root, page_size=512) as db:
+        with db.begin("write") as txn:
+            txn.execute(
+                f"CREATE NODE TABLE T({', '.join(columns)}, PRIMARY KEY({key}))"
+            )
+        table = db.catalog.catalog.table("T")
+        assert db.indexes.index("pk_T").definition.positions == (position,), (
+            "the index keys on a column the table did not declare as its primary key"
+        )
+        assert table.column_index(key) == position
+
+        values = {"abc"[i]: (7 if i == position else "x") for i in range(3)}
+        literals = ", ".join(
+            f"{name}: {value!r}" if isinstance(value, str) else f"{name}: {value}"
+            for name, value in values.items()
+        )
+        with db.begin("write") as txn:
+            txn.execute(f"CREATE (:T {{{literals}}})")
+
+        # The seek finds it under the declared key...
+        assert db.execute(f"MATCH (t:T) WHERE t.{key} = 7 RETURN t.{key}").rows == ((7,),)
+        assert IndexSeek.__name__ in _plan_operators(
+            db, f"MATCH (t:T) WHERE t.{key} = $k RETURN t.{key}", {"k": 7}
+        )
+        # ...and the duplicate refusal still reads the same column.
+        with pytest.raises(GrafxQueryError) as refused:
+            with db.begin("write") as txn:
+                txn.execute(f"CREATE (:T {{{literals}}})")
+        assert refused.value.details.get("field") == "primary_key"
+        assert db.execute("MATCH (t:T) RETURN count(*)").rows == ((1,),)
