@@ -472,6 +472,7 @@ class QueryEngine:
         "_clock",
         "_skipped_indexes",
         "_working",
+        "_txn_effects",
     )
 
     def __init__(
@@ -499,6 +500,14 @@ class QueryEngine:
         # leaks the copy until the process ends, which is memory, not a wrong answer -- txn ids
         # are never reused, so a stale entry can never be read.
         self._working: dict[int, Catalog] = {}
+        # Every out-of-transaction effect each open schema transaction has made -- indexes
+        # registered, spaces attached, skip-report entries, index files created -- in the order
+        # it made them. The rollback undo. Pruning by table id against the live catalog was
+        # tried first and fails exactly when it matters: a loser's table and the winner's table
+        # both allocated their ids from the same committed pages, so the loser's registrations
+        # looked alive and the documented retry was then refused by its own predecessor's
+        # leftovers.
+        self._txn_effects: dict[int, list[tuple[str, str]]] = {}
         self._indexes = indexes
         self._vectors = vectors
         self._metrics = MetricEmitter(metrics)
@@ -727,6 +736,19 @@ class QueryEngine:
         and no endpoint format to agree. ``save()`` returns the pages of the chain it wrote,
         which is exactly what CONTRACT.md section 8.5 step 4 turns into log records.
         """
+        mode = getattr(getattr(txn, "mode", None), "value", None)
+        if mode is not None and mode != "write":
+            # Refused by MODE, up front. The callable check below is satisfied by a READ
+            # context too -- its refusal comes when stage_page_image is CALLED, which is after
+            # the index registrations -- so db.execute("CREATE TABLE ...") registered indexes
+            # first and refused second, and the legitimate write-door retry of the same DDL was
+            # then refused for the life of the process.
+            raise GrafxTransactionStateError(
+                f"A schema statement writes, and this transaction was opened {mode!r}; open a "
+                f"write transaction.",
+                field="mode",
+                value=mode,
+            )
         stage = getattr(txn, "stage_page_image", None)
         if stage is None or not callable(stage):
             # Refused BEFORE any side effect -- the working copy, the index registration, the
@@ -738,7 +760,39 @@ class QueryEngine:
                 field="transaction",
                 value=type(txn).__name__,
             )
-        catalog = self._working_catalog(txn)
+        # THE STATEMENT IS HELD UNTIL COMPLETE, like every row statement (see the hold
+        # doctrine at the top of this module): a refusal must leave the transaction exactly as
+        # it found it. Two things make that non-trivial here. The working catalog is MUTATED in
+        # place, so the statement works on a CLONE and the clone is adopted only at the end -- a
+        # refusal after `add_table` used to leave the phantom table in the remembered copy, and
+        # a later INSERT in the same transaction then committed durable rows for a table no
+        # catalog would ever describe, with verify() clean. And the index attaches install
+        # state OUTSIDE the transaction (the registry, the vector engine's space map), so every
+        # attach records its undo in a journal that a refusal replays in reverse -- by NAME,
+        # never by pruning against a catalog, because another open transaction's attachments
+        # are absent from every catalog this statement can see.
+        base = self._working_catalog(txn)
+        catalog = Catalog.deserialize(base.serialize())
+        undo: list[tuple[str, str]] = []
+        try:
+            self._schema_change(node, txn, statistics, catalog, undo)
+        except BaseException:
+            self._unwind_schema_statement(undo)
+            raise
+        self._remember_working(txn, catalog)
+        txn_id = getattr(txn, "txn_id", None)
+        if isinstance(txn_id, int) and not isinstance(txn_id, bool):
+            self._txn_effects.setdefault(txn_id, []).extend(undo)
+
+    def _schema_change(
+        self,
+        node: PlanNode,
+        txn: object,
+        statistics: dict[str, int],
+        catalog: Catalog,
+        undo: list[tuple[str, str]],
+    ) -> None:
+        """Apply one schema statement to the working CLONE, journalling external effects."""
         if isinstance(node, CreateVectorSpace):
             catalog.add_space(
                 EmbeddingSpaceDef(
@@ -762,8 +816,8 @@ class QueryEngine:
                     primary_key=node.primary_key,
                 )
             )
-            self._attach_primary_key_index(installed, statistics)
-            self._attach_vector_columns(installed, statistics, catalog)
+            self._attach_primary_key_index(installed, statistics, undo)
+            self._attach_vector_columns(installed, statistics, catalog, undo)
             statistics["tables_created"] = statistics.get("tables_created", 0) + 1
         elif isinstance(node, CreateRelTable):
             installed = catalog.add_table(
@@ -776,7 +830,7 @@ class QueryEngine:
                     to_table=node.to_table,
                 )
             )
-            self._attach_endpoint_indexes(installed, statistics)
+            self._attach_endpoint_indexes(installed, statistics, undo)
             statistics["tables_created"] = statistics.get("tables_created", 0) + 1
         else:  # pragma: no cover - the caller checked the type
             raise GrafxPlanError(
@@ -799,8 +853,40 @@ class QueryEngine:
         staged = self._catalog.stage(catalog)
         for page_index, image in staged:
             txn.stage_page_image(self._catalog.file, page_index, image)
-        self._remember_working(txn, catalog)
         statistics["pages_staged"] = statistics.get("pages_staged", 0) + len(staged)
+
+    def _unwind_schema_statement(self, undo: list[tuple[str, str]]) -> None:
+        """Reverse one refused schema statement's out-of-transaction effects, newest first.
+
+        Runs while the refusal is already unwinding, so nothing here may raise. Each entry names
+        exactly one thing this statement did -- an index registered, a space attached, a table
+        added to the skip report -- so another open transaction's attachments are untouched.
+        """
+        for kind, name in reversed(undo):
+            try:
+                if kind == "index" and self._indexes is not None:
+                    drop = getattr(self._indexes, "unregister", None)
+                    if callable(drop):
+                        drop(name)
+                elif kind == "space":
+                    detach = getattr(self._vectors, "detach", None)
+                    if callable(detach):
+                        detach(name)
+                elif kind == "skip":
+                    self._skipped_indexes.discard(name)
+                elif kind == "file":
+                    # The register CREATED this file, and left behind it refuses the retry: the
+                    # successor's definition digest differs (its ids re-derive from pages the
+                    # winner has since changed), and the vector attach has no decline guard by
+                    # design. Frames are dropped UNWRITTEN first, or the next flush would
+                    # re-create what was just removed.
+                    storage = self._pool.storage
+                    if storage.exists(name):
+                        for page_index in range(storage.page_count(name)):
+                            self._pool.discard(name, page_index)
+                        storage.remove(name)
+            except GrafxError:
+                continue
 
     def _working_catalog(self, txn: object) -> Catalog:
         """Return the catalog this transaction's schema statements build on.
@@ -846,27 +932,16 @@ class QueryEngine:
         and replacing its reason would hide why the transaction was abandoned at all.
         """
         working = self._working.pop(txn_id, None)
+        effects = self._txn_effects.pop(txn_id, None)
         if committed or working is None:
             return
-        try:
-            live = self._catalog.catalog
-            alive_tables = {table.table_id for table in live.tables()}
-            alive_names = {table.name for table in live.tables()}
-            manager = self._indexes
-            if manager is not None:
-                listing = getattr(manager, "indexes", None)
-                drop = getattr(manager, "unregister", None)
-                if callable(listing) and callable(drop):
-                    for index in tuple(listing()):
-                        if index.definition.table_id not in alive_tables:
-                            drop(index.definition.name)
-            vectors = self._vectors
-            discard = getattr(vectors, "discard_unknown", None)
-            if callable(discard):
-                discard(live)
-            self._skipped_indexes &= alive_names
-        except GrafxError:
-            return
+        # The transaction's own journal, replayed in reverse -- never a prune against a catalog.
+        # A catalog prune was the first shape of this and it failed exactly when it mattered: a
+        # loser's table and the winner's allocate their ids from the same committed pages, so by
+        # table id the loser's registrations looked alive, and by ANY catalog another open
+        # transaction's registrations look dead. The journal names precisely what this
+        # transaction did, and nothing else.
+        self._unwind_schema_statement(effects or [])
 
     @property
     def skipped_indexes(self) -> tuple[str, ...]:
@@ -874,7 +949,7 @@ class QueryEngine:
         return tuple(sorted(self._skipped_indexes))
 
     def _attach_primary_key_index(
-        self, table: TableDef, statistics: dict[str, int]
+        self, table: TableDef, statistics: dict[str, int], undo: list[tuple[str, str]]
     ) -> None:
         """Create the index covering the primary key of a table this statement just created.
 
@@ -900,10 +975,14 @@ class QueryEngine:
             index = primary_key_index(table, self._pool, self._metrics.sink)
             if index is None:
                 return
+            existed = self._pool.storage.exists(index.file)
             self._indexes.register(
                 index, complete_through=self._published_lsn_for_new_index()
             )
-        except GrafxIndexError:
+            undo.append(("index", index.definition.name))
+            if not existed:
+                undo.append(("file", index.file))
+        except (GrafxIndexError, GrafxUnsupportedOperation):
             # THE INDEX MAY NOT FAIL THE STATEMENT, and the first version of this let it.
             # `add_table` has already mutated the live catalog by the time this runs, so a
             # refusal here left the table INSTALLED and the statement REFUSED -- and the next
@@ -921,12 +1000,14 @@ class QueryEngine:
             # opposite of the vector case, where the column would be permanently unsearchable
             # and refusing is the only honest answer.
             statistics["indexes_skipped"] = statistics.get("indexes_skipped", 0) + 1
-            self._skipped_indexes.add(table.name)
+            if table.name not in self._skipped_indexes:
+                self._skipped_indexes.add(table.name)
+                undo.append(("skip", table.name))
             return
         statistics["indexes_created"] = statistics.get("indexes_created", 0) + 1
 
     def _attach_endpoint_indexes(
-        self, table: TableDef, statistics: dict[str, int]
+        self, table: TableDef, statistics: dict[str, int], undo: list[tuple[str, str]]
     ) -> None:
         """Create the two indexes covering the endpoints of a relationship table just declared.
 
@@ -942,12 +1023,18 @@ class QueryEngine:
             for index in relationship_endpoint_indexes(
                 table, self._pool, self._metrics.sink
             ):
+                existed = self._pool.storage.exists(index.file)
                 self._indexes.register(
                     index, complete_through=self._published_lsn_for_new_index()
                 )
-        except GrafxIndexError:
+                undo.append(("index", index.definition.name))
+                if not existed:
+                    undo.append(("file", index.file))
+        except (GrafxIndexError, GrafxUnsupportedOperation):
             statistics["indexes_skipped"] = statistics.get("indexes_skipped", 0) + 1
-            self._skipped_indexes.add(table.name)
+            if table.name not in self._skipped_indexes:
+                self._skipped_indexes.add(table.name)
+                undo.append(("skip", table.name))
             return
         if getattr(table, "kind", None) == "rel":
             statistics["indexes_created"] = statistics.get("indexes_created", 0) + 2
@@ -973,7 +1060,11 @@ class QueryEngine:
         return 0
 
     def _attach_vector_columns(
-        self, table: TableDef, statistics: dict[str, int], catalog: Catalog | None = None
+        self,
+        table: TableDef,
+        statistics: dict[str, int],
+        catalog: Catalog | None = None,
+        undo: list[tuple[str, str]] | None = None,
     ) -> None:
         """Create the index of every embedding space a new table declares a column in.
 
@@ -1007,7 +1098,11 @@ class QueryEngine:
                 value=type(vectors).__name__,
             )
         for space in spaces:
-            attach(table, space, catalog)
+            attached = attach(table, space, catalog)
+            if undo is not None:
+                undo.append(("index", attached.definition.name))
+                undo.append(("space", space))
+                undo.append(("file", attached.file))
             statistics["indexes_attached"] = statistics.get("indexes_attached", 0) + 1
 
     def _stage(self, txn: object, file: str, pages: Sequence[int]) -> None:

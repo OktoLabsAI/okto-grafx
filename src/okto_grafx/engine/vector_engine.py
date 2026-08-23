@@ -909,6 +909,20 @@ class VectorEngine:
         self._publish_space_metrics()
         return index
 
+    def detach(self, space_name: str) -> bool:
+        """Forget this engine's per-space state for ONE space, and say whether any was held.
+
+        The caller is the undo of a refused schema STATEMENT: ``attach`` ran for a space the
+        statement declared, the statement was then refused, and exactly that attachment must go.
+        ``discard_unknown`` prunes against a whole catalog and is the rollback-of-a-transaction
+        door; pruning by catalog here would also drop the attachments of ANOTHER open
+        transaction, whose spaces are not in this one's base picture either. Registry entries
+        are the index manager's and are unwound there by name. Never raises.
+        """
+        held = self._by_space.pop(space_name, None) is not None
+        self._maintained_at.pop(space_name, None)
+        return held
+
     def discard_unknown(self, catalog: object) -> tuple[str, ...]:
         """Drop the spaces this engine holds an index for and that catalog does not know.
 

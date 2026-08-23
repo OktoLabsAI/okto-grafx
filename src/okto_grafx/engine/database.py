@@ -582,6 +582,7 @@ class Database:
         "_recovery_report",
         "_attached_indexes",
         "_stale_indexes",
+        "_unindexed_tables",
         # A public object a host cannot hold weakly is a public object a host must hold
         # strongly, which is how a cache of databases becomes a leak of databases.
         "__weakref__",
@@ -617,6 +618,7 @@ class Database:
         recovery_report: object = None,
         attached_indexes: Sequence[str] = (),
         stale_indexes: Sequence[str] = (),
+        unindexed_tables: Sequence[str] = (),
         closers: Sequence[Callable[[], None]] = (),
     ) -> None:
         """Adopt a complete composition. Nothing here opens anything: the root already did."""
@@ -649,6 +651,7 @@ class Database:
         self._recovery_report: object = recovery_report
         self._attached_indexes: tuple[str, ...] = tuple(attached_indexes)
         self._stale_indexes: tuple[str, ...] = tuple(stale_indexes)
+        self._unindexed_tables: tuple[str, ...] = tuple(unindexed_tables)
         if metrics.enabled:
             for declared in DATABASE_METRICS:
                 metrics.register(declared)
@@ -703,6 +706,17 @@ class Database:
         because a registry belongs to one composition and a reopened database starts with none.
         """
         return self._attached_indexes
+
+    @property
+    def unindexed_tables(self) -> tuple[str, ...]:
+        """Return the tables whose automatic indexes could not be adopted at open.
+
+        The open-time twin of ``QueryEngine.skipped_indexes``: an index whose name is illegal or
+        collides declines rather than failing the open, and the table it covers answers keyed
+        reads and traversals by the scan it always did. This is where an operator learns WHICH
+        tables run without their accelerator, instead of discovering it as a slow query.
+        """
+        return self._unindexed_tables
 
     @property
     def stale_indexes(self) -> tuple[str, ...]:
@@ -853,6 +867,12 @@ class Database:
                 field="transaction",
                 value=type(transaction).__name__,
             )
+        # The loser's schema bookkeeping is settled BEFORE the successor opens: its working
+        # catalog is dropped and its registered indexes pruned, so the successor's re-executed
+        # DDL registers cleanly instead of being refused by its own predecessor's leftovers --
+        # which made the documented BR-6 retry loop unable to ever succeed for a schema change,
+        # and let the successor's later rows commit against a phantom table.
+        self._settle_schema(transaction.context, committed=False)
         return Transaction(self, self._transactions.retry(transaction.context))
 
     @contextmanager
@@ -996,6 +1016,7 @@ class Database:
         for step in (
             self._close_transactions,
             self._flush_pages,
+            self._publish_metrics,
             self._release_closers,
         ):
             try:
@@ -1055,6 +1076,19 @@ class Database:
         # this pool stops they can never be reused, and left unwritten they are indistinguishable
         # from the pages a crash leaves half-allocated.
         self._pool.settle_abandoned()
+
+    def _publish_metrics(self) -> None:
+        """Publish the metrics document, on the one sink whose selector promises a file.
+
+        ``metrics="json"`` documents that the sink writes to the destination the configuration
+        names, and nothing in the shipped composition ever called ``publish()`` -- so the
+        documented outcome was unreachable and the flag was silently inert. Close is the moment
+        the numbers are final. A sink with no ``publish`` door has nothing to do here, and a
+        refusal is collected with the other close failures rather than lost.
+        """
+        publish = getattr(self._metrics, "publish", None)
+        if callable(publish):
+            publish()
 
     def _release_closers(self) -> None:
         """Run every release the composition root handed over, and raise the first failure.

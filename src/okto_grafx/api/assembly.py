@@ -40,6 +40,7 @@ from collections.abc import Callable
 from typing import TypeVar, cast
 
 from okto_grafx.domain.errors import (
+    GrafxUnsupportedOperation,
     GrafxIndexError,
     GrafxConfigurationError,
     GrafxError,
@@ -59,8 +60,11 @@ from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.database import META_FILE, Database, DatabaseIdentity, MetaStore
 from okto_grafx.engine.heap_store import MINIMUM_FRAMES as HEAP_FRAMES
 from okto_grafx.engine.heap_store import HeapStore
+from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
 from okto_grafx.engine.index_manager import (
     IndexManager,
+    edge_from_index_name,
+    edge_to_index_name,
     primary_key_index,
     primary_key_index_name,
     relationship_endpoint_indexes,
@@ -149,7 +153,12 @@ def assemble_database(
     storage = _port(ports, "storage", StorageDevice)
     clock = _port(ports, "clock", Clock)
     codec = _port(ports, "codec", PageCodec)
-    metrics = _port(ports, "metrics", MetricsSink)
+    # The shell, not the sink. A host-supplied sink may do anything at all, and the engine
+    # calls it from inside public doors -- including after a commit's invariants have settled,
+    # where a raise made a DURABLY COMMITTED transaction report failure and the caller's retry
+    # duplicated the row. Same rule as the connect guard below: only Grafx types leave a public
+    # door. The raw sink stays reachable through .inner for the doors that own its lifecycle.
+    metrics = ContainedMetricsSink(_port(ports, "metrics", MetricsSink))
     events = _port(ports, "events", EventSink)
     vector_math = _port(ports, "vector_math", VectorMath)
     coordinator = _port(ports, "coordinator", ProcessCoordinator)
@@ -300,11 +309,21 @@ def assemble_database(
             descriptor=config.granularity_descriptor,
         )
         attached = _attach_primary_key_indexes(catalog, indexes, pool, metrics)
+        adopted = set(attached)
         unindexed = tuple(
             table.name
             for table in catalog.catalog.tables()
-            if table.primary_key is not None
-            and primary_key_index_name(table.name) not in {name for name in attached}
+            if (
+                table.primary_key is not None
+                and primary_key_index_name(table.name) not in adopted
+            )
+            or (
+                getattr(table, "kind", None) == "rel"
+                and (
+                    edge_from_index_name(table.name) not in adopted
+                    or edge_to_index_name(table.name) not in adopted
+                )
+            )
         )
         attached += _attach_declared_vector_indexes(catalog, vectors)
         stale = tuple(
@@ -364,6 +383,7 @@ def assemble_database(
         recovery_report=report,
         attached_indexes=attached,
         stale_indexes=stale,
+        unindexed_tables=unindexed,
         closers=tuple(closers),
     )
 
@@ -426,7 +446,7 @@ def _attach_primary_key_indexes(
             if index is None:
                 continue
             attached.append(indexes.register(index).name)
-        except GrafxIndexError:
+        except (GrafxIndexError, GrafxUnsupportedOperation):
             # AN INDEX MAY NEVER MAKE A DATABASE UNOPENABLE. A catalog can hold a table whose
             # index name is illegal or collides -- two names differing only by case fold to one
             # file -- and raising here meant every later `connect()` on that database refused,
