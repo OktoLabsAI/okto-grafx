@@ -58,7 +58,7 @@ from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.database import META_FILE, Database, DatabaseIdentity, MetaStore
 from okto_grafx.engine.heap_store import MINIMUM_FRAMES as HEAP_FRAMES
 from okto_grafx.engine.heap_store import HeapStore
-from okto_grafx.engine.index_manager import IndexManager
+from okto_grafx.engine.index_manager import IndexManager, primary_key_index
 from okto_grafx.engine.ledger_store import LedgerStore
 from okto_grafx.engine.metrics_catalog import register_catalog
 from okto_grafx.engine.quarantine import QuarantineStore
@@ -293,7 +293,8 @@ def assemble_database(
             reader_stall_threshold=config.reader_stall_threshold_seconds,
             descriptor=config.granularity_descriptor,
         )
-        attached = _attach_declared_vector_indexes(catalog, vectors)
+        attached = _attach_primary_key_indexes(catalog, indexes, pool, metrics)
+        attached += _attach_declared_vector_indexes(catalog, vectors)
         stale = tuple(
             index.name for index in indexes.open(transactions.published_lsn())
         )
@@ -381,6 +382,36 @@ def _verifier_factory(
         )
 
     return build
+
+
+def _attach_primary_key_indexes(
+    catalog: CatalogStore,
+    indexes: IndexManager,
+    pool: BufferPool,
+    metrics: MetricsSink,
+) -> tuple[str, ...]:
+    """Register the primary-key index of every table the catalog holds, and name them.
+
+    The DDL that creates a table creates its index, so this is the RE-ADOPTION path: the next
+    process to open the database has an index file on disk and no object for it. It mirrors
+    `_attach_declared_vector_indexes` exactly, and for the same reason -- an index that exists on
+    the device and is registered by nobody is an index the planner cannot see, which is a silent
+    fall back to a full scan rather than an error.
+
+    Registering OPENS an existing file rather than replacing it (G6), so this adopts what is there
+    instead of rebuilding it, and `IndexManager.open` decides freshness afterwards. A database
+    written before primary keys were indexed has no such file: one is created, it is empty while
+    the heap is not, and it is therefore STALE -- which is the honest answer and the safe one,
+    because a stale index is excluded from planning and the query falls back to the scan it used
+    to do.
+    """
+    attached: list[str] = []
+    for table in catalog.catalog.tables():
+        index = primary_key_index(table, pool, metrics)
+        if index is None:
+            continue
+        attached.append(indexes.register(index).name)
+    return tuple(attached)
 
 
 def _attach_declared_vector_indexes(

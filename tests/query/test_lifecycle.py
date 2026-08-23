@@ -390,7 +390,10 @@ def test_verify_keys_a_row_the_way_the_index_it_checks_keys_it() -> None:
             txn.execute("CREATE NODE TABLE C(id INT64, e VECTOR(s), PRIMARY KEY(id))")
         with handle.begin("write") as txn:
             txn.execute("CREATE (:C {id: 1, e: [1.0, 0.0, 0.0, 0.0]})")
-        index = handle.indexes.indexes()[0]
+        # The VECTOR index by name, not by position: the table also carries the index of its
+        # primary key now, and that one keys on column bytes -- so "the first index" would have
+        # made this assertion pass for the wrong index and prove nothing about the vector one.
+        index = handle.indexes.index("vector_C_s")
         assert index.definition.key_derivation != "columns"
         assert len(index.walk()) == 1
         assert handle.verify("all").findings == ()

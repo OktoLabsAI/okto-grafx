@@ -354,12 +354,14 @@ def test_a_read_only_reopen_attaches_the_vector_index_without_writing(tmp_path: 
                 "CREATE NODE TABLE Chunk("
                 "id INT64, embedding VECTOR(minilm_v2), PRIMARY KEY(id))"
             )
-        created = db.indexes.indexes()[0].name
+        created = next(
+            index.name for index in db.indexes.indexes() if index.name.startswith("vector_")
+        )
     before = _tree(root)
     assert any("vector_Chunk_minilm_v2" in name for name in before)
 
     with connect(root, page_size=512, read_only=True) as read_only:
-        assert read_only.attached_indexes == (created,)
+        assert read_only.attached_indexes == ("pk_Chunk", created)
         assert read_only.vectors.index("minilm_v2").name == created
         assert read_only.verify("all").findings == ()
     assert _tree(root) == before

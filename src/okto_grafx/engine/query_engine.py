@@ -60,6 +60,7 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.ids import NO_CSN
 from okto_grafx.domain.index.keys import index_key
+from okto_grafx.engine.index_manager import primary_key_index, primary_key_index_name
 from okto_grafx.domain.model.record import HeapVersion
 from okto_grafx.domain.model.schema import (
     ENDPOINT_COLUMNS,
@@ -559,7 +560,17 @@ class QueryEngine:
         listing = getattr(self._indexes, "indexes", None)
         if listing is None:
             return ()
-        return tuple(index.definition for index in listing())
+        # A STALE index is withheld from the planner, and that is a correctness rule rather than
+        # a policy. A stale index is a SUBSET of what the heap holds -- entries it never received
+        # -- and being a subset is exactly what the EXACT contract cannot repair: validating a
+        # candidate against the heap removes hits that should not be there and cannot invent ones
+        # that are missing. So a plan built on one answers a keyed read with fewer rows than
+        # exist. Withholding it plans the scan the engine planned before any index existed, which
+        # is slower and right. The index says so itself through `stale`, and `Database.
+        # stale_indexes` is where an operator sees which ones need rebuilding.
+        return tuple(
+            index.definition for index in listing() if not getattr(index, "stale", False)
+        )
 
     def _bind_parameters(
         self, plan: PlannedQuery, parameters: Mapping[str, object] | None
@@ -671,6 +682,7 @@ class QueryEngine:
                     primary_key=node.primary_key,
                 )
             )
+            self._attach_primary_key_index(installed, statistics)
             self._attach_vector_columns(installed, statistics)
             statistics["tables_created"] = statistics.get("tables_created", 0) + 1
         elif isinstance(node, CreateRelTable):
@@ -694,6 +706,43 @@ class QueryEngine:
         pages = self._catalog.save()
         self._stage(txn, self._catalog.file, pages)
         statistics["pages_staged"] = statistics.get("pages_staged", 0) + len(pages)
+
+    def _attach_primary_key_index(
+        self, table: TableDef, statistics: dict[str, int]
+    ) -> None:
+        """Create the index covering the primary key of a table this statement just created.
+
+        This is where the pair exists for the first time, exactly as `_attach_vector_columns`
+        argues for its own case: a table declares its primary key at creation, so the index is
+        created here and re-adopted by every later open. Nothing else in the engine creates one,
+        which would leave every keyed read on the table planning a full scan for ever.
+
+        The table is EMPTY -- this is the statement that made it -- so the index covers everything
+        there is to cover and is told so. Without that it would register behind the database's
+        published position and be marked stale on a database that has ever committed anything,
+        which is a rebuild for an index that has nothing to build.
+
+        A composition without the index framework is not refused. An index is an accelerator here,
+        not a semantic: the planner falls back to the scan it would have planned anyway, and
+        refusing a CREATE TABLE because the composition has no C7 would take a working database
+        away for a facility the caller never asked for. This is the opposite of the vector case,
+        where the column would be permanently unsearchable and refusing is the only honest answer.
+        """
+        if self._indexes is None or table.primary_key is None:
+            return
+        index = primary_key_index(table, self._pool, self._metrics.sink)
+        if index is None:
+            return
+        registered = self._indexes.register(index)
+        registered.advance_built_through(self._published_lsn_for_new_index())
+        statistics["indexes_created"] = statistics.get("indexes_created", 0) + 1
+
+    def _published_lsn_for_new_index(self) -> int:
+        """Return the position a brand-new index over an empty table may claim to cover."""
+        published = getattr(self._indexes, "published_lsn", None)
+        if callable(published):
+            return int(published())
+        return 0
 
     def _attach_vector_columns(self, table: TableDef, statistics: dict[str, int]) -> None:
         """Create the index of every embedding space a new table declares a column in.
@@ -1773,11 +1822,67 @@ def _require_unique_primary_key(
             continue  # ended, or this very row being updated again
         if len(latest) > position and _equal(latest[position], key):
             raise _duplicate_key(table, key)
-    for ref, version in engine.heap.scan(table, context.snapshot):
+    stored = _rows_carrying_key(engine, table, key, position, context)
+    if stored is None:
+        stored = engine.heap.scan(table, context.snapshot)
+    for ref, version in stored:
         if ref in state or (replacing is not None and ref == replacing):
             continue  # replaced or ended by this transaction: the view above is its truth
         if _equal(version.values[position], key):
             raise _duplicate_key(table, key)
+
+
+def _rows_carrying_key(
+    engine: QueryEngine,
+    table: TableDef,
+    key: Value,
+    position: int,
+    context: _Context,
+) -> tuple[tuple[object, object], ...] | None:
+    """Return the stored rows the primary-key index offers, or None to fall back to a scan.
+
+    The question this check asks -- "is there a live row of this table, visible to my snapshot,
+    carrying this key?" -- is the question an EXACT index answers, and `IndexManager.lookup`
+    already discharges the whole obligation of CONTRACT.md section 8.7 on the way: every candidate
+    is read from the heap, checked for visibility under the caller's snapshot, checked to still
+    carry the key it was filed under, and checked to belong to this table. So the rows this hands
+    back are exactly the rows the scan would have kept, and the loop above is unchanged.
+
+    Without it every insert scanned the whole table, which made a bulk load quadratic: measured
+    at 16 ms a row over 200 rows and 89 ms a row over 3200, on a machine where a commit of ten
+    rows costs about 75 ms in total.
+
+    None means "ask the heap instead", and it is returned for three reasons that are all the same
+    reason: there is no index framework, there is no index over this table, or the index is STALE.
+    A stale index is a SUBSET of the heap, and a subset is precisely what this check must not
+    consult -- a missing entry would let a duplicate key through, which is the duplication this
+    function exists to refuse. Falling back to the scan is slower and right.
+    """
+    manager = getattr(engine, "_indexes", None)
+    if manager is None:
+        return None
+    lookup = getattr(manager, "lookup", None)
+    index_of = getattr(manager, "index", None)
+    if not callable(lookup) or not callable(index_of):
+        return None
+    name = primary_key_index_name(table.name)
+    try:
+        index = index_of(name)
+    except GrafxError:
+        return None  # no index covers this table's key
+    if index.definition.table_id != table.table_id or index.definition.positions != (position,):
+        # A name collision rather than this table's index. Two tables whose names differ only by
+        # case become one file name, and the catalog is what refuses that -- but this reads the
+        # index by name, so it checks that what it found is what it asked for.
+        return None
+    if getattr(index, "stale", False):
+        return None
+    template: list[Value] = [None] * len(table.columns)
+    template[position] = key
+    return tuple(
+        (ref, engine.heap.read(ref))
+        for ref in lookup(name, index_key(template, (position,)), context.snapshot)
+    )
 
 
 def _duplicate_key(table: TableDef, key: Value) -> GrafxQueryError:

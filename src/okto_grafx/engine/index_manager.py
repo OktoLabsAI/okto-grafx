@@ -1473,6 +1473,75 @@ class ProximityIndex(IndexStore):
         )
 
 
+def _tables_written_by(txn: object) -> frozenset[int] | None:
+    """Return the ids of the tables this transaction wrote rows of, or None if it cannot say.
+
+    None is not "no tables". It means the transaction does not describe its row intents in a shape
+    this can read, and the caller must then assume the worst -- that any index may have been owed
+    an entry -- rather than granting freshness it cannot justify.
+    """
+    intents = getattr(txn, "row_intents", None)
+    if intents is None:
+        return None
+    tables: set[int] = set()
+    for intent in intents:
+        table_id = getattr(getattr(intent, "table", None), "table_id", None)
+        if not isinstance(table_id, int) or isinstance(table_id, bool):
+            return None  # an intent whose table cannot be named makes the whole answer unsafe
+        tables.add(table_id)
+    return frozenset(tables)
+
+
+PRIMARY_KEY_INDEX_PREFIX: str = "pk_"
+"""What the index covering a table's declared PRIMARY KEY is named after."""
+
+
+def primary_key_index_name(table_name: str) -> str:
+    """Return the name of the index covering that table's primary key.
+
+    One function rather than an f-string at each site, because the name is a FILE name: the DDL
+    that creates the index and the composition that re-adopts it on the next open must produce
+    the same string or the second one creates a second, empty index beside the first.
+    """
+    return f"{PRIMARY_KEY_INDEX_PREFIX}{table_name}"
+
+
+def primary_key_index(
+    table: object, pool: BufferPool, metrics: MetricsSink
+) -> HashIndex | None:
+    """Return the exact index covering that table's primary key, or None if it declares none.
+
+    A table's primary key is the column every keyed read names, so without this the engine had a
+    complete index framework and no index: `CREATE NODE TABLE ... PRIMARY KEY(id)` registered
+    nothing, `_index_for` searched an empty list, and every `WHERE id = $k` planned a full heap
+    scan. Measured before this existed, a point read cost 5.97 ms at 200 rows, 25.4 ms at 800 and
+    57.4 ms at 3200 -- linear in the table, against a D5 ceiling of five times a reference engine's
+    ~0.9 ms. Insertion carried the same cost through its uniqueness check, which made a bulk load
+    quadratic, and a two-pattern MATCH multiplied two scans.
+
+    EXACT visibility, so the hit is a candidate and `IndexManager.lookup` validates it against the
+    heap under the caller's snapshot (CONTRACT.md section 8.7). That is what lets the index be a
+    superset without being a wrong answer, and it is why a primary key can be indexed at all
+    without the index having to know about visibility.
+
+    A relationship table has no primary key and gets none.
+    """
+    primary = getattr(table, "primary_key", None)
+    if not primary:
+        return None
+    return HashIndex(
+        IndexDefinition(
+            name=primary_key_index_name(table.name),
+            table_id=table.table_id,
+            table_name=table.name,
+            positions=(table.column_index(primary),),
+            visibility=IndexVisibility.EXACT,
+        ),
+        pool,
+        metrics,
+    )
+
+
 class IndexManager:
     """The registry of the indexes of one database, and the door callers use (SPEC-M1 FR-12).
 
@@ -1660,11 +1729,32 @@ class IndexManager:
         """
         applied = 0
         touched: list[str] = []
+        written = _tables_written_by(txn)
         for index in self.indexes():
             moved = index.commit(txn, csn)
             if moved:
                 applied += moved
                 touched.append(index.file)
+            elif written is not None and index.definition.table_id not in written:
+                # This commit staged nothing for this index BECAUSE it wrote no row of the table
+                # the index covers. The index has therefore seen everything there was to see
+                # through this position, and saying so is what keeps it from going stale for a
+                # commit that had nothing to do with it.
+                #
+                # Without this, an index went stale the moment ANY commit happened after it was
+                # created and before it received its first entry -- so "create the schema in one
+                # session, load the data in the next" left every index of that database
+                # permanently stale, and permanently is the right word: `_advance` refuses to move
+                # a stale index, so the loads that followed could never lift it and only a rebuild
+                # could. Reproduced on the vector index before any of this existed: create a table
+                # with a vector column, close, reopen -> stale, and inserting rows did not clear
+                # it.
+                #
+                # The condition is narrow ON PURPOSE. An index whose table WAS written and which
+                # staged nothing is exactly the shape of defect E3 -- a commit that populated no
+                # index at all -- and that case still goes stale, which is the alarm that found
+                # E3 in the first place. Advancing unconditionally here would have silenced it.
+                index.advance_built_through(csn)
         for file in touched:
             # A page applied into this process's pool is invisible to every other process until
             # it reaches the device, and the commit is about to publish a position that says the

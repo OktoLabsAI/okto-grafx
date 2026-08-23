@@ -557,8 +557,10 @@ def test_a_table_with_a_vector_column_gets_the_index_that_makes_it_searchable() 
     )
     after = {index.name for index in built.indexes.indexes()}
     assert result.statistics["indexes_attached"] == 1
-    assert len(after - before) == 1
-    assert (after - before).pop().startswith("vector_Note")
+    # Two indexes appear, and naming both is deliberate: the statement attaches the vector index
+    # AND the index of the primary key it declares, and a test that only counted would not notice
+    # if one of them stopped appearing.
+    assert after - before == {"pk_Note", "vector_Note_minilm_v2"}
 
 
 def test_a_table_with_no_vector_column_attaches_nothing() -> None:
@@ -569,7 +571,9 @@ def test_a_table_with_no_vector_column_attaches_nothing() -> None:
     )
     after = {index.name for index in built.indexes.indexes()}
     assert "indexes_attached" not in result.statistics
-    assert after == before
+    # No VECTOR index -- which is what "attaches nothing" meant -- and exactly the primary-key
+    # index the table declares, so an unexpected third one still fails this.
+    assert after - before == {"pk_Plain"}
 
 
 @pytest.mark.parametrize(

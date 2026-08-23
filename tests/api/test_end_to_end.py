@@ -356,7 +356,9 @@ def test_vector_ddl_through_the_public_door_attaches_its_index(tmp_path: Path) -
         # given the registry that owns it.
         assert table.statistics["indexes_attached"] == 1
         registered = [index.name for index in db.indexes.indexes()]
-        assert registered == ["vector_Chunk_minilm_v2"]
+        # Both, and named exhaustively: the statement attaches the vector index AND the index of
+        # the primary key the same table declares.
+        assert registered == ["pk_Chunk", "vector_Chunk_minilm_v2"]
         assert db.verify("all").findings == ()
 
     with connect(root, page_size=512) as reopened:
@@ -399,11 +401,17 @@ def test_a_reopened_database_re_attaches_the_vector_index_it_declared(tmp_path: 
                 "CREATE NODE TABLE Chunk("
                 "id INT64, embedding VECTOR(minilm_v2), PRIMARY KEY(id))"
             )
-        created = db.indexes.indexes()[0].name
+        # Named, not positioned. A table now also carries the index of its PRIMARY KEY, and
+        # indexes() sorts by name, so "the first one" stopped being the vector one.
+        created = next(
+            index.name for index in db.indexes.indexes() if index.name.startswith("vector_")
+        )
 
     with connect(root, page_size=512) as reopened:
-        assert reopened.attached_indexes == (created,)
-        assert [index.name for index in reopened.indexes.indexes()] == [created]
+        # Still exhaustive: the expectation gained the primary-key index rather than the
+        # assertion being narrowed to vector ones, so an index nobody asked for still fails here.
+        assert reopened.attached_indexes == ("pk_Chunk", created)
+        assert [index.name for index in reopened.indexes.indexes()] == ["pk_Chunk", created]
         # Reachable the way a query reaches it: by SPACE, through the engine.
         assert reopened.vectors.index("minilm_v2").name == created
         assert reopened.verify("all").findings == ()
@@ -411,7 +419,7 @@ def test_a_reopened_database_re_attaches_the_vector_index_it_declared(tmp_path: 
     # Idempotent: the store opens the existing file rather than replacing it (G6), so a third
     # composition adopts the same durable index instead of rebuilding it.
     with connect(root, page_size=512) as third:
-        assert third.attached_indexes == (created,)
+        assert third.attached_indexes == ("pk_Chunk", created)
 
 
 def test_a_reopened_database_says_which_indexes_opened_behind(tmp_path: Path) -> None:
@@ -453,6 +461,10 @@ def test_a_database_with_no_vector_column_attaches_nothing(tmp_path: Path) -> No
         with db.begin("write") as txn:
             txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
     with connect(tmp_path / "db", page_size=512) as reopened:
-        assert reopened.attached_indexes == ()
+        # The table has a primary key, so it has that index and nothing else. Asserting the exact
+        # tuple rather than "no vector index" is what keeps this test able to fail if some other
+        # index is ever invented here, which is the whole point of it.
+        assert reopened.attached_indexes == ("pk_Person",)
         assert reopened.stale_indexes == ()
-        assert reopened.indexes.indexes() == ()
+        assert [index.name for index in reopened.indexes.indexes()] == ["pk_Person"]
+        assert not any(name.startswith("vector_") for name in reopened.attached_indexes)

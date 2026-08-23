@@ -1131,6 +1131,89 @@ an abandoned page is settled as FREE; `grow_to` adds what it reports). Recorded 
 in that file passes WITHOUT the fix and says so in its own docstring -- scripting the interleaving
 deterministically was attempted three times and did not reproduce it. LESSONS L29, L30.
 
+### CF-15 — a complete index framework that nothing ever put an index in (C7/C10; CLOSED)
+
+Found by a smoke test that would not finish: building a 2500-node graph with 5400 edges through
+`connect()` never completed, and the reason was not the writing.
+
+`CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))` registered NO index. `db.indexes.indexes()`
+returned `()`, there is no `CREATE INDEX` in the grammar, and `_index_for` therefore searched an
+empty list -- so `IndexSeek` existed in the planner and was never once chosen. Everything else was
+built and tested: `HashIndex`, the EXACT contract of section 8.7, `IndexManager.lookup`'s heap
+validation, `_index_definitions` feeding the planner, and the commit seam that populates indexes
+(itself the subject of defect E3). The only missing piece was that nobody ever created a definition.
+
+**Measured before, with the fixed per-call cost separated from the marginal cost:**
+
+| rows | point read (marginal) | insert/row | one edge via a two-pattern MATCH |
+|---|---|---|---|
+| 200 | 5.97 ms | 16.1 ms | 292 ms |
+| 800 | 25.4 ms | 32.5 ms | 587 ms |
+| 3200 | 57.4 ms | 89.3 ms | 1953 ms |
+
+Four times the data, 4.3 times the time: a scan. D5 sets the point-read ceiling at five times a
+reference engine's ~0.9 ms on this platform, so the ceiling was missed by ~23x at 200 rows and ~78x
+at 3200, **and by more the larger the table**. The uniqueness check on every insert scanned the same
+way, which made a bulk load quadratic; `MATCH (a {...}), (b {...})` multiplied two scans.
+
+**Fix.** `primary_key_index()` in C7 is the single factory, used by two callers for the two moments
+a table's index has to exist: the DDL that declares the primary key, and the composition that
+re-adopts what is on disk at the next open. One factory rather than an f-string at each site,
+because the name is a FILE name -- two spellings would make the second open create an empty index
+beside the first. The uniqueness check now asks the index rather than scanning. A relationship table
+declares no key and gets none.
+
+**Measured after, same machine, same script:**
+
+| rows | point read | insert/row | one edge |
+|---|---|---|---|
+| 200 | 0.71 ms | 11.9 ms | 86.5 ms |
+| 800 | 1.10 ms | 13.6 ms | 96.6 ms |
+| 3200 | 1.96 ms | 14.1 ms | 98.1 ms |
+
+Point read 29x faster at 3200 rows and now inside the D5 ceiling; insert 6.3x and no longer growing,
+so a bulk load is linear; edge creation 20x and flat.
+
+**The correctness rule that makes it safe, and it is not optional.** A STALE index is withheld from
+the planner and from the uniqueness check. A stale index is a SUBSET of what the heap holds --
+entries it never received -- and a subset is exactly what the EXACT contract cannot repair:
+validating a candidate against the heap removes hits that should not be there and cannot invent ones
+that are missing. A plan built on one answers a keyed read with fewer rows than exist, and a
+uniqueness check built on one accepts a duplicate under a declared primary key. Both fall back to the
+scan they did before any index existed: slower, and right. A database written before this change has
+no index file, so its index is created empty over a populated heap, is therefore stale, and is
+correctly not used until a rebuild.
+
+**A pre-existing defect this exposed, and it was the more serious half.** An index went stale the
+moment ANY commit happened after it was created and before it received its first entry -- and
+`_advance` refuses to move a stale index, so nothing could ever lift it. "Create the schema in one
+session, load the data in the next" therefore left an index that no amount of loading would repair
+and only a rebuild could. Reproduced on the VECTOR index, which predates any of this work:
+
+```
+create table with a vector column, close, reopen -> stale: ('vector_V_s',)
+insert rows                                      -> stale: ('vector_V_s',)   # never clears
+```
+
+`IndexManager.commit` now advances an index whose table this transaction wrote NO row of: such a
+commit had nothing to stage for it because there was nothing to stage, so it has seen everything
+through that position. The condition is narrow on purpose -- an index whose table WAS written and
+which staged nothing is the shape of defect E3, and that case still goes stale, which is the alarm
+that found E3.
+
+**Tests:** `tests/query/test_primary_key_index.py` (10: the index exists and covers the right
+column; a rel table gets none; a keyed read plans a seek and an unkeyed one a scan; seek and scan
+return the same rows; a deleted row is not returned; an updated row moves keys; the duplicate-key
+refusal survives the index answering it; the index comes back fresh across two reopens and a write;
+a stale index is never planned and the answer stays right; a stale index does not let a duplicate
+through). Seven existing tests that named the vector index as the only index there could be were
+widened, not filtered: each expectation GAINED the primary-key index, so each still fails if an
+index nobody asked for appears.
+
+**Cost, reported not hidden:** the full suite went from ~572 s to ~870 s across this change. Part of
+that is a blind-critic agent sharing the machine, so the figure is an upper bound and the split is
+UNMEASURED. Index maintenance on every commit is real and is the thing to measure in W6.
+
 ### D5 durable_commit — 'consult JP' DISCHARGED: the ceiling stands, W6 owns the Windows gap
 
 SPEC-M1 `fr_18f8eff7` anticipated this: *"se o multiplo de commit exceder 10x, o pipeline PARA em

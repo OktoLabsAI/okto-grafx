@@ -822,3 +822,32 @@ the case that was still open.
 Practical form, and it is the same shape as L28 and L30: before writing CLOSED, name the parameter
 you held fixed while measuring -- the budget, the process count, the table count, the page size --
 and either vary it or write down that you did not.
+
+
+## L32 — a component can be complete, tested, signed off, and reachable by nobody
+
+C7 built an index framework: a hash index, the dual visibility rule of section 8.7, candidate
+validation against the heap, staleness detection, rebuild, recovery. C10 built `IndexSeek` into the
+planner and wired `_index_definitions` to feed it. Both were reviewed and both were right. And
+`db.indexes.indexes()` returned `()` on every database anyone ever created, because no statement in
+the grammar creates an index and `PRIMARY KEY` did not either. `_index_for` searched an empty list,
+`IndexSeek` was never once chosen, and a facility that was fully built was fully unreachable.
+
+Every test of C7 passed, because they built their indexes by hand. Every test of C10's planner
+passed, because they handed it definitions directly. The seam between "the framework can hold an
+index" and "something puts one in it" belonged to neither component's suite, so neither component's
+suite covered it -- and the integration tests did not notice either, because a scan returns the same
+ROWS as a seek. Only the clock told the difference, and no test asserts a clock.
+
+**The rule:** when two components meet, ask what CREATES the thing they exchange, and write a test
+at the outermost door that asserts it exists. Not that it works -- that it EXISTS. `assert
+db.indexes.indexes() != ()` after a `CREATE TABLE` would have caught this on the first day, and it
+is one line.
+
+Same family as E3, which was the commit seam not populating any index, and it is not a coincidence
+that both defects lived on a seam and both were invisible to a green suite. E3 was found by
+counterfactual (revert the seam, watch 1615 tests stay green); this one was found by a smoke test
+that would not finish. Neither was found by anything that was looking.
+
+**Corollary for a review:** "component X is signed off" and "the feature X provides is reachable"
+are different claims, and a per-component definition of done can only ever establish the first.
