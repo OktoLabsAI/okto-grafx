@@ -105,6 +105,10 @@ def test_concurrent_writers_leave_a_readable_heap_and_lose_nothing(tmp_path: Pat
         f"({conflicts} retryable conflicts along the way)"
     )
     assert len(stored) == len(set(stored)), "a row is stored more than once"
+    # The other direction, and it is not implied by the one above: a row NO writer acknowledged
+    # is a phantom, and a set that only checks acknowledged-implies-stored cannot see one.
+    phantom = sorted(set(stored) - set(acknowledged))
+    assert not phantom, f"rows nobody acknowledged are stored: {phantom[:10]}"
     assert sorted(stored) == sorted(reopened_rows), "the reopened database disagrees"
     assert [finding.kind for finding in live_findings] == []
     assert [finding.kind for finding in reopened_findings] == []

@@ -1123,6 +1123,38 @@ asserted by construction rather than by scheduling: page 0 is never offered for 
 | `_reusable_index` pin guard | SURVIVES -- same, PUNCHLIST |
 | `_grow_buckets` loses `reuse=False` | SURVIVES -- the loop still terminates and still reaches its target; costs a wasted page, PUNCHLIST |
 
+**Round 4 -- the undo could not undo a page the attempt had already written.** `_abandon_rows`
+takes a page back by restamping its rows invisible IN THE FRAME and then discarding the frame
+unwritten, and both halves only work while the device has never seen the page. Round 2 taught the
+measurement to include pages the pool had already written back -- correctly, for the LOG -- and the
+undo then discarded those too, which throws away the corrected frame and leaves the attempt's bytes
+on the device. Measured by the round-3 review at a 512-byte page size, one refused attempt of 60
+rows:
+
+| frames | outcome for a participant that did none of the writing |
+|---|---|
+| 4 to 58 | rows of the refused transaction are READABLE, and `verify()` reports clean |
+| 59 to 62 | `corruption_detected`: the chain link was written and its target was not |
+| 63 and above | correct -- nothing had been evicted, so nothing had escaped |
+
+Not a regression (the pre-fix tree was worse at every budget), and blocking anyway for the reason
+L31 states: the register said CLOSED without naming the regime, and three docstrings asserted the
+undo was total.
+
+**Round-4 fix:** the undo is ALL-OR-NOTHING at the device. If any page of the attempt reached the
+device, every page of it is WRITTEN there in its restamped form -- a chain the device can walk whose
+rows carry no commit number and are invisible to every snapshot, which is space leaked exactly like
+the page an append abandons (G6) and never a row a reader can meet. If no page reached it, every
+frame is dropped as before. The page-half test is now a matrix over eight budgets; reverting to the
+old always-discard undo kills it at 4, 12, 24, 40, 59 and 62 and leaves 64 and 1024 green.
+
+**Also round 4:** `_reusable_index` removing the candidate from the reuse list was a survivor whose
+reversion hands one index to two owners -- reproduced through `connect()` with three writers as
+`the page chain of table 'Item' returns to page 7`. Every reuse test took exactly ONE page from the
+list, and so does the smoke workload, which is the regime that cannot see it. Two more declarations
+that nothing held are now held directly: the relinked page being in the interest set, and the mark
+subtraction that keeps the undo off a page the attempt never touched.
+
 **Tests:** `tests/smoke/test_concurrent_writers.py` (symptom; fails without the fix with 10
 `page_unwritten`; 7 consecutive green runs after the settle), `tests/txn/test_chain_relink_
 regressions.py` (cause: nothing of a refused attempt left dirty; the relinked page is carried by the
@@ -1210,9 +1242,11 @@ through). Seven existing tests that named the vector index as the only index the
 widened, not filtered: each expectation GAINED the primary-key index, so each still fails if an
 index nobody asked for appears.
 
-**Cost, reported not hidden:** the full suite went from ~572 s to ~870 s across this change. Part of
-that is a blind-critic agent sharing the machine, so the figure is an upper bound and the split is
-UNMEASURED. Index maintenance on every commit is real and is the thing to measure in W6.
+**Cost, measured after the machine was free:** 572 s before this change, 870 s with a blind-critic
+agent sharing the box, **610 s** on the same tree with nothing else running. So index maintenance on
+every commit costs about **6.6%** of the suite, and the 52% figure an earlier draft of this entry
+carried was almost entirely the other agent. Recorded because it is the kind of number that gets
+quoted: a measurement taken on a loaded machine is a measurement of the load.
 
 ### D5 durable_commit — 'consult JP' DISCHARGED: the ceiling stands, W6 owns the Windows gap
 

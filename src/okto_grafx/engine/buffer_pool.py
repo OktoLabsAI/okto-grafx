@@ -507,7 +507,17 @@ class BufferPool:
 
         A caller whose loop is "allocate until the file is long enough" must pass ``reuse=False``.
         For those, a hand-out that does not lengthen the file is not a saving: it makes the return
-        value describe something other than the growth, and the loop go round again.
+        value describe something other than the growth, and the loop go round again. Three do:
+        ``grow_to`` and ``IndexStore._grow_buckets`` wait on ``page_count``, and ``write_chain``
+        builds a list of DISTINCT pages that the pool must not inject a duplicate into.
+
+        The other seven callers take the default, and each was checked rather than assumed. They
+        are ``CatalogStore.bootstrap``, ``Database`` identity, ``HeapStore.bootstrap`` and
+        ``IndexStore.create`` -- all four guarded by ``page_count(file) == 0``, where no page can
+        be waiting, and all four refusing outright if the index they get is not page 0 -- plus
+        ``HeapStore._append`` and ``_extent_for`` and ``IndexStore._append_bucket_page``, which ask
+        for a fresh page and link whatever they are given. For every one of those, reuse is the
+        point.
         """
         prospective = self._storage.page_count(file) if self._storage.exists(file) else 0
         self._make_room(file, prospective)
@@ -585,6 +595,34 @@ class BufferPool:
         )
 
     @_guarded
+    def pages_written_back(self, file: str | None = None) -> frozenset[tuple[str, PageIndex]]:
+        """Return the pages this pool has WRITTEN OUT since the last :meth:`forget_modified`.
+
+        The other half of :meth:`modified_pages`, and the caller that needs it apart is the one
+        undoing a unit of work. Forgetting a frame restores the device only for a page the device
+        has never seen; for a page this pool has already written, the device carries the work and
+        forgetting the frame throws away the only corrected copy of it. A caller cannot tell those
+        two apart from the dirty flag -- a written-back page is CLEAN -- so it asks here.
+        """
+        return frozenset(
+            key for key in self._modified if file is None or key[0] == file
+        )
+
+    @_guarded
+    def write_back(self, file: str, page_index: PageIndex) -> bool:
+        """Put one resident page on the device now, and say whether there was one to put.
+
+        A flush of the whole file would also write pages that have nothing to do with the caller.
+        This writes exactly the page named, which is what an all-or-nothing undo needs: it decides
+        page by page and must not carry anything else along with its decision.
+        """
+        frame = self._frames.get((file, page_index))
+        if frame is None:
+            return False
+        self._write_back(file, page_index, frame.page)
+        return True
+
+    @_guarded
     def forget_modified(self) -> None:
         """Open a fresh window for :meth:`modified_pages`, forgetting what was written back.
 
@@ -605,8 +643,8 @@ class BufferPool:
         left all zeros it stays that way for the life of the database. ``is_unwritten_image``
         cannot tell that page from the one a crash leaves between allocating and writing, so
         ``verify()`` reports ``page_unwritten`` and a database in which nothing went wrong stops
-        reporting clean. Under four writer processes that happened about once a run, which made a
-        test that asserts a clean database fail two runs in six.
+        reporting clean. Under the three writer processes of `tests/smoke` that happened about once a
+        run, which made a test that asserts a clean database fail one run in six.
 
         Writing the page settles the ambiguity in the honest direction rather than teaching
         verify to look away. The page IS free; a FREE page with a valid checksum and an even
@@ -882,8 +920,8 @@ class BufferPool:
             # The reserved header page of every paged file (A2), which _require_reserved_header_page
             # and CatalogStore._release both refuse by name. It cannot arrive here today -- the
             # first begin() invalidates the whole pool and writes page 0 back, which takes it out
-            # of _grown for good, and a probe over the whole suite saw 12 reclaims and none of them
-            # page 0. That is soundness by scheduling; this is soundness by construction, and the
+            # of _grown for good, and a probe over the whole suite saw 73 reclaims of the heap and none of
+            # them page 0. That is soundness by scheduling; this is soundness by construction, and the
             # two cost the same.
             return
         self._abandoned.setdefault(file, []).append(page_index)

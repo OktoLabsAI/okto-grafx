@@ -985,3 +985,41 @@ either. A pool configured with a one-page budget can hold an arbitrarily large k
 Two ways to close it in W6: clear the set at the same points a checkpoint settles pages, or charge
 its size against the budget the way resident frames are. Neither changes any answer; both change
 what a small-budget pool costs in memory.
+
+## Mutation survivors on the append fix after round 4 (C1/C5; recorded under 14.1.5)
+
+A 34-mutant battery over the changed surface, one mutant at a time, each survivor then re-run
+against the whole suite. Three survivors from the round-3 report were closed by tests
+(`_reusable_index` removing its candidate, the mark subtraction, and the relinked page being
+declared). These are what remain, each with the reason no test holds it. None has a production path
+I could construct to the reverted behaviour; that is the condition 14.1.5 sets for recording rather
+than covering, and if a path is ever found the entry becomes a defect.
+
+- **`_reusable_index` skipping a resident-and-pinned candidate.** Nothing should be able to pin a
+  page that was discarded and never written. The guard exists because the alternative is `allocate`
+  deleting a frame whose holder still has the object.
+- **`_reusable_index` scanning backward rather than forward**, and **`allocate` dropping its
+  `del self._frames[key]`** — both equivalent-class: a different page index or a different LRU
+  position, same bookkeeping.
+- **`modified_pages(file=...)` and `settle_abandoned(file=...)`** have no production caller, so
+  their filter has one reachable value and is unmeasured however green the suite is (L28).
+- **`settle_abandoned` popping rather than reading the list**, and **`_write_back` withdrawing from
+  the reuse list** — an A93 2x2 pair: each survives alone, both together are killed by
+  `test_a_page_settled_as_free_is_not_handed_out_again_by_this_pool`. They are two spellings of one
+  guarantee and either alone is enough.
+- **`_reclaim` keeping the key in `_grown`.** Needs a second `_reclaim` of the same page with no
+  hand-out or write-back between, which no caller produces.
+- **`write_chain` and `IndexStore._grow_buckets` passing `reuse=False`.** The parameter itself is
+  covered; what is not covered is these two callers' use of it. `write_chain`'s harm needs a
+  caller-supplied reuse list overlapping a reclaimed index, which `chain_pages()` cannot produce
+  because its pages are device-backed. `_grow_buckets` costs a wasted page, never a wrong result.
+- **`_abandon_rows` discarding every heap page rather than the measured set.** Over 2165 instrumented
+  calls across six test packages, the measured set never contained a non-heap page, so the two are
+  the same value on every input the suite reaches.
+- **`_abandon_rows`'s explicit header-page entry.** Now redundant with the measured set, which is
+  two mechanisms answering one question (A67). Worth removing in W6 rather than keeping a guard whose
+  only evidence is that another one covers it.
+
+Also recorded, and it is the more useful number: `tests/storage_core/test_buffer_pool.py` and
+`test_heap_store.py` kill NONE of the 34. The whole new surface is held by one file,
+`tests/txn/test_chain_relink_regressions.py`.

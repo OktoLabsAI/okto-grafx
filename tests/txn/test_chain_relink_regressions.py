@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from okto_grafx.domain.errors import GrafxWriteConflict
+from okto_grafx.domain.errors import GrafxError, GrafxWriteConflict
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.page import HEADER_PAGE_INDEX, PageType
@@ -136,15 +136,6 @@ def _verify(stack: Stack):
     ).verify("all")
 
 
-def _zero_pages(stack: Stack) -> list[int]:
-    blank = b"\x00" * stack.storage.page_size
-    return [
-        index
-        for index in range(1, stack.storage.page_count(HEAP))
-        if stack.storage.read_page(HEAP, index) == blank
-    ]
-
-
 # --- the defect: a refused append leaves a link to the page it abandoned ------------------------
 
 
@@ -219,6 +210,12 @@ def test_a_refused_append_leaves_no_chain_link_to_the_page_it_abandoned(
 
 def test_a_refused_append_leaves_nothing_of_itself_dirty_in_the_pool(tmp_path: Path) -> None:
     """The invariant the fix rests on, asserted directly rather than through its consequence.
+
+    Measured and recorded: this one kills no mutant on the changed surface either, for the same
+    reason the first test in this file does not -- its refusal lands on the ROW half, so the
+    attempt under test writes nothing and both sides of the assertion are the same empty value.
+    It stays because the invariant is worth stating where a reader will look for it; what HOLDS
+    the invariant is `test_a_refusal_on_the_PAGE_half_...` below, over eight buffer budgets.
 
     A commit attempt that is refused must leave the pool exactly as it found it. Anything of the
     attempt left dirty is written back by the next flush of ANY participant, at which point the
@@ -484,8 +481,9 @@ def test_growing_a_file_to_an_index_never_spends_a_page_it_meant_to_add(
     assert after > target - 1
 
 
+@pytest.mark.parametrize("frames", [4, 12, 24, 40, 59, 62, 64, 1024])
 def test_a_refusal_on_the_PAGE_half_undoes_the_link_the_append_had_already_made(
-    tmp_path: Path,
+    tmp_path: Path, frames: int
 ) -> None:
     """The undo half of the fix, reached by the only refusal that can reach it.
 
@@ -506,11 +504,11 @@ def test_a_refusal_on_the_PAGE_half_undoes_the_link_the_append_had_already_made(
     """
     root = tmp_path / "db"
     clock = ManualClock()
-    p1 = _participant(root, "p1", clock)
+    p1 = _participant(root, "p1", clock, frames=frames)
     table = _registered(p1, _table())
     next_id = _fill_until_a_second_page(p1, table)
 
-    p2 = _participant(root, "p2", clock)
+    p2 = _participant(root, "p2", clock, frames=frames)
     doomed = p2.manager.begin("write")            # P2's snapshot is taken here
     for offset in range(60):                      # enough to need a page of its own
         doomed.stage_row_insert(table, (next_id + offset, FILLER))
@@ -541,7 +539,12 @@ def test_a_refusal_on_the_PAGE_half_undoes_the_link_the_append_had_already_made(
     stored = _rows(witness, table)
     assert (9001, "p1-wins") in stored
     assert (9002, "after") in stored
-    assert not any(values[0] == next_id for values in stored), "an abandoned row is readable"
+    # The WHOLE doomed batch, not just its first row. The pages an eviction had already written
+    # carry the LAST rows of the batch, so an assertion on the first id passed at every budget
+    # while rows 2 to 60 sat readable on the device.
+    doomed_ids = set(range(next_id, next_id + 60))
+    leaked = sorted(values[0] for values in stored if values[0] in doomed_ids)
+    assert not leaked, f"rows of a refused transaction are readable: {leaked[:8]}"
     assert _verify(witness).findings == ()
 
 
@@ -599,3 +602,124 @@ def test_the_reserved_header_page_is_never_offered_for_reuse(tmp_path: Path) -> 
     assert HEADER_PAGE_INDEX not in pool._abandoned.get(HEAP, []), (
         "the reserved header page was put on the reuse list"
     )
+
+
+def test_one_attempt_taking_two_pages_never_gets_the_same_index_twice(
+    tmp_path: Path,
+) -> None:
+    """A page handed out of the reuse list must LEAVE it, or one index gets two owners.
+
+    Every other reuse test here takes exactly one page from the list, and so does the smoke
+    workload -- eight rows of 120 bytes fit on one 8192-byte page. That regime cannot see this:
+    the second hand-out is what collides. A retry that re-stages a multi-row batch takes two,
+    and then two pages of the same chain are the same page, which `refuse_endless_chain` meets
+    as ``the page chain of table 'Item' returns to page 7`` -- reproduced through `connect()`
+    with three writer processes.
+    """
+    root = tmp_path / "db"
+    clock = ManualClock()
+    stack = _participant(root, "solo", clock)
+
+    spare = stack.pool.allocate(HEAP, int(PageType.HEAP))
+    abandoned = spare.page_index
+    stack.pool.unpin(HEAP, abandoned, dirty=True)
+    stack.pool.discard(HEAP, abandoned)          # exactly one page waiting
+
+    first = stack.pool.allocate(HEAP, int(PageType.HEAP))
+    stack.pool.unpin(HEAP, first.page_index, dirty=True)
+    second = stack.pool.allocate(HEAP, int(PageType.HEAP))
+    stack.pool.unpin(HEAP, second.page_index, dirty=True)
+
+    assert first.page_index == abandoned, "the abandoned page was not reused at all"
+    assert second.page_index != first.page_index, (
+        "the reuse list handed the same index out twice"
+    )
+
+
+def test_a_page_dirty_before_the_attempt_is_not_taken_back_with_it(tmp_path: Path) -> None:
+    """The mark subtracts, and this is the direction where getting it wrong LOSES data.
+
+    `_attempt_pages` is the difference between two readings of the pool, and the mark is the
+    first one. Without the subtraction the undo of a refused attempt takes back pages that were
+    already dirty when it started -- changes the attempt never made and has no business
+    reverting.
+
+    Two things had to be arranged for this to be observable, and both say something about the
+    regime. The refusal is a heap refusal rather than a write conflict, because a conflict needs
+    another participant to commit and that moves the read-view token, which drops every frame and
+    empties the mark. And the budget is large, so nothing is evicted and the undo takes the
+    DISCARD path -- on the write-back path an over-included page is merely written, which hides
+    the mistake rather than answering it.
+    """
+    root = tmp_path / "db"
+    clock = ManualClock()
+    stack = _participant(root, "solo", clock, frames=1024)
+    table = _registered(stack, _table())
+
+    doomed = stack.manager.begin("write")
+    # Dirtied AFTER the transaction opened: begin() refreshes the read view, and that writes back
+    # and drops every frame, so anything dirtied before it is gone by the time the mark is taken.
+    _registered(stack, _table(table_id=2, name="other"))
+    dirty_before = stack.pool.modified_pages("catalog.dat")
+    assert dirty_before, "the setup did not leave a page dirty before the attempt"
+
+    doomed.stage_row_insert(table, (1, "fine"))
+    doomed.stage_row_insert(table, ("not-an-int", "bad"))   # the heap refuses this one
+    doomed.note_write(stack.manager.partition_of(table.table_id, b"1"))
+    with pytest.raises(GrafxError):
+        stack.manager.commit(doomed)
+    stack.manager.rollback(doomed)
+
+    for _file, page_index in dirty_before:
+        assert stack.pool.is_resident("catalog.dat", page_index), (
+            f"catalog page {page_index} was dirty before the attempt and the undo took it"
+        )
+
+    # And it still reaches the device when this participant next writes, which is the consequence.
+    stack.pool.flush()
+    witness = _participant(root, "witness", clock)
+    assert witness.catalog.catalog.table("other").table_id == 2
+
+
+def test_the_relinked_page_is_declared_as_well_as_logged(tmp_path: Path) -> None:
+    """CF-14's second consequence, held on its own rather than through a symptom.
+
+    A page image replaces the WHOLE page, so two commits that write one page conflict however
+    disjoint the rows they thought they were touching were -- and that rule is only as good as
+    the set that declares them. The page an append relinks was in nobody's interest set, so two
+    participants could rewrite one tail page and neither be refused. The commit section makes
+    that hard to observe as a symptom today, which is exactly why the declaration is asserted
+    directly: a guard whose protection comes from somewhere else is a guard nothing tests.
+    """
+    root = tmp_path / "db"
+    clock = ManualClock()
+    stack = _participant(root, "solo", clock)
+    table = _registered(stack, _table())
+    next_id = _fill_until_a_second_page(stack, table)
+
+    pages_before = stack.storage.page_count(HEAP)
+
+    txn = stack.manager.begin("write")
+    for offset in range(60):
+        txn.stage_row_insert(table, (next_id + offset, FILLER))
+    txn.note_write(stack.manager.partition_of(table.table_id, b"grow"))
+    stack.manager.commit(txn)
+    # The set the commit validated against, read from the transaction it belongs to.
+    declared = set(txn.write_partitions)
+
+    assert stack.storage.page_count(HEAP) > pages_before, "this commit allocated no page"
+
+    from okto_grafx.domain.txn.partitions import page_partition
+
+    reached_through = set()
+    for index in range(stack.storage.page_count(HEAP)):
+        with stack.pool.pinned(HEAP, index) as page:
+            if page.page_type == int(PageType.HEAP) and page.next_page >= pages_before:
+                reached_through.add(index)
+    assert reached_through, "no page links forward into the pages this commit allocated"
+    missing = [
+        index
+        for index in reached_through
+        if page_partition(HEAP, index) not in declared
+    ]
+    assert not missing, f"pages {missing} carry the link and were declared by nobody"

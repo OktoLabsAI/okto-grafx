@@ -1354,24 +1354,65 @@ class TransactionManager:
                     self._restamp(item.ended, xmax=NO_CSN, flags=_LIVE_FLAGS)
             except GrafxError:
                 pass
-        # The restamp keeps any live holder of these pages coherent; the DISCARD is what keeps
-        # them off the device. The frames hold the page as it looked during the refused attempt,
-        # and written back -- by the next flush, or by a read view dropping them -- they would
-        # land over pages another participant has since committed (C5 round-2 B2: rows lost,
-        # verify clean). Dropped unwritten, the device is the truth the next pin re-reads.
+        # The restamp keeps any live holder of these pages coherent; what happens to the FRAMES
+        # is decided below, and it is decided for the whole attempt at once.
         touched = {(self._heap_file, page_index) for page_index in self._pages_touched_by(rows)}
         if rows:
             touched.add((self._heap_file, HEADER_PAGE_INDEX))
-        # The measured set, and the reason this method stopped being enough on its own. The
-        # attempt may have relinked a page no row of it ever landed on, and it may have dirtied
-        # pages before it raised and produced no rows at all -- in which case the loop above
-        # discards nothing while the pool still holds the attempt's writes. Both left the pool
-        # holding state of a commit that did not happen, which the next flush of ANY participant
-        # carried to the device.
+        # The measured set, and the reason the enumeration above stopped being enough on its own.
+        # The attempt may have relinked a page no row of it ever landed on, and it may have
+        # dirtied pages before it raised and produced no rows at all -- in which case the
+        # enumeration names nothing while the pool still holds the attempt's writes.
         touched.update(self._attempt_pages())
-        for file, page_index in touched:
+        self._undo_pages(touched)
+
+    def _undo_pages(self, touched: set[tuple[str, PageIndex]]) -> None:
+        """Take back the pages of a commit that did not happen -- all of them the same way.
+
+        TWO WAYS TO TAKE A PAGE BACK, and which one is available is not a choice.
+
+        DISCARD, for a page the device has never seen. The frame holds the page as it looked
+        during the refused attempt, and written back -- by the next flush, or by a read view
+        dropping frames -- it would land over pages another participant has since committed (C5
+        round-2 B2: rows lost, verify clean). Dropped unwritten, the device is the truth the next
+        pin re-reads, and the attempt leaves nothing anywhere.
+
+        WRITE BACK, for a page the device has ALREADY seen. Discarding one of those undoes
+        nothing: the device carries the attempt's bytes whatever happens to the frame, and the
+        frame is the only copy that carries the restamp which makes those rows invisible.
+        Discarding it therefore throws away the repair and keeps the damage.
+
+        **The two must not be mixed within one attempt, and mixing them was a defect.** A commit
+        whose working set is larger than the buffer budget has some of its pages evicted -- and
+        therefore written -- while it is still running. Discarding the rest then left the device
+        holding a chain whose link had been written and whose target had not, which a later walk
+        follows into a page nobody wrote (`corruption_detected`, on a database in which nothing
+        went wrong), or left the attempt's rows readable under a stamp no commit ever assigned,
+        with `verify()` reporting clean. Measured at a 512-byte page size: a refused attempt of 60
+        rows leaked readable rows at every frame budget from 4 to 58, and raised
+        `corruption_detected` at 59 to 62; only at 63 and above, where nothing had been evicted,
+        did the old undo work. It was measured at 1024.
+
+        So: if ANY page of the attempt reached the device, EVERY page of it is written there in
+        its restamped form. The result is a chain the device can walk, whose rows carry no commit
+        number and are therefore invisible to every snapshot -- space leaked, exactly like the page
+        an append abandons (G6), and never a row a reader can meet. If NO page reached the device,
+        every frame is dropped and the device never learns the attempt existed.
+
+        This runs while a failure is already unwinding, so nothing here may raise: replacing that
+        failure with one about cleaning up after it would hide the reason the commit is being
+        abandoned at all.
+        """
+        try:
+            escaped = touched & self._pool.pages_written_back()
+        except GrafxError:
+            escaped = frozenset(touched)  # cannot tell: assume the device has seen them
+        for file, page_index in sorted(touched):
             try:
-                self._pool.discard(file, page_index)
+                if escaped:
+                    self._pool.write_back(file, page_index)
+                else:
+                    self._pool.discard(file, page_index)
             except GrafxError:
                 continue
 
