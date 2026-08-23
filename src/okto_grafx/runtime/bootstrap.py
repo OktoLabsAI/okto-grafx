@@ -35,6 +35,7 @@ from okto_grafx.adapters.metrics_openmetrics import OpenMetricsSink
 from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
 from okto_grafx.adapters.checksum_pure import PureCrc32c
+from okto_grafx.domain.page.checksum import crc32c_implementation
 from okto_grafx.adapters.vectormath_pure import PureVectorMath
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -229,7 +230,7 @@ def install_checksum(config: DatabaseConfig) -> str:
     """
     selector = config.checksum
     if selector == "pure":
-        return PureCrc32c().install()
+        return _install(PureCrc32c())
     try:
         from okto_grafx.adapters.checksum_native import NativeCrc32c
     except ImportError as failure:  # pragma: no cover - the module is part of this package
@@ -239,9 +240,9 @@ def install_checksum(config: DatabaseConfig) -> str:
                 field="checksum",
                 value=selector,
             ) from failure
-        return PureCrc32c().install()
+        return _install(PureCrc32c())
     try:
-        return NativeCrc32c().install()
+        return _install(NativeCrc32c())
     except (ImportError, GrafxConfigurationError) as failure:
         if selector == "native":
             raise GrafxConfigurationError(
@@ -251,7 +252,20 @@ def install_checksum(config: DatabaseConfig) -> str:
                 value=selector,
             ) from failure
         # "auto" asked for the fastest correct answer, and the reference is a correct answer.
-        return PureCrc32c().install()
+        return _install(PureCrc32c())
+
+
+def _install(adapter: object) -> str:
+    """Install one checksum adapter and return the name that is now IN EFFECT.
+
+    The adapters' own ``install()`` returns the name it REPLACED, and says so; this door promises
+    the name it installed. While the reference was the only implementation that could ever be in
+    effect, the two were the same string and nothing could tell them apart -- so the first machine
+    with a native provider installed made ``install_checksum(checksum='pure')`` answer ``'native'``.
+    Two values that must be different were secretly one.
+    """
+    adapter.install()  # type: ignore[attr-defined]
+    return crc32c_implementation()
 
 
 def build_coordinator(context: PortContext) -> object:

@@ -344,6 +344,11 @@ def calibrate(
         "processor": platform.processor() or "unknown",
         "python": sys.version.split()[0],
         "ladybug": _ladybug_version(),
+        # WHICH implementation answered is part of the measurement, not of the machine. The
+        # durable-commit multiple is 17x with the pure-Python checksum and 5x with the native one
+        # on the same box (the accelerator is optional, `okto-grafx[accel]`), so an artefact that
+        # records the multiple without recording this says two different things with one number.
+        "checksum": _checksum_implementation(),
         "taken_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "workspace": str(workspace),
     }
@@ -354,6 +359,20 @@ def calibrate(
         environment=environment,
         notes=tuple(notes),
     )
+
+
+def _checksum_implementation() -> str:
+    """Return the CRC-32C implementation this run measured, or why it could not be asked.
+
+    Never raises: an artefact missing one descriptive field is worth more than a calibration that
+    could not be written, and the ceiling verdict does not depend on this value.
+    """
+    try:
+        from okto_grafx.domain.page.checksum import crc32c_implementation
+
+        return str(crc32c_implementation())
+    except Exception as failure:  # noqa: BLE001 - a description, never a verdict
+        return f"unknown ({type(failure).__name__})"
 
 
 def publish(result: CalibrationResult, destination: Path) -> str:

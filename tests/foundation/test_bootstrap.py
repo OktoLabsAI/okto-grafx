@@ -363,6 +363,25 @@ def test_the_json_sink_never_reaches_the_composition_root_without_a_destination(
 # --- the CRC-32C implementation (D5 item 2, D2's native acceleration behind a port) ------------
 
 
+@pytest.fixture(autouse=True)
+def _restore_checksum() -> object:
+    """Put back whatever CRC-32C implementation was in effect before a test changed it.
+
+    The implementation is process-global on purpose: every component of a database must compute
+    the same checksum, so it is installed once and not injected per object. That makes it shared
+    state between tests, and a machine WITH a native provider is the only one where a test that
+    left `native` behind can make the next test read something other than what it installed.
+    """
+    from okto_grafx.adapters.checksum_native import NativeCrc32c
+    from okto_grafx.adapters.checksum_pure import PureCrc32c
+    from okto_grafx.domain.page.checksum import crc32c_implementation
+
+    before = crc32c_implementation()
+    yield
+    if crc32c_implementation() != before:
+        (NativeCrc32c() if before == "native" else PureCrc32c()).install()
+
+
 def test_the_pure_selector_installs_the_reference() -> None:
     """The reference is always installable: it is the thing every candidate is measured against."""
     assert bootstrap.install_checksum(DatabaseConfig(path=":memory:", checksum="pure")) == "pure"

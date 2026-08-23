@@ -717,3 +717,34 @@ Footnote, because it is the same lesson one level up: the coordinator's own scri
 entry died with `UnicodeEncodeError` on the lone surrogate in its text. A non-`Grafx*` escape from an
 unpaired code point is not hypothetical -- it is what happens to anything that later re-serialises the
 value, which is the reason the decode guard's docstring gives for existing.
+
+## L28 — a value that has only ever had one possible answer is not being tested, it is being echoed
+
+`install_crc32c` returns the name it REPLACED, and says so in its docstring. The composition root's
+`install_checksum` promised the name it INSTALLED and returned that value straight through. The two
+are different things -- and for the whole life of the project they were the same string, because the
+pure-Python reference was the only implementation that could ever be in effect. Replaced == installed
+== "pure", on every path, in every test.
+
+The defect appeared the moment a machine had a native provider: `install_checksum(checksum="pure")`
+answered `"native"`. Nothing about the code had changed; the ENVIRONMENT had gained a second possible
+answer, and the first thing it did was tell the two apart.
+
+**The rule:** when a value can currently take only one answer, no test of it is a test. A test that
+asserts `f() == "pure"` where "pure" is the only string the system can produce passes against every
+implementation of `f`, correct or not -- it is the same shape as L16 (an earlier operation satisfies
+the assertion) and L24 (the regime with a safety net is the one that gets tested), one level more
+abstract: the assertion cannot fail, so it measures nothing.
+
+**What to do about it:** when a port has one adapter, a selector has one reachable value, or an
+optional dependency is absent everywhere the suite runs, that surface is UNMEASURED however green it
+looks. Either make a second answer reachable in the test (install the extra in CI, inject a second
+adapter, force the selector) or write the gap down. The three of these in this repository were the
+checksum implementation, the vector math adapter, and the platform family -- and the platform family
+is the one C13's cross-family matrix exists to keep honest, which is the shape of the answer for the
+other two.
+
+Corollary for a review: "this assertion has never failed" and "this assertion cannot fail" look
+identical in a green run, and the battery is what distinguishes them -- but only if the mutation can
+produce the second answer at all. A mutation battery on a single-adapter port is measuring the same
+blind spot it is meant to find.

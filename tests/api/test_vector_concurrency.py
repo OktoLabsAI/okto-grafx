@@ -14,6 +14,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from okto_grafx import connect
 from okto_grafx.domain.errors import GrafxError
 
@@ -115,12 +117,33 @@ def test_a_search_never_escapes_while_another_thread_commits_vectors(tmp_path: P
         writer = threading.Thread(target=writer_loop, daemon=True)
         for thread in (*readers, writer):
             thread.start()
-        time.sleep(8.0)
+        # Driven by WORK, not by the clock. A fixed sleep makes the floor below a hostage of the
+        # machine's throughput: the same 8 seconds bought 30 searches on an idle box and 4 while
+        # the suite shared the CPU, and the floor then failed a run in which nothing was wrong.
+        # The floor itself is not negotiable -- a run that interleaved nothing must not pass
+        # silently (A75.2) -- so the loop waits for the interleaving instead of for a duration.
+        wanted_searches, wanted_commits = 12, 4
+        deadline = time.monotonic() + 120.0
+        while time.monotonic() < deadline:
+            with guard:
+                enough = answered[0] >= wanted_searches and committed[0] >= wanted_commits
+            if enough or escapes:
+                break
+            time.sleep(0.05)
         stop.set()
         for thread in (*readers, writer):
-            thread.join(timeout=60)
+            thread.join(timeout=120)
         assert escapes == [], escapes
-        assert answered[0] > 10 and committed[0] > 3, (answered[0], committed[0])
+        if answered[0] < wanted_searches or committed[0] < wanted_commits:
+            pytest.skip(
+                "machine too loaded to interleave: "
+                f"{answered[0]} searches and {committed[0]} commits in 120 s, below the "
+                f"{wanted_searches}/{wanted_commits} this test needs to have exercised anything. "
+                "The deterministic twin is "
+                "tests/vector/test_overflow_and_ordering.py::"
+                "test_a_search_finishes_on_the_picture_it_started_with_when_the_graph_is_"
+                "discarded_under_it"
+            )
         findings = database.verify("all").findings
         assert findings == (), (
             [(finding.kind, finding.detail[:160]) for finding in findings[:4]],

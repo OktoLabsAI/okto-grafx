@@ -1015,3 +1015,64 @@ is REDONE from the log (`_recover_post_barrier`: drop the index staging, redo WR
 INDEX_WRITE records of this commit through the idempotent doors, publish; failing that, mark the
 covering indexes stale). Test `test_a_commit_whose_index_apply_fails_after_the_barrier_is_redone_
 from_the_log`; reverted: `assert 0 == 2`.
+
+### D5 durable_commit — 'consult JP' DISCHARGED: the ceiling stands, W6 owns the Windows gap
+
+SPEC-M1 `fr_18f8eff7` anticipated this: *"se o multiplo de commit exceder 10x, o pipeline PARA em
+estado explicito 'consult JP' -- a troca para lease justo so por Q&A com o JP (altera D1)"*. That
+state was entered, the Q&A happened, and this is its record.
+
+**Measured side by side, same machine, same operation** (`durable_commit`: one auto-commit CREATE of
+one small node, the bench harness's own definition), Grafx and LadybugDB 0.16.0 in the same run:
+
+| configuration | Linux (ext4, CPython 3.12) | Windows (NTFS, CPython 3.13) |
+|---|---|---|
+| baseline LadybugDB | 2.45 / 3.61 / 2.75 ms | 0.97 / 0.92 ms |
+| pure CRC, lease per commit (default) | 42.6 / 46.2 / 47.2 ms -- **17.4x / 12.8x / 17.2x** | 100 / 93 ms -- **103x / 102x** |
+| **native CRC, lease per commit** | **13.9 / 17.6 / 16.2 ms -- 5.65x / 4.89x / 5.88x -- MET** | 77 / 75 ms -- **79x / 82x** |
+| native CRC + lease retained | 10.0 / 10.7 / 10.0 ms -- 4.08x / 2.97x / 3.65x -- MET | 40 / 40 ms -- 41x / 43x |
+
+**The ceiling is MET on POSIX with the optional accelerator, using the SAFE default lease
+behaviour** -- 3 runs of 3. No lease retention, no yield protocol, no change to D1. It is MISSED on
+Windows by roughly 8x even in the best configuration.
+
+**Where the Windows cost is**, measured by phase: a coordinator control-file publication costs
+16.5 ms, of which `atomic_replace` is 14 ms, of which `CreateFileW` on the source is 11.4 ms. The
+same publication on Linux costs **0.13 ms** -- a factor of ~100. Four such publications happen per
+commit (lease acquire, lease release, reader registration, commit state).
+
+**What the Windows 11 ms is NOT** (each measured, each ruled out): not the directory (a probe
+`CreateFileW` in `control/` costs 1.2 ms), not the device's open `FILE_SHARE_DELETE` handles
+(releasing every cached descriptor before each commit changes nothing), not fsync (0.07 ms/commit
+for all nine), not the advisory lock (the reader publication holds only an in-process lock and costs
+the same 14 ms), and not the `ctypes.Structure` built per call (0.07 ms). The txn manager's own
+`commit.state` publication, the same seven-step sequence through the same device, costs **2.65 ms**.
+That asymmetry is unexplained and it is the W6 investigation's starting point.
+
+**Decision (JP): the ceiling stands as written; do not amend.** Reasons, in order:
+
+1. **SPEC-M1 requires BOTH families green** (`ac_7f69d7dc`: "o gate agregado so fica verde com as DUAS
+   familias verdes"; D9 makes Windows and POSIX equal citizens). Meeting it on POSIX alone does not
+   discharge the gate, and recording it as met would be false.
+2. **Every remaining lever is a reduction in durability-adjacent bookkeeping.** The four publications
+   are epoch ownership (BR-7, AC-6, A74), the reader horizon that stops recycling from eating what a
+   reader needs (BR-10), and the published snapshot source (section 8.5 step 3.7). Optimising the
+   commit IS touching the machinery that makes multi-process safe. That needs a design and a blind
+   critic, not a deadline.
+3. **The one lever that would help most is measured harmful.** `retain_lease` buys 36 ms on Windows
+   and costs another writer **5.3 s** for its first commit; two retaining writers did not finish ten
+   rows each inside the suite timeout. It stays internal. Offering it would trade the property the
+   product exists for -- multi-process writing -- for a benchmark number, which is what SPEC-M1 means
+   by "altera D1".
+
+**Done now, at no cost to safety:** `okto-grafx[accel]` is documented as the recommended install.
+`install_crc32c` replays the acceptance corpus against the reference and refuses a candidate that
+disagrees on any input BEFORE installing, so the accelerated path either produces byte-identical
+digests or never becomes the implementation -- a performance option with no correctness surface.
+
+**W6 owns, in this order:** (1) explain the 11 ms `CreateFileW` asymmetry between the coordinator's
+publications and the txn manager's -- same sequence, same device, 5x apart; (2) cut publications per
+commit: a reader registration per MANAGER rather than per `begin`, and a lease yield protocol (the
+holder releases at its next commit boundary when C3 reports a waiter) which is the only safe form of
+retention; (3) the redundant temp-file fsync in `_publish_once` (the target is fsynced after the
+rename on the same volume). None is a protocol change; all three are C2/C3/C5 seams.

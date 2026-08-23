@@ -857,3 +857,58 @@ P7 and P8 are recorded only, as asked.
   fork-path file belong in a per-component subdirectory of the scratchpad, not in its root**, the
   same way A95 makes the fork root unique. Recorded because every component in this build writes
   its driver to the shared scratchpad today.
+
+
+## W6 — D5 durable_commit on Windows (owner: C2 + C3 + C5)
+
+The ceiling is met on POSIX with `[accel]` and safe defaults (5.65x / 4.89x / 5.88x, 3 runs). It is
+missed on Windows by ~8x. SPEC-M1 `ac_7f69d7dc` requires BOTH families green, so the gate is not
+green and the ceiling is not amended. In priority order:
+
+1. **Explain the `CreateFileW` asymmetry (C2).** A coordinator control-file publication costs 16.5 ms
+   on Windows, of which `atomic_replace` is 14 ms, of which `CreateFileW` on the source is 11.4 ms.
+   The txn manager's `commit.state` publication -- the same seven-step sequence through the same
+   device -- costs 2.65 ms. Ruled out by measurement: the directory (a probe `CreateFileW` in
+   `control/` is 1.2 ms), the device's cached `FILE_SHARE_DELETE` handles (releasing all of them
+   before each commit changes nothing), fsync (0.07 ms per commit for all nine), the advisory lock
+   (the reader publication holds only an in-process lock and costs the same), and the per-call
+   `ctypes.Structure` (0.07 ms). Unexplained. Start here: a 5x difference between two callers of one
+   function is a fact about the caller, not about Windows.
+2. **One reader registration per MANAGER, not per `begin` (C5 + C3).** Measured at ~13 ms per commit
+   on Windows, 0.14 ms on Linux. It is not part of section 8.5 at all -- it is `begin`/CF-2 -- so it
+   costs nothing frozen to change.
+3. **A lease YIELD protocol (C3 + C5).** Retention alone is measured harmful: another writer waits
+   5.3 s for its first commit, and two retaining writers did not finish ten rows each inside the
+   suite timeout. The safe form is a holder that releases at its next commit boundary when C3 reports
+   a waiter, which needs C3 to expose "someone is waiting" cheaply (a waiter file, or a flag in the
+   lease record). `retain_lease` stays internal until that exists. SPEC-M1 calls the unsafe form a
+   change to D1, and it is.
+4. **The redundant temp-file fsync in `_publish_once` / `_publish` (C3 + C2).** The target is fsynced
+   after the rename on the same volume; halves the control fsyncs from 8 to 4.
+
+Not on this list, and deliberately: group commit. It amortises the WAL barrier, which is 0.76 ms of
+the commit, and it cannot be done under FROZEN section 8.5 without changing what `CommitReport.csn`
+means for each member of a batch. Measured at ~1.002x.
+
+
+## The checksum slot is process-global and `connect()` writes it (C0/C1; recorded, not a defect)
+
+Opening a database installs the CRC-32C implementation its configuration selects, process-wide.
+That is deliberate and load-bearing: every component of one database must compute the same
+checksum, so it is installed once rather than injected per object.
+
+The consequence a caller should know: two databases in one process do not get independent
+checksum implementations. `connect(a, checksum="pure")` followed by `connect(b)` (whose default
+`auto` finds the accelerator) leaves BOTH on the accelerator. No digest changes -- `install_crc32c`
+refuses a candidate that disagrees with the reference on any input of the acceptance corpus before
+installing it, so the two implementations are byte-identical by construction -- but a caller who
+asked for `pure` and reads `crc32c_implementation()` afterwards sees `native`.
+
+Surfaced when a machine first had a native provider installed: two test modules asserted the slot
+held `pure` at entry, which was true only while `pure` was the single reachable answer (L28). Both
+now snapshot and restore the slot rather than assuming it.
+
+Worth deciding in W6: either honour the strictest selector across live databases in a process, or
+refuse the second `connect()` whose selector disagrees with what is installed, or document the
+process-wide semantics on `connect()`. The current behaviour is safe; it is the SURPRISE that is
+worth closing.

@@ -150,12 +150,26 @@ def restore_the_reference() -> Iterator[None]:
 
     Restoring through the PUBLIC door rather than by assigning the module's private slot is
     deliberate: it proves the installer round-trips, and it means no test depends on a name the
-    module does not offer. Every accepted implementation is corpus-equivalent to the reference,
-    so reinstalling the reference restores exactly what was there.
+    module does not offer.
+
+    It restores what was ACTUALLY there, not the reference. The two were the same string until a
+    machine had a native provider, and then they were not: ``connect()`` installs the accelerator
+    process-wide by default, so any earlier test that opened a database leaves ``native`` in the
+    slot, and a fixture that always put back ``pure`` silently changed what the next test measured
+    (LESSONS L28). The slot is deliberately process-global -- every component of one database must
+    compute the same checksum -- which makes it shared state between tests, and shared state is
+    restored to its previous value or not restored at all.
     """
-    yield
+    before = crc32c_implementation()
     install_crc32c(crc32c_reference, name=PURE_IMPLEMENTATION_NAME)
-    assert crc32c_implementation() == PURE_IMPLEMENTATION_NAME
+    yield
+    if before == PURE_IMPLEMENTATION_NAME:
+        install_crc32c(crc32c_reference, name=PURE_IMPLEMENTATION_NAME)
+    else:
+        from okto_grafx.adapters.checksum_native import NativeCrc32c
+
+        NativeCrc32c().install()
+    assert crc32c_implementation() == before
 
 
 def mirror(data: bytes, crc: int) -> int:

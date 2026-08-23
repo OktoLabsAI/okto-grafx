@@ -123,3 +123,29 @@ def test_an_unmeasured_side_cannot_produce_a_ceiling_verdict(tmp_path: Path) -> 
     assert not item.ok
     assert not item.met
     assert "could not be assembled" in item.unmeasured
+
+
+def test_the_calibration_records_which_checksum_answered() -> None:
+    """The multiple means two different things depending on which implementation was measured.
+
+    On one machine the durable-commit multiple is ~17x with the pure-Python checksum and ~5x with
+    the native one (`okto-grafx[accel]`), so an artefact that records the multiple without
+    recording this says two different things with one number -- and D5's verdict is read from that
+    artefact. The field is descriptive, so it must never be able to break a calibration: an
+    implementation that cannot be asked reports why, and the run continues.
+    """
+    from bench.harness.calibrate import _checksum_implementation
+
+    answered = _checksum_implementation()
+    assert answered in {"pure", "native"} or answered.startswith("unknown (")
+
+
+def test_asking_which_checksum_answered_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    import bench.harness.calibrate as calibrate
+    import okto_grafx.domain.page.checksum as checksum_module
+
+    def refuse() -> str:
+        raise RuntimeError("the implementation cannot be named")
+
+    monkeypatch.setattr(checksum_module, "crc32c_implementation", refuse)
+    assert calibrate._checksum_implementation() == "unknown (RuntimeError)"
