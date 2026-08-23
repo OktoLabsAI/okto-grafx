@@ -912,3 +912,76 @@ Worth deciding in W6: either honour the strictest selector across live databases
 refuse the second `connect()` whose selector disagrees with what is installed, or document the
 process-wide semantics on `connect()`. The current behaviour is safe; it is the SURPRISE that is
 worth closing.
+
+
+## A refused append can still leak one page, rarely (C1/C5; CLOSED in round 2)
+
+An append that has already grown the file and is then refused by optimistic validation cannot give
+the page back to the file: G6 forbids shrinking a data file. The pool now hands such a page out
+again on the next allocation from the same process, which removes the steady-state leak -- measured
+over six runs of three processes appending to one table, findings fell from 10-24 per run to 0 in
+five runs and 1 in the sixth, and the heap file for the same data went from 20-26 pages to 15.
+
+What remains: a process that abandons an append and then EXITS without appending again leaks that
+one page for the life of the database, because the reclaim list is process-local and in memory.
+`verify()` reports it as `page_unwritten`, so a healthy database can occasionally report itself
+unclean and `oktografx verify` can exit 1 with nothing wrong.
+
+**CLOSED, and by neither of the two routes this entry expected.** No format change and no narrowing
+of `verify()`. The pool now WRITES the page out as the free page it is, at the one moment the leak
+becomes permanent: `BufferPool.settle_abandoned()`, called from `Database.close()`. A FREE page with
+a valid checksum and an even sequence counter carries no table descriptor, so `_page_owners` never
+claims it and it is not an orphan; `PageType.FREE` is a type the layout defines, so it is not a
+`page_type` finding; and it is not all zeros, so it is not `page_unwritten`. It stops being a
+finding because it stops being a question -- which is the opposite of teaching verify to look away.
+
+A process KILLED between abandoning an append and closing still leaves the page all zeros, and that
+is correct: that is the crash state, and `page_unwritten` is exactly what should be reported for it.
+
+Measured with the instrument that is IN THE TREE, so the next reader can re-run it. All figures are
+`tests/smoke/test_concurrent_writers.py` (3 writers, 16 rounds of 8 rows, ~16 s), reverting one
+thing at a time:
+
+| tree | result |
+|---|---|
+| whole change reverted | 5 of 5 runs fail, 6-9 `page_unwritten` each |
+| `settle_abandoned()` removed from `close()` only | 1 of 6 runs fails, on `assert ['page_unwritten'] == []` |
+| as shipped | 6 of 6 green (13 consecutive across two sessions) |
+
+An earlier draft of this entry quoted a "4 writers, 3 readers, 45 s" harness and the figures 4 -> 1
+-> 0. That harness was a scratch script and is not in the repository; the numbers were real but
+nobody else could re-run them, which is the exact harm L31 is about. Replaced above.
+
+
+
+## Three mutation survivors on the append fix, kept deliberately (C1/C5)
+
+Each is a guard whose reversion the suite does not notice. Recorded under 14.1.5 rather than
+covered, because in each case I could not construct a production path that reaches the reverted
+behaviour, and a test that reaches it only by driving internals into a state no caller produces
+proves the test, not the guard.
+
+- **`_write_back` withdrawing the page from the reuse list.** A page on that list is not resident,
+  so no flush or eviction can write it back, and `settle_abandoned` pops the list before writing.
+  The withdrawal is defence against a future path that makes such a page resident again.
+- **`_reusable_index` skipping a resident-and-pinned candidate.** Nothing should be able to pin a
+  page that was discarded and never written. The alternative to the guard is `allocate` deleting a
+  frame whose holder still has the object, and that holder's next unpin decrementing a stranger's
+  pin count -- which is why it is a guard and not a proof.
+- **`IndexStore._grow_buckets` passing `reuse=False`.** Without it the loop still terminates and
+  still reaches its target; the cost is one abandoned page spent per round, not a wrong result. The
+  parameter itself IS covered, by `test_allocating_with_reuse_disabled_never_spends_an_abandoned_
+  page`; what is uncovered is this one caller's use of it.
+
+
+## `_modified` is not charged against the buffer budget (C1; recorded)
+
+`BufferPool._modified` holds the keys of pages written back since the last `forget_modified()`, and
+that door is called only from a write commit. A process that only reads, checkpoints or recovers
+never clears it, so the set grows until close -- bounded by the number of distinct pages written
+since the last write commit, which is not unbounded but is not charged against `budget_bytes`
+either. A pool configured with a one-page budget can hold an arbitrarily large key set.
+
+Two ways to close it in W6: clear the set at the same points a checkpoint settles pages, or charge
+its size against the budget the way resident frames are. Neither changes any answer; both change
+what a small-budget pool costs in memory.

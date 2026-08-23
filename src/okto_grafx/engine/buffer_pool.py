@@ -209,6 +209,9 @@ class BufferPool:
         "_drop_epochs",
         "_every_file_drop",
         "_read_view_token",
+        "_grown",
+        "_abandoned",
+        "_modified",
     )
 
     def __init__(
@@ -230,6 +233,13 @@ class BufferPool:
             nullcontext() if guard is None else guard
         )
         self._doomed: dict[tuple[str, PageIndex], list[_Frame]] = {}
+        # Pages this pool has grown a file for and not yet written back, and the subset of them
+        # an attempt abandoned and this pool may hand out again. See allocate() and _reclaim().
+        self._grown: set[tuple[str, PageIndex]] = set()
+        self._abandoned: dict[str, list[PageIndex]] = {}
+        # Pages written back since the last forget_modified(), so an eviction cannot take a page
+        # out of the answer modified_pages() gives. See that method.
+        self._modified: set[tuple[str, PageIndex]] = set()
         self._budget_bytes: int = _validate_budget(budget_bytes, self._page_size)
         self._db_label: str = _validate_db_label(db_label)
         self._frames: OrderedDict[tuple[str, PageIndex], _Frame] = OrderedDict()
@@ -449,9 +459,32 @@ class BufferPool:
             # may now stand under the same key.
             self.unpin(file, page_index, dirty=page.dirty, page=page)
 
+    def _reusable_index(self, file: str) -> PageIndex | None:
+        """Return an index this pool may hand out again, or None to ask the device for one.
+
+        A candidate that is RESIDENT AND PINNED is left where it is rather than taken. Nothing
+        should be able to pin a page that was discarded and never written, so this is a guard on
+        an invariant rather than a case with a caller -- but it is a guard and not a proof,
+        because the alternative is the branch below deleting a frame whose holder still has the
+        object, and that holder's next unpin would then decrement a stranger's pin count.
+        """
+        waiting = self._abandoned.get(file)
+        if not waiting:
+            return None
+        for position in range(len(waiting) - 1, -1, -1):
+            candidate = waiting[position]
+            frame = self._frames.get((file, candidate))
+            if frame is not None and frame.pins:
+                continue
+            del waiting[position]
+            if not waiting:
+                del self._abandoned[file]
+            return candidate
+        return None
+
     @_guarded
-    def allocate(self, file: str, page_type: int) -> Page:
-        """Grow the file by one page and return it pinned, empty and of the requested type.
+    def allocate(self, file: str, page_type: int, *, reuse: bool = True) -> Page:
+        """Return a fresh page, pinned, empty and of the requested type, growing the file if need be.
 
         The page comes back pinned on purpose: an unpinned fresh page could be evicted before
         the caller had written anything into it, and the caller would then be holding a page the
@@ -461,17 +494,36 @@ class BufferPool:
         would leave the file one page longer every time the refusal is raised, and the refusal
         is retryable, so a retry loop would grow the data file once per attempt with no
         sanctioned way to shrink it back (G6).
+
+        **The file does not always grow, and ``reuse=False`` is for the callers that need it to.**
+        A page this pool grew the file for during an attempt that was then refused is handed out
+        again: G6 forbids shrinking, so without this every refused append leaked one page for the
+        life of the database -- three participants appending to one table left ten to twenty-four
+        all-zero pages behind in a minute, each of them a `verify()` finding on a database in
+        which nothing had gone wrong. Reuse is safe because such a page has never been readable
+        by anybody and no other participant can hold it: `StorageDevice.allocate` derives its
+        index from the file length, the file never shrinks, and every allocation on the commit
+        path runs inside the coordinator's commit section.
+
+        A caller whose loop is "allocate until the file is long enough" must pass ``reuse=False``.
+        For those, a hand-out that does not lengthen the file is not a saving: it makes the return
+        value describe something other than the growth, and the loop go round again.
         """
         prospective = self._storage.page_count(file) if self._storage.exists(file) else 0
         self._make_room(file, prospective)
-        page_index = self._storage.allocate(file, 1)
+        page_index = self._reusable_index(file) if reuse else None
+        if page_index is None:
+            page_index = self._storage.allocate(file, 1)
+        self._grown.add((file, page_index))
         key = (file, page_index)
         existing = self._frames.get(key)
         if existing is not None:
-            # A stale frame at a freshly allocated index can only mean the file shrank, and no
-            # sanctioned operation shrinks a data file (G6). The frame is dropped rather than
-            # inspected: a branch that asked whether it was pinned could not be reached by any
-            # input, and a guard no input can reach is dead code (A34).
+            # Two ways to get here and neither leaves a holder behind. The file shrank, which no
+            # sanctioned operation does (G6); or this is a reused index that something read after
+            # it was discarded, which _reusable_index has already established is unpinned. The
+            # original A34 argument -- that no input could reach this branch at all -- stopped
+            # holding when reuse was added, so the pin question moved to where a candidate is
+            # chosen rather than being answered by declaring the branch dead.
             del self._frames[key]
         page = Page(page_type, page_size=self._page_size, page_index=page_index)
         page.dirty = True
@@ -498,6 +550,81 @@ class BufferPool:
                 continue
             self._write_back(name, page_index, frame.page)
             written += 1
+        return written
+
+    @_guarded
+    def modified_pages(self, file: str | None = None) -> frozenset[tuple[str, PageIndex]]:
+        """Return every page this pool has CHANGED since the last :meth:`forget_modified`.
+
+        This exists so a caller can learn what its own work actually changed, instead of
+        re-deriving it from what the work was supposed to change. A caller that enumerates the
+        pages it believes it touched has to name every site that touches one, and the day a new
+        site appears -- relinking a chain, moving a hint -- the enumeration is silently short by
+        one page, with no test able to see it because nothing declares the omission.
+
+        **A still-dirty frame is not the whole answer, and reading only those was a defect.**
+        The first version of this returned the resident frames whose page was dirty. A page the
+        work changed and that the pool then EVICTED under budget pressure was written back and
+        marked clean, so it left the set -- and the caller, which was using two readings of it to
+        decide what its commit had to log, logged nothing for that page. Measured on the shape
+        that reaches it: one commit of 400 rows against a 256-frame budget replayed to 2 of 402
+        rows, with the rest in the log and unreachable, because the chain links that reached them
+        had been evicted out of the answer. A set that a write-back can shrink is not a record of
+        what happened; it is a record of what has not been dealt with yet.
+
+        So a write-back REMEMBERS the page instead of forgetting it, and this returns the union:
+        frames still dirty, plus every page written back since the window opened. The eviction
+        can no longer take a page out of the answer, which is the property the whole measurement
+        rests on.
+
+        The set is a snapshot, not a view: the frames go on changing after it is returned.
+        """
+        live = {key for key, frame in self._frames.items() if frame.page.dirty}
+        return frozenset(
+            key for key in (live | self._modified) if file is None or key[0] == file
+        )
+
+    @_guarded
+    def forget_modified(self) -> None:
+        """Open a fresh window for :meth:`modified_pages`, forgetting what was written back.
+
+        The written-back half of that answer accumulates, so something has to say when a new
+        window starts. Its caller is whoever is about to measure a unit of work, and it says so
+        immediately before taking its first reading -- never after work has begun, which would
+        drop pages that unit had already changed.
+        """
+        self._modified.clear()
+
+    @_guarded
+    def settle_abandoned(self, file: str | None = None) -> int:
+        """Write out every page an attempt abandoned as the FREE page it is; return how many.
+
+        A page this pool grew a file for and then had discarded is unreferenced, and the file
+        cannot shrink to give it back (G6). While this pool lives it is reusable and costs
+        nothing. When the pool stops -- the process closes -- the chance to reuse it is gone, and
+        left all zeros it stays that way for the life of the database. ``is_unwritten_image``
+        cannot tell that page from the one a crash leaves between allocating and writing, so
+        ``verify()`` reports ``page_unwritten`` and a database in which nothing went wrong stops
+        reporting clean. Under four writer processes that happened about once a run, which made a
+        test that asserts a clean database fail two runs in six.
+
+        Writing the page settles the ambiguity in the honest direction rather than teaching
+        verify to look away. The page IS free; a FREE page with a valid checksum and an even
+        sequence counter says so, carries no table descriptor so no walk can claim it, and is a
+        page type the layout defines. It stops being a finding because it stops being a question.
+
+        Settling ENDS the reuse of that page, and that is deliberate: the reclaim rests on the
+        page never having been readable, and this makes it readable.
+        """
+        names = sorted(self._abandoned) if file is None else [file]
+        written = 0
+        for name in names:
+            for page_index in list(self._abandoned.pop(name, ())):
+                blank = Page(
+                    int(PageType.FREE), page_size=self._page_size, page_index=page_index
+                )
+                self._write_back(name, page_index, blank)
+                written += 1
         return written
 
     @_guarded
@@ -588,6 +715,7 @@ class BufferPool:
             frame.page.dirty = False
             return False
         del self._frames[(file, page_index)]
+        self._reclaim(file, page_index)
         self._bump_drop_epoch(file)
         self._report_usage()
         return True
@@ -730,6 +858,36 @@ class BufferPool:
             cause=None if failure is None else failure.message,
         )
 
+    def _reclaim(self, file: str, page_index: PageIndex) -> None:
+        """Take a page an attempt allocated and abandoned back for reuse, if that is what it is.
+
+        The narrow condition is the whole safety argument. Only a page THIS pool grew the file
+        for, and which no write-back has since put on the device, is reclaimed: such a page has
+        never been readable by anybody, so nothing can hold a reference to it. A page that was
+        already on the device is discarded here like any other and is NOT reclaimed, because a
+        discard forgets what an attempt wrote and says nothing about what the page was before.
+
+        Handing the index out again cannot collide with another participant. The file never
+        shrinks (G6) and ``StorageDevice.allocate`` derives its index from the file length, so
+        every index any participant is ever given is at or past the length at that moment and no
+        other participant can be handed one this pool already holds. (``BufferPool.allocate``
+        itself no longer has that property, which is the whole point of it -- the claim is about
+        the device door underneath.)
+        """
+        key = (file, page_index)
+        if key not in self._grown:
+            return
+        self._grown.discard(key)
+        if page_index == HEADER_PAGE_INDEX:
+            # The reserved header page of every paged file (A2), which _require_reserved_header_page
+            # and CatalogStore._release both refuse by name. It cannot arrive here today -- the
+            # first begin() invalidates the whole pool and writes page 0 back, which takes it out
+            # of _grown for good, and a probe over the whole suite saw 12 reclaims and none of them
+            # page 0. That is soundness by scheduling; this is soundness by construction, and the
+            # two cost the same.
+            return
+        self._abandoned.setdefault(file, []).append(page_index)
+
     def _write_back(self, file: str, page_index: PageIndex, page: Page) -> None:
         """Encode the page and hand it to the device, advancing its sequence counter.
 
@@ -743,6 +901,22 @@ class BufferPool:
         image = self._codec.encode_page(page)
         self._storage.write_page(file, page_index, image)
         page.dirty = False
+        # Remembered, not forgotten. Clearing the dirty flag is what used to take an evicted
+        # page out of modified_pages() and out of the log with it; see that method.
+        self._modified.add((file, page_index))
+        # Written is real. A page whose image is on the device may be referenced by anything
+        # that has read it since, so it stops being a page this pool may hand out again -- and
+        # that has to withdraw it from BOTH lists. Withdrawing it only from _grown left a page
+        # that had already been reclaimed still standing on the reuse list, where the safety
+        # check that put it there is never re-taken, so allocate() would hand out an index whose
+        # image was by then real and write a blank page over it.
+        key = (file, page_index)
+        self._grown.discard(key)
+        waiting = self._abandoned.get(file)
+        if waiting is not None and page_index in waiting:
+            waiting.remove(page_index)
+            if not waiting:
+                del self._abandoned[file]
 
     def _report_usage(self) -> None:
         """Publish the resident bytes of this database under its own label."""
@@ -960,7 +1134,14 @@ def write_chain(
     chunks = split_payload(payload, chunk_capacity(pool.page_size))
     indices: list[PageIndex] = list(reuse[: len(chunks)])
     while len(indices) < len(chunks):
-        page = pool.allocate(file, page_type)
+        # reuse=False, and the reason is an invariant rather than a preference.
+        # _require_distinct_reusable_pages checks the CALLER's list, which cannot see an index the
+        # pool injects: a reclaimed page that also stood in that list would be written twice and
+        # the chain would read back short, with no refusal anywhere. No production caller can
+        # reach that today -- the only non-empty reuse list comes from chain_pages(), whose pages
+        # are device-backed -- but the guard's own docstring names that harm, and a guard that
+        # holds by an accident of who calls it is not holding.
+        page = pool.allocate(file, page_type, reuse=False)
         index = page.page_index
         pool.unpin(file, index, dirty=True)
         indices.append(index)
@@ -1012,7 +1193,9 @@ def grow_to(pool: BufferPool, file: str, page_index: PageIndex) -> int:
         )
     grown = 0
     while storage.page_count(file) <= page_index:
-        page = pool.allocate(file, int(PageType.FREE))
+        # reuse=False: this loop's exit condition is the FILE's length, and its return value
+        # is how much the file grew. A hand-out that lengthens nothing satisfies neither.
+        page = pool.allocate(file, int(PageType.FREE), reuse=False)
         pool.unpin(file, page.page_index, dirty=True)
         grown += 1
     return grown

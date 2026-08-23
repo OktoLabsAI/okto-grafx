@@ -1037,6 +1037,10 @@ class Database:
         if self._read_only:
             return
         self._pool.flush()
+        # Last chance to say what the pages an abandoned attempt allocated actually are. After
+        # this pool stops they can never be reused, and left unwritten they are indistinguishable
+        # from the pages a crash leaves half-allocated.
+        self._pool.settle_abandoned()
 
     def _release_closers(self) -> None:
         """Run every release the composition root handed over, and raise the first failure.

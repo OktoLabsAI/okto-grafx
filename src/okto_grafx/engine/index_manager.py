@@ -410,7 +410,9 @@ class IndexStore:
         storage = self._pool.storage
         wanted = 1 + self._definition.bucket_count
         while storage.page_count(self.file) < wanted:
-            page = self._pool.allocate(self.file, self.page_type)
+            # reuse=False: the loop waits on the file's length, so a hand-out that does not
+            # lengthen it just goes round again and spends an abandoned page on the way.
+            page = self._pool.allocate(self.file, self.page_type, reuse=False)
             self._pool.unpin(self.file, page.page_index, dirty=True)
         for bucket in range(self._definition.bucket_count):
             index = self._bucket_head(bucket)

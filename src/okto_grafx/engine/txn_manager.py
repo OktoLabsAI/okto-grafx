@@ -220,6 +220,7 @@ class TransactionManager:
         "_index_manager",
         "_partitions_per_table",
         "_commit_lock_timeout",
+        "_dirty_mark",
         "_lease_timeout",
         "_reader_stall_threshold",
         "_refresh_interval",
@@ -323,6 +324,11 @@ class TransactionManager:
         self._open: dict[TxnId, TransactionContext] = {}
         self._pins: dict[TxnId, _ReaderPin] = {}
         self._published_high_water: Lsn = NO_LSN
+        # The page set a commit attempt is measured against; see _attempt_pages. Set at the top
+        # of every attempt and NOT cleared afterwards: every reader of it runs inside the attempt
+        # that set it, under the participant section, so a stale value is unreachable rather than
+        # guarded against. Empty until the first attempt.
+        self._dirty_mark: frozenset[tuple[str, PageIndex]] = frozenset()
         self._mode_counts: dict[str, int] = {
             TransactionMode.READ.value: 0,
             TransactionMode.WRITE.value: 0,
@@ -762,6 +768,13 @@ class TransactionManager:
                     conflict = self._find_conflict(txn)              # step 3.3
                     rows: tuple[_RowWrite, ...] = ()
                     staging_mark = len(txn.pending_records)
+                    # The mark this attempt's page set is measured against. The window opens
+                    # and the reading is taken HERE, after the read view has settled and before
+                    # a single page is written, so that everything the pool changes from here on
+                    # is this attempt's doing and nothing that was already dirty is mistaken for
+                    # it. See _attempt_pages.
+                    self._pool.forget_modified()
+                    self._dirty_mark = self._pool.modified_pages()
                     try:
                         if conflict is None:
                             # Inside the guard, not before it: a refusal on the SECOND intent
@@ -851,6 +864,12 @@ class TransactionManager:
             txn.write_partitions.add(page_partition(file, page_index))
         for page_index in self._pages_touched_by(rows):
             txn.write_partitions.add(page_partition(self._heap_file, page_index))
+        # Every page this attempt actually modified, which is a superset of the two above and
+        # is the one that includes a relinked chain page. Without it two participants appending
+        # to one table both rewrote the same tail page and neither conflicted, because the page
+        # that carried the difference was in nobody's interest set.
+        for file, page_index in self._attempt_pages():
+            txn.write_partitions.add(page_partition(file, page_index))
         if txn.wrote and not (txn.read_partitions or txn.write_partitions):
             raise GrafxTransactionStateError(
                 "This transaction staged durable work and declared interest in no partition, so "
@@ -961,6 +980,13 @@ class TransactionManager:
         for page_index in self._pages_touched_by(rows):
             if (self._heap_file, page_index) not in txn.page_images:
                 staged.append((self._heap_file, page_index))
+        # The measured set, so a page this attempt changed without a row landing on it is
+        # carried by the log too. A chain link that is not logged is a change no redo can
+        # reproduce: the page it makes reachable is in the log, the fact that it is reachable
+        # is not, and a replay rebuilds a heap that has lost the tail of every table.
+        for file, page_index in self._attempt_pages():
+            if (file, page_index) not in txn.page_images:
+                staged.append((file, page_index))
         staged = sorted(set(staged))
         # The index changes are staged HERE, between knowing the batch length and building the
         # records, because they are part of that batch: they lengthen it, and the number they
@@ -1333,12 +1359,19 @@ class TransactionManager:
         # and written back -- by the next flush, or by a read view dropping them -- they would
         # land over pages another participant has since committed (C5 round-2 B2: rows lost,
         # verify clean). Dropped unwritten, the device is the truth the next pin re-reads.
-        touched = set(self._pages_touched_by(rows))
+        touched = {(self._heap_file, page_index) for page_index in self._pages_touched_by(rows)}
         if rows:
-            touched.add(HEADER_PAGE_INDEX)
-        for page_index in touched:
+            touched.add((self._heap_file, HEADER_PAGE_INDEX))
+        # The measured set, and the reason this method stopped being enough on its own. The
+        # attempt may have relinked a page no row of it ever landed on, and it may have dirtied
+        # pages before it raised and produced no rows at all -- in which case the loop above
+        # discards nothing while the pool still holds the attempt's writes. Both left the pool
+        # holding state of a commit that did not happen, which the next flush of ANY participant
+        # carried to the device.
+        touched.update(self._attempt_pages())
+        for file, page_index in touched:
             try:
-                self._pool.discard(self._heap_file, page_index)
+                self._pool.discard(file, page_index)
             except GrafxError:
                 continue
 
@@ -1374,6 +1407,35 @@ class TransactionManager:
             page.update_slot(
                 reference.slot, corrected.encode() + payload[RECORD_HEADER_SIZE:]
             )
+
+    def _attempt_pages(self) -> tuple[tuple[str, PageIndex], ...]:
+        """Return every page THIS commit attempt has modified, in a fixed order.
+
+        THE DEFECT THIS EXISTS FOR. Three things need to know which pages a commit changed --
+        the log, so a redo reproduces them; the interest set, so two commits that write one page
+        conflict; and the abandonment, so a refused attempt leaves nothing behind. All three
+        asked :meth:`_pages_touched_by`, which re-derives the answer from where the ROWS landed,
+        and a heap append changes a page no row lands on: the previous last page, whose
+        ``next_page`` is what makes the new page reachable. That link was therefore never logged,
+        never declared, and -- the part that corrupted databases -- never undone. A refused
+        attempt left the pool holding a tail page pointing at the page it had just abandoned, and
+        the next commit of any participant flushed that link to the device. A later walk followed
+        it into a page nobody ever wrote and refused with corruption_detected, on a database in
+        which nothing had gone wrong. Three processes appending to one table reproduced it inside
+        a minute; one process never could, because one process never abandons and re-appends
+        against a tail another attempt has already moved.
+
+        So the answer is no longer re-derived. It is MEASURED, against the mark taken before the
+        attempt wrote anything: whatever the pool holds dirty that it did not hold dirty then is
+        what this attempt changed. An enumeration has to name every site that touches a page and
+        is silently short by one the day a site is added; a measurement cannot be short, because
+        it asks the pool what happened rather than asking the code what it intended.
+
+        Pages that were already dirty are excluded rather than swept in. They belong to no
+        attempt this commit can undo, and discarding one on abandonment would throw away a change
+        this commit never made.
+        """
+        return tuple(sorted(self._pool.modified_pages() - self._dirty_mark))
 
     def _pages_touched_by(
         self, rows: Sequence[_RowWrite]

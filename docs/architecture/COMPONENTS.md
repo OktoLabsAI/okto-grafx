@@ -1016,6 +1016,121 @@ INDEX_WRITE records of this commit through the idempotent doors, publish; failin
 covering indexes stale). Test `test_a_commit_whose_index_apply_fails_after_the_barrier_is_redone_
 from_the_log`; reverted: `assert 0 == 2`.
 
+### CF-14 — a heap append relinked a page that the log, the interest set and the abandonment all missed (C1/C5; CLOSED)
+
+Found by a real multi-process smoke test, not by the suite. Three processes appending to one table
+through `connect()` left the heap PERMANENTLY unreadable in under a minute: `MATCH (i:Item) RETURN
+count(*)` in a fresh process -- after every writer had exited cleanly and recovery had replayed --
+refused with `corruption_detected` naming a page "reachable from a chain but has never been
+written". Nothing had crashed. Two of three writers died mid-run; 0 of 576 acknowledged rows were
+reachable. **7858 tests were green.**
+
+**Discriminated by experiment** (four arms, same workload, one variable each). These figures and
+the "2 of 3 writers died" one below were measured with scratch scripts against code that predates
+this fix, so they are UNVERIFIABLE by a later reader -- kept because they are how the defect was
+found and what its shape was, not as a claim anyone can re-run. The re-runnable evidence is
+`tests/smoke/test_concurrent_writers.py` and the figures in PUNCHLIST.md, which name the tree state
+each was taken against (L31):
+
+| arm | writers died | rows readable | findings |
+|---|---|---|---|
+| 3 writers, one shared table | 2 of 3 | 0 of 576 | 10 |
+| 3 writers, one table each | 0 | 576/576 | 24 |
+| 3 writers + forced contention | 0 | all | 0 |
+| 1 writer | 0 | all | 0 |
+
+Contention HIDES it: a shared row serialises the writers and the window closes, which is why the
+arm with the most conflicts was the clean one. Two hypotheses were refuted before the cause was
+found -- "a refused transaction leaks its allocation" (84 conflicts, 0 findings) and "a committed
+page is not on the device" (`_apply_images` already flushes for exactly that reason, and a byte-level
+probe found no unwritten page). The cause came from a forensic dump of the damaged file: the chain
+read `1→3→5→8→10→13→15→17→**18**` with page 18 all zeros and page 19 written and orphaned.
+
+**Cause, one omission with three consequences.** `_pages_touched_by` re-derives the pages a commit
+changed from where its ROWS landed. `HeapStore._append` also relinks the previous last page --
+`page.next_page = new_index`, the only thing that makes the new page reachable -- and no row lands
+there. The same set feeds three jobs, so the link was never LOGGED (no redo could reproduce it),
+never DECLARED (two commits could rewrite one tail page and neither conflict), and never UNDONE. The
+third is what corrupted databases: a refused attempt left the pool holding a tail page pointing at
+the page it had just abandoned, and the next commit of any participant flushed that link to the
+device.
+
+**Fix (C1 + C5):** the set is MEASURED, not re-derived. `BufferPool.dirty_pages()` reports what the
+pool holds modified; the commit takes a mark before it writes anything and `_attempt_pages()` is the
+difference. All three consumers take the union with it. An enumeration has to name every site that
+touches a page and is short by one the day a site is added; a measurement cannot be short.
+
+**Also closed:** the leak the same omission left behind. A refused append that had grown the file
+abandoned that page for good (G6 forbids shrinking), at 10-24 all-zero pages a minute under three
+writers, each a `page_unwritten` finding on a healthy database. `BufferPool` now reclaims a page it
+grew the file for and never wrote back -- safe precisely because such a page has never been readable
+by anybody, and no other participant can be given an index this one already has. Measured over six
+runs: findings 10-24 -> 0 in five and 1 in the sixth; the heap for the same data 20-26 pages -> 15.
+The residual (a process that abandons and then exits) is in PUNCHLIST.
+
+**Round 2 -- the blind critic refuted the first fix's central claim, and it was right.** The
+measurement was `dirty_pages() - mark`, read from the pool's still-dirty frames. A page the attempt
+changed and the pool then EVICTED under budget pressure was written back and marked clean, so it
+left the difference and the log with it -- the same consequence #1, still open, in exactly the
+regime the docstring said could not happen. Measured by the critic: one commit of 400 rows against
+a 256-frame budget replayed to **2 of 402 rows**, the rest in the log and unreachable. Not a
+regression (the pre-change code lost them at every budget), but the register said CLOSED and the
+code did not support it, which is the gap that made it a finding.
+
+**Round-2 fix:** a write-back REMEMBERS the page instead of forgetting it. `BufferPool` keeps the
+pages written back since `forget_modified()`, and `modified_pages()` returns those plus the frames
+still dirty, so an eviction can no longer take a page out of the answer. The relink test is now a
+matrix over buffer budgets (4, 5, 6, 8, 12, 64, 1024 frames): reverting just the line that
+remembers kills it at 4, 5, 6, 8 and 12 and leaves 64 and 1024 green, which is the shape of the
+defect and the reason a single-budget test could never see it.
+
+**Also round 2, from the same review:** a write-back withdrew the page from `_grown` but not from
+the reuse list, so a page whose image had become real could still be handed out and blanked -- the
+reclaim-time safety check was never re-taken at hand-out time. Both lists are now cleared, and the
+candidate is re-checked for pins when it is chosen. `grow_to`, `IndexStore._grow_buckets` and
+`write_chain` now allocate with `reuse=False`: the first two wait on a FILE's length, and the third
+builds a list of distinct pages the pool must not inject a duplicate into.
+
+**Round 3 -- the blind critic found the UNDO half was a guard no test held.** Deleting
+`touched.update(self._attempt_pages())` from `_abandon_rows` left the entire suite green, while an
+ordinary caller reached `corruption_detected` in under a second. The reason every existing test
+missed it, measured by instrumenting `_abandon_rows`: they all declare the SAME key partition, so
+the refusal lands on the ROW half of validation, which runs BEFORE `_write_rows` -- nothing has been
+appended, nothing relinked, and the batch handed to the undo is empty. Reaching the undo needs the
+PAGE half, which needs two participants declaring DIFFERENT key partitions that still collide on a
+page (any two row-writing commits do, because every one of them writes the table directory on heap
+page 0). `test_a_refusal_on_the_PAGE_half_undoes_the_link_the_append_had_already_made` does that and
+kills the mutant with the original corruption error. Two more guards from the same review are now
+asserted by construction rather than by scheduling: page 0 is never offered for reuse, and
+`reuse=False` never spends an abandoned page.
+
+**Mutation battery (14.1.5), round 2/3 surface.** Baseline: full suite 7879 tests, 0 failures,
+0 errors, 5 skipped. Run one mutant at a time against the tests named.
+
+| mutation | verdict |
+|---|---|
+| `_write_back` no longer records the page in `_modified` | KILLED (relink matrix at 4, 5, 6, 8, 12 frames; 64 and 1024 survive, which is the defect's shape) |
+| `_write_back` no longer withdraws from `_grown` | KILLED (`..._already_on_the_device_is_never_handed_out_again`) |
+| `discard` no longer calls `_reclaim` | KILLED |
+| `_attempt_pages` dropped from `_build_records` | KILLED |
+| `forget_modified` call dropped | KILLED |
+| `grow_to` loses `reuse=False` | KILLED (`...never_spends_a_page_it_meant_to_add`) |
+| `allocate` ignores `reuse=False` | KILLED (two tests) |
+| `_reclaim` loses the page-0 guard | KILLED (`...reserved_header_page_is_never_offered_for_reuse`) |
+| `settle_abandoned` dropped from `close()` | KILLED 1 run in 6 by the smoke test -- probabilistic, recorded as such |
+| **`_attempt_pages` dropped from `_abandon_rows`** | **SURVIVED in round 2; KILLED in round 3** |
+| `_write_back` no longer withdraws from `_abandoned` | SURVIVES -- no production path reaches it (a page on the reuse list is not resident, so nothing writes it back); defensive, PUNCHLIST |
+| `_reusable_index` pin guard | SURVIVES -- same, PUNCHLIST |
+| `_grow_buckets` loses `reuse=False` | SURVIVES -- the loop still terminates and still reaches its target; costs a wasted page, PUNCHLIST |
+
+**Tests:** `tests/smoke/test_concurrent_writers.py` (symptom; fails without the fix with 10
+`page_unwritten`; 7 consecutive green runs after the settle), `tests/txn/test_chain_relink_
+regressions.py` (cause: nothing of a refused attempt left dirty; the relinked page is carried by the
+log AT EVERY BUDGET; the abandoned page is handed out again; a page already on the device never is;
+an abandoned page is settled as FREE; `grow_to` adds what it reports). Recorded honestly: one test
+in that file passes WITHOUT the fix and says so in its own docstring -- scripting the interleaving
+deterministically was attempted three times and did not reproduce it. LESSONS L29, L30.
+
 ### D5 durable_commit — 'consult JP' DISCHARGED: the ceiling stands, W6 owns the Windows gap
 
 SPEC-M1 `fr_18f8eff7` anticipated this: *"se o multiplo de commit exceder 10x, o pipeline PARA em

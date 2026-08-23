@@ -748,3 +748,77 @@ Corollary for a review: "this assertion has never failed" and "this assertion ca
 identical in a green run, and the battery is what distinguishes them -- but only if the mutation can
 produce the second answer at all. A mutation battery on a single-adapter port is measuring the same
 blind spot it is meant to find.
+
+## L29 — a set that three different jobs share must be MEASURED, not re-derived from intent
+
+`_pages_touched_by` answered one question -- "which pages did this commit change?" -- for three
+jobs: what the log carries, what the interest set declares, and what an abandoned attempt undoes.
+It answered it by re-deriving the pages from where the commit's ROWS landed. A heap append changes
+a page no row lands on: the previous last page, whose `next_page` is the only thing that makes the
+new page reachable. So the link was never logged, never declared, and never undone.
+
+The third one is what corrupted databases. A refused attempt left the pool holding a tail page
+pointing at the page it had just abandoned; the next commit of any participant flushed that link to
+the device; a later walk followed it into a page nobody had written and refused with
+`corruption_detected` on a database in which nothing had gone wrong. Three processes appending to
+one table reproduced it in under a minute. **7858 tests were green.**
+
+**The rule:** when several jobs depend on the same answer about what code DID, derive that answer
+from what actually happened, not from a second reading of what the code was supposed to do. The
+re-derivation has to name every site that touches a page, and the day a site is added it is silently
+short by one -- with no test able to see it, because nothing declares the omission. The fix reads
+the buffer pool twice, before and after the attempt, and takes the difference.
+
+**And the first version of that fix was short too, which is the sharper half of this lesson.** It
+measured the frames the pool still held DIRTY. A page the attempt changed and the pool then evicted
+was written back, marked clean, and left the measurement -- so a commit larger than the buffer
+budget logged the new pages and not the links that reach them: 400 rows in one commit against a
+256-frame budget replayed to 2 of 402. "Measured, therefore complete" is not an argument; the
+question is always what the instrument DROPS. A dirty flag is not a record of what happened, it is a
+record of what has not been dealt with yet, and those are different sets the moment anything deals
+with one. The write-back now remembers the page instead of forgetting it.
+
+**Corollary, and it is the sharper half:** the enumeration was not obviously wrong. It carried a
+careful docstring arguing that including a page that did not change is harmless and missing one is
+not, and it was RIGHT about that -- it just did not include a page it did not know about. Prose that
+argues for the safe direction is not evidence that the code went that way. Ask what produces the set,
+not what the comment says about it.
+
+## L30 — the regime that breaks is the one nothing runs
+
+Every concurrency test in this repository did one of three things: drove the engine below the public
+door, read with a fresh short-lived process, or contended hard enough that the writers serialised.
+The defect of L29 needed all three to be false at once -- long-lived processes, appending to one
+table, through `connect()`, contending little enough that their appends overlapped. Contention
+HIDES it: with a shared row forcing conflicts, three writers serialise and the window closes, which
+is why the arm of the experiment with the most conflicts was the arm that came out clean.
+
+**The rule:** a concurrency suite that only tests the contended case tests the case where the
+protocol is doing the least work. The uncontended concurrent case -- several writers whose work does
+not intersect, which is the case a user expects to be FAST and therefore the case they will run --
+is a different regime, and it is the one where a missing declaration goes unnoticed, because nothing
+refuses. Same shape as L24: the regime with a safety net is the one that gets tested.
+
+Practical consequence, recorded as a standing obligation: `tests/smoke/` exists now, it drives only
+the public door, it is slow on purpose, and a cheaper version of it did not find this. Before
+declaring a concurrency property held, name the regime the test ran in and the regime it did not.
+
+
+## L31 — writing "CLOSED" is a claim, and the register is where an unearned one does damage
+
+The round-1 fix for L29 was real, tested and an improvement. What was wrong was the sentence next to
+it: `COMPONENTS.md` said CF-14 was CLOSED and `LESSONS.md` stated the general rule as proven, while
+the code held only for buffer budgets large enough never to evict. The blind critic's own report put
+it exactly: the defect it found was "not a regression" -- the pre-change code was worse on the same
+input -- and it was blocking anyway, because *"that gap between the claim and the code is what makes
+it a finding rather than a footnote."*
+
+**The rule:** a register entry is load-bearing. The next person to touch this code will read CLOSED
+and not re-derive the case, and a lesson stated as a general rule will be applied where it does not
+hold. So the claim has to name the regime it was established in. "Closed for commits that fit the
+buffer budget" would have been true, would have cost one clause, and would have pointed straight at
+the case that was still open.
+
+Practical form, and it is the same shape as L28 and L30: before writing CLOSED, name the parameter
+you held fixed while measuring -- the budget, the process count, the table count, the page size --
+and either vary it or write down that you did not.
