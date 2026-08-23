@@ -30,6 +30,14 @@ all change, and there is no migration path yet.
 - **A declared `PRIMARY KEY` is indexed automatically**, created by the DDL and re-adopted at every
   later open. A keyed read plans an index seek; the uniqueness check reads the index rather than
   scanning the table.
+- **Relationship tables are indexed per endpoint** (`ef_`/`et_`): traversal expands a bounded
+  frontier by index lookup and switches to one grouped edge scan past a fan limit, with identical
+  answers in both regimes. The old cost — every edge of the table read per frontier node — is gone.
+- **Schema changes are transactions.** A `CREATE ... TABLE`/`VECTOR SPACE` builds on a
+  per-transaction working catalog and stages its page images — the file header included, closing a
+  recorded durability gap — so a rollback leaves nothing anywhere and a crash cannot lose a
+  committed schema. A table declared inside a transaction is visible to other transactions once the
+  transaction commits, not before.
 - **Dual index visibility** (CONTRACT §8.7): EXACT indexes return candidates validated against the
   heap under the caller's snapshot; PROXIMITY indexes are versioned with tombstones and a horizon.
 - **A stale index is never used**, by the planner or by the uniqueness check — it is a subset of the
@@ -58,8 +66,8 @@ all change, and there is no migration path yet.
 - Performance on Windows does not meet the D5 ceilings; POSIX with `[accel]` does. Windows
   control-file publication costs ~16.5 ms against ~0.13 ms on Linux. The measurements and the
   analysis are in `docs/architecture/COMPONENTS.md`.
-- Reverse traversal of a relationship table is a scan — relationship tables carry no index over their
-  endpoints yet.
+- Traversal with an unbound target resolves landings by one scan of the landing table per
+  traversal; edges are indexed, landings are not yet.
 - `DETACH DELETE` and relationship deletion are not implemented, and refuse rather than pretend.
 - A `MATCH` cannot bind a row the same transaction created; a row's identity is allocated by the
   commit.

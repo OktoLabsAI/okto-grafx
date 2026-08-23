@@ -85,12 +85,17 @@ openCypher in the Kùzu dialect, executed by a planner that produces one operato
 
 **Not yet supported**, and refused in the error taxonomy rather than silently ignored:
 `DETACH DELETE`, relationship deletion, and `MATCH` binding a row the same transaction created
-(a row's identity is allocated by the commit — commit first, then match).
+(a row's identity is allocated by the commit — commit first, then match). A table declared inside
+a transaction is usable by that transaction's own later statements and becomes visible to every
+other transaction when it commits — schema changes are transactions like any other.
 
 ### Indexes
 
 - **A declared `PRIMARY KEY` gets an index automatically**, created by the DDL and re-adopted at
   every later open. A keyed read plans an index seek; an unkeyed predicate plans a scan.
+- **A relationship table gets an index per endpoint** (`ef_`/`et_`), so traversal expands a
+  bounded frontier by lookup instead of reading every edge, switching to one grouped scan when
+  the frontier grows past the point where the scan is cheaper.
 - **Dual visibility (CONTRACT §8.7).** An EXACT index returns candidates that are validated against
   the heap under the caller's own snapshot — so the index may be a superset and can never be a wrong
   answer. A PROXIMITY index is versioned with tombstones and a horizon, and its entries are the
@@ -518,8 +523,10 @@ practice:
   reference engine; they are met on POSIX with `[accel]` and missed on Windows, where control-file
   publication costs ~16.5 ms against ~0.13 ms on Linux. The measurements and the analysis are in
   `docs/architecture/COMPONENTS.md`.
-- **Reverse traversal of a relationship table is a scan.** Relationship tables carry no index over
-  their endpoints yet, so a query that walks *into* a heavily referenced node reads every edge.
+- **Traversal with an unbound target resolves landings by scanning the landing table** (edges
+  store record identities, and identities carry no index yet). Endpoint indexes cover the edges
+  themselves, so the old every-edge-per-node scan is gone, but a hop that lands on a large free
+  table still pays one scan of it per traversal.
 - **`DETACH DELETE` and relationship deletion are not implemented**, and refuse rather than pretend.
 - **Known gaps are written down** rather than hidden: see `docs/architecture/PUNCHLIST.md`.
 

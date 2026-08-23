@@ -357,6 +357,9 @@ def test_the_engine_exposes_nothing_that_could_generate_an_embedding(
         "commit",
         "coverage",
         "create_space",
+        # Takes a catalog and drops per-space state for spaces it does not know -- the rollback
+        # of a schema transaction is the caller. Produces nothing, generates nothing (BR-4).
+        "discard_unknown",
         "exact_scan_threshold",
         "index",
         "indexes",

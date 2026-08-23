@@ -77,14 +77,29 @@ def test_declaring_a_primary_key_creates_the_index_that_covers_it(database) -> N
     assert not database.indexes.index("pk_Person").stale
 
 
-def test_a_relationship_table_declares_no_primary_key_and_gets_no_index(database) -> None:
-    """A rel table has endpoints, not a key. Inventing an index for it would index nothing."""
+def test_a_relationship_table_declares_no_primary_key_and_gets_endpoint_indexes(
+    database,
+) -> None:
+    """A rel table has endpoints, not a key: no pk index, and one index per endpoint.
+
+    The list is asserted exhaustively, so an index nobody asked for still fails here -- the same
+    rule the vector tests follow.
+    """
     with database.begin("write") as txn:
         txn.execute("CREATE NODE TABLE A(id INT64, PRIMARY KEY(id))")
         txn.execute("CREATE NODE TABLE B(id INT64, PRIMARY KEY(id))")
         txn.execute("CREATE REL TABLE E(FROM A TO B, w INT64)")
 
-    assert [index.name for index in database.indexes.indexes()] == ["pk_A", "pk_B"]
+    assert [index.name for index in database.indexes.indexes()] == [
+        "ef_E",
+        "et_E",
+        "pk_A",
+        "pk_B",
+    ]
+    definition = database.indexes.index("ef_E").definition
+    assert (definition.positions, definition.visibility.value) == ((0,), "exact")
+    definition = database.indexes.index("et_E").definition
+    assert (definition.positions, definition.visibility.value) == ((1,), "exact")
 
 
 # --- it is what the planner chooses ---------------------------------------------------------------

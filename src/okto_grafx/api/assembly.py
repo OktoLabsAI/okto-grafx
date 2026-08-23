@@ -63,6 +63,7 @@ from okto_grafx.engine.index_manager import (
     IndexManager,
     primary_key_index,
     primary_key_index_name,
+    relationship_endpoint_indexes,
 )
 from okto_grafx.engine.ledger_store import LedgerStore
 from okto_grafx.engine.metrics_catalog import register_catalog
@@ -419,6 +420,8 @@ def _attach_primary_key_indexes(
     attached: list[str] = []
     for table in catalog.catalog.tables():
         try:
+            for endpoint in relationship_endpoint_indexes(table, pool, metrics):
+                attached.append(indexes.register(endpoint).name)
             index = primary_key_index(table, pool, metrics)
             if index is None:
                 continue

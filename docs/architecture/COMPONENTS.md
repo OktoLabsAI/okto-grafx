@@ -1302,6 +1302,73 @@ fact:
   differing only by case. Measured: it does not. That false claim is what made defect 1 look
   impossible.
 
+### CF-16 — a schema change was not a transaction (C10, owed since the C1 scope cut; CLOSED)
+
+The DDL path called `CatalogStore.save()` -- which writes through the buffer pool the moment it is
+called -- and mutated the LIVE catalog at statement time. The staged door `stage()` had been built
+and documented one round earlier and nothing walked through it; the punch list recorded the defect
+as "still live end to end". Measured through `connect()` alone before fixing:
+
+* **A rolled-back CREATE TABLE survived a REOPEN.** The rollback dropped the transaction's records,
+  but the pool held save()'s pages and the next flush carried them to the device: an uncommitted
+  schema change made durable, `verify()` clean. In-session, the retry was refused with "already has
+  a table named", and the DDL's index registration stayed registered.
+* **A committed CREATE TABLE's file header reached the device outside every log record** -- save()
+  returns the chain pages only, so page 0 (root_page, payload_length) was never staged and a crash
+  between the barrier and the flush lost the schema, unreachable to redo.
+
+**Fix.** Every schema statement builds on a per-transaction WORKING COPY of the catalog
+(`QueryEngine._working_catalog`), stages the images `stage()` returns -- chain, freed pages, and
+page 0, unconditionally -- and the live catalog learns about the change when the commit applies
+them. Planning and execution INSIDE the declaring transaction resolve names from the working copy
+(the planner, the row materialiser's vector-space lookup, and the traversal's endpoint tables), so
+the quick start's one-block schema still works. A rollback drops the copy and prunes the two side
+effects DDL makes outside the transaction: registered indexes (by table id, against the live
+catalog a rollback never touched) and the vector engine's per-space map (`discard_unknown`, a new
+door on C9's enumerated surface).
+
+**Behavior change, deliberate and recorded:** a table is visible to OTHER transactions only once
+its declaring transaction commits. Statement-time visibility was not a feature; it was the leak.
+
+**Tests:** `tests/query/test_schema_transactionality.py` -- six, five failing against the pre-fix
+tree (rollback leaves nothing anywhere; the vector map is pruned; an uncommitted table is invisible
+to others; the catalog HEADER page is in the commit's WAL batch; two schema transactions allocate
+distinct ids), one compatibility guard that passes both ways and says so (the one-block
+schema-and-rows contract). The five statement-time tests of `test_query_engine.py` were rewritten
+to the staged contract -- each now also asserts the live catalog does NOT hold the table before the
+images apply -- and the harness double gained the real context's doors (`page_images` +
+`staged_pages()`), which L12 requires and the old double did not have.
+
+### CF-17 — traversal read every edge of the table, per frontier node (C7/C10; CLOSED)
+
+After CF-15, the slowest thing left in a real graph: a reverse hop into a well-referenced entity of
+a 2500-node graph read all 3600 edges and cost 1.46 s (1.83 s on the CF-17 rig before the fix). A
+stored relationship row leads with its endpoints (W5c), so "the edges leaving this node" is exactly
+what an EXACT index over stored positions 0 and 1 answers.
+
+**Fix.** Every `CREATE REL TABLE` gets two endpoint indexes (`ef_<T>` over `_from`, `et_<T>` over
+`_to`), created by the DDL, re-adopted at open, populated by the same commit seam every index uses,
+and DECLINING rather than failing a statement -- the same three rules as the primary key's index.
+The traversal expands a frontier node through them, with two deliberate qualifications:
+
+* **A fan limit** (`_EDGE_LOOKUP_FAN_LIMIT = 64` distinct start nodes) past which one grouped edge
+  scan takes over. The limit is a cost model, not a hedge: a lookup costs a few bucket probes
+  however large the edge table, so a bounded frontier wins by index; a whole-table frontier pays
+  one lookup per node, which past a point costs more than reading the edges ONCE -- measured, a
+  scan-shaped plan paid 1800 lookups for 1.83 s where the grouped scan pays 221 ms.
+* **A stale endpoint index is never consulted** -- same subset argument as the planner's rule --
+  and the fallback groups the scan by endpoint, so even the no-index path stopped being
+  O(frontier x edges).
+
+**Measured, same rig, same query** (`MATCH (c:C)-[:M]->(e:E {id: 11})`, 1800 nodes, 3600 edges):
+1834 ms before, **221 ms** after; forward hop from one node 29 ms; two hops out and back 56 ms.
+Index-vs-scan equality asserted by test on every shape.
+
+**What remains, recorded not hidden:** the landing of a traversal with a FREE target is resolved by
+one scan of the landing table per traversal (edges store record identities, and no identity index
+exists); and the planner does not reorder a pattern to start from its seekable side, so
+`MATCH (c)-[:M]->(e {id: k})` still walks from `c`. Both in PUNCHLIST as the next levers.
+
 ### D5 durable_commit — 'consult JP' DISCHARGED: the ceiling stands, W6 owns the Windows gap
 
 SPEC-M1 `fr_18f8eff7` anticipated this: *"se o multiplo de commit exceder 10x, o pipeline PARA em

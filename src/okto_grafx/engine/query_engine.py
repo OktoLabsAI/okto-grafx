@@ -61,7 +61,13 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.ids import NO_CSN
 from okto_grafx.domain.index.keys import index_key
-from okto_grafx.engine.index_manager import primary_key_index, primary_key_index_name
+from okto_grafx.engine.index_manager import (
+    edge_from_index_name,
+    edge_to_index_name,
+    primary_key_index,
+    primary_key_index_name,
+    relationship_endpoint_indexes,
+)
 from okto_grafx.domain.model.record import HeapVersion
 from okto_grafx.domain.model.schema import (
     ENDPOINT_COLUMNS,
@@ -132,6 +138,7 @@ from okto_grafx.domain.query.tokens import (
 )
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.engine.buffer_pool import BufferPool
+from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.metrics_catalog import MetricEmitter, metric
@@ -301,10 +308,21 @@ class _Context:
     parameters: dict[str, Value]
     analysis: QueryAnalysis
     statistics: dict[str, int]
+    # The catalog this statement was PLANNED against. Inside a transaction that has declared
+    # schema of its own, that is the transaction's working copy, and execution must resolve
+    # tables and spaces from the same picture the planner did -- a row materialised for a table
+    # whose vector space exists only in the working copy cannot ask the live catalog for it.
+    catalog: Catalog | None = None
     staged_rows: list[_HeldRow] = field(default_factory=list)
     staged_partitions: list[tuple[int, bytes]] = field(default_factory=list)
     tokens_issued: int = 0
     pending_tokens: dict[int, int] = field(default_factory=dict)
+
+    def schema(self) -> Catalog:
+        """Return the catalog this statement resolves names from."""
+        if self.catalog is not None:
+            return self.catalog
+        return self.engine._catalog.catalog
 
     def token_for(self, binding: RowBinding) -> int:
         """Return the token that ties a pending binding to the held insert it stands for.
@@ -453,6 +471,7 @@ class QueryEngine:
         "_metrics",
         "_clock",
         "_skipped_indexes",
+        "_working",
     )
 
     def __init__(
@@ -473,6 +492,13 @@ class QueryEngine:
         # Tables whose primary-key index could not be created. Reported rather than
         # raised: see _attach_primary_key_index.
         self._skipped_indexes: set[str] = set()
+        # The working catalog of each open schema transaction: the COPY its DDL statements
+        # mutate and stage, keyed by txn id. The live catalog is untouched until the commit
+        # applies the staged images and the structure epoch makes it re-read. Entries are
+        # dropped by settle_schema; a caller that drives the manager directly and never settles
+        # leaks the copy until the process ends, which is memory, not a wrong answer -- txn ids
+        # are never reused, so a stale entry can never be read.
+        self._working: dict[int, Catalog] = {}
         self._indexes = indexes
         self._vectors = vectors
         self._metrics = MetricEmitter(metrics)
@@ -510,6 +536,34 @@ class QueryEngine:
         """Return the operator tree of one query text, without running it (SPEC-VEC AC-7)."""
         return self.plan(self.parse(text))
 
+    def _planned_for(
+        self, statement: Statement, txn: object, working: Catalog | None
+    ) -> PlannedQuery:
+        """Return the plan a statement RUNS with, seeing this transaction's own schema.
+
+        The public ``planned``/``explain`` doors describe the database as committed, which is
+        what an outside caller asks about. A statement running INSIDE a transaction that has
+        already declared tables must be planned against that transaction's working catalog, or
+        the second statement of the quick start's schema block fails to plan the table the first
+        one declared.
+        """
+        if working is None:
+            return self.planned(statement)
+        started = self._reading()
+        try:
+            analysis = analyze(statement)
+            plan = build_plan(
+                statement,
+                catalog=working,
+                indexes=self._index_definitions(),
+                analysis=analysis,
+            )
+        except GrafxError as failure:
+            self._count_error(failure)
+            raise
+        self._observe(PHASE_PLAN, started)
+        return plan
+
     def planned(self, statement: Statement) -> PlannedQuery:
         """Return the plan together with the analysis it was built from."""
         started = self._reading()
@@ -535,10 +589,15 @@ class QueryEngine:
     ) -> QueryResult:
         """Run one statement inside a transaction and return its rows."""
         statement = self.parse(text)
-        plan = self.planned(statement)
+        working = self._working.get(getattr(txn, "txn_id", None))
+        if working is not None and not self._txn_stages_catalog(txn):
+            working = None
+        plan = self._planned_for(statement, txn, working)
         started = self._reading()
         try:
-            result = self._run(plan, txn, self._bind_parameters(plan, parameters))
+            result = self._run(
+                plan, txn, self._bind_parameters(plan, parameters), catalog=working
+            )
         except GrafxError as failure:
             self._count_error(failure)
             raise
@@ -609,7 +668,11 @@ class QueryEngine:
     # --- running -----------------------------------------------------------------------------
 
     def _run(
-        self, plan: PlannedQuery, txn: object, parameters: dict[str, Value]
+        self,
+        plan: PlannedQuery,
+        txn: object,
+        parameters: dict[str, Value],
+        catalog: Catalog | None = None,
     ) -> QueryResult:
         """Walk the plan and produce the result."""
         root = plan.root
@@ -629,6 +692,7 @@ class QueryEngine:
             parameters=parameters,
             analysis=plan.analysis,
             statistics=statistics,
+            catalog=catalog,
         )
         rows = tuple(self._rows(root.child, context))
         context.release()
@@ -663,7 +727,18 @@ class QueryEngine:
         and no endpoint format to agree. ``save()`` returns the pages of the chain it wrote,
         which is exactly what CONTRACT.md section 8.5 step 4 turns into log records.
         """
-        catalog = self._catalog.catalog
+        stage = getattr(txn, "stage_page_image", None)
+        if stage is None or not callable(stage):
+            # Refused BEFORE any side effect -- the working copy, the index registration, the
+            # vector attach -- so a caller that handed no write transaction leaves nothing
+            # behind, and gets the taxonomy rather than an AttributeError from deep inside.
+            raise GrafxTransactionStateError(
+                "A statement that writes needs a write transaction to stage its pages on; the "
+                f"object supplied is a {type(txn).__name__}.",
+                field="transaction",
+                value=type(txn).__name__,
+            )
+        catalog = self._working_catalog(txn)
         if isinstance(node, CreateVectorSpace):
             catalog.add_space(
                 EmbeddingSpaceDef(
@@ -688,10 +763,10 @@ class QueryEngine:
                 )
             )
             self._attach_primary_key_index(installed, statistics)
-            self._attach_vector_columns(installed, statistics)
+            self._attach_vector_columns(installed, statistics, catalog)
             statistics["tables_created"] = statistics.get("tables_created", 0) + 1
         elif isinstance(node, CreateRelTable):
-            catalog.add_table(
+            installed = catalog.add_table(
                 TableDef(
                     table_id=catalog.next_table_id(),
                     name=node.name,
@@ -701,6 +776,7 @@ class QueryEngine:
                     to_table=node.to_table,
                 )
             )
+            self._attach_endpoint_indexes(installed, statistics)
             statistics["tables_created"] = statistics.get("tables_created", 0) + 1
         else:  # pragma: no cover - the caller checked the type
             raise GrafxPlanError(
@@ -708,9 +784,89 @@ class QueryEngine:
                 field="operator",
                 value=node.label,
             )
-        pages = self._catalog.save()
-        self._stage(txn, self._catalog.file, pages)
-        statistics["pages_staged"] = statistics.get("pages_staged", 0) + len(pages)
+        # The staged door, not save(). save() wrote through the pool the moment it was
+        # called, so a DDL that was then ROLLED BACK had already made its pages reachable: the
+        # next flush of anyone carried them to the device, and the rolled-back table survived a
+        # reopen -- an uncommitted schema change made durable, measured through connect() alone.
+        # And save() returns the CHAIN pages only, so the file header reached the device outside
+        # every log record and a crash between the barrier and the flush lost the schema with no
+        # refusal anywhere. stage() answers with VALUES -- chain, freed pages, and page 0,
+        # unconditionally -- and staging them on the transaction puts all three in the log.
+        #
+        # Restaging on a second DDL statement of the same transaction supersedes by page key,
+        # which is complete because a schema only ever GROWS within a transaction (there is no
+        # drop): the payload is monotonic, so a later staging never names fewer pages.
+        staged = self._catalog.stage(catalog)
+        for page_index, image in staged:
+            txn.stage_page_image(self._catalog.file, page_index, image)
+        self._remember_working(txn, catalog)
+        statistics["pages_staged"] = statistics.get("pages_staged", 0) + len(staged)
+
+    def _working_catalog(self, txn: object) -> Catalog:
+        """Return the catalog this transaction's schema statements build on.
+
+        The SECOND statement of a schema transaction must see the first one's tables -- the
+        quick start declares a space and the table that uses it in one block -- and the live
+        catalog must not, because a refusal or a rollback would then leave the live catalog
+        describing tables that never happened; measured through the public door, the rolled-back
+        table survived a REOPEN, because save() had already pushed its pages into the pool.
+
+        So each transaction gets a working COPY: fresh from the pages on its first schema
+        statement, remembered across its later ones, discarded whole on rollback. The guard on
+        the remembered copy is that the transaction still carries staged catalog images -- a
+        transaction that somehow lost them gets a fresh read rather than a copy nothing else
+        vouches for.
+        """
+        txn_id = getattr(txn, "txn_id", None)
+        held = self._working.get(txn_id)
+        if held is not None and self._txn_stages_catalog(txn):
+            return held
+        return self._catalog.read_from_pages()
+
+    def _txn_stages_catalog(self, txn: object) -> bool:
+        """Return True when this transaction holds staged images of the catalog file."""
+        staged = getattr(txn, "staged_pages", None)
+        if not callable(staged):
+            return False
+        return any(file == self._catalog.file for file, _index in staged())
+
+    def _remember_working(self, txn: object, catalog: Catalog) -> None:
+        """Keep this transaction's working catalog for its next schema statement."""
+        txn_id = getattr(txn, "txn_id", None)
+        if isinstance(txn_id, int) and not isinstance(txn_id, bool):
+            self._working[txn_id] = catalog
+
+    def settle_schema(self, txn_id: int, *, committed: bool) -> None:
+        """Finish a transaction's schema bookkeeping, undoing its side effects on a rollback.
+
+        The working copy is dropped either way. On a rollback the two side effects the DDL made
+        OUTSIDE the transaction are undone as well: the indexes it registered (pruned by table
+        id against the live catalog, which a rollback never touched) and the vector engine's
+        per-space map. Nothing here may raise -- it runs while a rollback is already unwinding,
+        and replacing its reason would hide why the transaction was abandoned at all.
+        """
+        working = self._working.pop(txn_id, None)
+        if committed or working is None:
+            return
+        try:
+            live = self._catalog.catalog
+            alive_tables = {table.table_id for table in live.tables()}
+            alive_names = {table.name for table in live.tables()}
+            manager = self._indexes
+            if manager is not None:
+                listing = getattr(manager, "indexes", None)
+                drop = getattr(manager, "unregister", None)
+                if callable(listing) and callable(drop):
+                    for index in tuple(listing()):
+                        if index.definition.table_id not in alive_tables:
+                            drop(index.definition.name)
+            vectors = self._vectors
+            discard = getattr(vectors, "discard_unknown", None)
+            if callable(discard):
+                discard(live)
+            self._skipped_indexes &= alive_names
+        except GrafxError:
+            return
 
     @property
     def skipped_indexes(self) -> tuple[str, ...]:
@@ -769,6 +925,33 @@ class QueryEngine:
             return
         statistics["indexes_created"] = statistics.get("indexes_created", 0) + 1
 
+    def _attach_endpoint_indexes(
+        self, table: TableDef, statistics: dict[str, int]
+    ) -> None:
+        """Create the two indexes covering the endpoints of a relationship table just declared.
+
+        Same moment, same rules as the primary key's index: the pair exists when the table is
+        declared, the table is EMPTY so the indexes cover everything there is to cover and are
+        told so, and the accelerator DECLINES rather than failing the statement or a later open
+        -- a table whose endpoint index cannot be created traverses by the scan it always did,
+        and the name is reported through :attr:`skipped_indexes`.
+        """
+        if self._indexes is None:
+            return
+        try:
+            for index in relationship_endpoint_indexes(
+                table, self._pool, self._metrics.sink
+            ):
+                self._indexes.register(
+                    index, complete_through=self._published_lsn_for_new_index()
+                )
+        except GrafxIndexError:
+            statistics["indexes_skipped"] = statistics.get("indexes_skipped", 0) + 1
+            self._skipped_indexes.add(table.name)
+            return
+        if getattr(table, "kind", None) == "rel":
+            statistics["indexes_created"] = statistics.get("indexes_created", 0) + 2
+
     def _published_lsn_for_new_index(self) -> int:
         """Return the position a brand-new index over an empty table may claim to cover.
 
@@ -789,7 +972,9 @@ class QueryEngine:
             return int(published())
         return 0
 
-    def _attach_vector_columns(self, table: TableDef, statistics: dict[str, int]) -> None:
+    def _attach_vector_columns(
+        self, table: TableDef, statistics: dict[str, int], catalog: Catalog | None = None
+    ) -> None:
         """Create the index of every embedding space a new table declares a column in.
 
         An index covers a (table, space) PAIR, and the vector subsystem says so explicitly: a
@@ -822,7 +1007,7 @@ class QueryEngine:
                 value=type(vectors).__name__,
             )
         for space in spaces:
-            attach(table, space)
+            attach(table, space, catalog)
             statistics["indexes_attached"] = statistics.get("indexes_attached", 0) + 1
 
     def _stage(self, txn: object, file: str, pages: Sequence[int]) -> None:
@@ -964,6 +1149,145 @@ def _index_seek(
             yield _Row(bindings=bindings)
 
 
+_EDGE_LOOKUP_FAN_LIMIT: int = 64
+"""Distinct traversal start nodes served by index lookups before one grouped edge scan wins.
+
+Chosen from the shape of the two costs, not tuned to a machine: a lookup costs a few bucket-page
+reads however large the edge table is, and the grouped scan costs the whole edge table once.
+Sixty-four lookups are well under one scan of any edge table large enough for the difference to
+matter, and a frontier that crosses sixty-four distinct nodes is a whole-table walk, which is
+what the scan is for."""
+
+
+def _edge_steps(
+    engine: QueryEngine,
+    context: _Context,
+    relationship: TableDef,
+    from_table: TableDef,
+    to_table: TableDef,
+    outgoing: bool,
+    incoming: bool,
+    ended: frozenset[object] | set[object],
+) -> Callable[[object], Iterator[tuple[object, HeapVersion, TableDef, object]]]:
+    """Return the function a traversal expands one frontier node with.
+
+    Two regimes, chosen once per traversal and the same answer from both.
+
+    **By index**, when every direction the pattern walks has its endpoint index present, owned
+    by this table, and FRESH. A stored relationship row leads with its endpoints, so "the edges
+    leaving this node" is exactly the question the ``ef_``/``et_`` indexes answer, and
+    ``IndexManager.lookup`` discharges section 8.7 on the way: every candidate is validated
+    against the heap under this snapshot, so the hits are the edges the scan would have kept.
+    Before this existed, a reverse hop into a well-referenced node of a 2500-node graph read all
+    3600 edges and cost 1.46 s.
+
+    **By one scan**, otherwise -- no framework, no index, or a STALE one, which is a subset of
+    the heap and the one thing validation cannot repair. The scan is taken ONCE and grouped by
+    endpoint, so a frontier of F nodes costs O(E), not the O(F x E) the old per-node rescan
+    paid; slower than the index, and right, which is the same fallback rule the planner and the
+    uniqueness check follow.
+    """
+    manager = engine._indexes
+    lookup = getattr(manager, "lookup", None) if manager is not None else None
+
+    def usable(name: str) -> str | None:
+        """Return the name when that index is present, this table's own, and fresh."""
+        try:
+            index = manager.index(name)  # type: ignore[union-attr]
+        except GrafxError:
+            return None
+        if index.definition.table_id != relationship.table_id:
+            return None  # a name collision, not this table's index
+        if getattr(index, "stale", False):
+            return None
+        return name
+
+    from_name = (
+        usable(edge_from_index_name(relationship.name))
+        if callable(lookup) and outgoing
+        else None
+    )
+    to_name = (
+        usable(edge_to_index_name(relationship.name))
+        if callable(lookup) and incoming
+        else None
+    )
+    indexed = ((not outgoing) or from_name) and ((not incoming) or to_name)
+    snapshot = context.snapshot
+
+    def by_index(
+        record_id: object,
+    ) -> Iterator[tuple[object, HeapVersion, TableDef, object]]:
+        """Yield the node's edges from the endpoint indexes, validated against the heap."""
+        if outgoing:
+            for ref in lookup(from_name, index_key((record_id, None), (0,)), snapshot):
+                if ref in ended:
+                    continue
+                version = engine.heap.read(ref)
+                yield ref, version, to_table, version.values[1]
+        if incoming:
+            for ref in lookup(to_name, index_key((None, record_id), (1,)), snapshot):
+                if ref in ended:
+                    continue
+                version = engine.heap.read(ref)
+                yield ref, version, from_table, version.values[0]
+
+    maps: list[tuple[dict, dict]] = []
+
+    def grouped() -> tuple[dict, dict]:
+        """Build the by-endpoint edge maps ONCE, on the first caller that needs them."""
+        if not maps:
+            by_source: dict[object, list[tuple[object, HeapVersion]]] = {}
+            by_target: dict[object, list[tuple[object, HeapVersion]]] = {}
+            for ref, version in engine.heap.scan(relationship, snapshot):
+                if ref in ended:
+                    continue
+                if outgoing:
+                    by_source.setdefault(version.values[0], []).append((ref, version))
+                if incoming:
+                    by_target.setdefault(version.values[1], []).append((ref, version))
+            maps.append((by_source, by_target))
+        return maps[0]
+
+    def by_scan(
+        record_id: object,
+    ) -> Iterator[tuple[object, HeapVersion, TableDef, object]]:
+        """Yield the node's edges from one grouped scan of the relationship table."""
+        by_source, by_target = grouped()
+        if outgoing:
+            for ref, version in by_source.get(record_id, ()):
+                yield ref, version, to_table, version.values[1]
+        if incoming:
+            for ref, version in by_target.get(record_id, ()):
+                yield ref, version, from_table, version.values[0]
+
+    if not indexed:
+        return by_scan
+
+    # Indexed, WITH a fan limit -- and the limit is a cost model, not a hedge. One lookup
+    # answers one frontier node, so a bounded frontier (a seek, a bound endpoint, a short
+    # range) pays a handful of bucket probes and never reads the edge table. A frontier that
+    # keeps growing -- a scan traversing every node of a table -- pays one lookup per node,
+    # and past a point that costs more than reading the edges ONCE and grouping them. The
+    # switch is by DISTINCT start nodes seen, so it is deterministic for a given plan and
+    # data, and both regimes return the same tuples because the lookup validates against the
+    # same snapshot the scan reads under.
+    seen_starts: set[object] = set()
+
+    def hybrid(
+        record_id: object,
+    ) -> Iterator[tuple[object, HeapVersion, TableDef, object]]:
+        """Serve by index up to the fan limit, then by the grouped scan for good."""
+        if not maps:
+            seen_starts.add(record_id)
+            if len(seen_starts) <= _EDGE_LOOKUP_FAN_LIMIT:
+                yield from by_index(record_id)
+                return
+        yield from by_scan(record_id)
+
+    return hybrid
+
+
 def _traverse(
     engine: QueryEngine, node: TraverseRelationship, context: _Context
 ) -> Iterator[_Row]:
@@ -985,7 +1309,7 @@ def _traverse(
     very row.
     """
     snapshot = context.snapshot
-    catalog = engine._catalog.catalog
+    catalog = context.schema()
     relationship = node.table
     from_table = catalog.table(relationship.from_table)
     to_table = catalog.table(relationship.to_table)
@@ -1005,18 +1329,11 @@ def _traverse(
             nodes_by_id[table.table_id] = found
         return found.get(record_id)  # type: ignore[arg-type]
 
-    edges = list(engine.heap.scan(relationship, snapshot))
     outgoing = node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
     incoming = node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
-
-    def steps(record_id: object) -> Iterator[tuple[object, HeapVersion, TableDef, object]]:
-        """Yield every edge leaving this node in the pattern's direction, with where it lands."""
-        for ref, version in edges:
-            source_id, target_id = version.values[0], version.values[1]
-            if outgoing and source_id == record_id:
-                yield ref, version, to_table, target_id
-            if incoming and target_id == record_id:
-                yield ref, version, from_table, source_id
+    steps = _edge_steps(
+        engine, context, relationship, from_table, to_table, outgoing, incoming, ended
+    )
 
     for row in engine._rows(node.child, context):
         start = row.bindings.get(node.source)
@@ -1038,7 +1355,17 @@ def _traverse(
                 for ref, version, next_table, next_id in steps(record_id):
                     if ref in taken:
                         continue
-                    landing = node_at(next_table, next_id)
+                    if (
+                        isinstance(bound_target, RowBinding)
+                        and bound_target.record_id == next_id
+                        and bound_target.table.table_id == next_table.table_id
+                    ):
+                        # The landing IS the bound row, which arrived through operators that
+                        # already validated its visibility -- so the full-table scan node_at
+                        # would take to re-prove it is not paid.
+                        landing = (bound_target.ref, bound_target.version)
+                    else:
+                        landing = node_at(next_table, next_id)
                     if landing is None:
                         continue
                     edge = RowBinding(
@@ -2182,7 +2509,7 @@ def _prepare_assignment(
         )
     column = _column_named(binding.table, target.key)
     value = _evaluate(assignment.value, row, context)
-    _check_stored_value(engine, binding.table, column, value)
+    _check_stored_value(engine, binding.table, column, value, context)
     return binding, binding.table.column_index(target.key), value
 
 
@@ -2220,7 +2547,7 @@ def materialise_row(
             column = _column_named(table, entry.key)
             position = table.column_index(entry.key)
             stored = _stored_value(
-                engine, table, column, _evaluate(entry.value, row, context)
+                engine, table, column, _evaluate(entry.value, row, context), context
             )
             values[position] = stored
     materialised = tuple(values)
@@ -2243,7 +2570,11 @@ def _column_named(table: TableDef, key: str) -> ColumnDef:
 
 
 def _stored_value(
-    engine: QueryEngine, table: TableDef, column: ColumnDef, value: object
+    engine: QueryEngine,
+    table: TableDef,
+    column: ColumnDef,
+    value: object,
+    context: _Context,
 ) -> Value:
     """Return the value as the column stores it, converting an embedding to its stored shape.
 
@@ -2263,7 +2594,7 @@ def _stored_value(
             field="column",
             value=column.name,
         )
-    space = engine.catalog.catalog.space(str(column.vector_space))
+    space = context.schema().space(str(column.vector_space))
     vectors = engine.require_vectors()
     validated = vectors.validate_vector(space, tuple(value))  # type: ignore[attr-defined]
     return VectorValue(
@@ -2272,10 +2603,14 @@ def _stored_value(
 
 
 def _check_stored_value(
-    engine: QueryEngine, table: TableDef, column: ColumnDef, value: object
+    engine: QueryEngine,
+    table: TableDef,
+    column: ColumnDef,
+    value: object,
+    context: _Context,
 ) -> Value:
     """Return one value checked against the column it is about to be written to."""
-    stored = _stored_value(engine, table, column, value)
+    stored = _stored_value(engine, table, column, value, context)
     if stored is None:
         if not column.nullable:
             raise GrafxPlanError(

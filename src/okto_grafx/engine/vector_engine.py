@@ -862,14 +862,23 @@ class VectorEngine:
         self._publish_space_metrics()
         self._emit("vector.space_retired", space=retired.name)
 
-    def attach(self, table: TableDef, space_name: str) -> VectorHnswIndex:
+    def attach(
+        self, table: TableDef, space_name: str, catalog: object = None
+    ) -> VectorHnswIndex:
         """Create and register the index of one embedding space over one table (TR-2).
 
         One index per (property, space) is what the specification asks for, and the property is a
         column of a table -- so the index is created when a table declares the column, not when
         the space is declared.
+
+        ``catalog`` is for the one caller that knows about a space the LIVE catalog does not yet:
+        the DDL path builds schema changes on a per-transaction working copy, so a space and a
+        table declared in the same transaction exist only there until the commit installs them.
+        Resolving the space from the live catalog would refuse exactly the statement the quick
+        start opens with.
         """
-        space = self._catalog.catalog.space(space_name)
+        source = catalog if catalog is not None else self._catalog.catalog
+        space = source.space(space_name)
         position = self._vector_column_of(table, space)
         registry = self._require_registry()
         index = VectorHnswIndex(
@@ -899,6 +908,26 @@ class VectorEngine:
         self._maintained_at[space.name] = self._clock.monotonic()
         self._publish_space_metrics()
         return index
+
+    def discard_unknown(self, catalog: object) -> tuple[str, ...]:
+        """Drop the spaces this engine holds an index for and that catalog does not know.
+
+        The rollback of a schema transaction is the caller: ``attach`` ran at statement time and
+        installed per-space state here, and the transaction that declared the space is now not
+        going to happen. The registry half is pruned by table id in the index manager; this is
+        the vector engine's own map, which would otherwise answer ``index(space)`` for a space
+        that does not exist. Returns the names dropped, and never raises -- it runs inside an
+        unwind.
+        """
+        try:
+            alive = {space.name for space in catalog.spaces()}
+        except Exception:  # noqa: BLE001 - an unwind must not gain a second failure
+            return ()
+        dropped = tuple(name for name in self._by_space if name not in alive)
+        for name in dropped:
+            self._by_space.pop(name, None)
+            self._maintained_at.pop(name, None)
+        return dropped
 
     def _require_registry(self) -> IndexManager:
         """Return the index registry, refusing an engine that was built without one.

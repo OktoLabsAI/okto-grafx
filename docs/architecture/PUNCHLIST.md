@@ -600,7 +600,9 @@ cap.
   `save()` return the header page too, or to route `bootstrap()` through `stage()` and delete
   `save()`; both are behaviour changes to a signed-off, heavily-tested path and are out of scope
   under a one-round cap.
-- **C10 / `engine/query_engine.py:_schema` (not C1's file; the fix is owed by C10).** It still does
+- **C10 / `engine/query_engine.py:_schema` — CLOSED (CF-16).** The migration below landed, with
+  the per-transaction working copy that the three-line sketch did not anticipate (same-transaction
+  statement chains and the vector attach both needed it). Kept for the record: it used to say
   `catalog = self._catalog.catalog` (mutating the LIVE catalog) then `self._catalog.save()` then
   `self._stage(txn, file, pages)`. The replacement is three lines and is written out in the
   `stage()` docstring: `read_from_pages()` for the copy, mutate the copy, then
@@ -609,7 +611,10 @@ cap.
   already encoded, and pinning would read the OLD page, since staging deliberately writes nothing.
   Until this lands, the defect is still live end to end: C1 has built the door, not walked through
   it.
-- **C10 / `engine/query_engine.py:_attach_vector_columns` -- unverified, same defect class.** It
+- **C10 / `engine/query_engine.py:_attach_vector_columns` — CONFIRMED and CLOSED (CF-16).** It was
+  the same defect class: attach() installs registry and per-space state at statement time, and a
+  rollback left both. `settle_schema` prunes the registry by table id and `discard_unknown` prunes
+  the vector engine's map. Originally recorded as: it
   runs on the `CREATE NODE TABLE` path, before the commit, and calls `vectors.attach(table, space)`.
   If that installs index state that is not staged on the transaction, a refused DDL leaves an index
   attached to a table that does not exist. C1 did not measure it and does not own it; C7/C9/C10
@@ -1074,3 +1079,37 @@ carries this key". They stay because the doors are public.
   remains: a retry of the same `CREATE` fails with `GrafxConfigurationError`.
 - `IndexManager.register` flushes a header during a DDL statement, which puts a device write outside
   the transaction that may then roll back.
+
+
+## Traversal after CF-17: the two levers left (C7/C10; recorded)
+
+- **The landing scan.** A traversal whose target is FREE resolves each landing table once per
+  traversal by a full scan, because edges store record IDENTITIES and nothing maps an identity to a
+  heap location. That is the 29 ms in a forward hop whose index work is microseconds, and the bulk
+  of the 221 ms reverse case. The structural fix is an identity index (a third automatic index per
+  node table) or storing refs with a repair protocol for the update case; both are format-adjacent
+  and W6-sized.
+- **The planner does not reorder a pattern to start from its seekable side.**
+  `MATCH (c)-[:M]->(e {id: k})` walks from `c` -- a whole-table frontier -- when seeking `e` and
+  traversing INCOMING would touch a handful of rows. The traversal's fan limit caps the damage; the
+  ordering decision itself is planner work with its own review burden.
+- **Nothing asserts the traversal actually USES the index path.** The equality tests compare
+  index-vs-scan answers and the populate test walks entries, but a mutant that silently always took
+  the grouped scan would pass the suite -- correctness-neutral by construction, visible only in the
+  CF-17 measurement. Same survivor class as "re-adopt only the first table's index" was.
+
+## Schema transactionality after CF-16: residues (C10; recorded)
+
+- **Index FILES of a rolled-back DDL stay on the device.** The registration is pruned; the file an
+  `IndexStore.create()` wrote at statement time is not removed (a device operation inside an
+  unwind). Harmless: the next registration under the name either adopts the empty file or declines.
+- **`QueryEngine._working` entries leak for callers that drive the TransactionManager directly**
+  (test harnesses): the wrapper's commit/rollback is what settles them. Memory, bounded by such a
+  caller's DDL transaction count; txn ids are never reused, so a stale entry can never be read.
+- **Two threads of one process running DDL concurrently** share the live registry side effects;
+  DDL-vs-DDL commit conflicts are refused by the page-0 intersection (both stage it), but the
+  working copies are per-transaction and the registry prune on one rollback can drop the OTHER
+  open transaction's freshly registered index. Pre-existing regime (concurrent DDL was racier
+  before CF-16 than after); recorded, not closed.
+- **`CatalogStore.save()` keeps its old shape for `bootstrap()` and recovery adoption**, per the
+  original W6 record. No transactional caller remains.

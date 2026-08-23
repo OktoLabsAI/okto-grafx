@@ -490,6 +490,7 @@ class Transaction:
         report = self._database.transactions.commit(self._context)
         self._report = report
         self._finished = True
+        self._database._settle_schema(self._context, committed=True)
         return report
 
     def rollback(self) -> None:
@@ -498,6 +499,7 @@ class Transaction:
             return
         self._finished = True
         self._database.transactions.rollback(self._context)
+        self._database._settle_schema(self._context, committed=False)
 
     def __enter__(self) -> Self:
         """Return this transaction so a ``with`` block can use it."""
@@ -1025,6 +1027,18 @@ class Database:
     def _close_transactions(self) -> None:
         """Abort every open transaction and withdraw every reader registration."""
         self._transactions.close()
+
+    def _settle_schema(self, context: TransactionContext, *, committed: bool) -> None:
+        """Tell the query engine one transaction's schema bookkeeping is over.
+
+        On a rollback this is what takes back the two side effects a DDL statement makes outside
+        the transaction -- the indexes it registered and the vector engine's space map -- and
+        drops the working catalog copy. Never raises: it runs on the rollback path.
+        """
+        queries = self._queries
+        settle = getattr(queries, "settle_schema", None)
+        if callable(settle):
+            settle(context.txn_id, committed=committed)
 
     def _flush_pages(self) -> None:
         """Write dirty pages back, unless the database was opened read-only.

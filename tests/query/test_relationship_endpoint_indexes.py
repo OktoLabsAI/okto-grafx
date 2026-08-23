@@ -1,0 +1,161 @@
+"""The indexes over a relationship table's endpoints, and the traversal that reads them.
+
+WHY THIS FILE EXISTS. Traversal was a scan: "the edges leaving this node" was answered by
+filtering EVERY edge of the table, per frontier node, and resolving each landing by scanning the
+landing table. Measured on a 2500-node knowledge graph, a reverse hop into a well-referenced
+entity read all 3600 edges and cost 1.46 s -- the slowest thing left in a real graph after the
+primary keys were indexed. A stored relationship row leads with its endpoints (W5c), so the
+question is exactly what an EXACT index over stored positions 0 and 1 answers.
+
+What these tests hold, in order: the indexes exist and cover the right positions; the commit
+populates them (through the same staging seam every index uses); the traversal answers the SAME
+rows through the index, through the grouped-scan fallback, and past the fan limit where the
+hybrid switches between them; a stale endpoint index is never consulted; and the accelerator
+declines rather than failing a statement, the same rule the primary key's index follows.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+import okto_grafx
+from okto_grafx.engine.index_manager import edge_from_index_name, edge_to_index_name
+
+
+@pytest.fixture()
+def database(tmp_path: Path):
+    handle = okto_grafx.connect(tmp_path / "db", page_size=512)
+    try:
+        yield handle
+    finally:
+        handle.close()
+
+
+def _small_graph(db) -> None:
+    with db.begin("write") as txn:
+        txn.execute("CREATE NODE TABLE A(id INT64, PRIMARY KEY(id))")
+        txn.execute("CREATE NODE TABLE B(id INT64, PRIMARY KEY(id))")
+        txn.execute("CREATE REL TABLE E(FROM A TO B, w INT64)")
+    with db.begin("write") as txn:
+        for identity in range(1, 6):
+            txn.execute("CREATE (:A {id: $i})", {"i": identity})
+        for identity in range(1, 4):
+            txn.execute("CREATE (:B {id: $i})", {"i": identity})
+    with db.begin("write") as txn:
+        for source, target in ((1, 1), (1, 2), (2, 1), (3, 3), (4, 1), (5, 2)):
+            txn.execute(
+                "MATCH (a:A {id: $a}), (b:B {id: $b}) CREATE (a)-[:E {w: 1}]->(b)",
+                {"a": source, "b": target},
+            )
+
+
+def test_the_commit_populates_both_endpoint_indexes(database) -> None:
+    """One entry per edge in each, through the same staging seam every index uses.
+
+    Walked directly rather than through a query, so a traversal that silently fell back to the
+    scan could not make an EMPTY index look populated (the E3 shape, one component over).
+    """
+    _small_graph(database)
+    assert len(database.indexes.index(edge_from_index_name("E")).walk()) == 6
+    assert len(database.indexes.index(edge_to_index_name("E")).walk()) == 6
+
+
+def test_traversal_answers_the_same_rows_by_index_and_by_scan(database) -> None:
+    """The index is an accelerator: same rows forward, reverse, and undirected, both regimes."""
+    _small_graph(database)
+    shapes = [
+        ("MATCH (a:A {id: 1})-[:E]->(b:B) RETURN b.id", None),
+        ("MATCH (a:A)-[:E]->(b:B {id: 1}) RETURN a.id", None),
+        ("MATCH (a:A)-[:E]->(b:B) RETURN a.id, b.id", None),
+        ("MATCH (b:B {id: 1})<-[:E]-(a:A) RETURN a.id", None),
+    ]
+    indexed = [sorted(database.execute(text).rows) for text, _p in shapes]
+    database.indexes.index(edge_from_index_name("E")).mark_stale("forced by this test")
+    database.indexes.index(edge_to_index_name("E")).mark_stale("forced by this test")
+    scanned = [sorted(database.execute(text).rows) for text, _p in shapes]
+    assert indexed == scanned
+    assert indexed[0] == [(1,), (2,)]
+    assert indexed[1] == [(1,), (2,), (4,)]
+
+
+def test_the_hybrid_switches_past_the_fan_limit_and_the_answer_does_not_change(
+    database,
+) -> None:
+    """A whole-table frontier crosses the fan limit; the grouped scan takes over mid-query.
+
+    More distinct start nodes than the limit, and the total is asserted against arithmetic
+    (every A of the table has exactly one edge), so an answer that lost rows at the switch --
+    or double-served the starts that went through the index -- cannot pass.
+    """
+    with database.begin("write") as txn:
+        txn.execute("CREATE NODE TABLE A(id INT64, PRIMARY KEY(id))")
+        txn.execute("CREATE NODE TABLE B(id INT64, PRIMARY KEY(id))")
+        txn.execute("CREATE REL TABLE E(FROM A TO B, w INT64)")
+    with database.begin("write") as txn:
+        for identity in range(1, 101):
+            txn.execute("CREATE (:A {id: $i})", {"i": identity})
+        for identity in range(1, 4):
+            txn.execute("CREATE (:B {id: $i})", {"i": identity})
+    with database.begin("write") as txn:
+        for identity in range(1, 101):
+            txn.execute(
+                "MATCH (a:A {id: $a}), (b:B {id: $b}) CREATE (a)-[:E {w: 1}]->(b)",
+                {"a": identity, "b": identity % 3 + 1},
+            )
+    rows = database.execute("MATCH (a:A)-[:E]->(b:B) RETURN a.id, b.id").rows
+    assert len(rows) == 100
+    assert len(set(rows)) == 100
+
+
+def test_a_deleted_landing_node_is_not_reached_through_its_edges(database) -> None:
+    """An edge is followed only when the snapshot sees the node it lands on -- index or scan."""
+    _small_graph(database)
+    with database.begin("write") as txn:
+        txn.execute("MATCH (b:B) WHERE b.id = 1 DELETE b")
+    assert database.execute("MATCH (a:A {id: 2})-[:E]->(b:B) RETURN b.id").rows == ()
+    assert sorted(database.execute("MATCH (a:A {id: 1})-[:E]->(b:B) RETURN b.id").rows) == [
+        (2,)
+    ]
+
+
+def test_endpoint_indexes_come_back_fresh_on_reopen(tmp_path: Path) -> None:
+    root = tmp_path / "db"
+    with okto_grafx.connect(root, page_size=512) as db:
+        _small_graph(db)
+    with okto_grafx.connect(root, page_size=512) as reopened:
+        assert "ef_E" in reopened.attached_indexes
+        assert "et_E" in reopened.attached_indexes
+        assert reopened.stale_indexes == ()
+        assert sorted(
+            reopened.execute("MATCH (a:A)-[:E]->(b:B {id: 1}) RETURN a.id").rows
+        ) == [(1,), (2,), (4,)]
+        assert reopened.verify("all").findings == ()
+
+
+def test_a_rel_table_whose_name_leaves_no_room_for_an_index_name_still_works(
+    database,
+) -> None:
+    """The accelerator declines; the statement and the traversal do not fail.
+
+    Same rule, same guard, same reason as the primary key's index: an index may not fail a
+    statement, and a table whose endpoint indexes could not be created traverses by the scan it
+    always did.
+    """
+    long_name = "R" + "x" * 127
+    with database.begin("write") as txn:
+        txn.execute("CREATE NODE TABLE A(id INT64, PRIMARY KEY(id))")
+        txn.execute("CREATE NODE TABLE B(id INT64, PRIMARY KEY(id))")
+        txn.execute(f"CREATE REL TABLE {long_name}(FROM A TO B, w INT64)")
+    assert long_name in database.queries.skipped_indexes
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:A {id: 1})")
+        txn.execute("CREATE (:B {id: 1})")
+    with database.begin("write") as txn:
+        txn.execute(
+            f"MATCH (a:A {{id: 1}}), (b:B {{id: 1}}) CREATE (a)-[:{long_name} {{w: 1}}]->(b)"
+        )
+    assert database.execute(
+        f"MATCH (a:A)-[:{long_name}]->(b:B) RETURN a.id, b.id"
+    ).rows == ((1, 1),)

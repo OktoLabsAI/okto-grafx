@@ -515,31 +515,51 @@ def test_a_reference_vector_that_is_not_numbers_is_refused(chunks: QueryStack) -
 
 
 def test_a_node_table_statement_installs_the_table_and_stages_its_pages() -> None:
+    """The statement STAGES; the commit installs. Both halves are asserted.
+
+    The live catalog learning about a table at statement time was the defect: a rolled-back DDL
+    stayed in it, and -- because save() had pushed the pages into the pool -- survived a REOPEN.
+    So the honest assertions are that the statement staged the images (page 0 of the catalog
+    among them, which is what makes the change reachable to redo), that the live catalog does
+    NOT hold the table yet, and that it does once the images are applied the way a commit
+    applies them.
+    """
     built = build_query_stack()
     transaction = built.transaction()
     result = built.engine.execute(
         "CREATE NODE TABLE Team(id INT64, label STRING, PRIMARY KEY(id))", transaction
     )
-    assert built.catalog_store.catalog.has_table("Team")
     assert result.statistics["tables_created"] == 1
-    assert transaction.staged_pages
+    assert transaction.page_images, "the statement staged nothing"
+    assert (built.catalog_store.file, 0) in transaction.page_images, (
+        "the file header is not among the staged images, so a redo could not reach the change"
+    )
+    assert not built.catalog_store.catalog.has_table("Team"), (
+        "the live catalog learned about a table whose transaction has not committed"
+    )
+    built.apply_schema(transaction)
+    assert built.catalog_store.catalog.has_table("Team")
 
 
 def test_a_vector_space_statement_installs_the_space() -> None:
     built = build_query_stack()
+    transaction = built.transaction()
     built.engine.execute(
         "CREATE VECTOR SPACE second {dimension: 8, metric: 'dot', normalized: true}",
-        built.transaction(),
+        transaction,
     )
+    built.apply_schema(transaction)
     space = built.catalog_store.catalog.space("second")
     assert (space.dimension, space.metric.value, space.normalized) == (8, "dot", True)
 
 
 def test_a_relationship_table_statement_installs_the_table() -> None:
     built = build_query_stack()
+    transaction = built.transaction()
     built.engine.execute(
-        "CREATE REL TABLE Wrote(FROM Person TO Chunk, at INT64)", built.transaction()
+        "CREATE REL TABLE Wrote(FROM Person TO Chunk, at INT64)", transaction
     )
+    built.apply_schema(transaction)
     table = built.catalog_store.catalog.table("Wrote")
     assert (table.kind, table.from_table, table.to_table) == ("rel", "Person", "Chunk")
 
@@ -645,10 +665,12 @@ def test_a_column_attached_by_the_statement_is_searchable_at_once() -> None:
     # End to end for the attach: declare the table through the language, write a vector into the
     # index the statement created, and search it. If the attach were missing this would refuse.
     built = build_query_stack()
+    ddl = built.transaction()
     built.engine.execute(
         "CREATE NODE TABLE Note(id INT64, body VECTOR(minilm_v2), PRIMARY KEY(id))",
-        built.transaction(),
+        ddl,
     )
+    built.apply_schema(ddl)
     table = built.catalog_store.catalog.table("Note")
     ref = built.heap.insert(table, 1, (1, vector((1.0, 0.0, 0.0, 0.0))), 1)
     transaction = built.transaction()
@@ -822,10 +844,12 @@ def test_a_null_predicate_is_unknown_rather_than_an_error(stack: QueryStack) -> 
 
 def test_a_boolean_column_is_a_condition_like_any_other() -> None:
     built = build_query_stack()
+    ddl = built.transaction()
     built.engine.execute(
         "CREATE NODE TABLE Flagged(id INT64, live BOOL, PRIMARY KEY(id))",
-        built.transaction(),
+        ddl,
     )
+    built.apply_schema(ddl)
     built.insert("Flagged", 1, (1, True))
     built.insert("Flagged", 2, (2, False))
     found = built.engine.execute(

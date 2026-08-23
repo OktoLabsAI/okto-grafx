@@ -265,7 +265,12 @@ class TransactionDouble:
     snapshot: SnapshotDouble
     txn_id: int = 1
     staged_records: list[object] = field(default_factory=list)
-    staged_pages: dict[tuple[str, int], bytes] = field(default_factory=dict)
+    # Named and shaped like the REAL context: `page_images` is the dict, `staged_pages()` is the
+    # method returning its sorted keys. The engine now asks a transaction which files it has
+    # staged pages for -- through `staged_pages()` -- so a double whose attribute shadowed that
+    # name with a dict answered "not callable" and the engine treated it as a transaction with
+    # nothing staged (LESSONS L12: a double weaker than the thing it stands in for).
+    page_images: dict[tuple[str, int], bytes] = field(default_factory=dict)
     row_intents: list[RowIntent] = field(default_factory=list)
     row_refs: list[object] = field(default_factory=list)
     read_partitions: set[int] = field(default_factory=set)
@@ -278,7 +283,11 @@ class TransactionDouble:
 
     def stage_page_image(self, file: str, page_index: int, image: bytes) -> None:
         """Stage the bytes one page should hold."""
-        self.staged_pages[(file, page_index)] = bytes(image)
+        self.page_images[(file, page_index)] = bytes(image)
+
+    def staged_pages(self) -> list[tuple[str, int]]:
+        """Return the staged page locations in a fixed order, the way the real context does."""
+        return sorted(self.page_images)
 
     def stage_row_insert(
         self, table: object, values: object, *, record_id: int | None = None
@@ -374,6 +383,36 @@ class QueryStack:
     def transaction(self, read_lsn: int = 1000) -> TransactionDouble:
         """Return a transaction reading at that log position."""
         return TransactionDouble(snapshot=self.snapshot(read_lsn))
+
+    def apply_schema(self, transaction: TransactionDouble) -> int:
+        """Apply the catalog images a schema statement staged, the way a commit would.
+
+        A schema statement no longer installs anything at statement time: it builds on the
+        transaction's working catalog and stages the page images, and the LIVE catalog learns
+        about the change when the commit applies those images (CONTRACT section 8.5 step 3.6).
+        This is the harness's one-line stand-in for that step, going through the same
+        `apply_page_image` door a real commit and a redo go through -- so a test that asserts
+        the live catalog after calling this is asserting the committed picture, which is the
+        only picture the live catalog ever shows now.
+        """
+        applied = 0
+        for (file, page_index), image in sorted(transaction.page_images.items()):
+            if file != self.catalog_store.file:
+                continue
+            # Straight to the device, not through apply_page_image: that door honours the redo
+            # rule -- apply only when the resident page is OLDER -- and staged images are
+            # unstamped until a real commit stamps them with the batch's log position, so the
+            # header page would tie with its resident twin and be left alone. The stale frame is
+            # dropped first so the next read through the pool meets the device's bytes.
+            self.pool.discard(file, page_index)
+            self.pool.storage.write_page(file, page_index, image)
+            applied += 1
+        # A real participant re-reads on the next read view, whose frame drop moves the epoch
+        # the catalog property watches. The harness has no next read view, so it re-reads
+        # explicitly -- load() is the destructive re-read, and nothing in memory is worth
+        # keeping here precisely because the images just applied ARE the state.
+        self.catalog_store.load()
+        return applied
 
     def insert(
         self, table_name: str, record_id: int, values: Sequence[Value], csn: Csn = 1

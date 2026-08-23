@@ -1492,6 +1492,73 @@ def _tables_written_by(txn: object) -> frozenset[int] | None:
     return frozenset(tables)
 
 
+EDGE_FROM_INDEX_PREFIX: str = "ef_"
+"""What the index over a relationship table's SOURCE endpoint is named after."""
+
+EDGE_TO_INDEX_PREFIX: str = "et_"
+"""What the index over a relationship table's TARGET endpoint is named after."""
+
+
+def edge_from_index_name(table_name: str) -> str:
+    """Return the name of the index over that relationship table's source endpoint."""
+    return f"{EDGE_FROM_INDEX_PREFIX}{table_name}"
+
+
+def edge_to_index_name(table_name: str) -> str:
+    """Return the name of the index over that relationship table's target endpoint."""
+    return f"{EDGE_TO_INDEX_PREFIX}{table_name}"
+
+
+def relationship_endpoint_indexes(
+    table: object, pool: BufferPool, metrics: MetricsSink
+) -> tuple[HashIndex, ...]:
+    """Return the two exact indexes covering a relationship table's endpoints, or none.
+
+    A stored relationship row leads with the two endpoints it connects (W5c): ``_from`` and
+    ``_to`` at positions 0 and 1 of the STORED tuple, each a record identity, ahead of the
+    properties. Traversal is a walk over those two columns, and without an index it was a scan
+    of every edge per frontier node -- measured on a 2500-node knowledge graph, a reverse hop
+    into a well-referenced entity read all 3600 edges and cost 1.46 s.
+
+    The positions deliberately index the stored tuple, not ``table.columns``: a relationship
+    table's declared columns are its properties, which sit AFTER the endpoints, and the one
+    thing every consumer of an IndexDefinition agrees on -- ``key_for``, the commit's staging,
+    the verifier's drift detector -- is that positions index the stored values. The PLANNER
+    maps WHERE clauses through column names and therefore never chooses these; the traversal
+    operator is their one reader, by name.
+
+    EXACT visibility, for the same reason the primary key's index is exact: a hit is a
+    candidate, and ``IndexManager.lookup`` validates every one against the heap under the
+    caller's snapshot, so the index may be a superset and can never be a wrong answer.
+    """
+    if getattr(table, "kind", None) != "rel":
+        return ()
+    return (
+        HashIndex(
+            IndexDefinition(
+                name=edge_from_index_name(table.name),
+                table_id=table.table_id,
+                table_name=table.name,
+                positions=(0,),
+                visibility=IndexVisibility.EXACT,
+            ),
+            pool,
+            metrics,
+        ),
+        HashIndex(
+            IndexDefinition(
+                name=edge_to_index_name(table.name),
+                table_id=table.table_id,
+                table_name=table.name,
+                positions=(1,),
+                visibility=IndexVisibility.EXACT,
+            ),
+            pool,
+            metrics,
+        ),
+    )
+
+
 PRIMARY_KEY_INDEX_PREFIX: str = "pk_"
 """What the index covering a table's declared PRIMARY KEY is named after."""
 
@@ -1606,6 +1673,22 @@ class IndexManager:
             index.advance_built_through(complete_through)
         index.check_freshness(self._published_lsn)
         return index
+
+    def unregister(self, name: str) -> bool:
+        """Forget one registered index, leaving its file alone, and say whether one was held.
+
+        The caller is the rollback of a schema transaction: the DDL registered the index the
+        moment it ran, and the transaction that asked for it is now not going to happen. The
+        FILE stays -- removing it is a device operation inside an unwind, with its own failure
+        mode -- and an orphan index file is harmless: the next registration under the same name
+        either adopts it (same definition digest) or declines, and nothing else ever reads it.
+
+        A name nothing is registered under answers False rather than raising, because this runs
+        while a rollback is already unwinding and must not replace its reason.
+        """
+        if not isinstance(name, str):
+            return False
+        return self._indexes.pop(name.lower(), None) is not None
 
     def indexes(self) -> tuple[IndexStore, ...]:
         """Return every registered index, in the order names sort, so a report is reproducible."""
