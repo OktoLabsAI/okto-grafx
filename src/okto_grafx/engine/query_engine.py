@@ -51,6 +51,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from okto_grafx.domain.errors import (
+    GrafxIndexError,
     GrafxEmbeddingSpaceMismatch,
     GrafxError,
     GrafxPlanError,
@@ -451,6 +452,7 @@ class QueryEngine:
         "_vectors",
         "_metrics",
         "_clock",
+        "_skipped_indexes",
     )
 
     def __init__(
@@ -468,6 +470,9 @@ class QueryEngine:
         self._catalog = catalog
         self._heap = heap
         self._pool = pool
+        # Tables whose primary-key index could not be created. Reported rather than
+        # raised: see _attach_primary_key_index.
+        self._skipped_indexes: set[str] = set()
         self._indexes = indexes
         self._vectors = vectors
         self._metrics = MetricEmitter(metrics)
@@ -707,6 +712,11 @@ class QueryEngine:
         self._stage(txn, self._catalog.file, pages)
         statistics["pages_staged"] = statistics.get("pages_staged", 0) + len(pages)
 
+    @property
+    def skipped_indexes(self) -> tuple[str, ...]:
+        """Return the tables whose primary-key index could not be created, in name order."""
+        return tuple(sorted(self._skipped_indexes))
+
     def _attach_primary_key_index(
         self, table: TableDef, statistics: dict[str, int]
     ) -> None:
@@ -730,17 +740,52 @@ class QueryEngine:
         """
         if self._indexes is None or table.primary_key is None:
             return
-        index = primary_key_index(table, self._pool, self._metrics.sink)
-        if index is None:
+        try:
+            index = primary_key_index(table, self._pool, self._metrics.sink)
+            if index is None:
+                return
+            self._indexes.register(
+                index, complete_through=self._published_lsn_for_new_index()
+            )
+        except GrafxIndexError:
+            # THE INDEX MAY NOT FAIL THE STATEMENT, and the first version of this let it.
+            # `add_table` has already mutated the live catalog by the time this runs, so a
+            # refusal here left the table INSTALLED and the statement REFUSED -- and the next
+            # committed schema change wrote that table to disk, after which the re-adoption at
+            # every later open raised the same refusal and the database could never be opened
+            # again. Two ordinary inputs reach it through `connect()` alone: a table name of 126
+            # characters or more, because `pk_` prepended to it exceeds the 128-character
+            # identifier budget; and two tables whose names differ only by case, which the
+            # catalog accepts as two tables and which fold to one index file name.
+            #
+            # So the accelerator declines instead. The table exists, its keyed reads plan the
+            # scan they planned before any index existed, and the name is reported through
+            # `Database.unindexed_tables` rather than being discovered as a slow query. This is
+            # the same position the composition-without-C7 branch above already takes, and the
+            # opposite of the vector case, where the column would be permanently unsearchable
+            # and refusing is the only honest answer.
+            statistics["indexes_skipped"] = statistics.get("indexes_skipped", 0) + 1
+            self._skipped_indexes.add(table.name)
             return
-        registered = self._indexes.register(index)
-        registered.advance_built_through(self._published_lsn_for_new_index())
         statistics["indexes_created"] = statistics.get("indexes_created", 0) + 1
 
     def _published_lsn_for_new_index(self) -> int:
-        """Return the position a brand-new index over an empty table may claim to cover."""
+        """Return the position a brand-new index over an empty table may claim to cover.
+
+        ``IndexManager.published_lsn`` is a PROPERTY, and the first version of this asked
+        ``callable()`` before reading it. A property read through ``getattr`` is already the int,
+        so the test was always False and this always returned 0 -- which made
+        ``advance_built_through`` a no-op on the position and left every table declared in a
+        session after the first with an index that registered behind the published position, was
+        marked stale on the spot, and could never be lifted, because ``_advance`` refuses to move
+        a stale index. Exactly the failure the caller's docstring says it prevents. Every test of
+        it created its table in the FIRST session, where the published position is 0 and the bug
+        cannot show (LESSONS L24, L30).
+        """
         published = getattr(self._indexes, "published_lsn", None)
-        if callable(published):
+        if isinstance(published, int) and not isinstance(published, bool):
+            return published
+        if callable(published):          # a composition whose manager exposes it as a method
             return int(published())
         return 0
 

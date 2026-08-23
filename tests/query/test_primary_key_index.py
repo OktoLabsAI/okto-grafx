@@ -303,3 +303,131 @@ def test_a_stale_index_does_not_let_a_duplicate_key_through(database) -> None:
             txn.execute("CREATE (:Person {id: 1, name: 'other'})")
     assert refused.value.details.get("field") == "primary_key"
     assert database.execute("MATCH (p:Person) RETURN count(*)").rows == ((1,),)
+
+
+# --- an index may never fail a statement, and never make a database unopenable -------------------
+
+
+LONG_NAME = "T" + "x" * 127
+"""A table name at the identifier budget. Prepending ``pk_`` puts the index name over it."""
+
+
+def test_a_table_whose_name_leaves_no_room_for_an_index_name_is_still_created(
+    tmp_path: Path,
+) -> None:
+    """The accelerator declines; it does not take the statement down with it.
+
+    `catalog.add_table` mutates the live catalog BEFORE the index is attached, so a refusal from
+    the attach left the table INSTALLED and the statement REFUSED. The next committed schema
+    change then wrote that table to disk, and the re-adoption at every later open raised the same
+    refusal -- every row in the database unreachable through the only door there is.
+
+    Two ordinary inputs reach it and neither needs concurrency or a fault: a table name of 126
+    characters or more, because the identifier budget is 128 and ``pk_`` is three of them; and two
+    tables whose names differ only by case, which the catalog accepts as two tables and which fold
+    to one index file name.
+    """
+    root = tmp_path / "db"
+    with okto_grafx.connect(root, page_size=512) as db:
+        with db.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE Ok(id INT64, PRIMARY KEY(id))")
+        with db.begin("write") as txn:
+            txn.execute("CREATE (:Ok {id: 1})")
+        with db.begin("write") as txn:
+            txn.execute(f"CREATE NODE TABLE {LONG_NAME}(id INT64, PRIMARY KEY(id))")
+        # It exists, it is usable, and the engine says which table went without an index.
+        assert LONG_NAME in db.queries.skipped_indexes
+        with db.begin("write") as txn:
+            txn.execute(f"CREATE (:{LONG_NAME} {{id: 7}})")
+        assert db.execute(f"MATCH (t:{LONG_NAME}) RETURN t.id").rows == ((7,),)
+        # A later schema change is what used to persist the leaked table.
+        with db.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE Later(id INT64, PRIMARY KEY(id))")
+        with db.begin("write") as txn:
+            txn.execute("CREATE (:Ok {id: 2})")
+
+    with okto_grafx.connect(root, page_size=512) as reopened:
+        assert reopened.execute("MATCH (o:Ok) RETURN o.id").rows == ((1,), (2,))
+        assert reopened.execute(f"MATCH (t:{LONG_NAME}) RETURN t.id").rows == ((7,),)
+        assert "pk_Ok" in reopened.attached_indexes
+        assert reopened.verify("all").findings == ()
+
+
+def test_two_table_names_differing_only_by_case_do_not_brick_the_database(
+    tmp_path: Path,
+) -> None:
+    """The catalog is case-SENSITIVE and an index name is case-FOLDED, because it is a file name.
+
+    So two legal tables want one index file. The second one goes without an index rather than
+    taking the statement, and later the whole database, down with it.
+    """
+    root = tmp_path / "db"
+    with okto_grafx.connect(root, page_size=512) as db:
+        with db.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
+        with db.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE person(id INT64, PRIMARY KEY(id))")
+        with db.begin("write") as txn:
+            txn.execute("CREATE (:Person {id: 1})")
+            txn.execute("CREATE (:person {id: 2})")
+
+    with okto_grafx.connect(root, page_size=512) as reopened:
+        assert reopened.execute("MATCH (p:Person) RETURN p.id").rows == ((1,),)
+        assert reopened.execute("MATCH (p:person) RETURN p.id").rows == ((2,),)
+        assert reopened.verify("all").findings == ()
+
+
+def test_a_table_declared_in_a_later_session_gets_a_FRESH_index(tmp_path: Path) -> None:
+    """The regime every other test of this feature skipped, and the one that was broken.
+
+    A brand-new index over an empty table covers everything there is to cover, and it must be told
+    so BEFORE its freshness is judged -- `_advance` refuses to move an index already marked stale,
+    so an advance afterwards is a no-op and the index stays stale for ever.
+
+    In the FIRST session the published position is 0, so an index that failed to advance still
+    looked fresh and every test passed. From the second session on, the published position is
+    ahead: the index registered behind it, was marked stale on the spot, and no amount of loading
+    lifted it. The answers stayed correct -- a stale index is withheld and the query falls back to
+    the scan -- so the only symptom was that the feature silently did nothing (LESSONS L24, L30).
+    """
+    root = tmp_path / "db"
+    with okto_grafx.connect(root, page_size=512) as first:
+        with first.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE A(id INT64, PRIMARY KEY(id))")
+        with first.begin("write") as txn:
+            for identity in range(1, 6):
+                txn.execute("CREATE (:A {id: $i})", {"i": identity})
+
+    with okto_grafx.connect(root, page_size=512) as second:
+        assert second.stale_indexes == ()
+        with second.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE B(id INT64, PRIMARY KEY(id))")
+        assert not second.indexes.index("pk_B").stale, (
+            "an index created in a later session was stale the moment it was made"
+        )
+        with second.begin("write") as txn:
+            for identity in range(1, 6):
+                txn.execute("CREATE (:B {id: $i})", {"i": identity})
+        assert not second.indexes.index("pk_B").stale
+
+    with okto_grafx.connect(root, page_size=512) as third:
+        assert third.stale_indexes == ()
+        assert IndexSeek.__name__ in _plan_operators(
+            third, "MATCH (b:B) WHERE b.id = $k RETURN b.id", {"k": 3}
+        )
+        assert third.execute("MATCH (b:B) WHERE b.id = 3 RETURN b.id").rows == ((3,),)
+
+
+def test_every_primary_keyed_table_gets_its_index_back_on_reopen(tmp_path: Path) -> None:
+    """All of them, not the first one. A loop that stopped early would be invisible to a
+    single-table test, and correctness-neutral -- which is exactly why nothing would notice."""
+    root = tmp_path / "db"
+    with okto_grafx.connect(root, page_size=512) as db:
+        with db.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE A(id INT64, PRIMARY KEY(id))")
+            txn.execute("CREATE NODE TABLE B(id INT64, PRIMARY KEY(id))")
+            txn.execute("CREATE NODE TABLE C(id INT64, PRIMARY KEY(id))")
+
+    with okto_grafx.connect(root, page_size=512) as reopened:
+        assert reopened.attached_indexes == ("pk_A", "pk_B", "pk_C")
+        assert reopened.stale_indexes == ()

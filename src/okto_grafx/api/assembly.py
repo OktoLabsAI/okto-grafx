@@ -40,6 +40,7 @@ from collections.abc import Callable
 from typing import TypeVar, cast
 
 from okto_grafx.domain.errors import (
+    GrafxIndexError,
     GrafxConfigurationError,
     GrafxError,
     GrafxSchemaVersionMismatch,
@@ -58,7 +59,11 @@ from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.database import META_FILE, Database, DatabaseIdentity, MetaStore
 from okto_grafx.engine.heap_store import MINIMUM_FRAMES as HEAP_FRAMES
 from okto_grafx.engine.heap_store import HeapStore
-from okto_grafx.engine.index_manager import IndexManager, primary_key_index
+from okto_grafx.engine.index_manager import (
+    IndexManager,
+    primary_key_index,
+    primary_key_index_name,
+)
 from okto_grafx.engine.ledger_store import LedgerStore
 from okto_grafx.engine.metrics_catalog import register_catalog
 from okto_grafx.engine.quarantine import QuarantineStore
@@ -294,6 +299,12 @@ def assemble_database(
             descriptor=config.granularity_descriptor,
         )
         attached = _attach_primary_key_indexes(catalog, indexes, pool, metrics)
+        unindexed = tuple(
+            table.name
+            for table in catalog.catalog.tables()
+            if table.primary_key is not None
+            and primary_key_index_name(table.name) not in {name for name in attached}
+        )
         attached += _attach_declared_vector_indexes(catalog, vectors)
         stale = tuple(
             index.name for index in indexes.open(transactions.published_lsn())
@@ -407,10 +418,19 @@ def _attach_primary_key_indexes(
     """
     attached: list[str] = []
     for table in catalog.catalog.tables():
-        index = primary_key_index(table, pool, metrics)
-        if index is None:
+        try:
+            index = primary_key_index(table, pool, metrics)
+            if index is None:
+                continue
+            attached.append(indexes.register(index).name)
+        except GrafxIndexError:
+            # AN INDEX MAY NEVER MAKE A DATABASE UNOPENABLE. A catalog can hold a table whose
+            # index name is illegal or collides -- two names differing only by case fold to one
+            # file -- and raising here meant every later `connect()` on that database refused,
+            # with every row in it unreachable through the only door there is. The accelerator
+            # declines instead: the table is readable, its keyed reads plan a scan, and the name
+            # is reported through `Database.unindexed_tables`.
             continue
-        attached.append(indexes.register(index).name)
     return tuple(attached)
 
 

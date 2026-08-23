@@ -1561,8 +1561,20 @@ class IndexManager:
 
     # --- registry ---------------------------------------------------------------------------
 
-    def register(self, index: IndexStore) -> IndexStore:
-        """Register an index, create its file if it has none, and check that it is fresh."""
+    def register(
+        self, index: IndexStore, *, complete_through: Lsn | None = None
+    ) -> IndexStore:
+        """Register an index, create its file if it has none, and check that it is fresh.
+
+        ``complete_through`` is for the one caller that KNOWS the index it is registering has
+        nothing to catch up on: the statement that creates a table declares its primary key and
+        the table is empty, so the index covers everything there is to cover at the position the
+        database has published. It is applied BEFORE the freshness check, and the order is the
+        whole point -- `_advance` refuses to move an index that is already marked stale, so an
+        advance after the check is a no-op and the index stays stale for ever. That is what
+        happened: every table declared in a session after the first got an index that was marked
+        stale on the spot and that no amount of loading could lift.
+        """
         if not isinstance(index, IndexStore):
             raise GrafxIndexError(
                 f"An index registered here is built on the paged store; got "
@@ -1590,6 +1602,8 @@ class IndexManager:
             )
         index.create()
         self._indexes[key] = index
+        if complete_through is not None:
+            index.advance_built_through(complete_through)
         index.check_freshness(self._published_lsn)
         return index
 
