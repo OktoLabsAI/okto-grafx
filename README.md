@@ -3,96 +3,576 @@
 An embedded graph database for Python: correct under multi-process concurrency, verifiable on disk,
 and recoverable by construction.
 
-Status: under construction against two validated specs (see `docs/specs/`).
+Okto Grafx runs inside your process, stores a database as a directory of files, and lets **several
+processes and several threads read and write it at the same time**. There is no server to run and
+no daemon to keep alive. The core is pure Python and the standard library is its only runtime
+requirement.
 
-## Install
+**Version 0.0.1 — pre-alpha.** The on-disk format, the public API and the query surface may all
+change. Read [Status and limitations](#status-and-limitations) before you rely on it.
+
+---
+
+## Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Command line](#command-line)
+- [Architecture](#architecture)
+- [Ports and adapters](#ports-and-adapters)
+- [Configuration](#configuration)
+- [Errors](#errors)
+- [Status and limitations](#status-and-limitations)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## Features
+
+### Concurrency that is real, not serialized behind a lock
+
+- **N processes and N threads, reading and writing.** A commit is refused only when its partitions
+  genuinely intersect another commit's, never because another writer exists. Two writers touching
+  different rows both succeed.
+- **Snapshot isolation.** A reader sees the state of the instant it opened, for its whole life,
+  while other processes commit. Readers never block writers; writers never block readers.
+- **Optimistic concurrency control.** A conflict is reported as `GrafxWriteConflict` with
+  `retryable=True` and the partitions that intersected, so a caller retries with a fresh snapshot
+  instead of guessing.
+- **Process coordination on the filesystem.** A lease with an epoch, a liveness clock that is
+  monotonic, and takeover of a dead writer's lease with stale-epoch rejection — so a process that
+  was paused, swapped out or SIGSTOPped cannot write after its lease was taken.
+
+### Durability that does not lie
+
+- **Write-ahead log.** A commit returns only after its records survive the log's barrier. What is
+  published is logged; what is applied is logged.
+- **Self-describing records** with CRC-32C checksums, in segments with an LSN mark index, recycled
+  only above the checkpoint and below the oldest live reader.
+- **Recovery at open.** The log is replayed idempotently; a torn tail is truncated at the last
+  intact record and the evidence is preserved rather than discarded.
+- **Crash-tested.** A process killed with `os._exit(9)` immediately after a commit returns loses
+  nothing: the rows are in the log and the next open replays them.
+
+### Verifiability
+
+- **`verify()` walks the database and reports findings with their location** — which file, which
+  page, which slot, which sequence number, which index. A clean database reports nothing, and the
+  report carries counts as well as findings so a caller can tell "nothing was wrong" from "nothing
+  was checked".
+- **A forensic ledger and quarantine.** Damaged bytes are preserved and located rather than
+  silently repaired or thrown away.
+
+### Query
+
+openCypher in the Kùzu dialect, executed by a planner that produces one operator tree per statement.
+
+| Supported | Notes |
+|---|---|
+| `CREATE NODE TABLE` / `CREATE REL TABLE` | with `PRIMARY KEY`, typed columns, `FROM`/`TO` |
+| `CREATE VECTOR SPACE` | dimension, metric, storage dtype |
+| `CREATE` (nodes and relationships) | patterns with inline properties |
+| `MATCH` … `WHERE` … `RETURN` | equality, comparison, `STARTS WITH`, `ENDS WITH`, boolean operators |
+| `MERGE` | matches on the properties the pattern NAMED |
+| `SET`, `DELETE` | on nodes |
+| Traversal | one hop, bounded ranges `[:REL*1..3]`, both directions, relationship isomorphism |
+| `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT`, `WITH` | |
+| Aggregates | `count`, `min`, `max`, and friends |
+| Parameters | `$name`, refused before anything runs if one is missing |
+
+**Not yet supported**, and refused in the error taxonomy rather than silently ignored:
+`DETACH DELETE`, relationship deletion, and `MATCH` binding a row the same transaction created
+(a row's identity is allocated by the commit — commit first, then match).
+
+### Indexes
+
+- **A declared `PRIMARY KEY` gets an index automatically**, created by the DDL and re-adopted at
+  every later open. A keyed read plans an index seek; an unkeyed predicate plans a scan.
+- **Dual visibility (CONTRACT §8.7).** An EXACT index returns candidates that are validated against
+  the heap under the caller's own snapshot — so the index may be a superset and can never be a wrong
+  answer. A PROXIMITY index is versioned with tombstones and a horizon, and its entries are the
+  answer.
+- **A stale index is never used.** A stale index is a *subset* of the heap, which validation cannot
+  repair, so both the planner and the uniqueness check fall back to the scan they did before any
+  index existed: slower, and right.
+
+### Embeddings, first class
+
+- `CREATE VECTOR SPACE` declares a dimension, a metric (`cosine`, `l2`, `dot`) and a storage dtype.
+- A node table declares a `VECTOR(space)` column, and the index that makes it searchable is created
+  with the table.
+- `db.vectors.search(space=…, k=…, query=…, snapshot=…)` returns the nearest rows visible to a
+  snapshot, reporting the **regime** it answered in (`exact` or `approximate`) and the `achieved_k`,
+  so a caller can tell an exhaustive answer from an approximate one.
+
+### Observability
+
+- A frozen metric catalogue: every metric declared once, in one place, so a name that leaves the
+  catalogue breaks the import rather than a scrape in production.
+- Three sinks: no-op (allocates and formats nothing), OpenMetrics over a loopback endpoint, and
+  JSON documents to a rotating file.
+- A sanitised, bounded event sink on a standard-library logger.
+
+### Windows and POSIX as equal citizens
+
+Both families are supported in behaviour, and the suite enforces it: a test that exercises one
+family must declare its counterpart for the other, and a skip must be attributed.
+
+---
+
+## Installation
+
+Python 3.11, 3.12 or 3.13.
 
 ```bash
-pip install okto-grafx            # pure Python, no runtime dependency
-pip install "okto-grafx[accel]"   # recommended: same answers, measurably faster
+pip install okto-grafx              # pure Python, no runtime dependency
+pip install "okto-grafx[accel]"     # recommended: same answers, measurably faster
 ```
 
-The core is pure Python and the standard library is its only runtime requirement. `[accel]` adds two
-optional accelerators behind ports the engine already declares: a native CRC-32C and numpy vector
-math. **The accelerated checksum is not a different answer.** `install_crc32c` replays an acceptance
-corpus against the pure-Python reference and refuses a candidate that disagrees on any input before
-it is installed, so a database written by one build reads identically in the other. It is worth
-installing: on Linux the durable-commit multiple against the reference engine falls from ~17x to
-**~5x** with it, which is inside the ceiling binding decision D5 sets. See
-`docs/architecture/COMPONENTS.md` for the measurements and for the Windows gap, which is open.
+### What `[accel]` adds, and why it is safe
 
-## Using it
+Two accelerators behind ports the engine already declares.
 
-Two doors, and CONTRACT.md section 10 draws the line between them: `db.execute(...)` is the
-autocommit **read**; writes go through a transaction.
+**`google-crc32c`** — a native CRC-32C. **The accelerated checksum is not a different answer.**
+`install_crc32c` replays an acceptance corpus against the pure-Python reference and refuses a
+candidate that disagrees on any input *before* installing it, so a database written by one build
+reads identically in the other. It is worth installing: on Linux the durable-commit multiple against
+the reference engine falls from ~17× to **~5×** with it, which is inside the ceiling that binding
+decision D5 sets.
+
+**`numpy`** — accelerated vector math. Selected only by `vector_math="numpy"`, never automatically.
+The pure and accelerated adapters agree to a *stated tolerance* rather than exactly, so a selector
+that silently bound whichever adapter happened to be installed would make the ranking of a query
+depend on the machine it ran on. `auto` therefore binds the pure oracle deliberately, and `"numpy"`
+refuses when the extra is absent rather than falling back to something the caller did not ask for.
+
+### From source
+
+```bash
+git clone https://github.com/OktoLabsAI/okto-grafx.git
+cd okto-grafx
+pip install -e ".[dev,accel]"
+pytest -q
+```
+
+---
+
+## Quick start
+
+### Two doors, and the line between them
+
+`db.execute(...)` is the **autocommit read**. Writes go through a transaction. That distinction is
+`CONTRACT.md` §10 and it is worth learning first, because it is the thing new callers most often
+get wrong.
 
 ```python
 from okto_grafx import connect
 
 db = connect("./mydb")
 
+# --- schema -------------------------------------------------------------------
 with db.begin("write") as txn:
-    txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
+    txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, city STRING, PRIMARY KEY(id))")
     txn.execute("CREATE REL TABLE Knows(FROM Person TO Person, since INT64)")
 
+# --- rows ---------------------------------------------------------------------
 with db.begin("write") as txn:
-    txn.execute("CREATE (:Person {id: 1, name: 'Ada'})")
-    txn.execute("CREATE (:Person {id: 2, name: 'Grace'})")
+    txn.execute("CREATE (:Person {id: 1, name: 'Ada',   city: 'London'})")
+    txn.execute("CREATE (:Person {id: 2, name: 'Grace', city: 'New York'})")
+    txn.execute("CREATE (:Person {id: 3, name: 'Alan',  city: 'London'})")
 
+# A row's identity is allocated by the COMMIT, so a MATCH cannot bind a row the same
+# transaction created. Commit the rows, then match them.
 with db.begin("write") as txn:
     txn.execute(
         "MATCH (a:Person {id: 1}), (b:Person {id: 2}) CREATE (a)-[:Knows {since: 1994}]->(b)"
     )
 
-db.execute("MATCH (a:Person)-[:Knows]->(b:Person) RETURN a.name, b.name")  # (('Ada', 'Grace'),)
-db.verify("all")        # walks the database and reports every finding, precisely located
-db.checkpoint()         # puts the committed state on the platter and reclaims the log
+# --- reads --------------------------------------------------------------------
+db.execute("MATCH (p:Person) WHERE p.id = 1 RETURN p.name").rows
+# (('Ada',),)
+
+db.execute("MATCH (p:Person) WHERE p.city = $c RETURN p.name ORDER BY p.name", {"c": "London"}).rows
+# (('Ada',), ('Alan',))
+
+db.execute("MATCH (a:Person)-[:Knows]->(b:Person) RETURN a.name, b.name").rows
+# (('Ada', 'Grace'),)
+
+# --- updates and deletes ------------------------------------------------------
+with db.begin("write") as txn:
+    txn.execute("MATCH (p:Person) WHERE p.id = 3 SET p.city = 'Cambridge'")
+with db.begin("write") as txn:
+    txn.execute("MATCH (p:Person) WHERE p.id = 3 DELETE p")
+
+# --- operations ---------------------------------------------------------------
+db.verify("all")     # walks pages, records and indexes; a clean database reports nothing
+db.checkpoint()      # puts committed state on the platter and reclaims the log
 db.close()
 ```
 
-A row's identity is allocated by the commit, so a `MATCH` cannot bind a row the same transaction
-created: commit the rows, then match them. `SET` and `DELETE` work; `DETACH DELETE` and relationship
-deletion do not yet and refuse in the taxonomy rather than pretending.
+### Handling a write conflict
 
-## Operator command line
+A conflict is the protocol working, not an error in your code. Retry with a fresh transaction.
+
+```python
+from okto_grafx.domain.errors import GrafxError
+
+def transfer(db, statement, parameters, attempts=20):
+    for _ in range(attempts):
+        try:
+            with db.begin("write") as txn:
+                txn.execute(statement, parameters)
+            return
+        except GrafxError as refused:
+            if not getattr(refused, "retryable", False):
+                raise
+    raise RuntimeError("gave up after too many conflicts")
+```
+
+`retryable` is part of the taxonomy, not a guess: `GrafxWriteConflict` and `GrafxLeaseTimeout`
+carry it, `GrafxCorruptionDetected` does not.
+
+### Several processes on one database
+
+Nothing special is required — open it in each process.
+
+```python
+# process A                          # process B, at the same time
+db = connect("./mydb")               db = connect("./mydb")
+with db.begin("write") as txn:       n = db.execute(
+    txn.execute("CREATE (...)")          "MATCH (p:Person) RETURN count(*)"
+                                     ).rows[0][0]
+```
+
+### Embeddings
+
+```python
+with db.begin("write") as txn:
+    txn.execute("CREATE VECTOR SPACE minilm {dimension: 384, metric: 'cosine'}")
+    txn.execute(
+        "CREATE NODE TABLE Chunk(id INT64, body STRING, embedding VECTOR(minilm), PRIMARY KEY(id))"
+    )
+
+with db.begin("write") as txn:
+    txn.execute(
+        "CREATE (:Chunk {id: 1, body: 'the text', embedding: $e})",
+        {"e": [0.1] * 384},
+    )
+
+reader = db.begin("read")
+try:
+    hits = db.vectors.search(space="minilm", k=10, query=[0.1] * 384,
+                             snapshot=reader.context.snapshot)
+    print(hits.regime, hits.achieved_k)   # 'exact' or 'approximate', and how many it reached
+finally:
+    reader.rollback()
+```
+
+### In memory
+
+`connect(":memory:")` selects the in-memory device, which has the same transactional semantics as
+the directory-backed one. Useful for tests; nothing survives the process.
+
+---
+
+## Command line
+
+Installing the package provides `oktografx`.
 
 ```
-oktografx status PATH            # what state this database is in
-oktografx verify PATH            # walk it and report every finding
-oktografx query PATH STMT        # autocommit read; add --write for a write transaction
-oktografx recovery PATH          # what the recovery pass at open did
-oktografx ledger|quarantine ...  # the evidence preserved when something went wrong
-oktografx metrics PATH           # the endpoint and the current value of every metric
+oktografx status PATH                 # what state this database is in
+oktografx verify PATH [--scope all]   # walk it and report every finding
+oktografx query PATH STMT             # autocommit read; add --write for a write transaction
+oktografx recovery PATH               # what the recovery pass at open did
+oktografx ledger list|inspect|export  # the forensic evidence preserved when something went wrong
+oktografx quarantine list|inspect|read
+oktografx metrics PATH                # the endpoint and the current value of every metric
 ```
 
-Exit codes are a contract: `0` clean, `1` not clean, `2` unreadable command line, `3` typed refusal,
-`4` damaged bytes, `5` retryable refusal.
+**Exit codes are a contract**, so a CI job can switch on them:
 
-## What it guarantees
+| code | meaning |
+|---|---|
+| `0` | clean |
+| `1` | findings — the database is readable but `verify` reported something |
+| `2` | unreadable command line |
+| `3` | typed refusal (a `Grafx*` error the caller should act on) |
+| `4` | damaged bytes |
+| `5` | retryable refusal — try again |
+| `6` | inconclusive |
+| `70` | internal error |
+| `130` | interrupted |
 
-* **Multi-process reads and writes** (D1). N processes and N threads hold transactions on one
-  database; a commit is refused only when its partitions genuinely intersect another's, never because
-  another writer exists.
-* **Snapshot isolation.** A reader sees the state of the instant it opened for its whole life, while
-  other processes commit; readers never block writers and writers never block readers.
-* **Durability that does not lie.** A commit returns only after its records survive the log's
-  barrier. What is published is logged; what is applied is logged.
-* **Verifiability.** `verify()` walks pages, records and indexes and reports findings with their
-  location. A clean database reports nothing.
-* **Windows and POSIX as equal citizens** (D9) in behaviour. Performance is not yet at parity: see
-  the D5 record in `docs/architecture/COMPONENTS.md`.
+---
+
+## Architecture
+
+Okto Grafx is **hexagonal**, and the boundary is enforced by a test rather than by convention.
+
+```
+                      ┌──────────────────────────────────────────┐
+   your code  ───────►│  okto_grafx.connect() / Database / CLI   │   api/, cli/
+                      └───────────────────┬──────────────────────┘
+                                          │
+                      ┌───────────────────▼──────────────────────┐
+                      │              runtime/                    │   composition root:
+                      │  config · port registry · bootstrap      │   builds and wires everything
+                      └───────────────────┬──────────────────────┘
+                                          │
+        ┌─────────────────────────────────▼─────────────────────────────────┐
+        │                             engine/                               │
+        │  buffer pool · heap store · catalog store · WAL manager           │
+        │  transaction manager · query engine · index manager               │
+        │  vector engine · recovery manager · verifier · coordination       │
+        └─────────────────────────────────┬─────────────────────────────────┘
+                                          │
+        ┌─────────────────────────────────▼─────────────────────────────────┐
+        │                             domain/                               │
+        │  page layout · records · schema · values · query AST and planner  │
+        │  error taxonomy · metric catalogue · PORTS (protocols only)       │
+        └─────────────────────────────────┬─────────────────────────────────┘
+                                          │  protocols
+        ┌─────────────────────────────────▼─────────────────────────────────┐
+        │                            adapters/                              │
+        │  every line of OS access lives here, and only here                │
+        └───────────────────────────────────────────────────────────────────┘
+```
+
+**`domain/` and `engine/` are mechanism-free.** They import no `os`, no `time`, no `socket`, no
+`threading` primitive — every one of those arrives through a port. `tests/test_import_boundary.py`
+walks the import graph and fails the build if that stops being true. This is not an aesthetic
+choice: it is what makes the engine testable against a fault-injecting device, and what makes
+Windows and POSIX two adapters rather than two code paths.
+
+### The layers
+
+| Layer | Holds | Rule |
+|---|---|---|
+| `domain/` | Page and record formats, the schema and value model, the query AST and planner, the error taxonomy, the metric catalogue, and the **port protocols** | Pure. No mechanism, no I/O, no clock. |
+| `engine/` | The components that implement the protocols of `CONTRACT.md` | Talks to the world only through ports. |
+| `adapters/` | Concrete implementations of each port | The only place the operating system is touched. |
+| `runtime/` | Config, the port registry, the bootstrap | The composition root. Chooses adapters; nothing below it does. |
+| `api/`, `cli/` | The public doors | Thin. Assembly and presentation. |
+
+### How a commit works
+
+The protocol is `CONTRACT.md` §8.5 and is worth reading in outline, because most of the guarantees
+follow from its ordering:
+
+1. A transaction that staged nothing finishes without appending a record.
+2. The writer takes a **lease** and confirms its **epoch** before a byte can reach the device.
+3. Inside the **commit section** (exclusive across processes):
+   1. the lease is validated again;
+   2. the published commit position is read, and the buffer pool starts a fresh read view — the
+      commit decides against the picture as it is *now*, not as this pool last cached it;
+   3. **optimistic validation**: a conflict exists when a COMMIT record appended after this
+      transaction's snapshot wrote a partition this transaction read or wrote — intersection, never
+      the mere existence of another writer;
+   4. rows are written and the pages they landed on are declared, then validation runs again on the
+      page half;
+   5. the records are appended and the log takes its **barrier** — the commit is durable here;
+   6. the page images and index changes are applied and flushed to the device;
+   7. the new commit state is published.
+4. The lease is dropped and the reader registration withdrawn.
+
+Two consequences worth stating. A page image replaces the *whole* page, so two commits that write
+one page conflict however disjoint the rows they thought they were touching were. And the data files
+are deliberately **not** fsynced at step 6 — the log is the authority on durability and the redo is
+idempotent — but they *are* written, because a page that exists only in one process's memory is
+invisible to every other process.
+
+### Storage layout
+
+```
+mydb/
+  identity.dat        # what this database is; refuses a mismatched open
+  catalog.dat         # the schema
+  heap.dat            # rows, in slotted pages chained per table
+  index/              # one file per secondary index
+  wal/                # segmented write-ahead log
+  control/            # lease, commit state, reader registrations
+  ledger/             # forensic evidence
+  quarantine/         # preserved damaged bytes
+```
+
+Every page carries a CRC-32C over its own bytes and a sequence counter that is always even in a
+durable image, so a reader that meets an odd counter is looking at a write that did not complete and
+reads again.
+
+---
+
+## Ports and adapters
+
+Seven ports. The registry is **fail-closed**: an empty slot is never filled with a silent default
+and never degrades into a no-op — opening a database with an incomplete registry raises
+`GrafxPortNotConfigured` naming *every* missing slot in one error.
+
+| Port | Protocol | What it abstracts | Default adapter | Also shipped |
+|---|---|---|---|---|
+| `storage` | `StorageDevice` | Files, pages, growth, durability barriers, directory listing | `LocalStorageDevice` — a directory on the real filesystem | `MemoryStorageDevice` (`:memory:`), `FaultInjectingStorageDevice` (tests) |
+| `clock` | `Clock` | Monotonic time for liveness, wall time for human-facing stamps only | `SystemClock` | — |
+| `coordinator` | `ProcessCoordinator` | Leases, epochs, exclusive sections, reader registration, dead-owner takeover | `LocalProcessCoordinator` — lock files under `<db>/control` | same class, `lock_directory=None` for in-memory process-wide sections |
+| `codec` | `PageCodec` | Encoding and decoding a page image, checksum included | `PageCodecV1` | — |
+| `metrics` | `MetricsSink` | Counters, gauges, histograms, timers | `NoOpMetricsSink` | `OpenMetricsSink`, `JsonMetricsSink` |
+| `events` | `EventSink` | Structured, sanitised, bounded event records | `LoggingEventSink` — standard-library `logging` | — |
+| `vector_math` | `VectorMath` | Distance and similarity kernels | `PureVectorMath` | `NumpyVectorMath` (needs `[accel]`) |
+
+There is an eighth pluggable thing that is **not** a registry slot, because it is installed
+process-wide rather than injected per object: the **CRC-32C implementation**. `checksum="pure"`
+always binds the reference; `checksum="auto"` accelerates when `google-crc32c` is installed, and
+`install_crc32c` proves byte-identical digests against the reference before installing anything.
+
+### Substituting an adapter
+
+Anything that satisfies the protocol is acceptable — the registry checks structurally, so you do not
+inherit from anything.
+
+```python
+from okto_grafx import DatabaseConfig, PortRegistry, connect
+from okto_grafx.runtime.bootstrap import build_default_registry
+
+class CountingMetrics:
+    """Any object with the MetricsSink members is a MetricsSink."""
+    enabled = True
+    def increment(self, name, value=1.0, labels=None): ...
+    def observe(self, name, value, labels=None): ...
+    def set_gauge(self, name, value, labels=None): ...
+    # ... the rest of the protocol
+
+config = DatabaseConfig(path="./mydb", metrics="noop")
+registry = build_default_registry(config).replace(metrics=CountingMetrics())
+db = connect("./mydb", registry=registry)
+```
+
+A device is the interesting one to substitute: `FaultInjectingStorageDevice` is how the suite
+proves that a refused write, a full device or a failed barrier produce a typed refusal and never a
+half-written page.
+
+---
+
+## Configuration
+
+`connect(path, **options)` builds a `DatabaseConfig`. Every option is validated at open, and an
+invalid one is refused with the field name the caller actually wrote.
+
+| Option | Default | Notes |
+|---|---|---|
+| `page_size` | `8192` | Fixed for the life of the database |
+| `partitions_per_table` | `64` | Conflict granularity — more partitions, fewer false conflicts |
+| `buffer_budget_bytes` | `64 MiB` | Per database, never shared between two databases in one process |
+| `recovery_policy` | `"replay"` | What the pass at open is allowed to do |
+| `lease_ttl_seconds` | `5.0` | How long a writer's lease stays valid without renewal |
+| `lease_timeout_seconds` | `10.0` | How long to wait for another writer's lease |
+| `commit_lock_timeout_seconds` | `30.0` | How long to wait at the commit section |
+| `reader_stall_threshold_seconds` | `15.0` | When a reader stops holding the horizon down |
+| `wal_segment_bytes` | `4 MiB` | Log segment size |
+| `checkpoint_interval_records` | `512` | |
+| `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
+| `metrics_destination` | `None` | Required for `"json"` |
+| `vector_math` | `"auto"` | `"auto"` and `"pure"` both bind the pure oracle; `"numpy"` requires `[accel]` |
+| `checksum` | `"auto"` | `"auto"` accelerates when available; `"pure"` pins the reference |
+| `vector_exact_scan_threshold` | `4096` | Below this many candidates, search is exhaustive |
+| `vector_recall_target` | `0.90` | |
+| `read_only` | `False` | Opens without writing anything, including recovery |
+
+---
+
+## Errors
+
+Every failure is a `GrafxError` subclass carrying a machine-readable `code`, a `retryable` flag and
+located `details`. Nothing else escapes a public door.
+
+| Error | `retryable` | Means |
+|---|---|---|
+| `GrafxWriteConflict` | ✅ | Partitions intersected another commit's — retry with a fresh snapshot |
+| `GrafxLeaseTimeout` | ✅ | Another writer held the lease too long |
+| `GrafxLeaseStolen` / `GrafxStaleEpoch` | ❌ | This writer was superseded; its writes are refused |
+| `GrafxCorruptionDetected` | ❌ | Bytes that cannot be trusted, with the location |
+| `GrafxDeviceFull` / `GrafxStorageError` | ✅ | The device refused |
+| `GrafxDurabilityBarrierFailed` | ❌ | An fsync failed — nothing may be acknowledged as durable |
+| `GrafxRecoveryRefused` | ❌ | Recovery would not be safe; the evidence is preserved |
+| `GrafxBufferBudgetExceeded` | ✅ | The working set exceeded the budget |
+| `GrafxSchemaVersionMismatch` | ❌ | This build cannot read this database |
+| `GrafxPortNotConfigured` | ❌ | An incomplete registry, naming every missing slot |
+| `GrafxTransactionStateError` | ❌ | The transaction is not in a state that allows this |
+| `GrafxQueryError` / `GrafxParseError` / `GrafxPlanError` | ❌ | The statement |
+| `GrafxIndexError` | ❌ | An index refused, including a stale one asked to answer |
+| `GrafxVectorValidationError`, `GrafxEmbeddingSpaceMismatch`, `GrafxSpaceRetired` | ❌ | Embeddings |
+| `GrafxConfigurationError` | ❌ | An option, naming the field |
+| `GrafxUnsupportedOperation` | ❌ | Declared not to exist, rather than silently ignored |
+
+---
+
+## Status and limitations
+
+**0.0.1 is pre-alpha.** It is tested hard — 7900+ tests, multi-process smoke tests, crash-and-recover
+tests, a mutation battery with per-mutant verdicts — and it is still young. What that means in
+practice:
+
+- **The on-disk format is not stable.** A database written by 0.0.1 may not open in the next version.
+  There is no migration path yet.
+- **Performance is not at parity on Windows.** Binding decision D5 sets relative ceilings against a
+  reference engine; they are met on POSIX with `[accel]` and missed on Windows, where control-file
+  publication costs ~16.5 ms against ~0.13 ms on Linux. The measurements and the analysis are in
+  `docs/architecture/COMPONENTS.md`.
+- **Reverse traversal of a relationship table is a scan.** Relationship tables carry no index over
+  their endpoints yet, so a query that walks *into* a heavily referenced node reads every edge.
+- **`DETACH DELETE` and relationship deletion are not implemented**, and refuse rather than pretend.
+- **Known gaps are written down** rather than hidden: see `docs/architecture/PUNCHLIST.md`.
+
+**Deployment responsibility.** Okto Grafx is an embedded library for local or controlled
+single-tenant use. It has no authentication, no authorization and no network listener other than the
+optional loopback metrics endpoint. Operators are responsible for filesystem permissions, access
+control, backup, and for keeping the database directory off shared network filesystems whose locking
+semantics differ from a local disk.
+
+---
 
 ## Documentation
 
-* `docs/specs/` — the two validated specifications this is built against.
-* `docs/architecture/CONTRACT.md` — the frozen coordination substrate: error taxonomy, on-disk
-  formats, the commit protocol, the metric catalogue, and the Definition of Done every component is
-  reviewed against.
-* `docs/architecture/COMPONENTS.md` — the component register, the sign-off record, and every carried
-  finding with the measurement behind it.
-* `docs/architecture/LESSONS.md` — what went wrong while building this and what it taught.
-* `docs/architecture/PUNCHLIST.md` — known gaps, written down rather than hidden.
+| Document | What it holds |
+|---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | The detailed architecture: components, protocols, data flow, on-disk formats |
+| [`docs/PORTS.md`](docs/PORTS.md) | Every port, its protocol, its default adapter, and how to write your own |
+| `docs/specs/` | The two validated specifications this is built against |
+| `docs/architecture/CONTRACT.md` | The frozen coordination substrate: error taxonomy, on-disk formats, the commit protocol, the metric catalogue, and the Definition of Done every component is reviewed against |
+| `docs/architecture/COMPONENTS.md` | The component register, the sign-off record, and every carried finding with the measurement behind it |
+| `docs/architecture/LESSONS.md` | What went wrong while building this and what it taught |
+| `docs/architecture/PUNCHLIST.md` | Known gaps, written down rather than hidden |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed, per release |
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Report security vulnerabilities using
+[SECURITY.md](SECURITY.md), not a public issue.
 
 ## License
 
-Apache 2.0. See `LICENSE`.
+Copyright 2026 Okto Labs.
+
+Okto Grafx is distributed under the **Elastic License 2.0** together with the project's SaaS,
+competing-service, internal-use, and attribution addendum.
+
+The licensor's intent, stated in the addendum itself: **building applications on Okto Grafx is
+unrestricted; selling Okto Grafx is not.**
+
+- **Permitted**, including commercially and including in a multi-tenant SaaS: embedding Okto Grafx in
+  your own application as its storage engine. An application that uses Okto Grafx to store its data
+  is providing *its* features, not the software's.
+- **Permitted**: internal use at any scale, single-tenant deployments, consulting and managed
+  operations, adapters and tools you publish under your own license, and benchmarking — including
+  publishing results, favorable or otherwise.
+- **Prohibited**: offering Okto Grafx *itself* to third parties — a database-as-a-service, a hosted
+  graph API, a white-label or OEM redistribution, or a competing product built from it.
+- **Required**: the Okto Labs and Okto Grafx names, the LICENSE file, and the package metadata stay
+  intact in any redistribution. An application that merely embeds the library does **not** have to
+  show Okto Labs branding in its own interface; a mention in its dependency or acknowledgements
+  listing is enough.
+
+Read the complete [LICENSE](LICENSE) before use or redistribution. If a use is genuinely ambiguous,
+contact dev@oktolabs.ai — the addendum says to ask.

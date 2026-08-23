@@ -40,4 +40,4 @@ __all__ = [
     "connect",
 ]
 
-__version__: str = "0.1.0"
+__version__: str = "0.0.1"

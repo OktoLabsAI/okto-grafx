@@ -1,0 +1,122 @@
+name: Bug report
+description: Report reproducible incorrect behavior in Okto Grafx
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Remove private data before posting: row values,
+        embeddings, file paths outside the database directory, and anything else you
+        would not publish. A database directory is NOT safe to attach as-is.
+
+        If the problem is data loss, corruption, or a wrong query result, please say so
+        in the title. Those are triaged first.
+  - type: input
+    id: version
+    attributes:
+      label: Okto Grafx version
+      description: Run `oktografx --version`, or `python -c "import okto_grafx; print(okto_grafx.__version__)"`.
+      placeholder: 0.0.1
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: 3.13.1
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and filesystem
+      description: The filesystem matters for a storage or concurrency problem.
+      placeholder: Windows 11 / NTFS, Ubuntu 24.04 / ext4, macOS 15 / APFS
+    validations:
+      required: true
+  - type: dropdown
+    id: install-extra
+    attributes:
+      label: Installation mode
+      options:
+        - Core (pure Python, no extra)
+        - accel
+        - bench
+        - Installed from source
+        - Custom combination
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area does this touch
+      options:
+        - Query engine (parse, plan, wrong result)
+        - Transactions and concurrency (conflicts, isolation, leases)
+        - Storage, WAL, or recovery
+        - Indexes (primary key or vector)
+        - Verification (verify, ledger, quarantine)
+        - Public API or CLI
+        - Observability (metrics, events)
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: concurrency
+    attributes:
+      label: How many processes and threads were touching the database
+      description: Most of the hard defects in this engine only appear under real concurrency.
+      options:
+        - One process, one thread
+        - One process, several threads
+        - Several processes
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: The smallest script or sequence that consistently reproduces the problem.
+      render: python
+      placeholder: |
+        from okto_grafx import connect
+        db = connect("./repro")
+        ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Paste the full traceback when there is one. Grafx errors carry a code and located details; include them.
+    validations:
+      required: true
+  - type: textarea
+    id: verify
+    attributes:
+      label: Output of `oktografx verify PATH`
+      description: Run it against the affected database if you still have it. Findings are located and are usually the fastest route to a diagnosis.
+      render: shell
+  - type: input
+    id: frequency
+    attributes:
+      label: How often does it reproduce
+      placeholder: every run, 1 in 5, once and never again
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed private data from this report.
+          required: true
+        - label: I searched existing issues for the same problem.
+          required: true

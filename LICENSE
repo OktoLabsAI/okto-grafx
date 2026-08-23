@@ -1,201 +1,228 @@
-                                 Apache License
-                           Version 2.0, January 2004
-                        http://www.apache.org/licenses/
+Elastic License 2.0
 
-   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+Acceptance. By using the software, you agree to all of the terms and
+conditions below.
 
-   1. Definitions.
+Copyright 2026 Okto Labs
 
-      "License" shall mean the terms and conditions for use, reproduction,
-      and distribution as defined by Sections 1 through 9 of this document.
+1. Grant of License. The licensor grants you a non-exclusive, royalty-free,
+worldwide, non-sublicensable, non-transferable license to use, copy,
+distribute, make available, and prepare derivative works of the software,
+in each case subject to the limitations and conditions below.
 
-      "Licensor" shall mean the copyright owner or entity authorized by
-      the copyright owner that is granting the License.
+2. Limitations. You may not provide the software to third parties as a
+hosted or managed service, where the service provides users with access to
+any substantial set of the features or functionality of the software.
+You may not move, change, disable, or circumvent the license key
+functionality in the software, and you may not remove or obscure any
+functionality in the software that is protected by the license key.
+You may not alter, remove, or obscure any licensing, copyright, or other
+notices of the licensor in the software.
 
-      "Legal Entity" shall mean the union of the acting entity and all
-      other entities that control, are controlled by, or are under common
-      control with that entity. For the purposes of this definition,
-      "control" means (i) the power, direct or indirect, to cause the
-      direction or management of such entity, whether by contract or
-      otherwise, or (ii) ownership of fifty percent (50%) or more of the
-      outstanding shares, or (iii) beneficial ownership of such entity.
+3. Patent License. The licensor grants you a license, under any patent
+claims the licensor can license, or becomes able to license, to make, have
+made, use, sell, offer for sale, import and have imported the software.
+However, this license does not cover any patent claims that you cause to be
+infringed by modifications or additions to the software. If you or your
+company make any written claim that the software infringes or contributes
+to infringement of any patent, your patent license for the software granted
+under these terms ends immediately. Your company's patent license granted
+under these terms also ends immediately if your company makes any written
+claim that the software infringes or contributes to infringement of any
+patent.
 
-      "You" (or "Your") shall mean an individual or Legal Entity
-      exercising permissions granted by this License.
+4. Distribution. You may not alter, remove, or obscure any licensing,
+copyright, or other notices of the licensor in the software. Any
+distribution of the software must include a copy of these terms and
+conditions, and anyone who receives the software from you is bound by these
+terms and conditions.
 
-      "Source" form shall mean the preferred form for making modifications,
-      including but not limited to software source code, documentation
-      source, and configuration files.
+5. Notices. You must include a copy of these terms with any distribution of
+the software. If you modify the software, you must mark the modifications
+clearly and include the date of the modifications.
 
-      "Object" form shall mean any form resulting from mechanical
-      transformation or translation of a Source form, including but
-      not limited to compiled object code, generated documentation,
-      and conversions to other media types.
+6. Termination. If you violate these terms, your licenses will terminate
+automatically. If the licensor notifies you of your violation, and you cease
+all violation of this license no later than 30 days after you receive that
+notice, your licenses will be reinstated retroactively. However, if you
+violate these terms after the reinstatement, all of your licenses will
+terminate permanently.
 
-      "Work" shall mean the work of authorship, whether in Source or
-      Object form, made available under the License, as indicated by a
-      copyright notice that is included in or attached to the work
-      (an example is provided in the Appendix below).
+7. No Other Rights. Except as expressly stated herein, no other rights or
+licenses are granted, express or implied.
 
-      "Derivative Works" shall mean any work, whether in Source or Object
-      form, that is based on (or derived from) the Work and for which the
-      editorial revisions, annotations, elaborations, or other modifications
-      represent, as a whole, an original work of authorship. For the purposes
-      of this License, Derivative Works shall not include works that remain
-      separable from, or merely link (or bind by name) to the interfaces of,
-      the Work and Derivative Works thereof.
+8. Limitation on Liability. As far as the law allows, the software comes as
+is, without any warranty or condition, and the licensor will not be liable
+to you for any damages arising out of these terms or the use or nature of
+the software, under any kind of legal claim.
 
-      "Contribution" shall mean any work of authorship, including
-      the original version of the Work and any modifications or additions
-      to that Work or Derivative Works thereof, that is intentionally
-      submitted to Licensor for inclusion in the Work by the copyright owner
-      or by an individual or Legal Entity authorized to submit on behalf of
-      the copyright owner. For the purposes of this definition, "submitted"
-      means any form of electronic, verbal, or written communication sent
-      to the Licensor or its representatives, including but not limited to
-      communication on electronic mailing lists, source code control systems,
-      and issue tracking systems that are managed by, or on behalf of, the
-      Licensor for the purpose of discussing and improving the Work, but
-      excluding communication that is conspicuously marked or otherwise
-      designated in writing by the copyright owner as "Not a Contribution."
+9. Definitions.
 
-      "Contributor" shall mean Licensor and any individual or Legal Entity
-      on behalf of whom a Contribution has been received by Licensor and
-      subsequently incorporated within the Work.
+"Licensor" means Okto Labs and its
+affiliates.
 
-   2. Grant of Copyright License. Subject to the terms and conditions of
-      this License, each Contributor hereby grants to You a perpetual,
-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-      copyright license to reproduce, prepare Derivative Works of,
-      publicly display, publicly perform, sublicense, and distribute the
-      Work and such Derivative Works in Source or Object form.
+"Software" means the software the licensor makes available under these
+terms, including any portions, modifications, or derivative works.
 
-   3. Grant of Patent License. Subject to the terms and conditions of
-      this License, each Contributor hereby grants to You a perpetual,
-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-      (except as stated in this section) patent license to make, have made,
-      use, offer to sell, sell, import, and otherwise transfer the Work,
-      where such license applies only to those patent claims licensable
-      by such Contributor that are necessarily infringed by their
-      Contribution(s) alone or by combination of their Contribution(s)
-      with the Work to which such Contribution(s) was submitted. If You
-      institute patent litigation against any entity (including a
-      cross-claim or counterclaim in a lawsuit) alleging that the Work
-      or a Contribution incorporated within the Work constitutes direct
-      or contributory patent infringement, then any patent licenses
-      granted to You under this License for that Work shall terminate
-      as of the date such litigation is filed.
+"You" means you, individually.
 
-   4. Redistribution. You may reproduce and distribute copies of the
-      Work or Derivative Works thereof in any medium, with or without
-      modifications, and in Source or Object form, provided that You
-      meet the following conditions:
+"Your company" means any legal entity, sole proprietorship, or other
+organization that you work for, plus all other organizations that control,
+are controlled by, or are under common control with that organization. The
+term "control" means ownership of substantially all the assets of an entity.
 
-      (a) You must give any other recipients of the Work or
-          Derivative Works a copy of this License; and
+"Your licenses" means the licenses granted to you in Section 1.
 
-      (b) You must cause any modified files to carry prominent notices
-          stating that You changed the files; and
+"Use" means anything you do with the software in violation of these terms.
 
-      (c) You must retain, in the Source form of any Derivative Works
-          that You distribute, all copyright, patent, trademark, and
-          attribution notices from the Source form of the Work,
-          excluding those notices that do not pertain to any part of
-          the Derivative Works; and
 
-      (d) If the Work includes a "NOTICE" text file as part of its
-          distribution, then any Derivative Works that You distribute must
-          include a readable copy of the attribution notices contained
-          within such NOTICE file, excluding those notices that do not
-          pertain to any part of the Derivative Works, in at least one
-          of the following places: within a NOTICE text file distributed
-          as part of the Derivative Works; within the Source form or
-          documentation, if provided along with the Derivative Works; or,
-          within a display generated by the Derivative Works, if and
-          wherever such third-party notices normally appear. The contents
-          of the NOTICE file are for informational purposes only and
-          do not modify the License. You may add Your own attribution
-          notices within Derivative Works that You distribute, alongside
-          or as an addendum to the NOTICE text from the Work, provided
-          that such additional attribution notices cannot be construed
-          as modifying the License.
+Addendum: SaaS, Competing Service, Internal Use, and Attribution
+================================================================
 
-      You may add Your own copyright statement to Your modifications and
-      may provide additional or different license terms and conditions
-      for use, reproduction, or distribution of Your modifications, or
-      for any such Derivative Works as a whole, provided Your use,
-      reproduction, and distribution of the Work otherwise complies with
-      the conditions stated in this License.
+This addendum clarifies and supplements Section 2 ("Limitations") of the
+Elastic License 2.0. In case of conflict between the body of the license
+and this addendum, this addendum controls.
 
-   5. Submission of Contributions. Unless You explicitly state otherwise,
-      any Contribution intentionally submitted for inclusion in the Work
-      by You to the Licensor shall be under the terms and conditions of
-      this License, without any additional terms or conditions.
-      Notwithstanding the above, nothing herein shall supersede or modify
-      the terms of any separate license agreement you may have executed
-      with Licensor regarding such Contributions.
+Okto Grafx is an EMBEDDED LIBRARY. It runs inside an application's own
+process and has no server, no network service, and no multi-tenant surface
+of its own. The sections below are written for that shape: what is
+restricted is offering Okto Grafx ITSELF to third parties as a service or a
+product, not building your own application on top of it.
 
-   6. Trademarks. This License does not grant permission to use the trade
-      names, trademarks, service marks, or product names of the Licensor,
-      except as required for reasonable and customary use in describing the
-      origin of the Work and reproducing the content of the NOTICE file.
+I. Hosted or Managed Service - PROHIBITED uses
+-----------------------------------------------
 
-   7. Disclaimer of Warranty. Unless required by applicable law or
-      agreed to in writing, Licensor provides the Work (and each
-      Contributor provides its Contributions) on an "AS IS" BASIS,
-      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-      implied, including, without limitation, any warranties or conditions
-      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
-      PARTICULAR PURPOSE. You are solely responsible for determining the
-      appropriateness of using or redistributing the Work and assume any
-      risks associated with Your exercise of permissions under this License.
+For the purposes of Section 2, the following constitute providing the
+software as a "hosted or managed service" and are PROHIBITED:
 
-   8. Limitation of Liability. In no event and under no legal theory,
-      whether in tort (including negligence), contract, or otherwise,
-      unless required by applicable law (such as deliberate and grossly
-      negligent acts) or agreed to in writing, shall any Contributor be
-      liable to You for damages, including any direct, indirect, special,
-      incidental, or consequential damages of any character arising as a
-      result of this License or out of the use or inability to use the
-      Work (including but not limited to damages for loss of goodwill,
-      work stoppage, computer failure or malfunction, or any and all
-      other commercial damages or losses), even if such Contributor
-      has been advised of the possibility of such damages.
+(a) Operating a database-as-a-service, a hosted graph service, or any
+    API, platform, or application whose purpose is to give end users
+    from more than one client organization access to the features or
+    functionality of Okto Grafx itself - its storage engine, its query
+    surface, its transactions, or its vector search - whether directly
+    or through a wrapper, proxy, or abstraction layer.
 
-   9. Accepting Warranty or Additional Liability. While redistributing
-      the Work or Derivative Works thereof, You may choose to offer,
-      and charge a fee for, acceptance of support, warranty, indemnity,
-      or other liability obligations and/or rights consistent with this
-      License. However, in accepting such obligations, You may act only
-      on Your own behalf and on Your sole responsibility, not on behalf
-      of any other Contributor, and only if You agree to indemnify,
-      defend, and hold each Contributor harmless for any liability
-      incurred by, or claims asserted against, such Contributor by reason
-      of your accepting any such warranty or additional liability.
+(b) Providing the software as a white-label, embedded, OEM, or rebranded
+    offering to third parties, including redistributing it as a
+    component of a product where the origin of the software is
+    concealed.
 
-   END OF TERMS AND CONDITIONS
+(c) Offering the software, any derivative work of it, or any substantial
+    portion of its features or functionality as a product, service, or
+    platform that competes with Okto Grafx, regardless of whether the
+    deployment is single-tenant or multi-tenant.
 
-   APPENDIX: How to apply the Apache License to your work.
+(d) Internal large-scale platform exposure - operating the software as
+    an internally hosted database service that meets BOTH of the
+    following conditions simultaneously:
 
-      To apply the Apache License to your work, attach the following
-      boilerplate notice, with the fields enclosed by brackets "[]"
-      replaced with your own identifying information. (Don't include
-      the brackets!)  The text should be enclosed in the appropriate
-      comment syntax for the file format. We also recommend that a
-      file or class name and description of purpose be included on the
-      same "printed page" as the copyright notice for easier
-      identification within third-party archives.
+    (i)  the software, or modules extracted, externalized, or repackaged
+         from it, are exposed as a hosted database service, query API,
+         or internal data platform to users within your organization who
+         are not directly involved in developing or operating the
+         application that embeds it; AND
 
-   Copyright [yyyy] [name of copyright owner]
+    (ii) the total population of such exposed users exceeds two hundred
+         (200) individuals.
 
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
+    Both conditions (i) and (ii) must be met for this prohibition to
+    apply. Local, desktop, workstation, and in-process application use
+    of the software by any number of individuals is never restricted by
+    this clause.
 
-       http://www.apache.org/licenses/LICENSE-2.0
+    This clause exists to prevent large organizations from extracting the
+    engine and serving it at scale as an internal database-as-a-service.
+    It is not intended to limit normal use of the library inside
+    applications, no matter how large the organization or how many people
+    use those applications.
 
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
+II. PERMITTED uses
+-------------------
+
+The following are expressly permitted, including for commercial purposes
+and including when financial consideration is exchanged:
+
+(a) EMBEDDING the software in your own application or service as its
+    storage engine, and distributing or operating that application -
+    including as a multi-tenant SaaS - provided the application does not
+    expose Okto Grafx's own features or query surface to third parties
+    as described in Section I(a). An application that uses Okto Grafx to
+    store its data is providing ITS features, not the software's, and is
+    not restricted by this license.
+
+(b) Using the software internally within your organization, without any
+    numeric or scale restriction, for your own products, data, and
+    operations.
+
+(c) Hosting a single-tenant deployment of an application built on the
+    software for yourself or for a single client organization. Each
+    distinct client organization must receive its own dedicated instance
+    where Section I(a) would otherwise apply.
+
+(d) Providing consulting, integration, customization, deployment, or
+    managed operations services using the software, including charging
+    fees for such services, provided that:
+
+    (i)   the offering does not constitute a hosted service under
+          Section I(a) or a competing service under Section I(c), and
+          does not exceed the thresholds of Section I(d);
+    (ii)  the attribution requirements in Section III are honored.
+
+(e) Modifying the software for personal or internal organizational use,
+    including for commercial purposes, subject to Sections I and III.
+
+(f) Building, publishing, and distributing adapters that satisfy the
+    software's port protocols, tools that read or verify databases it
+    writes, and libraries that build on its public API - including under
+    a license of your choosing for your own original code, provided the
+    software itself is not redistributed in violation of these terms.
+
+(g) Academic, research, evaluation, and benchmarking use, including
+    publishing the results of benchmarks. No permission is required to
+    publish a measurement of this software, favorable or otherwise.
+
+III. Attribution - REQUIRED preservation
+-----------------------------------------
+
+You may not alter, remove, obscure, hide, replace, or otherwise diminish
+the visibility of any of the following in any distribution, deployment,
+or derivative work of the software:
+
+(a) The "Okto Labs" name.
+(b) The "Okto Grafx" name.
+(c) Copyright and licensing notices identifying Okto Labs as the
+    licensor, including this LICENSE file and the package metadata.
+
+Because Okto Grafx is a library rather than a user-facing application,
+these elements MUST remain intact in:
+
+(a) The source distribution and any built package, including the LICENSE
+    file, the package metadata, and the module-level version identifier.
+
+(b) The command-line interface, including the output of `--version` and
+    equivalent commands, and help and usage screens.
+
+(c) Any documentation, README, or notice file that accompanies a
+    redistribution of the software or a derivative work of it.
+
+This section does NOT require an application that merely EMBEDS the
+software to display Okto Labs branding in that application's own user
+interface. Attribution in the application's dependency, license, or
+acknowledgements listing is sufficient and is encouraged.
+
+You MAY add your own branding, notices, or attributions alongside the
+required Okto Labs and Okto Grafx marks, but you may NOT replace them or
+misrepresent the origin of the software.
+
+IV. Clarifications
+-------------------
+
+If you are unsure whether your intended use constitutes a hosted service
+under Section I(a), a competing service under Section I(c), an internal
+large-scale platform exposure under Section I(d), or otherwise requires a
+commercial license, contact the licensor at dev@oktolabs.ai for
+clarification or to negotiate a commercial agreement.
+
+The licensor's intent is that building applications on Okto Grafx is
+unrestricted, and that selling Okto Grafx is not. Where a use is
+genuinely ambiguous, ask.

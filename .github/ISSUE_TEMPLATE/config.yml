@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and support
+    url: https://github.com/OktoLabsAI/okto-grafx/discussions
+    about: Ask usage and support questions in Grafx Discussions.
+  - name: Security vulnerability
+    url: https://github.com/OktoLabsAI/okto-grafx/blob/main/SECURITY.md
+    about: Report privately to dev@oktolabs.ai. Do not open a public issue.

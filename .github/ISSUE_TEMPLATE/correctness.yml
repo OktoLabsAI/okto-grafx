@@ -1,0 +1,113 @@
+name: Correctness report
+description: Report data loss, corruption, a wrong query result, or a broken guarantee
+title: "correctness: "
+labels:
+  - bug
+  - correctness
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This template is for the failures Okto Grafx exists to prevent: an acknowledged write that
+        is not there afterwards, a row stored twice, a query answering fewer rows than exist,
+        `corruption_detected` on a database nothing went wrong with, or a hang.
+
+        These are triaged ahead of everything else. Please keep the affected database directory if
+        you can — do not delete it, and do not run a repair over it. A copy taken before any
+        further use is the most useful artifact you can offer.
+
+        If this is a security vulnerability rather than a correctness defect, use
+        [SECURITY.md](https://github.com/OktoLabsAI/okto-grafx/blob/main/SECURITY.md) instead.
+  - type: input
+    id: version
+    attributes:
+      label: Okto Grafx version
+      placeholder: 0.0.1
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of failure
+      options:
+        - Acknowledged write is missing afterwards
+        - A row appears more than once
+        - A query returned the wrong rows
+        - corruption_detected on a healthy database
+        - verify() reports findings on a healthy database
+        - A hang, deadlock, or a call that never returns
+        - A non-Grafx exception escaped a public door
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: concurrency
+    attributes:
+      label: The regime it happened in
+      description: >
+        Which regime a defect appears in is usually the fastest clue to where it lives, because
+        most of them are invisible outside one.
+      options:
+        - One process, one thread
+        - One process, several threads
+        - Several processes, writing to the same table
+        - Several processes, writing to different tables
+        - Several processes, readers and writers together
+        - After a crash or a kill
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and filesystem
+      placeholder: Windows 11 / NTFS, Ubuntu 24.04 / ext4
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What was acknowledged, and what was found
+      description: >
+        Be specific about the two sides. "The commit returned and these ids are not in the database"
+        is actionable; "data was lost" is not.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: A script if you have one. If it only reproduces sometimes, say how often.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: verify
+    attributes:
+      label: Output of `oktografx verify PATH --scope all`
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: recovery
+    attributes:
+      label: Output of `oktografx recovery PATH` and `oktografx status PATH`
+      render: shell
+  - type: textarea
+    id: config
+    attributes:
+      label: Non-default configuration
+      description: >
+        page_size, buffer_budget_bytes, partitions_per_table, the lease and timeout settings, and
+        the metrics and vector_math selectors. The buffer budget in particular changes which
+        internal regimes a workload reaches.
+      render: python
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I removed private data from this report.
+          required: true
+        - label: I still have the affected database directory, or I have said that I do not.
+          required: true

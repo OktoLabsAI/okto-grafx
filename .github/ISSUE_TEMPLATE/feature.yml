@@ -1,0 +1,71 @@
+name: Feature request
+description: Propose an improvement to Okto Grafx
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or opportunity
+      description: Explain the need in terms of what an application is trying to do.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior, the interface, and the expected outcome.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area would this touch
+      options:
+        - Query language or planner
+        - Transactions and concurrency
+        - Storage, WAL, or recovery
+        - Indexes (primary key or vector)
+        - Public API or CLI
+        - Observability
+        - Ports and adapters
+        - Documentation
+    validations:
+      required: true
+  - type: dropdown
+    id: compatibility
+    attributes:
+      label: Would this change the on-disk format or a frozen surface
+      description: >
+        CONTRACT.md freezes the error taxonomy, the on-disk formats, the commit protocol and the
+        metric catalogue. A change to any of them needs an amendment, not just an implementation.
+      options:
+        - "No: purely additive"
+        - "Yes: on-disk format"
+        - "Yes: a frozen surface in CONTRACT.md"
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: >
+        Observable conditions that would make this complete. Prefer conditions a test could assert
+        over descriptions of an implementation.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and discussions for a similar request.
+          required: true
+        - label: I checked docs/architecture/PUNCHLIST.md, which records known gaps.
+          required: true

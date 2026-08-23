@@ -4,28 +4,87 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "okto-grafx"
-version = "0.1.0"
-description = "An embedded graph database for Python: correct under multi-process concurrency, verifiable on disk, and recoverable by construction."
+version = "0.0.1"
+description = "Okto Grafx - embedded graph database for Python: multi-process safe, verifiable on disk, recoverable by construction"
 readme = "README.md"
 requires-python = ">=3.11"
-keywords = ["graph", "database", "embedded", "mvcc", "wal", "vector-search"]
+license = { text = "Elastic License 2.0 + SaaS/Branding Addendum" }
+authors = [{ name = "Okto Labs" }]
+keywords = [
+    "graph-database",
+    "embedded-database",
+    "mvcc",
+    "write-ahead-log",
+    "vector-search",
+    "opencypher",
+    "local-first",
+]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
+    # Elastic License 2.0 is not an OSI-approved license, so there is deliberately no
+    # "License :: OSI Approved" classifier here. The license field above and LICENSE
+    # are the authority.
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
+# The core is pure Python and the standard library is its only runtime requirement.
+# Everything optional lives behind an extra below, and nothing is imported unless it
+# was asked for by configuration.
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/OktoLabsAI/okto-grafx"
+Documentation = "https://github.com/OktoLabsAI/okto-grafx#readme"
+Repository = "https://github.com/OktoLabsAI/okto-grafx"
+Issues = "https://github.com/OktoLabsAI/okto-grafx/issues"
+Changelog = "https://github.com/OktoLabsAI/okto-grafx/blob/main/CHANGELOG.md"
+License = "https://github.com/OktoLabsAI/okto-grafx/blob/main/LICENSE"
+
 [project.optional-dependencies]
-accel = ["numpy>=1.24", "google-crc32c>=1.5"]
-bench = ["ladybug==0.16.0", "numpy>=1.24"]
-dev = ["pytest>=8", "pytest-timeout"]
+# RECOMMENDED for any real workload. Two accelerators behind ports the engine already
+# declares, and neither one changes an answer:
+#
+#   google-crc32c - a native CRC-32C. `install_crc32c` replays an acceptance corpus
+#     against the pure-Python reference and REFUSES a candidate that disagrees on any
+#     input before installing it, so a database written by one build reads identically
+#     in the other. Worth installing: on Linux the durable-commit multiple against the
+#     reference engine falls from ~17x to ~5x with it, which is inside the ceiling
+#     binding decision D5 sets.
+#
+#   numpy - accelerated vector math. Selected only by `vector_math="numpy"`, never
+#     automatically: the pure and accelerated adapters agree to a stated tolerance
+#     rather than exactly, so `auto` binds the pure oracle deliberately and the ranking
+#     of a query does not depend on the machine it ran on.
+accel = [
+    "numpy>=1.24",
+    "google-crc32c>=1.5",
+]
+# The side-by-side benchmark harness against the reference engine (the D5 measurements
+# in docs/architecture/COMPONENTS.md). Not needed to run or test Okto Grafx.
+bench = [
+    "ladybug==0.16.0",
+    "numpy>=1.24",
+]
+dev = [
+    "pytest>=8",
+    "pytest-timeout",
+]
+
+[project.scripts]
+oktografx = "okto_grafx.cli.entry:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
