@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -10,6 +11,7 @@ from typing import Any, Callable, Iterator
 import pytest
 
 from okto_grafx import connect
+from okto_grafx.adapters.vectormath_pure import PureVectorMath
 from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.adapters.storage_fault import FaultInjectingStorageDevice
 from okto_grafx.domain.errors import (
@@ -20,8 +22,10 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.txn import WalRecordType
 from okto_grafx.domain.txn.context import TransactionContext
+from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.engine.database import Database, Transaction
+from okto_grafx.engine.index_manager import IndexManager
 from okto_grafx.engine.catalog_store import CATALOG_FILE
 from okto_grafx.engine import txn_manager as txn_module
 from okto_grafx.engine.query_engine import QueryEngine
@@ -1039,6 +1043,210 @@ def test_close_between_precheck_and_transition_refuses_late_begin_without_new_wo
         release_ports(registry)
 
 
+def test_checkpoint_defers_metric_close_until_inventory_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One outer section keeps checkpoint callbacks behind its complete facade postlude."""
+    database, registry, _storage, metrics = _instrumented_database()
+    manager_finished = [False]
+    inventory_finished = [False]
+    callback_observations: list[bool] = []
+    original_checkpoint = TransactionManager.checkpoint
+    original_indexes = IndexManager.indexes
+
+    def checkpoint_then_record(self: TransactionManager):  # noqa: ANN202
+        report = original_checkpoint(self)
+        if self is database._transactions:
+            manager_finished[0] = True
+            self._metrics.set_gauge("checkpoint_outer_section_probe", 1.0)
+        return report
+
+    def observe_inventory(self: IndexManager):  # noqa: ANN202
+        result = original_indexes(self)
+        if self is database._indexes and manager_finished[0]:
+            inventory_finished[0] = True
+        return result
+
+    def close_from_callback() -> None:
+        metrics.callback = None
+        callback_observations.append(inventory_finished[0])
+        database.close()
+
+    try:
+        monkeypatch.setattr(TransactionManager, "checkpoint", checkpoint_then_record)
+        monkeypatch.setattr(IndexManager, "indexes", observe_inventory)
+        metrics.calls.clear()
+        metrics.callback = close_from_callback
+        report = database.checkpoint()
+
+        assert report.horizon_lsn >= 0
+        assert callback_observations == [True]
+        assert database.close_complete
+    finally:
+        metrics.callback = None
+        database.close()
+        release_ports(registry)
+
+
+def test_checkpoint_outer_section_blocks_commit_until_inventory_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No committing thread can enter the manager-to-inventory checkpoint gap."""
+    database = connect(":memory:")
+    with database.begin("write") as schema:
+        schema.execute("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")
+    writer = database.begin("write")
+    writer.execute("CREATE (:P {id: 1})")
+
+    manager_finished = threading.Event()
+    release_postlude = threading.Event()
+    inventory_finished = threading.Event()
+    commit_attempted = threading.Event()
+    commit_finished = threading.Event()
+    checkpoint_failures: list[BaseException] = []
+    commit_failures: list[BaseException] = []
+    commit_before_inventory: list[bool] = []
+    original_checkpoint = TransactionManager.checkpoint
+    original_commit = TransactionManager.commit
+    original_indexes = IndexManager.indexes
+
+    def pause_after_manager(self: TransactionManager):  # noqa: ANN202
+        report = original_checkpoint(self)
+        if self is database._transactions:
+            manager_finished.set()
+            if not release_postlude.wait(_WAIT_SECONDS):
+                raise AssertionError("test did not release checkpoint postlude")
+        return report
+
+    def mark_inventory(self: IndexManager):  # noqa: ANN202
+        result = original_indexes(self)
+        if self is database._indexes and manager_finished.is_set():
+            inventory_finished.set()
+        return result
+
+    def observe_commit(self: TransactionManager, context: TransactionContext) -> object:
+        if self is database._transactions and context is writer._context:
+            commit_attempted.set()
+        result = original_commit(self, context)
+        if self is database._transactions and context is writer._context:
+            commit_before_inventory.append(not inventory_finished.is_set())
+            commit_finished.set()
+        return result
+
+    monkeypatch.setattr(TransactionManager, "checkpoint", pause_after_manager)
+    monkeypatch.setattr(TransactionManager, "commit", observe_commit)
+    monkeypatch.setattr(IndexManager, "indexes", mark_inventory)
+
+    def checkpoint() -> None:
+        try:
+            database.checkpoint()
+        except BaseException as failure:  # noqa: BLE001 - exact evidence below
+            checkpoint_failures.append(failure)
+
+    def commit() -> None:
+        try:
+            writer.commit()
+        except BaseException as failure:  # noqa: BLE001 - exact evidence below
+            commit_failures.append(failure)
+            commit_finished.set()
+
+    checkpoint_worker = threading.Thread(target=checkpoint, name="paused-checkpoint")
+    commit_worker = threading.Thread(target=commit, name="checkpoint-racing-commit")
+    try:
+        checkpoint_worker.start()
+        assert manager_finished.wait(_WAIT_SECONDS)
+        commit_worker.start()
+        assert commit_attempted.wait(_WAIT_SECONDS)
+        assert not commit_finished.wait(0.25), (
+            "commit crossed the manager-to-inventory checkpoint gap"
+        )
+        release_postlude.set()
+        checkpoint_worker.join(_WAIT_SECONDS)
+        commit_worker.join(_WAIT_SECONDS)
+    finally:
+        release_postlude.set()
+        checkpoint_worker.join(_WAIT_SECONDS)
+        commit_worker.join(_WAIT_SECONDS)
+        database.close()
+
+    assert not checkpoint_worker.is_alive()
+    assert not commit_worker.is_alive()
+    assert checkpoint_failures == []
+    assert commit_failures == []
+    assert commit_before_inventory == [False]
+
+
+def test_vector_math_can_wait_for_cross_thread_close_without_deadlock() -> None:
+    """A host VectorMath may synchronously wait for close while search owns page access."""
+    database = connect(":memory:")
+    with database.begin("write") as schema:
+        schema.execute("CREATE VECTOR SPACE s {dimension: 2, metric: 'cosine'}")
+        schema.execute("CREATE NODE TABLE V(id INT64, e VECTOR(s), PRIMARY KEY(id))")
+    with database.begin("write") as writer:
+        writer.execute("CREATE (:V {id: 1, e: [1.0, 0.0]})")
+
+    inner = PureVectorMath()
+    close_joined: list[bool] = []
+    close_failures: list[BaseException] = []
+
+    class ClosingMath:
+        @property
+        def name(self) -> str:
+            return "closing"
+
+        def dot(self, a: Sequence[float], b: Sequence[float]) -> float:
+            return inner.dot(a, b)
+
+        def cosine(self, a: Sequence[float], b: Sequence[float]) -> float:
+            return inner.cosine(a, b)
+
+        def euclidean(self, a: Sequence[float], b: Sequence[float]) -> float:
+            return inner.euclidean(a, b)
+
+        def norm(self, a: Sequence[float]) -> float:
+            return inner.norm(a)
+
+        def normalize(self, a: Sequence[float]) -> tuple[float, ...]:
+            return inner.normalize(a)
+
+        def score(
+            self,
+            a: Sequence[float],
+            b: Sequence[float],
+            metric: DistanceMetric,
+        ) -> float:
+            return inner.score(a, b, metric)
+
+        def top_k(
+            self,
+            query: Sequence[float],
+            candidates: Sequence[tuple[int, Sequence[float]]],
+            k: int,
+            metric: DistanceMetric,
+        ) -> list[tuple[int, float]]:
+            def close() -> None:
+                try:
+                    database.close()
+                except BaseException as failure:  # noqa: BLE001 - exact evidence below
+                    close_failures.append(failure)
+
+            worker = threading.Thread(target=close, name="vector-math-close")
+            worker.start()
+            worker.join(_WAIT_SECONDS)
+            close_joined.append(not worker.is_alive())
+            return inner.top_k(query, candidates, k, metric)
+
+    database._vectors._math = ClosingMath()
+    reader = database.begin("read")
+    result = database.search_vectors(reader, space="s", query=(1.0, 0.0), k=1)
+
+    assert tuple(hit.record_id for hit in result.hits) == (1,)
+    assert close_joined == [True]
+    assert close_failures == []
+    assert not reader.active
+    assert database.close_complete
+
+
 def test_close_drains_committed_schema_with_its_outcome_before_late_wrapper_returns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1097,12 +1305,12 @@ def test_close_drains_committed_schema_with_its_outcome_before_late_wrapper_retu
         "close waited for a wrapper after manager quiescence"
     )
     assert close_failures == []
-    assert settle_outcomes == [True]
-    assert database._public_contexts == {}
+    assert settle_outcomes == []
+    assert tuple(database._public_contexts) == (transaction.txn_id,)
     assert not database.close_complete
 
-    # The wrapper's absent-id settlement is a QueryEngine no-op; leaving its facade transition
-    # then resumes the pending close and releases lower dependencies.
+    # The still-active facade wrapper owns its exact committed outcome and settlement. Leaving
+    # that transition then resumes the pending close and releases lower dependencies.
     release_wrapper.set()
     commit_worker.join(_WAIT_SECONDS)
 
@@ -1140,8 +1348,6 @@ def test_close_owns_rollback_schema_unwind_in_the_manager_to_wrapper_gap(
     transaction.execute("CREATE NODE TABLE Ghost(id INT64, PRIMARY KEY(id))")
     manager_rolled_back = threading.Event()
     release_wrapper = threading.Event()
-    close_drain_started = threading.Event()
-    release_close_drain = threading.Event()
     settle_outcomes: list[bool] = []
     rollback_failures: list[BaseException] = []
     close_failures: list[BaseException] = []
@@ -1160,10 +1366,6 @@ def test_close_owns_rollback_schema_unwind_in_the_manager_to_wrapper_gap(
     def pause_close_drain(self: QueryEngine, txn_id: int, *, committed: bool) -> None:
         if self is database._queries and txn_id == transaction.txn_id:
             settle_outcomes.append(committed)
-            if threading.current_thread().name == "close-rolled-back-schema":
-                close_drain_started.set()
-                if not release_close_drain.wait(_WAIT_SECONDS):
-                    raise AssertionError("test did not release close's schema drain")
         original_settle(self, txn_id, committed=committed)
 
     monkeypatch.setattr(TransactionManager, "rollback", pause_after_manager_rollback)
@@ -1191,29 +1393,22 @@ def test_close_owns_rollback_schema_unwind_in_the_manager_to_wrapper_gap(
             "manager rollback never released its pin"
         )
         close_worker.start()
-        assert close_drain_started.wait(_WAIT_SECONDS), (
-            "close did not adopt schema unwind"
-        )
-        assert not storage_closed.is_set(), (
-            "storage closed while speculative files were live"
-        )
-        assert settle_outcomes == [False]
-        assert close_worker.is_alive()
-
-        release_close_drain.set()
         close_worker.join(_WAIT_SECONDS)
         assert not close_worker.is_alive()
         assert close_failures == []
+        assert not storage_closed.is_set(), (
+            "storage closed while speculative files were live"
+        )
+        assert settle_outcomes == []
         assert not storage_closed.is_set()
         assert not database.close_complete
-        assert database._public_contexts == {}
+        assert tuple(database._public_contexts) == (transaction.txn_id,)
 
-        # The original wrapper now returns from manager.rollback. Its settlement is absent-id
-        # and cannot reach QueryEngine again; transition exit resumes the safe pending close.
+        # The original wrapper owns rollback settlement. Its transition exit then resumes the
+        # safe pending close and releases storage only after speculative schema is gone.
         release_wrapper.set()
         rollback_worker.join(_WAIT_SECONDS)
     finally:
-        release_close_drain.set()
         release_wrapper.set()
         rollback_worker.join(_WAIT_SECONDS)
         close_worker.join(_WAIT_SECONDS)

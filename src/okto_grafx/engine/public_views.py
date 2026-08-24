@@ -25,6 +25,7 @@ from okto_grafx.domain.errors import (
     GrafxLedgerError,
     GrafxQuarantineError,
     GrafxRecoveryRefused,
+    GrafxVectorValidationError,
 )
 from okto_grafx.domain.index.definition import IndexDefinition
 from okto_grafx.domain.index.entry import IndexEntry
@@ -40,16 +41,28 @@ from okto_grafx.domain.ledger.entry import (
 from okto_grafx.domain.ledger.payload import LedgerPayload, decode_payload
 from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
-from okto_grafx.domain.model.value import ValueType
-from okto_grafx.domain.page.layout import MAX_U64
+from okto_grafx.domain.model.value import (
+    MAX_VECTOR_DIMENSION,
+    VECTOR_DTYPES,
+    ValueType,
+    VectorValue,
+)
+from okto_grafx.domain.page.layout import MAX_U32, MAX_U64
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.recovery.manifest import QuarantineManifest
 from okto_grafx.domain.recovery.report import RecoveryFinding, RecoveryReport
 from okto_grafx.domain.txn.commit_state import CommitState
 from okto_grafx.domain.txn.partitions import partition_of
 from okto_grafx.domain.vector.key import VectorIndexDefinition
+from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.domain.vector.planner import REGIMES
 from okto_grafx.domain.verify.findings import (
+    NOT_APPLICABLE,
+    SCOPE_ALL,
+    SCOPE_INDEXES,
+    SCOPE_PAGES,
+    SCOPE_RECORDS,
+    VERIFICATION_FINDING_KINDS,
     FindingLocation,
     VerificationFinding,
     VerificationReport,
@@ -1355,7 +1368,7 @@ def _index_entry_view(value: object) -> IndexEntry:
 def _finding_location_view(value: object) -> FindingLocation:
     """Rebuild the complete location of a verification finding."""
     value = _domain_value(value, FindingLocation, field="verify.finding.location")
-    return FindingLocation(
+    location = FindingLocation(
         file=_builtin_text(
             _domain_field(value, FindingLocation, "file"),
             field="verify.finding.location.file",
@@ -1377,17 +1390,43 @@ def _finding_location_view(value: object) -> FindingLocation:
             field="verify.finding.location.index",
         ),
     )
+    if location.page != NOT_APPLICABLE and not 0 <= location.page <= MAX_PAGE_INDEX:
+        raise GrafxConfigurationError(
+            "A verification finding page must be not-applicable or an encodable page index.",
+            field="verify.finding.location.page",
+            value="out_of_range",
+        )
+    if location.slot != NOT_APPLICABLE and not 0 <= location.slot <= MAX_SLOT_ID:
+        raise GrafxConfigurationError(
+            "A verification finding slot must be not-applicable or an encodable slot id.",
+            field="verify.finding.location.slot",
+            value="out_of_range",
+        )
+    if not 0 <= location.lsn <= MAX_U64:
+        raise GrafxConfigurationError(
+            "A verification finding sequence number must fit the unsigned 64-bit field.",
+            field="verify.finding.location.lsn",
+            value="out_of_range",
+        )
+    return location
 
 
 def _verification_finding_view(value: object) -> VerificationFinding:
     """Rebuild one verification finding and its nested location."""
     value = _domain_value(value, VerificationFinding, field="verify.finding")
-    return VerificationFinding(
-        kind=_builtin_text(
-            _domain_field(value, VerificationFinding, "kind"),
+    kind = _builtin_text(
+        _domain_field(value, VerificationFinding, "kind"),
+        field="verify.finding.kind",
+        empty=False,
+    )
+    if kind not in VERIFICATION_FINDING_KINDS:
+        raise GrafxConfigurationError(
+            "A verification finding must use the closed machine-readable vocabulary.",
             field="verify.finding.kind",
-            empty=False,
-        ),
+            value=kind,
+        )
+    return VerificationFinding(
+        kind=kind,
         location=_finding_location_view(
             _domain_field(value, VerificationFinding, "location")
         ),
@@ -1416,34 +1455,71 @@ def _verification_report_view(
             value=scope,
             requested=requested_scope,
         )
+    findings = tuple(
+        _verification_finding_view(finding)
+        for finding in _tuple_items(
+            _domain_field(value, VerificationReport, "findings"),
+            field="verify.findings",
+        )
+    )
+    pages_checked = _require_nonnegative_integer(
+        "verify.pages_checked",
+        _domain_field(value, VerificationReport, "pages_checked"),
+    )
+    records_checked = _require_nonnegative_integer(
+        "verify.records_checked",
+        _domain_field(value, VerificationReport, "records_checked"),
+    )
+    index_entries_checked = _require_nonnegative_integer(
+        "verify.index_entries_checked",
+        _domain_field(value, VerificationReport, "index_entries_checked"),
+    )
+    files_checked = tuple(
+        _builtin_text(file, field="verify.files_checked", empty=False)
+        for file in _tuple_items(
+            _domain_field(value, VerificationReport, "files_checked"),
+            field="verify.files_checked",
+        )
+    )
+    if len(frozenset(files_checked)) != len(files_checked):
+        raise GrafxConfigurationError(
+            "A verification report cannot name the same checked file more than once.",
+            field="verify.files_checked",
+            value="duplicate_file",
+        )
+    inactive_counts = {
+        SCOPE_PAGES: (records_checked, index_entries_checked),
+        SCOPE_RECORDS: (pages_checked, index_entries_checked),
+        SCOPE_INDEXES: (pages_checked, records_checked),
+        SCOPE_ALL: (),
+    }[scope]
+    if any(inactive_counts):
+        raise GrafxConfigurationError(
+            "A verification report must leave counters outside its requested scope at zero.",
+            field="verify.report",
+            value="inactive_counter",
+        )
+    if scope not in (SCOPE_PAGES, SCOPE_ALL) and files_checked:
+        raise GrafxConfigurationError(
+            "Only a verification page walk may report checked files.",
+            field="verify.files_checked",
+            value="scope_mismatch",
+        )
+    if scope in (SCOPE_PAGES, SCOPE_ALL) and (
+        bool(files_checked) != bool(pages_checked) or len(files_checked) > pages_checked
+    ):
+        raise GrafxConfigurationError(
+            "A verification page count and its unique checked-file inventory must agree.",
+            field="verify.files_checked",
+            value="count_mismatch",
+        )
     return VerificationReport(
         scope=scope,
-        findings=tuple(
-            _verification_finding_view(finding)
-            for finding in _tuple_items(
-                _domain_field(value, VerificationReport, "findings"),
-                field="verify.findings",
-            )
-        ),
-        pages_checked=_require_nonnegative_integer(
-            "verify.pages_checked",
-            _domain_field(value, VerificationReport, "pages_checked"),
-        ),
-        records_checked=_require_nonnegative_integer(
-            "verify.records_checked",
-            _domain_field(value, VerificationReport, "records_checked"),
-        ),
-        index_entries_checked=_require_nonnegative_integer(
-            "verify.index_entries_checked",
-            _domain_field(value, VerificationReport, "index_entries_checked"),
-        ),
-        files_checked=tuple(
-            _builtin_text(file, field="verify.files_checked")
-            for file in _tuple_items(
-                _domain_field(value, VerificationReport, "files_checked"),
-                field="verify.files_checked",
-            )
-        ),
+        findings=findings,
+        pages_checked=pages_checked,
+        records_checked=records_checked,
+        index_entries_checked=index_entries_checked,
+        files_checked=files_checked,
     )
 
 
@@ -1452,6 +1528,7 @@ def _recycle_report_view(value: object) -> RecycleReport:
     value = _domain_value(value, RecycleReport, field="checkpoint.report")
 
     def names(field: str) -> tuple[str, ...]:
+        """Copy one segment-name collection into exact, non-empty strings."""
         return tuple(
             _builtin_text(item, field=f"checkpoint.{field}", empty=False)
             for item in _tuple_items(
@@ -1470,23 +1547,187 @@ def _recycle_report_view(value: object) -> RecycleReport:
             field="checkpoint.horizon_lsn",
             value="out_of_range",
         )
+    recycled = names("recycled")
+    deferred = names("deferred")
+    retained = names("retained")
+    for field, collection in (
+        ("recycled", recycled),
+        ("deferred", deferred),
+        ("retained", retained),
+    ):
+        if len(frozenset(collection)) != len(collection):
+            raise GrafxConfigurationError(
+                "A checkpoint report cannot repeat a segment within one collection.",
+                field=f"checkpoint.{field}",
+                value="duplicate_segment",
+            )
+    recycled_names = frozenset(recycled)
+    if recycled_names.intersection(deferred) or recycled_names.intersection(retained):
+        raise GrafxConfigurationError(
+            "A recycled checkpoint segment cannot also be deferred or retained.",
+            field="checkpoint.recycled",
+            value="contradictory_segment_state",
+        )
+    reclaimed_bytes = _require_nonnegative_integer(
+        "checkpoint.reclaimed_bytes",
+        _domain_field(value, RecycleReport, "reclaimed_bytes"),
+    )
+    lag_segments = _require_nonnegative_integer(
+        "checkpoint.lag_segments",
+        _domain_field(value, RecycleReport, "lag_segments"),
+    )
+    if bool(recycled) != bool(reclaimed_bytes):
+        raise GrafxConfigurationError(
+            "A checkpoint recycles segments exactly when it reclaims bytes.",
+            field="checkpoint.reclaimed_bytes",
+            value="recycled_bytes_mismatch",
+        )
+    expected_lag = max(len(retained) - 1, 0)
+    if lag_segments != expected_lag:
+        raise GrafxConfigurationError(
+            "A checkpoint lag must count retained segments older than the newest one.",
+            field="checkpoint.lag_segments",
+            value=lag_segments,
+            expected=expected_lag,
+        )
     return RecycleReport(
         horizon_lsn=horizon_lsn,
-        recycled=names("recycled"),
-        deferred=names("deferred"),
-        retained=names("retained"),
-        reclaimed_bytes=_require_nonnegative_integer(
-            "checkpoint.reclaimed_bytes",
-            _domain_field(value, RecycleReport, "reclaimed_bytes"),
-        ),
-        lag_segments=_require_nonnegative_integer(
-            "checkpoint.lag_segments",
-            _domain_field(value, RecycleReport, "lag_segments"),
-        ),
+        recycled=recycled,
+        deferred=deferred,
+        retained=retained,
+        reclaimed_bytes=reclaimed_bytes,
+        lag_segments=lag_segments,
         reader_present=_builtin_bool(
             _domain_field(value, RecycleReport, "reader_present")
         ),
     )
+
+
+def _vector_component(value: object) -> float:
+    """Copy one query component into an exact float before engine coordination begins."""
+    value_type = type(value)
+    if value_type is bool:
+        return float(value)
+    if issubclass(value_type, float):
+        return float.__float__(value)
+    if issubclass(value_type, int):
+        return float(int.__int__(value))
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError) as failure:
+        raise GrafxVectorValidationError(
+            "A vector needs a sequence of numbers.",
+            field="values",
+            reason="not_a_sequence",
+            value=_builtin_type_name(value),
+        ) from failure
+
+
+def _vector_query_snapshot(value: object) -> tuple[float, ...] | VectorValue:
+    """Detach a query into an exact tuple or an identity-preserving exact VectorValue."""
+    if issubclass(type(value), VectorValue):
+        source = _domain_value(value, VectorValue, field="vector.query")
+        values = tuple(
+            _vector_component(component)
+            for component in _tuple_items(
+                _domain_field(source, VectorValue, "values"),
+                field="vector.query.values",
+            )
+        )
+        space_ref = _builtin_int(
+            _domain_field(source, VectorValue, "space_ref"),
+            field="vector.query.space_ref",
+        )
+        dtype = _builtin_text(
+            _domain_field(source, VectorValue, "dtype"),
+            field="vector.query.dtype",
+            empty=False,
+        )
+        if not 1 <= space_ref <= MAX_U32:
+            raise GrafxVectorValidationError(
+                "A query vector space reference must be a real unsigned 32-bit identifier.",
+                field="space_ref",
+                value=space_ref,
+            )
+        if dtype not in VECTOR_DTYPES:
+            raise GrafxVectorValidationError(
+                "A query vector must name a supported storage dtype.",
+                field="dtype",
+                value=dtype,
+            )
+        if len(values) > MAX_VECTOR_DIMENSION:
+            raise GrafxVectorValidationError(
+                f"A query vector may have at most {MAX_VECTOR_DIMENSION} components.",
+                field="values",
+                reason="dimension_too_large",
+                value=len(values),
+            )
+        return VectorValue(values=values, space_ref=space_ref, dtype=dtype)
+
+    if issubclass(type(value), (str, bytes, bytearray)):
+        raise GrafxVectorValidationError(
+            f"A vector needs a sequence of numbers; got {_builtin_type_name(value)}.",
+            field="values",
+            reason="not_a_sequence",
+            value=_builtin_type_name(value),
+        )
+    try:
+        if issubclass(type(value), tuple):
+            iterator = tuple.__iter__(value)
+        elif issubclass(type(value), list):
+            iterator = list.__iter__(value)
+        else:
+            iterator = iter(value)  # type: ignore[arg-type]
+        components: list[float] = []
+        for component in iterator:
+            components.append(_vector_component(component))
+            if len(components) > MAX_VECTOR_DIMENSION:
+                raise GrafxVectorValidationError(
+                    f"A query vector may have at most {MAX_VECTOR_DIMENSION} components.",
+                    field="values",
+                    reason="dimension_too_large",
+                    value=len(components),
+                )
+    except GrafxVectorValidationError:
+        raise
+    except (TypeError, ValueError, OverflowError) as failure:
+        raise GrafxVectorValidationError(
+            f"A vector needs a sequence of numbers; got {_builtin_type_name(value)}.",
+            field="values",
+            reason="not_a_sequence",
+            value=_builtin_type_name(value),
+        ) from failure
+    return tuple(components)
+
+
+def _record_id_filter_snapshot(value: object | None) -> RecordIdFilter | None:
+    """Rebuild an exact enumerated filter with exact, usable record identifiers."""
+    if value is None:
+        return None
+    if type(value) is not RecordIdFilter:
+        raise GrafxConfigurationError(
+            "A public vector candidate filter must be an immutable RecordIdFilter or None.",
+            field="candidate_filter",
+            value=_builtin_type_name(value),
+        )
+    source = _domain_field(value, RecordIdFilter, "record_ids")
+    if not issubclass(type(source), frozenset):
+        raise GrafxConfigurationError(
+            "A public vector candidate filter must contain a frozenset of record ids.",
+            field="candidate_filter.record_ids",
+            value=_builtin_type_name(source),
+        )
+    identifiers: list[int] = []
+    for raw_identifier in frozenset.__iter__(source):
+        identifier = _builtin_int(raw_identifier, field="candidate_filter.record_ids")
+        if not 1 <= identifier < MAX_U64:
+            raise GrafxConfigurationError(
+                "A vector candidate record id must be within the usable unsigned 64-bit range.",
+                field="candidate_filter.record_ids",
+                value="out_of_range",
+            )
+        identifiers.append(identifier)
+    return RecordIdFilter(frozenset(identifier for identifier in identifiers))
 
 
 def _vector_hit_view(value: object) -> VectorHit:
@@ -1495,9 +1736,9 @@ def _vector_hit_view(value: object) -> VectorHit:
     record_id = _require_nonnegative_integer(
         "vector.hit.record_id", _domain_field(value, VectorHit, "record_id")
     )
-    if record_id > MAX_U64:
+    if not 1 <= record_id < MAX_U64:
         raise GrafxConfigurationError(
-            "A vector hit record id must fit the unsigned 64-bit identity field.",
+            "A vector hit record id must be within the usable unsigned 64-bit identity field.",
             field="vector.hit.record_id",
             value="out_of_range",
         )
@@ -1514,7 +1755,11 @@ def _vector_hit_view(value: object) -> VectorHit:
 
 
 def _vector_search_result_view(
-    value: object, *, requested_k: int, requested_space: str
+    value: object,
+    *,
+    requested_k: int,
+    requested_space: str,
+    candidate_filter: RecordIdFilter | None,
 ) -> VectorSearchResult:
     """Rebuild and cross-check the complete result of one public vector search."""
     value = _domain_value(value, VectorSearchResult, field="vector.result")
@@ -1569,12 +1814,54 @@ def _vector_search_result_view(
             field="vector.hits",
             value="duplicate_record_id",
         )
+    references = tuple(hit.ref for hit in hits)
+    if len(frozenset(references)) != len(references):
+        raise GrafxConfigurationError(
+            "A vector result cannot name the same record reference more than once.",
+            field="vector.hits",
+            value="duplicate_record_ref",
+        )
+    if hits != tuple(sorted(hits, key=lambda hit: (-hit.score, hit.record_id))):
+        raise GrafxConfigurationError(
+            "A vector result must be ranked by descending score and then ascending record id.",
+            field="vector.hits",
+            value="ranking_mismatch",
+        )
+    if len(frozenset(hit.retired for hit in hits)) > 1:
+        raise GrafxConfigurationError(
+            "Every hit in one vector result must report the same space retirement state.",
+            field="vector.hits",
+            value="mixed_retired_state",
+        )
     raw_cardinality = _domain_field(value, VectorSearchResult, "filter_cardinality")
     filter_cardinality = (
         None
         if raw_cardinality is None
         else _require_nonnegative_integer("vector.filter_cardinality", raw_cardinality)
     )
+    if candidate_filter is None:
+        if filter_cardinality is not None:
+            raise GrafxConfigurationError(
+                "An unfiltered vector result must not report a filter cardinality.",
+                field="vector.filter_cardinality",
+                value=filter_cardinality,
+            )
+    else:
+        candidate_ids = _domain_field(candidate_filter, RecordIdFilter, "record_ids")
+        expected_cardinality = frozenset.__len__(candidate_ids)
+        if filter_cardinality != expected_cardinality:
+            raise GrafxConfigurationError(
+                "A filtered vector result must report the exact enumerated cardinality.",
+                field="vector.filter_cardinality",
+                value=filter_cardinality,
+                expected=expected_cardinality,
+            )
+        if any(record_id not in candidate_ids for record_id in record_ids):
+            raise GrafxConfigurationError(
+                "Every vector hit must belong to the exact candidate filter.",
+                field="vector.hits",
+                value="outside_candidate_filter",
+            )
     return VectorSearchResult(
         hits=hits,
         regime=regime,

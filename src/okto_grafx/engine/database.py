@@ -46,6 +46,7 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.index.entry import IndexEntry
+from okto_grafx.domain.model.value import VectorValue
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.page.file_header import (
     HEADER_PAGE_INDEX,
@@ -114,6 +115,7 @@ from okto_grafx.engine.public_views import (
     _metrics_snapshot_view,
     _pool_view,
     _quarantine_view,
+    _record_id_filter_snapshot,
     _recycle_report_view,
     _queries_view,
     _recovery_report_view,
@@ -122,6 +124,7 @@ from okto_grafx.engine.public_views import (
     _transactions_view,
     _tuple_items,
     _verification_report_view,
+    _vector_query_snapshot,
     _vector_search_result_view,
     _vectors_view,
     _wal_view,
@@ -1394,7 +1397,7 @@ class Database:
         transaction: Transaction,
         *,
         space: str,
-        query: Sequence[float],
+        query: Sequence[float] | VectorValue,
         k: int,
         candidate_filter: RecordIdFilter | None = None,
     ) -> VectorSearchResult:
@@ -1437,6 +1440,13 @@ class Database:
                     field="candidate_filter",
                     value=observed,
                 )
+            # Detach every caller-controlled leaf and iterable before participant coordination.
+            # A custom sequence may execute host code while being copied; if it rolls this
+            # transaction back, the liveness recheck below refuses before search.
+            wanted_space = _require_text("space", space)
+            wanted_k = _require_positive_integer("k", k)
+            wanted_query = _vector_query_snapshot(query)
+            wanted_filter = _record_id_filter_snapshot(candidate_filter)
             vectors = self._require_component(
                 "vectors", self._vectors, "the vector engine (C9)"
             )
@@ -1445,20 +1455,20 @@ class Database:
                 # use. Checking before it would let a racing rollback withdraw this snapshot's
                 # reader pin in the gap and leave the search below a recyclable horizon.
                 transaction._require_active()
-                wanted_space = _require_text("space", space)
-                wanted_k = _require_positive_integer("k", k)
+                snapshot = _public_snapshot(transaction._context.snapshot)
                 result = vectors.search(  # type: ignore[attr-defined]
                     space=wanted_space,
-                    query=query,
+                    query=wanted_query,
                     k=wanted_k,
-                    snapshot=transaction._context.snapshot,
-                    candidate_filter=candidate_filter,
+                    snapshot=snapshot,
+                    candidate_filter=wanted_filter,
                 )
-                return _vector_search_result_view(
-                    result,
-                    requested_k=wanted_k,
-                    requested_space=wanted_space,
-                )
+            return _vector_search_result_view(
+                result,
+                requested_k=wanted_k,
+                requested_space=wanted_space,
+                candidate_filter=wanted_filter,
+            )
 
     # --- operator surface ---------------------------------------------------------------------
 
@@ -1555,13 +1565,16 @@ class Database:
         with self._public_operation("checkpoint"):
             self._require_open()
             self._require_writable("checkpoint the database")
-            report = self._transactions.checkpoint()
-            indexes = self._indexes
-            if indexes is not None:
-                # Checkpoint redo may have adopted schema and indexes committed by another
-                # participant after this handle opened. Keep the public inventory aligned with
-                # the registry that now serves queries, just as operator recovery does.
-                with self._transactions.page_access_section():
+            # The manager's checkpoint section is re-entrant. This outer section deliberately
+            # spans its operation and the facade inventory postlude so deferred metrics
+            # callbacks cannot close lifecycle state between those two halves.
+            with self._transactions.page_access_section():
+                report = self._transactions.checkpoint()
+                indexes = self._indexes
+                if indexes is not None:
+                    # Checkpoint redo may have adopted schema and indexes committed by another
+                    # participant after this handle opened. Keep the public inventory aligned
+                    # with the registry that now serves queries, just as operator recovery does.
                     registered = indexes.indexes()  # type: ignore[attr-defined]
                     self._attached_indexes = tuple(
                         _builtin_text(index.name, field="attached_index", empty=False)
@@ -1662,13 +1675,16 @@ class Database:
         self._closed = True
         self._transactions.request_close()
         if (
-            self._facade_transition_reentrant()
+            self._facade_transition_active()
+            or self._facade_transition_reentrant()
             or self._transactions.transition_active
             or self._close_releasing
         ):
-            # A callback arrived inside begin/commit/rollback/retry, a manager transition, or
-            # this close's host release phase. The terminal request is enough here; the public
-            # transition finally (or a later explicit close) resumes after wrapper settlement.
+            # A facade wrapper (including one on another thread) is still inside its outcome
+            # boundary, a manager transition, or this close's host release phase. The terminal
+            # request is enough here; transition-finally resumes after wrapper settlement. In
+            # particular, do not wait for a participant held by host VectorMath that is waiting
+            # for this close call to return.
             return
 
         failures: list[BaseException] = []
