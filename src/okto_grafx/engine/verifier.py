@@ -424,11 +424,16 @@ class Verifier:
         owners, physical_maxima = self._physical_heap_inventory(
             heap_file, findings, reported
         )
-        findings.extend(
-            self._verify_record_id_counters(
-                heap_file, physical_maxima, findings, reported
-            )
+        counter_findings, extent_slots = self._verify_record_id_counters(
+            heap_file, physical_maxima, findings, reported
         )
+        findings.extend(counter_findings)
+        if extent_slots is not None:
+            findings.extend(
+                self._verify_unowned_heap_pages(
+                    heap_file, owners, frozenset(extent_slots), reported
+                )
+            )
         if self._catalog is None:
             return 0, findings
         try:
@@ -442,8 +447,19 @@ class Verifier:
                 )
             )
             return 0, findings
+        tables = tuple(catalog.tables())
+        if extent_slots is not None:
+            findings.extend(
+                self._verify_catalog_ownership(
+                    heap_file,
+                    owners,
+                    extent_slots,
+                    frozenset(table.table_id for table in tables),
+                    reported,
+                )
+            )
         checked = 0
-        for table in catalog.tables():
+        for table in tables:
             counted, found = self._verify_table(table, heap_file, owners, reported)
             checked += counted
             findings.extend(found)
@@ -468,7 +484,8 @@ class Verifier:
         Visibility is a reader's opinion and a directory counter cannot use it: handing out an id
         already present in any persisted header would make the answer depend on whether that old
         header happened to be visible. Pages and slots are read from the device, never through the
-        heap or its cache.
+        heap or its cache. A page without an exact readable descriptor is located and excluded:
+        assigning its headers to any table would fabricate the association the damaged bytes lost.
         """
         owners: dict[int, set[PageIndex]] = {}
         maxima: dict[int, int] = {}
@@ -483,12 +500,40 @@ class Verifier:
             if page is None or page.page_type != int(PageType.HEAP):
                 continue
             if page.slot_count <= _HEAP_DESCRIPTOR_SLOT:
+                self._report_page(
+                    findings,
+                    reported,
+                    heap_file,
+                    index,
+                    FindingKind.PAGE_DESCRIPTOR_MISSING,
+                    "This physical heap page has no table descriptor in slot 0, so its owner "
+                    "cannot be established.",
+                )
                 continue
             try:
                 descriptor = page.read_slot(_HEAP_DESCRIPTOR_SLOT)
-            except GrafxError:
+            except GrafxError as failure:
+                self._report_page(
+                    findings,
+                    reported,
+                    heap_file,
+                    index,
+                    FindingKind.PAGE_DESCRIPTOR_MISSING,
+                    "This physical heap page has no readable table descriptor in slot 0: "
+                    f"{failure}",
+                )
                 continue
             if len(descriptor) != DESCRIPTOR_SIZE:
+                self._report_page(
+                    findings,
+                    reported,
+                    heap_file,
+                    index,
+                    FindingKind.PAGE_DESCRIPTOR_MISSING,
+                    "This physical heap page carries a "
+                    f"{len(descriptor)}-byte table descriptor in slot 0; exactly "
+                    f"{DESCRIPTOR_SIZE} bytes are required before an owner can be trusted.",
+                )
                 continue
             table_id = int.from_bytes(descriptor[:4], "little")
             owners.setdefault(table_id, set()).add(index)
@@ -514,7 +559,7 @@ class Verifier:
         physical_maxima: Mapping[int, int],
         findings: list[VerificationFinding],
         reported: set[tuple[str, PageIndex]],
-    ) -> list[VerificationFinding]:
+    ) -> tuple[list[VerificationFinding], dict[int, tuple[int, ...]] | None]:
         """Compare device-resident directory counters with every physical record header.
 
         ``next_record_id`` is the identity the next insert will take, so equality is already
@@ -525,11 +570,13 @@ class Verifier:
 
         Page zero is decoded directly from ``storage``. Calling ``HeapStore.extent_of`` here would
         let a resident old image certify lower bytes on the device, the precise failure a verifier
-        is meant to expose.
+        is meant to expose. Duplicate extents are an authority failure of their own, so no counter
+        is selected between them; the returned physical slot map lets the catalog comparison make
+        the same choice without re-reading page zero through a cache.
         """
         page = self._decode_page(heap_file, HEADER_PAGE_INDEX, findings, reported)
         if page is None:
-            return []
+            return [], None
         try:
             header = FileHeaderPage.read(page)
         except GrafxError as failure:
@@ -541,7 +588,7 @@ class Verifier:
                 FindingKind.FILE_HEADER,
                 f"Page 0 is not a readable heap file header page: {failure}",
             )
-            return []
+            return [], None
         if header.kind is not FileKind.HEAP:
             self._report_page(
                 findings,
@@ -551,7 +598,7 @@ class Verifier:
                 FindingKind.FILE_HEADER,
                 f"Page 0 carries a {header.kind.name.lower()} file header, not a heap header.",
             )
-            return []
+            return [], None
         if header.page_size != self._pool.page_size:
             self._report_page(
                 findings,
@@ -562,9 +609,10 @@ class Verifier:
                 f"The heap header declares {header.page_size}-byte pages and this verifier uses "
                 f"{self._pool.page_size}-byte pages.",
             )
-            return []
+            return [], None
 
         found: list[VerificationFinding] = []
+        extents: dict[int, list[tuple[int, TableExtent]]] = {}
         for slot, payload in page.iter_slots():
             if slot < EXTENT_FIRST_SLOT:
                 continue
@@ -581,7 +629,29 @@ class Verifier:
                     )
                 )
                 continue
-            highest = physical_maxima.get(extent.table_id)
+            extents.setdefault(extent.table_id, []).append((slot, extent))
+
+        for table_id in sorted(extents):
+            entries = extents[table_id]
+            if len(entries) > 1:
+                first_slot = entries[0][0]
+                for slot, _extent in entries[1:]:
+                    found.append(
+                        VerificationFinding(
+                            kind=FindingKind.TABLE_UNREADABLE,
+                            location=FindingLocation(
+                                file=heap_file, page=HEADER_PAGE_INDEX, slot=slot
+                            ),
+                            detail=(
+                                f"Table {table_id} has duplicate heap directory entries in "
+                                f"slots {first_slot} and {slot}; no counter or chain can be "
+                                "chosen as its authority."
+                            ),
+                        )
+                    )
+                continue
+            _slot, extent = entries[0]
+            highest = physical_maxima.get(table_id)
             if highest is None or extent.next_record_id > highest:
                 continue
             found.append(
@@ -598,6 +668,81 @@ class Verifier:
                     ),
                 )
             )
+        return found, {
+            table_id: tuple(slot for slot, _extent in entries)
+            for table_id, entries in extents.items()
+        }
+
+    def _verify_unowned_heap_pages(
+        self,
+        heap_file: str,
+        owners: Mapping[int, set[PageIndex]],
+        known_extent_ids: frozenset[int],
+        reported: set[tuple[str, PageIndex]],
+    ) -> list[VerificationFinding]:
+        """Locate physical heap pages whose trustworthy descriptor has no directory owner.
+
+        A descriptor is admitted to ``owners`` only after slot 0 decoded to exactly
+        ``DESCRIPTOR_SIZE`` bytes.  Page zero is the ownership authority; if it cannot be read,
+        the caller skips this comparison rather than guessing that every page is an orphan.
+        """
+        found: list[VerificationFinding] = []
+        for table_id in sorted(set(owners) - known_extent_ids):
+            for page_index in sorted(owners[table_id]):
+                self._report_page(
+                    found,
+                    reported,
+                    heap_file,
+                    page_index,
+                    FindingKind.ORPHAN_PAGE,
+                    f"This physical heap page declares table {table_id}, but page 0 has no "
+                    "decodable directory extent that owns it.",
+                )
+        return found
+
+    def _verify_catalog_ownership(
+        self,
+        heap_file: str,
+        owners: Mapping[int, set[PageIndex]],
+        extent_slots: Mapping[int, tuple[int, ...]],
+        catalog_table_ids: frozenset[int],
+        reported: set[tuple[str, PageIndex]],
+    ) -> list[VerificationFinding]:
+        """Report directory owners that have no table definition in the decoded catalog.
+
+        The caller supplies the immutable ids returned by one ``read_from_pages`` result. An
+        intentionally unwired catalog never reaches this method, and a catalog read failure stops
+        before it, so neither absence of a collaborator nor unreadable authority is guessed to
+        mean that every extent is orphaned.
+        """
+        found: list[VerificationFinding] = []
+        for table_id in sorted(set(extent_slots) - catalog_table_ids):
+            slots = extent_slots[table_id]
+            if slots:
+                found.append(
+                    VerificationFinding(
+                        kind=FindingKind.TABLE_UNREADABLE,
+                        location=FindingLocation(
+                            file=heap_file,
+                            page=HEADER_PAGE_INDEX,
+                            slot=slots[0],
+                        ),
+                        detail=(
+                            f"The heap directory declares table {table_id}, but the catalog "
+                            "snapshot has no table definition with that id."
+                        ),
+                    )
+                )
+            for page_index in sorted(owners.get(table_id, ())):
+                self._report_page(
+                    found,
+                    reported,
+                    heap_file,
+                    page_index,
+                    FindingKind.ORPHAN_PAGE,
+                    f"This physical heap page declares table {table_id}, but the catalog "
+                    "snapshot has no table definition that can own it.",
+                )
         return found
 
     def _verify_table(
@@ -620,6 +765,8 @@ class Verifier:
             # different things about the two.
             kind, is_damage = route_page_refusal(failure)
             page = failure.details.get("page")
+            if isinstance(page, int) and (heap_file, page) in reported:
+                return 0, []
             return 0, [
                 VerificationFinding(
                     # Compared by VALUE, never by identity: both sides are ordinary strings, and

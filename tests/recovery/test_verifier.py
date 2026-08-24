@@ -125,6 +125,19 @@ def _rewrite_device_counter(
     return changed
 
 
+def _append_device_extent(stack: Stack, extent: TableExtent) -> int:
+    """Append one checksum-valid heap directory entry without consulting HeapStore."""
+    stack.pool.flush()
+    raw = stack.storage.read_page(HEAP_FILE, 0)  # type: ignore[attr-defined]
+    page = stack.codec.decode_page(raw, verify=True)
+    slot = page.insert_slot(extent.encode())
+    stack.storage.write_page(  # type: ignore[attr-defined]
+        HEAP_FILE, 0, stack.codec.encode_page(page)
+    )
+    stack.pool.invalidate()
+    return slot
+
+
 def _rewrite_first_record_header(stack: Stack, table: TableDef, **changes: int) -> None:
     """Rewrite one reachable header while preserving its payload and a valid page checksum."""
     reference = next(iter(stack.heap.scan_all(table)))[0]
@@ -147,6 +160,34 @@ def _append_orphan_header(stack: Stack, table: TableDef, record_id: int) -> int:
     try:
         page.insert_slot(table.table_id.to_bytes(4, "little"))
         page.insert_slot(RecordHeader(record_id=record_id, xmin=1).encode())
+    finally:
+        stack.pool.unpin(HEAP_FILE, page_index, dirty=True)
+    stack.pool.flush()
+    return page_index
+
+
+def _append_physical_heap_page(
+    stack: Stack,
+    descriptor: bytes | None,
+    payload: bytes | None,
+) -> int:
+    """Write a heap page without using HeapStore's descriptor/chain policy.
+
+    ``descriptor=None`` with a payload leaves slot 0 allocated and then frees it, making the
+    descriptor unreadable while preserving the adversarial record bytes in slot 1. With both
+    arguments ``None`` the page has no slot 0 at all.
+    """
+    page = stack.pool.allocate(HEAP_FILE, int(PageType.HEAP))
+    page_index = page.page_index
+    try:
+        if descriptor is not None:
+            page.insert_slot(descriptor)
+        elif payload is not None:
+            page.insert_slot(b"descriptor-to-free")
+        if payload is not None:
+            page.insert_slot(payload)
+        if descriptor is None and payload is not None:
+            page.free_slot(0)
     finally:
         stack.pool.unpin(HEAP_FILE, page_index, dirty=True)
     stack.pool.flush()
@@ -357,6 +398,171 @@ def test_an_empty_or_ahead_counter_is_legal(stack: Stack) -> None:
     assert stack.heap.allocate_record_id(empty) == 1
     _rewrite_device_counter(stack, empty, 500, invalidate=True)
     assert stack.verifier().verify(SCOPE_RECORDS).findings == ()
+
+
+@pytest.mark.parametrize("scope", (SCOPE_RECORDS, SCOPE_ALL))
+@pytest.mark.parametrize(
+    "descriptor",
+    (None, b"\x01\x00\x00", b"\x01\x00\x00\x00\xff"),
+    ids=("freed", "short", "long"),
+)
+def test_an_untrustworthy_descriptor_is_located_without_inventing_a_counter_owner(
+    stack: Stack, scope: str, descriptor: bytes | None
+) -> None:
+    """A high id behind malformed ownership metadata must not be assigned to another table."""
+    table = _populate(stack)
+    assert stack.heap.next_record_id(table) == 4
+    page_index = _append_physical_heap_page(
+        stack,
+        descriptor,
+        RecordHeader(record_id=99, xmin=1).encode(),
+    )
+    before = stack.storage.read_page(HEAP_FILE, page_index)  # type: ignore[attr-defined]
+
+    report = stack.verifier().verify(scope)
+
+    missing = report.findings_at(
+        FindingKind.PAGE_DESCRIPTOR_MISSING, HEAP_FILE, page_index
+    )
+    assert len(missing) == 1
+    assert report.findings_at(FindingKind.ORPHAN_PAGE, HEAP_FILE, page_index) == ()
+    assert report.findings_of(FindingKind.RECORD_ID_COUNTER) == ()
+    assert report.records_checked == 3
+    assert report.clean is False
+    assert stack.storage.read_page(HEAP_FILE, page_index) == before  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("scope", (SCOPE_RECORDS, SCOPE_ALL))
+def test_a_physical_heap_page_with_no_descriptor_slot_is_never_clean(
+    stack: Stack, scope: str
+) -> None:
+    _populate(stack)
+    page_index = _append_physical_heap_page(stack, None, None)
+
+    report = stack.verifier().verify(scope)
+
+    assert len(
+        report.findings_at(
+            FindingKind.PAGE_DESCRIPTOR_MISSING, HEAP_FILE, page_index
+        )
+    ) == 1
+    assert report.findings_of(FindingKind.RECORD_ID_COUNTER) == ()
+    assert report.clean is False
+
+
+@pytest.mark.parametrize("scope", (SCOPE_RECORDS, SCOPE_ALL))
+@pytest.mark.parametrize(
+    "payload",
+    (RecordHeader(record_id=99, xmin=1).encode(), b"short-record-header"),
+    ids=("decodable-header", "short-header"),
+)
+def test_an_exact_descriptor_without_a_directory_owner_is_a_located_orphan(
+    stack: Stack, scope: str, payload: bytes
+) -> None:
+    _populate(stack)
+    page_index = _append_physical_heap_page(
+        stack, (999).to_bytes(4, "little"), payload
+    )
+
+    report = stack.verifier().verify(scope)
+
+    orphans = report.findings_at(FindingKind.ORPHAN_PAGE, HEAP_FILE, page_index)
+    assert len(orphans) == 1
+    assert "table 999" in orphans[0].detail
+    assert report.findings_at(
+        FindingKind.PAGE_DESCRIPTOR_MISSING, HEAP_FILE, page_index
+    ) == ()
+    assert report.findings_of(FindingKind.RECORD_ID_COUNTER) == ()
+    assert report.records_checked == 3
+    assert report.clean is False
+
+
+@pytest.mark.parametrize("scope", (SCOPE_RECORDS, SCOPE_ALL))
+def test_an_extent_and_page_without_a_catalog_table_are_both_located(
+    stack: Stack, scope: str
+) -> None:
+    _populate(stack)
+    page_index = _append_physical_heap_page(
+        stack,
+        (999).to_bytes(4, "little"),
+        RecordHeader(record_id=99, xmin=1).encode(),
+    )
+    extent_slot = _append_device_extent(
+        stack,
+        TableExtent(
+            table_id=999,
+            first_page=page_index,
+            last_page=page_index,
+            page_count=1,
+            next_record_id=100,
+        ),
+    )
+
+    report = stack.verifier().verify(scope)
+
+    missing_table = [
+        finding
+        for finding in report.findings_of(FindingKind.TABLE_UNREADABLE)
+        if finding.location.slot == extent_slot
+    ]
+    assert len(missing_table) == 1
+    assert "catalog" in missing_table[0].detail
+    assert len(report.findings_at(FindingKind.ORPHAN_PAGE, HEAP_FILE, page_index)) == 1
+    assert report.findings_of(FindingKind.RECORD_ID_COUNTER) == ()
+    assert report.records_checked == 3
+    assert report.clean is False
+
+
+@pytest.mark.parametrize("scope", (SCOPE_RECORDS, SCOPE_ALL))
+def test_duplicate_directory_extents_are_unreadable_and_never_choose_a_counter(
+    stack: Stack, scope: str
+) -> None:
+    table = _populate(stack)
+    extent = stack.heap.extent_of(table)
+    assert extent is not None
+    duplicate_slot = _append_device_extent(
+        stack, replace(extent, next_record_id=1)
+    )
+
+    report = stack.verifier().verify(scope)
+
+    duplicates = [
+        finding
+        for finding in report.findings_of(FindingKind.TABLE_UNREADABLE)
+        if finding.location.slot == duplicate_slot
+    ]
+    assert len(duplicates) == 1
+    assert "duplicate heap directory entries" in duplicates[0].detail
+    assert report.findings_of(FindingKind.RECORD_ID_COUNTER) == ()
+    assert report.records_checked == 3
+    assert report.clean is False
+
+
+def test_an_intentionally_absent_catalog_does_not_invent_missing_table_findings(
+    stack: Stack,
+) -> None:
+    _populate(stack)
+    page_index = _append_physical_heap_page(
+        stack,
+        (999).to_bytes(4, "little"),
+        RecordHeader(record_id=99, xmin=1).encode(),
+    )
+    _append_device_extent(
+        stack,
+        TableExtent(
+            table_id=999,
+            first_page=page_index,
+            last_page=page_index,
+            page_count=1,
+            next_record_id=100,
+        ),
+    )
+
+    report = stack.verifier(catalog=None).verify(SCOPE_RECORDS)
+
+    assert report.findings_of(FindingKind.TABLE_UNREADABLE) == ()
+    assert report.findings_of(FindingKind.ORPHAN_PAGE) == ()
+    assert report.findings_of(FindingKind.RECORD_ID_COUNTER) == ()
 
 
 def test_the_record_counter_check_belongs_only_to_records_and_all(stack: Stack) -> None:
@@ -696,7 +902,10 @@ def test_a_heap_page_with_no_descriptor_is_reported_as_damage(stack: Stack) -> N
     stack.storage.write_page(HEAP_FILE, bare, stack.codec.encode_page(written))  # type: ignore[attr-defined]
     _rewrite_page(stack, HEAP_FILE, chain[-1], lambda page: setattr(page, "next_page", bare))
     report = stack.verifier().verify(SCOPE_RECORDS)
-    assert report.findings_of(FindingKind.PAGE_DESCRIPTOR_MISSING)
+    assert len(
+        report.findings_at(FindingKind.PAGE_DESCRIPTOR_MISSING, HEAP_FILE, bare)
+    ) == 1
+    assert report.findings_of(FindingKind.TABLE_UNREADABLE) == ()
     assert report.clean is False
 
 

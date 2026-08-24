@@ -42,7 +42,13 @@ including the on-disk format.
   walk reads page 0 and every heap record header straight from the storage device, so a resident
   cache image, an ended or provisional version, or an orphan page cannot hide the physical high
   water. `record_id_counter` identifies the exact directory slot when `next_record_id` is equal to
-  or below the greatest decodable id; gaps and counters ahead of empty tables remain valid.
+  or below the greatest decodable id; gaps and counters ahead of empty tables remain valid. Every
+  physical heap page without an exact readable descriptor now produces a located
+  `page_descriptor_missing`, while an exact owner absent from page 0 produces a located
+  `orphan_page`; neither malformed ownership bytes nor short orphan headers can certify the file
+  clean or invent a counter association. Duplicate directory extents are unreadable rather than
+  arbitrarily selected, and extents/pages whose table id is absent from the catalog are located as
+  unreadable/orphaned instead of disappearing from the catalog-driven walk.
 - **A checksum provider could forge equality and be installed without returning an integer.** The
   installer and native adapter now require and copy an exact unsigned 32-bit result before every
   comparison and runtime use, contain ordinary provider failures, cover the largest legal page in
