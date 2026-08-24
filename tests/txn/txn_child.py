@@ -57,7 +57,7 @@ def run(
             commit_lock_timeout=30.0,
         )
         txn = stack.manager.begin("write")
-        txn.stage_page_image(
+        txn.owner._stage_page_image(txn,
             "heap.dat",
             page_index,
             make_page_image(stack.codec, [payload], page_index=page_index),
@@ -77,7 +77,7 @@ def run(
             outcome["details_retryable"] = conflict.details.get("retryable", conflict.retryable)
             if retry_on_conflict:
                 successor = stack.manager.retry(txn)
-                successor.stage_page_image(
+                successor.owner._stage_page_image(successor,
                     "heap.dat",
                     page_index,
                     make_page_image(stack.codec, [payload], page_index=page_index),

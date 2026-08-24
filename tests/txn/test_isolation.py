@@ -124,7 +124,7 @@ def test_no_instant_of_a_commit_offers_a_snapshot_of_half_of_it(
 
     txn = writer_side.manager.begin("write")
     for page in PAGES:
-        txn.stage_page_image(
+        txn.owner._stage_page_image(txn,
             HEAP, page, make_page_image(writer_side.codec, [b"batch"], page_index=page)
         )
     txn.note_write(writer_side.manager.partition_of(1, b"batch"))
@@ -173,7 +173,7 @@ def test_a_reader_keeps_its_view_across_a_parallel_commit(make_stack) -> None:
     reader = reader_side.manager.begin("read")
     opened_at = reader.snapshot.read_lsn
     txn = writer_side.manager.begin("write")
-    txn.stage_page_image(HEAP, 3, make_page_image(writer_side.codec, [b"later"], page_index=3))
+    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(writer_side.codec, [b"later"], page_index=3))
     txn.note_write(writer_side.manager.partition_of(1, b"later"))
     report = writer_side.manager.commit(txn)
     assert reader.snapshot.read_lsn == opened_at
@@ -190,7 +190,7 @@ def test_a_second_snapshot_sees_everything_the_first_one_could(make_stack) -> No
     numbers: list[int] = []
     for page in PAGES:
         txn = writer_side.manager.begin("write")
-        txn.stage_page_image(
+        txn.owner._stage_page_image(txn,
             HEAP, page, make_page_image(writer_side.codec, [bytes([page])], page_index=page)
         )
         txn.note_write(writer_side.manager.partition_of(1, bytes([page])))
@@ -206,7 +206,7 @@ def test_a_committed_page_is_readable_by_another_participant(make_stack) -> None
     writer_side = make_stack()
     reader_side = make_stack()
     txn = writer_side.manager.begin("write")
-    txn.stage_page_image(HEAP, 3, make_page_image(writer_side.codec, [b"shared"], page_index=3))
+    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(writer_side.codec, [b"shared"], page_index=3))
     txn.note_write(writer_side.manager.partition_of(1, b"shared"))
     report = writer_side.manager.commit(txn)
     assert reader_side.manager.published_lsn() == report.csn

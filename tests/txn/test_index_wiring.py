@@ -49,6 +49,13 @@ class _RecordingIndexManager:
         self.rolled_back.append(txn.txn_id)  # type: ignore[attr-defined]
         return 1
 
+    def validate_staged_records(self, txn: object, records: object) -> None:
+        """Accept the one synthetic index record this interaction double owns."""
+        staged = tuple(records)  # type: ignore[arg-type]
+        assert len(staged) == 1
+        assert staged[0].txn_id == txn.txn_id  # type: ignore[attr-defined]
+        assert staged[0].record_type == int(WalRecordType.INDEX_WRITE)
+
 
 def _wired(database_root: Path) -> tuple[Stack, _RecordingIndexManager, TransactionManager]:
     """Return a stack, a recording index manager, and a transaction manager wired to it."""
@@ -72,7 +79,7 @@ def _wired(database_root: Path) -> tuple[Stack, _RecordingIndexManager, Transact
 def _stage(stack: Stack, manager: TransactionManager, page: int = 3) -> object:
     """Open a write transaction with one page and one index record staged on it."""
     txn = manager.begin("write")
-    txn.stage_page_image(HEAP, page, make_page_image(stack.codec, [b"row"], page_index=page))
+    txn.owner._stage_page_image(txn, HEAP, page, make_page_image(stack.codec, [b"row"], page_index=page))
     txn.note_write(manager.partition_of(1, b"row"))
     txn.stage_record(
         WalRecord(record_type=int(WalRecordType.INDEX_WRITE), payload=b"entry", txn_id=txn.txn_id)
@@ -137,7 +144,7 @@ def test_a_refused_commit_applies_nothing_to_any_index(database_root: Path) -> N
     shared = manager.partition_of(1, b"row")
     loser = _stage(stack, manager, page=4)
     winner = other.manager.begin("write")
-    winner.stage_page_image(HEAP, 3, make_page_image(other.codec, [b"w"], page_index=3))
+    winner.owner._stage_page_image(winner, HEAP, 3, make_page_image(other.codec, [b"w"], page_index=3))
     winner.note_write(shared)
     other.manager.commit(winner)
     with pytest.raises(GrafxWriteConflict):
@@ -157,7 +164,7 @@ def test_a_refused_commit_applies_nothing_to_any_index(database_root: Path) -> N
 def test_a_database_with_no_index_manager_commits_normally(stack: Stack) -> None:
     """The ordinary state of a database with no secondary index is nothing to apply."""
     txn = stack.manager.begin("write")
-    txn.stage_page_image(HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
+    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
     txn.note_write(stack.manager.partition_of(1, b"row"))
     assert stack.manager.index_manager is None
     assert stack.manager.commit(txn).wrote is True
@@ -225,7 +232,7 @@ def test_an_entry_staged_through_the_real_index_is_there_after_the_commit(
         commit_lock_timeout=5.0,
     )
     txn = manager.begin("write")
-    txn.stage_page_image(HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
+    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
     txn.note_write(manager.partition_of(1, b"ada"))
     reference = RecordRef(page=3, slot=1)
     record = index.stage_insert(txn, b"ada", reference, 0)
@@ -267,7 +274,7 @@ def test_a_rolled_back_transaction_leaves_the_real_index_as_it_found_it(
         commit_lock_timeout=5.0,
     )
     txn = manager.begin("write")
-    txn.stage_page_image(HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
+    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
     txn.note_write(manager.partition_of(1, b"ada"))
     index.stage_insert(txn, b"ada", RecordRef(page=3, slot=1), 0)
     manager.rollback(txn)

@@ -28,11 +28,20 @@ from okto_grafx.domain.ids import Epoch, Lsn
 from okto_grafx.domain.ports.coordination import Lease, ProcessCoordinator, ReaderHandle
 
 __all__ = [
+    "COMMIT_SECTION",
     "DEFAULT_RENEWAL_FRACTION",
     "LeaseGuard",
     "ReaderRegistration",
     "recyclable_horizon",
 ]
+
+COMMIT_SECTION: str = "commit"
+"""Cross-process section shared by commit, checkpoint and recovery.
+
+Every operation that decides, appends, replays, truncates or recycles WAL records uses this
+same name.  Keeping the name beside the other coordination primitives prevents two callers from
+silently serialising on different sections while believing they exclude one another.
+"""
 
 DEFAULT_RENEWAL_FRACTION: float = 1.0 / 3.0
 """Fraction of the lease TTL after which a renewal is due.

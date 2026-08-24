@@ -84,8 +84,15 @@ __all__ = [
 QUARANTINE_DIRECTORY: str = "quarantine"
 """Where quarantined copies live inside a database directory (CONTRACT.md section 6.1)."""
 
-PROTECTED_FILES: frozenset[str] = frozenset({"heap.dat", "catalog.dat", "grafx.meta"})
-"""The main data files G6 forbids any sanctioned operation from moving, renaming or deleting."""
+PROTECTED_FILES: frozenset[str] = frozenset(
+    {"heap.dat", "catalog.dat", "grafx.meta", "control/commit.state"}
+)
+"""Files no generic quarantine/retirement door may overwrite, move, rename or delete.
+
+``commit.state`` is reconstructed and atomically published only by the commit/recovery
+protocol. Treating it as an arbitrary damaged coordination record lets the generic retirement
+door erase the snapshot/checkpoint fence after a probe/capture TOCTOU.
+"""
 
 PROTECTED_PREFIXES: tuple[str, ...] = ("index/",)
 """Prefixes under the same protection: every secondary index file (G6, BR-1)."""

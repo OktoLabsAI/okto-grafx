@@ -51,7 +51,7 @@ with a located error instead of hanging (amendment A42).
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from okto_grafx.domain.errors import (
     GrafxCorruptionDetected,
@@ -62,11 +62,14 @@ from okto_grafx.domain.ids import (
     NO_CSN,
     NO_LSN,
     NO_PAGE,
+    PROVISIONAL_CSN,
     Csn,
     Lsn,
     PageIndex,
     RecordRef,
     SlotId,
+    is_open_end_csn,
+    is_provisional_csn,
 )
 from okto_grafx.domain.index.contract import SecondaryIndex, StagingTransaction
 from okto_grafx.domain.index.definition import (
@@ -108,7 +111,11 @@ from okto_grafx.domain.page import (
 )
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
 from okto_grafx.domain.wal.record import WalRecord
-from okto_grafx.engine.buffer_pool import BufferPool, refuse_endless_chain, visited_pages
+from okto_grafx.engine.buffer_pool import (
+    BufferPool,
+    refuse_endless_chain,
+    visited_pages,
+)
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.metrics_catalog import metric
 
@@ -334,7 +341,10 @@ class IndexStore:
         with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
             if page.is_pristine():
                 return False
-            if page.page_type != int(PageType.META) or page.slot_count <= INDEX_HEADER_SLOT:
+            if (
+                page.page_type != int(PageType.META)
+                or page.slot_count <= INDEX_HEADER_SLOT
+            ):
                 return False
             self._require_file_header(page)
         return True
@@ -457,9 +467,7 @@ class IndexStore:
                 value=header.bucket_count,
             )
         if header.flags & INDEX_FLAG_STALE and self._stale_reason is None:
-            self._stale_reason = (
-                f"Index {definition.name!r} was recorded as stale and has not been rebuilt."
-            )
+            self._stale_reason = f"Index {definition.name!r} was recorded as stale and has not been rebuilt."
         return header
 
     def _require_file_header(self, page: Page) -> FileHeader:
@@ -533,8 +541,8 @@ class IndexStore:
         """Return True while this index may not be read."""
         return self._stale_reason is not None
 
-    def mark_stale(self, reason: str) -> None:
-        """Record, durably, that this index is behind the heap and may not answer a lookup."""
+    def mark_stale(self, reason: str, *, persist: bool = True) -> None:
+        """Exclude this index from reads, optionally recording the verdict on the device."""
         if not isinstance(reason, str) or not reason:
             raise GrafxIndexError(
                 "Marking an index stale needs a reason a reader can act on.",
@@ -543,6 +551,11 @@ class IndexStore:
                 index=self.name,
             )
         self._stale_reason = reason
+        if not persist:
+            # A failed recovery may have changed an unknown prefix and must poison the current
+            # handle without turning an otherwise non-mutating refusal into another device
+            # write. The retained WAL lets the next open retry and derive a durable verdict.
+            return
         header = self._read_header()
         if not header.flags & INDEX_FLAG_STALE:
             self._write_header(_with_flags(header, header.flags | INDEX_FLAG_STALE))
@@ -607,7 +620,13 @@ class IndexStore:
             # this one after a restart, would go on refusing an index that is whole.
             self._pool.flush(self.file)
 
-    def check_freshness(self, published_lsn: Lsn) -> bool:
+    def check_freshness(
+        self,
+        published_lsn: Lsn,
+        *,
+        persist: bool = True,
+        allow_ahead: bool = False,
+    ) -> bool:
         """Compare the position this index claims against the one the database published.
 
         This is the only detector of staleness in the component, and the flag it sets is the only
@@ -633,16 +652,31 @@ class IndexStore:
         header = self._read_header()
         if header.flags & INDEX_FLAG_STALE:
             if self._stale_reason is None:
-                self._stale_reason = (
-                    f"Index {self.name!r} was recorded as stale and has not been rebuilt."
-                )
+                self._stale_reason = f"Index {self.name!r} was recorded as stale and has not been rebuilt."
             return True
         if header.built_through_lsn < published_lsn:
-            self.mark_stale(
+            reason = (
                 f"Index {self.name!r} covers the log through position "
                 f"{header.built_through_lsn} and the database has published "
                 f"{published_lsn}, so a lookup could omit a row."
             )
+            if persist:
+                self.mark_stale(reason)
+            else:
+                # A read-only open still refuses the unsafe access path, but records that verdict
+                # only in this participant. Persisting it would make inspection modify the DB.
+                self._stale_reason = reason
+            return True
+        if header.built_through_lsn > published_lsn and not allow_ahead:
+            reason = (
+                f"Index {self.name!r} claims to cover log position "
+                f"{header.built_through_lsn}, ahead of the database's published position "
+                f"{published_lsn}; the file may belong to another database state."
+            )
+            if persist:
+                self.mark_stale(reason)
+            else:
+                self._stale_reason = reason
             return True
         return False
 
@@ -681,7 +715,9 @@ class IndexStore:
                 operation=IndexOperation.INSERT,
                 key=self._require_key(key),
                 ref=self._require_ref(ref),
-                csn=self._require_csn("csn", csn) if self._definition.versioned else NO_CSN,
+                csn=self._require_csn("csn", csn)
+                if self._definition.versioned
+                else NO_CSN,
                 versioned=self._definition.versioned,
             ),
         )
@@ -934,8 +970,20 @@ class IndexStore:
                 operation=change.operation.name,
             )
         position = lsn_of(record)
-        self._apply_change(change, position)
-        self._advance(position)
+        try:
+            self._apply_change(change, position)
+            self._advance(position)
+            if change.operation is IndexOperation.REMOVE:
+                # A reconciliation record carries both the erasure and the horizon that made it
+                # legal. Restoring only the erasure makes verification report a cleanly
+                # reclaimed entry as missing after a crash.
+                self._record_reconciled(change.csn)
+        except GrafxError as failure:
+            self._mark_stale_after_failure(
+                f"Replaying log position {position} into index {self.name!r} failed, so the "
+                f"current handle cannot prove the index complete: {failure.message}"
+            )
+            raise
 
     # --- reading ----------------------------------------------------------------------------
 
@@ -948,7 +996,9 @@ class IndexStore:
         self._require_readable()
         wanted = self._require_key(key)
         found: list[IndexEntry] = []
-        for page_index in self._bucket_pages(bucket_of(wanted, self._definition.bucket_count)):
+        for page_index in self._bucket_pages(
+            bucket_of(wanted, self._definition.bucket_count)
+        ):
             for entry in self._entries_on(page_index):
                 if entry.key == wanted:
                     found.append(entry)
@@ -1052,10 +1102,7 @@ class IndexStore:
         one that went missing: below the recorded horizon an absent entry is the pass working,
         and above it the same absence is a divergence worth reporting.
         """
-        header = self._read_header()
-        reconciled = header.reconciled_to(horizon)
-        if reconciled is not header:
-            self._write_header(reconciled)
+        self._record_reconciled(horizon)
         # The fourth unlogged write, and it is NOT in the conservative half. The REMOVALS a pass
         # made are covered -- every one travels as an INDEX_RECONCILE record and reaches the
         # device when the transaction carrying it commits -- but the horizon itself is covered by
@@ -1071,6 +1118,13 @@ class IndexStore:
         if self._metrics.enabled and self._definition.versioned:
             self._metrics.increment(RECONCILIATION_TOTAL)
             self._metrics.set_gauge(TOMBSTONE_BACKLOG, float(self._tombstone_backlog()))
+
+    def _record_reconciled(self, horizon: Lsn) -> None:
+        """Advance the reconciliation watermark without choosing a flush boundary."""
+        header = self._read_header()
+        reconciled = header.reconciled_to(horizon)
+        if reconciled is not header:
+            self._write_header(reconciled)
 
     def _tombstone_backlog(self) -> int:
         """Return how many entries carry a tombstone that has not been reclaimed yet."""
@@ -1181,7 +1235,9 @@ class IndexStore:
             tail.dirty = True
         return True
 
-    def _rewrite(self, page_index: PageIndex, slot: SlotId, entry: IndexEntry, lsn: Lsn) -> bool:
+    def _rewrite(
+        self, page_index: PageIndex, slot: SlotId, entry: IndexEntry, lsn: Lsn
+    ) -> bool:
         """Replace an entry in place, which a stamp change always fits because it is fixed width."""
         with self._pool.pinned(self.file, page_index) as page:
             self._require_index_page(page, page_index)
@@ -1349,9 +1405,10 @@ class IndexStore:
                 value=repr(csn),
                 index=self.name,
             )
-        if csn < NO_CSN:
+        if csn < NO_CSN or csn >= PROVISIONAL_CSN:
             raise GrafxIndexError(
-                f"An index change needs a non-negative {field_name}; got {csn}.",
+                f"An index change needs a {field_name} between {NO_CSN} and "
+                f"{PROVISIONAL_CSN - 1}; got {csn}.",
                 field=field_name,
                 value=csn,
                 index=self.name,
@@ -1442,7 +1499,10 @@ class ProximityIndex(IndexStore):
         self, definition: IndexDefinition, pool: BufferPool, metrics: MetricsSink
     ) -> None:
         """Build the index, refusing a definition that does not declare the proximity contract."""
-        if IndexVisibility.parse(definition.visibility) is not IndexVisibility.PROXIMITY:
+        if (
+            IndexVisibility.parse(definition.visibility)
+            is not IndexVisibility.PROXIMITY
+        ):
             raise GrafxIndexError(
                 f"A ProximityIndex realises the proximity contract; definition "
                 f"{definition.name!r} declares {definition.visibility.value}.",
@@ -1468,9 +1528,7 @@ class ProximityIndex(IndexStore):
         this store never has to re-derive the rule -- and never has to consult the heap.
         """
         self._require_readable()
-        return tuple(
-            entry for entry in self.walk() if entry_visible(entry, snapshot)
-        )
+        return tuple(entry for entry in self.walk() if entry_visible(entry, snapshot))
 
 
 def _tables_written_by(txn: object) -> frozenset[int] | None:
@@ -1629,9 +1687,14 @@ class IndexManager:
     # --- registry ---------------------------------------------------------------------------
 
     def register(
-        self, index: IndexStore, *, complete_through: Lsn | None = None
+        self,
+        index: IndexStore,
+        *,
+        complete_through: Lsn | None = None,
+        existing_only: bool = False,
+        persist_stale: bool = True,
     ) -> IndexStore:
-        """Register an index, create its file if it has none, and check that it is fresh.
+        """Register an index, optionally requiring a complete existing file, and check freshness.
 
         ``complete_through`` is for the one caller that KNOWS the index it is registering has
         nothing to catch up on: the statement that creates a table declares its primary key and
@@ -1667,11 +1730,31 @@ class IndexManager:
                 value=index.name,
                 index=existing.name,
             )
-        index.create()
+        if existing_only:
+            # A read-only composition may inspect an existing accelerator, but it must never
+            # repair a zero-length/torn one as a side effect of opening the database. ``create``
+            # deliberately repairs that shape, so the strict route proves the structure first
+            # and then calls the read-only ``open`` door directly.
+            if not index.exists() or not index.is_created():
+                raise GrafxIndexError(
+                    f"Index {index.name!r} has no complete existing file to register without "
+                    "creating or repairing one.",
+                    field="file",
+                    file=index.file,
+                    index=index.name,
+                )
+            index.open()
+        else:
+            index.create()
         self._indexes[key] = index
         if complete_through is not None:
             index.advance_built_through(complete_through)
-        index.check_freshness(self._published_lsn)
+        # Startup registers durable files before recovery has loaded the authoritative published
+        # ceiling into the manager. Being ahead of this provisional value is therefore allowed;
+        # the final ``open`` checks both sides after recovery.
+        index.check_freshness(
+            self._published_lsn, persist=persist_stale, allow_ahead=True
+        )
         return index
 
     def unregister(self, name: str) -> bool:
@@ -1725,7 +1808,13 @@ class IndexManager:
         """Return the log position this manager was last told the database had published."""
         return self._published_lsn
 
-    def open(self, published_lsn: Lsn) -> tuple[IndexStore, ...]:
+    def open(
+        self,
+        published_lsn: Lsn,
+        *,
+        persist_stale: bool = True,
+        allow_ahead: bool = False,
+    ) -> tuple[IndexStore, ...]:
         """Check every registered index against the position the database has published.
 
         Returns the indexes that are stale, which is what a caller needs in order to decide
@@ -1734,7 +1823,31 @@ class IndexManager:
         """
         self._published_lsn = _require_position("published_lsn", published_lsn)
         return tuple(
-            index for index in self.indexes() if index.check_freshness(self._published_lsn)
+            index
+            for index in self.indexes()
+            if index.check_freshness(
+                self._published_lsn,
+                persist=persist_stale,
+                allow_ahead=allow_ahead,
+            )
+        )
+
+    def check_replay_floor(
+        self, checkpoint_lsn: Lsn, *, persist_stale: bool = True
+    ) -> tuple[IndexStore, ...]:
+        """Flag indexes behind a WAL replay floor without changing the published ceiling.
+
+        Recovery may only replay records above ``checkpoint_lsn``. An index below that floor is
+        irreparable from the retained suffix, while one above it is expected and must not be
+        called stale yet. Unlike :meth:`open`, this diagnostic deliberately leaves
+        ``published_lsn`` untouched so a refused operator recovery cannot regress the state of a
+        live handle.
+        """
+        floor = _require_position("checkpoint_lsn", checkpoint_lsn)
+        return tuple(
+            index
+            for index in self.indexes()
+            if index.check_freshness(floor, persist=persist_stale, allow_ahead=True)
         )
 
     def mark_built_through(self, lsn: Lsn) -> None:
@@ -1757,6 +1870,180 @@ class IndexManager:
         for index in self.indexes():
             index.advance_built_through(position)
         self._published_lsn = max(self._published_lsn, position)
+
+    def mark_all_stale(self, reason: str, *, persist: bool = False) -> None:
+        """Exclude every registered index after a redo whose completed prefix is unknown.
+
+        A page replay can fail before logical-index replay begins. In that shape no individual
+        index operation gets the chance to mark itself, yet a later unrelated commit could
+        flush the recovered heap pages and advance every untouched index past the missing
+        entries. Excluding the registry as one unit prevents that false certification. The
+        default is in-memory only: the WAL is retained and the failed pass may have refused
+        before its first mutation, so poisoning this handle must not invent another disk write.
+        """
+        for index in self.indexes():
+            index.mark_stale(reason, persist=persist)
+
+    def validate_staged_records(
+        self, txn: StagingTransaction, records: Sequence[object]
+    ) -> None:
+        """Prove that every staged WAL effect is owned by this registry's staging state.
+
+        ``TransactionContext.pending_records`` is reachable to callers because indexes stage
+        through that protocol. A caller must not be able to inject an ABORT/outcome record or an
+        extra logical change that is replayed after restart but was never applied on the live
+        commit path. The decoded multiset must exactly match the changes held by the registered
+        indexes for this transaction.
+        """
+        actual: list[IndexChange] = []
+        for position, record in enumerate(records):
+            if not isinstance(record, WalRecord):
+                raise GrafxIndexError(
+                    "A staged index effect must be a concrete WalRecord.",
+                    field="pending_records",
+                    position=position,
+                    value=type(record).__name__,
+                )
+            if record.lsn != NO_LSN or record.txn_id != txn.txn_id:
+                raise GrafxIndexError(
+                    "A staged index effect must be unnumbered and belong to its transaction.",
+                    field="pending_records",
+                    position=position,
+                    lsn=record.lsn,
+                    record_txn_id=record.txn_id,
+                    txn_id=txn.txn_id,
+                )
+            try:
+                change = change_of(record)
+            except GrafxError as failure:
+                raise GrafxIndexError(
+                    "A staged index effect does not carry a valid logical index change.",
+                    field="pending_records",
+                    position=position,
+                ) from failure
+            if change.index.lower() not in self._indexes:
+                raise GrafxIndexError(
+                    f"A staged effect names unregistered index {change.index!r}.",
+                    field="index",
+                    index=change.index,
+                    position=position,
+                )
+            actual.append(change)
+
+        expected = [change for index in self.indexes() for change in index.pending(txn)]
+        remaining = list(expected)
+        for change in actual:
+            try:
+                remaining.remove(change)
+            except ValueError as failure:
+                raise GrafxIndexError(
+                    "A staged WAL effect has no matching change in the index registry.",
+                    field="pending_records",
+                    index=change.index,
+                    operation=change.operation.name,
+                ) from failure
+        if remaining or len(actual) != len(expected):
+            raise GrafxIndexError(
+                "The transaction's staged WAL effects do not exactly match the index registry.",
+                field="pending_records",
+                expected=len(expected),
+                actual=len(actual),
+                missing=len(remaining),
+            )
+
+    def retarget_staged(
+        self, txn: StagingTransaction, old_csn: Csn, new_csn: Csn
+    ) -> tuple[WalRecord, ...]:
+        """Atomically replace a predicted CSN in this transaction's staged index effects.
+
+        Segment creation can add a WAL header between a transaction's first prediction and the
+        exact terminal LSN planned for its batch.  Index effects are logical WAL records, so
+        their stamps must move with the heap page images before append.  Every old record and
+        every replacement is proved first; only then are the registry staging lists and the
+        transaction's public record list replaced in place.  Unversioned inserts keep
+        ``NO_CSN`` because zero never matches a usable ``old_csn``.
+        """
+        old = _require_retarget_csn("old_csn", old_csn)
+        new = _require_retarget_csn("new_csn", new_csn)
+        pending = getattr(txn, "pending_records", None)
+        if type(pending) is not list:
+            raise GrafxIndexError(
+                "Retargeting staged index effects needs the transaction's concrete mutable "
+                "pending_records list.",
+                field="pending_records",
+                value=type(pending).__name__,
+            )
+
+        # This validates the complete multiset before any staging state moves.  In particular,
+        # a caller-replaced record cannot be blessed merely because its index name is known.
+        self.validate_staged_records(txn, tuple(pending))
+
+        staged_replacements: list[tuple[_Staged, list[IndexChange]]] = []
+        expected: list[IndexChange] = []
+        txn_id = int(txn.txn_id)
+        for index in self.indexes():
+            staged = index._staged.get(txn_id)
+            if staged is None:
+                continue
+            changes = [_retarget_change(change, old, new) for change in staged.changes]
+            staged_replacements.append((staged, changes))
+            expected.extend(changes)
+
+        records: list[WalRecord] = []
+        actual: list[IndexChange] = []
+        for record in pending:
+            # validate_staged_records already established this concrete type; retaining the
+            # guard here keeps this method locally total if that validator is ever generalized.
+            if not isinstance(record, WalRecord):  # pragma: no cover - guarded above
+                raise GrafxIndexError(
+                    "A retargeted index effect must be a concrete WalRecord.",
+                    field="pending_records",
+                    value=type(record).__name__,
+                )
+            original_change = change_of(record)
+            change = _retarget_change(original_change, old, new)
+            actual.append(change)
+            records.append(
+                record
+                if change is original_change
+                else replace(record, payload=change.encode())
+            )
+
+        remaining = list(expected)
+        for change in actual:
+            try:
+                remaining.remove(change)
+            except (
+                ValueError
+            ) as failure:  # pragma: no cover - guarded before transformation
+                raise GrafxIndexError(
+                    "Retargeting changed the transaction and registry into different effects.",
+                    field="pending_records",
+                ) from failure
+        if remaining or len(actual) != len(
+            expected
+        ):  # pragma: no cover - guarded above
+            raise GrafxIndexError(
+                "Retargeting changed the cardinality of the transaction's staged effects.",
+                field="pending_records",
+                expected=len(expected),
+                actual=len(actual),
+            )
+
+        original_records = list(pending)
+        original_staging = [
+            (staged, list(staged.changes)) for staged, _ in staged_replacements
+        ]
+        try:
+            for staged, changes in staged_replacements:
+                staged.changes[:] = changes
+            pending[:] = records
+        except BaseException:
+            for staged, changes in original_staging:
+                staged.changes[:] = changes
+            pending[:] = original_records
+            raise
+        return tuple(records)
 
     # --- staging ----------------------------------------------------------------------------
 
@@ -1959,10 +2246,12 @@ class IndexManager:
         """Re-derive every entry of an index from the heap, and return how many changes it staged.
 
         This is the repair of a stale index, and it is covered by the log like every other index
-        change: the pass stages a reset followed by one insert per stored version and one
-        tombstone per version that has ended, so a crash in the middle of it replays to the same
-        place rather than leaving a half-built structure. The index stops being stale only when
-        the transaction that carries these records commits.
+        change: the pass stages a reset followed by one insert per committed stored version and
+        one tombstone per version that has a committed end. Abandoned provisional births are
+        heap residue, not rows, and a provisional xmax is an abandoned end rather than a
+        tombstone. A crash in the middle replays to the same place rather than leaving a
+        half-built structure. The index stops being stale only when the transaction that carries
+        these records commits.
 
         The cost is proportional to the table and the whole pass is one transaction, which is the
         honest bound for a reference implementation: a rebuild that spanned several commits would
@@ -1976,10 +2265,12 @@ class IndexManager:
         staged = 1
         index.stage_reset(txn, position)
         for ref, version in self._heap.scan_all(table):
+            if is_provisional_csn(version.xmin):
+                continue
             key = definition.key_for(version.values)
             index.stage_insert(txn, key, ref, version.xmin)
             staged += 1
-            if version.xmax != NO_CSN:
+            if not is_open_end_csn(version.xmax):
                 index.stage_delete(txn, key, ref, version.xmax)
                 staged += 1
         return staged
@@ -2078,6 +2369,11 @@ class IndexManager:
                     ref=entry.ref,
                 ),
             )
+        if is_provisional_csn(version.xmin):
+            # A frame written before WAL refusal is an abandoned allocation, not an index row.
+            # Exact indexes may legally retain a candidate for it, and proximity indexes must
+            # never have persisted its reserved birth stamp.
+            return ()
         if definition.key_for(version.values) != entry.key:
             findings.append(
                 IndexFinding(
@@ -2112,8 +2408,9 @@ class IndexManager:
                     ref=entry.ref,
                 )
             )
-        if entry.dead_csn != version.xmax:
-            missing = version.xmax != NO_CSN and entry.live
+        version_end = NO_CSN if is_open_end_csn(version.xmax) else version.xmax
+        if entry.dead_csn != version_end:
+            missing = version_end != NO_CSN and entry.live
             findings.append(
                 IndexFinding(
                     kind="missing_tombstone"
@@ -2122,12 +2419,12 @@ class IndexManager:
                     index=index.name,
                     detail=(
                         f"Entry at page {entry.page} slot {entry.slot} ends at {entry.dead_csn} "
-                        f"and the version it points at ends at {version.xmax}."
+                        f"and the version it points at ends at {version_end}."
                     ),
                     file=index.file,
                     page=entry.page,
                     slot=entry.slot,
-                    lsn=version.xmax,
+                    lsn=version_end,
                     ref=entry.ref,
                 )
             )
@@ -2159,10 +2456,12 @@ class IndexManager:
             return ()
         findings: list[IndexFinding] = []
         for ref, version in self._heap.scan_all(table):
+            if is_provisional_csn(version.xmin):
+                continue
             key = definition.key_for(version.values)
             if (key, ref) in stored:
                 continue
-            if version.xmax != NO_CSN and version.xmax <= reconciled:
+            if not is_open_end_csn(version.xmax) and version.xmax <= reconciled:
                 # The entry was released by a reconciliation pass this index has recorded, so its
                 # absence is the pass working rather than a row going missing.
                 continue
@@ -2219,10 +2518,31 @@ def _require_position(field_name: str, value: object) -> Lsn:
             field=field_name,
             value=repr(value),
         )
-    if value < NO_LSN:
+    if value < NO_LSN or value >= PROVISIONAL_CSN:
         raise GrafxIndexError(
-            f"A log position must not be negative; got {value}.",
+            f"A log position must be between {NO_LSN} and {PROVISIONAL_CSN - 1}; got {value}.",
             field=field_name,
             value=value,
         )
     return value
+
+
+def _require_retarget_csn(field_name: str, value: object) -> Csn:
+    """Return a real commit stamp suitable for staged-record retargeting."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not NO_CSN < value < PROVISIONAL_CSN
+    ):
+        raise GrafxIndexError(
+            f"A retargeted commit number must be between 1 and {PROVISIONAL_CSN - 1}; "
+            f"{field_name} is {value!r}.",
+            field=field_name,
+            value=repr(value),
+        )
+    return value
+
+
+def _retarget_change(change: IndexChange, old_csn: Csn, new_csn: Csn) -> IndexChange:
+    """Return ``change`` with one predicted non-zero stamp replaced."""
+    return replace(change, csn=new_csn) if change.csn == old_csn else change

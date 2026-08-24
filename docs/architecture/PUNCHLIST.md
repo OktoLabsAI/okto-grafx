@@ -1216,3 +1216,31 @@ option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`
 - **Recorded** — `apply()` certifies after each redo record with the header as it stands, as it
   did before. During recovery there is no picture; the path is reached only by the checkpoint and
   post-barrier redo of a warm process, and the same before-the-store-moves verdict applies.
+
+## C5/C6 — recovery foundation (round 7, M0-B; 2026-08-24)
+
+- **CLOSED** — startup recovery and live commits now share `COMMIT_SECTION`; scan, evidence,
+  truncation, replay and publication observe one stable WAL picture.
+- **CLOSED** — durable COMMIT completion uses one strict grammar and one preflighted page/index
+  redo path in commit, checkpoint and recovery. A failed completion latches the participant and
+  prevents stale flush/certification until recovery succeeds.
+- **CLOSED** — pre-WAL heap versions use a reserved invisible sentinel; only private page copies
+  and private index staging receive the exact terminal COMMIT LSN. Segment rolls are planned and
+  revalidated before append, so no acknowledged state can carry a predicted or header LSN.
+- **CLOSED** — an append failure restores its exact preimage or leaves a sticky uncertainty latch;
+  recovery force-barriers the authoritative segment range independently of the pending cache.
+  Growth after a damaged partial-tail observation forces a full rescan from byte zero.
+- **CLOSED** — read-only startup proves checkpoint completeness under the same section and is
+  byte-identical on both success and refusal. An old `commit.state` cannot hide a retained COMMIT.
+- **CLOSED** — lifecycle cleanup attempts all steps and closers for every `BaseException`, while
+  preserving the original exception that caused assembly or context-manager unwind.
+- **OPEN for M0-C** — `Database` still exposes raw collaborators (`transactions`, `storage`,
+  `queries`, pool-reachable paths) whose direct use can bypass the public read-only and recovery
+  gates. Replace them with read-only views/private assembly plumbing or enforce the invariant at
+  the lowest callable door.
+- **OPEN for M0-C** — a directly composed `RecoveryManager` with no coordinator has no
+  cross-process fence. Refuse destructive recovery unless a coordinator/capability proves the
+  caller owns the section; retain only a deliberately named single-process composition.
+- **OPEN for M0-C** — control-record retirement proves damage and later retires by path. Bind the
+  proof to the exact captured bytes/generation so a healthy replacement cannot lose a
+  probe-to-retire race.

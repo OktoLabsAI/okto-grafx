@@ -3,7 +3,8 @@
 Two of them are worth explaining.
 
 ``LogWal`` stands in for C4. It implements the part of CONTRACT.md section 8.3 that C5 calls --
-``last_lsn``, ``append_many``, ``barrier`` and ``read_from`` -- over a real ``StorageDevice``, so
+``last_lsn``, commit-LSN planning, append/barrier and ``read_from`` -- over a real
+``StorageDevice``, so
 the same double serves an in-process test over the memory device and a two-process test over a
 real directory. Its framing is its own; the WAL record format belongs to C4 and nothing here
 depends on it.
@@ -23,7 +24,6 @@ from pathlib import Path
 
 from okto_grafx.adapters.codec_v1 import PageCodecV1
 from okto_grafx.adapters.coordination_local import LocalProcessCoordinator
-from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
 from okto_grafx.domain.errors import GrafxCorruptionDetected
 from okto_grafx.domain.ids import NO_LSN, Lsn, PageIndex
@@ -202,9 +202,27 @@ class LogWal:
         """Append one record and return the sequence number it was given."""
         return self.append_many([record])
 
-    def append_many(self, records: Sequence[WalRecordLike]) -> Lsn:
+    def planned_terminal_lsn(self, records: Sequence[WalRecordLike]) -> Lsn:
+        """Return the terminal LSN; this deliberately non-segmented double never rolls."""
+        self._refresh()
+        return self._last_lsn + len(records)
+
+    def append_many(
+        self,
+        records: Sequence[WalRecordLike],
+        *,
+        expected_terminal_lsn: Lsn | None = None,
+    ) -> Lsn:
         """Append several records in order and return the sequence number of the last one."""
         self._refresh()
+        planned = self._last_lsn + len(records)
+        if expected_terminal_lsn is not None and planned != expected_terminal_lsn:
+            raise GrafxCorruptionDetected(
+                "The test WAL tail changed after commit planning.",
+                reason="planned_terminal_lsn_drift",
+                expected_terminal_lsn=expected_terminal_lsn,
+                planned_terminal_lsn=planned,
+            )
         assigned = self._last_lsn
         for record in records:
             assigned += 1
@@ -227,6 +245,12 @@ class LogWal:
         """Make everything appended so far durable."""
         self._storage.durable_barrier(self._file)
         self.barriers += 1
+
+    def force_barrier_range(self, first_lsn: Lsn, through_lsn: Lsn) -> tuple[str, ...]:
+        """Force the stand-in's sole file independently of ordinary barrier bookkeeping."""
+        del first_lsn, through_lsn
+        self.barrier()
+        return (self._file,)
 
     def read_from(self, lsn: Lsn) -> Iterator[LogRecord]:
         """Yield every record whose sequence number is at or above the given one."""

@@ -16,7 +16,7 @@ import pytest
 
 from okto_grafx.adapters.storage_fault import FaultInjectingStorageDevice, SimulatedCrash
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
-from okto_grafx.domain.errors import GrafxError
+from okto_grafx.domain.errors import GrafxError, GrafxRecoveryRefused
 from okto_grafx.domain.recovery.report import OUTCOME_CLEAN, OUTCOME_TRUNCATED
 
 from .conftest import (
@@ -27,7 +27,6 @@ from .conftest import (
     Stack,
     build_stack,
     commit_pages,
-    digest_of_file,
     make_page_image,
 )
 
@@ -46,6 +45,14 @@ def _fresh(clock: FrozenClock, metrics: RecordingMetricsSink) -> tuple[
 
 FIRST = b"durable"
 SECOND = b"payload"
+
+
+def _device_bytes(device: FaultInjectingStorageDevice) -> dict[str, bytes]:
+    """Return every stored file byte-for-byte, including control and forensic files."""
+    return {
+        name: device.read_log(name, 0, device.file_size(name))
+        for name in device.list_files()
+    }
 
 
 def _workload(stack: Stack, marker: bytes) -> None:
@@ -197,10 +204,16 @@ def test_a_commit_acknowledged_before_a_later_crash_is_never_lost(
         inner.close()
 
 
-def test_a_run_of_interior_zeros_leaves_the_main_file_byte_identical(
+def test_interior_zeros_in_an_acknowledged_commit_fail_closed_without_mutation(
     clock: FrozenClock, metrics: RecordingMetricsSink
 ) -> None:
-    """The NTFS signature of AC-5: zeros written into the middle of a segment."""
+    """A published commit whose WAL proof is damaged may not be silently rolled back.
+
+    ``commit.state`` already offered the second commit as a snapshot.  Truncating the WAL to an
+    earlier intact prefix would therefore lose an acknowledged commit.  The only safe answer is
+    a typed refusal which preserves every byte, including the damaged evidence, and creates no
+    ledger or quarantine record as a side effect of a pass that changed nothing.
+    """
     inner = MemoryStorageDevice(page_size=PAGE_SIZE)
     bench = FaultInjectingStorageDevice(inner, seed=SEED)
     try:
@@ -208,25 +221,21 @@ def test_a_run_of_interior_zeros_leaves_the_main_file_byte_identical(
         _workload(stack, b"first")
         _workload(stack, b"second")
         stack.pool.flush()
-        heap_before = digest_of_file(bench, HEAP_FILE)
-        catalog_before = digest_of_file(bench, "catalog.dat")
         segment = stack.wal.segments()[-1].name
         size = bench.log_size(segment)
         zeroed = bench.inject_interior_zeros(segment, size // 2)
         assert zeroed > 0
+        before = _device_bytes(bench)
+        assert not any(name.startswith(("ledger/", "quarantine/")) for name in before)
+
         reopened = build_stack(bench, clock=clock, metrics=metrics, bootstrap=False)
-        report = reopened.recovery().run()
-        assert report.outcome == OUTCOME_TRUNCATED
-        assert report.records_discarded >= 1
-        assert report.ledger_entries_created == report.records_discarded
-        forensic = reopened.ledger.list(origin_class="forensic")
-        assert forensic
-        provenance = reopened.ledger.provenance(forensic[0].entry_id)
-        assert provenance.origin == segment
-        assert provenance.offset >= 0
-        assert reopened.ledger.export(forensic[0].entry_id)
-        assert digest_of_file(bench, HEAP_FILE) == heap_before
-        assert digest_of_file(bench, "catalog.dat") == catalog_before
+        with pytest.raises(GrafxRecoveryRefused) as refused:
+            reopened.recovery().run()
+
+        assert refused.value.details["field"] in {"last_committed_lsn", "wal_lineage"}
+        assert _device_bytes(bench) == before
+        assert reopened.ledger.list(limit=1000) == ()
+        assert reopened.quarantine.list() == ()
     finally:
         inner.close()
 
@@ -264,7 +273,7 @@ def test_a_full_device_during_a_commit_leaves_a_database_that_still_opens(
 def test_a_lying_barrier_followed_by_a_crash_is_caught_rather_than_silently_lost(
     clock: FrozenClock, metrics: RecordingMetricsSink
 ) -> None:
-    """AC-11's other half: what a barrier did not really pin must not read as intact."""
+    """A torn COMMIT already named by commit.state refuses without destroying evidence."""
     inner = MemoryStorageDevice(page_size=PAGE_SIZE)
     bench = FaultInjectingStorageDevice(inner, seed=SEED)
     try:
@@ -274,11 +283,17 @@ def test_a_lying_barrier_followed_by_a_crash_is_caught_rather_than_silently_lost
         segment = stack.wal.segments()[-1].name
         size = bench.log_size(segment)
         bench.truncate_log(segment, size - 12)
+        before = _device_bytes(bench)
+        assert not any(name.startswith(("ledger/", "quarantine/")) for name in before)
+
         reopened = build_stack(bench, clock=clock, metrics=metrics, bootstrap=False)
-        report = reopened.recovery().run()
-        assert report.records_discarded >= 1
-        assert report.ledger_entries_created == report.records_discarded
-        assert reopened.wal.damage is None
+        with pytest.raises(GrafxRecoveryRefused) as refused:
+            reopened.recovery().run()
+
+        assert refused.value.details["field"] in {"last_committed_lsn", "wal_lineage"}
+        assert _device_bytes(bench) == before
+        assert reopened.ledger.list(limit=1000) == ()
+        assert reopened.quarantine.list() == ()
     finally:
         inner.close()
 

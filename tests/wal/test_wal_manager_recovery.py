@@ -51,7 +51,6 @@ from okto_grafx.engine.wal_manager import (
 from .conftest import (
     DESCRIPTOR,
     PAGE_SIZE,
-    FrozenClock,
     RecordingMetricsSink,
     make_record,
 )
@@ -839,6 +838,44 @@ def test_a_repair_that_cannot_release_a_segment_leaves_the_log_longer(
     assert reopened.damage is None
     assert _lsns(reopened) == list(range(1, reopened.last_lsn + 1))
     assert reopened.last_lsn > target
+
+
+def test_a_rolled_cut_is_incomplete_while_the_old_segment_name_still_exists(
+    make_wal: Callable[..., WalManager], memory_device: MemoryStorageDevice
+) -> None:
+    """A Windows-held old name must not turn two copies of one LSN range into success."""
+    manager = make_wal(memory_device)
+    _fill(manager, 6)
+    assert len(manager.segments()) == 1
+    old = manager.segments()[0].name
+    old_bytes = _bytes_of(memory_device, old)
+    before_last = manager.last_lsn
+    target = before_last - 2
+    original = memory_device.recycle
+
+    def _keep_the_old_name(file: str) -> bool:
+        if file == old:
+            return False
+        return original(file)
+
+    memory_device.recycle = _keep_the_old_name  # type: ignore[method-assign]
+    try:
+        report = manager.truncate_after(target)
+    finally:
+        memory_device.recycle = original  # type: ignore[method-assign]
+
+    replacement = report.truncated_segment
+    assert replacement is not None and replacement != old
+    assert report.completed is False
+    assert report.deferred_segments == (old,)
+    assert old not in report.removed_segments
+    assert memory_device.exists(old) is True
+    assert memory_device.exists(replacement) is True
+    assert _bytes_of(memory_device, old) == old_bytes
+    assert report.last_lsn == before_last > target
+    assert manager.damage is not None
+    with pytest.raises(GrafxCorruptionDetected):
+        list(manager.read_from(0))
 
 
 def test_a_truncation_is_made_durable_before_it_is_reported(

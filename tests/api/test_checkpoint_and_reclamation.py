@@ -12,13 +12,17 @@ import glob
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
 from okto_grafx import connect
-from okto_grafx.domain.errors import GrafxUnsupportedOperation
+from okto_grafx.domain.errors import GrafxDeviceFull, GrafxError, GrafxUnsupportedOperation
+from okto_grafx.domain.txn.commit_state import CommitState
+from okto_grafx.engine.commit_state_store import CommitStateStore
+from okto_grafx.engine.index_manager import IndexManager
 
 SEGMENT_BYTES: int = 64 * 1024
 """Small enough that sixty one-row commits span many segments."""
@@ -85,6 +89,7 @@ def test_a_read_only_database_cannot_checkpoint(tmp_path: Path) -> None:
     root = tmp_path / "db"
     database = connect(str(root))
     _schema(database)
+    database.checkpoint()
     database.close()
     reader = connect(str(root), read_only=True)
     try:
@@ -93,6 +98,140 @@ def test_a_read_only_database_cannot_checkpoint(tmp_path: Path) -> None:
         assert refusal.value.details["field"] == "read_only"
     finally:
         reader.close()
+
+
+def test_a_long_lived_checkpointer_adopts_foreign_schema_before_logical_redo(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint can replay an index introduced after its own handle opened.
+
+    Participant A starts with an empty catalog. Participant B then commits both the DDL that
+    declares a primary-key index and a row whose WAL contains a logical write for that index.
+    Replaying only the pages in A is insufficient: logical redo then names an index A has never
+    registered and refuses the checkpoint. The catalog must be adopted and its indexes
+    synchronized after catalog-page redo and before logical-index redo, just as startup recovery
+    does.
+    """
+    root = tmp_path / "db"
+    checkpointer = connect(str(root), page_size=512, wal_segment_bytes=SEGMENT_BYTES)
+    writer = connect(str(root), page_size=512, wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        with writer.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))")
+        with writer.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 7, name: 'foreign'})")
+
+        assert checkpointer.attached_indexes == ()
+        checkpointer.checkpoint()
+
+        assert tuple(table.name for table in checkpointer.catalog.catalog.tables()) == ("P",)
+        assert checkpointer.indexes.index("pk_P").name == "pk_P"
+        assert checkpointer.attached_indexes == ("pk_P",)
+        assert checkpointer.execute("MATCH (p:P) RETURN p.id").rows == ((7,),)
+        assert checkpointer.verify("all").findings == ()
+    finally:
+        writer.close()
+        checkpointer.close()
+
+
+def test_checkpoint_index_inventory_is_serialized_with_a_post_barrier_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The public checkpoint postlude cannot straddle a recovery-required latch."""
+    database = connect(str(tmp_path / "db"))
+    inventory_entered = threading.Event()
+    release_inventory = threading.Event()
+    checkpoint_done = threading.Event()
+    commit_done = threading.Event()
+    checkpoint_results: list[object] = []
+    checkpoint_failures: list[BaseException] = []
+    commit_failures: list[BaseException] = []
+    try:
+        _schema(database)
+        database.checkpoint()
+        transaction = database.begin("write")
+        transaction.execute("CREATE (:P {id: 7, name: 'durable'})")
+
+        original_publish = CommitStateStore.publish
+        original_open = IndexManager.open
+
+        def fail_commit_publication(
+            store: CommitStateStore, state: CommitState
+        ) -> None:
+            if threading.current_thread().name == "latching-commit":
+                raise GrafxDeviceFull(
+                    "The test refuses publication after the commit barrier.",
+                    file="control/commit.state",
+                )
+            original_publish(store, state)
+
+        def pause_checkpoint_inventory(
+            manager: IndexManager,
+            published_lsn: int,
+            *,
+            persist_stale: bool = True,
+            allow_ahead: bool = False,
+        ) -> tuple[object, ...]:
+            if threading.current_thread().name == "checkpoint-postlude":
+                inventory_entered.set()
+                if not release_inventory.wait(timeout=5.0):
+                    raise AssertionError("the test did not release checkpoint inventory")
+            return original_open(
+                manager,
+                published_lsn,
+                persist_stale=persist_stale,
+                allow_ahead=allow_ahead,
+            )
+
+        def run_checkpoint() -> None:
+            try:
+                checkpoint_results.append(database.checkpoint())
+            except BaseException as failure:
+                checkpoint_failures.append(failure)
+            finally:
+                checkpoint_done.set()
+
+        def run_commit() -> None:
+            try:
+                transaction.commit()
+            except BaseException as failure:
+                commit_failures.append(failure)
+            finally:
+                commit_done.set()
+
+        monkeypatch.setattr(CommitStateStore, "publish", fail_commit_publication)
+        monkeypatch.setattr(IndexManager, "open", pause_checkpoint_inventory)
+
+        checkpoint_thread = threading.Thread(
+            target=run_checkpoint, name="checkpoint-postlude"
+        )
+        checkpoint_thread.start()
+        assert inventory_entered.wait(timeout=5.0)
+        wal_at_inventory = database.wal.last_lsn
+
+        commit_thread = threading.Thread(target=run_commit, name="latching-commit")
+        commit_thread.start()
+        try:
+            # IndexManager.open is after TransactionManager.checkpoint returned. Holding the same
+            # participant section here must nevertheless keep commit from reaching its barrier.
+            assert not commit_done.wait(timeout=0.2)
+            assert database.wal.last_lsn == wal_at_inventory
+            assert database.transactions.recovery_required is False
+        finally:
+            release_inventory.set()
+
+        checkpoint_thread.join(timeout=5.0)
+        commit_thread.join(timeout=5.0)
+        assert checkpoint_done.is_set() and commit_done.is_set()
+        assert checkpoint_failures == []
+        assert len(checkpoint_results) == 1
+        assert len(commit_failures) == 1
+        assert isinstance(commit_failures[0], GrafxError)
+        assert commit_failures[0].details["committed"] is True  # type: ignore[union-attr]
+        assert database.transactions.recovery_required is True
+    finally:
+        release_inventory.set()
+        database.close()
 
 
 _OTHER_PROCESS = r'''

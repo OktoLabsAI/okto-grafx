@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from okto_grafx import connect
-from okto_grafx.api.assembly import assemble_database, database_label
+from okto_grafx.api.assembly import _release, assemble_database, database_label
 from okto_grafx.adapters.codec_v1 import PageCodecV1
 from okto_grafx.adapters.storage_local import LocalStorageDevice, barrier_failure
 from okto_grafx.domain.errors import (
@@ -268,6 +268,35 @@ def test_a_failure_raised_under_the_assembly_arrives_unchanged(
     assert raised.value.details.get("retryable", raised.value.retryable) == planted.retryable
 
 
+@pytest.mark.parametrize("cleanup_type", [RuntimeError, KeyboardInterrupt])
+def test_assembly_unwind_exhausts_closers_without_replacing_the_primary_failure(
+    cleanup_type: type[BaseException],
+) -> None:
+    """Cleanup failures are secondary while an assembly failure is already active."""
+    primary = GrafxDeviceFull("The assembly's primary operation failed.", free_bytes=0)
+    cleanup_failure = cleanup_type("a closer failed during unwind")
+    ran: list[str] = []
+
+    def outer() -> None:
+        ran.append("outer")
+
+    def inner() -> None:
+        ran.append("inner")
+        raise cleanup_failure
+
+    with pytest.raises(GrafxDeviceFull) as raised:
+        try:
+            raise primary
+        except BaseException:
+            # Acquisition order is outer then inner; assembly releases in reverse and a bare
+            # raise preserves the failure that caused this unwind.
+            _release([outer, inner])
+            raise
+
+    assert raised.value is primary
+    assert ran == ["inner", "outer"]
+
+
 def test_a_retryable_device_failure_stays_retryable_through_connect(tmp_path: Path) -> None:
     """A47: the retryable classification is what a caller acts on, so it must survive the open.
 
@@ -333,7 +362,7 @@ def test_a_barrier_failure_reaches_a_committing_caller_with_its_detail_intact(
     try:
         db = connect(tmp_path / "db", registry=registry)
         txn = db.begin("write")
-        txn.context.stage_page_image("heap.dat", 0, db.codec.encode_page(_heap_page(db)))
+        txn.context.owner._stage_page_image(txn.context, "heap.dat", 0, db.codec.encode_page(_heap_page(db)))
         txn.context.note_write(db.transactions.partition_of(1, b"k"))
         device_type.durable_barrier = refuse  # type: ignore[method-assign]
         try:

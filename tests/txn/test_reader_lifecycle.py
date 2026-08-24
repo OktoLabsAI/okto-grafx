@@ -27,7 +27,7 @@ HEAP = "heap.dat"
 def _commit_one(stack: Stack, page_index: int, payload: bytes = b"row") -> int:
     """Commit one page through this participant and return the commit number."""
     txn = stack.manager.begin("write")
-    txn.stage_page_image(
+    txn.owner._stage_page_image(txn,
         HEAP, page_index, make_page_image(stack.codec, [payload], page_index=page_index)
     )
     txn.note_write(stack.manager.partition_of(1, payload))
@@ -256,7 +256,7 @@ def test_a_live_reader_holds_the_recyclable_horizon_down(make_stack) -> None:
     reader = make_stack()
     for page in (3, 4, 5):
         txn = writer.manager.begin("write")
-        txn.stage_page_image(
+        txn.owner._stage_page_image(txn,
             "heap.dat", page, make_page_image(writer.codec, [bytes([page])], page_index=page)
         )
         txn.note_write(writer.manager.partition_of(1, bytes([page])))
@@ -272,7 +272,7 @@ def test_the_horizon_never_passes_a_snapshot_this_manager_handed_out(make_stack)
     writer = make_stack()
     reader = make_stack()
     txn = writer.manager.begin("write")
-    txn.stage_page_image("heap.dat", 3, make_page_image(writer.codec, [b"x"], page_index=3))
+    txn.owner._stage_page_image(txn, "heap.dat", 3, make_page_image(writer.codec, [b"x"], page_index=3))
     txn.note_write(writer.manager.partition_of(1, b"x"))
     writer.manager.commit(txn)
     live = reader.manager.begin("read")

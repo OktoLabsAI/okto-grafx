@@ -28,6 +28,9 @@ from okto_grafx.domain.recovery.report import (
     stronger_outcome,
 )
 from okto_grafx.domain.wal.record import WalRecord, WalRecordType
+from okto_grafx.domain.wal.replay import TruncationReport
+from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE, CommitState
+from okto_grafx.engine.commit_state_store import CommitStateStore
 from okto_grafx.engine.ledger_store import LEDGER_FILE, LedgerStore
 from okto_grafx.engine.recovery_manager import (
     RECOVERIES_TOTAL,
@@ -86,6 +89,17 @@ def _reopened(stack: Stack) -> Stack:
     )
 
 
+def _stored_bytes(stack: Stack) -> dict[str, bytes]:
+    """Return an exact image of every file held by this in-memory recovery stack."""
+    names = stack.storage.list_files("")  # type: ignore[attr-defined]
+    return {
+        name: stack.storage.read_log(  # type: ignore[attr-defined]
+            name, 0, stack.storage.file_size(name)  # type: ignore[attr-defined]
+        )
+        for name in names
+    }
+
+
 # --- the report shape ----------------------------------------------------------------------------
 
 
@@ -127,6 +141,113 @@ def test_an_empty_database_recovers_clean(stack: Stack) -> None:
     assert report.outcome == OUTCOME_CLEAN and report.last_good_lsn == 0
 
 
+def test_writable_recovery_barriers_a_clean_foreign_tail_before_publication(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _commit(stack, 3, b"durable-shape")
+    stack.storage.truncate_log(COMMIT_STATE_FILE, 0)  # type: ignore[attr-defined]
+    reopened = _reopened(stack)
+    events: list[str] = []
+    original_barrier = WalManager.force_barrier_range
+    original_publish = CommitStateStore.publish
+
+    def barrier(manager: WalManager, first_lsn: int, through_lsn: int) -> tuple[str, ...]:
+        events.append("barrier")
+        return original_barrier(manager, first_lsn, through_lsn)
+
+    def publish(store: CommitStateStore, state: CommitState) -> None:
+        events.append("publish")
+        original_publish(store, state)
+
+    monkeypatch.setattr(WalManager, "force_barrier_range", barrier)
+    monkeypatch.setattr(CommitStateStore, "publish", publish)
+
+    reopened.recovery().run()
+
+    assert "publish" in events
+    assert events.index("barrier") < events.index("publish")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (RuntimeError("recovery WAL barrier failed"), KeyboardInterrupt()),
+    ids=("runtime-error", "keyboard-interrupt"),
+)
+def test_recovery_never_publishes_when_its_wal_barrier_escapes(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    _commit(stack, 3, b"unpublished")
+    stack.storage.truncate_log(COMMIT_STATE_FILE, 0)  # type: ignore[attr-defined]
+    before = _stored_bytes(stack)
+    reopened = _reopened(stack)
+
+    def fail_barrier(
+        _manager: WalManager, _first_lsn: int, _through_lsn: int
+    ) -> tuple[str, ...]:
+        raise failure
+
+    def forbidden_publish(_store: CommitStateStore, _state: CommitState) -> None:
+        raise AssertionError("recovery published state without a successful WAL barrier")
+
+    monkeypatch.setattr(WalManager, "force_barrier_range", fail_barrier)
+    monkeypatch.setattr(CommitStateStore, "publish", forbidden_publish)
+
+    with pytest.raises(type(failure)) as escaped:
+        reopened.recovery().run()
+
+    assert escaped.value is failure
+    assert _stored_bytes(stack) == before
+
+
+def test_the_read_only_consistency_proof_never_barriers_wal(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    def forbidden_barrier(
+        _manager: WalManager, _first_lsn: int, _through_lsn: int
+    ) -> tuple[str, ...]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("a read-only proof attempted to flush the WAL")
+
+    monkeypatch.setattr(WalManager, "force_barrier_range", forbidden_barrier)
+
+    stack.recovery().require_read_only_consistent()
+
+    assert calls == 0
+
+
+def test_checkpoint_complete_writable_recovery_does_not_barrier_an_idle_wal(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    committed = _commit(stack, 3, b"already-checkpointed")
+    CommitStateStore(stack.storage, owner_id="checkpoint-test").publish(
+        CommitState(
+            last_committed_lsn=committed,
+            last_csn=committed,
+            checkpoint_lsn=committed,
+        )
+    )
+    reopened = _reopened(stack)
+    calls = 0
+
+    def count_barrier(
+        _manager: WalManager, _first_lsn: int, _through_lsn: int
+    ) -> tuple[str, ...]:
+        nonlocal calls
+        calls += 1
+        return ()
+
+    monkeypatch.setattr(WalManager, "force_barrier_range", count_barrier)
+
+    reopened.recovery().run()
+
+    assert calls == 0
+
+
 def test_a_clean_recovery_counts_itself_under_its_outcome(stack: Stack) -> None:
     _commit(stack, 3, b"first")
     _reopened(stack).recovery().run()
@@ -149,6 +270,105 @@ def test_a_run_of_interior_zeros_truncates_at_the_last_valid_record(stack: Stack
     assert reopened.wal.damage is None
     assert reopened.wal.last_lsn == good
     assert offset > 0
+
+
+def test_an_incomplete_truncation_refuses_retryably_instead_of_publishing_success(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preserved bytes are not a completed recovery while the damaged WAL tail remains."""
+    _commit(stack, 3, b"kept")
+    good = stack.wal.last_lsn
+    _append_garbage(stack, bytes(96))
+    reopened = _reopened(stack)
+    attempts: list[int] = []
+    deferred = (_segment(reopened),)
+
+    def leave_the_tail_in_place(_wal: WalManager, lsn: int) -> TruncationReport:
+        attempts.append(lsn)
+        return TruncationReport(
+            last_lsn=lsn,
+            removed_records=0,
+            removed_bytes=0,
+            deferred_segments=deferred,
+            completed=False,
+        )
+
+    monkeypatch.setattr(WalManager, "truncate_after", leave_the_tail_in_place)
+
+    with pytest.raises(GrafxRecoveryRefused) as refused:
+        reopened.recovery().run()
+
+    assert attempts == [good, good, good]
+    assert refused.value.details == {
+        "field": "wal_truncation",
+        "last_good_lsn": good,
+        "attempts": 3,
+        "deferred_segments": deferred,
+    }
+    assert is_retryable(refused.value) is True
+    assert reopened.wal.damage is not None
+    assert len(reopened.quarantine.list()) == 1
+
+
+def test_recovery_refuses_to_cut_below_the_checkpoint_before_any_mutation(
+    stack: Stack,
+) -> None:
+    """A cut below the replay floor would let a later WAL batch reuse filtered LSNs."""
+    checkpoint = _commit(stack, 3, b"checkpointed")
+    device = stack.storage
+    CommitStateStore(  # type: ignore[arg-type]
+        device, owner_id="checkpoint-floor-test"
+    ).publish(
+        CommitState(
+            last_committed_lsn=checkpoint,
+            last_csn=checkpoint,
+            checkpoint_lsn=checkpoint,
+        )
+    )
+
+    segment = _segment(stack)
+    raw = bytearray(
+        device.read_log(segment, 0, device.log_size(segment))  # type: ignore[attr-defined]
+    )
+    raw[-1] ^= 0xFF  # damage the final COMMIT while its WRITE_PAGE remains intact
+    device.truncate_log(segment, 0)  # type: ignore[attr-defined]
+    device.append_log(segment, bytes(raw))  # type: ignore[attr-defined]
+    device.durable_barrier(segment)  # type: ignore[attr-defined]
+
+    reopened = _reopened(stack)
+    names_before = device.list_files("")  # type: ignore[attr-defined]
+    wal_before = device.read_log(  # type: ignore[attr-defined]
+        segment, 0, device.log_size(segment)  # type: ignore[attr-defined]
+    )
+    state_before = device.read_log(  # type: ignore[attr-defined]
+        COMMIT_STATE_FILE, 0, device.log_size(COMMIT_STATE_FILE)  # type: ignore[attr-defined]
+    )
+    heap_before = digest_of_file(device, HEAP_FILE)
+
+    with pytest.raises(GrafxRecoveryRefused) as refused:
+        reopened.recovery().run()
+
+    assert refused.value.details == {
+        "field": "wal_lineage",
+        "checkpoint_lsn": checkpoint,
+        "last_good_lsn": checkpoint - 1,
+    }
+    assert device.list_files("") == names_before  # type: ignore[attr-defined]
+    assert (
+        device.read_log(segment, 0, device.log_size(segment)) == wal_before  # type: ignore[attr-defined]
+    )
+    assert (
+        device.read_log(  # type: ignore[attr-defined]
+            COMMIT_STATE_FILE,
+            0,
+            device.log_size(COMMIT_STATE_FILE),  # type: ignore[attr-defined]
+        )
+        == state_before
+    )
+    assert digest_of_file(device, HEAP_FILE) == heap_before
+    assert reopened.quarantine.list() == ()
+    assert reopened.ledger.list() == ()
+    assert reopened.wal.damage is not None
 
 
 def test_the_forensic_entry_carries_the_offset_the_digest_and_the_bytes(stack: Stack) -> None:
@@ -205,10 +425,12 @@ def test_a_checksum_failure_is_classified_as_such_and_the_rest_as_the_truncated_
     stack.storage.truncate_log(name, 0)  # type: ignore[attr-defined]
     stack.storage.append_log(name, bytes(raw))  # type: ignore[attr-defined]
     reopened = _reopened(stack)
-    report = reopened.recovery().run()
-    assert report.outcome == OUTCOME_TRUNCATED
-    reasons = {entry.reason for entry in reopened.ledger.list()}
-    assert LedgerReason.CHECKSUM_FAILURE in reasons
+    before = stack.storage.log_size(name)  # type: ignore[attr-defined]
+    with pytest.raises(GrafxRecoveryRefused):
+        reopened.recovery().run()
+    assert stack.storage.log_size(name) == before  # type: ignore[attr-defined]
+    assert reopened.ledger.list() == ()
+    assert reopened.quarantine.list() == ()
 
 
 def test_a_record_that_decodes_above_the_cut_is_reapplicable_and_not_forensic(
@@ -445,7 +667,8 @@ def test_replaying_a_page_twice_leaves_the_page_identical(stack: Stack) -> None:
 
 def test_a_committed_page_is_put_back_after_the_apply_was_lost(stack: Stack) -> None:
     image = make_page_image(stack.codec, [b"committed"], page_index=3)
-    predicted = stack.wal.last_lsn + 2
+    # The first append also writes the segment header; later batches do not.
+    predicted = stack.wal.last_lsn + 2 + (0 if stack.wal.segments() else 1)
     page = stack.codec.decode_page(image, verify=True)
     page.page_lsn = predicted
     stamped = stack.codec.encode_page(page)
@@ -477,11 +700,21 @@ def test_a_committed_page_is_put_back_after_the_apply_was_lost(stack: Stack) -> 
     report = reopened.recovery().run()
     assert report.records_replayed == 1
     reopened.pool.flush()
+    state_size = stack.storage.log_size(COMMIT_STATE_FILE)  # type: ignore[attr-defined]
+    state = CommitState.decode(
+        stack.storage.read_log(COMMIT_STATE_FILE, 0, state_size)  # type: ignore[attr-defined]
+    )
+    assert state.last_committed_lsn == predicted
     with reopened.pool.pinned(HEAP_FILE, 3) as restored:
         assert restored.read_slot(0) == b"committed"
+    once = digest_of_file(stack.storage, HEAP_FILE)
+    assert _reopened(stack).recovery().run().records_replayed == 1
+    assert digest_of_file(stack.storage, HEAP_FILE) == once
 
 
-def test_an_uncommitted_page_is_never_applied_and_needs_no_undo(stack: Stack) -> None:
+def test_a_clean_tail_with_an_effect_but_no_outcome_refuses_without_mutation(
+    stack: Stack,
+) -> None:
     from okto_grafx.domain.txn.records import encode_page_write
 
     image = make_page_image(stack.codec, [b"uncommitted"], page_index=5)
@@ -497,8 +730,14 @@ def test_an_uncommitted_page_is_never_applied_and_needs_no_undo(stack: Stack) ->
     stack.wal.barrier()
     pages_before = stack.storage.page_count(HEAP_FILE)  # type: ignore[attr-defined]
     reopened = _reopened(stack)
-    report = reopened.recovery().run()
-    assert report.records_replayed == 0
+    bytes_before = _stored_bytes(reopened)
+
+    with pytest.raises(GrafxRecoveryRefused) as refused:
+        reopened.recovery().run()
+
+    assert refused.value.details["field"] == "wal_lineage"
+    assert refused.value.details["incomplete_effect_lsns"]
+    assert _stored_bytes(reopened) == bytes_before
     assert stack.storage.page_count(HEAP_FILE) == pages_before  # type: ignore[attr-defined]
 
 
@@ -525,15 +764,8 @@ def test_an_aborted_transaction_contributes_nothing_to_the_redo(stack: Stack) ->
     assert report.records_replayed == 0
 
 
-def test_a_commit_after_an_abort_does_not_resurrect_the_aborted_writes(stack: Stack) -> None:
-    """Dropping an aborted transaction's pages is what keeps a later commit from adopting them.
-
-    The earlier test only proves an ABORT with nothing after it changes nothing, which is true
-    whether or not the writes were dropped -- nothing releases them either way. The property the
-    drop actually buys is only visible when a COMMIT carrying the same epoch and transaction
-    number arrives afterwards: without the drop, that commit releases pages a transaction
-    explicitly abandoned, and rows nobody committed appear in the heap (A71).
-    """
+def test_a_commit_after_an_abort_is_refused_before_recovery_mutates_bytes(stack: Stack) -> None:
+    """A legacy staged ABORT cannot make recovery skip an applied page and publish past it."""
     from okto_grafx.domain.txn.commit_record import CommitPayload
     from okto_grafx.domain.txn.records import encode_page_write
 
@@ -564,8 +796,15 @@ def test_a_commit_after_an_abort_does_not_resurrect_the_aborted_writes(stack: St
     stack.wal.barrier()
     pages_before = stack.storage.page_count(HEAP_FILE)  # type: ignore[attr-defined]
     reopened = _reopened(stack)
-    report = reopened.recovery().run()
-    assert report.records_replayed == 0
+    bytes_before = _stored_bytes(reopened)
+
+    with pytest.raises(GrafxRecoveryRefused) as refused:
+        reopened.recovery().run()
+
+    assert refused.value.details["field"] == "wal_transaction"
+    assert refused.value.details["terminal_type"] == "ABORT"
+    assert refused.value.details["offending_type"] == "COMMIT"
+    assert _stored_bytes(reopened) == bytes_before
     assert stack.storage.page_count(HEAP_FILE) == pages_before  # type: ignore[attr-defined]
 
 
@@ -600,8 +839,15 @@ def test_a_transaction_identifier_reused_in_a_later_epoch_does_not_commit_the_ea
     )
     stack.wal.barrier()
     pages_before = stack.storage.page_count(HEAP_FILE)  # type: ignore[attr-defined]
-    report = _reopened(stack).recovery().run()
-    assert report.records_replayed == 0
+    reopened = _reopened(stack)
+    bytes_before = _stored_bytes(reopened)
+
+    with pytest.raises(GrafxRecoveryRefused) as refused:
+        reopened.recovery().run()
+
+    assert refused.value.details["field"] == "wal_lineage"
+    assert refused.value.details["incomplete_transactions"] == ((1, 4),)
+    assert _stored_bytes(reopened) == bytes_before
     assert stack.storage.page_count(HEAP_FILE) == pages_before  # type: ignore[attr-defined]
 
 
@@ -634,10 +880,9 @@ def test_a_record_naming_a_file_the_log_does_not_cover_is_refused_rather_than_ap
     )
     stack.wal.barrier()
     reopened = _reopened(stack)
-    report = reopened.recovery().run()
-    assert report.records_replayed == 0
-    refused = report.findings_of(FindingKind.REDO_REFUSED)
-    assert refused and refused[0].file == "control/writer.lease"
+    with pytest.raises(GrafxRecoveryRefused) as refused:
+        reopened.recovery().run()
+    assert refused.value.details["file"] == "control/writer.lease"
     assert not stack.storage.exists("control/writer.lease")  # type: ignore[attr-defined]
 
 
@@ -814,6 +1059,18 @@ def test_a_file_outside_the_control_directory_is_never_retired_by_this_door(
     assert stack.storage.exists(HEAP_FILE)  # type: ignore[attr-defined]
 
 
+def test_commit_state_is_never_retired_as_a_generic_control_record(stack: Stack) -> None:
+    """Only commit/recovery publication may replace the snapshot/checkpoint fence."""
+    name = "control/commit.state"
+    probe = RefusingProbe(GrafxCorruptionDetected("Damaged."))
+
+    with pytest.raises(GrafxRecoveryRefused) as caught:
+        stack.recovery(control_probe=probe).retire_control_record(name)
+
+    assert caught.value.details["field"] == "file"
+    assert probe.reads == []
+
+
 def test_retiring_a_control_record_that_is_not_there_is_refused(stack: Stack) -> None:
     probe = RefusingProbe(GrafxCorruptionDetected("Damaged."))
     with pytest.raises(GrafxRecoveryRefused):
@@ -943,9 +1200,9 @@ def test_recovery_says_the_caller_owes_the_route_when_no_catalog_store_is_wired(
 ) -> None:
     test_the_catalog_is_re_derived_from_the_replayed_pages_and_adopted(stack)
     reopened = _reopened(stack)
-    report = reopened.recovery(catalog=None).run()
-    adopted = report.findings_of(FindingKind.CATALOG_ADOPTED)
-    assert adopted and "adopt" in adopted[0].detail
+    with pytest.raises(GrafxRecoveryRefused) as refused:
+        reopened.recovery(catalog=None).run()
+    assert refused.value.details["field"] == "catalog"
 
 
 # --- ports ------------------------------------------------------------------------------------------------

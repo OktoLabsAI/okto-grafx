@@ -16,6 +16,7 @@ from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxDeviceFull,
+    GrafxRecoveryRefused,
     GrafxStaleEpoch,
     GrafxStorageError,
     GrafxTransactionStateError,
@@ -29,6 +30,8 @@ from okto_grafx.domain.txn import (
     TransactionState,
     decode_page_write,
 )
+from okto_grafx.domain.wal.record import WalRecord
+from okto_grafx.engine.buffer_pool import apply_page_image
 from okto_grafx.engine.txn_manager import (
     ACTIVE_TRANSACTIONS,
     TRANSACTION_MANAGER_METRICS,
@@ -52,7 +55,7 @@ HEAP = "heap.dat"
 def _stage(stack: Stack, page_index: int = 3, payload: bytes = b"row") -> object:
     """Open a write transaction that changes one page of the heap."""
     txn = stack.manager.begin("write")
-    txn.stage_page_image(HEAP, page_index, make_page_image(stack.codec, [payload], page_index=page_index))
+    txn.owner._stage_page_image(txn, HEAP, page_index, make_page_image(stack.codec, [payload], page_index=page_index))
     txn.note_write(stack.manager.partition_of(1, payload))
     return txn
 
@@ -95,7 +98,7 @@ def test_the_published_state_is_replaced_only_after_every_page_is_in_place(
     stack, device = _fault_stack(database_root)
     txn = stack.manager.begin("write")
     for page_index in (3, 4, 5):
-        txn.stage_page_image(
+        txn.owner._stage_page_image(txn,
             HEAP, page_index, make_page_image(stack.codec, [b"row"], page_index=page_index)
         )
     txn.note_write(stack.manager.partition_of(1, b"row"))
@@ -130,7 +133,7 @@ def test_the_epoch_is_validated_before_any_byte_reaches_the_device(database_root
         commit_lock_timeout=5.0,
     )
     txn = manager.begin("write")
-    txn.stage_page_image(HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
+    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
     txn.note_write(manager.partition_of(1, b"row"))
     trail.clear()
     device.clear_trail()
@@ -160,7 +163,7 @@ def test_the_lease_is_released_only_after_the_commit_section_is_left(
         commit_lock_timeout=5.0,
     )
     txn = manager.begin("write")
-    txn.stage_page_image(HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
+    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
     txn.note_write(manager.partition_of(1, b"row"))
     trail.clear()
     manager.commit(txn)
@@ -197,7 +200,7 @@ def test_a_takeover_inside_the_commit_window_refuses_before_the_first_byte(
         commit_lock_timeout=5.0,
     )
     txn = manager.begin("write")
-    txn.stage_page_image(HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
+    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
     txn.note_write(manager.partition_of(1, b"row"))
     before = stack.storage.log_size(WAL_FILE)
     device.clear_trail()
@@ -235,7 +238,7 @@ def test_the_logged_image_carries_the_commit_number_so_a_replay_can_apply_it(
 
 def test_the_commit_record_carries_the_sets_that_were_validated(stack: Stack) -> None:
     txn = stack.manager.begin("write")
-    txn.stage_page_image(HEAP, 6, make_page_image(stack.codec, [b"x"], page_index=6))
+    txn.owner._stage_page_image(txn, HEAP, 6, make_page_image(stack.codec, [b"x"], page_index=6))
     txn.note_read(stack.manager.partition_of(1, b"a"))
     txn.note_write(stack.manager.partition_of(2, b"b"))
     report = stack.manager.commit(txn)
@@ -312,10 +315,64 @@ def test_a_write_transaction_that_staged_nothing_writes_no_commit_record(stack: 
     assert len(stack.wal.records()) == before
 
 
+def test_a_caller_cannot_stage_a_checksum_valid_physical_page(stack: Stack) -> None:
+    """Encoded heap/catalog bytes are an engine capability, never a public mutation API."""
+    txn = stack.manager.begin("write")
+    image = make_page_image(stack.codec, [b"caller-authored"], page_index=7)
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        txn.stage_page_image(HEAP, 7, image)
+
+    assert raised.value.details["field"] == "page_image_provenance"
+    assert txn.page_images == {}
+    stack.manager.rollback(txn)
+
+
+def test_direct_page_map_mutation_is_refused_before_wal_or_publication(stack: Stack) -> None:
+    """The observable context map carries no authority without a matching private proof."""
+    txn = stack.manager.begin("write")
+    txn.page_images[(HEAP, 7)] = make_page_image(
+        stack.codec, [b"caller-authored"], page_index=7
+    )
+    txn.note_write(stack.manager.partition_of(1, b"caller-authored"))
+    before_records = tuple(stack.wal.records())
+    before_state = stack.manager.published_state()
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        stack.manager.commit(txn)
+
+    assert raised.value.details["field"] == "page_image_provenance"
+    assert tuple(stack.wal.records()) == before_records
+    assert stack.manager.published_state() == before_state
+    stack.manager.rollback(txn)
+
+
+def test_replacing_a_privately_staged_image_breaks_its_proof(stack: Stack) -> None:
+    """A proof seals the bytes as well as the file/page key."""
+    txn = stack.manager.begin("write")
+    txn.owner._stage_page_image(
+        txn,
+        HEAP,
+        7,
+        make_page_image(stack.codec, [b"trusted"], page_index=7),
+    )
+    txn.page_images[(HEAP, 7)] = make_page_image(
+        stack.codec, [b"replacement"], page_index=7
+    )
+    before_records = tuple(stack.wal.records())
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        stack.manager.commit(txn)
+
+    assert raised.value.details["field"] == "page_image_provenance"
+    assert tuple(stack.wal.records()) == before_records
+    stack.manager.rollback(txn)
+
+
 def test_a_read_transaction_cannot_stage_work(stack: Stack) -> None:
     txn = stack.manager.begin("read")
     with pytest.raises(GrafxTransactionStateError):
-        txn.stage_page_image(HEAP, 3, make_page_image(stack.codec, [b"x"], page_index=3))
+        txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(stack.codec, [b"x"], page_index=3))
     with pytest.raises(GrafxTransactionStateError):
         txn.note_write(1)
 
@@ -398,7 +455,7 @@ def test_a_transaction_cannot_be_committed_through_another_manager(
     first = make_stack()  # type: ignore[operator]
     second = make_stack()  # type: ignore[operator]
     txn = first.manager.begin("write")
-    txn.stage_page_image(HEAP, 3, make_page_image(first.codec, [b"x"], page_index=3))
+    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(first.codec, [b"x"], page_index=3))
     txn.note_write(first.manager.partition_of(1, b"x"))
     with pytest.raises(GrafxTransactionStateError) as raised:
         second.manager.commit(txn)
@@ -423,6 +480,147 @@ def test_something_that_is_not_a_transaction_is_refused(stack: Stack) -> None:
 # --- failure on the way through ------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "failure",
+    (RuntimeError("foreign adapter failure"), KeyboardInterrupt()),
+    ids=("runtime-error", "keyboard-interrupt"),
+)
+def test_any_escape_after_partial_committed_redo_latches_the_handle(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    """A non-Grafx exception class cannot make an applied prefix safe to publish over."""
+    image = make_page_image(
+        stack.codec,
+        [b"applied-prefix"],
+        page_index=4,
+        page_lsn=1,
+    )
+
+    def fail_after_one_page(
+        manager: TransactionManager, checkpoint: int, through: int
+    ) -> int:
+        assert manager is stack.manager
+        assert (checkpoint, through) == (0, 1)
+        assert apply_page_image(stack.pool, HEAP, 4, image) is True
+        raise failure
+
+    monkeypatch.setattr(
+        TransactionManager,
+        "_redo_onto_device_unchecked",
+        fail_after_one_page,
+    )
+
+    with pytest.raises(type(failure)) as escaped:
+        stack.manager._redo_onto_device(0, 1)
+
+    assert escaped.value is failure
+    with stack.pool.pinned(HEAP, 4) as page:
+        assert tuple(payload for _slot, payload in page.iter_slots()) == (
+            b"applied-prefix",
+        )
+    assert stack.manager.recovery_required is True
+    with pytest.raises(GrafxRecoveryRefused) as blocked:
+        stack.manager.published_lsn()
+    assert blocked.value.details["field"] == "recovery_required"
+
+
+def test_a_foreign_escape_after_gap_redo_latches_before_it_repropagates(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The outer durable-gap door also latches failures that occur after redo returned."""
+    descriptor = "hash-v1;partitions_per_table=8"
+    stack.wal.append(
+        WalRecord(
+            record_type=int(WalRecordType.COMMIT),
+            descriptor=descriptor,
+            epoch=1,
+            txn_id=91,
+        )
+    )
+    image = make_page_image(
+        stack.codec,
+        [b"completed-prefix"],
+        page_index=4,
+        page_lsn=1,
+    )
+
+    def apply_gap(
+        manager: TransactionManager, checkpoint: int, through: int
+    ) -> int:
+        assert manager is stack.manager
+        assert (checkpoint, through) == (0, 1)
+        assert apply_page_image(stack.pool, HEAP, 4, image) is True
+        return 1
+
+    failure = RuntimeError("publication callback failed")
+
+    def fail_publication(manager: TransactionManager, state: CommitState) -> None:
+        assert manager is stack.manager
+        assert state.last_committed_lsn == 1
+        assert stack.wal.barriers == 1, "gap completion must barrier before publication"
+        raise failure
+
+    monkeypatch.setattr(TransactionManager, "_redo_onto_device", apply_gap)
+    monkeypatch.setattr(TransactionManager, "_publish", fail_publication)
+
+    with pytest.raises(RuntimeError) as escaped:
+        stack.manager._complete_committed_gap()
+
+    assert escaped.value is failure
+    with stack.pool.pinned(HEAP, 4) as page:
+        assert tuple(payload for _slot, payload in page.iter_slots()) == (
+            b"completed-prefix",
+        )
+    assert stack.manager.recovery_required is True
+    with pytest.raises(GrafxRecoveryRefused) as blocked:
+        stack.manager.published_lsn()
+    assert blocked.value.details["field"] == "recovery_required"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (RuntimeError("gap barrier failed"), KeyboardInterrupt()),
+    ids=("runtime-error", "keyboard-interrupt"),
+)
+def test_a_visible_commit_cannot_be_redone_or_published_without_a_gap_barrier(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    stack.wal.append(
+        WalRecord(
+            record_type=int(WalRecordType.COMMIT),
+            descriptor="hash-v1;partitions_per_table=8",
+            epoch=1,
+            txn_id=92,
+        )
+    )
+    calls = 0
+
+    def fail_barrier() -> None:
+        nonlocal calls
+        calls += 1
+        raise failure
+
+    def forbidden(*_arguments: object, **_keywords: object) -> object:
+        raise AssertionError("redo/publication ran before WAL durability was established")
+
+    monkeypatch.setattr(stack.wal, "barrier", fail_barrier)
+    monkeypatch.setattr(TransactionManager, "_redo_onto_device", forbidden)
+    monkeypatch.setattr(TransactionManager, "_publish", forbidden)
+
+    with pytest.raises(type(failure)) as escaped:
+        stack.manager._complete_committed_gap()
+
+    assert escaped.value is failure
+    assert calls == 1
+    assert stack.manager.recovery_required is True
+    assert stack.manager._read_commit_state() == CommitState()
+
+
 def test_a_full_device_during_the_append_leaves_no_page_and_no_publication(
     database_root: Path,
 ) -> None:
@@ -433,7 +631,8 @@ def test_a_full_device_during_the_append_leaves_no_page_and_no_publication(
     before_page = read_page_payloads(stack.pool, HEAP, 4) if stack.storage.page_count(HEAP) > 4 else ()
     txn = _stage(stack, page_index=4, payload=b"never")
     device.clear_trail()
-    device.fill_device_on("append_log", 1)
+    # Lease acquisition writes its atomic-replace temporary first; the second append is WAL.
+    device.fill_device_on("append_log", 2)
     with pytest.raises(GrafxDeviceFull):
         stack.manager.commit(txn)
     device.disarm()
@@ -441,6 +640,105 @@ def test_a_full_device_during_the_append_leaves_no_page_and_no_publication(
     if stack.storage.page_count(HEAP) > 4:
         assert read_page_payloads(stack.pool, HEAP, 4) == before_page
     assert txn.state is TransactionState.ACTIVE
+
+
+@pytest.mark.parametrize(
+    "cleanup_failure",
+    (RuntimeError("index cleanup failed"), KeyboardInterrupt()),
+    ids=("runtime-error", "keyboard-interrupt"),
+)
+def test_foreign_unstage_cleanup_never_replaces_the_append_failure_and_latches(
+    database_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_failure: BaseException,
+) -> None:
+    stack, device = _fault_stack(database_root)
+    txn = _stage(stack, page_index=4, payload=b"never")
+    cleanup_calls: list[object] = []
+
+    def fail_index_cleanup(
+        manager: TransactionManager, cleaned: object
+    ) -> int:
+        assert manager is stack.manager
+        assert cleaned is txn
+        cleanup_calls.append(cleaned)
+        raise cleanup_failure
+
+    monkeypatch.setattr(TransactionManager, "_drop_index_changes", fail_index_cleanup)
+    device.clear_trail()
+    # Lease acquisition writes its atomic-replace temporary first; the second append is WAL.
+    device.fill_device_on("append_log", 2)
+
+    with pytest.raises(GrafxDeviceFull) as escaped:
+        stack.manager.commit(txn)
+
+    device.disarm()
+    assert isinstance(escaped.value, GrafxDeviceFull)
+    assert cleanup_calls == [txn]
+    assert stack.manager.recovery_required is True
+    with pytest.raises(GrafxRecoveryRefused):
+        stack.manager.begin("write")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (RuntimeError("lease release failed"), KeyboardInterrupt()),
+    ids=("runtime-error", "keyboard-interrupt"),
+)
+def test_lease_release_escape_happens_only_after_committed_outcome_is_settled(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    txn = _stage(stack, page_index=4, payload=b"committed-before-cleanup")
+    coordinator_type = type(stack.coordinator)
+    original = coordinator_type.release_lease
+    observed_states: list[TransactionState] = []
+
+    def release_then_fail(coordinator: object, lease: object) -> None:
+        original(coordinator, lease)  # type: ignore[arg-type]
+        if coordinator is stack.coordinator:
+            observed_states.append(txn.state)
+            raise failure
+
+    monkeypatch.setattr(coordinator_type, "release_lease", release_then_fail)
+
+    report = stack.manager.commit(txn)
+
+    assert report.durable is True and report.wrote is True
+    assert observed_states == [TransactionState.COMMITTED]
+    assert txn.state is TransactionState.COMMITTED
+    assert txn.commit_csn == stack.manager.published_state().last_committed_lsn
+    assert stack.manager.open_transactions == 0
+    assert stack.manager.recovery_required is False
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (RuntimeError("reader close failed"), KeyboardInterrupt()),
+    ids=("runtime-error", "keyboard-interrupt"),
+)
+def test_reader_close_escape_cannot_leave_a_committed_transaction_active(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    txn = stack.manager.begin("read")
+    coordinator_type = type(stack.coordinator)
+    original = coordinator_type.unregister_reader
+
+    def close_then_fail(coordinator: object, handle: object) -> None:
+        original(coordinator, handle)  # type: ignore[arg-type]
+        if coordinator is stack.coordinator:
+            raise failure
+
+    monkeypatch.setattr(coordinator_type, "unregister_reader", close_then_fail)
+
+    report = stack.manager.commit(txn)
+
+    assert report.durable is True and report.wrote is False
+    assert txn.state is TransactionState.COMMITTED
+    assert stack.manager.open_transactions == 0
 
 
 def test_a_failure_after_the_barrier_is_reported_as_already_committed(
@@ -459,7 +757,10 @@ def test_a_failure_after_the_barrier_is_reported_as_already_committed(
     assert raised.value.retryable is False
     assert raised.value.details["csn"] == txn.commit_csn
     assert txn.state is TransactionState.COMMITTED
-    assert stack.manager.published_lsn() == txn.commit_csn
+    assert stack.manager.recovery_required is True
+    with pytest.raises(GrafxRecoveryRefused) as blocked:
+        stack.manager.published_lsn()
+    assert blocked.value.details["field"] == "recovery_required"
 
 
 # --- metrics ---------------------------------------------------------------------------------------
@@ -534,15 +835,28 @@ class _RewoundLog:
             return self._rewind_to
         return self._inner.last_lsn  # type: ignore[attr-defined]
 
-    def append_many(self, records: object) -> int:
+    def planned_terminal_lsn(self, records: object) -> int:
+        """Preview the same rewound terminal the append will report."""
+        return self._rewind_to + len(list(records))  # type: ignore[arg-type]
+
+    def append_many(
+        self, records: object, *, expected_terminal_lsn: int | None = None
+    ) -> int:
         """Assign numbers from the rewound position, as a re-used segment index would."""
         self._used = True
         assigned = self._rewind_to + len(list(records))  # type: ignore[arg-type]
+        assert expected_terminal_lsn in (None, assigned)
         return assigned
 
     def barrier(self) -> None:
         """Count the barrier, so a test can prove one was never taken."""
         self.barriers += 1
+
+    def force_barrier_range(self, first_lsn: int, through_lsn: int) -> tuple[str, ...]:
+        """Delegate gap durability to the real log underneath."""
+        return self._inner.force_barrier_range(  # type: ignore[attr-defined,no-any-return]
+            first_lsn, through_lsn
+        )
 
     def read_from(self, lsn: int) -> object:
         """Answer from the real log underneath."""
@@ -578,7 +892,7 @@ def test_a_commit_numbered_at_or_below_the_published_one_is_refused_before_the_b
         commit_lock_timeout=5.0,
     )
     txn = manager.begin("write")
-    txn.stage_page_image(HEAP, 9, make_page_image(stack.codec, [b"rewound"], page_index=9))
+    txn.owner._stage_page_image(txn, HEAP, 9, make_page_image(stack.codec, [b"rewound"], page_index=9))
     txn.note_write(manager.partition_of(1, b"rewound"))
     with pytest.raises(GrafxTransactionStateError) as raised:
         manager.commit(txn)
@@ -586,7 +900,10 @@ def test_a_commit_numbered_at_or_below_the_published_one_is_refused_before_the_b
     assert raised.value.details["published_lsn"] == published.csn
     assert raised.value.details["value"] <= published.csn
     assert log.barriers == 0, "the refusal must come before anything is made durable"
-    assert manager.published_lsn() == published.csn
+    assert manager.recovery_required is True
+    with pytest.raises(GrafxRecoveryRefused) as blocked:
+        manager.published_lsn()
+    assert blocked.value.details["field"] == "recovery_required"
     assert stack.manager.published_lsn() == published.csn
     assert txn.state is TransactionState.ACTIVE
 
@@ -776,7 +1093,7 @@ def test_a_retained_lease_is_published_once_and_not_per_commit(
     stack = build_stack(database_root, storage=device, retain_lease=True)
     for page in (3, 4, 5, 6):
         txn = stack.manager.begin("write")
-        txn.stage_page_image(
+        txn.owner._stage_page_image(txn,
             HEAP, page, make_page_image(stack.codec, [bytes([page])], page_index=page)
         )
         txn.note_write(stack.manager.partition_of(1, bytes([page])))
@@ -794,7 +1111,7 @@ def test_the_default_publishes_the_lease_for_every_commit(database_root: Path) -
     stack = build_stack(database_root, storage=device)
     for page in (3, 4, 5, 6):
         txn = stack.manager.begin("write")
-        txn.stage_page_image(
+        txn.owner._stage_page_image(txn,
             HEAP, page, make_page_image(stack.codec, [bytes([page])], page_index=page)
         )
         txn.note_write(stack.manager.partition_of(1, bytes([page])))
@@ -810,7 +1127,7 @@ def test_a_retained_lease_keeps_one_epoch_across_commits(database_root: Path) ->
     epochs = []
     for page in (3, 4, 5):
         txn = stack.manager.begin("write")
-        txn.stage_page_image(
+        txn.owner._stage_page_image(txn,
             HEAP, page, make_page_image(stack.codec, [bytes([page])], page_index=page)
         )
         txn.note_write(stack.manager.partition_of(1, bytes([page])))
@@ -823,14 +1140,14 @@ def test_closing_gives_a_retained_lease_back(database_root: Path) -> None:
     """A retained lease outliving its manager makes every other participant wait out the stall."""
     holder = build_stack(database_root, retain_lease=True, owner_id="holder")
     txn = holder.manager.begin("write")
-    txn.stage_page_image(HEAP, 3, make_page_image(holder.codec, [b"x"], page_index=3))
+    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(holder.codec, [b"x"], page_index=3))
     txn.note_write(holder.manager.partition_of(1, b"x"))
     holder.manager.commit(txn)
     holder.manager.close()
 
     successor = build_stack(database_root, owner_id="successor")
     other = successor.manager.begin("write")
-    other.stage_page_image(HEAP, 4, make_page_image(successor.codec, [b"y"], page_index=4))
+    other.owner._stage_page_image(other, HEAP, 4, make_page_image(successor.codec, [b"y"], page_index=4))
     other.note_write(successor.manager.partition_of(2, b"y"))
     assert successor.manager.commit(other).wrote is True
 
@@ -847,7 +1164,7 @@ def test_the_default_still_lets_two_participants_take_turns(make_stack) -> None:
     for index, participant in enumerate((first, second, first, second)):
         page = 10 + index
         txn = participant.manager.begin("write")
-        txn.stage_page_image(
+        txn.owner._stage_page_image(txn,
             HEAP, page, make_page_image(participant.codec, [bytes([index])], page_index=page)
         )
         txn.note_write(participant.manager.partition_of(index + 1, bytes([index])))

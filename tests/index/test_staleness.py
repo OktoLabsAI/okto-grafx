@@ -62,6 +62,34 @@ def test_an_index_level_with_the_published_position_is_not_stale(database: Datab
     assert database.exact.stale_reason is None
 
 
+def test_an_index_ahead_of_the_published_position_is_marked_stale(
+    database: Database,
+) -> None:
+    """A future watermark may belong to another database state and cannot be trusted."""
+    database.manager.mark_built_through(ENDED)
+
+    stale = database.manager.open(BORN)
+
+    assert {index.name for index in stale} == {"person_by_name", "person_near_name"}
+    assert "ahead" in (database.exact.stale_reason or "")
+    assert header_on_device(database.device, database.exact.file).flags & INDEX_FLAG_STALE
+
+
+def test_checking_a_replay_floor_does_not_regress_the_published_position(
+    database: Database,
+) -> None:
+    """A floor is a lower replay bound, not a new published ceiling."""
+    database.manager.mark_built_through(ENDED)
+    assert database.manager.published_lsn == ENDED
+
+    stale = database.manager.check_replay_floor(BORN)
+
+    assert stale == ()
+    assert database.manager.published_lsn == ENDED
+    assert not database.exact.stale
+    assert not database.proximity.stale
+
+
 def test_a_stale_index_refuses_to_answer_rather_than_omitting_a_row(
     database: Database,
 ) -> None:

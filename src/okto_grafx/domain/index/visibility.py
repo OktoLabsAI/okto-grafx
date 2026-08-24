@@ -29,7 +29,7 @@ from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from okto_grafx.domain.errors import GrafxIndexError
-from okto_grafx.domain.ids import NO_CSN, Csn, Lsn
+from okto_grafx.domain.ids import NO_CSN, PROVISIONAL_CSN, Csn, Lsn
 from okto_grafx.domain.index.entry import IndexEntry
 
 __all__ = [
@@ -143,9 +143,10 @@ def _require_horizon(horizon: object) -> Csn:
             field="horizon",
             value=repr(horizon),
         )
-    if horizon < NO_CSN:
+    if horizon < NO_CSN or horizon >= PROVISIONAL_CSN:
         raise GrafxIndexError(
-            f"A snapshot horizon must not be negative; got {horizon}.",
+            f"A snapshot horizon must be between {NO_CSN} and {PROVISIONAL_CSN - 1}; "
+            f"got {horizon}.",
             field="horizon",
             value=horizon,
         )

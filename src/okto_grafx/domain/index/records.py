@@ -31,7 +31,15 @@ from dataclasses import dataclass
 from enum import IntEnum
 
 from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxIndexError
-from okto_grafx.domain.ids import NO_CSN, Csn, Epoch, Lsn, RecordRef, TxnId
+from okto_grafx.domain.ids import (
+    NO_CSN,
+    PROVISIONAL_CSN,
+    Csn,
+    Epoch,
+    Lsn,
+    RecordRef,
+    TxnId,
+)
 from okto_grafx.domain.index.definition import require_index_name
 from okto_grafx.domain.index.entry import MAX_INDEX_KEY_BYTES
 from okto_grafx.domain.wal.record import WalRecord, WalRecordType
@@ -148,20 +156,40 @@ class IndexChange:
             ("csn", self.csn, _MAX_U64),
             ("format_version", self.format_version, 0xFFFF),
         ):
-            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= ceiling:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= ceiling
+            ):
                 raise GrafxIndexError(
                     f"Index change field {field!r} is outside its width: {value!r}.",
                     field=field,
                     value=repr(value),
                 )
-        if self.operation is IndexOperation.INSERT and self.versioned and self.csn == NO_CSN:
+        if self.csn == PROVISIONAL_CSN:
+            raise GrafxIndexError(
+                "The provisional heap stamp is not a commit and cannot be written to an index "
+                "WAL change.",
+                field="csn",
+                value=PROVISIONAL_CSN,
+                operation=self.operation.name,
+            )
+        if (
+            self.operation is IndexOperation.INSERT
+            and self.versioned
+            and self.csn == NO_CSN
+        ):
             raise GrafxIndexError(
                 "A versioned entry is created by the commit that made it visible, so an insert "
                 "into a proximity index must carry a commit number.",
                 field="csn",
                 operation=self.operation.name,
             )
-        if self.operation is IndexOperation.INSERT and not self.versioned and self.csn != NO_CSN:
+        if (
+            self.operation is IndexOperation.INSERT
+            and not self.versioned
+            and self.csn != NO_CSN
+        ):
             raise GrafxIndexError(
                 "An unversioned entry has no birth stamp, so an insert into an exact index must "
                 f"not carry one; got csn={self.csn}.",
@@ -335,7 +363,10 @@ def change_of(record: object) -> IndexChange:
             field="record_type",
             value=type(record).__name__,
         )
-    if record_type not in (int(WalRecordType.INDEX_WRITE), int(WalRecordType.INDEX_RECONCILE)):
+    if record_type not in (
+        int(WalRecordType.INDEX_WRITE),
+        int(WalRecordType.INDEX_RECONCILE),
+    ):
         raise GrafxIndexError(
             f"Record type {record_type} is not an index record; the index reads only "
             f"{int(WalRecordType.INDEX_WRITE)} and {int(WalRecordType.INDEX_RECONCILE)}.",

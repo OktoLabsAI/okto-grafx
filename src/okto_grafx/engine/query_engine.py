@@ -473,6 +473,7 @@ class QueryEngine:
         "_skipped_indexes",
         "_working",
         "_txn_effects",
+        "_page_stager",
     )
 
     def __init__(
@@ -485,6 +486,7 @@ class QueryEngine:
         clock: Clock,
         indexes: object = None,
         vectors: object = None,
+        page_stager: Callable[[object, str, int, bytes], None] | None = None,
     ) -> None:
         """Adopt one catalog, one heap, one pool and whichever engines this composition has."""
         self._catalog = catalog
@@ -510,6 +512,7 @@ class QueryEngine:
         self._txn_effects: dict[int, list[tuple[str, str]]] = {}
         self._indexes = indexes
         self._vectors = vectors
+        self._page_stager = page_stager
         self._metrics = MetricEmitter(metrics)
         self._clock = clock
         if metrics.enabled:
@@ -852,7 +855,7 @@ class QueryEngine:
         # drop): the payload is monotonic, so a later staging never names fewer pages.
         staged = self._catalog.stage(catalog)
         for page_index, image in staged:
-            txn.stage_page_image(self._catalog.file, page_index, image)
+            self._stage_page_image(txn, self._catalog.file, page_index, image)
         statistics["pages_staged"] = statistics.get("pages_staged", 0) + len(staged)
 
     def _unwind_schema_statement(self, undo: list[tuple[str, str]]) -> None:
@@ -1113,6 +1116,12 @@ class QueryEngine:
         durability hole CONTRACT.md section 8.5 exists to close, so a caller that hands this
         engine no write transaction is refused rather than allowed to write unlogged bytes.
         """
+        stage = self._page_stager
+        if stage is not None:
+            for page_index in sorted(set(pages)):
+                with self._pool.pinned(file, page_index) as page:
+                    stage(txn, file, page_index, self._pool.codec.encode_page(page))
+            return
         stage = getattr(txn, "stage_page_image", None)
         if stage is None or not callable(stage):
             raise GrafxTransactionStateError(
@@ -1124,6 +1133,23 @@ class QueryEngine:
         for page_index in sorted(set(pages)):
             with self._pool.pinned(file, page_index) as page:
                 stage(file, page_index, self._pool.codec.encode_page(page))
+
+    def _stage_page_image(
+        self, txn: object, file: str, page_index: int, image: bytes
+    ) -> None:
+        """Stage one physical image through the production capability or an isolated test port."""
+        if self._page_stager is not None:
+            self._page_stager(txn, file, page_index, image)
+            return
+        stage = getattr(txn, "stage_page_image", None)
+        if stage is None or not callable(stage):
+            raise GrafxTransactionStateError(
+                "A statement that writes needs a write transaction to stage its pages on; the "
+                f"object supplied is a {type(txn).__name__}.",
+                field="transaction",
+                value=type(txn).__name__,
+            )
+        stage(file, page_index, image)
 
     # --- collaborators -----------------------------------------------------------------------
 

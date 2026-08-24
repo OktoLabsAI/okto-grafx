@@ -29,7 +29,13 @@ from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
 )
-from okto_grafx.domain.ids import Csn, RecordId, RecordRef
+from okto_grafx.domain.ids import (
+    Csn,
+    RecordId,
+    RecordRef,
+    is_committed_csn,
+    is_open_end_csn,
+)
 from okto_grafx.domain.model.value import Value
 
 __all__ = [
@@ -184,13 +190,21 @@ class HeapVersion:
 
     @property
     def live(self) -> bool:
-        """Return True when no later version and no delete has ended this one."""
-        return self.xmax == 0
+        """Return True when this is a committed birth with no committed end.
+
+        The provisional stamp has opposite meanings at the two edges of a lifetime: at
+        ``xmin`` it is an abandoned birth, while at ``xmax`` it is an abandoned attempt to end
+        an already committed version.  Keeping that distinction here makes maintenance walks
+        agree with snapshot visibility even after provisional frames reached the device.
+        """
+        return is_committed_csn(self.xmin) and is_open_end_csn(self.xmax)
 
 
 def encode_overflow_pointer(first_page: int) -> bytes:
     """Return the four bytes that follow the header of a record with an overflow chain."""
-    return _POINTER_STRUCT.pack(_require_unsigned("overflow_page", first_page, _MAX_U32))
+    return _POINTER_STRUCT.pack(
+        _require_unsigned("overflow_page", first_page, _MAX_U32)
+    )
 
 
 def decode_overflow_pointer(raw: bytes, offset: int = 0) -> int:

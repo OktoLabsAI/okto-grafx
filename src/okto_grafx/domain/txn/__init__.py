@@ -56,6 +56,7 @@ from okto_grafx.domain.txn.records import (
     WalRecordType,
     decode_page_write,
     encode_page_write,
+    is_redoable_page_file,
 )
 from okto_grafx.domain.txn.snapshot import Snapshot
 
@@ -91,6 +92,7 @@ __all__ = [
     "WalRecordType",
     "decode_page_write",
     "encode_page_write",
+    "is_redoable_page_file",
     "page_partition",
     "partition_index_of",
     "partition_key",

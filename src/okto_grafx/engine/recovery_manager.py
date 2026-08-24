@@ -63,7 +63,7 @@ re-run converge.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Protocol, runtime_checkable
 
 from okto_grafx.domain.errors import (
@@ -73,6 +73,7 @@ from okto_grafx.domain.errors import (
     GrafxPortNotConfigured,
     GrafxRecoveryRefused,
     GrafxSchemaVersionMismatch,
+    GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import NO_LSN, Lsn
 from okto_grafx.domain.ledger.classification import classify_failure, classify_record
@@ -83,11 +84,12 @@ from okto_grafx.domain.page.layout import is_unwritten_image
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
 from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.recovery.decision import (
+    CommittedReplay,
     DiscardedRange,
     DiscardedRecord,
     RecoveryPlan,
+    committed_replay,
     plan_recovery,
-    redo_order,
 )
 from okto_grafx.domain.recovery.report import (
     OUTCOME_CLEAN,
@@ -103,9 +105,13 @@ from okto_grafx.domain.recovery.report import (
     stronger_outcome,
 )
 from okto_grafx.domain.recovery.retry import RETRYABLE_KEY, is_retryable
-from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE, CommitState
+from okto_grafx.domain.txn.commit_state import CommitState
 from okto_grafx.domain.txn.records import decode_page_write
-from okto_grafx.engine.buffer_pool import BufferPool, apply_page_image
+from okto_grafx.domain.wal.record import WalRecordType
+from okto_grafx.engine.buffer_pool import BufferPool
+from okto_grafx.engine.commit_redo import CommitRedo, is_redoable_page_file
+from okto_grafx.engine.commit_state_store import CommitStateStore
+from okto_grafx.engine.coordination import COMMIT_SECTION
 from okto_grafx.engine.ledger_store import LedgerStore
 from okto_grafx.engine.metrics_catalog import metric
 from okto_grafx.engine.quarantine import QuarantineStore, is_protected
@@ -201,10 +207,15 @@ class RecoveryManager:
         "_quarantine",
         "_pool",
         "_catalog",
+        "_index_manager",
+        "_index_sync",
+        "_redo_engine",
+        "_state_store",
         "_metrics",
         "_policy",
         "_probe",
         "_coordinator",
+        "_commit_lock_timeout",
         "_meta_file",
     )
 
@@ -218,9 +229,13 @@ class RecoveryManager:
         metrics: MetricsSink,
         *,
         catalog: object = None,
+        index_manager: object = None,
+        index_sync: Callable[[], object] | None = None,
+        commit_state_store: CommitStateStore | None = None,
         recovery_policy: str | None = None,
         control_probe: ControlRecordProbe | None = None,
         coordinator: object = None,
+        commit_lock_timeout: float = 30.0,
         meta_file: str = META_FILE,
         policy: str | None = None,
     ) -> None:
@@ -240,7 +255,19 @@ class RecoveryManager:
         refused rather than resolved by an ordering rule nobody can see from the call site.
         """
         _require_port("storage", storage, STORAGE_PORT_METHODS)
-        _require_port("wal", wal, ("scan_all", "truncate_after", "open", "damage", "segments"))
+        _require_port(
+            "wal",
+            wal,
+            (
+                "scan_all",
+                "truncate_after",
+                "open",
+                "damage",
+                "segments",
+                "barrier",
+                "force_barrier_range",
+            ),
+        )
         _require_port("metrics", metrics, ("enabled", "register", "increment"))
         if not isinstance(ledger, LedgerStore):
             raise GrafxConfigurationError(
@@ -267,11 +294,32 @@ class RecoveryManager:
         self._quarantine: QuarantineStore = quarantine
         self._pool: BufferPool = pool
         self._catalog = catalog
+        if index_sync is not None and not callable(index_sync):
+            raise GrafxConfigurationError(
+                "Recovery index_sync must be callable when configured.",
+                field="index_sync",
+                value=type(index_sync).__name__,
+            )
+        self._index_manager = index_manager
+        self._index_sync = index_sync
         self._metrics: MetricsSink = metrics
         self._policy: str = _validate_policy(_one_policy(recovery_policy, policy))
         self._probe: ControlRecordProbe | None = control_probe
         self._coordinator = coordinator
+        self._commit_lock_timeout: float = _require_timeout(
+            "commit_lock_timeout", commit_lock_timeout
+        )
         self._meta_file: str = _require_text("meta_file", meta_file)
+        owner = "recovery"
+        owner_reader = getattr(coordinator, "owner_id", None)
+        if callable(owner_reader):
+            owner = str(owner_reader())
+        self._state_store = (
+            commit_state_store
+            if commit_state_store is not None
+            else CommitStateStore(storage, owner_id=owner)
+        )
+        self._redo_engine = CommitRedo(pool, index_manager)  # type: ignore[arg-type]
         if self._metrics.enabled:
             for declared in RECOVERY_METRICS:
                 self._metrics.register(declared)
@@ -290,9 +338,122 @@ class RecoveryManager:
 
     def run(self) -> RecoveryReport:
         """Recover the database and return what was done (CONTRACT.md section 8.6)."""
+        coordinator = self._coordinator
+        if coordinator is None:
+            return self._run_fail_closed()
+        # The whole destructive decision uses the exact section commits use: scan, forensic
+        # preservation, truncation, redo and publication must all see one stable WAL picture.
+        # Acquiring only around truncate would still let the scan classify an in-flight append.
+        with coordinator.exclusive(COMMIT_SECTION, timeout=self._commit_lock_timeout):
+            return self._run_fail_closed()
+
+    def _run_fail_closed(self) -> RecoveryReport:
+        """Run one fenced pass and poison this handle's indexes if it cannot finish.
+
+        A redo can fail after installing only a prefix of heap pages and before the first logical
+        index effect. If this live handle then commits unrelated work, that commit may flush the
+        recovered heap prefix and advance an untouched index past entries it never received.
+        Excluding every registered index in memory prevents that false certification. Nothing is
+        persisted here: a refusal that happened before mutation remains byte-identical, and the
+        retained WAL lets a later open retry the pass.
+        """
+        try:
+            return self._run_fenced()
+        except BaseException as failure:
+            manager = self._index_manager
+            exclude = getattr(manager, "mark_all_stale", None)
+            if callable(exclude):
+                try:
+                    failure_name = (
+                        failure.code
+                        if isinstance(failure, GrafxError)
+                        else type(failure).__name__
+                    )
+                    exclude(
+                        f"Recovery did not complete ({failure_name}); this handle cannot prove "
+                        "any index is complete.",
+                        persist=False,
+                    )
+                except BaseException:  # noqa: BLE001 - never replace the recovery failure
+                    pass
+            raise
+
+    def require_read_only_consistent(self) -> None:
+        """Prove that pages need no WAL completion, without changing any persisted byte.
+
+        ``commit.state`` is a publication record, not the durability authority. Restoring an
+        older copy of it must not make a complete COMMIT still present in the WAL disappear from
+        the startup decision. A read-only handle cannot replay that commit, so it may open only
+        when both sources prove that the checkpoint already covers every complete commit.
+
+        The tolerant scan is deliberate: damage is reported as a reason to refuse, never
+        repaired here. Unsupported intact records retain their schema-mismatch classification.
+        The state and WAL must be one atomic observation against commit, so this door takes the
+        same ``COMMIT_SECTION`` as :meth:`run`. Taking an advisory lock changes no database byte;
+        the proof itself calls no persistence door and is byte-identical even when it refuses.
+        """
+        coordinator = self._coordinator
+        if coordinator is None:
+            self._require_read_only_consistent_fenced()
+            return
+        with coordinator.exclusive(COMMIT_SECTION, timeout=self._commit_lock_timeout):
+            self._require_read_only_consistent_fenced()
+
+    def _require_read_only_consistent_fenced(self) -> None:
+        """Run the read-only proof after commit/checkpoint WAL mutation is excluded."""
+        self._check_meta()
+        state = self._state_store.read()
+        plan = plan_recovery(
+            self._wal.scan_all(), floor_lsn=state.checkpoint_lsn
+        )
+        if plan.unsupported is not None:
+            raise GrafxSchemaVersionMismatch(
+                f"The log holds a record this build cannot read at byte "
+                f"{plan.unsupported.offset} of {plan.unsupported.segment!r}; a read-only open "
+                "cannot prove that the checkpoint covers it.",
+                file=plan.unsupported.segment,
+                offset=plan.unsupported.offset,
+                field="format_version",
+            )
+        replay = committed_replay(plan.replayable)
+        expected_first = state.checkpoint_lsn + 1
+        observed_first = plan.replayable[0].lsn if plan.replayable else None
+        state_invalid = state.checkpoint_lsn > state.last_committed_lsn
+        state_needs_replay = state.last_committed_lsn > state.checkpoint_lsn
+        wal_needs_replay = replay.last_committed_lsn > state.checkpoint_lsn
+        wal_has_ambiguous_effects = bool(replay.incomplete_effects)
+        lineage_missing = observed_first is not None and observed_first != expected_first
+        if not (
+            state_invalid
+            or state_needs_replay
+            or wal_needs_replay
+            or wal_has_ambiguous_effects
+            or lineage_missing
+            or plan.damaged
+        ):
+            return
+        raise GrafxUnsupportedOperation(
+            "A read-only open cannot prove a checkpoint-complete database from commit.state "
+            "and the WAL. Open writable, run recovery and checkpoint, then reopen read-only.",
+            field="read_only_consistency",
+            last_committed_lsn=state.last_committed_lsn,
+            checkpoint_lsn=state.checkpoint_lsn,
+            wal_committed_lsn=replay.last_committed_lsn,
+            incomplete_effect_lsns=tuple(
+                record.lsn for record in replay.incomplete_effects
+            ),
+            expected_first_lsn=expected_first,
+            observed_first_lsn=observed_first,
+            wal_damaged=plan.damaged,
+        )
+
+    def _run_fenced(self) -> RecoveryReport:
+        """Execute one pass after the caller has excluded commit/checkpoint WAL mutation."""
         findings: list[RecoveryFinding] = []
         self._check_meta()
-        plan = self._scan(findings)
+        state, state_was_damaged = self._read_recovery_state()
+        manager = self._index_manager
+        plan = self._scan(findings, floor_lsn=state.checkpoint_lsn)
         if plan.unsupported is not None:
             raise GrafxSchemaVersionMismatch(
                 f"The log holds a record this build cannot read at byte {plan.unsupported.offset} "
@@ -301,6 +462,22 @@ class RecoveryManager:
                 file=plan.unsupported.segment,
                 offset=plan.unsupported.offset,
                 field="format_version",
+            )
+        replay = committed_replay(plan.replayable)
+        self._validate_publication_lineage(state, state_was_damaged, plan, replay)
+        # This is the last read-only gate before recovery can preserve/cut WAL bytes or persist
+        # a conservative stale bit into an index header. A bad effect late in the committed plan
+        # must not leave either an applied page prefix or unrelated control/index publication
+        # behind merely because static validation used to live inside the later redo step.
+        self._preflight_committed_replay(replay)
+        if manager is not None and not state_was_damaged:
+            # The checkpoint is the replay floor. An index already behind it cannot be completed
+            # from the retained WAL suffix and must be marked stale BEFORE replay; otherwise the
+            # final mark_built_through would certify a permanently missing historical entry.
+            # Even the in-memory verdict follows preflight so a byte-identical refusal has no
+            # state transition to unwind.
+            manager.check_replay_floor(
+                state.checkpoint_lsn, persist_stale=False
             )
         outcome = OUTCOME_CLEAN
         entries_created = 0
@@ -329,7 +506,23 @@ class RecoveryManager:
             # ``test_a_clean_log_under_refuse_leaves_a_damaged_ledger_exactly_as_it_was``.
             if self._policy != POLICY_REFUSE:
                 self._repair_ledger(findings)
-        replayed = self._redo(plan, findings)
+        if (
+            manager is not None
+            and not state_was_damaged
+            and self._policy != POLICY_REFUSE
+        ):
+            # Only after the policy has accepted mutation may the conservative verdict become a
+            # durable stale bit. The refuse policy promises byte-for-byte non-interference.
+            manager.check_replay_floor(
+                state.checkpoint_lsn, persist_stale=True
+            )
+        replayed = self._redo(
+            plan,
+            findings,
+            replay=replay,
+            state=state,
+            state_was_damaged=state_was_damaged,
+        )
         self._count_outcome(outcome)
         report = RecoveryReport(
             outcome=outcome,
@@ -540,10 +733,11 @@ class RecoveryManager:
             )
         )
 
-    def _scan(self, findings: list[RecoveryFinding]) -> RecoveryPlan:
+    def _scan(
+        self, findings: list[RecoveryFinding], *, floor_lsn: Lsn = NO_LSN
+    ) -> RecoveryPlan:
         """Step 2: walk the log and decide where the good work ended."""
-        floor = self._checkpoint_lsn()
-        plan = plan_recovery(self._wal.scan_all(), floor_lsn=floor)
+        plan = plan_recovery(self._wal.scan_all(), floor_lsn=floor_lsn)
         for discontinuity in plan.discontinuities:
             findings.append(
                 RecoveryFinding(
@@ -735,61 +929,161 @@ class RecoveryManager:
                 length=report.removed_bytes,
             )
         )
+        if not report.completed:
+            raise GrafxRecoveryRefused(
+                detail,
+                retryable=True,
+                field="wal_truncation",
+                last_good_lsn=plan.last_good_lsn,
+                attempts=attempt,
+                deferred_segments=tuple(report.deferred_segments),
+            )
 
-    def _redo(self, plan: RecoveryPlan, findings: list[RecoveryFinding]) -> int:
-        """Step 5: reapply the page writes of committed transactions, idempotently.
+    def _preflight_committed_replay(self, replay: CommittedReplay) -> None:
+        """Validate every committed effect before recovery performs its first mutation.
 
-        The redo door is C1's ``apply_page_image``, and using it rather than writing the rule
-        again is deliberate: the same rule decides here and in the commit path, so the two cannot
-        drift into disagreeing about which image wins. It applies when the resident page is free
-        or older, grows the file when the page is missing, and leaves a newer page alone -- which
-        is what makes replaying the same log twice produce the same file.
-
-        The count returned is the number of records REPLAYED -- offered to that rule and not
-        refused -- and not the number of pages it changed. The two differ exactly when a page is
-        already at or above the image's sequence number, which is the ordinary case for a database
-        that closed cleanly; reporting zero there would say recovery did not look at the log.
+        Startup intentionally delays catalog interpretation until recovery owns the commit
+        section. If this replay does not replace catalog pages, the existing catalog can safely
+        populate the registry before strict validation. If it does replace them, only lookups of
+        names introduced by those pages are deferred; payload/image validation still runs now,
+        and the index-only subplan is preflighted strictly after adoption inside :meth:`_redo`.
         """
-        replayed = 0
+        touched_catalog = any(
+            decode_page_write(record.payload).file == _CATALOG_FILE
+            for record in replay.effects
+            if record.record_type == int(WalRecordType.WRITE_PAGE)
+        )
+        if not touched_catalog and self._index_sync is not None:
+            self._index_sync()
+        self._redo_engine.preflight(
+            replay,
+            allow_unregistered_indexes=touched_catalog,
+        )
+
+    def _redo(
+        self,
+        plan: RecoveryPlan,
+        findings: list[RecoveryFinding],
+        *,
+        replay: CommittedReplay,
+        state: CommitState,
+        state_was_damaged: bool,
+    ) -> int:
+        """Complete committed WAL work and publish it as one fail-closed unit.
+
+        Page effects land first so catalog pages can be adopted and the index registry can be
+        synchronised before logical index records are dispatched.  No effect refusal is turned
+        into a successful report: publishing a watermark after skipping one mandatory effect
+        would make a partial commit visible permanently.
+        """
+        del plan  # the committed replay is the only part of the scan this stage consumes
+        page_records = tuple(
+            record
+            for record in replay.effects
+            if record.record_type == int(WalRecordType.WRITE_PAGE)
+        )
+        index_records = tuple(
+            record
+            for record in replay.effects
+            if record.record_type
+            in (int(WalRecordType.INDEX_WRITE), int(WalRecordType.INDEX_RECONCILE))
+        )
         touched_catalog = False
-        for record in redo_order(plan.replayable):
+        for record in page_records:
             write = decode_page_write(record.payload)
-            if not _is_redoable(write.file):
+            if not is_redoable_page_file(write.file):
                 findings.append(
                     RecoveryFinding(
                         kind=FindingKind.REDO_REFUSED,
                         detail=(
                             f"Record {record.lsn} names {write.file!r}, which is not a paged "
-                            "file of this database; no page image was applied to it."
+                            "file of this database; commit completion was refused."
                         ),
                         file=write.file,
                         lsn=record.lsn,
                     )
                 )
-                continue
-            try:
-                apply_page_image(self._pool, write.file, write.page_index, write.image)
-            except GrafxCorruptionDetected as damaged:
-                findings.append(
-                    RecoveryFinding(
-                        kind=FindingKind.REDO_REFUSED,
-                        detail=(
-                            f"The page image of record {record.lsn} for page "
-                            f"{write.page_index} of {write.file!r} was refused: {damaged.message}"
-                        ),
-                        file=write.file,
-                        page=write.page_index,
-                        lsn=record.lsn,
-                    )
+                raise GrafxRecoveryRefused(
+                    f"Committed page record {record.lsn} names non-data file "
+                    f"{write.file!r}; commit-state publication was refused.",
+                    field="file",
+                    file=write.file,
+                    lsn=record.lsn,
                 )
-                continue
-            replayed += 1
-            if write.file == _CATALOG_FILE:
-                touched_catalog = True
-        if replayed and self._metrics.enabled:
-            self._metrics.increment(RECOVERY_REPLAYS_TOTAL, float(replayed))
+            touched_catalog = touched_catalog or write.file == _CATALOG_FILE
+
+        page_replay = CommittedReplay(
+            effects=page_records, last_committed_lsn=replay.last_committed_lsn
+        )
+        index_replay = CommittedReplay(
+            effects=index_records, last_committed_lsn=replay.last_committed_lsn
+        )
+        manager = self._index_manager
+        if not touched_catalog and self._index_sync is not None:
+            # Startup deliberately postpones interpreting catalog bytes until recovery owns the
+            # commit section. When this WAL range does not replace catalog pages, the existing
+            # catalog is already the authority, so adopt its existing indexes now. This turns
+            # an absent mandatory index into a preflight refusal before heap pages move.
+            self._index_sync()
+        # Decode and statically validate the whole committed plan before the first real page
+        # changes. A catalog effect may be the authority that introduces an index to this
+        # participant, so only that registry lookup is deferred; after catalog adoption the
+        # index-only apply below performs its ordinary strict preflight before dispatch.
+        self._redo_engine.preflight(
+            replay,
+            allow_unregistered_indexes=touched_catalog,
+        )
+        target = max(state.last_committed_lsn, replay.last_committed_lsn)
+        # The scan proves that the bytes form complete records; it does not prove that the process
+        # which appended them forced them to stable storage. Recovery must establish that proof
+        # before the first data-page apply and, especially, before publishing commit.state. Use
+        # the explicit range door rather than WalManager's pending cache: an earlier barrier may
+        # have emptied that cache without proving these foreign bytes for this publication.
+        if target > state.checkpoint_lsn:
+            first = NO_LSN + 1 if state_was_damaged else state.checkpoint_lsn + 1
+            self._wal.force_barrier_range(first, target)
+        page_result = self._redo_engine.apply(page_replay)
         if touched_catalog:
             self._adopt_catalog(findings)
+        if touched_catalog and self._index_sync is not None:
+            self._index_sync()
+        if manager is not None and not state_was_damaged:
+            # Startup could not register the persistent indexes until catalog page redo made
+            # their definitions readable. Check those newly adopted files against the retained
+            # WAL floor before replay can certify them through the final target.
+            manager.check_replay_floor(
+                state.checkpoint_lsn,
+                persist_stale=self._policy != POLICY_REFUSE,
+            )
+        index_result = self._redo_engine.apply(index_replay)
+
+        # Make every replayed heap/catalog/index effect visible to the device before certifying
+        # derived indexes. If a data flush fails, no fresh header may get ahead of the data it
+        # claims to cover.
+        self._redo_engine.flush(page_result)
+        self._redo_engine.flush(index_result)
+        if manager is not None and target > NO_LSN:
+            marker = getattr(manager, "mark_built_through", None)
+            if not callable(marker):
+                raise GrafxRecoveryRefused(
+                    "Recovery has an index manager that cannot certify completed replay.",
+                    field="index_manager",
+                )
+            marker(target)
+
+        # WAL remains the durability authority; publication below is the last visible act.
+        if target > state.last_committed_lsn or state_was_damaged:
+            self._state_store.publish(
+                CommitState(
+                    last_committed_lsn=target,
+                    last_csn=target,
+                    checkpoint_lsn=state.checkpoint_lsn,
+                )
+            )
+
+        replayed = page_result.effects_replayed + index_result.effects_replayed
+        if replayed and self._metrics.enabled:
+            self._metrics.increment(RECOVERY_REPLAYS_TOTAL, float(replayed))
         return replayed
 
     def _adopt_catalog(self, findings: list[RecoveryFinding]) -> None:
@@ -804,16 +1098,20 @@ class RecoveryManager:
         if self._catalog is None:
             findings.append(
                 RecoveryFinding(
-                    kind=FindingKind.CATALOG_ADOPTED,
+                    kind=FindingKind.CATALOG_UNREADABLE,
                     detail=(
                         "Catalog pages were replayed and no catalog store is wired to this "
-                        "recovery, so the caller must read its catalog from the pages and adopt "
-                        "it before saving; a plain save would be refused."
+                        "recovery, so commit completion cannot safely publish them."
                     ),
                     file=_CATALOG_FILE,
                 )
             )
-            return
+            raise GrafxRecoveryRefused(
+                "Recovery replayed catalog pages but has no catalog store to adopt them; "
+                "commit-state publication was refused.",
+                field="catalog",
+                file=_CATALOG_FILE,
+            )
         try:
             adopted = self._catalog.adopt(self._catalog.read_from_pages())
         except GrafxError as failure:
@@ -827,7 +1125,7 @@ class RecoveryManager:
                     file=_CATALOG_FILE,
                 )
             )
-            return
+            raise
         findings.append(
             RecoveryFinding(
                 kind=FindingKind.CATALOG_ADOPTED,
@@ -842,6 +1140,154 @@ class RecoveryManager:
 
     # --- helpers -----------------------------------------------------------------------------
 
+    def _read_recovery_state(self) -> tuple[CommitState, bool]:
+        """Return the strict published state and whether damaged bytes had to be rebuilt.
+
+        Corruption is recoverable only from a complete WAL lineage and is checked before any
+        destructive step by :meth:`_validate_publication_lineage`. Intact bytes from a newer
+        format and transient device failures propagate unchanged; neither is evidence that the
+        state may be replaced.
+        """
+        try:
+            return self._state_store.read(), False
+        except GrafxCorruptionDetected:
+            return CommitState(), True
+
+    def _validate_publication_lineage(
+        self,
+        state: CommitState,
+        state_was_damaged: bool,
+        plan: RecoveryPlan,
+        replay: CommittedReplay,
+    ) -> None:
+        """Refuse to invent or regress a published commit watermark from an incomplete WAL."""
+        if state.checkpoint_lsn > state.last_committed_lsn:
+            raise GrafxRecoveryRefused(
+                "The published checkpoint is ahead of the last committed LSN; recovery cannot "
+                "derive a safe replay floor.",
+                field="checkpoint_lsn",
+                checkpoint_lsn=state.checkpoint_lsn,
+                last_committed_lsn=state.last_committed_lsn,
+            )
+        if plan.last_good_lsn < state.checkpoint_lsn:
+            # Recycling deliberately retains the segment that reaches the published checkpoint.
+            # Falling below it therefore means the WAL no longer carries the sequence anchor
+            # that keeps future appends above the page replay floor. Truncating there would let
+            # WalManager reuse LSNs at or below the checkpoint; a later recovery would filter
+            # their page images out and could publish their COMMIT as an empty transaction.
+            raise GrafxRecoveryRefused(
+                "The trustworthy WAL prefix ends below the published checkpoint; recovery "
+                "will not truncate into the replay floor or allow its sequence numbers to be "
+                "reused.",
+                field="wal_lineage",
+                checkpoint_lsn=state.checkpoint_lsn,
+                last_good_lsn=plan.last_good_lsn,
+            )
+        damage_positions = tuple((item.segment, item.offset) for item in plan.ranges)
+        effect_types = {
+            int(WalRecordType.WRITE_PAGE),
+            int(WalRecordType.INDEX_WRITE),
+            int(WalRecordType.INDEX_RECONCILE),
+        }
+        ambiguous_tail = tuple(
+            discarded.record
+            for discarded in plan.records
+            if discarded.record.lsn > state.last_committed_lsn
+            and (
+                discarded.record.record_type == int(WalRecordType.COMMIT)
+                or (
+                    discarded.record.record_type in effect_types
+                    and any(
+                        position > (discarded.segment, discarded.offset)
+                        for position in damage_positions
+                    )
+                )
+            )
+        )
+        if ambiguous_tail:
+            # A decoder failure cuts the trustworthy prefix, but later bytes may still decode.
+            # Those records cannot be treated as an unapplied tail: the old live path barriers
+            # the complete batch, applies its effects, and only then publishes commit.state. If
+            # corruption later destroys the FIRST effect, the surviving COMMIT sits above the
+            # cut and replay sees neither it nor an incomplete effect; truncating would leave the
+            # already-applied page/index state behind as a ghost. With no UNDO or batch digest,
+            # a surviving COMMIT above the already-published watermark (or a later damaged range
+            # that may have held one) makes physical application ambiguous. Duplicate records at
+            # or below commit.state can be left by a crash during segment replacement and are
+            # already proven/applied; effects that reach the end with no COMMIT are likewise
+            # provably unapplied by the live protocol and remain safe reapplicable discards.
+            transactions = tuple(
+                sorted({(record.epoch, record.txn_id) for record in ambiguous_tail})
+            )
+            record_lsns = tuple(record.lsn for record in ambiguous_tail)
+            raise GrafxRecoveryRefused(
+                "The WAL contains transactional records after its first damaged byte range. "
+                "Those records may belong to a batch whose effects already reached the data "
+                "files, so truncating the batch cannot prove atomicity without UNDO.",
+                field="wal_lineage",
+                incomplete_effect_lsns=record_lsns,
+                incomplete_transactions=transactions,
+                discarded_record_lsns=record_lsns,
+                last_good_lsn=plan.last_good_lsn,
+            )
+        if replay.incomplete_effects:
+            # A successful WAL barrier is followed by page/index apply and only then by
+            # commit.state publication. Damage can therefore erase a COMMIT record after its
+            # effects reached the device. Treating those effects as merely uncommitted leaves
+            # future MVCC watermarks free to make an orphaned row visible, and logical index
+            # effects provide no general physical test that could prove they were not applied.
+            # With no UNDO record, preserving the ambiguous tail is the only safe answer.
+            pending = replay.incomplete_effects
+            transactions = tuple(
+                sorted({(record.epoch, record.txn_id) for record in pending})
+            )
+            raise GrafxRecoveryRefused(
+                "The retained WAL ends with durable effects whose COMMIT or ABORT outcome "
+                "cannot be proved. Continuing or truncating could leave applied effects that "
+                "a later watermark would legitimize.",
+                field="wal_lineage",
+                incomplete_effect_lsns=tuple(record.lsn for record in pending),
+                incomplete_transactions=transactions,
+                last_good_lsn=plan.last_good_lsn,
+            )
+        records = plan.replayable
+        expected_first = NO_LSN + 1 if state_was_damaged else state.checkpoint_lsn + 1
+        needs_lineage = state_was_damaged or state.last_committed_lsn > state.checkpoint_lsn
+        if records and records[0].lsn != expected_first:
+            raise GrafxRecoveryRefused(
+                f"Recovery expected WAL record {expected_first} after its replay floor, but the "
+                f"first retained record is {records[0].lsn}; a recycled prefix prevents safe "
+                "commit-state reconstruction.",
+                field="wal_lineage",
+                expected_lsn=expected_first,
+                observed_lsn=records[0].lsn,
+            )
+        if needs_lineage and not records:
+            raise GrafxRecoveryRefused(
+                "The published state needs WAL completion, but no retained record proves the "
+                "lineage after its checkpoint.",
+                field="wal_lineage",
+                checkpoint_lsn=state.checkpoint_lsn,
+                last_committed_lsn=state.last_committed_lsn,
+            )
+        if (
+            state.last_committed_lsn > state.checkpoint_lsn
+            and replay.last_committed_lsn < state.last_committed_lsn
+        ):
+            raise GrafxRecoveryRefused(
+                "The WAL no longer proves the commit already named by commit.state; recovery "
+                "will not lower a published snapshot.",
+                field="last_committed_lsn",
+                published_lsn=state.last_committed_lsn,
+                recovered_lsn=replay.last_committed_lsn,
+            )
+        if state_was_damaged and replay.last_committed_lsn == NO_LSN:
+            raise GrafxRecoveryRefused(
+                "commit.state is damaged and the retained WAL proves no complete commit; "
+                "recovery cannot invent a published state.",
+                field="commit_state",
+            )
+
     def _checkpoint_lsn(self) -> Lsn:
         """Return the published checkpoint, or zero when there is none to read.
 
@@ -850,14 +1296,7 @@ class RecoveryManager:
         recovery redo more, which is idempotent. Refusing here would wedge the database on a file
         that no data depends on.
         """
-        if not self._storage.exists(COMMIT_STATE_FILE):
-            return NO_LSN
-        try:
-            size = self._storage.log_size(COMMIT_STATE_FILE)
-            state = CommitState.decode(self._storage.read_log(COMMIT_STATE_FILE, 0, size))
-        except GrafxError:
-            return NO_LSN
-        return state.checkpoint_lsn
+        return self._state_store.checkpoint_hint()
 
     def _probe_damage(self, file: str) -> str | None:
         """Return why the probe says a control record is damaged, or None when it reads cleanly.
@@ -994,8 +1433,6 @@ class RecoveryManager:
 
 
 _CATALOG_FILE: str = "catalog.dat"
-_REDOABLE_FILES: frozenset[str] = frozenset({"heap.dat", _CATALOG_FILE})
-_REDOABLE_PREFIXES: tuple[str, ...] = ("index/",)
 
 
 def _carried_body(body: bytes, entry_name: str, detail: str) -> tuple[bytes, str]:
@@ -1011,23 +1448,6 @@ def _carried_body(body: bytes, entry_name: str, detail: str) -> tuple[bytes, str
         f"{detail} The range is {len(body)} bytes, past the {MAX_LEDGER_BODY_BYTES} an entry "
         f"carries, so the bytes are preserved in quarantine entry {entry_name!r}."
     )
-
-
-def _is_redoable(file: str) -> bool:
-    """Return whether a page image may be applied to this file.
-
-    G6 protects the main data files from being MOVED, renamed or deleted; writing a logged page
-    into one is not that -- it is the redo those files exist for. What is refused here is a record
-    naming anything that is not a paged file of this database: a control record, a log segment or
-    a quarantine copy. Applying a page image to one of those would be this component manufacturing
-    the corruption it exists to answer.
-    """
-    if not isinstance(file, str) or not file:
-        return False
-    normalised = file.replace("\\", "/")
-    if normalised in _REDOABLE_FILES:
-        return True
-    return any(normalised.startswith(prefix) for prefix in _REDOABLE_PREFIXES)
 
 
 def _require_port(slot: str, instance: object, methods: Sequence[str]) -> None:
@@ -1070,6 +1490,24 @@ def _validate_policy(policy: object) -> str:
             value=repr(policy),
         )
     return str(policy)
+
+
+def _require_timeout(field: str, value: object) -> float:
+    """Return a finite positive timeout for the shared recovery section."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise GrafxConfigurationError(
+            f"The {field} must be a positive number; got {value!r}.",
+            field=field,
+            value=repr(value),
+        )
+    timeout = float(value)
+    if not timeout > 0.0 or timeout != timeout or timeout == float("inf"):
+        raise GrafxConfigurationError(
+            f"The {field} must be finite and greater than zero; got {value!r}.",
+            field=field,
+            value=repr(value),
+        )
+    return timeout
 
 
 def _require_text(field: str, value: object) -> str:

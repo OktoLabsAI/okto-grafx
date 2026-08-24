@@ -85,6 +85,45 @@ class BarrierRefusingDevice:
         self._inner.durable_barrier(file)
 
 
+class PostWriteFailingDevice:
+    """Raise a foreign exception only after the wrapped append stored every byte."""
+
+    def __init__(
+        self,
+        inner: MemoryStorageDevice,
+        failure: BaseException,
+        *,
+        rollback_failure: BaseException | None = None,
+    ) -> None:
+        self._inner = inner
+        self.failure: BaseException | None = failure
+        self.rollback_failure = rollback_failure
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    @property
+    def name(self) -> str:
+        return self._inner.name
+
+    @property
+    def page_size(self) -> int:
+        return self._inner.page_size
+
+    def append_log(self, file: str, payload: bytes) -> int:
+        offset = self._inner.append_log(file, payload)
+        failure = self.failure
+        self.failure = None
+        if failure is not None:
+            raise failure
+        return offset
+
+    def truncate_log(self, file: str, size: int) -> None:
+        if self.rollback_failure is not None:
+            raise self.rollback_failure
+        self._inner.truncate_log(file, size)
+
+
 class CallRecordingDevice:
     """A device that remembers every port call it served, with the argument that mattered."""
 
@@ -143,6 +182,140 @@ def test_every_door_refuses_before_open(
 
 
 # --- appending -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (RuntimeError("post-write runtime failure"), KeyboardInterrupt()),
+    ids=("runtime-error", "keyboard-interrupt"),
+)
+def test_a_foreign_escape_after_the_physical_append_rolls_the_whole_batch_back(
+    make_wal: Callable[..., WalManager],
+    memory_device: MemoryStorageDevice,
+    failure: BaseException,
+) -> None:
+    device = PostWriteFailingDevice(memory_device, failure)
+    manager = make_wal(device)
+
+    with pytest.raises(type(failure)) as escaped:
+        manager.append_many((make_record(1), make_record(2)))
+
+    assert escaped.value is failure
+    assert manager.last_lsn == 0
+    assert manager.damage is None
+    assert memory_device.list_files("wal/") == ()
+    assert manager.append(make_record(3)) == 2
+
+
+def test_failed_rollback_marks_the_wal_damaged_without_replacing_the_append_failure(
+    make_wal: Callable[..., WalManager], memory_device: MemoryStorageDevice
+) -> None:
+    primary = RuntimeError("post-write append failure")
+    rollback = KeyboardInterrupt()
+    manager = make_wal(
+        PostWriteFailingDevice(
+            memory_device,
+            primary,
+            rollback_failure=rollback,
+        )
+    )
+
+    with pytest.raises(RuntimeError) as escaped:
+        manager.append(make_record())
+
+    assert escaped.value is primary
+    # The surviving batch is complete and decodes cleanly, so scan damage alone cannot remember
+    # that the caller observed a failed outcome. The independent uncertainty latch must.
+    assert manager.damage is None
+    assert manager.append_uncertain is True
+    with pytest.raises(GrafxCorruptionDetected) as refused:
+        manager.append(make_record(2))
+    assert refused.value.details["reason"] == "append_uncertain"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (RuntimeError("registration failed"), KeyboardInterrupt()),
+    ids=("runtime-error", "keyboard-interrupt"),
+)
+def test_a_foreign_escape_after_registration_restores_bytes_and_memory_exactly(
+    make_wal: Callable[..., WalManager],
+    memory_device: MemoryStorageDevice,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    manager = make_wal(memory_device)
+    original = WalManager._register_append
+
+    def register_then_fail(wal: WalManager, *args: Any, **kwargs: Any) -> None:
+        original(wal, *args, **kwargs)
+        raise failure
+
+    monkeypatch.setattr(WalManager, "_register_append", register_then_fail)
+
+    with pytest.raises(type(failure)) as escaped:
+        manager.append_many((make_record(1), make_record(2)))
+
+    assert escaped.value is failure
+    assert manager.last_lsn == 0
+    assert manager.segments() == ()
+    assert manager.total_bytes() == 0
+    assert manager.append_uncertain is False
+    assert memory_device.list_files("wal/") == ()
+
+
+def test_metrics_failure_after_registration_cannot_make_a_successful_append_ambiguous(
+    make_wal: Callable[..., WalManager],
+    memory_device: MemoryStorageDevice,
+    metrics: RecordingMetricsSink,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = make_wal(memory_device)
+    # Finish the deferred read-only index pass before arming the sink, so the injected escape is
+    # specifically the post-append publication inside _register_append.
+    assert manager.last_lsn == 0
+
+    def fail_gauge(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("metrics sink failed")
+
+    monkeypatch.setattr(metrics, "set_gauge", fail_gauge)
+
+    committed = manager.append(make_record(1))
+
+    assert committed == manager.last_lsn == 2
+    assert manager.append_uncertain is False
+
+
+def test_planning_includes_the_segment_header_and_append_revalidates_it(
+    wal: WalManager,
+) -> None:
+    records = (make_record(1), make_record(2, record_type=WalRecordType.COMMIT))
+
+    planned = wal.planned_terminal_lsn(records)
+
+    assert planned == 3  # SEGMENT_HEADER + two caller records
+    assert wal.append_many(records, expected_terminal_lsn=planned) == planned
+
+
+def test_tail_drift_after_planning_is_refused_before_this_writer_adds_a_byte(
+    make_wal: Callable[..., WalManager], memory_device: MemoryStorageDevice
+) -> None:
+    first = make_wal(memory_device)
+    records = (make_record(1), make_record(2, record_type=WalRecordType.COMMIT))
+    planned = first.planned_terminal_lsn(records)
+    second = make_wal(memory_device)
+    second.append(make_record(9))
+    sizes_before = {
+        name: memory_device.log_size(name) for name in memory_device.list_files("wal/")
+    }
+
+    with pytest.raises(GrafxTransactionStateError) as refused:
+        first.append_many(records, expected_terminal_lsn=planned)
+
+    assert refused.value.details["field"] == "expected_terminal_lsn"
+    assert {
+        name: memory_device.log_size(name) for name in memory_device.list_files("wal/")
+    } == sizes_before
 
 
 def test_sequence_numbers_start_at_one_and_never_skip(wal: WalManager) -> None:
@@ -292,6 +465,27 @@ def test_a_second_participant_never_writes_a_sequence_number_the_first_used(
     lsns = [record.lsn for record in cold.read_from(0)]
     assert lsns == list(range(1, len(lsns) + 1))
     assert len(set(lsns)) == len(lsns)
+
+
+def test_a_tail_that_grows_after_truncated_observation_is_rebuilt_from_its_record_start(
+    make_wal: Callable[..., WalManager], memory_device: MemoryStorageDevice
+) -> None:
+    writer = make_wal(memory_device)
+    writer.append(make_record(1))
+    observer = make_wal(memory_device)
+    assert observer.last_lsn == 2
+    segment = writer.segments()[-1].name
+    completed = make_record(2).with_lsn(3).encode()
+
+    memory_device.append_log(segment, completed[:-1])
+    assert observer.damage is not None
+    assert observer.damage.reason is FailureReason.TRUNCATED_TAIL
+
+    memory_device.append_log(segment, completed[-1:])
+
+    assert observer.damage is None
+    assert observer.last_lsn == 3
+    assert [record.lsn for record in observer.read_from(1)] == [1, 2, 3]
 
 
 def test_two_participants_taking_turns_keep_the_log_contiguous(
@@ -1060,6 +1254,23 @@ def test_a_barrier_with_nothing_pending_touches_no_device(
     device.flushed.clear()
     manager.barrier()
     assert device.flushed == []
+
+
+def test_a_forced_range_barriers_again_after_the_pending_cache_was_emptied(
+    make_wal: Callable[..., WalManager], memory_device: MemoryStorageDevice
+) -> None:
+    device = BarrierRefusingDevice(memory_device)
+    manager = make_wal(device)
+    through = manager.append_many(
+        (make_record(1), make_record(2, record_type=WalRecordType.COMMIT))
+    )
+    manager.barrier()
+    device.flushed.clear()
+
+    forced = manager.force_barrier_range(1, through)
+
+    assert forced == (manager.segments()[0].name,)
+    assert device.flushed == list(forced)
 
 
 def test_a_failed_barrier_is_counted_and_re_raised(

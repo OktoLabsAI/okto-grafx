@@ -30,7 +30,17 @@ from okto_grafx.domain.errors import (
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
 )
-from okto_grafx.domain.ids import NO_PAGE, Csn, PageIndex, RecordId, RecordRef, SlotId
+from okto_grafx.domain.ids import (
+    NO_PAGE,
+    PROVISIONAL_CSN,
+    Csn,
+    PageIndex,
+    RecordId,
+    RecordRef,
+    SlotId,
+    is_open_end_csn,
+    is_provisional_csn,
+)
 from okto_grafx.domain.model.record import (
     NO_PREVIOUS_VERSION,
     RECORD_FLAG_DELETED,
@@ -290,7 +300,9 @@ class TableExtent:
                 field="directory_entry",
                 value=len(raw),
             )
-        table_id, first_page, last_page, page_count, next_record_id = _DIRECTORY_ENTRY.unpack(raw)
+        table_id, first_page, last_page, page_count, next_record_id = (
+            _DIRECTORY_ENTRY.unpack(raw)
+        )
         if next_record_id < FIRST_RECORD_ID:
             # The catalog makes the same refusal about its own counters: a stored counter below
             # the first id that can exist is not a small number, it is a number that would hand
@@ -704,7 +716,17 @@ class HeapStore:
                 )
             content = old_page.read_slot(ref.slot)
             previous = RecordHeader.decode(content)
-            if previous.xmax != 0:
+            if is_provisional_csn(previous.xmin):
+                raise GrafxTransactionStateError(
+                    f"Version {ref.page}:{ref.slot} of record {previous.record_id} is an "
+                    "abandoned provisional birth and cannot be updated.",
+                    file=self._file,
+                    page=ref.page,
+                    slot=ref.slot,
+                    xmin=PROVISIONAL_CSN,
+                    field="provisional_birth",
+                )
+            if not is_open_end_csn(previous.xmax):
                 raise GrafxTransactionStateError(
                     f"Version {ref.page}:{ref.slot} of record {previous.record_id} already "
                     f"ended at {previous.xmax} and cannot be updated.",
@@ -724,7 +746,9 @@ class HeapStore:
             )
             new_ref = self._store_version(table, header, payload)
             ended = previous.ended_at(xmin, deleted=False)
-            old_page.update_slot(ref.slot, ended.encode() + content[RECORD_HEADER_SIZE:])
+            old_page.update_slot(
+                ref.slot, ended.encode() + content[RECORD_HEADER_SIZE:]
+            )
         return new_ref
 
     def delete(self, table: TableDef, ref: RecordRef, xmax: Csn) -> None:
@@ -778,9 +802,11 @@ class HeapStore:
         seen: set[int] = visited_pages()
         # A version chain visits distinct slots, so the pages of the file times the slots a page
         # can hold is an upper bound it can never legitimately reach.
-        limit = self._pool.storage.page_count(self._file) * (
-            self._pool.page_size // SLOT_ENTRY_SIZE
-        ) + 1
+        limit = (
+            self._pool.storage.page_count(self._file)
+            * (self._pool.page_size // SLOT_ENTRY_SIZE)
+            + 1
+        )
         current: RecordRef | None = ref
         while current is not None:
             refuse_endless_chain(self._file, len(chain) + 1, limit)
@@ -1396,7 +1422,17 @@ class HeapStore:
                 )
             content = page.read_slot(ref.slot)
             header = RecordHeader.decode(content)
-            if header.xmax != 0:
+            if is_provisional_csn(header.xmin):
+                raise GrafxTransactionStateError(
+                    f"Version {ref.page}:{ref.slot} of record {header.record_id} is an "
+                    "abandoned provisional birth and cannot be ended.",
+                    file=self._file,
+                    page=ref.page,
+                    slot=ref.slot,
+                    xmin=PROVISIONAL_CSN,
+                    field="provisional_birth",
+                )
+            if not is_open_end_csn(header.xmax):
                 raise GrafxTransactionStateError(
                     f"Version {ref.page}:{ref.slot} of record {header.record_id} already ended "
                     f"at {header.xmax}.",
@@ -1408,9 +1444,7 @@ class HeapStore:
             ended = header.ended_at(xmax, deleted=deleted)
             page.update_slot(ref.slot, ended.encode() + content[RECORD_HEADER_SIZE:])
 
-    def _walk(
-        self, table: TableDef
-    ) -> Iterator[tuple[RecordRef, RecordHeader, bytes]]:
+    def _walk(self, table: TableDef) -> Iterator[tuple[RecordRef, RecordHeader, bytes]]:
         """Yield every stored version of the table with its location and its raw content.
 
         One page at a time is pinned and its slots are copied out before anything is decoded, so
@@ -1443,7 +1477,11 @@ class HeapStore:
                 )
                 following = page.next_page
             for slot, content in items:
-                yield RecordRef(page=index, slot=slot), RecordHeader.decode(content), content
+                yield (
+                    RecordRef(page=index, slot=slot),
+                    RecordHeader.decode(content),
+                    content,
+                )
             index = following
 
     def _decode_version(self, table: TableDef, content: bytes) -> HeapVersion:

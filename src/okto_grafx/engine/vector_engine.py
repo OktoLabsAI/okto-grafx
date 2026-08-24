@@ -78,6 +78,7 @@ from okto_grafx.domain.errors import (
     GrafxVectorValidationError,
 )
 from okto_grafx.domain.ids import Csn, Lsn, RecordId, RecordRef
+from okto_grafx.domain.index.definition import IndexDefinition
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.records import IndexChange, IndexOperation
 from okto_grafx.domain.index.visibility import IndexVisibility, SnapshotLike, entry_visible
@@ -1076,7 +1077,13 @@ class VectorEngine:
         self._emit("vector.space_retired", space=retired.name)
 
     def attach(
-        self, table: TableDef, space_name: str, catalog: object = None
+        self,
+        table: TableDef,
+        space_name: str,
+        catalog: object = None,
+        *,
+        existing_only: bool = False,
+        persist_stale: bool = True,
     ) -> VectorHnswIndex:
         """Create and register the index of one embedding space over one table (TR-2).
 
@@ -1117,7 +1124,9 @@ class VectorEngine:
             ef_search=self._ef_search,
             guard=self._guard,
         )
-        registry.register(index)
+        registry.register(
+            index, existing_only=existing_only, persist_stale=persist_stale
+        )
         self._by_space[space.name] = index
         self._maintained_at[space.name] = self._clock.monotonic()
         self._publish_space_metrics()

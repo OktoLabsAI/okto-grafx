@@ -37,13 +37,13 @@ class _ContainedTimer(AbstractContextManager):
     def __enter__(self) -> object:
         try:
             return self._inner.__enter__()  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001 - the whole point of the shell
+        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
             return None
 
     def __exit__(self, kind: object, value: object, trace: object) -> bool:
         try:
             self._inner.__exit__(kind, value, trace)  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
             pass
         return False
 
@@ -66,49 +66,49 @@ class ContainedMetricsSink:
         """Return the inner sink's answer, and False when even asking raises."""
         try:
             return bool(self._inner.enabled)
-        except Exception:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
             return False
 
     def register(self, descriptor: MetricDescriptor) -> None:
         """Register on the inner sink, absorbing a refusal of a catalogued descriptor."""
         try:
             self._inner.register(descriptor)
-        except Exception:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
             return
 
     def increment(self, name: str, value: float = 1.0, labels: object = None) -> None:
         """Record a counter movement, absorbing whatever the inner sink raises."""
         try:
             self._inner.increment(name, value, labels)
-        except Exception:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
             return
 
     def set_gauge(self, name: str, value: float, labels: object = None) -> None:
         """Record a gauge, absorbing whatever the inner sink raises."""
         try:
             self._inner.set_gauge(name, value, labels)
-        except Exception:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
             return
 
     def observe(self, name: str, value: float, labels: object = None) -> None:
         """Record an observation, absorbing whatever the inner sink raises."""
         try:
             self._inner.observe(name, value, labels)
-        except Exception:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
             return
 
     def time(self, name: str, labels: object = None) -> AbstractContextManager:
         """Return the inner timer wrapped so neither entering nor leaving it can raise."""
         try:
             return _ContainedTimer(self._inner.time(name, labels))
-        except Exception:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
             return nullcontext()
 
     def snapshot(self) -> object:
         """Return the inner snapshot, or an empty one when asking raises."""
         try:
             return self._inner.snapshot()
-        except Exception:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
             return {}
 
     def publish(self) -> object:

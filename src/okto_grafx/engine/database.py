@@ -7,12 +7,11 @@ engine object that was handed to it. The concrete adapters are chosen by the com
 :mod:`okto_grafx.runtime.bootstrap` and by :mod:`okto_grafx.api`, and neither of those is imported
 from here.
 
-**No lock is held here, ever** (A91, LESSONS L2). Every collaborator of a database is
-host-supplied or host-reachable -- a storage device, a metrics sink, an event sink, a coordinator
--- and any of them may re-enter the public API. The database keeps its own state in plain
-attributes, mutates it before it calls out, and calls out with nothing held. That is why a
-re-entrant ``close()`` from inside an ``EventSink`` cannot deadlock: there is nothing to
-re-acquire.
+**Locks are owned by collaborators, never invented here** (A91, LESSONS L2). Lifecycle calls
+still run with no section held, so a re-entrant ``close()`` from host code cannot deadlock.
+Page-touching transaction doors deliberately enter the transaction manager's re-entrant
+participant section: that is the shared guard which keeps a failed post-barrier commit from
+racing an older cached frame into the device.
 
 **Lifecycle is the property this component is judged on.** Two rules, and both are structural
 rather than remembered:
@@ -367,7 +366,10 @@ class MetaStore:
         else:
             with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
                 self._stamp(page, identity)
-        self._pool.flush(self._file)
+        # The database UUID is not reconstructible from WAL. Returning it after a cache flush
+        # alone lets a power loss erase the identity and the next open silently create another
+        # database in the same directory.
+        self._pool.checkpoint(self._file)
         return identity
 
     def open(self, expected: DatabaseIdentity) -> DatabaseIdentity:
@@ -916,7 +918,8 @@ class Database:
         self._require_open()
         _require_text("statement", text)
         engine = self._require_component("queries", self._queries, "the query engine (C10)")
-        return engine.execute(text, context, parameters)  # type: ignore[attr-defined]
+        with self._transactions.page_access_section():
+            return engine.execute(text, context, parameters)  # type: ignore[attr-defined]
 
     # --- operator surface ---------------------------------------------------------------------
 
@@ -934,8 +937,9 @@ class Database:
         # database registers indexes for as long as it is open. A verifier captured at open would
         # quietly report a clean "indexes" scope for every index registered after it -- a wrong
         # answer, which is worse than no answer.
-        verifier = factory()  # type: ignore[operator]
-        return verifier.verify(scope)  # type: ignore[attr-defined]
+        with self._transactions.page_access_section():
+            verifier = factory()  # type: ignore[operator]
+            return verifier.verify(scope)  # type: ignore[attr-defined]
 
     def recover(self) -> object:
         """Run a recovery pass and return its report (SPEC-M1 FR-8).
@@ -953,8 +957,30 @@ class Database:
         self._require_open()
         self._require_writable("run recovery")
         manager = self._require_component("recovery", self._recovery, "recovery (C6)")
-        report = manager.run()  # type: ignore[attr-defined]
+        # Quiescence is checked under the participant-local section and held through the pass;
+        # checking ``open_transactions`` one instruction earlier would race with begin(). The
+        # recovery manager itself takes the cross-process COMMIT_SECTION.
+        with self._transactions.recovery_section():
+            # Latch before the first replay effect. If the pass fails after installing only a
+            # prefix, no later transaction on this handle may publish over the missing suffix.
+            self._transactions.require_recovery()
+            report = manager.run()  # type: ignore[attr-defined]
+            self._transactions.recovery_completed()
         self._recovery_report = report
+        indexes = self._indexes
+        if indexes is not None:
+            # Reacquire after recovery_section released. A concurrent post-barrier failure may
+            # latch this participant in that gap; index open can mark/flush headers, so it must
+            # either finish before that latch or refuse after it, never straddle it.
+            with self._transactions.page_access_section():
+                registered = indexes.indexes()  # type: ignore[attr-defined]
+                self._attached_indexes = tuple(index.name for index in registered)
+                self._stale_indexes = tuple(
+                    index.name
+                    for index in indexes.open(  # type: ignore[attr-defined]
+                        self._transactions.published_lsn()
+                    )
+                )
         return report
 
     def flush(self) -> int:
@@ -967,7 +993,8 @@ class Database:
         """
         self._require_open()
         self._require_writable("flush pages")
-        return self._pool.flush()
+        with self._transactions.page_access_section():
+            return self._pool.flush()
 
     def checkpoint(self) -> object:
         """Put the committed state on the platter, publish the checkpoint, and reclaim the log (BR-10).
@@ -982,7 +1009,22 @@ class Database:
         """
         self._require_open()
         self._require_writable("checkpoint the database")
-        return self._transactions.checkpoint()
+        report = self._transactions.checkpoint()
+        indexes = self._indexes
+        if indexes is not None:
+            # Checkpoint redo may have adopted schema and indexes committed by another
+            # participant after this handle opened. Keep the public inventory aligned with the
+            # registry that now serves queries, just as operator recovery does.
+            with self._transactions.page_access_section():
+                registered = indexes.indexes()  # type: ignore[attr-defined]
+                self._attached_indexes = tuple(index.name for index in registered)
+                self._stale_indexes = tuple(
+                    index.name
+                    for index in indexes.open(  # type: ignore[attr-defined]
+                        self._transactions.published_lsn()
+                    )
+                )
+        return report
 
     def snapshot_metrics(self) -> Mapping[str, object]:
         """Return the machine-readable current value of every metric this database emitted."""
@@ -1012,7 +1054,7 @@ class Database:
         # time (A91). There is no lock here to make re-entry safe by exclusion, deliberately:
         # a lock held across foreign code is the defect A91 names.
         self._closed = True
-        failures: list[GrafxError] = []
+        failures: list[BaseException] = []
         for step in (
             self._close_transactions,
             self._flush_pages,
@@ -1021,7 +1063,7 @@ class Database:
         ):
             try:
                 step()
-            except GrafxError as failure:
+            except BaseException as failure:
                 failures.append(failure)
         if failures:
             raise failures[0]
@@ -1042,7 +1084,7 @@ class Database:
             return
         try:
             self.close()
-        except GrafxError:
+        except BaseException:
             return
 
     def _close_transactions(self) -> None:
@@ -1068,8 +1110,14 @@ class Database:
         commit: every acknowledged commit is already durable in the log and redo is idempotent
         through ``page_lsn``. It is skipped on a read-only database, which has nothing of its own
         to write and must not touch a database another process owns.
+
+        It is also skipped after this participant has latched ``recovery_required``. A failed
+        post-COMMIT redo can leave an old dirty frame resident while another participant completes
+        the same WAL gap and writes a newer page. Flushing the failed participant during close
+        would then overwrite the newer page with that stale frame. Retaining WAL and dropping the
+        cache is the only fail-closed close: the next writable open replays the authoritative log.
         """
-        if self._read_only:
+        if self._read_only or self._transactions.recovery_required:
             return
         self._pool.flush()
         # Last chance to say what the pages an abandoned attempt allocated actually are. After
@@ -1094,16 +1142,17 @@ class Database:
         """Run every release the composition root handed over, and raise the first failure.
 
         Each closer runs even when an earlier one raised: a socket left bound because a device
-        failed to close is the leak this method exists to prevent. Only Grafx failures are
-        collected; anything else is a defect in the closer and belongs at the caller unchanged.
+        failed to close is the leak this method exists to prevent. Every ``BaseException`` is
+        retained unchanged, including process-control signals; the first is re-raised only after
+        every remaining resource has had its one chance to close.
         """
-        failures: list[GrafxError] = []
+        failures: list[BaseException] = []
         # Reverse of the order the composition root opened them, so an inner resource is released
         # before the outer one it depends on.
         for closer in reversed(self._closers):
             try:
                 closer()
-            except GrafxError as failure:
+            except BaseException as failure:
                 failures.append(failure)
         if failures:
             raise failures[0]

@@ -1593,3 +1593,55 @@ None` -- the same property (derived state discarded / retained) in the new shape
 takes a `guard`; the engine's own suite composes without one.
 
 **Residue** recorded in PUNCHLIST ("C9 — round 7").
+
+### C6/C5 round 7 (M0-B) — a durable COMMIT is mandatory work, never a hint
+
+**Defects.** Recovery inspected and truncated WAL without the section held by a live commit, so a
+second opener could classify an in-flight append as crash damage. More deeply, commit, recovery and
+checkpoint had separate effect-dispatch/publication paths: a durable COMMIT followed by a page or
+index replay refusal could leave the participant usable, allow a stale frame to flush on close, or
+certify an index past work it had not received. `commit.state` could also be treated as a stronger
+source than the retained COMMIT, allowing an old restored control record to hide mandatory replay.
+
+**Protocol.** `CommittedReplay` is the single WAL grammar: effects are replayable only with exactly
+one terminal COMMIT, no effect after the terminal, and no duplicate or conflicting outcome.
+`CommitRedo` decodes every page and index payload, validates page checksums, redo-gap bounds,
+index definition/version/key limits and the whole dispatch plan before mutation. `CommitStateStore`
+is the single strict reader and durable atomic publisher. Commit completion, checkpoint and startup
+use those primitives; startup holds `COMMIT_SECTION` from observation through forensic capture,
+truncation, redo and publication. Any post-COMMIT failure latches the local participant before the
+section is released; all writing/page-observing doors refuse or serialize against that latch, and
+close deliberately drops its possibly stale cache rather than flushing it over another process's
+repair. Read-only startup performs the same fenced proof but changes no byte and refuses whenever
+WAL, checkpoint and published state do not prove a checkpoint-complete image.
+
+Before WAL durability, a heap mutation carries the domain sentinel `PROVISIONAL_CSN = MAX_U64`:
+a provisional birth is never visible, while a provisional end leaves the prior committed version
+open. The commit batch is materialised into private page copies, never by publishing a predicted
+CSN into resident frames. `WalManager.planned_terminal_lsn()` includes a possible segment-header
+LSN; index staging and page copies are retargeted to that exact terminal, and
+`append_many(expected_terminal_lsn=...)` repeats the decision before its first physical byte.
+Thus heap headers, page LSNs, logical index changes, COMMIT and `CommitReport` agree even across a
+roll. A failed append proves an exact preimage or leaves a sticky `append_uncertain` latch.
+
+Durability proof during recovery does not rely on `_unflushed`, which is only a performance cache.
+`force_barrier_range()` re-derives and flushes the complete retained segment range before any redo
+or publication. If a partial-tail observation later grows, the WAL discards the damaged cursor and
+rebuilds from byte zero; resuming at the old cut could otherwise treat the final checksum byte as
+an invented record header.
+
+**Evidence.** Public and engine-level regressions cover a writer parked mid-append, dead-owner
+takeover and timeout; crash-at-every-recovery-write idempotence; a checksum-damaged or missing first
+effect followed by a surviving COMMIT; incomplete exact-boundary transactions; restored old or
+damaged `commit.state`; catalog recovery; indexes ahead of publication or behind the checkpoint;
+missing checkpoint segments; `recovery_policy='refuse'` byte identity; logical index redo; public
+page-staging capability proof; and lifecycle cleanup under `RuntimeError`, `KeyboardInterrupt` and
+`SystemExit`. Anchors: `tests/recovery/test_recovery_respects_the_commit_section.py`,
+`test_recovery_crash_matrix.py`, `test_commit_redo.py`, `tests/api/test_public_crash_recovery.py`,
+`test_startup_recovery_gate.py`, `tests/txn/test_commit_protocol.py`,
+`test_wal_integration.py`, `tests/wal/test_wal_manager_append.py`, and the provisional-CSN suites
+under `tests/index`, `tests/storage_core` and `tests/txn`.
+
+**Residue.** Public exposure of raw collaborators, unfenced direct construction without a process
+coordinator, and control-record probe-to-retire TOCTOU remain a separate boundary-hardening
+milestone; they are recorded in PUNCHLIST and are not claimed closed by M0-B.

@@ -18,12 +18,12 @@ predicate, it is unreachable as a snapshot. Proved by
 ``test_no_instant_of_a_commit_offers_a_snapshot_of_half_of_it`` and
 ``test_the_published_state_is_replaced_only_after_every_page_is_in_place``.
 
-The claim is deliberately not absolute, and the exception is recorded as punch-list item P4:
-when applying the pages FAILS after the barrier, the commit is durable and unapplied, and a
-later commit publishes a number at or above it. Recovery is what closes that window -- the log
-holds every page of both commits and FR-1 runs recovery before a reopened database accepts a
-transaction -- but until it runs, that one path can offer a snapshot whose pages are still only
-in the log. Saying otherwise here would be prose no test backs (A85).
+Post-barrier failure is a durable commit gap, never permission to continue. The participant first
+tries the same shared redo used by startup; if completion still fails, it latches
+``recovery_required`` before releasing its local section. Begin, commit, checkpoint and every
+page-touching facade door then refuse until operator recovery proves and publishes the whole WAL
+prefix. A later transaction therefore cannot publish over a commit whose pages or index effects
+remain only in the log.
 
 Two decisions carried from the review record are worth stating where they are implemented.
 
@@ -61,21 +61,23 @@ participants cannot hold one section each and wait for the other. Proved by
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, is_dataclass, replace
 from typing import Any
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
-    GrafxLeaseStolen,
     GrafxError,
+    GrafxLeaseStolen,
+    GrafxRecoveryRefused,
     GrafxTransactionStateError,
     GrafxWriteConflict,
 )
 from okto_grafx.domain.ids import (
     NO_CSN,
     NO_LSN,
+    PROVISIONAL_CSN,
     Csn,
     Epoch,
     Lsn,
@@ -86,12 +88,12 @@ from okto_grafx.domain.ids import (
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.coordination import ProcessCoordinator
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
+from okto_grafx.domain.recovery.decision import CommittedReplay, committed_replay
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
-from okto_grafx.domain.page import HEADER_PAGE_INDEX
+from okto_grafx.domain.page import HEADER_PAGE_INDEX, Page
 from okto_grafx.domain.page.checksum import crc32c
-from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.txn.commit_record import CommitPayload, FileIdMap, PageTouch
-from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE, CommitState
+from okto_grafx.domain.txn.commit_state import CommitState
 from okto_grafx.domain.txn.context import (
     CommitReport,
     RowIntent,
@@ -111,11 +113,18 @@ from okto_grafx.domain.txn.records import (
     WalRecordType,
     decode_page_write,
     encode_page_write,
+    is_redoable_page_file,
 )
 from okto_grafx.domain.wal.replay import RecycleReport
 from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.engine.buffer_pool import BufferPool, apply_page_image
+from okto_grafx.engine.commit_state_store import (
+    COMMIT_STATE_READ_ATTEMPTS,
+    CommitStateStore,
+)
+from okto_grafx.engine.commit_redo import CommitRedo
 from okto_grafx.engine.coordination import (
+    COMMIT_SECTION,
     DEFAULT_RENEWAL_FRACTION,
     LeaseGuard,
     ReaderRegistration,
@@ -147,9 +156,6 @@ A metric is a contract, so the name is looked up rather than declared a second t
 is not in CONTRACT.md section 9 cannot be emitted from here at all.
 """
 
-COMMIT_SECTION: str = "commit"
-"""Name of the cross-process critical section of CONTRACT.md section 8.5 step 3."""
-
 PARTICIPANT_SECTION_PREFIX: str = "txn-"
 """Prefix of the section that serialises the THREADS of one participant.
 
@@ -157,15 +163,6 @@ The name carries a digest of the owner identity, so the section belongs to one p
 and one participant only: two processes never contend on it, and two threads of one process
 always do. A digest collision between two participants costs them a serialisation neither
 needed and can never cost a correctness property, which is why 32 bits are enough here.
-"""
-
-COMMIT_STATE_READ_ATTEMPTS: int = 4
-"""How many times a read of the published state rides out a concurrent replacement.
-
-Reading takes two device calls, the size and the bytes, and another process may publish a record
-between them. That is a benign race and not damage, so it is repeated. There is no sleep between
-attempts because the domain and the engine own no clock they may wait on (G2); the window being
-ridden out is one ``atomic_replace``, not a slow device.
 """
 
 _NO_EPOCH: Epoch = 0
@@ -215,9 +212,12 @@ class TransactionManager:
         "_heap",
         "_catalog",
         "_coordinator",
+        "_commit_state_store",
+        "_commit_redo",
         "_clock",
         "_metrics",
         "_index_manager",
+        "_index_sync",
         "_partitions_per_table",
         "_commit_lock_timeout",
         "_dirty_mark",
@@ -233,6 +233,8 @@ class TransactionManager:
         "_open",
         "_pins",
         "_published_high_water",
+        "_recovery_required",
+        "_page_staging_capability",
         "_mode_counts",
     )
 
@@ -253,6 +255,7 @@ class TransactionManager:
         reader_stall_threshold: float | None = None,
         descriptor: str = "",
         retain_lease: bool = False,
+        index_sync: Callable[[], object] | None = None,
     ) -> None:
         """Build a manager over one database.
 
@@ -275,9 +278,14 @@ class TransactionManager:
         self._heap: Any = heap
         self._catalog: Any = catalog
         self._coordinator: ProcessCoordinator = coordinator
+        self._commit_state_store = CommitStateStore(
+            pool.storage, owner_id=coordinator.owner_id()
+        )
+        self._commit_redo = CommitRedo(pool, index_manager)
         self._clock: Clock = clock
         self._metrics: MetricsSink = metrics
         self._index_manager: Any = index_manager
+        self._index_sync: Callable[[], object] | None = index_sync
         self._partitions_per_table: int = validate_partitions_per_table(partitions_per_table)
         self._commit_lock_timeout: float = _require_timeout(
             "commit_lock_timeout", commit_lock_timeout
@@ -324,6 +332,11 @@ class TransactionManager:
         self._open: dict[TxnId, TransactionContext] = {}
         self._pins: dict[TxnId, _ReaderPin] = {}
         self._published_high_water: Lsn = NO_LSN
+        self._recovery_required: bool = False
+        # An identity token, never exported through a public door. QueryEngine receives only the
+        # bound private staging callback, so encoded physical pages cannot be supplied through a
+        # caller-reachable TransactionContext and later mistaken for store-produced state.
+        self._page_staging_capability: object = object()
         # The page set a commit attempt is measured against; see _attempt_pages. Set at the top
         # of every attempt and NOT cleared afterwards: every reader of it runs inside the attempt
         # that set it, under the participant section, so a stale value is unreachable rather than
@@ -385,14 +398,58 @@ class TransactionManager:
         """Return how many transactions this manager currently has open."""
         return len(self._open)
 
+    @property
+    def recovery_required(self) -> bool:
+        """Return True while a durable commit gap forbids new snapshots and writes."""
+        return self._recovery_required
+
+    def require_recovery(self) -> None:
+        """Latch this participant closed until a complete operator recovery succeeds."""
+        self._recovery_required = True
+
+    def recovery_completed(self) -> None:
+        """Release the latch only after durable state covers this process's high-water mark."""
+        durable = self._read_commit_state()
+        if durable.last_committed_lsn < self._published_high_water:
+            raise GrafxRecoveryRefused(
+                "Recovery returned without publishing every durable commit this participant "
+                "already observed; the handle remains recovery-required.",
+                field="recovery_required",
+                published_lsn=durable.last_committed_lsn,
+                required_lsn=self._published_high_water,
+            )
+        self._recovery_required = False
+
     # --- snapshots --------------------------------------------------------------------------
 
     def partition_of(self, table_id: int, key: bytes) -> int:
         """Return the partition key a row of this table with this key belongs to (FR-4)."""
         return partition_of(table_id, key, self._partitions_per_table)
 
+    def _stage_page_image(
+        self,
+        txn: TransactionContext,
+        file: str,
+        page_index: PageIndex,
+        image: bytes,
+    ) -> None:
+        """Accept one physical image from a trusted engine collaborator.
+
+        This is intentionally private.  The query/store layer receives the bound callable, not
+        the capability itself; the context seals the accepted location and bytes so direct
+        mutation of its observable ``page_images`` map is detected before commit writes WAL.
+        """
+        self._require_owned(txn)
+        txn._stage_page_image(
+            file,
+            page_index,
+            image,
+            capability=self._page_staging_capability,
+        )
+
     def published_state(self) -> CommitState:
         """Return the published commit state, or an empty one when nothing was ever published."""
+        self._require_recovery_complete()
         durable = self._read_commit_state()
         if durable.last_committed_lsn >= self._published_high_water:
             return durable
@@ -427,6 +484,43 @@ class TransactionManager:
         """Return the LSN of the last commit this database has published (section 8.5 step 3.2)."""
         return self.published_state().last_committed_lsn
 
+    def assert_recovery_complete(self) -> None:
+        """Refuse public work that could touch cached pages while redo is incomplete.
+
+        The latch protects more than publication. A failed post-COMMIT replay can leave an old
+        dirty frame in this participant while another participant installs a newer page. Reads
+        that cause eviction and explicit flushes can write that old frame too, so the database
+        facade uses this assertion before every page-touching operator door.
+        """
+        self._require_recovery_complete()
+
+    @contextmanager
+    def page_access_section(self) -> Iterator[None]:
+        """Keep the recovery latch stable for one page-touching public operation.
+
+        A check performed immediately before a flush, query or verification still leaves a
+        scheduling window: another thread can fail after its WAL barrier, latch this participant
+        recovery-required, and leave the first thread free to evict or write an older frame. The
+        participant section closes that window because every path that can set the latch after a
+        durable commit holds the same section. An operation that enters first finishes before the
+        latch can be set; one that enters afterwards refuses before touching the pool.
+        """
+        with self._participant_section():
+            self._require_recovery_complete()
+            yield
+
+    def _require_recovery_complete(self) -> None:
+        """Refuse work that could publish over a durable commit missing from the pages."""
+        if not self._recovery_required:
+            return
+        raise GrafxRecoveryRefused(
+            "A previous durable commit or redo could not be completed on this handle. Roll "
+            "back any open transaction and run database.recover() before beginning or "
+            "committing more work.",
+            field="recovery_required",
+            required_lsn=self._published_high_water,
+        )
+
     # --- life of a transaction ----------------------------------------------------------------
 
     def begin(self, mode: str) -> TransactionContext:
@@ -449,6 +543,7 @@ class TransactionManager:
         """
         parsed = TransactionMode.parse(mode)
         with self._participant_section():
+            self._require_recovery_complete()
             self._refresh_due_readers()
             floor = self.published_lsn()
             registration = ReaderRegistration.open(self._coordinator, floor)
@@ -467,6 +562,7 @@ class TransactionManager:
                     snapshot=Snapshot(read_lsn),
                     epoch=_NO_EPOCH,
                     owner=self,
+                    page_staging_capability=self._page_staging_capability,
                 )
             except BaseException:
                 # Everything from the registration onwards is inside the guard: a pin that
@@ -497,16 +593,26 @@ class TransactionManager:
         in (CONTRACT.md section 10).
         """
         self._require_owned(txn)
+        cleanup_failure: BaseException | None = None
         with self._participant_section():
             if txn.state is TransactionState.ABORTED:
                 return
             self._require_active(txn)
             self._refresh_due_readers(skip=txn.txn_id)
             mode = txn.mode.value
-            self._drop_index_changes(txn)
+            try:
+                self._drop_index_changes(txn)
+            except BaseException as failure:
+                cleanup_failure = failure
+                self._recovery_required = True
             txn.mark_aborted()
-            self._release_reader(txn)
+            cleanup_failure = _first_failure(
+                cleanup_failure,
+                self._release_reader(txn),
+            )
             open_now = self._forget(txn, mode)
+        if cleanup_failure is not None:
+            raise cleanup_failure
         self._publish_gauge(mode, open_now)
 
     def commit(self, txn: TransactionContext) -> CommitReport:
@@ -617,6 +723,7 @@ class TransactionManager:
         back on its own account; nothing here evicts it.
         """
         with self._participant_section():
+            self._require_recovery_complete()
             lease = self._hold_lease()
             try:
                 lease.validate()
@@ -624,7 +731,7 @@ class TransactionManager:
                     COMMIT_SECTION, timeout=self._commit_lock_timeout
                 ):
                     lease.validate()
-                    state = self.published_state()
+                    state = self._complete_committed_gap()
                     self._pool.begin_read_view(state.last_committed_lsn)
                     self._redo_onto_device(state.checkpoint_lsn, state.last_committed_lsn)
                     self._pool.checkpoint()
@@ -635,39 +742,196 @@ class TransactionManager:
                             checkpoint_lsn=state.last_committed_lsn,
                         )
                     )
-            except BaseException:
-                self._drop_lease(lease)
+                    # Recycling belongs to the same stable-WAL picture as redo and checkpoint
+                    # publication.  Releasing COMMIT_SECTION before this call let startup
+                    # recovery scan while segments were disappearing underneath it.
+                    reader_present = self._coordinator.reader_horizon() is not None
+                    recycled = self._wal.recycle(
+                        self.recyclable_horizon(), reader_present=reader_present
+                    )
+            except BaseException as failure:
+                cleanup_failure = self._drop_lease(lease)
+                if cleanup_failure is not None:
+                    self._recovery_required = True
+                    _note_cleanup_failure(failure, cleanup_failure)
                 raise
-            self._drop_lease(lease)
-        reader_present = self._coordinator.reader_horizon() is not None
-        return self._wal.recycle(self.recyclable_horizon(), reader_present=reader_present)
+            cleanup_failure = self._drop_lease(lease)
+            if cleanup_failure is not None:
+                raise cleanup_failure
+        return recycled
+
+    def _complete_committed_gap(self) -> CommitState:
+        """Complete any durable WAL COMMIT another participant has not yet published.
+
+        ``commit.state`` is the snapshot publication, while the WAL barrier is the durability
+        authority. A participant can therefore die after a complete COMMIT became durable and
+        before its page redo or state publication. Another long-lived participant must close
+        that gap while it owns ``COMMIT_SECTION`` and before it publishes a later commit;
+        otherwise the later page image can overwrite a page that never received the earlier
+        commit, and replaying in WAL order preserves the overwrite permanently.
+        """
+        try:
+            durable = self._read_commit_state()
+            tail = committed_replay(
+                self._wal.read_from(durable.last_committed_lsn + 1)
+            )
+            if tail.incomplete_effects:
+                pending = tail.incomplete_effects
+                raise GrafxRecoveryRefused(
+                    "The retained WAL contains durable page or index effects without a "
+                    "provable COMMIT or ABORT. This participant will not advance the snapshot "
+                    "over effects that may already have reached the device.",
+                    field="wal_lineage",
+                    incomplete_effect_lsns=tuple(record.lsn for record in pending),
+                    incomplete_transactions=tuple(
+                        sorted({(record.epoch, record.txn_id) for record in pending})
+                    ),
+                )
+            target = tail.last_committed_lsn
+            if target <= durable.last_committed_lsn:
+                return durable
+            # A complete record is visible in the page cache before it is necessarily durable.
+            # The participant that appended it may have escaped after the physical write and
+            # before its own barrier.  Establish WAL durability here before redo can put any of
+            # its data pages on the device or commit.state can publish its outcome.
+            self._wal.force_barrier_range(
+                durable.last_committed_lsn + 1,
+                target,
+            )
+            self._redo_onto_device(durable.checkpoint_lsn, target)
+            completed = CommitState(
+                last_committed_lsn=target,
+                last_csn=target,
+                checkpoint_lsn=durable.checkpoint_lsn,
+            )
+            self._publish(completed)
+            self._published_high_water = _larger(self._published_high_water, target)
+            return completed
+        except BaseException:
+            # Redo can already have installed a prefix of the durable transaction when an
+            # adapter, callback, or process-control exception escapes.  The exception class
+            # does not make that prefix safe to publish over: latch first and preserve the
+            # original exception (including KeyboardInterrupt/SystemExit) unchanged.
+            self._recovery_required = True
+            raise
 
     def _redo_onto_device(self, checkpoint: Lsn, through: Lsn) -> int:
-        """Install every logged page image above the checkpoint and at or below ``through``.
+        """Replay a commit range and fail closed for every index if the pass is incomplete."""
+        try:
+            return self._redo_onto_device_unchecked(checkpoint, through)
+        except BaseException as failure:
+            self._recovery_required = True
+            manager = self._index_manager
+            exclude = getattr(manager, "mark_all_stale", None)
+            if callable(exclude):
+                reason = (
+                    failure.code
+                    if isinstance(failure, GrafxError)
+                    else type(failure).__name__
+                )
+                try:
+                    exclude(
+                        f"Committed redo did not complete ({reason}); this handle cannot "
+                        "prove any index is complete.",
+                        persist=False,
+                    )
+                except BaseException:  # noqa: BLE001 - never replace the redo failure
+                    pass
+            raise
+
+    def _redo_onto_device_unchecked(self, checkpoint: Lsn, through: Lsn) -> int:
+        """Install every committed effect above the checkpoint and at or below ``through``.
 
         The redo rule is C1's ``apply_page_image``: an image whose number the page already carries
         is left alone, so replaying what this process applied itself changes nothing, and an image
         another process committed lands exactly as recovery would land it. Returns how many images
         were installed.
         """
-        installed = 0
-        manager = self._index_manager
+        records: list[WalRecord] = []
         for record in self._wal.read_from(checkpoint + 1):
             if record.lsn > through:
                 break
-            if record.record_type == WalRecordType.INDEX_WRITE:
-                # The index half of the same redo: C7's apply is idempotent by construction, so a
-                # record already applied by the commit changes nothing and one the commit never
-                # reached lands now.
-                if manager is not None and manager.apply(record):
-                    installed += 1
-                continue
-            if record.record_type != WalRecordType.WRITE_PAGE:
-                continue
-            write = decode_page_write(record.payload)
-            if apply_page_image(self._pool, write.file, write.page_index, write.image):
-                installed += 1
-        return installed
+            records.append(record)
+        replay = committed_replay(records)
+        if checkpoint > through:
+            raise GrafxRecoveryRefused(
+                "The published checkpoint is ahead of the commit watermark; checkpoint cannot "
+                "derive a safe WAL range.",
+                field="checkpoint_lsn",
+                checkpoint_lsn=checkpoint,
+                last_committed_lsn=through,
+            )
+        if through > checkpoint:
+            expected = checkpoint + 1
+            for record in records:
+                if record.lsn != expected:
+                    raise GrafxRecoveryRefused(
+                        f"Checkpoint expected WAL record {expected}, but observed "
+                        f"{record.lsn}; no page, watermark or segment was changed.",
+                        field="wal_lineage",
+                        expected_lsn=expected,
+                        observed_lsn=record.lsn,
+                    )
+                expected += 1
+            if not records or records[-1].lsn != through or replay.last_committed_lsn != through:
+                raise GrafxRecoveryRefused(
+                    "The retained WAL does not prove the commit watermark checkpoint was asked "
+                    "to publish; no page, watermark or segment was changed.",
+                    field="wal_lineage",
+                    checkpoint_lsn=checkpoint,
+                    last_committed_lsn=through,
+                    last_record_lsn=records[-1].lsn if records else NO_LSN,
+                    recovered_lsn=replay.last_committed_lsn,
+                )
+        page_records = tuple(
+            record
+            for record in replay.effects
+            if record.record_type == int(WalRecordType.WRITE_PAGE)
+        )
+        index_records = tuple(
+            record
+            for record in replay.effects
+            if record.record_type
+            in (int(WalRecordType.INDEX_WRITE), int(WalRecordType.INDEX_RECONCILE))
+        )
+        page_replay = CommittedReplay(
+            effects=page_records, last_committed_lsn=replay.last_committed_lsn
+        )
+        index_replay = CommittedReplay(
+            effects=index_records, last_committed_lsn=replay.last_committed_lsn
+        )
+
+        # A long-lived participant may checkpoint WAL written by another process. Its catalog
+        # and index registry can therefore predate a committed CREATE TABLE. Install catalog
+        # pages first, adopt their authoritative image, and only then register and dispatch the
+        # logical index effects that name the newly-created index. The complete plan is still
+        # decoded before the first page moves; only registry-dependent checks for a name the
+        # catalog pages introduce are deferred to the strict index-only preflight after sync.
+        touched_catalog = any(
+            decode_page_write(record.payload).file == self._file_ids.catalog_file
+            for record in page_records
+        )
+        self._commit_redo.preflight(
+            replay,
+            allow_unregistered_indexes=touched_catalog,
+        )
+        page_result = self._commit_redo.apply(page_replay)
+        if touched_catalog:
+            self._catalog.adopt(self._catalog.read_from_pages())
+        if self._index_sync is not None:
+            self._index_sync()
+
+        manager = self._index_manager
+        if manager is not None:
+            # Only after lineage is proven and foreign schema is adopted may this conservative
+            # verdict write a stale flag for every now-known persistent index.
+            manager.check_replay_floor(checkpoint)
+        index_result = self._commit_redo.apply(index_replay)
+        self._commit_redo.flush(page_result)
+        self._commit_redo.flush(index_result)
+        if manager is not None and replay.last_committed_lsn > NO_LSN:
+            manager.mark_built_through(replay.last_committed_lsn)
+        return page_result.effects_replayed + index_result.effects_replayed
 
     def close(self) -> None:
         """Abandon every open transaction and withdraw every reader registration.
@@ -700,6 +964,24 @@ class TransactionManager:
         for mode_name in self._mode_counts:
             self._publish_gauge(mode_name, 0)
 
+    @contextmanager
+    def recovery_section(self) -> Iterator[None]:
+        """Hold this participant quiescent for operator recovery.
+
+        The open-transaction check and the whole recovery pass share the participant section, so
+        a racing ``begin()`` cannot slip between them. Startup recovery does not need this door:
+        no TransactionManager exists yet. Cross-process exclusion remains RecoveryManager's own
+        responsibility through ``COMMIT_SECTION``.
+        """
+        with self._participant_section():
+            if self._open:
+                raise GrafxTransactionStateError(
+                    "Recovery requires this database handle to have no open transactions.",
+                    field="open_transactions",
+                    open_transactions=len(self._open),
+                )
+            yield
+
     # --- the commit protocol -------------------------------------------------------------------
 
     def _commit_without_writing(self, txn: TransactionContext) -> CommitReport:
@@ -714,6 +996,9 @@ class TransactionManager:
         with self._participant_section():
             self._refresh_due_readers(skip=txn.txn_id)
             txn.mark_committed(csn)
+            # Reader withdrawal is best-effort after the outcome is settled. Its registration
+            # has a TTL; surfacing a foreign cleanup exception here would invite a caller to
+            # retry an operation this transaction has already completed.
             self._release_reader(txn)
             open_now = self._forget(txn, mode)
         self._publish_gauge(mode, open_now)
@@ -735,8 +1020,11 @@ class TransactionManager:
         # Assigned inside the section on every path that publishes it; the name exists here only
         # so no path can read it before the section has settled it.
         open_now = 0
-        post_barrier_failure: GrafxError | None = None
+        post_barrier_failure: BaseException | None = None
+        cleanup_failure: BaseException | None = None
         with self._participant_section():
+            self._require_recovery_complete()
+            self._validate_staged_inputs(txn)
             self._refresh_due_readers(skip=txn.txn_id)
             lease = self._hold_lease()
             try:
@@ -747,7 +1035,7 @@ class TransactionManager:
                     COMMIT_SECTION, timeout=self._commit_lock_timeout
                 ):
                     lease.validate()                                 # step 3.1
-                    current = self.published_lsn()                   # step 3.2
+                    current = self._complete_committed_gap().last_committed_lsn
                     # The commit decides against the picture as it is NOW, not as this pool last
                     # cached it. Optimistic validation reads the log, but everything else the commit
                     # consults -- the catalog, the pages a row will land on -- comes through the pool,
@@ -785,17 +1073,54 @@ class TransactionManager:
                             self._declare_page_interest(txn, rows)
                             conflict = self._find_conflict(txn)      # step 3.3, page half
                         if conflict is None:
-                            records, images = self._build_records(txn, lease.epoch, rows)
-                            committed = self._wal.append_many(records)   # step 3.4
+                            records, images, materialized_csn = self._build_records(
+                                txn, lease.epoch, rows
+                            )
+                            planned_csn = self._wal.planned_terminal_lsn(records)
+                            if planned_csn != materialized_csn:
+                                records, images = self._retarget_commit_batch(
+                                    txn,
+                                    records,
+                                    images,
+                                    rows,
+                                    old_csn=materialized_csn,
+                                    new_csn=planned_csn,
+                                    epoch=lease.epoch,
+                                )
+                            committed = self._wal.append_many(
+                                records,
+                                expected_terminal_lsn=planned_csn,
+                            )                                               # step 3.4
                             _require_forward_commit(committed, current)
                             self._wal.barrier()                      # step 3.5 -- durable here
-                    except BaseException:
-                        self._abandon_rows(rows)
-                        self._unstage_index_changes(txn, staging_mark)
+                            # The WAL outcome is irrevocable at this instant. Settle it before
+                            # page/index apply, publication, lease release, reader cleanup or any
+                            # other fallible callback can run and tempt a caller to retry an ACTIVE
+                            # transaction whose COMMIT is already durable.
+                            txn.bind_epoch(lease.epoch)
+                            txn.mark_committed(committed)
+                    except BaseException as failure:
+                        if committed > NO_CSN or _wal_is_damaged(self._wal):
+                            # A complete COMMIT record was appended, but the barrier or the
+                            # forward-order proof did not finish, or append rollback could not put
+                            # the segment back. Its outcome is now uncertain: no later transaction
+                            # on this handle may step over it until operator recovery resolves the
+                            # WAL bytes that survived.
+                            self._recovery_required = True
+                        abandoned = self._abandon_rows(rows)
+                        unstaged = self._unstage_index_changes(txn, staging_mark)
+                        failed_cleanup = _first_failure(abandoned, unstaged)
+                        if failed_cleanup is not None:
+                            self._recovery_required = True
+                            _note_cleanup_failure(failure, failed_cleanup)
                         raise
                     if conflict is not None:
-                        self._abandon_rows(rows)
-                        self._unstage_index_changes(txn, staging_mark)
+                        cleanup_failure = _first_failure(
+                            self._abandon_rows(rows),
+                            self._unstage_index_changes(txn, staging_mark),
+                        )
+                        if cleanup_failure is not None:
+                            self._recovery_required = True
                     else:
                         self._published_high_water = _larger(
                             self._published_high_water, committed
@@ -804,25 +1129,59 @@ class TransactionManager:
                             self._apply_images(images)               # step 3.6
                             self._apply_index_changes(txn, committed)   # step 3.6
                             self._publish_commit_state(current, committed)   # step 3.7
-                        except GrafxError as failure:
+                        except BaseException as failure:
                             post_barrier_failure = failure
-                            self._recover_post_barrier(txn, current, committed, rows)
-            except BaseException:
-                self._drop_lease(lease)
+                            if isinstance(failure, GrafxError):
+                                try:
+                                    recovered = self._recover_post_barrier(
+                                        txn, current, committed, rows
+                                    )
+                                except BaseException as recovery_failure:
+                                    # Recovery is cleanup for the already-recorded failure.  It may
+                                    # add evidence, but must never replace the failure that caused
+                                    # the cleanup to run.
+                                    _note_cleanup_failure(failure, recovery_failure)
+                                    recovered = False
+                            else:
+                                # KeyboardInterrupt/SystemExit or foreign adapter failures after
+                                # the WAL barrier cannot make the durable commit disappear. Settle
+                                # the transaction as committed, poison the handle, then re-raise.
+                                recovered = False
+                            if not recovered:
+                                self._recovery_required = True
+            except BaseException as failure:
+                lease_failure = self._drop_lease(lease)
+                if lease_failure is not None:
+                    self._recovery_required = True
+                    _note_cleanup_failure(failure, lease_failure)
                 raise
-            self._drop_lease(lease)
             if conflict is None:
-                txn.bind_epoch(lease.epoch)
-                txn.mark_committed(committed)
-                self._release_reader(txn)
+                cleanup_failure = _first_failure(
+                    cleanup_failure,
+                    self._release_reader(txn),
+                )
                 open_now = self._forget(txn, mode)
             else:
                 txn.mark_conflicted()
+            lease_failure = self._drop_lease(lease)
+            cleanup_failure = _first_failure(cleanup_failure, lease_failure)
+            if lease_failure is not None and conflict is not None:
+                # This is still a pre-barrier refusal.  An interrupted foreign lease cleanup may
+                # have left the writer authority uncertain, so the handle cannot immediately
+                # retry and write under an assumption about which epoch survived.
+                self._recovery_required = True
         # Everything below runs with no section and no lease held. A metrics sink is supplied by
         # the host and may do anything at all, including re-entering this API, so it is called
         # only once every invariant this component owns has been settled (amendment A91).
-        if retried and self._metrics.enabled:
-            self._metrics.increment(COMMIT_RETRIES_TOTAL)
+        if post_barrier_failure is not None:
+            if cleanup_failure is not None:
+                _note_cleanup_failure(post_barrier_failure, cleanup_failure)
+            if isinstance(post_barrier_failure, GrafxError):
+                raise _already_committed(post_barrier_failure, committed)
+            raise post_barrier_failure
+        # Lease/reader cleanup happens only after a durable outcome and is best-effort. A raw
+        # RuntimeError or KeyboardInterrupt here would make a confirmed COMMIT look retryable;
+        # the coordinator TTL is the recovery mechanism for a foreign cleanup that did not take.
         if conflict is not None:
             if self._metrics.enabled:
                 self._metrics.increment(WRITE_CONFLICTS_TOTAL)
@@ -833,13 +1192,13 @@ class TransactionManager:
                 snapshot_lsn=txn.snapshot.read_lsn,
                 partitions=list(conflict),
             )
+        if retried and self._metrics.enabled:
+            self._metrics.increment(COMMIT_RETRIES_TOTAL)
         self._publish_gauge(mode, open_now)
-        if post_barrier_failure is not None:
-            raise _already_committed(post_barrier_failure, committed)
         return CommitReport(csn=committed, durable=True, wrote=True)
 
     def _declare_page_interest(
-        self, txn: TransactionContext, rows: Sequence[tuple[object, RecordRef]]
+        self, txn: TransactionContext, rows: Sequence[_RowWrite]
     ) -> None:
         """Declare interest in every page this commit is about to overwrite, then refuse silence.
 
@@ -881,6 +1240,49 @@ class TransactionManager:
                 page_images=len(txn.page_images),
                 row_intents=len(txn.row_intents),
             )
+
+    def _validate_staged_inputs(self, txn: TransactionContext) -> None:
+        """Refuse caller-reachable durable inputs before the commit mutates a page or WAL."""
+        unproved = txn.unproved_page_images()
+        if unproved:
+            raise GrafxConfigurationError(
+                "Every physical page image in a transaction must carry the exact proof emitted "
+                "by this manager's private store staging capability.",
+                field="page_image_provenance",
+                pages=list(unproved),
+                txn_id=txn.txn_id,
+            )
+        for file, _page_index in txn.staged_pages():
+            if not is_redoable_page_file(file):
+                raise GrafxConfigurationError(
+                    "A transaction page image must target heap.dat, catalog.dat or a canonical "
+                    "index/<identifier>.idx file.",
+                    field="file",
+                    file=file,
+                    txn_id=txn.txn_id,
+                )
+        # Caller-reachable pending_records needs the same early proof as physical pages. Keep
+        # the second validation in _build_records too: legitimate row work can make the index
+        # manager stage additional records later in this same attempt.
+        self._validate_pending_index_records(txn, tuple(txn.pending_records))
+
+    def _validate_pending_index_records(
+        self, txn: TransactionContext, records: Sequence[object]
+    ) -> None:
+        """Require staged logical records to match the index manager's private staging."""
+        if not records:
+            return
+        manager = self._index_manager
+        validator = getattr(manager, "validate_staged_records", None)
+        if manager is None or not callable(validator):
+            raise GrafxConfigurationError(
+                "This transaction staged logical index records without an index manager that "
+                "can prove their matching live changes.",
+                field="pending_records",
+                count=len(records),
+                txn_id=txn.txn_id,
+            )
+        validator(txn, records)
 
     def _find_conflict(self, txn: TransactionContext) -> tuple[int, ...] | None:
         """Return the partitions that make this commit conflict, or None when none do.
@@ -950,30 +1352,18 @@ class TransactionManager:
         txn: TransactionContext,
         epoch: Epoch,
         rows: Sequence[_RowWrite] = (),
-    ) -> tuple[list[WalRecordLike], list[tuple[str, PageIndex, bytes]]]:
+    ) -> tuple[list[WalRecordLike], list[tuple[str, PageIndex, bytes]], Csn]:
         """Return the records this commit appends and the page images it will then apply.
 
-        Each image is stamped ONCE, here, and the very same bytes are what the log carries and
-        what the page ends up holding. The number is ``last_lsn + len(batch)``: the sequence
-        number the COMMIT record gets whenever the log numbers a batch contiguously, which is the
-        model CONTRACT.md section 8.3 describes and what step 6 means by "page_lsn = lsn".
+        The first materialisation uses the contiguous-batch candidate so every encoded length is
+        known, including logical index effects. WalManager then previews whether that exact body
+        rolls and inserts its own SEGMENT_HEADER. If it does, :meth:`_retarget_commit_batch`
+        rewrites the local images and private index staging to the exact terminal LSN before
+        ``append_many(expected_terminal_lsn=...)`` revalidates the plan without writing a byte.
 
-        Two properties are what the redo rule of step 6 actually rests on, and both hold even
-        when a log inserts records of its own into the batch -- C4's does, a SEGMENT_HEADER when
-        a segment rolls, which makes the COMMIT land one number higher than this:
-
-        * the stamp is strictly above every sequence number the log had assigned BEFORE this
-          batch, so it is strictly above the page_lsn any earlier commit left on these pages, so
-          a replay after a crash between the barrier and the apply installs the image rather than
-          skipping it. An image stamped with zero would be skipped and the page lost, on exactly
-          the crash the log exists for;
-        * the bytes on the page and the bytes in the log are identical, so replaying the record
-          reproduces the page exactly and replaying it twice changes nothing.
-
-        Stamping the log with one number and the page with another satisfied neither: it was safe
-        by the first property and broke the second, and a replay then left the page carrying a
-        different number from the run it was reproducing. Proved by
-        ``test_the_page_on_the_device_is_byte_identical_to_the_image_in_the_log``.
+        The same corrected bytes travel in WRITE_PAGE and are installed after the barrier. Thus
+        heap headers, index changes, page_lsn, the COMMIT record and CommitReport all name one
+        CSN, while the live frames stay provisional until durability is established.
         """
         base = _require_lsn("last_lsn", self._wal.last_lsn)
         staged = list(txn.staged_pages())
@@ -988,6 +1378,15 @@ class TransactionManager:
             if (file, page_index) not in txn.page_images:
                 staged.append((file, page_index))
         staged = sorted(set(staged))
+        for file, _page_index in staged:
+            if not is_redoable_page_file(file):
+                raise GrafxConfigurationError(
+                    "A commit can log pages only for heap.dat, catalog.dat or a canonical "
+                    "index/<identifier>.idx file.",
+                    field="file",
+                    file=file,
+                    txn_id=txn.txn_id,
+                )
         # The index changes are staged HERE, between knowing the batch length and building the
         # records, because they are part of that batch: they lengthen it, and the number they
         # carry is the number the lengthened batch gives the COMMIT record. Counting them first
@@ -999,16 +1398,29 @@ class TransactionManager:
             + self._index_record_count(rows)
             + 1
         )
+        if predicted >= PROVISIONAL_CSN:
+            raise GrafxTransactionStateError(
+                "The write-ahead log has exhausted its usable commit-number space; the maximum "
+                "unsigned value is reserved for provisional heap versions.",
+                field="last_lsn",
+                value=base,
+            )
         self._stage_index_changes(txn, rows, predicted)
         pending = list(txn.pending_records)
-        self._stamp_rows(rows, predicted)
+        self._validate_pending_index_records(txn, pending)
         images: list[tuple[str, PageIndex, bytes]] = []
         records: list[WalRecordLike] = []
         for file, page_index in staged:
             image = txn.page_images.get((file, page_index))
             if image is None:
                 image = self._read_image(file, page_index)
-            stamped = self._stamp(image, predicted)
+            stamped = self._committed_image(
+                file,
+                page_index,
+                image,
+                predicted,
+                rows,
+            )
             images.append((file, page_index, stamped))
             records.append(
                 WalRecord(
@@ -1038,7 +1450,88 @@ class TransactionManager:
                 descriptor=self._descriptor,
             )
         )
-        return records, images
+        return records, images, predicted
+
+    def _retarget_commit_batch(
+        self,
+        txn: TransactionContext,
+        records: Sequence[WalRecordLike],
+        images: Sequence[tuple[str, PageIndex, bytes]],
+        rows: Sequence[_RowWrite],
+        *,
+        old_csn: Csn,
+        new_csn: Csn,
+        epoch: Epoch,
+    ) -> tuple[list[WalRecordLike], list[tuple[str, PageIndex, bytes]]]:
+        """Retarget one materialised batch to the WAL's exact terminal LSN.
+
+        ``_build_records`` knows the cardinality and encoded size of every effect, but only the
+        WAL knows whether that size forces a segment roll and therefore inserts a header LSN.
+        Retargeting rewrites local page-image values and private logical-index staging only; live
+        heap frames remain provisional until the barrier. The final ``append_many`` revalidates
+        this terminal before its first byte, closing drift between the preview and append.
+        """
+        if new_csn <= NO_CSN or new_csn >= PROVISIONAL_CSN:
+            raise GrafxTransactionStateError(
+                "A commit batch must target a usable, non-provisional WAL sequence number.",
+                field="commit_csn",
+                value=new_csn,
+            )
+        manager = self._index_manager
+        if txn.pending_records:
+            retarget = getattr(manager, "retarget_staged", None)
+            if manager is None or not callable(retarget):
+                raise GrafxTransactionStateError(
+                    "The WAL roll changed the commit number, but the index registry cannot "
+                    "atomically retarget its private staging before append.",
+                    field="index_manager",
+                    old_csn=old_csn,
+                    new_csn=new_csn,
+                )
+            retarget(txn, old_csn, new_csn)
+            self._validate_pending_index_records(txn, tuple(txn.pending_records))
+
+        if not records or records[-1].record_type != int(WalRecordType.COMMIT):
+            raise GrafxTransactionStateError(
+                "A materialised commit batch must end in exactly one COMMIT record.",
+                field="records",
+                count=len(records),
+            )
+        pending = list(txn.pending_records)
+        if len(records) != len(images) + len(pending) + 1:
+            raise GrafxTransactionStateError(
+                "Retargeting changed the staged-record cardinality of a materialised commit.",
+                field="pending_records",
+                records=len(records),
+                pages=len(images),
+                pending=len(pending),
+            )
+
+        corrected_images: list[tuple[str, PageIndex, bytes]] = []
+        corrected_records: list[WalRecordLike] = []
+        for file, page_index, image in images:
+            corrected = self._committed_image(
+                file,
+                page_index,
+                image,
+                new_csn,
+                rows,
+            )
+            corrected_images.append((file, page_index, corrected))
+            corrected_records.append(
+                WalRecord(
+                    record_type=int(WalRecordType.WRITE_PAGE),
+                    epoch=epoch,
+                    txn_id=txn.txn_id,
+                    payload=encode_page_write(file, page_index, corrected),
+                    descriptor=self._descriptor,
+                )
+            )
+        corrected_records.extend(
+            self._with_commit_epoch(record, epoch) for record in pending
+        )
+        corrected_records.append(records[-1])
+        return corrected_records, corrected_images
 
     def _with_commit_epoch(self, record: WalRecordLike, epoch: Epoch) -> WalRecordLike:
         """Return the staged record carrying the epoch that is COMMITTING it.
@@ -1148,7 +1641,7 @@ class TransactionManager:
         previous: Lsn,
         committed: Csn,
         rows: Sequence[_RowWrite],
-    ) -> None:
+    ) -> bool:
         """Close the P4 window for THIS commit as far as it can be closed from here.
 
         The commit is durable: the barrier returned. What failed is the apply -- page images,
@@ -1168,12 +1661,12 @@ class TransactionManager:
             self._drop_index_changes(txn)
             self._redo_onto_device(previous, committed)
             self._publish_commit_state(previous, committed)
-            return
-        except GrafxError:
+            return True
+        except BaseException:
             pass
         manager = self._index_manager
         if manager is None:
-            return
+            return False
         tables = {getattr(row.table, "table_id", None) for row in rows}
         for table_id in tables:
             if table_id is None:
@@ -1184,8 +1677,9 @@ class TransactionManager:
                         f"commit {committed} was durable but could not be applied to this index "
                         f"and the redo from the log failed too"
                     )
-                except GrafxError:
+                except BaseException:
                     continue
+        return False
 
     def _apply_index_changes(self, txn: TransactionContext, csn: Csn) -> int:
         """Apply what this transaction staged into the indexes, and return how many moved.
@@ -1235,26 +1729,29 @@ class TransactionManager:
         sequence, which no reader can observe, where an id handed out twice would put two rows
         under one identity.
 
-        The rows are written with a provisional birth stamp and corrected to the real commit
-        number by :meth:`_stamp_rows` before a single byte of them is logged or applied. The
-        provisional value never leaves this process: the pages it touched are overwritten by the
-        corrected images at step 3.6, which is the same door recovery replays them through, and
-        nothing is flushed in between.
+        The rows are written with the reserved provisional sentinel.  The live frames retain that
+        sentinel through append and the WAL barrier; :meth:`_committed_image` corrects only local
+        image copies for the WAL.  Thus eviction or failed cleanup before durability can persist
+        unreachable space, but never a birth or ending a real snapshot can observe.  Step 3.6
+        installs the corrected images only after the barrier returns.
         """
         if not txn.row_intents:
             return ()
         heap = self._heap
-        provisional = _require_lsn("last_lsn", self._wal.last_lsn) + 1
+        provisional = PROVISIONAL_CSN
         written: list[_RowWrite] = []
         try:
             self._write_intents(txn, heap, provisional, written)
-        except BaseException:
+        except BaseException as failure:
             # The intents already written are abandoned HERE, by the one frame that knows
             # about them. The caller sees only what this method returns, and a refusal on the
             # second intent of a batch returned nothing -- so the first intent stayed written,
             # unabandoned, and the next commit of anyone flushed and published it as a row no
             # transaction ever committed (C5 round-2 B1).
-            self._abandon_rows(tuple(written))
+            cleanup_failure = self._abandon_rows(tuple(written))
+            if cleanup_failure is not None:
+                self._recovery_required = True
+                _note_cleanup_failure(failure, cleanup_failure)
             raise
         txn.row_refs = [item.born for item in written if item.born is not None]
         return tuple(written)
@@ -1310,7 +1807,9 @@ class TransactionManager:
                 )
             )
 
-    def _unstage_index_changes(self, txn: TransactionContext, mark: int) -> None:
+    def _unstage_index_changes(
+        self, txn: TransactionContext, mark: int
+    ) -> BaseException | None:
         """Undo what :meth:`_stage_index_changes` staged for an attempt that did not commit.
 
         Staging appends to ``txn.pending_records`` and to every index's own staging area. An
@@ -1320,28 +1819,31 @@ class TransactionManager:
         apply live index entries for versions that were abandoned (C5 round-2 B3).
         """
         del txn.pending_records[mark:]
-        self._drop_index_changes(txn)
+        try:
+            self._drop_index_changes(txn)
+        except BaseException as failure:
+            return failure
+        return None
 
     def _abandon_rows(
         self, rows: Sequence[_RowWrite]
-    ) -> None:
+    ) -> BaseException | None:
         """Make rows written by a commit that then failed unreachable to every snapshot.
 
         The rows are in the buffer pool by the time the log is asked for anything, and the pool
         is shared: the next commit that succeeds flushes that file, and it would carry these
-        rows to the device with it. They would then be readable, under the provisional stamp, by
-        any snapshot at or above it -- a row no transaction ever committed, visible.
+        rows to the device with it. The reserved provisional stamp is outside the legal snapshot
+        domain, so even total cleanup failure leaves a birth invisible and an ending ineffective.
 
-        Setting the birth stamp to NO_CSN is what removes them: the visibility predicate refuses
-        a version with no commit number outright, so the version cannot be seen whatever happens
-        to the page afterwards. It is left in place rather than removed because removing it would
-        be a second write with its own failure mode, and an unreachable version is the same shape
-        as the page C1 leaks when an append is refused -- space, not a result.
+        Cleanup still normalises births to NO_CSN and endings to NO_CSN when possible, reducing
+        residue for verifier/maintenance. It is best-effort rather than a correctness dependency:
+        the sentinel already converts an impossible cleanup into leaked space, never a result.
 
         This must not raise. It runs while a failure is already unwinding, and replacing that
         failure with one about cleaning up after it would hide the reason the commit is being
         abandoned at all.
         """
+        failure: BaseException | None = None
         for item in rows:
             try:
                 if item.born is not None:
@@ -1352,8 +1854,8 @@ class TransactionManager:
                     # The version this commit was going to end is live again: it was only ever
                     # ended on behalf of a commit that did not happen.
                     self._restamp(item.ended, xmax=NO_CSN, flags=_LIVE_FLAGS)
-            except GrafxError:
-                pass
+            except BaseException as cleanup_failure:
+                failure = _first_failure(failure, cleanup_failure)
         # The restamp keeps any live holder of these pages coherent; what happens to the FRAMES
         # is decided below, and it is decided for the whole attempt at once.
         touched = {(self._heap_file, page_index) for page_index in self._pages_touched_by(rows)}
@@ -1363,10 +1865,15 @@ class TransactionManager:
         # The attempt may have relinked a page no row of it ever landed on, and it may have
         # dirtied pages before it raised and produced no rows at all -- in which case the
         # enumeration names nothing while the pool still holds the attempt's writes.
-        touched.update(self._attempt_pages())
-        self._undo_pages(touched)
+        try:
+            touched.update(self._attempt_pages())
+        except BaseException as cleanup_failure:
+            failure = _first_failure(failure, cleanup_failure)
+        return _first_failure(failure, self._undo_pages(touched))
 
-    def _undo_pages(self, touched: set[tuple[str, PageIndex]]) -> None:
+    def _undo_pages(
+        self, touched: set[tuple[str, PageIndex]]
+    ) -> BaseException | None:
         """Take back the pages of a commit that did not happen -- all of them the same way.
 
         TWO WAYS TO TAKE A PAGE BACK, and which one is available is not a choice.
@@ -1403,9 +1910,11 @@ class TransactionManager:
         failure with one about cleaning up after it would hide the reason the commit is being
         abandoned at all.
         """
+        failure: BaseException | None = None
         try:
             escaped = touched & self._pool.pages_written_back()
-        except GrafxError:
+        except BaseException as cleanup_failure:
+            failure = cleanup_failure
             escaped = frozenset(touched)  # cannot tell: assume the device has seen them
         for file, page_index in sorted(touched):
             try:
@@ -1413,8 +1922,9 @@ class TransactionManager:
                     self._pool.write_back(file, page_index)
                 else:
                     self._pool.discard(file, page_index)
-            except GrafxError:
-                continue
+            except BaseException as cleanup_failure:
+                failure = _first_failure(failure, cleanup_failure)
+        return failure
 
     def _restamp(
         self,
@@ -1431,23 +1941,41 @@ class TransactionManager:
         carried through exactly as it was.
         """
         with self._pool.pinned(self._heap_file, reference.page) as page:
-            payload = page.read_slot(reference.slot)
-            header = RecordHeader.decode(payload[:RECORD_HEADER_SIZE])
-            corrected = RecordHeader(
-                record_id=header.record_id,
-                xmin=header.xmin if xmin is None else xmin,
-                xmax=header.xmax if xmax is None else xmax,
-                prev_version=header.prev_version,
-                payload_len=header.payload_len,
-                schema_version=header.schema_version,
-                flags=header.flags if flags is None else header.flags & flags,
-                reserved=header.reserved,
+            self._restamp_page(
+                page,
+                reference,
+                xmin=xmin,
+                xmax=xmax,
+                flags=flags,
             )
-            if corrected == header:
-                return
-            page.update_slot(
-                reference.slot, corrected.encode() + payload[RECORD_HEADER_SIZE:]
-            )
+
+    def _restamp_page(
+        self,
+        page: Page,
+        reference: RecordRef,
+        *,
+        xmin: Csn | None = None,
+        xmax: Csn | None = None,
+        flags: int | None = None,
+    ) -> None:
+        """Rewrite one version header in the supplied page value."""
+        payload = page.read_slot(reference.slot)
+        header = RecordHeader.decode(payload[:RECORD_HEADER_SIZE])
+        corrected = RecordHeader(
+            record_id=header.record_id,
+            xmin=header.xmin if xmin is None else xmin,
+            xmax=header.xmax if xmax is None else xmax,
+            prev_version=header.prev_version,
+            payload_len=header.payload_len,
+            schema_version=header.schema_version,
+            flags=header.flags if flags is None else header.flags & flags,
+            reserved=header.reserved,
+        )
+        if corrected == header:
+            return
+        page.update_slot(
+            reference.slot, corrected.encode() + payload[RECORD_HEADER_SIZE:]
+        )
 
     def _attempt_pages(self) -> tuple[tuple[str, PageIndex], ...]:
         """Return every page THIS commit attempt has modified, in a fixed order.
@@ -1502,38 +2030,37 @@ class TransactionManager:
                 touched.add(item.ended.page)
         return tuple(sorted(touched))
 
-    def _stamp_rows(
-        self, rows: Sequence[_RowWrite], csn: Csn
-    ) -> None:
-        """Correct the birth stamp of every row just written to the real commit number.
+    def _committed_image(
+        self,
+        file: str,
+        page_index: PageIndex,
+        image: bytes,
+        csn: Csn,
+        rows: Sequence[_RowWrite],
+    ) -> bytes:
+        """Return the post-commit image without publishing the CSN into a live frame.
 
-        The version header is C1's format and is read and written through C1's own value type,
-        never by reaching into the bytes: the header is decoded, its commit number replaced, and
-        the record put back in the slot it came from. Everything else about the version -- its
-        identity, its payload, its chain -- is carried through untouched.
+        Heap work has to be materialised before the page half of optimistic validation is known,
+        but a WAL append can still fail after that.  The resident/device version therefore keeps
+        the reserved provisional sentinel until the WAL barrier returns.  Only this local copy is
+        rewritten to the predicted commit number; it is the byte-identical image appended to WAL
+        and installed by :meth:`_apply_images` after the barrier.
         """
-        for item in rows:
-            if item.born is not None:
-                self._restamp(item.born, xmin=csn)
-            if item.ended is not None:
-                self._restamp(item.ended, xmax=csn)
+        page = self._pool.codec.decode_page(image, verify=True)
+        if page.page_lsn < csn:
+            page.page_lsn = csn
+        if file == self._heap_file:
+            for item in rows:
+                if item.born is not None and item.born.page == page_index:
+                    self._restamp_page(page, item.born, xmin=csn)
+                if item.ended is not None and item.ended.page == page_index:
+                    self._restamp_page(page, item.ended, xmax=csn)
+        return self._pool.codec.encode_page(page)
 
     def _read_image(self, file: str, page_index: PageIndex) -> bytes:
         """Return the current image of one resident page, as the log will carry it."""
         with self._pool.pinned(file, page_index) as page:
             return self._pool.codec.encode_page(page)
-
-    def _stamp(self, image: bytes, lsn: Lsn) -> bytes:
-        """Return the image with its page LSN raised to this commit's number.
-
-        The page goes through the codec rather than having eight bytes overwritten in place,
-        because the checksum of a page is the codec's business and a page whose header was
-        rewritten behind the codec's back is a page that fails its own verification.
-        """
-        page = self._pool.codec.decode_page(image, verify=True)
-        if page.page_lsn < lsn:
-            page.page_lsn = lsn
-        return self._pool.codec.encode_page(page)
 
     def _apply_images(self, images: Sequence[tuple[str, PageIndex, bytes]]) -> None:
         """Apply the staged pages under the redo rule of step 6, then put them on the device.
@@ -1592,16 +2119,7 @@ class TransactionManager:
 
     def _publish(self, state: CommitState) -> None:
         """Write the state to a temporary of this participant and replace the published file."""
-        storage = self._storage
-        payload = state.encode()
-        temporary = f"{COMMIT_STATE_FILE}.{self._coordinator.owner_id()}.tmp"
-        if storage.exists(temporary):
-            storage.remove(temporary)
-        storage.create(temporary, exclusive=True)
-        storage.append_log(temporary, payload)
-        storage.durable_barrier(temporary)
-        storage.atomic_replace(temporary, COMMIT_STATE_FILE)
-        storage.durable_barrier(COMMIT_STATE_FILE)
+        self._commit_state_store.publish(state)
 
     def _read_commit_state(self) -> CommitState:
         """Read the published state, riding out a device condition that is worth trying again.
@@ -1622,27 +2140,9 @@ class TransactionManager:
         the condition being ridden out is a sharing violation of a few milliseconds that the
         device below has already backed off for.
         """
-        storage = self._storage
-        attempts = 0
-        while True:
-            attempts += 1
-            try:
-                if not storage.exists(COMMIT_STATE_FILE):
-                    return CommitState()
-                size = storage.log_size(COMMIT_STATE_FILE)
-                return CommitState.decode(storage.read_log(COMMIT_STATE_FILE, 0, size))
-            except GrafxError as failure:
-                retryable = failure.details.get("retryable", failure.retryable)
-                if attempts < COMMIT_STATE_READ_ATTEMPTS and retryable is True:
-                    continue
-                raise
+        return self._commit_state_store.read()
 
     # --- internals ---------------------------------------------------------------------------
-
-    @property
-    def _storage(self) -> StorageDevice:
-        """Return the device under the buffer pool, which is the one this database was built on."""
-        return self._pool.storage
 
     def _hold_lease(self) -> LeaseGuard:
         """Return the writer lease this commit will validate under, acquiring one if needed.
@@ -1667,11 +2167,11 @@ class TransactionManager:
         self._lease_guard = guard
         return guard
 
-    def _drop_lease(self, lease: LeaseGuard) -> None:
-        """Give the lease up, unless this manager is holding it across commits."""
+    def _drop_lease(self, lease: LeaseGuard) -> BaseException | None:
+        """Give the lease up and return, rather than raise, a foreign cleanup failure."""
         if self._retain_lease and lease is self._lease_guard and not lease.released:
-            return
-        _release_quietly(lease)
+            return None
+        return _release_quietly(lease)
 
     def _participant_section(self) -> AbstractContextManager[None]:
         """Enter the section that serialises the THREADS of this participant.
@@ -1734,11 +2234,10 @@ class TransactionManager:
                 state=txn.state.value,
             )
 
-    def _release_reader(self, txn: TransactionContext) -> None:
-        """Withdraw the reader registration of one transaction and release its snapshot pin."""
+    def _release_reader(self, txn: TransactionContext) -> BaseException | None:
+        """Detach a transaction's reader pin and return any foreign withdrawal failure."""
         pin = self._pins.pop(txn.txn_id, None)
-        if pin is not None:
-            pin.registration.close()
+        return None if pin is None else _close_quietly(pin.registration)
 
     def _forget(self, txn: TransactionContext, mode: str) -> int:
         """Drop a finished transaction and return how many of its mode are still open.
@@ -1845,9 +2344,11 @@ def _require_forward_commit(committed: Csn, published: Lsn) -> Csn:
     moves backwards; every reader that then took a snapshot would be reading a database that had
     forgotten a commit it confirmed.
 
-    The check runs BEFORE the barrier, which is what makes the refusal clean: the records are in
-    the log but nothing was made durable and nothing was acknowledged, so the tail is exactly
-    the uncommitted tail recovery truncates.
+    The check runs BEFORE the barrier, so nothing was acknowledged. The append has nevertheless
+    returned after placing a complete COMMIT record in the WAL; without a successful barrier its
+    crash outcome is uncertain, and reusing a sequence number is itself broken lineage. The
+    caller therefore latches this participant recovery-required instead of stepping over or
+    silently truncating the conflicting tail.
 
     This is defence in depth for carried finding CF-6, where a real log holding its segment
     index in memory issued one number to two participants. Fixing that belongs to the log; this
@@ -1893,7 +2394,7 @@ def _larger(left: int, right: int) -> int:
     return left if left > right else right
 
 
-def _release_quietly(lease: LeaseGuard) -> None:
+def _release_quietly(lease: LeaseGuard) -> BaseException | None:
     """Release a lease, never letting the release replace what the caller is already handling.
 
     A commit that reached the barrier is durable whatever happens to the lease afterwards, and a
@@ -1902,16 +2403,50 @@ def _release_quietly(lease: LeaseGuard) -> None:
     """
     try:
         lease.release()
-    except GrafxError:
-        return
+    except BaseException as failure:
+        return failure
+    return None
 
 
-def _close_quietly(registration: ReaderRegistration) -> None:
+def _close_quietly(registration: ReaderRegistration) -> BaseException | None:
     """Withdraw a registration without letting the withdrawal replace a failure in flight."""
     try:
         registration.close()
-    except GrafxError:
+    except BaseException as failure:
+        return failure
+    return None
+
+
+def _first_failure(
+    first: BaseException | None, second: BaseException | None
+) -> BaseException | None:
+    """Return the first cleanup failure so later cleanup never replaces it."""
+    return first if first is not None else second
+
+
+def _note_cleanup_failure(primary: BaseException, cleanup: BaseException) -> None:
+    """Attach cleanup evidence without changing the exception identity being propagated."""
+    try:
+        primary.add_note(
+            f"Cleanup also failed ({type(cleanup).__name__}): {cleanup}"
+        )
+    except BaseException:  # noqa: BLE001 - diagnostics must never replace either failure
         return
+
+
+def _wal_is_damaged(wal: object) -> bool:
+    """Return True when append rollback left WAL damage or sticky outcome uncertainty."""
+    try:
+        damage = getattr(wal, "damage")
+    except AttributeError:
+        return False
+    except BaseException:
+        return True
+    try:
+        uncertain = bool(getattr(wal, "append_uncertain", False))
+    except BaseException:
+        uncertain = True
+    return damage is not None or uncertain
 
 
 def _already_committed(failure: GrafxError, csn: Csn) -> GrafxError:

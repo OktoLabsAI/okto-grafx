@@ -45,7 +45,6 @@ from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxError,
     GrafxSchemaVersionMismatch,
-    GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.codec import PageCodec
@@ -65,6 +64,7 @@ from okto_grafx.engine.index_manager import (
     IndexManager,
     edge_from_index_name,
     edge_to_index_name,
+    index_file,
     primary_key_index,
     primary_key_index_name,
     relationship_endpoint_indexes,
@@ -229,43 +229,10 @@ def assemble_database(
             descriptor=config.granularity_descriptor,
         )
         wal.open()
-        ledger = LedgerStore(storage, clock, metrics)
         quarantine = QuarantineStore(storage, clock, metrics)
+        ledger = LedgerStore(storage, clock, metrics, quarantine=quarantine)
         catalog = CatalogStore(pool)
-
-        recovery = RecoveryManager(
-            storage,
-            wal,
-            ledger,
-            quarantine,
-            pool,
-            metrics,
-            catalog=catalog,
-            policy=config.recovery_policy,
-            coordinator=coordinator,
-        )
-        # FR-1: reopening runs the recovery of FR-8 BEFORE any transaction is accepted. A
-        # read-only open runs none: recovery quarantines, truncates and replays, and a database
-        # opened read-only must not write to a database another process may own.
-        report = None if config.read_only else recovery.run()
-
         heap = HeapStore(pool, catalog)
-        if not config.read_only:
-            catalog.bootstrap()
-            heap.bootstrap()
-            # The bootstrap of each store reserves its header page IN THE CACHE and marks it
-            # dirty; nothing below this layer decides when a page reaches the device. Handing back
-            # a database whose heap and catalog still hold a zero-filled page 0 is not a
-            # cosmetic delay: `verify()` reads the device and reported three checksum failures on
-            # a database that had just been created cleanly (FR-11 says a clean database produces
-            # an empty report), and a crash in that window leaves C6 a zero page it can only read
-            # as damage -- routing an intact new database to quarantine and a forensic ledger
-            # entry (FR-8, FR-10). The open sequence is the only place that knows the creation is
-            # finished, so it is the place that makes it durable.
-            pool.flush()
-        elif catalog.is_bootstrapped():
-            catalog.load()
-
         indexes = IndexManager(pool, heap, metrics)
         vectors = VectorEngine(
             catalog=catalog,
@@ -290,15 +257,85 @@ def assemble_database(
             # bare lock because a search that arrives mid-build waits on it for the build.
             guard=threading.Condition(),
         )
-        queries = QueryEngine(
+
+        attached_names: list[str] = []
+        catalog_loaded = False
+
+        def sync_indexes(*, existing_only: bool) -> tuple[str, ...]:
+            """Adopt every index the current catalog declares, idempotently."""
+            newly_attached = _attach_primary_key_indexes(
+                catalog,
+                indexes,
+                pool,
+                metrics,
+                existing_only=existing_only,
+            )
+            newly_attached += _attach_declared_vector_indexes(
+                catalog,
+                vectors,
+                storage=storage,
+                existing_only=existing_only,
+            )
+            for name in newly_attached:
+                if name not in attached_names:
+                    attached_names.append(name)
+            return newly_attached
+
+        def load_catalog_and_sync_existing_indexes() -> tuple[str, ...]:
+            """Interpret catalog bytes only after recovery has replayed their page images."""
+            nonlocal catalog_loaded
+            if not catalog.is_bootstrapped():
+                return ()
+            if not catalog_loaded:
+                # Re-derive then adopt, the same non-destructive route recovery itself uses.
+                # When catalog pages were replayed this is an idempotent second reading; when
+                # they were not, it is the startup's first interpretation of the device bytes.
+                # Remembering it matters for an operator recovery on the live Database: direct
+                # unsaved changes must never be discarded by a later callback.
+                catalog.adopt(catalog.read_from_pages())
+                catalog_loaded = True
+            # Existing files form the only baseline recovery may certify. Creating an empty
+            # index from a retained WAL suffix would turn absence into a silently short path.
+            return sync_indexes(existing_only=True)
+
+        recovery = RecoveryManager(
+            storage,
+            wal,
+            ledger,
+            quarantine,
+            pool,
+            metrics,
             catalog=catalog,
-            heap=heap,
-            pool=pool,
-            metrics=metrics,
-            clock=clock,
-            indexes=indexes,
-            vectors=vectors,
+            index_manager=indexes,
+            index_sync=load_catalog_and_sync_existing_indexes,
+            policy=config.recovery_policy,
+            coordinator=coordinator,
+            commit_lock_timeout=config.commit_lock_timeout_seconds,
         )
+        # FR-1: a writable reopen replays BEFORE catalog payloads are interpreted. A read-only
+        # reopen proves from both commit.state and the WAL that replay is unnecessary, then may
+        # load the catalog; the proof performs no repair or other persistence.
+        if config.read_only:
+            recovery.require_read_only_consistent()
+            load_catalog_and_sync_existing_indexes()
+            report = None
+        else:
+            report = recovery.run()
+
+        if not config.read_only:
+            catalog.bootstrap()
+            heap.bootstrap()
+            # Identity, catalog and heap headers define whether this directory is a database at
+            # all. A successful connect must not return while those pages are only in volatile
+            # device caches; unlike row data, their identity/bootstrap state is not reconstructible
+            # from WAL.
+            pool.checkpoint()
+
+        # After recovery has published, a writable open may create a missing accelerator, but it
+        # will be checked stale against the recovered LSN below. A read-only open adopts existing
+        # files only and never manufactures an index as a side effect of inspection.
+        sync_indexes(existing_only=config.read_only)
+
         transactions = TransactionManager(
             wal,
             pool,
@@ -313,8 +350,19 @@ def assemble_database(
             lease_timeout=config.lease_timeout_seconds,
             reader_stall_threshold=config.reader_stall_threshold_seconds,
             descriptor=config.granularity_descriptor,
+            index_sync=lambda: sync_indexes(existing_only=True),
         )
-        attached = _attach_primary_key_indexes(catalog, indexes, pool, metrics)
+        queries = QueryEngine(
+            catalog=catalog,
+            heap=heap,
+            pool=pool,
+            metrics=metrics,
+            clock=clock,
+            indexes=indexes,
+            vectors=vectors,
+            page_stager=transactions._stage_page_image,
+        )
+        attached = tuple(attached_names)
         adopted = set(attached)
         unindexed = tuple(
             table.name
@@ -331,9 +379,11 @@ def assemble_database(
                 )
             )
         )
-        attached += _attach_declared_vector_indexes(catalog, vectors)
         stale = tuple(
-            index.name for index in indexes.open(transactions.published_lsn())
+            index.name
+            for index in indexes.open(
+                transactions.published_lsn(), persist_stale=not config.read_only
+            )
         )
     except GrafxError:
         # A47: the class a component chose and the retryable detail it carries are what a caller
@@ -427,6 +477,8 @@ def _attach_primary_key_indexes(
     indexes: IndexManager,
     pool: BufferPool,
     metrics: MetricsSink,
+    *,
+    existing_only: bool = False,
 ) -> tuple[str, ...]:
     """Register the primary-key index of every table the catalog holds, and name them.
 
@@ -444,14 +496,37 @@ def _attach_primary_key_indexes(
     to do.
     """
     attached: list[str] = []
+    known = {index.name.lower() for index in indexes.indexes()}
     for table in catalog.catalog.tables():
         try:
             for endpoint in relationship_endpoint_indexes(table, pool, metrics):
-                attached.append(indexes.register(endpoint).name)
+                if endpoint.name.lower() in known:
+                    continue
+                if existing_only and not pool.storage.exists(endpoint.file):
+                    continue
+                attached.append(
+                    indexes.register(
+                        endpoint,
+                        existing_only=existing_only,
+                        persist_stale=not existing_only,
+                    ).name
+                )
+                known.add(endpoint.name.lower())
             index = primary_key_index(table, pool, metrics)
             if index is None:
                 continue
-            attached.append(indexes.register(index).name)
+            if index.name.lower() in known:
+                continue
+            if existing_only and not pool.storage.exists(index.file):
+                continue
+            attached.append(
+                indexes.register(
+                    index,
+                    existing_only=existing_only,
+                    persist_stale=not existing_only,
+                ).name
+            )
+            known.add(index.name.lower())
         except (GrafxIndexError, GrafxUnsupportedOperation):
             # AN INDEX MAY NEVER MAKE A DATABASE UNOPENABLE. A catalog can hold a table whose
             # index name is illegal or collides -- two names differing only by case fold to one
@@ -464,7 +539,11 @@ def _attach_primary_key_indexes(
 
 
 def _attach_declared_vector_indexes(
-    catalog: CatalogStore, vectors: VectorEngine
+    catalog: CatalogStore,
+    vectors: VectorEngine,
+    *,
+    storage: StorageDevice | None = None,
+    existing_only: bool = False,
 ) -> tuple[str, ...]:
     """Attach the index of every vector column the catalog declares, and name what was attached.
 
@@ -481,12 +560,34 @@ def _attach_declared_vector_indexes(
     :attr:`okto_grafx.engine.database.Database.stale_indexes` rather than silently rebuilt.
     """
     attached: list[str] = []
+    known = {index.name.lower() for index in vectors.indexes()}
     for table in catalog.catalog.tables():
         for column in table.columns:
             space = column.vector_space
             if space is None:
                 continue
-            attached.append(vectors.attach(table, space).name)
+            name = f"vector_{table.name}_{space}"
+            if name.lower() in known:
+                continue
+            if existing_only and (
+                storage is None or not storage.exists(index_file(name))
+            ):
+                continue
+            try:
+                attached.append(
+                    vectors.attach(
+                        table,
+                        space,
+                        existing_only=existing_only,
+                        persist_stale=not existing_only,
+                    ).name
+                )
+                known.add(name.lower())
+            except (GrafxIndexError, GrafxUnsupportedOperation):
+                # A derived accelerator that cannot be adopted must not make the authoritative
+                # catalog and heap unreachable. Vector search will refuse the unattached space;
+                # ordinary graph reads remain available and a writable repair can rebuild it.
+                continue
     return tuple(attached)
 
 
@@ -629,16 +730,17 @@ def _nothing_to_close() -> None:
 
 
 def _release(closers: list[Callable[[], None]]) -> None:
-    """Run every registered release in reverse, swallowing failures.
+    """Run every registered release in reverse, preserving the active assembly failure.
 
     This runs while an earlier failure is already travelling to the caller. Replacing that
     failure with a failure of the closing path would hide the reason the composition is being
-    abandoned, so a release that cannot finish is dropped and the original error continues.
+    abandoned, so every closer gets its chance and every secondary failure -- including a
+    process-control ``BaseException`` -- is suppressed while the original error continues.
     """
     for closer in reversed(closers):
         try:
             closer()
-        except (GrafxError, OSError):
+        except BaseException:
             continue
 
 

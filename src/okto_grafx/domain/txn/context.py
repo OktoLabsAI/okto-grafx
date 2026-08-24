@@ -14,6 +14,7 @@ pages, so the log record and the page write cannot come apart.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -24,7 +25,11 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.ids import NO_CSN, Csn, Epoch, PageIndex, TxnId
 from okto_grafx.domain.txn.partitions import page_partition
-from okto_grafx.domain.txn.records import WalRecordLike
+from okto_grafx.domain.txn.records import (
+    WalRecordLike,
+    WalRecordType,
+    is_redoable_page_file,
+)
 from okto_grafx.domain.txn.snapshot import Snapshot
 
 __all__ = [
@@ -171,6 +176,8 @@ class TransactionContext:
         "write_partitions",
         "pending_records",
         "page_images",
+        "_page_image_proofs",
+        "_page_staging_capability",
         "row_intents",
         "row_refs",
     )
@@ -183,6 +190,7 @@ class TransactionContext:
         snapshot: Snapshot,
         epoch: Epoch,
         owner: object,
+        page_staging_capability: object,
     ) -> None:
         """Open a transaction bound to the manager that created it.
 
@@ -203,6 +211,13 @@ class TransactionContext:
         self.write_partitions: set[int] = set()
         self.pending_records: list[WalRecordLike] = []
         self.page_images: dict[tuple[str, PageIndex], bytes] = {}
+        # Physical page images are a private engine capability, not caller-authored data.  The
+        # public map remains observable for the frozen TransactionContext contract, so a proof
+        # covers both its complete key set and the exact bytes accepted through the private
+        # staging door.  Commit recomputes every digest before touching the heap or WAL: adding,
+        # replacing or deleting an entry directly makes the whole attempt fail closed.
+        self._page_image_proofs: dict[tuple[str, PageIndex], bytes] = {}
+        self._page_staging_capability: object = page_staging_capability
         self.row_intents: list[RowIntent] = []
         self.row_refs: list[object] = []
 
@@ -303,10 +318,59 @@ class TransactionContext:
                 field="record",
                 value=type(record).__name__,
             )
+        if record.record_type not in (
+            int(WalRecordType.INDEX_WRITE),
+            int(WalRecordType.INDEX_RECONCILE),
+        ):
+            raise GrafxConfigurationError(
+                "A transaction may stage only logical index effects; WRITE_PAGE and outcome "
+                "records are built by the transaction manager.",
+                field="record_type",
+                value=record.record_type,
+            )
+        if record.lsn != 0:
+            raise GrafxConfigurationError(
+                "A staged index record cannot carry a log position before commit assigns it.",
+                field="lsn",
+                value=record.lsn,
+            )
+        record_txn_id = getattr(record, "txn_id", self.txn_id)
+        if record_txn_id != self.txn_id:
+            raise GrafxConfigurationError(
+                "A staged index record must belong to the transaction staging it.",
+                field="txn_id",
+                value=record_txn_id,
+                txn_id=self.txn_id,
+            )
         self.pending_records.append(record)
 
     def stage_page_image(self, file: str, page_index: PageIndex, image: bytes) -> None:
-        """Stage the bytes this transaction wants page ``page_index`` of ``file`` to hold.
+        """Refuse caller-authored physical pages.
+
+        A page image is not a value-level mutation: it can replace the heap or catalog header
+        while remaining checksum-valid.  Only the stores/query engine may therefore stage one,
+        through the transaction manager's private capability.  Callers write through statements
+        and row/index APIs, whose invariants can be checked at their own abstraction level.
+        """
+        self._require_active()
+        self._require_write_mode("stage a page image")
+        raise GrafxConfigurationError(
+            "Physical page images are an internal engine capability; use a statement or a "
+            "value-level store operation instead of staging encoded bytes.",
+            field="page_image_provenance",
+            file=file,
+            page_index=page_index,
+        )
+
+    def _stage_page_image(
+        self,
+        file: str,
+        page_index: PageIndex,
+        image: bytes,
+        *,
+        capability: object,
+    ) -> None:
+        """Stage a store-produced page after authenticating the manager capability.
 
         Staging the LAST image for a page replaces the previous one on purpose: a transaction
         that changed one page twice wants one write of the final bytes, not two writes racing to
@@ -314,9 +378,17 @@ class TransactionContext:
         """
         self._require_active()
         self._require_write_mode("stage a page image")
-        if not isinstance(file, str) or not file:
+        if capability is not self._page_staging_capability:
             raise GrafxConfigurationError(
-                "A staged page image must name a non-empty file.",
+                "A physical page image must be staged by the manager that opened this "
+                "transaction.",
+                field="page_image_capability",
+                txn_id=self.txn_id,
+            )
+        if not is_redoable_page_file(file):
+            raise GrafxConfigurationError(
+                "A staged page image must name heap.dat, catalog.dat or a canonical "
+                "index/<identifier>.idx file.",
                 field="file",
                 value=repr(file),
             )
@@ -333,7 +405,10 @@ class TransactionContext:
                 field="image",
                 value=type(image).__name__,
             )
-        self.page_images[(file, page_index)] = bytes(image)
+        key = (file, page_index)
+        accepted = bytes(image)
+        self.page_images[key] = accepted
+        self._page_image_proofs[key] = hashlib.sha256(accepted).digest()
         # Staging a page IS declaring interest in it. A commit that wrote a whole page image and
         # declared interest in nothing could never be refused by optimistic validation -- the
         # predicate short-circuits on an empty set -- so two participants writing the same page
@@ -341,6 +416,32 @@ class TransactionContext:
         # The partition names the page, so the frozen COMMIT payload carries it and any
         # participant reading the log can compare against it (defect E1).
         self.write_partitions.add(page_partition(file, page_index))
+
+    def unproved_page_images(self) -> tuple[str, ...]:
+        """Return every physical image not exactly covered by a private staging proof.
+
+        The map is deliberately treated as hostile here: it is observable through the engine
+        context and Python lets a caller put values outside its annotation into it.  Reporting
+        representations keeps the refusal typed even when a malformed key could not be sorted
+        beside a legitimate ``(file, page)`` tuple.
+        """
+        locations = set(self.page_images) | set(self._page_image_proofs)
+        unproved: list[str] = []
+        for location in locations:
+            image = self.page_images.get(location)
+            proof = self._page_image_proofs.get(location)
+            if (
+                not isinstance(location, tuple)
+                or len(location) != 2
+                or not isinstance(location[0], str)
+                or isinstance(location[1], bool)
+                or not isinstance(location[1], int)
+                or not isinstance(image, bytes)
+                or not isinstance(proof, bytes)
+                or hashlib.sha256(image).digest() != proof
+            ):
+                unproved.append(repr(location))
+        return tuple(sorted(unproved))
 
     def stage_row_insert(
         self, table: object, values: Iterable[object], *, record_id: int | None = None
@@ -445,6 +546,7 @@ class TransactionContext:
         if len(self.page_images) != pages:
             for key in sorted(self.page_images)[pages:]:
                 del self.page_images[key]
+                self._page_image_proofs.pop(key, None)
 
     def staged_pages(self) -> Sequence[tuple[str, PageIndex]]:
         """Return the staged page locations in a fixed order, so a commit is reproducible."""
@@ -512,6 +614,7 @@ class TransactionContext:
         self.write_partitions.clear()
         self.pending_records.clear()
         self.page_images.clear()
+        self._page_image_proofs.clear()
         self.row_intents.clear()
         self.row_refs.clear()
 

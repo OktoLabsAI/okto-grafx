@@ -351,6 +351,111 @@ def test_a_close_that_cannot_release_still_records_the_database_as_closed(
     release_ports(registry)
 
 
+@pytest.mark.parametrize(
+    "failure_type",
+    [RuntimeError, KeyboardInterrupt, SystemExit],
+)
+def test_close_finishes_every_step_and_reraises_the_first_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    """A foreign or process-control failure cannot strand later close work."""
+    registry = build_default_registry(DatabaseConfig(path=str(tmp_path / "db")))
+    db = connect(tmp_path / "db", registry=registry)
+    first = failure_type("the transaction close failed")
+    later = RuntimeError("metrics publication also failed")
+    ran: list[str] = []
+
+    def close_transactions(_database: Database) -> None:
+        ran.append("transactions")
+        raise first
+
+    def flush_pages(_database: Database) -> None:
+        ran.append("pages")
+
+    def publish_metrics(_database: Database) -> None:
+        ran.append("metrics")
+        raise later
+
+    def release_closers(_database: Database) -> None:
+        ran.append("closers")
+
+    monkeypatch.setattr(Database, "_close_transactions", close_transactions)
+    monkeypatch.setattr(Database, "_flush_pages", flush_pages)
+    monkeypatch.setattr(Database, "_publish_metrics", publish_metrics)
+    monkeypatch.setattr(Database, "_release_closers", release_closers)
+    try:
+        with pytest.raises(failure_type) as raised:
+            db.close()
+        assert raised.value is first
+        assert ran == ["transactions", "pages", "metrics", "closers"]
+        assert db.closed is True
+    finally:
+        release_ports(registry)
+
+
+def test_every_closer_runs_after_foreign_and_process_control_failures(
+    tmp_path: Path,
+) -> None:
+    """Closer order is exhausted and the first BaseException keeps its identity."""
+    registry = build_default_registry(DatabaseConfig(path=str(tmp_path / "db")))
+    db = connect(tmp_path / "db", registry=registry)
+    ran: list[str] = []
+    first = RuntimeError("the inner closer failed")
+    later = KeyboardInterrupt("the middle closer was interrupted")
+
+    def outer() -> None:
+        ran.append("outer")
+
+    def middle() -> None:
+        ran.append("middle")
+        raise later
+
+    def inner() -> None:
+        ran.append("inner")
+        raise first
+
+    object.__setattr__(db, "_closers", (outer, middle, inner))
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            db.close()
+        assert raised.value is first
+        assert ran == ["inner", "middle", "outer"]
+        assert db.closed is True
+    finally:
+        release_ports(registry)
+
+
+def test_context_exit_never_masks_an_active_failure_with_a_foreign_close_failure(
+    tmp_path: Path,
+) -> None:
+    """The block's exception remains first while close still exhausts its resources."""
+    registry = build_default_registry(DatabaseConfig(path=str(tmp_path / "db")))
+    db = connect(tmp_path / "db", registry=registry)
+    marker = RuntimeError("the caller's own failure")
+    close_failure = ValueError("a foreign closer failed")
+    ran: list[str] = []
+
+    def outer() -> None:
+        ran.append("outer")
+
+    def inner() -> None:
+        ran.append("inner")
+        raise close_failure
+
+    object.__setattr__(db, "_closers", (outer, inner))
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            with db:
+                raise marker
+        assert raised.value is marker
+        assert ran == ["inner", "outer"]
+        assert db.closed is True
+    finally:
+        release_ports(registry)
+
+
 def test_nothing_of_a_closed_database_survives_collection(tmp_path: Path) -> None:
     # A live database keeps its own objects reachable; once it is closed and dropped, nothing in
     # this package holds it. A module-level cache would show up here as a survivor (BR-8).

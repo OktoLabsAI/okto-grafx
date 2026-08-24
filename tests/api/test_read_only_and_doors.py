@@ -58,6 +58,7 @@ def test_a_read_only_database_refuses_every_door_that_can_write(tmp_path: Path) 
     with connect(root, page_size=512) as db:
         with db.begin("write") as txn:
             txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
+        db.checkpoint()
     before = _tree(root)
 
     refused: list[str] = []
@@ -101,6 +102,7 @@ def test_a_read_only_database_reads_the_schema_that_is_on_the_device(tmp_path: P
         with db.begin("write") as txn:
             txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
             txn.execute("CREATE NODE TABLE Doc(id INT64, title STRING, PRIMARY KEY(id))")
+        db.checkpoint()
         expected = sorted(table.name for table in db.catalog.catalog.tables())
     assert expected == ["Doc", "Person"]
 
@@ -357,6 +359,7 @@ def test_a_read_only_reopen_attaches_the_vector_index_without_writing(tmp_path: 
         created = next(
             index.name for index in db.indexes.indexes() if index.name.startswith("vector_")
         )
+        db.checkpoint()
     before = _tree(root)
     assert any("vector_Chunk_minilm_v2" in name for name in before)
 

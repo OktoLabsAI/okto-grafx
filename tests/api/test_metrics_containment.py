@@ -17,7 +17,9 @@ import json
 from pathlib import Path
 
 import okto_grafx
+import pytest
 from okto_grafx import DatabaseConfig
+from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
 from okto_grafx.runtime.bootstrap import build_default_registry
 
 
@@ -56,8 +58,13 @@ class _PostCommitBomb(_HostileSink):
     lands after durability, and the report used to become a lie.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, failure_type: type[BaseException] = RuntimeError) -> None:
         self.armed = False
+        self.failure_type = failure_type
+
+    def _explode(self) -> None:
+        """Raise the configured host failure at the post-outcome recording site."""
+        raise self.failure_type("post-commit boom")
 
     @property
     def enabled(self) -> bool:
@@ -68,18 +75,18 @@ class _PostCommitBomb(_HostileSink):
 
     def increment(self, name, value=1.0, labels=None) -> None:
         if self.armed:
-            raise RuntimeError("post-commit boom")
+            self._explode()
 
     def set_gauge(self, name, value, labels=None) -> None:
         if name == "oktografx_active_transactions" and value == 0.0:
             self.armed = True
-            raise RuntimeError("post-commit boom")
+            self._explode()
         if self.armed:
-            raise RuntimeError("post-commit boom")
+            self._explode()
 
     def observe(self, name, value, labels=None) -> None:
         if self.armed:
-            raise RuntimeError("post-commit boom")
+            self._explode()
 
     def time(self, name, labels=None):
         from contextlib import nullcontext
@@ -88,6 +95,59 @@ class _PostCommitBomb(_HostileSink):
 
     def snapshot(self):
         return {}
+
+
+class _TimerBomb:
+    """Raise the configured exception from both halves of a metrics timer."""
+
+    def __init__(self, failure_type: type[BaseException]) -> None:
+        self.failure_type = failure_type
+
+    def __enter__(self) -> None:
+        raise self.failure_type("timer enter boom")
+
+    def __exit__(self, kind, value, trace) -> None:
+        raise self.failure_type("timer exit boom")
+
+
+class _EveryRecordingDoorBomb(_HostileSink):
+    """Raise one selected BaseException from every recording door and timer half."""
+
+    def __init__(self, failure_type: type[BaseException]) -> None:
+        self.failure_type = failure_type
+
+    def _explode(self, door: str) -> None:
+        """Raise the configured failure naming the recording door that invoked it."""
+        raise self.failure_type(f"metrics {door} boom")
+
+    @property
+    def enabled(self) -> bool:
+        self._explode("enabled")
+
+    def register(self, descriptor) -> None:
+        self._explode("register")
+
+    def increment(self, name, value=1.0, labels=None) -> None:
+        self._explode("increment")
+
+    def set_gauge(self, name, value, labels=None) -> None:
+        self._explode("set_gauge")
+
+    def observe(self, name, value, labels=None) -> None:
+        self._explode("observe")
+
+    def time(self, name, labels=None):
+        return _TimerBomb(self.failure_type)
+
+    def snapshot(self):
+        self._explode("snapshot")
+
+
+class _TimerFactoryBomb(_EveryRecordingDoorBomb):
+    """Raise before a host timer context is even returned."""
+
+    def time(self, name, labels=None):
+        self._explode("time")
 
 
 def _database_with(tmp_path: Path, sink):
@@ -110,8 +170,11 @@ def test_a_sink_that_always_raises_breaks_nothing(tmp_path: Path) -> None:
         db.close()
 
 
+@pytest.mark.parametrize(
+    "failure_type", (RuntimeError, KeyboardInterrupt, SystemExit)
+)
 def test_a_post_commit_raise_cannot_make_a_durable_commit_report_failure(
-    tmp_path: Path,
+    tmp_path: Path, failure_type: type[BaseException]
 ) -> None:
     """The duplication shape, held shut.
 
@@ -119,7 +182,7 @@ def test_a_post_commit_raise_cannot_make_a_durable_commit_report_failure(
     "failed" CREATE, and the table held the row twice. Now the commit returns its report, and
     the row is there exactly once.
     """
-    db = _database_with(tmp_path, _PostCommitBomb())
+    db = _database_with(tmp_path, _PostCommitBomb(failure_type))
     try:
         with db.begin("write") as txn:
             txn.execute("CREATE NODE TABLE T(id INT64, n STRING, PRIMARY KEY(id))")
@@ -130,6 +193,27 @@ def test_a_post_commit_raise_cannot_make_a_durable_commit_report_failure(
         assert db.execute("MATCH (t:T) RETURN count(*)").rows == ((1,),)
     finally:
         db.close()
+
+
+@pytest.mark.parametrize(
+    "failure_type", (RuntimeError, KeyboardInterrupt, SystemExit)
+)
+def test_every_recording_door_contains_every_exception_class(
+    failure_type: type[BaseException],
+) -> None:
+    """Telemetry callbacks and timer halves cannot alter an engine operation's outcome."""
+    contained = ContainedMetricsSink(_EveryRecordingDoorBomb(failure_type))
+
+    assert contained.enabled is False
+    contained.register(object())
+    contained.increment("counter")
+    contained.set_gauge("gauge", 1.0)
+    contained.observe("histogram", 1.0)
+    assert contained.snapshot() == {}
+    with contained.time("timer"):
+        pass
+    with ContainedMetricsSink(_TimerFactoryBomb(failure_type)).time("timer"):
+        pass
 
 
 def test_publish_stays_typed_and_the_json_selector_writes_its_file(tmp_path: Path) -> None:

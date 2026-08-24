@@ -241,7 +241,15 @@ def measure_durable_commit(
         payload = b"row-%08d" % index
         page_index = 2 + (index % pages)
         txn = stack.manager.begin("write")
-        txn.stage_page_image(HEAP_FILE, page_index, _page_image(stack.codec, page_index, payload))
+        # This harness intentionally measures the physical commit protocol. Page-image staging is
+        # a manager-owned capability (public callers must go through statements/value stores), so
+        # the in-tree engine harness uses the same bound private door as QueryEngine.
+        txn.owner._stage_page_image(
+            txn,
+            HEAP_FILE,
+            page_index,
+            _page_image(stack.codec, page_index, payload),
+        )
         txn.note_write(stack.manager.partition_of(stack.table.table_id, payload))
         report = stack.manager.commit(txn)
         if not report.durable or not report.wrote:

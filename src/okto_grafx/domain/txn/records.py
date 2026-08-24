@@ -17,8 +17,17 @@ import struct
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from okto_grafx.domain.errors import GrafxConfigurationError, GrafxCorruptionDetected
+from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
+    GrafxCorruptionDetected,
+    GrafxIndexError,
+)
 from okto_grafx.domain.ids import Lsn, PageIndex
+from okto_grafx.domain.index.definition import (
+    INDEX_DIRECTORY,
+    INDEX_FILE_SUFFIX,
+    require_index_name,
+)
 from okto_grafx.domain.wal.record import WAL_FORMAT_VERSION, WalRecord, WalRecordType
 
 __all__ = [
@@ -30,6 +39,7 @@ __all__ = [
     "WalRecordType",
     "decode_page_write",
     "encode_page_write",
+    "is_redoable_page_file",
 ]
 
 MAX_FILE_NAME_BYTES: int = 0xFFFF
@@ -38,6 +48,33 @@ MAX_FILE_NAME_BYTES: int = 0xFFFF
 _NAME_LENGTH: struct.Struct = struct.Struct("<H")
 _PAGE_INDEX: struct.Struct = struct.Struct("<I")
 _MAX_PAGE_INDEX_FIELD: int = 0xFFFFFFFF
+_REDOABLE_PAGE_FILES: frozenset[str] = frozenset({"heap.dat", "catalog.dat"})
+
+
+def is_redoable_page_file(file: object) -> bool:
+    """Return whether ``file`` is a canonical paged-data path.
+
+    Storage names are slash-separated logical names on every host. WAL and live commit inputs
+    share this predicate so neither path can target a control record, escape through traversal,
+    or interpret a backslash differently on Windows and POSIX.
+    """
+    if not isinstance(file, str) or not file or "\\" in file:
+        return False
+    parts = file.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return False
+    if file in _REDOABLE_PAGE_FILES:
+        return True
+    if len(parts) != 2 or parts[0] != INDEX_DIRECTORY:
+        return False
+    basename = parts[1]
+    if not basename.endswith(INDEX_FILE_SUFFIX):
+        return False
+    try:
+        require_index_name(basename[: -len(INDEX_FILE_SUFFIX)])
+    except GrafxIndexError:
+        return False
+    return True
 
 
 @runtime_checkable

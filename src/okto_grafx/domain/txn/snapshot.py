@@ -12,7 +12,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from okto_grafx.domain.errors import GrafxConfigurationError
-from okto_grafx.domain.ids import NO_CSN, Csn, Lsn
+from okto_grafx.domain.ids import (
+    NO_CSN,
+    PROVISIONAL_CSN,
+    Csn,
+    Lsn,
+    is_committed_csn,
+    is_open_end_csn,
+)
 
 __all__ = ["Snapshot"]
 
@@ -47,18 +54,31 @@ class Snapshot:
                 field="read_lsn",
                 value=value,
             )
+        if value >= PROVISIONAL_CSN:
+            raise GrafxConfigurationError(
+                "A snapshot read LSN must be below the value reserved for provisional heap "
+                f"versions ({PROVISIONAL_CSN}); got {value}.",
+                field="read_lsn",
+                value=value,
+            )
 
     def visible(self, xmin: Csn, xmax: Csn) -> bool:
         """Return True when a version created at xmin and ended at xmax belongs to this view.
 
-        This is the predicate of CONTRACT.md section 8.5, character for character:
+        This is the committed predicate of CONTRACT.md section 8.5 plus the fail-closed
+        interpretation of the reserved pre-WAL stamp:
 
-        * ``xmin != 0`` -- a version whose creating transaction has no commit number was never
-          committed, so no snapshot may see it;
+        * ``0 < xmin < PROVISIONAL_CSN`` -- a version whose creator has no real commit number
+          was never committed, so no snapshot may see it;
         * ``xmin <= read_lsn`` -- it was committed at or before this snapshot opened;
-        * ``xmax == 0 or xmax > read_lsn`` -- it had not been superseded or deleted yet.
+        * ``xmax`` is zero/provisional or above ``read_lsn`` -- it has no committed end visible
+          to this snapshot. A provisional end is an abandoned attempt to end an older row.
 
-        There is deliberately no fourth term. Adding one would hide a row a snapshot is entitled
-        to see, and removing one would show a row it must not.
+        The same sentinel therefore fails closed at both edges: it cannot create visibility and
+        cannot take visibility away.
         """
-        return xmin != 0 and xmin <= self.read_lsn and (xmax == 0 or xmax > self.read_lsn)
+        return (
+            is_committed_csn(xmin)
+            and xmin <= self.read_lsn
+            and (is_open_end_csn(xmax) or xmax > self.read_lsn)
+        )

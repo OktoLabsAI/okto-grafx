@@ -16,11 +16,19 @@ from pathlib import Path
 
 import pytest
 
-from okto_grafx.domain.errors import GrafxTransactionStateError, GrafxWriteConflict
+from okto_grafx.domain.errors import (
+    GrafxDeviceFull,
+    GrafxRecoveryRefused,
+    GrafxTransactionStateError,
+    GrafxWriteConflict,
+)
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.txn import Snapshot, TransactionState
+from okto_grafx.engine.buffer_pool import BufferPool
+from okto_grafx.engine.txn_manager import TransactionManager
+from okto_grafx.engine.verifier import Verifier
 from txn_support import Stack, build_stack, make_page_image
 
 HEAP = "heap.dat"
@@ -175,7 +183,7 @@ def test_a_refused_commit_writes_no_row(make_stack) -> None:
     loser.note_write(shared)
 
     winner = first.manager.begin("write")
-    winner.stage_page_image(HEAP, 9, make_page_image(first.codec, [b"w"], page_index=9))
+    winner.owner._stage_page_image(winner, HEAP, 9, make_page_image(first.codec, [b"w"], page_index=9))
     winner.note_write(shared)
     first.manager.commit(winner)
 
@@ -487,6 +495,84 @@ def _commit_row(stack: Stack, table: TableDef, values: tuple) -> tuple:
     txn.note_write(stack.manager.partition_of(table.table_id, bytes([values[0]])))
     report = stack.manager.commit(txn)
     return txn.row_refs[0], report.csn
+
+
+@pytest.mark.parametrize("operation", ("insert", "update", "delete"))
+@pytest.mark.parametrize(
+    "cleanup_failure",
+    (RuntimeError("foreign cleanup failed"), KeyboardInterrupt()),
+    ids=("runtime-error", "keyboard-interrupt"),
+)
+def test_provisional_rows_remain_logically_invisible_when_all_cleanup_fails(
+    database_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    cleanup_failure: BaseException,
+) -> None:
+    """Even persisted pre-WAL frames encode no row outcome a snapshot can observe."""
+    stack = build_stack(database_root, owner_id="doomed-writer")
+    table = _registered(stack, _table())
+    original = None
+    expected: list[tuple] = []
+    if operation != "insert":
+        original, _born = _commit_row(stack, table, (1, "seed"))
+        expected = [(1, "seed")]
+        stack.pool.flush(HEAP)
+
+    doomed = stack.manager.begin("write")
+    if operation == "insert":
+        doomed.stage_row_insert(table, (2, "never"))
+    elif operation == "update":
+        assert original is not None
+        doomed.stage_row_update(table, original, (1, "never"))
+    else:
+        assert original is not None
+        doomed.stage_row_delete(table, original)
+    doomed.note_write(stack.manager.partition_of(table.table_id, b"doomed"))
+    primary = GrafxDeviceFull("The WAL refused this batch.", free_bytes=0)
+
+    def persist_provisional_then_fail(
+        _records: object, *, expected_terminal_lsn: int | None = None
+    ) -> int:
+        # This is the eviction/crash shape: provisional heap/header frames reach the device before
+        # append reports failure, and none of the compensating cleanup is allowed to help.
+        assert expected_terminal_lsn is not None
+        stack.pool.flush(HEAP)
+        raise primary
+
+    def fail_restamp(
+        _manager: TransactionManager, _reference: object, **_changes: object
+    ) -> None:
+        raise cleanup_failure
+
+    def fail_write_back(
+        _pool: BufferPool, _file: str, _page_index: int
+    ) -> bool:
+        raise cleanup_failure
+
+    monkeypatch.setattr(stack.wal, "append_many", persist_provisional_then_fail)
+    monkeypatch.setattr(TransactionManager, "_restamp", fail_restamp)
+    monkeypatch.setattr(BufferPool, "write_back", fail_write_back)
+
+    with pytest.raises(GrafxDeviceFull) as escaped:
+        stack.manager.commit(doomed)
+
+    assert escaped.value is primary
+    assert stack.manager.recovery_required is True
+    with pytest.raises(GrafxRecoveryRefused):
+        stack.manager.begin("write")
+
+    reopened = build_stack(database_root, owner_id="post-crash-reader")
+    reader = reopened.manager.begin("read")
+    seen = [version.values for _ref, version in reopened.heap.scan(table, reader.snapshot)]
+    assert seen == expected
+    assert Verifier(
+        reopened.pool,
+        reopened.metrics,
+        heap=reopened.heap,
+        catalog=reopened.catalog,
+    ).verify().findings == ()
+    reopened.manager.rollback(reader)
 
 
 # --- update -----------------------------------------------------------------------------------

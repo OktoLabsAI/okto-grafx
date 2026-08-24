@@ -115,6 +115,24 @@ def test_registering_something_that_is_not_an_index_is_refused(database: Databas
     assert refused.value.details["field"] == "index"
 
 
+def test_register_existing_only_never_repairs_an_incomplete_file(database: Database) -> None:
+    """Inspection mode must not turn a zero-length/torn index into a created one."""
+    candidate = HashIndex(
+        exact_definition(database.table, name="incomplete"),
+        database.pool,
+        database.metrics,
+    )
+    database.device.create(candidate.file)
+
+    with pytest.raises(GrafxIndexError) as refused:
+        database.manager.register(
+            candidate, existing_only=True, persist_stale=False
+        )
+
+    assert refused.value.details["field"] == "file"
+    assert database.device.page_count(candidate.file) == 0
+
+
 def test_registering_a_store_that_does_not_answer_the_contract_is_refused(
     database: Database, person_table: TableDef
 ) -> None:
@@ -318,6 +336,31 @@ def test_a_change_survives_the_log_and_keeps_its_record_type(
 
     assert record.record_type == int(record_type)
     assert change_of(record) == change
+
+
+def test_replaying_a_reconciliation_restores_its_horizon(database: Database) -> None:
+    """INDEX_RECONCILE carries the proof that makes an absent old entry legitimate.
+
+    The removal itself is idempotent and may already be absent. Replay must still restore the
+    horizon from the logical record; otherwise verification reports correctly reclaimed entries
+    as missing after a crash.
+    """
+    record = wal_record_for(
+        IndexChange(
+            index=database.proximity.name,
+            operation=IndexOperation.REMOVE,
+            key=b"already-absent",
+            ref=RecordRef(3, 4),
+            csn=ENDED,
+            versioned=True,
+        ),
+        epoch=2,
+        txn_id=5,
+    ).with_lsn(30)
+
+    assert database.manager.apply(record) is True
+    assert database.proximity.reconciled_through_lsn == ENDED
+    assert database.proximity.built_through_lsn == 30
 
 
 def test_a_reset_carries_no_key_and_declares_a_position() -> None:

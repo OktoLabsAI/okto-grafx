@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from okto_grafx.domain.errors import GrafxConfigurationError
+from okto_grafx.domain.ids import PROVISIONAL_CSN
 from okto_grafx.domain.txn import Snapshot
 
 
@@ -45,13 +46,23 @@ def test_a_live_version_is_marked_by_a_zero_end() -> None:
     assert Snapshot(read_lsn=10).visible(2, 0) is True
 
 
+def test_the_provisional_stamp_has_opposite_meanings_at_birth_and_end() -> None:
+    """A flushed pre-WAL frame cannot publish a birth or hide an older committed row."""
+    snapshot = Snapshot(read_lsn=10)
+
+    assert snapshot.visible(PROVISIONAL_CSN, 0) is False
+    assert snapshot.visible(2, PROVISIONAL_CSN) is True
+
+
 def test_the_empty_database_snapshot_sees_nothing() -> None:
     snapshot = Snapshot(read_lsn=0)
     assert snapshot.visible(1, 0) is False
     assert snapshot.visible(0, 0) is False
 
 
-@pytest.mark.parametrize("value", [-1, "5", 5.0, None, True])
+@pytest.mark.parametrize(
+    "value", [-1, "5", 5.0, None, True, PROVISIONAL_CSN, PROVISIONAL_CSN + 1]
+)
 def test_an_unusable_read_lsn_is_refused_as_configuration(value: object) -> None:
     """A caller mistake is never corruption_detected (amendment A11-revised)."""
     with pytest.raises(GrafxConfigurationError) as raised:

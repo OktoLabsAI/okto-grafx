@@ -26,6 +26,33 @@ including the on-disk format.
 - Regressions: `tests/vector/test_first_use_concurrency.py` (three deterministic interleavings
   through the public door, the `VectorMath` port as the lever) and
   `tests/vector/test_warm_graph_across_processes.py` (two interpreters).
+- **Recovery and commit completion now share one fail-closed WAL protocol.** Startup recovery,
+  checkpoint completion and the post-COMMIT path select only transactions with one unambiguous
+  terminal COMMIT, validate the complete page/index replay plan before its first mutation, apply
+  effects idempotently, and publish `control/commit.state` only after completion. A participant
+  that fails after durable COMMIT latches `recovery_required` and cannot begin, flush, checkpoint
+  or certify an index until the authoritative WAL gap has been completed.
+- **Heap, index, WAL and commit reports now carry one exact commit number.** Live heap frames keep
+  the reserved, permanently invisible `PROVISIONAL_CSN` until the WAL barrier succeeds. The WAL
+  plans the real terminal LSN including a segment-header roll, heap page images are committed only
+  in private copies, logical index staging is retargeted atomically, and append revalidates the
+  plan before writing its first byte. Refused attempts therefore cannot leak a usable ghost row,
+  even when eviction and cleanup both fail.
+- **WAL uncertainty is sticky and recovery barriers are explicit.** A failed append either restores
+  its exact physical and in-memory preimage or closes the append door with `append_uncertain`.
+  Recovery and gap completion force every segment intersecting the authoritative LSN range before
+  page/index apply or publication, independently of the ordinary pending-flush cache. A tail that
+  grows after a partial damaged observation is rescanned from byte zero instead of interpreting
+  the completing checksum suffix as a new record.
+- **Startup can no longer truncate a live writer's in-flight WAL append.** The entire recovery
+  observation and repair pass takes the same cross-process commit section as append plus barrier;
+  read-only startup takes that section only to prove, byte-identically, that the checkpoint covers
+  every complete commit. Torn tails, missing segments, damaged first effects, restored old
+  `commit.state`, catalog/index lag and crash-at-every-recovery-write have dedicated regressions.
+- **Lifecycle cleanup is exhaustive for every exception class.** `Database.close()` and assembly
+  unwind attempt every release even when a host adapter raises `RuntimeError`, `KeyboardInterrupt`
+  or `SystemExit`, then preserve the first failure; cleanup can no longer strand later locks or
+  handles merely because the first closer was foreign.
 
 ## [0.0.1] — 2026-08-23
 

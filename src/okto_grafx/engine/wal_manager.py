@@ -65,13 +65,12 @@ from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
     GrafxDurabilityBarrierFailed,
-    GrafxError,
     GrafxPortNotConfigured,
     GrafxSchemaVersionMismatch,
     GrafxStaleEpoch,
     GrafxTransactionStateError,
 )
-from okto_grafx.domain.ids import NO_LSN, Epoch, Lsn
+from okto_grafx.domain.ids import NO_LSN, PROVISIONAL_CSN, Epoch, Lsn
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
 from okto_grafx.domain.ports.storage import StorageDevice
@@ -353,6 +352,7 @@ class WalManager:
         "_last_lsn",
         "_max_epoch",
         "_damage",
+        "_append_uncertain",
         "_unflushed",
         "_next_number",
         "_total_bytes",
@@ -385,6 +385,7 @@ class WalManager:
         self._last_lsn: Lsn = NO_LSN
         self._max_epoch: Epoch = 0
         self._damage: ScanFailure | None = None
+        self._append_uncertain: bool = False
         self._unflushed: list[str] = []
         self._next_number: int = MIN_SEGMENT_NUMBER
         self._total_bytes: int = 0
@@ -438,6 +439,18 @@ class WalManager:
         """
         self._refresh_if_open()
         return self._damage
+
+    @property
+    def append_uncertain(self) -> bool:
+        """Return whether a failed append could not restore the exact pre-append bytes.
+
+        Unlike scan damage, this latch is not inferred from the current tail.  A complete,
+        decodable COMMIT can survive a failed rollback and make a subsequent scan look healthy,
+        while the caller that received the exception has no right to treat its outcome as known.
+        Recovery clears the latch only after it has either cut the uncertain suffix or forced and
+        completed the intact WAL range.
+        """
+        return self._append_uncertain
 
     def segments(self) -> tuple[SegmentInfo, ...]:
         """Return what the log holds, oldest first, re-derived from the device."""
@@ -502,7 +515,11 @@ class WalManager:
         self._damage = None
         self._opened = True
         self._indexed = False
-        self._unflushed = [name for name in self._unflushed if name in sizes]
+        # A fresh handle did not append the discovered bytes, so they do not belong in the
+        # performance cache used by ordinary commit barriers. Recovery establishes durability
+        # of foreign work explicitly through force_barrier_range; marking all history pending
+        # here would make the first commit after every clean open fsync the whole retained WAL.
+        self._unflushed = []
         self._publish_size_metrics()
 
     def _rebuild(self) -> None:
@@ -671,6 +688,25 @@ class WalManager:
             self._rebuild()
             return
         sizes = {name: self._storage.log_size(name) for name in names}
+        # Bytes appended by another participant are no more provably durable than bytes appended
+        # through this object.  Remember every new or grown segment so gap completion's barrier
+        # really flushes the foreign COMMIT it is about to publish over.
+        changed = [
+            name
+            for name in names
+            if name not in known or sizes[name] != known[name].size_bytes
+        ]
+        if self._damage is not None and changed:
+            # The remembered cut may sit inside the record another participant was still
+            # appending. Resuming at the old byte size would interpret only the newly arrived
+            # suffix (often one checksum byte) as a fresh record and preserve invented damage.
+            # Once a damaged observation changes, no offset beyond its last good record is a
+            # trustworthy incremental anchor; re-derive the segment from byte zero.
+            self._rebuild()
+            return
+        pending = [name for name in self._unflushed if name in sizes]
+        pending.extend(name for name in changed if name not in pending)
+        self._unflushed = pending
         if any(sizes[name] < known[name].size_bytes for name in names if name in known):
             # A segment lost bytes, so what this participant remembers about the records inside
             # it may be wrong anywhere, not only past the end. Only a full pass can say.
@@ -758,7 +794,27 @@ class WalManager:
         """Append one record and return the sequence number it was given. No barrier is taken."""
         return self.append_many((record,))
 
-    def append_many(self, records: Sequence[WalRecord]) -> Lsn:
+    def planned_terminal_lsn(self, records: Sequence[WalRecord]) -> Lsn:
+        """Return the terminal LSN this exact batch would receive without writing a byte.
+
+        A segment header consumes a real LSN when the batch rolls.  Callers that stamp heap and
+        index effects with the COMMIT LSN therefore need the roll decision, not merely
+        ``last_lsn + len(records)``.  The append revalidates this answer under the same tail
+        checks immediately before it writes, so a foreign tail change becomes a clean refusal
+        instead of a batch whose payload names a different commit number.
+        """
+        self._require_open()
+        self._refresh_tail()
+        self._require_healthy()
+        _batch, _body_length, _rolling, terminal = self._plan_batch(records)
+        return terminal
+
+    def append_many(
+        self,
+        records: Sequence[WalRecord],
+        *,
+        expected_terminal_lsn: Lsn | None = None,
+    ) -> Lsn:
         """Append a batch with one write and return the sequence number of its last record.
 
         Every check happens before the first byte leaves: an epoch older than the log already
@@ -777,9 +833,20 @@ class WalManager:
         # CONTRACT.md section 8.5, so what it reads cannot move under it.
         self._refresh_tail()
         self._require_healthy()
-        batch = self._validate_batch(records)
-        body_length = sum(record.encoded_length() for record in batch)
-        rolling = self._needs_roll(body_length)
+        batch, _body_length, rolling, terminal = self._plan_batch(records)
+        if expected_terminal_lsn is not None:
+            expected = _require_lsn(
+                "expected_terminal_lsn", expected_terminal_lsn
+            )
+            if terminal != expected:
+                raise GrafxTransactionStateError(
+                    "The WAL tail or segment-roll decision changed after the commit batch was "
+                    "materialised; no byte of this batch reached the device.",
+                    field="expected_terminal_lsn",
+                    expected_terminal_lsn=expected,
+                    planned_terminal_lsn=terminal,
+                    last_lsn=self._last_lsn,
+                )
         lsn = self._last_lsn
         images: list[bytes] = []
         # Where every record of this batch lands. The writer knows each offset exactly, without
@@ -816,15 +883,70 @@ class WalManager:
             placed.append((lsn, cursor))
             cursor += len(image)
         blob = b"".join(images)
-        if rolling:
-            self._storage.create(name)
+        state_before = (
+            list(self._segments),
+            {segment: list(marks) for segment, marks in self._marks.items()},
+            self._next_number,
+            self._total_bytes,
+            self._last_lsn,
+            self._max_epoch,
+            list(self._unflushed),
+        )
         try:
+            if rolling:
+                self._storage.create(name)
             self._storage.append_log(name, blob)
-        except GrafxError:
-            self._undo_append(name, size_before, created=rolling)
+        except BaseException as failure:
+            repaired = self._undo_append(name, size_before, created=rolling)
+            if not repaired:
+                try:
+                    failure.add_note(
+                        f"WAL rollback to byte {size_before} of {name!r} did not complete; "
+                        "the manager was marked damaged."
+                    )
+                except BaseException:  # noqa: BLE001 - never replace the append failure
+                    pass
             raise
-        self._register_append(number, name, size_before, blob, stamped, rolling, placed)
+        try:
+            self._register_append(number, name, size_before, blob, stamped, rolling, placed)
+        except BaseException as failure:
+            (
+                self._segments,
+                self._marks,
+                self._next_number,
+                self._total_bytes,
+                self._last_lsn,
+                self._max_epoch,
+                self._unflushed,
+            ) = state_before
+            repaired = self._undo_append(name, size_before, created=rolling)
+            if not repaired:
+                try:
+                    failure.add_note(
+                        f"WAL registration failed and rollback to byte {size_before} of "
+                        f"{name!r} did not complete; the manager was marked damaged."
+                    )
+                except BaseException:  # noqa: BLE001 - never replace registration failure
+                    pass
+            raise
         return lsn
+
+    def _plan_batch(
+        self, records: Sequence[WalRecord]
+    ) -> tuple[tuple[WalRecord, ...], int, bool, Lsn]:
+        """Validate a batch and return its encoded length, roll decision and terminal LSN."""
+        batch = self._validate_batch(records)
+        body_length = sum(record.encoded_length() for record in batch)
+        rolling = self._needs_roll(body_length)
+        terminal = self._last_lsn + len(batch) + int(rolling)
+        if terminal >= PROVISIONAL_CSN:
+            raise GrafxConfigurationError(
+                "The write-ahead log has exhausted its usable sequence-number space; the "
+                "maximum unsigned value is reserved for provisional heap versions.",
+                field="last_lsn",
+                value=self._last_lsn,
+            )
+        return batch, body_length, rolling, terminal
 
     def _validate_batch(self, records: Sequence[WalRecord]) -> tuple[WalRecord, ...]:
         """Return the batch, stamped with this log's descriptor, or refuse it whole.
@@ -928,9 +1050,12 @@ class WalManager:
                 self._max_epoch = record.epoch
         if name not in self._unflushed:
             self._unflushed.append(name)
-        self._publish_size_metrics()
+        try:
+            self._publish_size_metrics()
+        except BaseException:  # noqa: BLE001 - observability cannot make an append ambiguous
+            pass
 
-    def _undo_append(self, name: str, size_before: int, *, created: bool) -> None:
+    def _undo_append(self, name: str, size_before: int, *, created: bool) -> bool:
         """Put a segment back to the size it had before a failed append.
 
         A device that stored part of a batch leaves bytes nobody acknowledged. Removing them is
@@ -963,16 +1088,25 @@ class WalManager:
                 self._next_number = max(
                     self._next_number, parse_segment_number(self._directory, name) or 0
                 ) + 1
-        except GrafxError as failure:
+        except BaseException as failure:
+            # This latch is independent of the decoder's damage verdict.  A complete batch can
+            # remain after recycle/truncate itself fails and decode cleanly on the next refresh;
+            # its caller still observed an exception and cannot know whether that COMMIT is the
+            # outcome.  Only recovery may clear this uncertainty.
+            self._append_uncertain = True
             self._damage = ScanFailure(
                 reason=FailureReason.TRUNCATED_TAIL,
                 segment=name,
                 offset=size_before,
                 length=0,
                 expected_lsn=self._last_lsn + 1,
-                detail=f"A failed append left {name!r} in a state this manager could not repair: "
-                f"{failure}",
+                detail=(
+                    f"A failed append left {name!r} in a state this manager could not repair "
+                    f"({type(failure).__name__}): {failure}"
+                ),
             )
+            return False
+        return True
 
     # --- durability ----------------------------------------------------------------------
 
@@ -998,6 +1132,71 @@ class WalManager:
         else:
             self._flush(targets)
         self._unflushed.clear()
+
+    def force_barrier_range(self, first_lsn: Lsn, through_lsn: Lsn) -> tuple[str, ...]:
+        """Force every segment intersecting an intact LSN range, ignoring the pending cache.
+
+        ``_unflushed`` is an optimisation for bytes appended by this object, not durability
+        evidence for bytes discovered during recovery or written by another participant.  Gap
+        completion and startup therefore use this door: it re-derives the inventory, proves the
+        requested range is retained in the clean prefix, and fsyncs its segments oldest-first
+        even if an earlier ordinary barrier emptied the cache.
+        """
+        self._require_open()
+        first = _require_lsn("first_lsn", first_lsn)
+        through = _require_lsn("through_lsn", through_lsn)
+        if first == NO_LSN:
+            raise GrafxConfigurationError(
+                "A forced WAL range begins at a record LSN, never at the no-LSN sentinel.",
+                field="first_lsn",
+                value=first,
+            )
+        if through < first:
+            return ()
+        self._refresh_tail()
+        if self._damage is not None:
+            raise self._damage.as_error()
+        if through > self._last_lsn:
+            raise GrafxTransactionStateError(
+                "The WAL cannot barrier a range beyond its intact tail.",
+                field="through_lsn",
+                through_lsn=through,
+                last_lsn=self._last_lsn,
+            )
+        intersecting = tuple(
+            segment
+            for segment in self._segments
+            if segment.first_lsn <= through and segment.last_lsn >= first
+        )
+        if (
+            not intersecting
+            or first < intersecting[0].first_lsn
+            or through > intersecting[-1].last_lsn
+        ):
+            raise GrafxTransactionStateError(
+                "The retained WAL does not cover the complete range requested for a forced "
+                "durability barrier.",
+                field="wal_range",
+                first_lsn=first,
+                through_lsn=through,
+                retained_first_lsn=(
+                    intersecting[0].first_lsn if intersecting else NO_LSN
+                ),
+                retained_last_lsn=(
+                    intersecting[-1].last_lsn if intersecting else NO_LSN
+                ),
+            )
+        targets = tuple(segment.name for segment in intersecting)
+        if self._metrics.enabled:
+            with self._metrics.time(FSYNC_DURATION_SECONDS, _WAL_TARGET_LABELS):
+                self._flush(targets)
+        else:
+            self._flush(targets)
+        selected = set(targets)
+        self._unflushed = [name for name in self._unflushed if name not in selected]
+        if through == self._last_lsn:
+            self._append_uncertain = False
+        return targets
 
     def _flush(self, targets: Sequence[str]) -> None:
         """Ask the device for a barrier on each segment, counting a failure before re-raising."""
@@ -1299,9 +1498,20 @@ class WalManager:
         if completed and cut_name is not None:
             current = self._storage.log_size(cut_name)
             if current > cut_offset:
-                truncated = self._roll_cut_segment(cut_name, cut_offset)
-                removed_bytes += current - cut_offset
-                removed.append(cut_name)
+                truncated, old_gone, old_deferred = self._roll_cut_segment(
+                    cut_name, cut_offset
+                )
+                if old_gone:
+                    removed_bytes += current - cut_offset
+                    removed.append(cut_name)
+                    if old_deferred:
+                        deferred.append(cut_name)
+                else:
+                    # The durable replacement exists, but the original still names the full
+                    # tail. Reporting success here would let recovery publish over two copies
+                    # of one LSN range and a later scan would meet a discontinuity we created.
+                    deferred.append(cut_name)
+                    completed = False
         if removed or truncated is not None:
             gone = set(removed)
             self._unflushed = [name for name in self._unflushed if name not in gone]
@@ -1315,6 +1525,8 @@ class WalManager:
         # every surviving record reads as still-to-go. A difference of two totals cannot be told
         # either story, and it is the number the operator-facing FR-8 finding claims to be.
         after_count = self._count_records()
+        if completed and self._damage is None:
+            self._append_uncertain = False
         return TruncationReport(
             last_lsn=self._last_lsn,
             removed_records=before_count - after_count,
@@ -1325,7 +1537,9 @@ class WalManager:
             completed=completed,
         )
 
-    def _roll_cut_segment(self, cut_name: str, cut_offset: int) -> str:
+    def _roll_cut_segment(
+        self, cut_name: str, cut_offset: int
+    ) -> tuple[str, bool, bool]:
         """Move the records at or below the cut into a NEW segment and let the old one go.
 
         A segment is never rewritten in place. The incremental re-derivation of :meth:`refresh`
@@ -1350,8 +1564,12 @@ class WalManager:
         self._storage.append_log(name, surviving)
         self._next_number = number + 1
         self._flush((name,))
-        self._storage.recycle(cut_name)
-        return name
+        released = self._storage.recycle(cut_name)
+        old_gone = released or not self._storage.exists(cut_name)
+        # ``released=False`` has two storage-contract meanings: a Windows deletion was queued
+        # and the logical name is already gone, or no deletion could be scheduled and the name
+        # remains. The caller must distinguish them when deciding whether truncation completed.
+        return name, old_gone, not released
 
     def _reserve_empty_segment(self) -> str:
         """Create the empty segment that stops the numbering from restarting at one.
@@ -1530,12 +1748,21 @@ class WalManager:
         """Refuse to append while the log holds bytes a scan cannot pass."""
         if self._damage is not None:
             raise self._damage.as_error()
+        if self._append_uncertain:
+            raise GrafxCorruptionDetected(
+                "A previous WAL append could not restore its exact starting bytes; recovery "
+                "must settle the surviving suffix before another append is allowed.",
+                reason="append_uncertain",
+                directory=self._directory,
+                last_lsn=self._last_lsn,
+            )
 
     def __repr__(self) -> str:
         """Return a short, readable form for a test failure or a log line."""
         return (
             f"WalManager(directory={self._directory!r}, segments={len(self._segments)}, "
-            f"last_lsn={self._last_lsn}, damaged={self._damage is not None})"
+            f"last_lsn={self._last_lsn}, damaged={self._damage is not None}, "
+            f"append_uncertain={self._append_uncertain})"
         )
 
 

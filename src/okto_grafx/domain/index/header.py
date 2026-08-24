@@ -29,7 +29,7 @@ from okto_grafx.domain.errors import (
     GrafxIndexError,
     GrafxSchemaVersionMismatch,
 )
-from okto_grafx.domain.ids import NO_LSN, Lsn
+from okto_grafx.domain.ids import NO_LSN, PROVISIONAL_CSN, Lsn
 from okto_grafx.domain.index.definition import DEFINITION_DIGEST_SIZE
 from okto_grafx.domain.index.visibility import IndexVisibility
 
@@ -113,11 +113,26 @@ class IndexHeader:
             ("built_through_lsn", self.built_through_lsn, _MAX_U64),
             ("reconciled_through_lsn", self.reconciled_through_lsn, _MAX_U64),
         ):
-            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= ceiling:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= ceiling
+            ):
                 raise GrafxIndexError(
                     f"Index header field {field!r} is outside its width: {value!r}.",
                     field=field,
                     value=repr(value),
+                )
+        for field, value in (
+            ("built_through_lsn", self.built_through_lsn),
+            ("reconciled_through_lsn", self.reconciled_through_lsn),
+        ):
+            if value == PROVISIONAL_CSN:
+                raise GrafxIndexError(
+                    "An index header cannot claim the log position reserved for provisional "
+                    f"heap versions in {field}.",
+                    field=field,
+                    value=value,
                 )
 
     def advanced_to(self, lsn: Lsn) -> IndexHeader:
@@ -128,7 +143,11 @@ class IndexHeader:
         claim it covers less than it does -- that would turn a fresh index into a stale one and
         force a rebuild that nothing needed.
         """
-        if isinstance(lsn, bool) or not isinstance(lsn, int) or lsn < NO_LSN:
+        if (
+            isinstance(lsn, bool)
+            or not isinstance(lsn, int)
+            or not NO_LSN <= lsn < PROVISIONAL_CSN
+        ):
             raise GrafxIndexError(
                 f"A build position must be a non-negative integer; got {lsn!r}.",
                 field="built_through_lsn",
@@ -140,7 +159,11 @@ class IndexHeader:
 
     def reconciled_to(self, horizon: Lsn) -> IndexHeader:
         """Return the header with its reconciliation horizon raised to this position."""
-        if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < NO_LSN:
+        if (
+            isinstance(horizon, bool)
+            or not isinstance(horizon, int)
+            or not NO_LSN <= horizon < PROVISIONAL_CSN
+        ):
             raise GrafxIndexError(
                 f"A reconciliation horizon must be a non-negative integer; got {horizon!r}.",
                 field="reconciled_through_lsn",
@@ -202,6 +225,21 @@ class IndexHeader:
                 f"An index header declares the unknown visibility class {visibility}.",
                 field="visibility",
                 value=visibility,
+            )
+        if (
+            built_through_lsn == PROVISIONAL_CSN
+            or reconciled_through_lsn == PROVISIONAL_CSN
+        ):
+            field = (
+                "built_through_lsn"
+                if built_through_lsn == PROVISIONAL_CSN
+                else "reconciled_through_lsn"
+            )
+            raise GrafxCorruptionDetected(
+                "A persisted index header claims the log position reserved for provisional "
+                f"heap versions in {field}.",
+                field=field,
+                value=PROVISIONAL_CSN,
             )
         return cls(
             visibility=known,

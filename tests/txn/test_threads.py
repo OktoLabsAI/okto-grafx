@@ -97,7 +97,7 @@ def test_every_thread_of_one_participant_confirms_on_disjoint_partitions(
         for round_number in range(ROUNDS):
             page = 3 + index * ROUNDS + round_number
             txn = stack.manager.begin("write")
-            txn.stage_page_image(
+            txn.owner._stage_page_image(txn,
                 HEAP,
                 page,
                 make_page_image(stack.codec, [bytes([index, round_number])], page_index=page),
@@ -169,7 +169,7 @@ def test_readers_and_writers_of_one_participant_share_the_pin_table_safely(
             if index % 2 == 0:
                 page = 200 + index * ROUNDS + round_number
                 txn = stack.manager.begin("write")
-                txn.stage_page_image(
+                txn.owner._stage_page_image(txn,
                     HEAP, page, make_page_image(stack.codec, [b"w"], page_index=page)
                 )
                 txn.note_write(stack.manager.partition_of(index + 1, bytes([round_number])))
@@ -206,7 +206,7 @@ def test_no_thread_ever_sees_a_non_grafx_failure(database_root: Path) -> None:
         for round_number in range(ROUNDS):
             page = 400 + index * ROUNDS + round_number
             txn = stack.manager.begin("write")
-            txn.stage_page_image(
+            txn.owner._stage_page_image(txn,
                 HEAP, page, make_page_image(stack.codec, [b"x"], page_index=page)
             )
             # One shared partition on purpose, so the conflict path runs under contention too.
@@ -215,7 +215,7 @@ def test_no_thread_ever_sees_a_non_grafx_failure(database_root: Path) -> None:
                 stack.manager.commit(txn)
             except GrafxWriteConflict:
                 successor = stack.manager.retry(txn)
-                successor.stage_page_image(
+                successor.owner._stage_page_image(successor,
                     HEAP, page, make_page_image(stack.codec, [b"x"], page_index=page)
                 )
                 successor.note_write(stack.manager.partition_of(99, b"shared"))

@@ -44,7 +44,7 @@ def _commit_workload(stack: Stack, payload: bytes = b"crashy") -> object:
     """Run one commit that touches two pages, so a crash can land between them."""
     txn = stack.manager.begin("write")
     for page in PAGES:
-        txn.stage_page_image(
+        txn.owner._stage_page_image(txn,
             HEAP, page, make_page_image(stack.codec, [payload], page_index=page)
         )
     txn.note_write(stack.manager.partition_of(1, payload))

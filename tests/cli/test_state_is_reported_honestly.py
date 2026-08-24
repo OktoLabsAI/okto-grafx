@@ -212,6 +212,12 @@ def test_a_read_only_recovery_certifies_nothing(database_path: str, cli: CliRunn
 
 
 def test_recovery_reports_what_the_open_replayed(database_path: str, cli: CliRunner) -> None:
+    # The shared CLI fixture is checkpoint-complete so read-only commands have an honest stable
+    # baseline. Put one later commit above that checkpoint for this test, whose subject is the
+    # writable opener's replay report.
+    with connect(database_path) as database:
+        with database.begin("write") as txn:
+            txn.execute("CREATE (:Person {id: 99, name: 'Recovery probe'})")
     run = cli("recovery", database_path, "--json")
     assert run.code == OK
     recovery = run.document["recovery"]

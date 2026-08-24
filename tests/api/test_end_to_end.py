@@ -19,8 +19,11 @@ from pathlib import Path
 import pytest
 
 from okto_grafx import connect
+from okto_grafx.domain.errors import GrafxTransactionStateError
+from okto_grafx.domain.index import index_file
 from okto_grafx.domain.page import Page, PageType
 from okto_grafx.engine.database import Database
+from okto_grafx.engine.index_manager import primary_key_index_name
 
 HEAP = "heap.dat"
 ROW = b"a durable row"
@@ -59,7 +62,7 @@ def _write_one_row(db: Database, page_index: int, payload: bytes) -> object:
     """Stage one page through a public write transaction and commit it."""
     _grow_to(db, page_index)
     txn = db.begin("write")
-    txn.context.stage_page_image(HEAP, page_index, _image(db, [payload], page_index))
+    txn.context.owner._stage_page_image(txn.context, HEAP, page_index, _image(db, [payload], page_index))
     txn.context.note_write(db.transactions.partition_of(1, payload))
     return txn.commit()
 
@@ -97,7 +100,7 @@ def test_a_rolled_back_transaction_leaves_nothing_on_the_device(tmp_path: Path) 
         _grow_to(db, 2)
         before = db.wal.last_lsn
         txn = db.begin("write")
-        txn.context.stage_page_image(HEAP, 2, _image(db, [b"never"], 2))
+        txn.context.owner._stage_page_image(txn.context, HEAP, 2, _image(db, [b"never"], 2))
         txn.context.note_write(db.transactions.partition_of(1, b"never"))
         txn.rollback()
         assert db.wal.last_lsn == before
@@ -112,7 +115,7 @@ def test_closing_a_database_with_an_uncommitted_transaction_loses_only_that_tran
     with connect(root, page_size=512, partitions_per_table=8) as db:
         _write_one_row(db, 3, ROW)
         abandoned = db.begin("write")
-        abandoned.context.stage_page_image(HEAP, 3, _image(db, [b"abandoned"], 3))
+        abandoned.context.owner._stage_page_image(abandoned.context, HEAP, 3, _image(db, [b"abandoned"], 3))
         abandoned.context.note_write(db.transactions.partition_of(1, b"abandoned"))
 
     with connect(root, page_size=512, partitions_per_table=8) as reopened:
@@ -126,9 +129,9 @@ def test_two_transactions_on_disjoint_partitions_both_commit(tmp_path: Path) -> 
         _grow_to(db, 4)
         first = db.begin("write")
         second = db.begin("write")
-        first.context.stage_page_image(HEAP, 3, _image(db, [b"first"], 3))
+        first.context.owner._stage_page_image(first.context, HEAP, 3, _image(db, [b"first"], 3))
         first.context.note_write(db.transactions.partition_of(1, b"first"))
-        second.context.stage_page_image(HEAP, 4, _image(db, [b"second"], 4))
+        second.context.owner._stage_page_image(second.context, HEAP, 4, _image(db, [b"second"], 4))
         second.context.note_write(db.transactions.partition_of(2, b"second"))
         assert first.commit().wrote is True
         assert second.commit().wrote is True
@@ -468,3 +471,44 @@ def test_a_database_with_no_vector_column_attaches_nothing(tmp_path: Path) -> No
         assert reopened.stale_indexes == ()
         assert [index.name for index in reopened.indexes.indexes()] == ["pk_Person"]
         assert not any(name.startswith("vector_") for name in reopened.attached_indexes)
+
+
+def test_recovery_never_certifies_an_index_behind_its_checkpoint(tmp_path: Path) -> None:
+    """A retained WAL suffix cannot repair an index that already missed older commits."""
+    root = tmp_path / "db"
+    name = primary_key_index_name("P")
+    path = root / index_file(name)
+    with connect(root, page_size=512) as db:
+        with db.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")
+        db.checkpoint()
+        old_index = path.read_bytes()
+        with db.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 1})")
+        db.checkpoint()
+
+    # Simulate an independently lost/rolled-back accelerator after the authoritative heap and
+    # checkpoint advanced. The WAL below that checkpoint is no longer available to fill it.
+    path.write_bytes(old_index)
+
+    with connect(root, page_size=512) as reopened:
+        assert name in reopened.stale_indexes
+        assert reopened.indexes.index(name).built_through_lsn < (
+            reopened.transactions.published_state().checkpoint_lsn
+        )
+        # The stale access path is excluded; the heap remains authoritative and the scan is whole.
+        assert reopened.execute("MATCH (p:P {id: 1}) RETURN p.id").rows == ((1,),)
+
+
+def test_operator_recovery_requires_local_transaction_quiescence(tmp_path: Path) -> None:
+    with connect(tmp_path / "db", page_size=512) as db:
+        transaction = db.begin("read")
+        try:
+            with pytest.raises(GrafxTransactionStateError) as refused:
+                db.recover()
+            assert refused.value.details["field"] == "open_transactions"
+            assert refused.value.details["open_transactions"] == 1
+        finally:
+            transaction.rollback()
+
+        assert db.recover().outcome == "clean"

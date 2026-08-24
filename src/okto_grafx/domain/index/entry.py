@@ -27,7 +27,15 @@ import struct
 from dataclasses import dataclass, replace
 
 from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxIndexError
-from okto_grafx.domain.ids import NO_CSN, NO_PAGE, Csn, PageIndex, RecordRef, SlotId
+from okto_grafx.domain.ids import (
+    NO_CSN,
+    NO_PAGE,
+    PROVISIONAL_CSN,
+    Csn,
+    PageIndex,
+    RecordRef,
+    SlotId,
+)
 
 __all__ = [
     "ENTRY_FLAG_VERSIONED",
@@ -127,6 +135,14 @@ class IndexEntry:
             )
         _require_commit_number("born_csn", self.born_csn)
         _require_commit_number("dead_csn", self.dead_csn)
+        if self.born_csn == PROVISIONAL_CSN or self.dead_csn == PROVISIONAL_CSN:
+            field = "born_csn" if self.born_csn == PROVISIONAL_CSN else "dead_csn"
+            raise GrafxIndexError(
+                "The provisional heap stamp is not a commit and cannot be stored in an index "
+                f"entry's {field}.",
+                field=field,
+                value=PROVISIONAL_CSN,
+            )
         if not self.versioned and self.born_csn != NO_CSN:
             raise GrafxIndexError(
                 "An unversioned index entry carries no birth stamp, so it cannot declare one; "
@@ -211,6 +227,14 @@ class IndexEntry:
                 value=flags,
             )
         versioned = bool(flags & ENTRY_FLAG_VERSIONED)
+        if born_csn == PROVISIONAL_CSN or dead_csn == PROVISIONAL_CSN:
+            field = "born_csn" if born_csn == PROVISIONAL_CSN else "dead_csn"
+            raise GrafxCorruptionDetected(
+                "A persisted index entry carries the stamp reserved for provisional heap "
+                f"versions in {field}.",
+                field=field,
+                value=PROVISIONAL_CSN,
+            )
         if not versioned and born_csn != NO_CSN:
             raise GrafxCorruptionDetected(
                 "An unversioned index entry carries a birth stamp, so it is not an image this "

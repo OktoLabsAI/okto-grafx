@@ -22,6 +22,10 @@ __all__ = [
     "RecordId",
     "NO_LSN",
     "NO_CSN",
+    "PROVISIONAL_CSN",
+    "is_provisional_csn",
+    "is_committed_csn",
+    "is_open_end_csn",
     "NO_PAGE",
     "MAX_PAGE_INDEX",
     "MAX_SLOT_ID",
@@ -52,7 +56,43 @@ RecordId: TypeAlias = int
 
 NO_LSN: Lsn = 0
 NO_CSN: Csn = 0
+PROVISIONAL_CSN: Csn = 0xFFFFFFFFFFFFFFFF
+"""The u64 value used only while a heap mutation has not reached durable WAL.
+
+It is deliberately outside the committed CSN space.  A row born with this stamp is an
+abandoned provisional version and is invisible forever; the same value in ``xmax`` means the
+attempt to end an older committed version was provisional too, so that older version remains
+open.  WAL and secondary indexes must never persist the value as a real commit number.
+"""
 NO_PAGE: PageIndex = 0xFFFFFFFF
+
+
+def is_provisional_csn(value: object) -> bool:
+    """Return whether ``value`` is the reserved pre-WAL heap stamp."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value == PROVISIONAL_CSN
+    )
+
+
+def is_committed_csn(value: object) -> bool:
+    """Return whether ``value`` belongs to the usable, non-sentinel commit-number space."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and NO_CSN < value < PROVISIONAL_CSN
+    )
+
+
+def is_open_end_csn(value: object) -> bool:
+    """Return whether an ``xmax`` says the version has no committed end yet."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and (value == NO_CSN or value == PROVISIONAL_CSN)
+    )
+
 
 MAX_PAGE_INDEX: PageIndex = 0xFFFFFFFF
 """Largest encodable page index. It is the same value as :data:`NO_PAGE` by construction.

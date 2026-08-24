@@ -71,11 +71,17 @@ def cli() -> CliRunner:
 
 @pytest.fixture
 def database_path(tmp_path: Path) -> str:
-    """Return the path of a real database holding one committed table."""
+    """Return a checkpoint-complete database holding one committed table.
+
+    CLI read-only probes must start from bytes a read-only participant can prove complete without
+    replaying WAL. A normal writable close only flushes pages; it is not a checkpoint and cannot
+    make that durability claim after a power loss.
+    """
     path = tmp_path / "db"
     with connect(str(path)) as database:
         with database.begin("write") as txn:
             txn.execute(TABLE_STATEMENT)
+        database.checkpoint()
     return str(path)
 
 

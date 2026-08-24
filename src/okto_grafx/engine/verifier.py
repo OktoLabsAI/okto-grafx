@@ -58,7 +58,13 @@ from okto_grafx.domain.errors import (
     GrafxError,
     GrafxPortNotConfigured,
 )
-from okto_grafx.domain.ids import NO_CSN, NO_PAGE, PageIndex, RecordRef
+from okto_grafx.domain.ids import (
+    NO_CSN,
+    NO_PAGE,
+    PageIndex,
+    RecordRef,
+    is_provisional_csn,
+)
 from okto_grafx.domain.index.keys import index_key
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
 from okto_grafx.domain.model.schema import TableDef
@@ -605,7 +611,12 @@ class Verifier:
         return checked, findings
 
     def _verify_record(
-        self, table: TableDef, heap_file: str, page: Page, page_index: PageIndex, slot: int
+        self,
+        table: TableDef,
+        heap_file: str,
+        page: Page,
+        page_index: PageIndex,
+        slot: int,
     ) -> list[VerificationFinding]:
         """Check one stored version against the slot that holds it.
 
@@ -636,7 +647,12 @@ class Verifier:
                 )
             ]
         findings: list[VerificationFinding] = []
-        if header.xmax and header.xmin and header.xmax < header.xmin:
+        if (
+            not is_provisional_csn(header.xmin)
+            and header.xmax
+            and header.xmin
+            and header.xmax < header.xmin
+        ):
             findings.append(
                 VerificationFinding(
                     kind=FindingKind.RECORD_LIFETIME,
@@ -790,7 +806,8 @@ class Verifier:
         try:
             catalog = self._catalog.read_from_pages()
             table = next(
-                (found for found in catalog.tables() if found.table_id == table_id), None
+                (found for found in catalog.tables() if found.table_id == table_id),
+                None,
             )
             if table is None:
                 return []
@@ -820,7 +837,10 @@ class Verifier:
                 VerificationFinding(
                     kind=FindingKind.INDEX_ENTRY_MISSING,
                     location=FindingLocation(
-                        index=name, file=_store_file(self._heap), page=ref.page, slot=ref.slot
+                        index=name,
+                        file=_store_file(self._heap),
+                        page=ref.page,
+                        slot=ref.slot,
                     ),
                     detail=(
                         f"Record {version.record_id} of table {table.name!r} is live at this "
@@ -857,7 +877,9 @@ def _expected_key(definition: object, values: object, positions: object) -> byte
     key_for = getattr(definition, "key_for", None)
     if callable(key_for):
         return bytes(key_for(values))
-    return index_key(values, positions)  # pragma: no cover - every definition carries key_for
+    return index_key(
+        values, positions
+    )  # pragma: no cover - every definition carries key_for
 
 
 def _store_file(store: object) -> str:

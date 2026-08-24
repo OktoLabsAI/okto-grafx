@@ -12,7 +12,11 @@ from pathlib import Path
 
 import pytest
 
-from okto_grafx.domain.errors import GrafxTransactionStateError, GrafxWriteConflict
+from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
+    GrafxTransactionStateError,
+    GrafxWriteConflict,
+)
 from okto_grafx.domain.txn import CommitPayload, TransactionState, WalRecordType
 from okto_grafx.engine.txn_manager import (
     COMMIT_RETRIES_TOTAL,
@@ -28,7 +32,7 @@ StackFactory = object
 def _write(stack: Stack, *, reads: tuple[int, ...] = (), writes: tuple[int, ...] = (), page: int = 3):
     """Open a write transaction with the given sets and one staged page."""
     txn = stack.manager.begin("write")
-    txn.stage_page_image(HEAP, page, make_page_image(stack.codec, [b"row"], page_index=page))
+    txn.owner._stage_page_image(txn, HEAP, page, make_page_image(stack.codec, [b"row"], page_index=page))
     for partition in reads:
         txn.note_read(partition)
     for partition in writes:
@@ -130,7 +134,14 @@ def test_a_record_that_is_not_a_commit_never_conflicts(stack: Stack) -> None:
                 epoch=1,
                 txn_id=99,
                 payload=impostor,
-            )
+            ),
+            LogRecord(
+                record_type=int(WalRecordType.ABORT),
+                lsn=0,
+                epoch=1,
+                txn_id=99,
+                payload=b"",
+            ),
         ]
     )
     txn = _write(stack, writes=(shared,), page=3)
@@ -199,7 +210,7 @@ def test_the_loser_of_a_conflict_commits_on_its_retry(make_stack) -> None:
         second.manager.commit(loser)
     successor = second.manager.retry(loser)
     assert successor.snapshot.read_lsn >= winner_report.csn
-    successor.stage_page_image(HEAP, 4, make_page_image(second.codec, [b"retried"], page_index=4))
+    successor.owner._stage_page_image(successor, HEAP, 4, make_page_image(second.codec, [b"retried"], page_index=4))
     successor.note_write(shared)
     retried = second.manager.commit(successor)
     assert retried.csn > winner_report.csn
@@ -250,7 +261,7 @@ def test_a_log_that_ignores_the_start_lsn_cannot_manufacture_a_conflict(
         commit_lock_timeout=5.0,
     )
     txn = manager.begin("write")
-    txn.stage_page_image(HEAP, 5, make_page_image(stack.codec, [b"row"], page_index=5))
+    txn.owner._stage_page_image(txn, HEAP, 5, make_page_image(stack.codec, [b"row"], page_index=5))
     txn.note_write(shared)
     assert txn.snapshot.read_lsn == stack.manager.published_lsn()
     assert manager.commit(txn).wrote is True
@@ -308,7 +319,7 @@ def test_three_participants_writing_one_catalog_page_cannot_all_commit(make_stac
     staged = []
     for index, participant in enumerate(participants):
         txn = participant.manager.begin("write")
-        txn.stage_page_image(
+        txn.owner._stage_page_image(txn,
             "catalog.dat",
             catalog_page,
             make_page_image(participant.codec, [bytes([index])], page_index=catalog_page),
@@ -333,13 +344,8 @@ def test_three_participants_writing_one_catalog_page_cannot_all_commit(make_stac
         ]
 
 
-def test_a_commit_that_staged_durable_work_must_say_what_it_touched(stack: Stack) -> None:
-    """The other half of E1: silence and "nothing" stop being the same value.
-
-    A transaction that stages a log record and declares no partition would reach the log with an
-    empty interest set, which no comparison can refuse. It is refused at the commit instead, and
-    the message says what to do about it.
-    """
+def test_a_caller_staged_index_record_without_a_private_change_is_refused(stack: Stack) -> None:
+    """A syntactically valid logical record is not proof that an index produced it."""
     from okto_grafx.domain.txn import WalRecord, WalRecordType
 
     txn = stack.manager.begin("write")
@@ -348,10 +354,10 @@ def test_a_commit_that_staged_durable_work_must_say_what_it_touched(stack: Stack
     )
     assert txn.wrote is True
     assert txn.read_partitions == set() and txn.write_partitions == set()
-    with pytest.raises(GrafxTransactionStateError) as raised:
+    with pytest.raises(GrafxConfigurationError) as raised:
         stack.manager.commit(txn)
-    assert raised.value.details["field"] == "write_partitions"
-    assert raised.value.details["pending_records"] == 1
+    assert raised.value.details["field"] == "pending_records"
+    assert raised.value.details["count"] == 1
     assert stack.wal.records() == () or all(
         record.record_type != WalRecordType.COMMIT for record in stack.wal.records()
     )
