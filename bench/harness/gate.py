@@ -136,7 +136,13 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
         if not isinstance(entry, Mapping):
             continue
         name = entry.get("name")
-        for sample in entry.get("samples", []):
+        samples = entry.get("samples")
+        if not isinstance(samples, list):
+            # samples can arrive as null, a number, anything: iterating a non-list raises
+            # TypeError through the never-raise promise. A non-list is simply not samples,
+            # so the entry contributes nothing and a required ceiling reads UNMEASURED.
+            continue
+        for sample in samples:
             if not isinstance(sample, Mapping) or "value" not in sample:
                 continue
             # The guarded coercion is load-bearing here too: float(10**400) raises

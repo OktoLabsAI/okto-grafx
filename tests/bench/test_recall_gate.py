@@ -365,6 +365,31 @@ def test_a_huge_integer_ceiling_sample_is_skipped_not_an_overflow(
     assert main(["--metrics", str(document)]) == 2
 
 
+@pytest.mark.parametrize(
+    "bad_samples", [None, 3, "list", {}], ids=["null", "int", "string", "dict"]
+)
+def test_non_list_samples_are_skipped_not_a_typeerror(
+    tmp_path: Path, bad_samples: object
+) -> None:
+    """read_multiples iterated entry['samples'] blind: null/int raised TypeError through
+    the never-raise promise. A non-list contributes nothing; the ceiling is UNMEASURED."""
+    document = tmp_path / "metrics.json"
+    document.write_text(
+        json.dumps(
+            {
+                "metrics": [
+                    {
+                        "name": "oktografx_baseline_ceiling_multiple",
+                        "samples": bad_samples,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert main(["--metrics", str(document)]) == 2
+
+
 def test_a_huge_integer_explicit_target_raises_the_typed_error_not_overflow() -> None:
     """_resolve refuses programmatic 10**10000 with its DOCUMENTED ValueError."""
     with pytest.raises(ValueError, match="finite number"):

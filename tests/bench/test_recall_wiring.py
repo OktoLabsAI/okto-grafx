@@ -557,6 +557,26 @@ def test_an_invalid_worker_gauge_is_refused_before_any_publication(
     assert metrics.read_text(encoding="utf-8") == metrics_before, "no gauge may land"
 
 
+def test_a_malformed_ok_verdict_fails_typed_before_any_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ok=true verdict MISSING a key build_section needs (hashes) raises KeyError --
+    a shape the old four-type catch missed. Exit 3 typed, both documents exactly as the
+    strip left them, because build_section runs inside the boundary BEFORE any append."""
+    out, metrics = _seed_documents(tmp_path)
+    out_before = out.read_text(encoding="utf-8")
+    metrics_before = metrics.read_text(encoding="utf-8")
+    verdict = _verdict_stub()
+    del verdict["hashes"]
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: verdict)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    assert out.read_text(encoding="utf-8") == out_before
+    assert metrics.read_text(encoding="utf-8") == metrics_before
+
+
 @pytest.mark.parametrize(
     "bad",
     [float("nan"), float("inf"), 0, -5, True, 10**10000, -(10**10000)],

@@ -171,10 +171,11 @@ def append_vector_recall(
     except RecallStageError as failure:
         print(f"vector recall: FAIL-CLOSED -- {failure}")
         return 3
-    except (OSError, ValueError, TypeError, RuntimeError) as failure:
+    except Exception as failure:  # noqa: BLE001 -- any ordinary failure is exit 3 typed
         # An ORDINARY exception from the strip or the worker is still a stage failure:
         # typed line, exit 3, no traceback -- and because the strip precedes the spawn,
-        # a strip failure aborts before any measurement begins.
+        # a strip failure aborts before any measurement begins. Exception, not
+        # BaseException: KeyboardInterrupt and SystemExit still propagate.
         print(f"vector recall: stage failed before publication -- {failure}")
         return 3
     # The verdict's gauge is validated BEFORE any publication: an exact non-bool number,
@@ -206,7 +207,11 @@ def append_vector_recall(
             _append_section(out, section)
         if metrics is not None:
             _append_gauge(metrics, gauge_value)
-    except (OSError, ValueError, TypeError, RuntimeError) as failure:
+    except Exception as failure:  # noqa: BLE001 -- any ordinary failure is exit 3 typed
+        # build_section over a malformed ok-verdict raises KeyError/LookupError -- shapes
+        # the old four-type tuple missed. It runs INSIDE this boundary, before
+        # _append_section, so a failure here leaves both documents exactly as the strip
+        # left them. Exception, not BaseException: KI and SystemExit still propagate.
         print(f"vector recall: publication failed after measurement -- {failure}")
         return 3
     home = next(iter(section["observed"]))  # type: ignore[call-overload]
