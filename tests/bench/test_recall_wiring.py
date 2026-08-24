@@ -61,6 +61,27 @@ def _seed_documents(tmp_path: Path) -> tuple[Path, Path]:
     return out, metrics
 
 
+def _tiny_hashes() -> dict[str, str]:
+    """The REAL recomputed tiny-profile digests -- the validator refuses fakes now."""
+    from bench.harness.recall_worker import CORPUS_SEED, PROFILES, QUERY_SEED
+    from bench.recall_corpus import (
+        generate_vectors,
+        sha256_hex,
+        vector_bytes_f32,
+        vector_bytes_f64,
+    )
+
+    profile = PROFILES["tiny"]
+    corpus = generate_vectors(CORPUS_SEED, profile.corpus_size, profile.dimension)
+    queries = generate_vectors(QUERY_SEED, profile.queries, profile.dimension)
+    return {
+        "corpus_sha256_f64": sha256_hex(vector_bytes_f64(corpus)),
+        "corpus_sha256_f32": sha256_hex(vector_bytes_f32(corpus)),
+        "query_sha256_f64": sha256_hex(vector_bytes_f64(queries)),
+        "query_sha256_f32": sha256_hex(vector_bytes_f32(queries)),
+    }
+
+
 def _verdict_stub() -> dict[str, object]:
     """A successful worker verdict, minimal but shape-complete for build_section."""
     return {
@@ -75,12 +96,7 @@ def _verdict_stub() -> dict[str, object]:
         "queries": 8,
         "corpus_size": 96,
         "dimension": 16,
-        "hashes": {
-            "corpus_sha256_f64": "a" * 64,
-            "corpus_sha256_f32": "b" * 64,
-            "query_sha256_f64": "c" * 64,
-            "query_sha256_f32": "d" * 64,
-        },
+        "hashes": _tiny_hashes(),
         "gauge": 0.975,
         "observed": {
             "mean_recall_at_k": 0.975,
@@ -579,6 +595,17 @@ def _broken(mutation) -> dict[str, object]:
         lambda v: v["observed"].__setitem__("queries_below_perfect", 0),
         lambda v: v.__setitem__("blas_environment", {}),
         lambda v: v.__setitem__("gt_path_used", "numpy"),
+        lambda v: v.__setitem__("k", 4.0),
+        lambda v: v.__setitem__("hashes", {key: "0" * 64 for key in v["hashes"]}),
+        lambda v: v["hnsw"].__setitem__("neighbours", 16.0),
+        lambda v: v.__setitem__("failure", "x"),
+        lambda v: v.__setitem__("exit_code", 1),
+        lambda v: v.__setitem__("duration_seconds", -1.0),
+        lambda v: v["blas_environment"].__setitem__("EXTRA_THREADS", "1"),
+        lambda v: (
+            v["observed"].__setitem__("mean_recall_at_k", 1.0),
+            v["observed"].__setitem__("min_recall_at_k", 1.0),
+        ),
     ],
     ids=[
         "gauge-vs-mean",
@@ -590,6 +617,14 @@ def _broken(mutation) -> dict[str, object]:
         "count-contradicts-min",
         "unpinned-blas",
         "oracle-gt-mismatch",
+        "float-typed-k",
+        "zeroed-hashes",
+        "float-typed-hnsw",
+        "nonempty-failure",
+        "nonzero-exit",
+        "negative-duration",
+        "extra-blas-key",
+        "perfect-mean-with-below-count",
     ],
 )
 def test_an_adulterated_verdict_is_refused_before_any_append(
@@ -607,6 +642,27 @@ def test_an_adulterated_verdict_is_refused_before_any_append(
     assert code == 3
     assert out.read_text(encoding="utf-8") == out_before
     assert metrics.read_text(encoding="utf-8") == metrics_before
+
+
+def test_a_hostile_mapping_verdict_cannot_escape_the_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-review (f): a dict SUBCLASS passes isinstance and raises inside the
+    validator; the boundary converts it into the typed exit 3, documents untouched."""
+
+    class Hostile(dict):
+        def get(self, *args: object, **kwargs: object) -> object:
+            raise RuntimeError("hostile verdict mapping")
+
+    out, metrics = _seed_documents(tmp_path)
+    before = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: Hostile())
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    after = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    assert after == before
 
 
 def test_a_worker_that_writes_nothing_cannot_resurrect_a_stale_verdict(

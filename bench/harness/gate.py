@@ -112,9 +112,10 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
     """
     try:
         payload = json.loads(document)
-    except (ValueError, RecursionError) as error:
-        # RecursionError: json.loads on thousands of nesting levels overflows the
-        # parser's recursion, and "never raises" has to include that shape too.
+    except Exception as error:  # noqa: BLE001 -- "never raises" is absolute here
+        # ValueError is the documented shape, RecursionError arrives from thousands of
+        # nesting levels, and the promise covers whatever else an ordinary parse can
+        # throw. KeyboardInterrupt and SystemExit are BaseException and still propagate.
         return {}, {}, f"the metrics document is not readable JSON: {error}"
     if not isinstance(payload, Mapping):
         # `[]`, `null` and `3` are all VALID JSON, so the parse above accepts them and only the
@@ -184,7 +185,7 @@ def _recall_measurement(document: str) -> tuple[str, object]:
     """
     try:
         payload = json.loads(document)
-    except (ValueError, RecursionError):
+    except Exception:  # noqa: BLE001 -- unreadable is absent; never-raise is absolute
         return ("absent", None)
     if not isinstance(payload, Mapping):
         return ("absent", None)

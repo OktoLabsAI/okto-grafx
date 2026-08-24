@@ -184,11 +184,20 @@ def append_vector_recall(
     # frozen constants over it. Contradictions are refused, never normalized; the
     # documents stay exactly as the strip left them, and junk is only ever printed
     # through the guarded describer inside the validator.
-    reason = (
-        _validate_verdict(verdict, profile)
-        if isinstance(verdict, dict)
-        else "the verdict is not an object"
-    )
+    try:
+        reason = (
+            _validate_verdict(verdict, profile)
+            if isinstance(verdict, dict)
+            else "the verdict is not an object"
+        )
+    except Exception as failure:  # noqa: BLE001 -- a hostile mapping may raise anywhere
+        # A dict SUBCLASS can pass isinstance and then raise from get/__eq__ inside the
+        # validator; the boundary converts that into the same typed refusal. Exception,
+        # never BaseException: KI and SystemExit still propagate.
+        print(
+            f"vector recall: FAIL-CLOSED -- verdict validation itself failed: {failure}"
+        )
+        return 3
     if reason is not None:
         print(f"vector recall: FAIL-CLOSED -- incoherent verdict: {reason}")
         return 3

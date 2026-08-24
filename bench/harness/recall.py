@@ -21,6 +21,12 @@ import tempfile
 import time
 from pathlib import Path
 
+from bench.recall_corpus import (
+    generate_vectors,
+    sha256_hex,
+    vector_bytes_f32,
+    vector_bytes_f64,
+)
 from bench.harness.recall_worker import (
     ACCEL_EPS_REL,
     CORPUS_SEED,
@@ -201,6 +207,30 @@ def run_recall(
     return verdict
 
 
+_EXPECTED_HASHES: dict[str, dict[str, str]] = {}
+
+
+def _expected_hashes(profile) -> dict[str, str]:
+    """The recomputed corpus/query digests for one profile, cached per process.
+
+    Pre-review (b): 64 well-formed hex characters are not IDENTITY -- four zeroed
+    digests still froze. The only honest comparison is a fresh recomputation from the
+    frozen recipe, the same recomputation the freeze test pins.
+    """
+    cached = _EXPECTED_HASHES.get(profile.name)
+    if cached is None:
+        corpus = generate_vectors(CORPUS_SEED, profile.corpus_size, profile.dimension)
+        queries = generate_vectors(QUERY_SEED, profile.queries, profile.dimension)
+        cached = {
+            "corpus_sha256_f64": sha256_hex(vector_bytes_f64(corpus)),
+            "corpus_sha256_f32": sha256_hex(vector_bytes_f32(corpus)),
+            "query_sha256_f64": sha256_hex(vector_bytes_f64(queries)),
+            "query_sha256_f32": sha256_hex(vector_bytes_f32(queries)),
+        }
+        _EXPECTED_HASHES[profile.name] = cached
+    return cached
+
+
 def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | None:
     """The reason this verdict cannot be published, or None when it is fully coherent.
 
@@ -221,6 +251,8 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
         return (
             f"generator {_describe(verdict.get('generator'))} is not {GENERATOR_NAME!r}"
         )
+    if verdict.get("failure") != "":
+        return "failure is not the empty string on a success verdict"
     gt_path = verdict.get("gt_path_used")
     oracle = verdict.get("oracle")
     if gt_path not in ("numpy", "pure"):
@@ -237,6 +269,16 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
             return "a numpy-oracle profile cannot have taken the pure GT path"
         if oracle != "pure-fsum":
             return f"oracle {_describe(oracle)} does not match the pure GT path"
+    numpy_field = verdict.get("numpy")
+    if gt_path == "numpy":
+        if (
+            not isinstance(numpy_field, str)
+            or not numpy_field
+            or numpy_field == "absent"
+        ):
+            return "the numpy GT path requires a real numpy version string"
+    elif numpy_field != "absent":
+        return "the pure GT path must record numpy as 'absent'"
     for field, expected in (
         ("k", profile.k),
         ("queries", profile.queries),
@@ -244,8 +286,9 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
         ("dimension", profile.dimension),
     ):
         value = verdict.get(field)
-        if isinstance(value, bool) or value != expected:
-            return f"{field} {_describe(value)} is not the profile's {expected}"
+        # type(value) is int: float equality (10.0 == 10) is a MUTATION, not the profile.
+        if isinstance(value, bool) or type(value) is not int or value != expected:
+            return f"{field} {_describe(value)} is not the profile's exact {expected}"
     hashes = verdict.get("hashes")
     declared_hashes = {
         "corpus_sha256_f64",
@@ -262,8 +305,17 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
             and all(ch in "0123456789abcdef" for ch in digest)
         ):
             return f"{key} is not a 64-character lowercase hex digest"
-    if verdict.get("hnsw") != dict(HNSW_FROZEN):
-        return "hnsw does not equal the frozen construction parameters"
+    if hashes != _expected_hashes(profile):
+        return "hashes do not equal the profile's recomputed corpus/query digests"
+    hnsw = verdict.get("hnsw")
+    if not isinstance(hnsw, dict) or set(hnsw) != set(HNSW_FROZEN):
+        return "hnsw does not carry exactly the frozen parameter names"
+    for key, frozen in HNSW_FROZEN.items():
+        value = hnsw[key]
+        # Type-exact: dict equality accepts 16.0 == 16, and a float that merely equals
+        # the frozen integer is a mutation the section must never launder.
+        if type(value) is not type(frozen) or value != frozen:
+            return f"hnsw.{key} {_describe(value)} is not exactly the frozen {frozen!r}"
     observed = verdict.get("observed")
     declared_observed = {
         "mean_recall_at_k",
@@ -298,6 +350,8 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
         )
     if (below == 0) != (minimum >= 1.0):
         return "queries_below_perfect and min_recall_at_k contradict each other"
+    if (below == 0) != (mean >= 1.0):
+        return "queries_below_perfect and mean_recall_at_k contradict each other"
     dtype = observed["dtype_check"]
     if not isinstance(dtype, dict) or set(dtype) != {"mean_overlap", "min_overlap"}:
         return "dtype_check is not exactly its declared keys"
@@ -321,10 +375,25 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
     if isinstance(gauge, bool) or type(gauge) is not float or gauge != mean:
         return "gauge does not EXACTLY equal observed.mean_recall_at_k"
     blas = verdict.get("blas_environment")
-    if not isinstance(blas, dict) or any(
-        blas.get(name) != "1" for name in _BLAS_THREAD_VARIABLES
+    if (
+        not isinstance(blas, dict)
+        or set(blas) != set(_BLAS_THREAD_VARIABLES)
+        or any(blas[name] != "1" for name in _BLAS_THREAD_VARIABLES)
     ):
-        return "blas_environment does not pin every thread variable to '1'"
+        return "blas_environment is not exactly the thread variables pinned to '1'"
+    duration = verdict.get("duration_seconds")
+    if (
+        isinstance(duration, bool)
+        or type(duration) is not float
+        or not math.isfinite(duration)
+        or duration < 0.0
+    ):
+        return (
+            f"duration_seconds {_describe(duration)} is not a finite non-negative float"
+        )
+    exit_code = verdict.get("exit_code")
+    if isinstance(exit_code, bool) or type(exit_code) is not int or exit_code != 0:
+        return f"exit_code {_describe(exit_code)} is not exactly 0"
     return None
 
 
