@@ -24,6 +24,7 @@ from pathlib import Path
 from bench.harness.recall import (
     RECALL_METRIC,
     RecallStageError,
+    _canonical_verdict,
     _validate_verdict,
     build_section,
     run_recall,
@@ -185,10 +186,14 @@ def append_vector_recall(
     # documents stay exactly as the strip left them, and junk is only ever printed
     # through the guarded describer inside the validator.
     try:
+        # Round 3 HIGH-2 (TOCTOU): the verdict is snapshotted ONCE into exact builtin
+        # types; subclasses that could answer validation and publication differently
+        # are refused outright, and the SAME canonical instance feeds both.
+        canonical = _canonical_verdict(verdict)
         reason = (
-            _validate_verdict(verdict, profile)
-            if isinstance(verdict, dict)
-            else "the verdict is not an object"
+            "the verdict is not canonical builtin data"
+            if canonical is None
+            else _validate_verdict(canonical, profile)
         )
     except Exception as failure:  # noqa: BLE001 -- a hostile mapping may raise anywhere
         # A dict SUBCLASS can pass isinstance and then raise from get/__eq__ inside the
@@ -201,9 +206,9 @@ def append_vector_recall(
     if reason is not None:
         print(f"vector recall: FAIL-CLOSED -- incoherent verdict: {reason}")
         return 3
-    gauge_value = float(verdict["gauge"])  # validated: exact float == observed mean
+    gauge_value = float(canonical["gauge"])  # validated: exact float == observed mean
     try:
-        section = build_section(verdict)
+        section = build_section(canonical)
         if out is not None:
             _append_section(out, section)
         if metrics is not None:

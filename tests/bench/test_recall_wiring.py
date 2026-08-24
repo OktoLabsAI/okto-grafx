@@ -97,10 +97,12 @@ def _verdict_stub() -> dict[str, object]:
         "corpus_size": 96,
         "dimension": 16,
         "hashes": _tiny_hashes(),
-        "gauge": 0.975,
+        # 31/32: seven perfect tiny queries and one at 3/4 -- ON the recall@4 grid and
+        # jointly realizable with min=0.75, below=1 (the validator now proves it).
+        "gauge": 0.96875,
         "observed": {
-            "mean_recall_at_k": 0.975,
-            "min_recall_at_k": 0.9,
+            "mean_recall_at_k": 0.96875,
+            "min_recall_at_k": 0.75,
             # One query below perfect: coherent with a minimum under 1.0 -- the full
             # verdict validator refuses a zero count beside an imperfect minimum.
             "queries_below_perfect": 1,
@@ -133,7 +135,7 @@ def test_success_appends_section_first_and_gauge_last_in_the_gate_shape(
     names = [entry["name"] for entry in document["metrics"]]
     assert names == ["oktografx_baseline_ceiling_multiple", RECALL_METRIC]
     gauge = document["metrics"][-1]
-    assert gauge["samples"] == [{"value": 0.975}]
+    assert gauge["samples"] == [{"value": 0.96875}]
 
 
 def test_a_recall_failure_before_any_append_touches_neither_document(
@@ -350,7 +352,7 @@ def test_a_rerun_with_duplicate_old_gauges_ends_with_exactly_one_entry(
     final = json.loads(metrics.read_text(encoding="utf-8"))
     gauges = [entry for entry in final["metrics"] if entry["name"] == RECALL_METRIC]
     assert len(gauges) == 1
-    assert gauges[0]["samples"] == [{"value": 0.975}]
+    assert gauges[0]["samples"] == [{"value": 0.96875}]
 
 
 def test_a_crash_after_the_strip_before_the_section_leaves_no_gauge_at_all(
@@ -645,6 +647,66 @@ def test_an_adulterated_verdict_is_refused_before_any_append(
     assert code == 3
     assert out.read_text(encoding="utf-8") == out_before
     assert metrics.read_text(encoding="utf-8") == metrics_before
+
+
+def test_an_unrealizable_summary_is_refused_and_the_possible_one_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3 HIGH-1, the auditor's exact probe: tiny (q=8, k=4) with min=0.75,
+    below=1 and mean=gauge=0.99 is arithmetic fiction -- only 31/32 is realizable."""
+    from bench.harness.recall import _validate_verdict
+
+    impossible = _verdict_stub()
+    impossible["observed"]["mean_recall_at_k"] = 0.99
+    impossible["gauge"] = 0.99
+    reason = _validate_verdict(impossible, "tiny")
+    assert reason is not None and "grid" in reason, reason
+    out, metrics = _seed_documents(tmp_path)
+    before = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: impossible)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    assert (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8")) == (
+        before
+    )
+    assert _validate_verdict(_verdict_stub(), "tiny") is None, "31/32 must pass"
+    off_grid_min = _verdict_stub()
+    off_grid_min["observed"]["min_recall_at_k"] = 0.9
+    assert _validate_verdict(off_grid_min, "tiny") is not None, (
+        "0.9 is off the k=4 grid"
+    )
+
+
+def test_a_chameleon_mapping_cannot_split_validation_from_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 3 HIGH-2 (TOCTOU): coherent under get(), poisoned under __getitem__.
+    The canonical snapshot refuses the subclass outright; nothing is published."""
+
+    class Chameleon(dict):
+        def __getitem__(self, key: object) -> object:
+            if key == "observed":
+                return {
+                    "mean_recall_at_k": 0.0,
+                    "min_recall_at_k": 0.0,
+                    "queries_below_perfect": 8,
+                    "dtype_check": {"mean_overlap": 1.0, "min_overlap": 1.0},
+                }
+            return dict.__getitem__(self, key)
+
+    out, metrics = _seed_documents(tmp_path)
+    before = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: Chameleon(_verdict_stub())
+    )
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    after = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    assert after == before, "a chameleon must publish NOTHING, coherent or not"
 
 
 def test_a_hostile_mapping_verdict_cannot_escape_the_boundary(

@@ -231,6 +231,43 @@ def _expected_hashes(profile) -> dict[str, str]:
     return cached
 
 
+class _NotCanonical(Exception):
+    """A node that is not exact builtin data; the rebuild refuses it."""
+
+
+def _canonical_verdict(verdict: object) -> dict[str, object] | None:
+    """A deep rebuild into EXACT builtin types, or None -- the TOCTOU antidote.
+
+    Round 3 HIGH-2: a dict subclass can keep ``get`` coherent while ``__getitem__``
+    lies later, so validating one read and publishing another lets an impossible pair
+    through (section mean 0.0 beside gauge 1.0). The verdict is snapshotted ONCE into
+    pure dict/list/str/int/float/bool/None -- exact types only, subclasses refused --
+    and that single canonical instance must feed BOTH the validator and the
+    publication. Hostile structures that raise during the rebuild surface to the
+    caller's boundary as ordinary exceptions.
+    """
+
+    def rebuild(node: object) -> object:
+        if node is None or type(node) in (bool, int, float, str):
+            return node
+        if type(node) is dict:
+            rebuilt: dict[str, object] = {}
+            for key, value in node.items():
+                if type(key) is not str:
+                    raise _NotCanonical()
+                rebuilt[key] = rebuild(value)
+            return rebuilt
+        if type(node) is list:
+            return [rebuild(item) for item in node]
+        raise _NotCanonical()
+
+    try:
+        result = rebuild(verdict)
+    except _NotCanonical:
+        return None
+    return result if type(result) is dict else None
+
+
 def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | None:
     """The reason this verdict cannot be published, or None when it is fully coherent.
 
@@ -352,6 +389,39 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
         return "queries_below_perfect and min_recall_at_k contradict each other"
     if (below == 0) != (mean >= 1.0):
         return "queries_below_perfect and mean_recall_at_k contradict each other"
+    # Round 3 HIGH-1: recalls@k live on the grid {m/k}, so mean, min and below must be
+    # JOINTLY realizable for this profile's (queries, k). min=.75 with below=1 and
+    # mean=.99 at q=8,k=4 is arithmetic fiction -- seven perfect queries and one at .75
+    # can only average 31/32. The comparisons work in integer grid units, where float
+    # division noise is orders of magnitude below half a step, so no tolerance wide
+    # enough to accept an impossible combination exists here.
+    m_min = next((m for m in range(profile.k + 1) if minimum == m / profile.k), None)
+    if m_min is None:
+        return (
+            f"observed.min_recall_at_k {_describe(minimum)} is not on the recall@k "
+            f"grid for k={profile.k}"
+        )
+    grid_units = mean * profile.queries * profile.k
+    total = round(grid_units)
+    if abs(grid_units - total) > 1e-6:
+        return (
+            f"observed.mean_recall_at_k {_describe(mean)} is not on the recall@k "
+            f"grid for queries={profile.queries}, k={profile.k}"
+        )
+    perfect = profile.queries - below
+    if below == 0:
+        realizable = total == perfect * profile.k
+    else:
+        # Every below-perfect query scores in [m_min, k-1], and at least one of them
+        # ATTAINS the minimum -- both ends of the sum are exact integers.
+        lowest_total = perfect * profile.k + below * m_min
+        highest_total = perfect * profile.k + m_min + (below - 1) * (profile.k - 1)
+        realizable = lowest_total <= total <= highest_total
+    if not realizable:
+        return (
+            "observed mean/min/queries_below_perfect are not jointly realizable for "
+            f"queries={profile.queries}, k={profile.k} (grid total {total})"
+        )
     dtype = observed["dtype_check"]
     if not isinstance(dtype, dict) or set(dtype) != {"mean_overlap", "min_overlap"}:
         return "dtype_check is not exactly its declared keys"
