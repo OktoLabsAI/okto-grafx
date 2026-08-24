@@ -177,6 +177,42 @@ def check(
     return GateResult(status=status, lines=tuple(lines))
 
 
+def _resolve_recall_target(
+    explicit: float | None, calibration: str | None
+) -> tuple[float, str]:
+    """Return the recall floor and WHERE it came from: flag > frozen artifact > built-in.
+
+    The flag default is None deliberately (C13): a default equal to the built-in value would
+    mask the frozen artifact, because an omitted flag and an explicit 0.9 would be
+    indistinguishable. An unreadable or sectionless calibration file falls through to the
+    built-in default, with the origin saying so -- the gate never guesses silently.
+    """
+    if explicit is not None:
+        return explicit, "explicit flag"
+    if calibration:
+        try:
+            payload = json.loads(Path(calibration).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return DEFAULT_RECALL_TARGET, (
+                f"built-in default; {calibration!r} was unreadable"
+            )
+        candidate = (
+            payload.get("vector_recall", {}).get("frozen", {}).get("target")
+            if isinstance(payload, dict)
+            else None
+        )
+        if (
+            isinstance(candidate, (int, float))
+            and not isinstance(candidate, bool)
+            and 0.0 < float(candidate) <= 1.0
+        ):
+            return float(candidate), f"frozen in {calibration}"
+        return DEFAULT_RECALL_TARGET, (
+            f"built-in default; {calibration!r} holds no usable frozen target"
+        )
+    return DEFAULT_RECALL_TARGET, "built-in default"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Read a published metrics document and apply the ceilings; no exception escapes."""
     parser = argparse.ArgumentParser(
@@ -193,8 +229,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--recall-target",
         type=float,
-        default=DEFAULT_RECALL_TARGET,
-        help="the frozen recall floor of SPEC-VEC FR-8",
+        default=None,
+        help=(
+            "the recall floor; omitted, it comes from --calibration's frozen target, "
+            "else the built-in default"
+        ),
+    )
+    parser.add_argument(
+        "--calibration",
+        default=None,
+        help="calibration.json whose vector_recall.frozen.target is the frozen recall floor",
     )
     parser.add_argument(
         "--require-recall",
@@ -208,10 +252,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"D5 ceiling gate: UNMEASURED -- the metrics file could not be read: {error}")
         return 2
     try:
+        recall_target, target_origin = _resolve_recall_target(
+            arguments.recall_target, arguments.calibration
+        )
+        print(f"vector recall target {recall_target:g} ({target_origin})")
         result = check(
             document,
             required=tuple(arguments.require) or tuple(CEILINGS),
-            recall_target=arguments.recall_target,
+            recall_target=recall_target,
             require_recall=arguments.require_recall,
         )
     except Exception as error:  # noqa: BLE001 - a crash here must read as UNMEASURED, never as 1
