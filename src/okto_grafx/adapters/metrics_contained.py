@@ -88,9 +88,11 @@ class ContainedMetricsSink:
     """The sink the ENGINE sees: every recording door absorbs what the inner sink raises."""
 
     __slots__ = (
+        "_close_wait_hazards",
         "_enabled_hint",
         "_inner",
         "_page_accesses",
+        "_pending_release_failures",
         "_state",
         "_transition_guard",
         "_transitions",
@@ -102,6 +104,8 @@ class ContainedMetricsSink:
         self._transition_guard = Lock()
         self._transitions = 0
         self._page_accesses = 0
+        self._close_wait_hazards = 0
+        self._pending_release_failures: list[BaseException] = []
         try:
             self._enabled_hint = bool(inner.enabled)
         except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
@@ -143,6 +147,17 @@ class ContainedMetricsSink:
         with self._transition_guard:
             return self._page_accesses > 0
 
+    @property
+    def close_wait_hazard_active(self) -> bool:
+        """Return whether a foreign callback may currently be waiting for close.
+
+        This is deliberately narrower than a participant section. Pure engine work and facade
+        outcome settlement must still let another thread enter normal close and quiesce the
+        manager; only an invocation whose implementation belongs to the host raises this bit.
+        """
+        with self._transition_guard:
+            return self._close_wait_hazards > 0
+
     @contextmanager
     def transition(self) -> Iterator[None]:
         """Track one facade lifecycle outcome without invoking or delaying host callbacks.
@@ -182,6 +197,50 @@ class ContainedMetricsSink:
         finally:
             with self._transition_guard:
                 self._page_accesses -= 1
+
+    @contextmanager
+    def close_wait_hazard(self) -> Iterator[None]:
+        """Mark one narrow foreign invocation that may synchronously wait for close.
+
+        The guarded counter is changed before and after, never around, host code. Database.close
+        can therefore publish its terminal request and return instead of waiting on the
+        participant section held by that invocation. Transition-finally completes close after
+        the callback and participant section have both left.
+        """
+        with self._transition_guard:
+            self._close_wait_hazards += 1
+        try:
+            yield
+        finally:
+            with self._transition_guard:
+                self._close_wait_hazards -= 1
+
+    def retain_release_failure(
+        self,
+        failure: BaseException,
+        expected: BaseException | None,
+    ) -> bool:
+        """Atomically retain an exact swallowed release failure for one later claimant."""
+        with self._transition_guard:
+            if expected is None or failure is not expected:
+                return False
+            if not any(
+                pending is failure for pending in self._pending_release_failures
+            ):
+                self._pending_release_failures.append(failure)
+            return True
+
+    def claim_release_failure(
+        self,
+        expected: BaseException | None,
+    ) -> BaseException | None:
+        """Atomically return and clear the exact pending failure, at most once."""
+        with self._transition_guard:
+            for position, pending in enumerate(self._pending_release_failures):
+                if pending is expected:
+                    self._pending_release_failures.pop(position)
+                    return pending
+            return None
 
     @contextmanager
     def defer(self) -> Iterator[None]:

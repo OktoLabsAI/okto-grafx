@@ -1248,6 +1248,288 @@ def test_vector_math_can_wait_for_cross_thread_close_without_deadlock() -> None:
     assert database.close_complete
 
 
+def test_clock_can_wait_for_cross_thread_close_without_deadlock() -> None:
+    """A host Clock callback under the participant section sees terminal close return."""
+    database = connect(":memory:")
+    manager = database._transactions
+    inner = manager._clock
+    close_joined: list[bool] = []
+    close_failures: list[BaseException] = []
+    close_workers: list[threading.Thread] = []
+
+    class ClosingClock:
+        def __init__(self) -> None:
+            self.fired = False
+
+        def monotonic(self) -> float:
+            if not self.fired:
+                self.fired = True
+
+                def close() -> None:
+                    try:
+                        database.close()
+                    except BaseException as failure:  # noqa: BLE001 - exact evidence below
+                        close_failures.append(failure)
+
+                worker = threading.Thread(target=close, name="clock-close")
+                close_workers.append(worker)
+                worker.start()
+                worker.join(_WAIT_SECONDS)
+                close_joined.append(not worker.is_alive())
+            return inner.monotonic()
+
+        def wall(self) -> float:
+            return inner.wall()
+
+    clock = ClosingClock()
+    manager._clock = clock
+    try:
+        with pytest.raises(GrafxTransactionStateError):
+            database.begin("read")
+    finally:
+        database.close()
+        for worker in close_workers:
+            worker.join(_WAIT_SECONDS)
+
+    assert clock.fired
+    assert close_joined == [True]
+    assert close_failures == []
+    assert all(not worker.is_alive() for worker in close_workers)
+    assert manager.open_transactions == 0
+    assert database.close_complete
+
+
+def test_storage_append_can_wait_for_cross_thread_close_without_deadlock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supported StorageDevice callback under commit may synchronously wait for close."""
+    database, registry, storage, _metrics = _instrumented_database()
+    with database.begin("write") as schema:
+        schema.execute("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")
+    writer = database.begin("write")
+    writer.execute("CREATE (:P {id: 1})")
+    close_joined: list[bool] = []
+    close_failures: list[BaseException] = []
+    close_workers: list[threading.Thread] = []
+    original_append = FaultInjectingStorageDevice.append_log
+    fired = [False]
+
+    def append_log(self: FaultInjectingStorageDevice, file: str, payload: bytes) -> int:
+        if self is storage and not fired[0] and file.startswith("wal/"):
+            fired[0] = True
+
+            def close() -> None:
+                try:
+                    database.close()
+                except BaseException as failure:  # noqa: BLE001 - exact evidence below
+                    close_failures.append(failure)
+
+            worker = threading.Thread(target=close, name="storage-append-close")
+            close_workers.append(worker)
+            worker.start()
+            worker.join(_WAIT_SECONDS)
+            close_joined.append(not worker.is_alive())
+        return original_append(self, file, payload)
+
+    monkeypatch.setattr(FaultInjectingStorageDevice, "append_log", append_log)
+    try:
+        report = writer.commit()
+    finally:
+        database.close()
+        for worker in close_workers:
+            worker.join(_WAIT_SECONDS)
+        release_ports(registry)
+
+    assert report.durable and report.wrote
+    assert fired == [True]
+    assert close_joined == [True]
+    assert close_failures == []
+    assert all(not worker.is_alive() for worker in close_workers)
+    assert database.close_complete
+
+
+def test_index_unwind_storage_can_wait_for_cross_thread_close_without_deadlock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollback marks QueryEngine's index/file unwind, not all schema settlement."""
+    database, registry, storage, _metrics = _instrumented_database()
+    close_joined: list[bool] = []
+    close_failures: list[BaseException] = []
+    close_workers: list[threading.Thread] = []
+    original_remove = FaultInjectingStorageDevice.remove
+    fired = [False]
+
+    def remove(self: FaultInjectingStorageDevice, file: str) -> None:
+        if self is storage and not fired[0] and file.startswith("index/"):
+            fired[0] = True
+
+            def close() -> None:
+                try:
+                    database.close()
+                except BaseException as failure:  # noqa: BLE001 - exact evidence below
+                    close_failures.append(failure)
+
+            worker = threading.Thread(target=close, name="index-unwind-close")
+            close_workers.append(worker)
+            worker.start()
+            worker.join(_WAIT_SECONDS)
+            close_joined.append(not worker.is_alive())
+        original_remove(self, file)
+
+    monkeypatch.setattr(FaultInjectingStorageDevice, "remove", remove)
+    transaction = database.begin("write")
+    transaction.execute(
+        "CREATE VECTOR SPACE transient {dimension: 2, metric: 'cosine'}"
+    )
+    transaction.execute(
+        "CREATE NODE TABLE V(id INT64, e VECTOR(transient), PRIMARY KEY(id))"
+    )
+    try:
+        transaction.rollback()
+    finally:
+        database.close()
+        for worker in close_workers:
+            worker.join(_WAIT_SECONDS)
+        release_ports(registry)
+
+    assert fired == [True]
+    assert close_joined == [True]
+    assert close_failures == []
+    assert all(not worker.is_alive() for worker in close_workers)
+    assert not transaction.active
+    assert database.close_complete
+
+
+def test_recovery_mechanism_can_wait_for_cross_thread_close_without_deadlock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery's storage/quarantine/index pass remains resumable as one host phase."""
+    database = connect(":memory:")
+    manager = database._recovery
+    original_run = type(manager).run
+    close_joined: list[bool] = []
+    close_failures: list[BaseException] = []
+    close_workers: list[threading.Thread] = []
+    fired = [False]
+
+    def run(self: object) -> object:
+        if self is manager and not fired[0]:
+            fired[0] = True
+
+            def close() -> None:
+                try:
+                    database.close()
+                except BaseException as failure:  # noqa: BLE001 - exact evidence below
+                    close_failures.append(failure)
+
+            worker = threading.Thread(target=close, name="recovery-mechanism-close")
+            close_workers.append(worker)
+            worker.start()
+            worker.join(_WAIT_SECONDS)
+            close_joined.append(not worker.is_alive())
+        return original_run(self)
+
+    monkeypatch.setattr(type(manager), "run", run)
+    try:
+        with pytest.raises(GrafxTransactionStateError):
+            database.recover()
+    finally:
+        database.close()
+        for worker in close_workers:
+            worker.join(_WAIT_SECONDS)
+
+    assert fired == [True]
+    assert close_joined == [True]
+    assert close_failures == []
+    assert all(not worker.is_alive() for worker in close_workers)
+    assert database.close_complete
+
+
+@pytest.mark.parametrize("phase", ("factory", "enter", "exit"))
+def test_coordinator_context_phases_can_wait_for_cross_thread_close(
+    phase: str,
+) -> None:
+    """Coordinator factory/enter/exit callbacks are hazards, never the yielded body."""
+    database = connect(":memory:")
+    manager = database._transactions
+    inner = manager._coordinator
+    close_joined: list[bool] = []
+    close_failures: list[BaseException] = []
+    close_workers: list[threading.Thread] = []
+    fired = [False]
+
+    def fire_close() -> None:
+        fired[0] = True
+
+        def close() -> None:
+            try:
+                database.close()
+            except BaseException as failure:  # noqa: BLE001 - exact evidence below
+                close_failures.append(failure)
+
+        worker = threading.Thread(target=close, name=f"coordinator-{phase}-close")
+        close_workers.append(worker)
+        worker.start()
+        worker.join(_WAIT_SECONDS)
+        close_joined.append(not worker.is_alive())
+
+    class ClosingSection:
+        def __init__(
+            self,
+            section: object,
+            *,
+            entered: bool = False,
+            value: object = None,
+        ) -> None:
+            self.section = section
+            self.entered = entered
+            self.value = value
+
+        def __enter__(self) -> object:
+            if self.entered:
+                return self.value
+            self.value = self.section.__enter__()  # type: ignore[attr-defined]
+            self.entered = True
+            if phase == "enter" and not fired[0]:
+                fire_close()
+            return self.value
+
+        def __exit__(self, kind: object, value: object, trace: object) -> object:
+            if phase == "exit" and not fired[0]:
+                fire_close()
+            return self.section.__exit__(kind, value, trace)  # type: ignore[attr-defined]
+
+    class ClosingCoordinator:
+        def __getattr__(self, name: str) -> object:
+            return getattr(inner, name)
+
+        def exclusive(self, name: str, *, timeout: float) -> object:
+            section = inner.exclusive(name, timeout=timeout)
+            if fired[0] or name != manager._participant_section_name:
+                return section
+            if phase == "factory":
+                value = section.__enter__()
+                fire_close()
+                return ClosingSection(section, entered=True, value=value)
+            return ClosingSection(section)
+
+    manager._coordinator = ClosingCoordinator()  # type: ignore[assignment]
+    try:
+        with pytest.raises(GrafxTransactionStateError):
+            database.begin("read")
+    finally:
+        database.close()
+        for worker in close_workers:
+            worker.join(_WAIT_SECONDS)
+
+    assert fired == [True]
+    assert close_joined == [True]
+    assert close_failures == []
+    assert all(not worker.is_alive() for worker in close_workers)
+    assert manager.open_transactions == 0
+    assert database.close_complete
+
+
 def test_close_cannot_enter_the_page_access_acquire_to_body_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1315,17 +1597,19 @@ def test_close_cannot_enter_the_page_access_acquire_to_body_window(
     assert database.close_complete
 
 
-def test_automatic_close_release_failure_remains_visible_without_double_release(
+@pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt, SystemExit))
+def test_automatic_close_release_failure_has_one_concurrent_explicit_claimant(
     monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
 ) -> None:
-    """A deferred release bomb is re-raised to explicit callers exactly as stored."""
+    """Two explicit closes race for one exact swallowed RuntimeError or process signal."""
     database = connect(":memory:")
     snapshot_inside = threading.Event()
     release_snapshot = threading.Event()
     snapshot_failures: list[BaseException] = []
-    close_failures: list[BaseException] = []
+    early_close_failures: list[BaseException] = []
     closer_calls = [0]
-    bomb = RuntimeError("automatic release sentinel")
+    bomb = failure_type("automatic release sentinel")
     original_snapshot = ContainedMetricsSink.snapshot
 
     def pause_snapshot(self: ContainedMetricsSink) -> object:
@@ -1349,7 +1633,7 @@ def test_automatic_close_release_failure_remains_visible_without_double_release(
         try:
             database.close()
         except BaseException as failure:  # noqa: BLE001 - exact evidence below
-            close_failures.append(failure)
+            early_close_failures.append(failure)
 
     monkeypatch.setattr(ContainedMetricsSink, "snapshot", pause_snapshot)
     object.__setattr__(database, "_closers", (*database._closers, failing_closer))
@@ -1361,7 +1645,7 @@ def test_automatic_close_release_failure_remains_visible_without_double_release(
         close_worker.start()
         close_worker.join(_WAIT_SECONDS)
         assert not close_worker.is_alive()
-        assert close_failures == []
+        assert early_close_failures == []
         assert database.closed and not database.close_complete
         release_snapshot.set()
         snapshot_worker.join(_WAIT_SECONDS)
@@ -1374,9 +1658,30 @@ def test_automatic_close_release_failure_remains_visible_without_double_release(
     assert database.close_complete
     assert database._close_failure is bomb
     assert closer_calls == [1]
-    with pytest.raises(RuntimeError) as raised:
-        database.close()
-    assert raised.value is bomb
+    claim_barrier = threading.Barrier(3, timeout=_WAIT_SECONDS)
+    claim_outcomes: list[None] = []
+    claim_failures: list[BaseException] = []
+
+    def claim() -> None:
+        try:
+            claim_barrier.wait()
+            claim_outcomes.append(database.close())
+        except BaseException as failure:  # noqa: BLE001 - identity is the assertion
+            claim_failures.append(failure)
+
+    claim_workers = [
+        threading.Thread(target=claim, name=f"release-failure-claim-{index}")
+        for index in range(2)
+    ]
+    for worker in claim_workers:
+        worker.start()
+    claim_barrier.wait()
+    for worker in claim_workers:
+        worker.join(_WAIT_SECONDS)
+
+    assert all(not worker.is_alive() for worker in claim_workers)
+    assert claim_outcomes == [None]
+    assert claim_failures == [bomb]
     database.close()
     assert closer_calls == [1]
 

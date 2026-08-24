@@ -829,6 +829,8 @@ class Database:
         "_close_released",
         "_close_failure",
         "_release_failure",
+        # Directly composed facades without ContainedMetricsSink keep a best-effort fallback;
+        # the supported composition atomically marks/claims through that adapter instead.
         "_release_failure_pending",
         "_recovery_report",
         "_attached_indexes",
@@ -1509,6 +1511,11 @@ class Database:
         handed a read-only handle the capability the open had just withheld, and it does so
         holding NO writer lease, so it would cut the log while another process appends under one.
         """
+        with self._public_transition():
+            return self._recover_in_transition()
+
+    def _recover_in_transition(self) -> object:
+        """Run recovery while one facade outcome keeps callback-requested close resumable."""
         self._require_open()
         self._require_writable("run recovery")
         manager = self._require_component("recovery", self._recovery, "recovery (C6)")
@@ -1519,7 +1526,8 @@ class Database:
             # Latch before the first replay effect. If the pass fails after installing only a
             # prefix, no later transaction on this handle may publish over the missing suffix.
             self._transactions.require_recovery()
-            report = manager.run()  # type: ignore[attr-defined]
+            with self._transactions._close_wait_hazard():
+                report = manager.run()  # type: ignore[attr-defined]
             self._transactions.recovery_completed()
         public_report = _recovery_report_view(report)
         self._recovery_report = public_report
@@ -1673,9 +1681,9 @@ class Database:
         state from completed lower-layer release.
         """
         if self._close_released:
-            if self._release_failure is not None and self._release_failure_pending:
-                self._release_failure_pending = False
-                raise self._release_failure
+            pending_failure = self._claim_unobserved_release_failure()
+            if pending_failure is not None:
+                raise pending_failure
             return
         # Marked closed BEFORE anything is released. A release path calls host-supplied code --
         # an event sink, a metrics publisher, a storage device -- and any of it may re-enter this
@@ -1688,12 +1696,14 @@ class Database:
             self._facade_transition_reentrant()
             or self._transactions.transition_active
             or self._close_releasing
+            or self._close_wait_hazard_active()
             or self._page_access_active()
         ):
             # A callback re-entered its own facade/manager transition, this close's host release
-            # phase, or page-access host code is active on some thread. The terminal request is
-            # enough here; transition-finally resumes after settlement. In particular, do not
-            # wait for a participant held by host VectorMath that is waiting for this call.
+            # phase, a narrow foreign invocation under the participant section, or page-access
+            # host code is active on some thread. The terminal request is enough here;
+            # transition-finally resumes after settlement. In particular, do not wait for a
+            # participant held by host Clock/Coordinator/VectorMath code waiting for this call.
             return
 
         failures: list[BaseException] = []
@@ -1846,7 +1856,10 @@ class Database:
         queries = self._queries
         settle = getattr(queries, "settle_schema", None)
         if callable(settle):
-            settle(context.txn_id, committed=committed)
+            # QueryEngine schema unwind reaches index storage and VectorEngine event callbacks.
+            # Mark only that foreign-capable invocation, never the surrounding settlement body.
+            with self._transactions._close_wait_hazard():
+                settle(context.txn_id, committed=committed)
         self._public_contexts.pop(context.txn_id, None)
 
     def _flush_pages(self) -> None:
@@ -1968,10 +1981,47 @@ class Database:
         except BaseException:  # noqa: BLE001 - telemetry cannot control dependency release
             return False
 
+    def _close_wait_hazard_active(self) -> bool:
+        """Read the contained adapter's narrow cross-thread foreign-call capability."""
+        try:
+            return bool(getattr(self._metrics, "close_wait_hazard_active", False))
+        except BaseException:  # noqa: BLE001 - telemetry cannot control dependency release
+            return False
+
     def _retain_unobserved_release_failure(self, failure: BaseException) -> None:
-        """Make a swallowed terminal release failure visible to one later explicit close."""
+        """Make a swallowed terminal release failure visible to one explicit claimant.
+
+        Standard composition delegates the identity test, pending mark and later claim to one
+        lock in ContainedMetricsSink. The bool is only a compatibility fallback for a directly
+        assembled facade and does not claim cross-thread exactly-once semantics.
+        """
+        retain = getattr(self._metrics, "retain_release_failure", None)
+        if callable(retain):
+            try:
+                if retain(failure, self._release_failure) is True:
+                    return
+            except BaseException:  # noqa: BLE001 - raw telemetry cannot hide close evidence
+                pass
         if failure is self._release_failure:
             self._release_failure_pending = True
+
+    def _claim_unobserved_release_failure(self) -> BaseException | None:
+        """Claim an automatically swallowed release failure at most once when supported."""
+        expected = self._release_failure
+        if expected is None:
+            return None
+        claim = getattr(self._metrics, "claim_release_failure", None)
+        if callable(claim):
+            try:
+                claimed = claim(expected)
+            except BaseException:  # noqa: BLE001 - use the direct-composition fallback below
+                pass
+            else:
+                return expected if claimed is expected else None
+        if self._release_failure_pending:
+            self._release_failure_pending = False
+            return expected
+        return None
 
     def _public_transaction(self, context: TransactionContext) -> Transaction:
         """Wrap a manager context only if it still belongs to an open public facade.

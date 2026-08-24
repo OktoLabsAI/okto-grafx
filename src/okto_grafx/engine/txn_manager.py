@@ -577,7 +577,7 @@ class TransactionManager:
     def _recyclable_horizon_in_section(self) -> Lsn:
         """Compute the horizon for an operation that already owns lifecycle serialisation."""
         return recyclable_horizon(
-            self._coordinator.reader_horizon(),
+            self._reader_horizon(),
             self._published_state_in_section().checkpoint_lsn,
         )
 
@@ -709,7 +709,8 @@ class TransactionManager:
             self._require_not_closed("begin a transaction")
             floor = self._published_state_in_section().last_committed_lsn
             self._require_not_closed("begin a transaction")
-            registration = ReaderRegistration.open(self._coordinator, floor)
+            with self._close_wait_hazard():
+                registration = ReaderRegistration.open(self._coordinator, floor)
             self._require_not_closed("begin a transaction")
             selected = self._published_state_in_section().last_committed_lsn
             self._require_not_closed("begin a transaction")
@@ -719,7 +720,8 @@ class TransactionManager:
             # participant commits and nowhere else. Without this, a transaction opened in a
             # participant that had already read a table answers from frames cached before
             # somebody else committed: no error, no missing file, just fewer rows than exist.
-            self._pool.begin_read_view(read_lsn)
+            with self._close_wait_hazard():
+                self._pool.begin_read_view(read_lsn)
             self._require_not_closed("begin a transaction")
             transaction = TransactionContext(
                 txn_id=self._next_txn_id,
@@ -729,7 +731,7 @@ class TransactionManager:
                 owner=self,
                 page_staging_capability=self._page_staging_capability,
             )
-            opened_at = self._clock.monotonic()
+            opened_at = self._monotonic()
             self._require_not_closed("begin a transaction")
             self._open[transaction.txn_id] = transaction
             self._pins[transaction.txn_id] = _ReaderPin(registration, opened_at)
@@ -744,7 +746,9 @@ class TransactionManager:
             if counted and self._mode_counts[mode.value] > 0:
                 self._mode_counts[mode.value] -= 1
             cleanup_failure = (
-                None if registration is None else _close_quietly(registration)
+                None
+                if registration is None
+                else self._close_reader_quietly(registration)
             )
             if cleanup_failure is not None:
                 _note_cleanup_failure(failure, cleanup_failure)
@@ -887,7 +891,8 @@ class TransactionManager:
         mode = txn.mode.value
         cleanup_failure: BaseException | None = None
         try:
-            self._drop_index_changes(txn)
+            with self._close_wait_hazard():
+                self._drop_index_changes(txn)
         except BaseException as failure:
             cleanup_failure = failure
             self._recovery_required = True
@@ -915,7 +920,8 @@ class TransactionManager:
         except BaseException as refresh_failure:
             failure = _accumulate_failure(failure, refresh_failure)
         try:
-            self._drop_index_changes(txn)
+            with self._close_wait_hazard():
+                self._drop_index_changes(txn)
         except BaseException as index_failure:
             self._recovery_required = True
             failure = _accumulate_failure(failure, index_failure)
@@ -973,7 +979,7 @@ class TransactionManager:
         """
         if not self._pins:
             return 0
-        now = self._clock.monotonic() if now_monotonic is None else float(now_monotonic)
+        now = self._monotonic() if now_monotonic is None else float(now_monotonic)
         interval = self._refresh_interval
         refreshed = 0
         for txn_id, pin in list(self._pins.items()):
@@ -981,7 +987,8 @@ class TransactionManager:
                 continue
             if now < pin.last_refresh + interval:
                 continue
-            pin.registration.refresh()
+            with self._close_wait_hazard():
+                pin.registration.refresh()
             pin.last_refresh = now
             refreshed += 1
         return refreshed
@@ -1021,17 +1028,19 @@ class TransactionManager:
             self._require_recovery_complete()
             lease = self._hold_lease()
             try:
-                lease.validate()
-                with self._coordinator.exclusive(
+                self._validate_lease(lease)
+                with self._coordinator_section(
                     COMMIT_SECTION, timeout=self._commit_lock_timeout
                 ):
-                    lease.validate()
+                    self._validate_lease(lease)
                     state = self._complete_committed_gap()
-                    self._pool.begin_read_view(state.last_committed_lsn)
+                    with self._close_wait_hazard():
+                        self._pool.begin_read_view(state.last_committed_lsn)
                     self._redo_onto_device(
                         state.checkpoint_lsn, state.last_committed_lsn
                     )
-                    self._pool.checkpoint()
+                    with self._close_wait_hazard():
+                        self._pool.checkpoint()
                     self._publish(
                         CommitState(
                             last_committed_lsn=state.last_committed_lsn,
@@ -1042,11 +1051,12 @@ class TransactionManager:
                     # Recycling belongs to the same stable-WAL picture as redo and checkpoint
                     # publication.  Releasing COMMIT_SECTION before this call let startup
                     # recovery scan while segments were disappearing underneath it.
-                    reader_present = self._coordinator.reader_horizon() is not None
-                    recycled = self._wal.recycle(
-                        self._recyclable_horizon_in_section(),
-                        reader_present=reader_present,
-                    )
+                    reader_present = self._reader_horizon() is not None
+                    with self._close_wait_hazard():
+                        recycled = self._wal.recycle(
+                            self._recyclable_horizon_in_section(),
+                            reader_present=reader_present,
+                        )
             except BaseException as failure:
                 cleanup_failure = self._drop_lease(lease)
                 if cleanup_failure is not None:
@@ -1070,7 +1080,10 @@ class TransactionManager:
         """
         try:
             durable = self._read_commit_state()
-            tail = committed_replay(self._wal.read_from(durable.last_committed_lsn + 1))
+            with self._close_wait_hazard():
+                tail = committed_replay(
+                    self._wal.read_from(durable.last_committed_lsn + 1)
+                )
             if tail.incomplete_effects:
                 pending = tail.incomplete_effects
                 raise GrafxRecoveryRefused(
@@ -1090,10 +1103,11 @@ class TransactionManager:
             # The participant that appended it may have escaped after the physical write and
             # before its own barrier.  Establish WAL durability here before redo can put any of
             # its data pages on the device or commit.state can publish its outcome.
-            self._wal.force_barrier_range(
-                durable.last_committed_lsn + 1,
-                target,
-            )
+            with self._close_wait_hazard():
+                self._wal.force_barrier_range(
+                    durable.last_committed_lsn + 1,
+                    target,
+                )
             self._redo_onto_device(durable.checkpoint_lsn, target)
             completed = CommitState(
                 last_committed_lsn=target,
@@ -1114,7 +1128,8 @@ class TransactionManager:
     def _redo_onto_device(self, checkpoint: Lsn, through: Lsn) -> int:
         """Replay a commit range and fail closed for every index if the pass is incomplete."""
         try:
-            return self._redo_onto_device_unchecked(checkpoint, through)
+            with self._close_wait_hazard():
+                return self._redo_onto_device_unchecked(checkpoint, through)
         except BaseException as failure:
             self._recovery_required = True
             manager = self._index_manager
@@ -1126,11 +1141,12 @@ class TransactionManager:
                     else type(failure).__name__
                 )
                 try:
-                    exclude(
-                        f"Committed redo did not complete ({reason}); this handle cannot "
-                        "prove any index is complete.",
-                        persist=False,
-                    )
+                    with self._close_wait_hazard():
+                        exclude(
+                            f"Committed redo did not complete ({reason}); this handle cannot "
+                            "prove any index is complete.",
+                            persist=False,
+                        )
                 except BaseException:  # noqa: BLE001 - never replace the redo failure
                     pass
             raise
@@ -1290,13 +1306,13 @@ class TransactionManager:
                                 if pin is not None:
                                     txn_failure = _accumulate_failure(
                                         txn_failure,
-                                        _close_quietly(pin.registration),
+                                        self._close_reader_quietly(pin.registration),
                                     )
                             failure = _accumulate_failure(failure, txn_failure)
                         for pin in list(self._pins.values()):
                             failure = _accumulate_failure(
                                 failure,
-                                _close_quietly(pin.registration),
+                                self._close_reader_quietly(pin.registration),
                             )
                         self._pins.clear()
                         self._open.clear()
@@ -1408,18 +1424,19 @@ class TransactionManager:
             try:
                 # Step 2: the epoch is confirmed before any byte can reach the device (BR-7,
                 # AC-6), through the coordinator that granted this very lease (A74).
-                lease.validate()
-                with self._coordinator.exclusive(
+                self._validate_lease(lease)
+                with self._coordinator_section(
                     COMMIT_SECTION, timeout=self._commit_lock_timeout
                 ):
-                    lease.validate()  # step 3.1
+                    self._validate_lease(lease)  # step 3.1
                     current = self._complete_committed_gap().last_committed_lsn
                     # The commit decides against the picture as it is NOW, not as this pool last
                     # cached it. Optimistic validation reads the log, but everything else the commit
                     # consults -- the catalog, the pages a row will land on -- comes through the pool,
                     # and a stale one makes a correct predicate decide against the wrong picture
                     # (defect E1, second half; LESSONS L22).
-                    self._pool.begin_read_view(current)
+                    with self._close_wait_hazard():
+                        self._pool.begin_read_view(current)
                     # The rows go in BEFORE validation, because the pages they land on are
                     # part of what this commit will overwrite and therefore part of what it must
                     # declare. Nothing of them is durable yet, and a refusal below puts them
@@ -1431,7 +1448,8 @@ class TransactionManager:
                     # ended, and it refuses with transaction_state, which tells a caller to stop
                     # where write_conflict would tell it to retry. Comparing what the caller
                     # declared BEFORE touching the heap keeps a real conflict reported as one.
-                    conflict = self._find_conflict(txn)  # step 3.3
+                    with self._close_wait_hazard():
+                        conflict = self._find_conflict(txn)  # step 3.3
                     rows: tuple[_RowWrite, ...] = ()
                     staging_mark = len(txn.pending_records)
                     # The mark this attempt's page set is measured against. The window opens
@@ -1447,30 +1465,39 @@ class TransactionManager:
                             # of a batch used to leave the first one written and never
                             # abandoned -- a phantom row the next commit of anyone flushed and
                             # published (C5 round-2 B1).
-                            rows = self._write_rows(txn)
+                            with self._close_wait_hazard():
+                                rows = self._write_rows(txn)
                             self._declare_page_interest(txn, rows)
-                            conflict = self._find_conflict(txn)  # step 3.3, page half
+                            with self._close_wait_hazard():
+                                conflict = self._find_conflict(
+                                    txn
+                                )  # step 3.3, page half
                         if conflict is None:
-                            records, images, materialized_csn = self._build_records(
-                                txn, lease.epoch, rows
-                            )
-                            planned_csn = self._wal.planned_terminal_lsn(records)
-                            if planned_csn != materialized_csn:
-                                records, images = self._retarget_commit_batch(
-                                    txn,
-                                    records,
-                                    images,
-                                    rows,
-                                    old_csn=materialized_csn,
-                                    new_csn=planned_csn,
-                                    epoch=lease.epoch,
+                            with self._close_wait_hazard():
+                                records, images, materialized_csn = self._build_records(
+                                    txn, lease.epoch, rows
                                 )
-                            committed = self._wal.append_many(
-                                records,
-                                expected_terminal_lsn=planned_csn,
-                            )  # step 3.4
+                            with self._close_wait_hazard():
+                                planned_csn = self._wal.planned_terminal_lsn(records)
+                            if planned_csn != materialized_csn:
+                                with self._close_wait_hazard():
+                                    records, images = self._retarget_commit_batch(
+                                        txn,
+                                        records,
+                                        images,
+                                        rows,
+                                        old_csn=materialized_csn,
+                                        new_csn=planned_csn,
+                                        epoch=lease.epoch,
+                                    )
+                            with self._close_wait_hazard():
+                                committed = self._wal.append_many(
+                                    records,
+                                    expected_terminal_lsn=planned_csn,
+                                )  # step 3.4
                             _require_forward_commit(committed, current)
-                            self._wal.barrier()  # step 3.5 -- durable here
+                            with self._close_wait_hazard():
+                                self._wal.barrier()  # step 3.5 -- durable here
                             # The WAL outcome is irrevocable at this instant. Settle it before
                             # page/index apply, publication, lease release, reader cleanup or any
                             # other fallible callback can run and tempt a caller to retry an ACTIVE
@@ -1478,25 +1505,30 @@ class TransactionManager:
                             txn.bind_epoch(lease.epoch)
                             txn.mark_committed(committed)
                     except BaseException as failure:
-                        if committed > NO_CSN or _wal_is_damaged(self._wal):
+                        with self._close_wait_hazard():
+                            wal_is_damaged = _wal_is_damaged(self._wal)
+                        if committed > NO_CSN or wal_is_damaged:
                             # A complete COMMIT record was appended, but the barrier or the
                             # forward-order proof did not finish, or append rollback could not put
                             # the segment back. Its outcome is now uncertain: no later transaction
                             # on this handle may step over it until operator recovery resolves the
                             # WAL bytes that survived.
                             self._recovery_required = True
-                        abandoned = self._abandon_rows(rows)
-                        unstaged = self._unstage_index_changes(txn, staging_mark)
+                        with self._close_wait_hazard():
+                            abandoned = self._abandon_rows(rows)
+                        with self._close_wait_hazard():
+                            unstaged = self._unstage_index_changes(txn, staging_mark)
                         failed_cleanup = _first_failure(abandoned, unstaged)
                         if failed_cleanup is not None:
                             self._recovery_required = True
                             _note_cleanup_failure(failure, failed_cleanup)
                         raise
                     if conflict is not None:
-                        cleanup_failure = _first_failure(
-                            self._abandon_rows(rows),
-                            self._unstage_index_changes(txn, staging_mark),
-                        )
+                        with self._close_wait_hazard():
+                            abandoned = self._abandon_rows(rows)
+                        with self._close_wait_hazard():
+                            unstaged = self._unstage_index_changes(txn, staging_mark)
+                        cleanup_failure = _first_failure(abandoned, unstaged)
                         if cleanup_failure is not None:
                             self._recovery_required = True
                     else:
@@ -1504,16 +1536,22 @@ class TransactionManager:
                             self._published_high_water, committed
                         )
                         try:
-                            self._apply_images(images)  # step 3.6
-                            self._apply_index_changes(txn, committed)  # step 3.6
-                            self._publish_commit_state(current, committed)  # step 3.7
+                            with self._close_wait_hazard():
+                                self._apply_images(images)  # step 3.6
+                            with self._close_wait_hazard():
+                                self._apply_index_changes(txn, committed)  # step 3.6
+                            with self._close_wait_hazard():
+                                self._publish_commit_state(
+                                    current, committed
+                                )  # step 3.7
                         except BaseException as failure:
                             post_barrier_failure = failure
                             if isinstance(failure, GrafxError):
                                 try:
-                                    recovered = self._recover_post_barrier(
-                                        txn, current, committed, rows
-                                    )
+                                    with self._close_wait_hazard():
+                                        recovered = self._recover_post_barrier(
+                                            txn, current, committed, rows
+                                        )
                                 except BaseException as recovery_failure:
                                     # Recovery is cleanup for the already-recorded failure.  It may
                                     # add evidence, but must never replace the failure that caused
@@ -1682,7 +1720,8 @@ class TransactionManager:
                 count=len(records),
                 txn_id=txn.txn_id,
             )
-        validator(txn, records)
+        with self._close_wait_hazard():
+            validator(txn, records)
 
     def _find_conflict(self, txn: TransactionContext) -> tuple[int, ...] | None:
         """Return the partitions that make this commit conflict, or None when none do.
@@ -2517,7 +2556,8 @@ class TransactionManager:
 
     def _publish(self, state: CommitState) -> None:
         """Write the state to a temporary of this participant and replace the published file."""
-        self._commit_state_store.publish(state)
+        with self._close_wait_hazard():
+            self._commit_state_store.publish(state)
 
     def _read_commit_state(self) -> CommitState:
         """Read the published state, riding out a device condition that is worth trying again.
@@ -2538,7 +2578,8 @@ class TransactionManager:
         the condition being ridden out is a sharing violation of a few milliseconds that the
         device below has already backed off for.
         """
-        return self._commit_state_store.read()
+        with self._close_wait_hazard():
+            return self._commit_state_store.read()
 
     # --- internals ---------------------------------------------------------------------------
 
@@ -2553,15 +2594,20 @@ class TransactionManager:
         placement did every time.
         """
         if not self._retain_lease:
-            return LeaseGuard.acquire(self._coordinator, timeout=self._lease_timeout)
+            with self._close_wait_hazard():
+                return LeaseGuard.acquire(
+                    self._coordinator, timeout=self._lease_timeout
+                )
         guard = self._lease_guard
         if guard is not None and not guard.released:
             try:
-                guard.renew_if_due(self._clock.monotonic())
+                with self._close_wait_hazard():
+                    guard.renew_if_due(self._clock.monotonic())
                 return guard
             except GrafxLeaseStolen:
                 self._lease_guard = None
-        guard = LeaseGuard.acquire(self._coordinator, timeout=self._lease_timeout)
+        with self._close_wait_hazard():
+            guard = LeaseGuard.acquire(self._coordinator, timeout=self._lease_timeout)
         self._lease_guard = guard
         return guard
 
@@ -2569,7 +2615,65 @@ class TransactionManager:
         """Give the lease up and return, rather than raise, a foreign cleanup failure."""
         if self._retain_lease and lease is self._lease_guard and not lease.released:
             return None
-        return _release_quietly(lease)
+        with self._close_wait_hazard():
+            return _release_quietly(lease)
+
+    def _validate_lease(self, lease: LeaseGuard) -> None:
+        """Validate one coordinator-owned lease under the narrow close-wait hazard."""
+        with self._close_wait_hazard():
+            lease.validate()
+
+    def _monotonic(self) -> float:
+        """Read the host clock without letting a callback make close wait on this section."""
+        with self._close_wait_hazard():
+            return self._clock.monotonic()
+
+    def _reader_horizon(self) -> Lsn | None:
+        """Read the coordinator horizon under the narrow close-wait hazard."""
+        with self._close_wait_hazard():
+            return self._coordinator.reader_horizon()
+
+    def _close_reader_quietly(
+        self, registration: ReaderRegistration
+    ) -> BaseException | None:
+        """Withdraw a coordinator reader without turning its callback into a close deadlock."""
+        with self._close_wait_hazard():
+            return _close_quietly(registration)
+
+    @contextmanager
+    def _close_wait_hazard(self) -> Iterator[None]:
+        """Consume the standard adapter's host-free narrow callback capability."""
+        capability = getattr(self._metrics, "close_wait_hazard", None)
+        boundary = capability() if callable(capability) else nullcontext()
+        with boundary:
+            yield
+
+    @contextmanager
+    def _coordinator_section(self, name: str, *, timeout: float) -> Iterator[object]:
+        """Enter each foreign context phase under a hazard, but never mark its body.
+
+        A coordinator owns the factory and both context-protocol callbacks. Any of those may
+        synchronously ask another thread to close the database while this participant section
+        is held. Keeping the marker around the yielded engine body would instead suppress
+        normal close/quiescence during commit and schema settlement, so the phases are expanded
+        explicitly here.
+        """
+        with self._close_wait_hazard():
+            section = self._coordinator.exclusive(name, timeout=timeout)
+        with self._close_wait_hazard():
+            entered = section.__enter__()
+        try:
+            yield entered
+        except BaseException as failure:
+            with self._close_wait_hazard():
+                suppressed = bool(
+                    section.__exit__(type(failure), failure, failure.__traceback__)
+                )
+            if not suppressed:
+                raise
+        else:
+            with self._close_wait_hazard():
+                section.__exit__(None, None, None)
 
     @contextmanager
     def _participant_section(self) -> Iterator[None]:
@@ -2605,7 +2709,7 @@ class TransactionManager:
         # request terminal state without recursively releasing dependencies. The adapter lowers
         # its deferral depth before draining the FIFO, after the real section has been released.
         with deferred:
-            with self._coordinator.exclusive(
+            with self._coordinator_section(
                 self._participant_section_name,
                 timeout=self._commit_lock_timeout,
             ):
@@ -2683,7 +2787,7 @@ class TransactionManager:
     def _release_reader(self, txn: TransactionContext) -> BaseException | None:
         """Detach a transaction's reader pin and return any foreign withdrawal failure."""
         pin = self._pins.pop(txn.txn_id, None)
-        return None if pin is None else _close_quietly(pin.registration)
+        return None if pin is None else self._close_reader_quietly(pin.registration)
 
     def _forget(self, txn: TransactionContext, mode: str) -> int:
         """Drop a finished transaction and return how many of its mode are still open.
