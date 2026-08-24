@@ -33,6 +33,7 @@ __all__ = [
     "MAX_PATTERNS_PER_CLAUSE",
     "MAX_PROJECTION_ITEMS",
     "MAX_QUERY_CHARACTERS",
+    "MAX_RENDERED_QUERY_CHARACTERS",
     "MAX_SORT_KEYS",
     "MAX_STRING_CHARACTERS",
     "MAX_TOKENS",
@@ -41,6 +42,16 @@ __all__ = [
 
 MAX_QUERY_CHARACTERS: int = 65536
 """Characters one query may carry. Anything longer is refused before a single token is cut."""
+
+MAX_RENDERED_QUERY_CHARACTERS: int = 1_048_576
+"""Characters one query-derived display value may carry in a public plan or result.
+
+Rendering is not bounded by the source length: ``repr`` expands one non-printable non-BMP code
+point to ten ASCII characters, and operator punctuation adds a little more.  Sixteen times the
+source-text ceiling therefore admits every valid query without leaving collaborator-forged
+columns unbounded.  This bound applies only to derived display names; identifiers and stored
+string values retain their substantially smaller limits.
+"""
 
 MAX_TOKENS: int = 8192
 """Tokens one query may produce, so a pathological but short text cannot expand without bound."""

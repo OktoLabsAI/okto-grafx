@@ -78,6 +78,7 @@ from okto_grafx.domain.model.schema import (
     encode_tuple,
 )
 from okto_grafx.domain.model.value import (
+    INT64_MAX,
     Value,
     VectorValue,
     encode_value,
@@ -101,6 +102,11 @@ from okto_grafx.domain.query.ast import (
     Statement,
     UnaryOperation,
     Variable,
+)
+from okto_grafx.domain.query.limits import (
+    MAX_NAME_CHARACTERS,
+    MAX_PROJECTION_ITEMS,
+    MAX_RENDERED_QUERY_CHARACTERS,
 )
 from okto_grafx.domain.query.parser import parse as parse_text
 from okto_grafx.domain.query.plan import (
@@ -129,6 +135,7 @@ from okto_grafx.domain.query.plan import (
     SortRows,
     TraverseRelationship,
     VectorSearch,
+    validate_plan,
 )
 from okto_grafx.domain.query.planner import SCORE_COLUMN, PlannedQuery, build_plan
 from okto_grafx.domain.query.tokens import (
@@ -243,6 +250,149 @@ class QueryResult:
     rows: tuple[tuple[Value, ...], ...] = ()
     plan: PlanNode | None = None
     statistics: Mapping[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Seal the structural invariants that make every result lossless and inspectable.
+
+        Deep value detachment belongs to the public facade because doing it here would execute a
+        hostile result container while the query engine still holds its page-access section.  The
+        DTO itself nevertheless owns its exact outer tuples and statistics dictionary and refuses
+        malformed arity before :meth:`dictionaries` could silently truncate it with ``zip``.
+        """
+        if not issubclass(type(self.columns), tuple):
+            raise GrafxPlanError(
+                "Query result columns must be a tuple.",
+                field="columns",
+                value="not_a_tuple",
+            )
+        columns = tuple(tuple.__iter__(self.columns))
+        if len(columns) > MAX_PROJECTION_ITEMS:
+            raise GrafxPlanError(
+                f"A query result may carry at most {MAX_PROJECTION_ITEMS} columns.",
+                field="columns",
+                value=len(columns),
+                limit=MAX_PROJECTION_ITEMS,
+            )
+        exact_columns: list[str] = []
+        seen: set[str] = set()
+        for position, column in enumerate(columns):
+            if not issubclass(type(column), str):
+                raise GrafxPlanError(
+                    "Every query result column must be text.",
+                    field="columns",
+                    value=position,
+                )
+            plain = str.__str__(column)
+            if not plain:
+                raise GrafxPlanError(
+                    "A query result column name cannot be empty.",
+                    field="columns",
+                    value=position,
+                )
+            if len(plain) > MAX_RENDERED_QUERY_CHARACTERS:
+                raise GrafxPlanError(
+                    f"A query result column may carry at most "
+                    f"{MAX_RENDERED_QUERY_CHARACTERS} "
+                    "characters.",
+                    field="columns",
+                    value=len(plain),
+                    limit=MAX_RENDERED_QUERY_CHARACTERS,
+                )
+            if plain in seen:
+                raise GrafxPlanError(
+                    f"A query result cannot contain duplicate column {plain!r}.",
+                    field="columns",
+                    value=plain,
+                )
+            seen.add(plain)
+            exact_columns.append(plain)
+
+        if not issubclass(type(self.rows), tuple):
+            raise GrafxPlanError(
+                "Query result rows must be a tuple.",
+                field="rows",
+                value="not_a_tuple",
+            )
+        exact_rows: list[tuple[Value, ...]] = []
+        for position, row in enumerate(tuple.__iter__(self.rows)):
+            if not issubclass(type(row), tuple):
+                raise GrafxPlanError(
+                    "Every query result row must be a tuple.",
+                    field="rows",
+                    value=position,
+                )
+            plain_row = tuple(tuple.__iter__(row))
+            if len(plain_row) != len(exact_columns):
+                raise GrafxPlanError(
+                    "Every query result row must have exactly one value per column.",
+                    field="rows",
+                    value=len(plain_row),
+                    expected=len(exact_columns),
+                    row=position,
+                )
+            exact_rows.append(plain_row)
+
+        if not issubclass(type(self.statistics), dict):
+            raise GrafxPlanError(
+                "Query result statistics must be a dictionary.",
+                field="statistics",
+                value="not_a_dict",
+            )
+        exact_statistics: dict[str, int] = {}
+        for position, (name, count) in enumerate(dict.items(self.statistics)):
+            if not issubclass(type(name), str):
+                raise GrafxPlanError(
+                    "Every query result statistic name must be text.",
+                    field="statistics",
+                    value=position,
+                )
+            plain_name = str.__str__(name)
+            if not plain_name or len(plain_name) > MAX_NAME_CHARACTERS:
+                raise GrafxPlanError(
+                    f"A query result statistic name must contain between 1 and "
+                    f"{MAX_NAME_CHARACTERS} characters.",
+                    field="statistics",
+                    value=len(plain_name),
+                    limit=MAX_NAME_CHARACTERS,
+                )
+            if plain_name in exact_statistics:
+                raise GrafxPlanError(
+                    "Query result statistic names must be unique.",
+                    field="statistics",
+                    value=plain_name,
+                )
+            if type(count) is bool or not issubclass(type(count), int):
+                raise GrafxPlanError(
+                    "Every query result statistic must be an integer.",
+                    field="statistics",
+                    value=plain_name,
+                )
+            plain_count = int.__int__(count)
+            if not 0 <= plain_count <= INT64_MAX:
+                raise GrafxPlanError(
+                    "A query result statistic must fit in a non-negative signed 64-bit "
+                    "integer.",
+                    field="statistics",
+                    value=plain_name,
+                    count=plain_count,
+                    limit=INT64_MAX,
+                )
+            exact_statistics[plain_name] = plain_count
+
+        if self.plan is not None:
+            try:
+                validate_plan(self.plan)
+            except GrafxPlanError:
+                raise
+            except Exception as failure:  # noqa: BLE001 - untrusted public plan value
+                raise GrafxPlanError(
+                    "The query result carries a malformed plan.",
+                    field="plan",
+                    value="malformed",
+                ) from failure
+        object.__setattr__(self, "columns", tuple(exact_columns))
+        object.__setattr__(self, "rows", tuple(exact_rows))
+        object.__setattr__(self, "statistics", exact_statistics)
 
     def __len__(self) -> int:
         """Return how many rows this result carries."""

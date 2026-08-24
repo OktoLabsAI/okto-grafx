@@ -289,7 +289,7 @@ class _Analyzer:
         clause = self._query.return_clause
         if clause is None:
             return (), ()
-        self._require_unique_aliases(clause)
+        self._require_unique_output_columns(clause)
         grouping: list[int] = []
         aggregations: list[Aggregation] = []
         for position, item in enumerate(clause.items):
@@ -312,20 +312,20 @@ class _Analyzer:
             )
         return tuple(grouping), tuple(aggregations)
 
-    def _require_unique_aliases(self, clause: ReturnClause) -> None:
-        """Refuse two projected items that were deliberately given the same name."""
-        seen: set[str] = set()
+    def _require_unique_output_columns(self, clause: ReturnClause) -> None:
+        """Refuse any two projected items whose explicit or derived names collide."""
+        seen: dict[str, bool] = {}
         for item in clause.items:
-            if item.alias is None:
-                continue
-            if item.alias in seen:
+            name = item.name
+            if name in seen:
+                explicit_collision = seen[name] and item.alias is not None
                 raise self._refuse(
-                    f"Two projected items are both named {item.alias!r}; a result column name "
+                    f"Two projected items are both named {name!r}; a result column name "
                     "must identify exactly one item.",
-                    field="alias",
-                    value=item.alias,
+                    field="alias" if explicit_collision else "column",
+                    value=name,
                 )
-            seen.add(item.alias)
+            seen[name] = item.alias is not None
 
     def _check_sort_keys(self, clause: ReturnClause, aggregated: bool) -> None:
         """Refuse an ORDER BY key that names nothing the clause returns.

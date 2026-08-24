@@ -14,15 +14,19 @@ change bytes or engine bookkeeping are absent rather than hidden behind an ``uns
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, fields
+from enum import Enum
+from functools import lru_cache
 from math import isfinite
-from typing import Any
+from typing import TYPE_CHECKING, Any, get_args, get_origin, get_type_hints
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxIndexError,
     GrafxLedgerError,
+    GrafxParseError,
+    GrafxPlanError,
     GrafxQuarantineError,
     GrafxRecoveryRefused,
     GrafxVectorValidationError,
@@ -42,13 +46,77 @@ from okto_grafx.domain.ledger.payload import LedgerPayload, decode_payload
 from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import (
+    INT64_MAX,
+    INT64_MIN,
+    MAX_VALUE_DEPTH,
     MAX_VECTOR_DIMENSION,
     VECTOR_DTYPES,
+    Timestamp,
+    Uuid,
+    Value,
     ValueType,
     VectorValue,
 )
 from okto_grafx.domain.page.layout import MAX_U32, MAX_U64
 from okto_grafx.domain.ports.vectormath import DistanceMetric
+from okto_grafx.domain.query.analysis import Aggregation
+from okto_grafx.domain.query.ast import (
+    BinaryOperation,
+    Expression,
+    FunctionCall,
+    ListExpression,
+    Literal,
+    MapEntry,
+    MapExpression,
+    NamedArgument,
+    NullCheck,
+    Parameter,
+    Property,
+    ReturnItem,
+    SortItem,
+    UnaryOperation,
+    Variable,
+)
+from okto_grafx.domain.query.limits import (
+    MAX_EXPRESSION_DEPTH,
+    MAX_LIST_ELEMENTS,
+    MAX_MAP_ENTRIES,
+    MAX_NAME_CHARACTERS,
+    MAX_PARAMETERS,
+    MAX_PROJECTION_ITEMS,
+    MAX_QUERY_CHARACTERS,
+    MAX_RENDERED_QUERY_CHARACTERS,
+    MAX_STRING_CHARACTERS,
+)
+from okto_grafx.domain.query.plan import (
+    MAX_PLAN_DEPTH,
+    AggregateRows,
+    CreateNodeTable,
+    CreatedNode,
+    CreatedRelationship,
+    CreateRelationships,
+    CreateRelTable,
+    CreateVectorSpace,
+    DeleteEntities,
+    DistinctRows,
+    EagerRows,
+    FilterRows,
+    IndexSeek,
+    LimitRows,
+    MergePattern,
+    NodeScan,
+    PlanNode,
+    ProduceResults,
+    ProjectRows,
+    PropertyAssignment,
+    SetProperties,
+    SingleRow,
+    SkipRows,
+    SortRows,
+    TraverseRelationship,
+    VectorSearch,
+    validate_plan,
+)
 from okto_grafx.domain.recovery.manifest import QuarantineManifest
 from okto_grafx.domain.recovery.report import RecoveryFinding, RecoveryReport
 from okto_grafx.domain.txn.commit_state import CommitState
@@ -73,6 +141,12 @@ from okto_grafx.domain.wal.segment import SegmentInfo
 from okto_grafx.engine.ledger_store import DamagedTail
 from okto_grafx.engine.quarantine import QuarantineEntry
 from okto_grafx.engine.vector_engine import VectorHit, VectorSearchResult
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from okto_grafx.engine.query_engine import QueryResult
+
+_PEP604_UNION_TYPE = type(str | None)
+"""Runtime origin returned by ``typing.get_origin`` for a PEP 604 union."""
 
 __all__ = [
     "PUBLIC_DATABASE_VIEW_ALLOWLIST",
@@ -1270,6 +1344,793 @@ def _metric_value(value: object, *, field: str, active: set[int]) -> object:
         field=field,
         value=observed,
     )
+
+
+def _query_parameters_snapshot(
+    value: Mapping[str, object] | None,
+) -> dict[str, Value]:
+    """Return one bounded, deeply owned parameter mapping before page access begins.
+
+    A mapping is executable Python: ``items()``, iteration and value conversion may all call
+    host code.  The facade invokes those doors while no page-access section is held, copies every
+    supported value into an exact domain shape and then rechecks transaction liveness under the
+    section.  Consequently a callback may roll back or close, but it cannot withdraw a reader pin
+    halfway through a query engine operation.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        observed = _builtin_type_name(value)
+        raise GrafxConfigurationError(
+            f"Query parameters must be a mapping; got {observed}.",
+            field="parameters",
+            value=observed,
+        )
+    marker = id(value)
+    active = {marker}
+    detached: dict[str, Value] = {}
+    for position, (raw_name, raw_value) in enumerate(
+        _bounded_mapping_pairs(value, limit=MAX_PARAMETERS, field="parameters")
+    ):
+        name = _builtin_text(raw_name, field=f"parameters[{position}].name", empty=False)
+        if len(name) > MAX_NAME_CHARACTERS:
+            raise GrafxConfigurationError(
+                f"A parameter name may carry at most {MAX_NAME_CHARACTERS} characters.",
+                field="parameters.name",
+                value=len(name),
+                limit=MAX_NAME_CHARACTERS,
+            )
+        if name in detached:
+            raise GrafxConfigurationError(
+                f"Two query parameters canonicalize to the same name {name!r}.",
+                field="parameters",
+                value=name,
+                reason="duplicate",
+            )
+        detached[name] = _query_value_snapshot(
+            raw_value,
+            field=f"parameters.{name}",
+            depth=0,
+            active=active,
+        )
+    return detached
+
+
+def _query_text_snapshot(value: object) -> str:
+    """Return exact bounded query text before the page-access section is entered."""
+    text = _builtin_text(value, field="statement", empty=False)
+    if len(text) > MAX_QUERY_CHARACTERS:
+        raise GrafxParseError(
+            f"A query may carry at most {MAX_QUERY_CHARACTERS} characters; got {len(text)}.",
+            field="text",
+            value=len(text),
+        )
+    return text
+
+
+def _query_value_snapshot(
+    value: object,
+    *,
+    field: str,
+    depth: int,
+    active: set[int],
+) -> Value:
+    """Copy one query value into an exact, bounded and capability-free value graph."""
+    if depth > MAX_VALUE_DEPTH:
+        raise GrafxConfigurationError(
+            f"A query value may nest at most {MAX_VALUE_DEPTH} levels deep.",
+            field=field,
+            value=depth,
+            limit=MAX_VALUE_DEPTH,
+        )
+    value_type = type(value)
+    if value is None or value_type is bool:
+        return value
+    if issubclass(value_type, int):
+        plain_integer = _builtin_int(value, field=field)
+        if not INT64_MIN <= plain_integer <= INT64_MAX:
+            raise GrafxConfigurationError(
+                "A query integer must fit in 64 signed bits.",
+                field=field,
+                value=plain_integer,
+                minimum=INT64_MIN,
+                maximum=INT64_MAX,
+            )
+        return plain_integer
+    if issubclass(value_type, float):
+        return float.__float__(value)
+    if issubclass(value_type, str):
+        plain_text = _builtin_text(value, field=field)
+        if len(plain_text) > MAX_STRING_CHARACTERS:
+            raise GrafxConfigurationError(
+                f"A query string may carry at most {MAX_STRING_CHARACTERS} characters.",
+                field=field,
+                value=len(plain_text),
+                limit=MAX_STRING_CHARACTERS,
+            )
+        return plain_text
+    if issubclass(value_type, (bytes, bytearray, memoryview)):
+        return _builtin_bytes(value, field=field)
+    if issubclass(value_type, Timestamp):
+        source = _domain_value(value, Timestamp, field=field)
+        micros = _builtin_int(
+            _domain_field(source, Timestamp, "micros"),
+            field=f"{field}.micros",
+        )
+        if not INT64_MIN <= micros <= INT64_MAX:
+            raise GrafxConfigurationError(
+                "A query timestamp must fit in 64 signed bits.",
+                field=field,
+                value=micros,
+                minimum=INT64_MIN,
+                maximum=INT64_MAX,
+            )
+        return Timestamp(micros=micros)
+    if issubclass(value_type, Uuid):
+        source = _domain_value(value, Uuid, field=field)
+        return Uuid(raw=_builtin_bytes(_domain_field(source, Uuid, "raw"), field=field))
+    if issubclass(value_type, VectorValue):
+        return _vector_query_snapshot(value)
+    if isinstance(value, Mapping):
+        return _query_mapping_snapshot(value, field=field, depth=depth, active=active)
+    if isinstance(value, Sequence):
+        return _query_sequence_snapshot(value, field=field, depth=depth, active=active)
+    observed = _builtin_type_name(value)
+    raise GrafxConfigurationError(
+        f"The query value at {field} cannot retain a {observed} capability.",
+        field=field,
+        value=observed,
+        reason="unsupported_value",
+    )
+
+
+def _query_mapping_snapshot(
+    value: Mapping[object, object],
+    *,
+    field: str,
+    depth: int,
+    active: set[int],
+) -> dict[Value, Value]:
+    """Copy one bounded map, rejecting cycles and canonical-key collisions."""
+    marker = id(value)
+    if marker in active:
+        raise GrafxConfigurationError(
+            "A query value cannot contain a recursive mapping or sequence.",
+            field=field,
+            value="cycle",
+        )
+    active.add(marker)
+    try:
+        detached: dict[Value, Value] = {}
+        for position, (raw_key, raw_value) in enumerate(
+            _bounded_mapping_pairs(value, limit=MAX_MAP_ENTRIES, field=field)
+        ):
+            key = _query_value_snapshot(
+                raw_key,
+                field=f"{field}.key[{position}]",
+                depth=depth + 1,
+                active=active,
+            )
+            item = _query_value_snapshot(
+                raw_value,
+                field=f"{field}[{position}]",
+                depth=depth + 1,
+                active=active,
+            )
+            try:
+                duplicate = key in detached
+            except TypeError as failure:
+                raise GrafxConfigurationError(
+                    "A query map key must canonicalize to a hashable value.",
+                    field=f"{field}.key[{position}]",
+                    value=_builtin_type_name(key),
+                ) from failure
+            if duplicate:
+                raise GrafxConfigurationError(
+                    "Two query map keys become equal after canonicalization.",
+                    field=f"{field}.key[{position}]",
+                    value="collision",
+                    reason="duplicate",
+                )
+            detached[key] = item
+        return detached
+    finally:
+        active.remove(marker)
+
+
+def _query_sequence_snapshot(
+    value: Sequence[object],
+    *,
+    field: str,
+    depth: int,
+    active: set[int],
+) -> tuple[Value, ...]:
+    """Copy one bounded sequence without invoking list or tuple subclass overrides."""
+    marker = id(value)
+    if marker in active:
+        raise GrafxConfigurationError(
+            "A query value cannot contain a recursive mapping or sequence.",
+            field=field,
+            value="cycle",
+        )
+    active.add(marker)
+    try:
+        iterator: Iterator[object]
+        if issubclass(type(value), tuple):
+            iterator = tuple.__iter__(value)
+        elif issubclass(type(value), list):
+            iterator = list.__iter__(value)
+        else:
+            iterator = iter(value)
+        detached: list[Value] = []
+        for item in iterator:
+            if len(detached) >= MAX_LIST_ELEMENTS:
+                raise GrafxConfigurationError(
+                    f"A query list may hold at most {MAX_LIST_ELEMENTS} elements.",
+                    field=field,
+                    value=len(detached) + 1,
+                    limit=MAX_LIST_ELEMENTS,
+                )
+            detached.append(
+                _query_value_snapshot(
+                    item,
+                    field=f"{field}[{len(detached)}]",
+                    depth=depth + 1,
+                    active=active,
+                )
+            )
+        return tuple(detached)
+    finally:
+        active.remove(marker)
+
+
+def _bounded_mapping_pairs(
+    value: Mapping[object, object], *, limit: int, field: str
+) -> Iterator[tuple[object, object]]:
+    """Yield at most ``limit`` mapping pairs and refuse the first pair beyond it."""
+    pairs = dict.items(value) if issubclass(type(value), dict) else value.items()
+    for position, pair in enumerate(pairs):
+        if position >= limit:
+            raise GrafxConfigurationError(
+                f"The {field} mapping may hold at most {limit} entries.",
+                field=field,
+                value=position + 1,
+                limit=limit,
+            )
+        try:
+            raw_key, raw_value = pair
+        except (TypeError, ValueError) as failure:
+            raise GrafxConfigurationError(
+                f"The {field} mapping returned an entry that is not a key/value pair.",
+                field=field,
+                value=_builtin_type_name(pair),
+            ) from failure
+        yield raw_key, raw_value
+
+
+_QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
+    {
+        AggregateRows,
+        CreateNodeTable,
+        CreateRelationships,
+        CreateRelTable,
+        CreateVectorSpace,
+        DeleteEntities,
+        DistinctRows,
+        EagerRows,
+        FilterRows,
+        IndexSeek,
+        LimitRows,
+        MergePattern,
+        NodeScan,
+        ProduceResults,
+        ProjectRows,
+        SetProperties,
+        SingleRow,
+        SkipRows,
+        SortRows,
+        TraverseRelationship,
+        VectorSearch,
+    }
+)
+"""Every exact operator implementation the frozen query planner may publish."""
+
+
+_QUERY_PLAN_EXPRESSION_TYPES: frozenset[type[Expression]] = frozenset(
+    {
+        BinaryOperation,
+        FunctionCall,
+        ListExpression,
+        Literal,
+        MapExpression,
+        NullCheck,
+        Parameter,
+        Property,
+        UnaryOperation,
+        Variable,
+    }
+)
+"""Every exact expression implementation that can be embedded in a public plan."""
+
+
+_QUERY_PLAN_AUXILIARY_TYPES: frozenset[type[object]] = frozenset(
+    {
+        Aggregation,
+        ColumnDef,
+        CreatedNode,
+        CreatedRelationship,
+        MapEntry,
+        NamedArgument,
+        PropertyAssignment,
+        ReturnItem,
+        SortItem,
+        TableDef,
+    }
+)
+"""Exact frozen dataclasses reachable from operator fields, excluding expressions."""
+
+
+def _query_plan_view(value: object) -> PlanNode:
+    """Rebuild a capability-free plan after checking its exact bounded grammar."""
+    try:
+        nodes = _query_plan_nodes(value)
+        detached: dict[int, PlanNode] = {}
+        for node in reversed(nodes):
+            clone = _query_plan_dataclass_snapshot(
+                node,
+                expected=type(node),
+                detached_nodes=detached,
+                active=set(),
+                expression_depth=0,
+            )
+            detached[id(node)] = clone  # type: ignore[assignment]
+        root = detached[id(value)]
+        return validate_plan(root)
+    except GrafxPlanError:
+        raise
+    except Exception as failure:  # noqa: BLE001 - malformed collaborator output is a plan error
+        observed = _builtin_type_name(failure)
+        raise GrafxPlanError(
+            f"The query collaborator returned a malformed plan field ({observed}).",
+            field="plan",
+            value="malformed",
+            cause=observed,
+        ) from failure
+
+
+def _query_plan_nodes(value: object) -> tuple[PlanNode, ...]:
+    """Return exact plan nodes parents-first without calling a subclass virtual door."""
+    pending: list[tuple[object, int]] = [(value, 0)]
+    seen: set[int] = set()
+    nodes: list[PlanNode] = []
+    while pending:
+        node, depth = pending.pop()
+        if type(node) not in _QUERY_PLAN_NODE_TYPES:
+            observed = _builtin_type_name(node)
+            raise GrafxPlanError(
+                f"A public query plan may contain only built-in operators; got {observed}.",
+                field="plan",
+                value=observed,
+            )
+        if depth > MAX_PLAN_DEPTH:
+            raise GrafxPlanError(
+                f"An operator tree may be at most {MAX_PLAN_DEPTH} operators deep.",
+                field="depth",
+                value=MAX_PLAN_DEPTH,
+            )
+        marker = id(node)
+        if marker in seen:
+            raise GrafxPlanError(
+                "A public query plan must be a tree without shared or cyclic operators.",
+                field="plan",
+                value="not_a_tree",
+            )
+        seen.add(marker)
+        nodes.append(node)  # type: ignore[arg-type]
+        # Exact-type validation above is deliberately before this virtual door. Every accepted
+        # implementation is frozen in the static allowlist, so a collaborator subclass never
+        # gets to run children(), label or details() during validation or escape to the caller.
+        children = node.children()  # type: ignore[union-attr]
+        if type(children) is not tuple:
+            raise GrafxPlanError(
+                "A query operator must publish its children as a tuple.",
+                field="plan",
+                value="invalid_children",
+            )
+        for child in reversed(tuple(tuple.__iter__(children))):
+            pending.append((child, depth + 1))
+    return tuple(nodes)
+
+
+@lru_cache(maxsize=None)
+def _query_plan_type_hints(expected: type[object]) -> Mapping[str, object]:
+    """Resolve the frozen field grammar once for one exact allowlisted dataclass."""
+    return get_type_hints(expected)
+
+
+def _query_plan_dataclass_snapshot(
+    value: object,
+    *,
+    expected: type[object],
+    detached_nodes: Mapping[int, PlanNode],
+    active: set[int],
+    expression_depth: int,
+) -> object:
+    """Reconstruct one exact plan, expression, schema or auxiliary dataclass by base slots."""
+    allowed = (
+        expected in _QUERY_PLAN_NODE_TYPES
+        or expected in _QUERY_PLAN_EXPRESSION_TYPES
+        or expected in _QUERY_PLAN_AUXILIARY_TYPES
+    )
+    if not allowed or type(value) is not expected:
+        observed = _builtin_type_name(value)
+        raise GrafxPlanError(
+            f"A query plan field expected exact {expected.__name__}; got {observed}.",
+            field="plan",
+            value=observed,
+        )
+    marker = id(value)
+    if marker in active:
+        raise GrafxPlanError(
+            "A query plan field graph cannot contain a cycle.",
+            field="plan",
+            value="cycle",
+        )
+    if expected in _QUERY_PLAN_EXPRESSION_TYPES and expression_depth > MAX_EXPRESSION_DEPTH:
+        raise GrafxPlanError(
+            f"A plan expression may nest at most {MAX_EXPRESSION_DEPTH} levels deep.",
+            field="expression",
+            value=expression_depth,
+            limit=MAX_EXPRESSION_DEPTH,
+        )
+    active.add(marker)
+    try:
+        if expected is Literal:
+            raw_literal = _domain_field(value, Literal, "value")
+            return Literal(
+                value=_query_value_snapshot(
+                    raw_literal,
+                    field="plan.literal",
+                    depth=0,
+                    active=set(),
+                )
+            )
+        hints = _query_plan_type_hints(expected)
+        child_depth = (
+            expression_depth + 1
+            if expected in _QUERY_PLAN_EXPRESSION_TYPES
+            else expression_depth
+        )
+        arguments: dict[str, object] = {}
+        for declared in fields(expected):
+            raw_field = _domain_field(value, expected, declared.name)
+            annotation = hints[declared.name]
+            arguments[declared.name] = _query_plan_field_snapshot(
+                raw_field,
+                annotation=annotation,
+                detached_nodes=detached_nodes,
+                active=active,
+                expression_depth=child_depth,
+                field=f"plan.{expected.__name__}.{declared.name}",
+                string_limit=(
+                    MAX_RENDERED_QUERY_CHARACTERS
+                    if (
+                        expected is ProduceResults and declared.name == "columns"
+                    )
+                    or (expected is ReturnItem and declared.name == "alias")
+                    else None
+                ),
+            )
+        if expected is ProduceResults:
+            columns = arguments["columns"]
+            if type(columns) is not tuple:  # pragma: no cover - grammar proves this above
+                raise AssertionError("ProduceResults.columns did not clone to a tuple")
+            seen_columns: set[str] = set()
+            for column in columns:
+                if column in seen_columns:
+                    raise GrafxPlanError(
+                        f"A public query plan cannot publish duplicate column {column!r}.",
+                        field="plan.ProduceResults.columns",
+                        value=column,
+                        reason="duplicate",
+                    )
+                seen_columns.add(column)
+        return expected(**arguments)
+    finally:
+        active.remove(marker)
+
+
+def _query_plan_field_snapshot(
+    value: object,
+    *,
+    annotation: object,
+    detached_nodes: Mapping[int, PlanNode],
+    active: set[int],
+    expression_depth: int,
+    field: str,
+    string_limit: int | None = None,
+) -> object:
+    """Clone a field according to the closed type annotation of its exact owner class."""
+    origin = get_origin(annotation)
+    arguments = get_args(annotation)
+    if origin is _PEP604_UNION_TYPE:
+        if value is None and type(None) in arguments:
+            return None
+        choices = tuple(item for item in arguments if item is not type(None))
+        if len(choices) != 1:
+            raise GrafxPlanError(
+                "A query plan field has an unsupported union grammar.",
+                field=field,
+                value="union",
+            )
+        return _query_plan_field_snapshot(
+            value,
+            annotation=choices[0],
+            detached_nodes=detached_nodes,
+            active=active,
+            expression_depth=expression_depth,
+            field=field,
+            string_limit=string_limit,
+        )
+    if origin is tuple:
+        if not issubclass(type(value), tuple):
+            raise GrafxPlanError(
+                "A query plan collection must be a tuple.",
+                field=field,
+                value=_builtin_type_name(value),
+            )
+        marker = id(value)
+        if marker in active:
+            raise GrafxPlanError(
+                "A query plan collection cannot contain a cycle.",
+                field=field,
+                value="cycle",
+            )
+        active.add(marker)
+        try:
+            raw_items = tuple(tuple.__iter__(value))
+            if len(raw_items) > MAX_LIST_ELEMENTS:
+                raise GrafxPlanError(
+                    f"A plan collection may hold at most {MAX_LIST_ELEMENTS} entries.",
+                    field=field,
+                    value=len(raw_items),
+                    limit=MAX_LIST_ELEMENTS,
+                )
+            if len(arguments) != 2 or arguments[1] is not Ellipsis:
+                raise GrafxPlanError(
+                    "A query plan tuple must declare one repeated item type.",
+                    field=field,
+                    value="tuple_grammar",
+                )
+            return tuple(
+                _query_plan_field_snapshot(
+                    item,
+                    annotation=arguments[0],
+                    detached_nodes=detached_nodes,
+                    active=active,
+                    expression_depth=expression_depth,
+                    field=f"{field}[{position}]",
+                    string_limit=string_limit,
+                )
+                for position, item in enumerate(raw_items)
+            )
+        finally:
+            active.remove(marker)
+    if annotation is PlanNode:
+        if type(value) not in _QUERY_PLAN_NODE_TYPES or id(value) not in detached_nodes:
+            raise GrafxPlanError(
+                "A query operator child is outside the validated tree.",
+                field=field,
+                value=_builtin_type_name(value),
+            )
+        return detached_nodes[id(value)]
+    if annotation is Expression:
+        expression_type = type(value)
+        if expression_type not in _QUERY_PLAN_EXPRESSION_TYPES:
+            raise GrafxPlanError(
+                "A query plan contains an unsupported expression implementation.",
+                field=field,
+                value=_builtin_type_name(value),
+            )
+        return _query_plan_dataclass_snapshot(
+            value,
+            expected=expression_type,
+            detached_nodes=detached_nodes,
+            active=active,
+            expression_depth=expression_depth,
+        )
+    if annotation is str:
+        text = _builtin_text(value, field=field)
+        limit = MAX_NAME_CHARACTERS if string_limit is None else string_limit
+        if len(text) > limit:
+            raise GrafxPlanError(
+                f"A query plan string at {field} may carry at most {limit} characters.",
+                field=field,
+                value=len(text),
+                limit=limit,
+            )
+        return text
+    if annotation is bool:
+        return _builtin_bool(value)
+    if annotation is int:
+        integer = _builtin_int(value, field=field)
+        if not INT64_MIN <= integer <= INT64_MAX:
+            raise GrafxPlanError(
+                "A query plan integer must fit in 64 signed bits.",
+                field=field,
+                value=integer,
+            )
+        return integer
+    if annotation is float:
+        return _builtin_float(value)
+    if isinstance(annotation, type) and issubclass(annotation, Enum):
+        if type(value) is not annotation:
+            raise GrafxPlanError(
+                f"A query plan field expected exact {annotation.__name__}.",
+                field=field,
+                value=_builtin_type_name(value),
+            )
+        return annotation(value.value)
+    if annotation in _QUERY_PLAN_AUXILIARY_TYPES or annotation in _QUERY_PLAN_EXPRESSION_TYPES:
+        return _query_plan_dataclass_snapshot(
+            value,
+            expected=annotation,  # type: ignore[arg-type]
+            detached_nodes=detached_nodes,
+            active=active,
+            expression_depth=expression_depth,
+        )
+    raise GrafxPlanError(
+        "A query plan field has a type outside the frozen public grammar.",
+        field=field,
+        value=repr(annotation),
+    )
+
+
+def _query_result_view(value: object) -> QueryResult:
+    """Rebuild one result and normalize every malformed collaborator shape as a plan error."""
+    try:
+        return _query_result_snapshot(value)
+    except GrafxPlanError:
+        raise
+    except Exception as failure:  # noqa: BLE001 - collaborator output is an untrusted plan
+        observed = _builtin_type_name(failure)
+        raise GrafxPlanError(
+            f"The query collaborator returned a malformed result ({observed}).",
+            field="result",
+            value="malformed",
+            cause=observed,
+        ) from failure
+
+
+def _query_result_snapshot(value: object) -> QueryResult:
+    """Rebuild one fully materialised query result outside the page-access section."""
+    # Local import avoids making the query engine depend on the public-view module that rebuilds
+    # its output.  Database calls this only after composition has finished importing both modules.
+    from okto_grafx.engine.query_engine import QueryResult
+
+    source = _domain_value(value, QueryResult, field="query.result")
+    raw_columns = _tuple_items(
+        _domain_field(source, QueryResult, "columns"), field="query.result.columns"
+    )
+    if len(raw_columns) > MAX_PROJECTION_ITEMS:
+        raise GrafxConfigurationError(
+            f"A query result may carry at most {MAX_PROJECTION_ITEMS} columns.",
+            field="query.result.columns",
+            value=len(raw_columns),
+            limit=MAX_PROJECTION_ITEMS,
+        )
+    columns: list[str] = []
+    seen_columns: set[str] = set()
+    for position, raw_column in enumerate(raw_columns):
+        column = _builtin_text(
+            raw_column, field=f"query.result.columns[{position}]", empty=False
+        )
+        if len(column) > MAX_RENDERED_QUERY_CHARACTERS:
+            raise GrafxConfigurationError(
+                f"A query result column may carry at most "
+                f"{MAX_RENDERED_QUERY_CHARACTERS} characters.",
+                field="query.result.columns",
+                value=len(column),
+                limit=MAX_RENDERED_QUERY_CHARACTERS,
+            )
+        if column in seen_columns:
+            raise GrafxConfigurationError(
+                f"A query result cannot publish duplicate column {column!r}.",
+                field="query.result.columns",
+                value=column,
+                reason="duplicate",
+            )
+        seen_columns.add(column)
+        columns.append(column)
+
+    raw_rows = _tuple_items(
+        _domain_field(source, QueryResult, "rows"), field="query.result.rows"
+    )
+    rows: list[tuple[Value, ...]] = []
+    active: set[int] = set()
+    for row_position, raw_row in enumerate(raw_rows):
+        row_items = _tuple_items(raw_row, field=f"query.result.rows[{row_position}]")
+        if len(row_items) != len(columns):
+            raise GrafxConfigurationError(
+                "Every query result row must have exactly one value per column.",
+                field=f"query.result.rows[{row_position}]",
+                value=len(row_items),
+                expected=len(columns),
+            )
+        rows.append(
+            tuple(
+                _query_value_snapshot(
+                    item,
+                    field=f"query.result.rows[{row_position}][{column_position}]",
+                    depth=0,
+                    active=active,
+                )
+                for column_position, item in enumerate(row_items)
+            )
+        )
+
+    raw_plan = _domain_field(source, QueryResult, "plan")
+    plan = None if raw_plan is None else _query_plan_view(raw_plan)
+    statistics = _query_statistics_snapshot(
+        _domain_field(source, QueryResult, "statistics")
+    )
+    return QueryResult(
+        columns=tuple(columns),
+        rows=tuple(rows),
+        plan=plan,
+        statistics=statistics,
+    )
+
+
+def _query_statistics_snapshot(value: object) -> dict[str, int]:
+    """Return exact, owned and mutable non-negative statement counters."""
+    if not isinstance(value, Mapping):
+        observed = _builtin_type_name(value)
+        raise GrafxConfigurationError(
+            f"Query result statistics must be a mapping; got {observed}.",
+            field="query.result.statistics",
+            value=observed,
+        )
+    detached: dict[str, int] = {}
+    for position, (raw_name, raw_count) in enumerate(
+        _bounded_mapping_pairs(
+            value,
+            limit=MAX_MAP_ENTRIES,
+            field="query.result.statistics",
+        )
+    ):
+        name = _builtin_text(
+            raw_name,
+            field=f"query.result.statistics[{position}].name",
+            empty=False,
+        )
+        if len(name) > MAX_NAME_CHARACTERS:
+            raise GrafxConfigurationError(
+                f"A query result statistic name may carry at most {MAX_NAME_CHARACTERS} "
+                "characters.",
+                field="query.result.statistics",
+                value=len(name),
+                limit=MAX_NAME_CHARACTERS,
+            )
+        if name in detached:
+            raise GrafxConfigurationError(
+                f"Query result statistics contain duplicate counter {name!r}.",
+                field="query.result.statistics",
+                value=name,
+                reason="duplicate",
+            )
+        count = _require_nonnegative_integer(
+            f"query.result.statistics.{name}", raw_count
+        )
+        if count > INT64_MAX:
+            raise GrafxConfigurationError(
+                "A query result statistic must fit in a signed 64-bit integer.",
+                field=f"query.result.statistics.{name}",
+                value=count,
+                limit=INT64_MAX,
+            )
+        detached[name] = count
+    return detached
 
 
 def _finite_float(value: object, *, field: str) -> float:
