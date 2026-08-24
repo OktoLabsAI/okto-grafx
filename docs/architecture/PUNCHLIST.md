@@ -1150,3 +1150,29 @@ is a sign-off in waiting.
   (C0 round 10) and is not continuously verified.
 - The registered `bench` marker is carried by no test; the [bench]-absent behavior rides
   `optional_dependency`. Use it or retire it.
+
+
+## Heap page 0 is a global write lock, measured (C5; W6 candidate)
+
+Every row-writing commit declares interest in heap page 0 unconditionally — the table directory,
+added by the E1 fix so a moved extent hint is always in the write set. The consequence, measured by
+the timed concurrency smoke (4 writers, 3 readers, Windows, this machine): two commits ANYWHERE in
+the database always intersect, so OCC serialises all writers however disjoint their keys are.
+
+| | median | p90 | max |
+|---|---|---|---|
+| committed txn, DISJOINT key ranges | 313 ms | 3,450 ms | 5,078 ms |
+| committed txn, contended rows | 328 ms | 1,282 ms | 2,476 ms |
+
+The disjoint phase has the WORSE tail — 254 retryable conflicts in a workload whose partitions
+never touch, with `partitions_per_table` granularity nullified for this purpose. End-to-end latency
+is queueing: ~300 ms Windows commit cost (the recorded W6 publication gap) times writers
+re-colliding under a random backoff (2–20 ms) far smaller than the commit itself.
+
+Reads under the same load are unaffected — point read median 1.52 ms, p99 under 6 ms, zero torn
+reads in 6,207 rounds — so this is purely a write-throughput ceiling.
+
+W6 candidate: declare page-0 interest only when the directory actually changes (table creation, a
+chain extension moving the extent record), which restores the disjoint concurrency BR-6 promises;
+plus commit-aware backoff in the retry guidance. Instrument: `scratchpad` smoke promoted to
+`tools/measure_concurrency.py` if this is picked up.
