@@ -870,69 +870,80 @@ class Database:
         write doors bypass the WAL and recovery protocols.  This snapshot keeps useful inventory
         reads while carrying no reference or callback back to that device.
         """
-        self._require_open()
-        return _storage_view(self._storage)
+        with self._public_transition():
+            self._require_open()
+            return _storage_view(self._storage)
 
     @property
     def clock(self) -> ClockView:
         """Return clock implementation identity without advancing either clock source."""
-        self._require_open()
-        return _clock_view(self._clock)
+        with self._public_transition():
+            self._require_open()
+            return _clock_view(self._clock)
 
     @property
     def codec(self) -> CodecView:
         """Return immutable format metadata without exposing page encode/decode doors."""
-        self._require_open()
-        return _codec_view(self._codec, self._identity.page_size)
+        with self._public_transition():
+            self._require_open()
+            return _codec_view(self._codec, self._identity.page_size)
 
     @property
     def metrics(self) -> MetricsView:
         """Return whether metrics collection is enabled, without exposing the mutable sink."""
-        self._require_open()
-        return MetricsView(bool(self._metrics.enabled))
+        with self._public_transition():
+            self._require_open()
+            return MetricsView(bool(self._metrics.enabled))
 
     @property
     def events(self) -> ComponentView:
         """Return identity-only metadata for the configured event destination."""
-        self._require_open()
-        return _component_view("events", self._events)
+        with self._public_transition():
+            self._require_open()
+            return _component_view("events", self._events)
 
     @property
     def vector_math(self) -> VectorMathView:
         """Return the selected vector arithmetic implementation's immutable name."""
-        self._require_open()
-        # Adapter identity is observable without executing a host-supplied descriptor.  Calling
-        # ``name`` here would turn a harmless property read into another callback into the host.
-        return VectorMathView(type(self._vector_math).__name__)
+        with self._public_transition():
+            self._require_open()
+            # Adapter identity is observable without executing a host-supplied descriptor.
+            # Calling ``name`` here would turn a harmless property read into another callback
+            # into the host.
+            return VectorMathView(type(self._vector_math).__name__)
 
     @property
     def coordinator(self) -> CoordinatorView:
         """Return participant identity without touching lease, horizon or fencing state."""
-        self._require_open()
-        return _coordinator_view(self._coordinator)
+        with self._public_transition():
+            self._require_open()
+            return _coordinator_view(self._coordinator)
 
     @property
     def pool(self) -> BufferPoolView:
         """Return immutable page-cache capacity and residency counters (FR-13)."""
-        self._require_open()
-        # Every public page operation enters this same section.  The snapshot therefore cannot
-        # straddle an eviction, while its builder only reads in-memory counters and never calls
-        # a storage or telemetry port with the section held.
-        with self._transactions._participant_section():
-            return _pool_view(self._pool)
+        with self._public_transition():
+            self._require_open()
+            # Every public page operation enters this same section.  The snapshot therefore
+            # cannot straddle an eviction, while its builder only reads in-memory counters and
+            # never calls a storage or telemetry port with the section held.
+            with self._transactions._participant_section():
+                return _pool_view(self._pool)
 
     @property
     def catalog(self) -> CatalogStoreView:
         """Return a complete, linearized schema and catalog-layout snapshot."""
-        self._require_open()
-        snapshot, _epoch = self._catalog_snapshot()
-        return snapshot
+        with self._public_transition():
+            self._require_open()
+            snapshot, _epoch = self._catalog_snapshot()
+            return snapshot
 
     @property
     def heap(self) -> HeapStoreView:
         """Return immutable heap layout metadata without row or page mutation doors."""
-        self._require_open()
-        return _heap_view(self._heap)
+        with self._public_transition():
+            self._require_open()
+            return _heap_view(self._heap)
 
     @property
     def wal(self) -> WalView:
@@ -943,15 +954,32 @@ class Database:
         durability barrier.  The participant section makes the cached fields one coherent cut
         without running storage or metrics callbacks while it is held.
         """
-        self._require_open()
-        with self._transactions._participant_section():
-            return _wal_view(self._wal)
+        with self._public_transition():
+            self._require_open()
+            with self._transactions._participant_section():
+                return _wal_view(self._wal)
 
     @property
     def transactions(self) -> TransactionManagerView:
         """Return immutable transaction configuration, counts and publication state."""
-        self._require_open()
-        return _transactions_view(self._transactions)
+        with self._public_transition():
+            self._require_open()
+            # Capture recovery and publication under the same section without re-entering the
+            # manager's public `published_state` door. A callback may seal the manager while its
+            # storage read is in flight; the facade transition defers release and this private
+            # in-section path lets that already-started observation finish honestly.
+            with self._transactions._participant_section():
+                recovery_required = bool(self._transactions.recovery_required)
+                state = (
+                    None
+                    if recovery_required
+                    else self._transactions._published_state_in_section()
+                )
+                return _transactions_view(
+                    self._transactions,
+                    recovery_required=recovery_required,
+                    state=state,
+                )
 
     @property
     def indexes(self) -> IndexRegistryView:
@@ -959,20 +987,23 @@ class Database:
 
         Refuses with GrafxUnsupportedOperation when the composition has no index manager.
         """
-        self._require_open()
-        indexes = self._require_component("indexes", self._indexes, "the index framework (C7)")
-        # Query DDL registers accelerators before commit and journals them for rollback.  Filter
-        # that speculative registry against the same linearized committed catalog the caller
-        # sees, and revalidate its epoch beside the registry snapshot.
-        while True:
-            catalog, epoch = self._catalog_snapshot()
-            table_ids = frozenset(
-                table.table_id for table in catalog.catalog.table_definitions
+        with self._public_transition():
+            self._require_open()
+            indexes = self._require_component(
+                "indexes", self._indexes, "the index framework (C7)"
             )
-            with self._transactions._participant_section():
-                if self._catalog._view_epoch() != epoch:
-                    continue
-                return _indexes_view(indexes, table_ids)
+            # Query DDL registers accelerators before commit and journals them for rollback.
+            # Filter that speculative registry against the same linearized committed catalog
+            # the caller sees, and revalidate its epoch beside the registry snapshot.
+            while True:
+                catalog, epoch = self._catalog_snapshot()
+                table_ids = frozenset(
+                    table.table_id for table in catalog.catalog.table_definitions
+                )
+                with self._transactions._participant_section():
+                    if self._catalog._view_epoch() != epoch:
+                        continue
+                    return _indexes_view(indexes, table_ids)
 
     @property
     def ledger(self) -> LedgerView:
@@ -980,9 +1011,12 @@ class Database:
 
         Refuses with GrafxUnsupportedOperation when the composition has no ledger store.
         """
-        self._require_open()
-        ledger = self._require_component("ledger", self._ledger, "the ledger store (C6)")
-        return _ledger_view(ledger)
+        with self._public_transition():
+            self._require_open()
+            ledger = self._require_component(
+                "ledger", self._ledger, "the ledger store (C6)"
+            )
+            return _ledger_view(ledger)
 
     @property
     def quarantine(self) -> QuarantineView:
@@ -990,11 +1024,12 @@ class Database:
 
         Refuses with GrafxUnsupportedOperation when the composition has no quarantine store.
         """
-        self._require_open()
-        quarantine = self._require_component(
-            "quarantine", self._quarantine, "quarantine (C6)"
-        )
-        return _quarantine_view(quarantine)
+        with self._public_transition():
+            self._require_open()
+            quarantine = self._require_component(
+                "quarantine", self._quarantine, "quarantine (C6)"
+            )
+            return _quarantine_view(quarantine)
 
     @property
     def vectors(self) -> VectorEngineView:
@@ -1002,22 +1037,25 @@ class Database:
 
         Refuses with GrafxUnsupportedOperation when the composition has no vector engine.
         """
-        self._require_open()
-        vectors = self._require_component("vectors", self._vectors, "the vector engine (C9)")
-        # A catalog refresh can read/evict pages and publish telemetry, so it happens before the
-        # participant section.  _catalog_snapshot validates the page epoch under that section;
-        # validate it once more beside the vector registry so a DDL commit cannot land in the
-        # small gap and produce spaces from one side with indexes from the other.
-        while True:
-            catalog, epoch = self._catalog_snapshot()
-            tables = frozenset(
-                table.table_id for table in catalog.catalog.table_definitions
+        with self._public_transition():
+            self._require_open()
+            vectors = self._require_component(
+                "vectors", self._vectors, "the vector engine (C9)"
             )
-            spaces = catalog.catalog.space_definitions
-            with self._transactions._participant_section():
-                if self._catalog._view_epoch() != epoch:
-                    continue
-                return _vectors_view(vectors, spaces, tables)
+            # A catalog refresh can read/evict pages and publish telemetry, so it happens before
+            # the participant section. _catalog_snapshot validates the page epoch under that
+            # section; validate it once more beside the vector registry so a DDL commit cannot
+            # land in the small gap and produce spaces from one side with indexes from the other.
+            while True:
+                catalog, epoch = self._catalog_snapshot()
+                tables = frozenset(
+                    table.table_id for table in catalog.catalog.table_definitions
+                )
+                spaces = catalog.catalog.space_definitions
+                with self._transactions._participant_section():
+                    if self._catalog._view_epoch() != epoch:
+                        continue
+                    return _vectors_view(vectors, spaces, tables)
 
     @property
     def queries(self) -> QueryEngineView:
@@ -1025,9 +1063,12 @@ class Database:
 
         Refuses with GrafxUnsupportedOperation when the composition has no query engine.
         """
-        self._require_open()
-        queries = self._require_component("queries", self._queries, "the query engine (C10)")
-        return _queries_view(queries)
+        with self._public_transition():
+            self._require_open()
+            queries = self._require_component(
+                "queries", self._queries, "the query engine (C10)"
+            )
+            return _queries_view(queries)
 
     # --- transactions -------------------------------------------------------------------------
 

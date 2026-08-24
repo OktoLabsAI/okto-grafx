@@ -27,7 +27,7 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.index.definition import IndexDefinition
 from okto_grafx.domain.index.header import INDEX_HEADER_SLOT, IndexHeader
 from okto_grafx.domain.index.visibility import IndexVisibility
-from okto_grafx.domain.ledger.entry import LedgerEntry
+from okto_grafx.domain.ledger.entry import LedgerEntry, LedgerOriginClass, LedgerReason
 from okto_grafx.domain.model.schema import EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.txn.commit_state import CommitState
@@ -97,7 +97,8 @@ class StorageView:
 
     def exists(self, file: str) -> bool:
         """Return whether ``file`` existed when this snapshot was built."""
-        return any(item.name == file for item in self.files)
+        wanted = _require_text("file", file)
+        return any(item.name == wanted for item in self.files)
 
     def file_size(self, file: str) -> int:
         """Return the captured byte length of ``file``."""
@@ -109,13 +110,14 @@ class StorageView:
 
     def _file(self, name: str) -> StorageFileView:
         """Return one captured file or refuse a name outside the snapshot."""
+        wanted = _require_text("file", name)
         for item in self.files:
-            if item.name == name:
+            if item.name == wanted:
                 return item
         raise GrafxConfigurationError(
-            f"No file named {name!r} belongs to this storage snapshot.",
+            f"No file named {wanted!r} belongs to this storage snapshot.",
             field="file",
-            value=name,
+            value=wanted,
         )
 
 
@@ -208,54 +210,60 @@ class CatalogView:
 
     def has_table(self, name: str) -> bool:
         """Return whether a captured table has ``name``."""
-        return any(table.name == name for table in self.table_definitions)
+        wanted = _require_text("table", name)
+        return any(table.name == wanted for table in self.table_definitions)
 
     def has_space(self, name: str) -> bool:
         """Return whether a captured embedding space has ``name``."""
-        return any(space.name == name for space in self.space_definitions)
+        wanted = _require_text("space", name)
+        return any(space.name == wanted for space in self.space_definitions)
 
     def table(self, name: str) -> TableDef:
         """Return a captured table by name."""
+        wanted = _require_text("table", name)
         for table in self.table_definitions:
-            if table.name == name:
+            if table.name == wanted:
                 return table
         raise GrafxConfigurationError(
-            f"There is no table named {name!r} in this catalog snapshot.",
+            f"There is no table named {wanted!r} in this catalog snapshot.",
             field="table",
-            value=name,
+            value=wanted,
         )
 
     def table_by_id(self, table_id: int) -> TableDef:
         """Return a captured table by numeric identity."""
+        wanted = _require_integer("table_id", table_id)
         for table in self.table_definitions:
-            if table.table_id == table_id:
+            if table.table_id == wanted:
                 return table
         raise GrafxConfigurationError(
-            f"There is no table with id {table_id!r} in this catalog snapshot.",
+            f"There is no table with id {wanted!r} in this catalog snapshot.",
             field="table_id",
-            value=table_id,
+            value=wanted,
         )
 
     def space(self, name: str) -> EmbeddingSpaceDef:
         """Return a captured embedding space by name."""
+        wanted = _require_text("space", name)
         for space in self.space_definitions:
-            if space.name == name:
+            if space.name == wanted:
                 return space
         raise GrafxConfigurationError(
-            f"There is no embedding space named {name!r} in this catalog snapshot.",
+            f"There is no embedding space named {wanted!r} in this catalog snapshot.",
             field="space",
-            value=name,
+            value=wanted,
         )
 
     def space_by_id(self, space_id: int) -> EmbeddingSpaceDef:
         """Return a captured embedding space by numeric identity."""
+        wanted = _require_integer("space_id", space_id)
         for space in self.space_definitions:
-            if space.space_id == space_id:
+            if space.space_id == wanted:
                 return space
         raise GrafxConfigurationError(
-            f"There is no embedding space with id {space_id!r} in this catalog snapshot.",
+            f"There is no embedding space with id {wanted!r} in this catalog snapshot.",
             field="space_id",
-            value=space_id,
+            value=wanted,
         )
 
     def is_empty(self) -> bool:
@@ -408,25 +416,28 @@ class LedgerView:
         offset: int = 0,
     ) -> tuple[LedgerEntry, ...]:
         """Filter the captured entries without touching the ledger store."""
-        origin_word = _enum_word(origin_class)
-        reason_word = _enum_word(reason)
+        wanted_class = _as_origin_class(origin_class)
+        wanted_reason = _as_reason(reason)
+        page_size = _require_ledger_count("limit", limit)
+        start = _require_ledger_count("offset", offset)
         selected = tuple(
             entry
             for entry in self.captured_entries
-            if (origin_word is None or _enum_word(entry.origin_class) == origin_word)
-            and (reason_word is None or _enum_word(entry.reason) == reason_word)
+            if (wanted_class is None or entry.origin_class is wanted_class)
+            and (wanted_reason is None or entry.reason is wanted_reason)
         )
-        return selected[offset : offset + limit]
+        return selected[start : start + page_size]
 
     def inspect(self, entry_id: int) -> LedgerEntry:
         """Return one captured ledger entry by identity."""
+        wanted = _require_ledger_identifier(entry_id)
         for entry in self.captured_entries:
-            if entry.entry_id == entry_id:
+            if entry.entry_id == wanted:
                 return entry
         raise GrafxLedgerError(
-            f"No ledger entry with id {entry_id!r} belongs to this snapshot.",
+            f"The ledger holds no entry {wanted}.",
             field="entry_id",
-            value=entry_id,
+            entry_id=wanted,
         )
 
 
@@ -443,13 +454,14 @@ class QuarantineView:
 
     def inspect(self, name: str) -> QuarantineEntry:
         """Return one captured quarantine entry by name."""
+        wanted = _require_quarantine_name(name)
         for entry in self.captured_entries:
-            if entry.name == name:
+            if entry.name == wanted:
                 return entry
         raise GrafxQuarantineError(
-            f"No quarantine entry named {name!r} belongs to this snapshot.",
+            f"The quarantine holds no readable entry {wanted!r}.",
             field="name",
-            value=name,
+            entry=wanted,
         )
 
 
@@ -487,13 +499,14 @@ class VectorEngineView:
 
     def space(self, name: str) -> EmbeddingSpaceDef:
         """Return one captured embedding-space definition by name."""
+        wanted = _require_text("space", name)
         for space in self.space_definitions:
-            if space.name == name:
+            if space.name == wanted:
                 return space
         raise GrafxConfigurationError(
-            f"There is no embedding space named {name!r} in this vector snapshot.",
+            f"There is no embedding space named {wanted!r} in this vector snapshot.",
             field="space",
-            value=name,
+            value=wanted,
         )
 
     def indexes(self) -> tuple[VectorIndexView, ...]:
@@ -502,6 +515,12 @@ class VectorEngineView:
 
     def index(self, space_name: str) -> VectorIndexView:
         """Return the captured vector index of one embedding space."""
+        if not isinstance(space_name, str):
+            raise GrafxIndexError(
+                f"An embedding space is named by a string; got {type(space_name).__name__}.",
+                field="space",
+                value=type(space_name).__name__,
+            )
         for index in self.registered_indexes:
             if index.space_name == space_name:
                 return index
@@ -534,12 +553,107 @@ PUBLIC_DATABASE_VIEW_ALLOWLIST: tuple[tuple[str, type[object]], ...] = (
 """Static allowlist of every public composition property and its safe result type."""
 
 
-def _enum_word(value: object) -> str | None:
-    """Return an enum-like value's public word, preserving None as no filter."""
-    if value is None:
-        return None
-    candidate = getattr(value, "value", value)
-    return str(candidate)
+def _require_text(field: str, value: object, *, empty: bool = False) -> str:
+    """Return a public snapshot's string argument or raise the stable configuration type."""
+    if not isinstance(value, str) or (not empty and not value):
+        qualification = "a string" if empty else "a non-empty string"
+        raise GrafxConfigurationError(
+            f"The {field} of this snapshot lookup must be {qualification}; got {value!r}.",
+            field=field,
+            value=repr(value),
+        )
+    return value
+
+
+def _require_integer(field: str, value: object) -> int:
+    """Return one integer lookup key without allowing bool to alias identity one."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise GrafxConfigurationError(
+            f"The {field} of this snapshot lookup must be an integer; got "
+            f"{type(value).__name__}.",
+            field=field,
+            value=repr(value),
+        )
+    return value
+
+
+def _as_origin_class(value: object) -> LedgerOriginClass | None:
+    """Match LedgerStore.list origin filters, including case-insensitive public names."""
+    if value is None or isinstance(value, LedgerOriginClass):
+        return value
+    if isinstance(value, str):
+        for member in LedgerOriginClass:
+            if member.name.casefold() == value.casefold():
+                return member
+    raise GrafxConfigurationError(
+        f"{value!r} is not an origin class; expected one of "
+        f"{tuple(member.name.lower() for member in LedgerOriginClass)}.",
+        field="origin_class",
+        value=repr(value),
+    )
+
+
+def _as_reason(value: object) -> LedgerReason | None:
+    """Match LedgerStore.list reason filters, including case-insensitive public names."""
+    if value is None or isinstance(value, LedgerReason):
+        return value
+    if isinstance(value, str):
+        for member in LedgerReason:
+            if member.name.casefold() == value.casefold():
+                return member
+    raise GrafxConfigurationError(
+        f"{value!r} is not a ledger reason; expected one of "
+        f"{tuple(member.name.lower() for member in LedgerReason)}.",
+        field="reason",
+        value=repr(value),
+    )
+
+
+def _require_ledger_count(field: str, value: object) -> int:
+    """Match LedgerStore.list validation for non-negative limit and offset values."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise GrafxConfigurationError(
+            f"The {field} of a ledger listing must be an integer; got "
+            f"{type(value).__name__}.",
+            field=field,
+            value=repr(value),
+        )
+    if value < 0:
+        raise GrafxConfigurationError(
+            f"The {field} of a ledger listing cannot be negative; got {value}.",
+            field=field,
+            value=value,
+        )
+    return value
+
+
+def _require_ledger_identifier(value: object) -> int:
+    """Match LedgerStore.inspect validation for one positive entry identifier."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise GrafxConfigurationError(
+            f"A ledger entry_id must be an integer; got {type(value).__name__}.",
+            field="entry_id",
+            value=repr(value),
+        )
+    if value <= 0:
+        raise GrafxConfigurationError(
+            f"A ledger entry_id is positive; got {value}.",
+            field="entry_id",
+            value=value,
+        )
+    return value
+
+
+def _require_quarantine_name(value: object) -> str:
+    """Match QuarantineStore.inspect text and one-directory-name validation."""
+    name = _require_text("name", value)
+    if "/" in name or "\\" in name or name in {".", ".."}:
+        raise GrafxConfigurationError(
+            f"A quarantine entry name is one directory name; got {name!r}.",
+            field="name",
+            value=name,
+        )
+    return name
 
 
 def _storage_view(storage: Any) -> StorageView:
@@ -634,9 +748,13 @@ def _wal_view(wal: Any) -> WalView:
     )
 
 
-def _transactions_view(transactions: Any) -> TransactionManagerView:
-    """Snapshot transaction limits, counts and published state."""
-    recovery_required = bool(transactions.recovery_required)
+def _transactions_view(
+    transactions: Any,
+    *,
+    recovery_required: bool,
+    state: CommitState | None,
+) -> TransactionManagerView:
+    """Snapshot transaction limits and caller-linearized publication state."""
     return TransactionManagerView(
         int(transactions.partitions_per_table),
         float(transactions.commit_lock_timeout),
@@ -645,7 +763,7 @@ def _transactions_view(transactions: Any) -> TransactionManagerView:
         float(transactions.refresh_interval),
         int(transactions.open_transactions),
         recovery_required,
-        None if recovery_required else transactions.published_state(),
+        state,
     )
 
 
