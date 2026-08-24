@@ -623,24 +623,14 @@ class TransactionManager:
         in (CONTRACT.md section 10).
         """
         self._require_owned(txn)
-        cleanup_failure: BaseException | None = None
         with self._participant_section():
+            # Ownership and state are re-read while settlement is serialised.  A preliminary
+            # check cannot carry across the wait for this section: commit, retry or another
+            # rollback may have settled this exact context in that window.
+            self._require_owned(txn)
             if txn.state is TransactionState.ABORTED:
                 return
-            self._require_active(txn)
-            self._refresh_due_readers(skip=txn.txn_id)
-            mode = txn.mode.value
-            try:
-                self._drop_index_changes(txn)
-            except BaseException as failure:
-                cleanup_failure = failure
-                self._recovery_required = True
-            txn.mark_aborted()
-            cleanup_failure = _first_failure(
-                cleanup_failure,
-                self._release_reader(txn),
-            )
-            open_now = self._forget(txn, mode)
+            mode, open_now, cleanup_failure = self._rollback_active_in_section(txn)
         if cleanup_failure is not None:
             raise cleanup_failure
         self._publish_gauge(mode, open_now)
@@ -672,20 +662,52 @@ class TransactionManager:
         self._require_owned(txn)
         if txn.mode is TransactionMode.WRITE:
             self._require_writable("retry a write transaction")
-        if txn.conflicts <= 0:
-            raise GrafxTransactionStateError(
-                "Only a transaction that optimistic validation refused can be retried through "
-                "this door; nothing has refused this one.",
-                txn_id=txn.txn_id,
-                conflicts=txn.conflicts,
-            )
-        carried = txn.conflicts
-        mode = txn.mode
-        if txn.active:
-            self.rollback(txn)
+        with self._participant_section():
+            self._require_current_active(txn)
+            if txn.mode is TransactionMode.WRITE:
+                self._require_writable("retry a write transaction")
+            if txn.conflicts <= 0:
+                raise GrafxTransactionStateError(
+                    "Only a transaction that optimistic validation refused can be retried "
+                    "through this door; nothing has refused this one.",
+                    txn_id=txn.txn_id,
+                    conflicts=txn.conflicts,
+                )
+            carried = txn.conflicts
+            mode = txn.mode
+            finished_mode, open_now, cleanup_failure = self._rollback_active_in_section(txn)
+        if cleanup_failure is not None:
+            raise cleanup_failure
+        self._publish_gauge(finished_mode, open_now)
         successor = self.begin(mode.value)
         successor.adopt_conflicts(carried)
         return successor
+
+    def _rollback_active_in_section(
+        self, txn: TransactionContext
+    ) -> tuple[str, int, BaseException | None]:
+        """Settle one current transaction as aborted while the participant section is held.
+
+        The exact context and ACTIVE state are checked again here, immediately before reader
+        refresh or index cleanup can reach a collaborator.  Both public rollback and retry use
+        this one transition so two lifecycle doors cannot each believe they won.
+        """
+        self._require_current_active(txn)
+        self._refresh_due_readers(skip=txn.txn_id)
+        mode = txn.mode.value
+        cleanup_failure: BaseException | None = None
+        try:
+            self._drop_index_changes(txn)
+        except BaseException as failure:
+            cleanup_failure = failure
+            self._recovery_required = True
+        txn.mark_aborted()
+        cleanup_failure = _first_failure(
+            cleanup_failure,
+            self._release_reader(txn),
+        )
+        open_now = self._forget(txn, mode)
+        return mode, open_now, cleanup_failure
 
     # --- reader scheduling (amendment A46) -----------------------------------------------------
 
@@ -978,7 +1000,9 @@ class TransactionManager:
         with self._participant_section():
             for txn in list(self._open.values()):
                 try:
-                    self.rollback(txn)
+                    _mode, _open_now, cleanup_failure = self._rollback_active_in_section(txn)
+                    if cleanup_failure is not None:
+                        raise cleanup_failure
                 except GrafxError:
                     # A rollback that cannot withdraw its registration must not stop the next
                     # one from being withdrawn: the pins that remain are what a horizon pass
@@ -1029,6 +1053,9 @@ class TransactionManager:
         csn: Csn = txn.snapshot.read_lsn
         mode = txn.mode.value
         with self._participant_section():
+            self._require_current_active(txn)
+            if txn.mode is TransactionMode.WRITE:
+                self._require_writable("commit a write transaction")
             self._refresh_due_readers(skip=txn.txn_id)
             txn.mark_committed(csn)
             # Reader withdrawal is best-effort after the outcome is settled. Its registration
@@ -1058,6 +1085,8 @@ class TransactionManager:
         post_barrier_failure: BaseException | None = None
         cleanup_failure: BaseException | None = None
         with self._participant_section():
+            self._require_current_active(txn)
+            self._require_writable("commit a write transaction")
             self._require_recovery_complete()
             self._validate_staged_inputs(txn)
             self._refresh_due_readers(skip=txn.txn_id)
@@ -2287,6 +2316,16 @@ class TransactionManager:
                 txn_id=txn.txn_id,
                 reason="transaction_capability_mismatch",
             )
+
+    def _require_current_active(self, txn: TransactionContext) -> None:
+        """Require the exact registered context to remain ACTIVE at the settlement instant.
+
+        Callers use this only while holding the participant section.  The same checks outside
+        that section are useful fail-fast diagnostics but cannot authorise lifecycle work: a
+        competing thread can settle the transaction before the section is acquired.
+        """
+        self._require_owned(txn)
+        self._require_active(txn)
 
     def _require_active(self, txn: TransactionContext) -> None:
         """Refuse a transaction that has already committed or rolled back."""
