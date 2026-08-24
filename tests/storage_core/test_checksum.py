@@ -56,7 +56,9 @@ KNOWN_VECTORS: tuple[tuple[bytes, int], ...] = (
 
 
 @pytest.mark.parametrize(
-    ("payload", "expected"), KNOWN_VECTORS, ids=[f"{index}" for index in range(len(KNOWN_VECTORS))]
+    ("payload", "expected"),
+    KNOWN_VECTORS,
+    ids=[f"{index}" for index in range(len(KNOWN_VECTORS))],
 )
 def test_the_known_vectors_are_reproduced(payload: bytes, expected: int) -> None:
     assert crc32c(payload) == expected
@@ -177,7 +179,9 @@ def mirror(data: bytes, crc: int) -> int:
     return crc32c_reference(data, crc)
 
 
-def test_the_shipped_door_and_the_reference_agree_on_the_whole_acceptance_corpus() -> None:
+def test_the_shipped_door_and_the_reference_agree_on_the_whole_acceptance_corpus() -> (
+    None
+):
     """The digest-equality test. It is what makes the seam safe to have at all.
 
     An accelerated checksum that disagrees with the reference on one input does not fail loudly:
@@ -188,7 +192,10 @@ def test_the_shipped_door_and_the_reference_agree_on_the_whole_acceptance_corpus
     """
     assert CRC32C_ACCEPTANCE_CORPUS, "an empty corpus would accept anything"
     for payload, seed in CRC32C_ACCEPTANCE_CORPUS:
-        assert crc32c(payload, seed) == crc32c_reference(payload, seed), (len(payload), seed)
+        assert crc32c(payload, seed) == crc32c_reference(payload, seed), (
+            len(payload),
+            seed,
+        )
     for payload, answer in CRC32C_KNOWN_ANSWERS:
         assert crc32c_reference(payload) == answer
         assert crc32c(payload) == answer
@@ -204,7 +211,23 @@ def test_the_acceptance_corpus_covers_the_inputs_a_fast_loop_gets_wrong() -> Non
     """
     lengths = {len(payload) for payload, _seed in CRC32C_ACCEPTANCE_CORPUS}
     assert set(range(0, 41)) <= lengths, "the byte-at-a-time tail is not covered"
-    for boundary in (255, 256, 257, 511, 512, 513, 4095, 4096, 4097, 8191, 8192):
+    for boundary in (
+        255,
+        256,
+        257,
+        511,
+        512,
+        513,
+        4095,
+        4096,
+        4097,
+        8191,
+        8192,
+        32763,
+        32764,
+        32765,
+        32768,
+    ):
         assert boundary in lengths, boundary
     seeds = {seed for _payload, seed in CRC32C_ACCEPTANCE_CORPUS}
     assert seeds - {CRC32C_INITIAL}, "every seed is zero, so chaining is untested"
@@ -233,11 +256,15 @@ def test_an_installed_accelerator_changes_no_digest_the_engine_produces(
     page.insert_slot(b"payload that has to survive the swap")
     codec = PageCodecV1(512)
     before_image = codec.encode_page(page)
-    before_digests = [crc32c(payload, seed) for payload, seed in CRC32C_ACCEPTANCE_CORPUS]
+    before_digests = [
+        crc32c(payload, seed) for payload, seed in CRC32C_ACCEPTANCE_CORPUS
+    ]
 
     install_crc32c(mirror, name="mirror")
 
-    assert [crc32c(payload, seed) for payload, seed in CRC32C_ACCEPTANCE_CORPUS] == before_digests
+    assert [
+        crc32c(payload, seed) for payload, seed in CRC32C_ACCEPTANCE_CORPUS
+    ] == before_digests
     assert codec.encode_page(page) == before_image
     assert codec.decode_page(before_image, verify=True) == page
 
@@ -313,6 +340,195 @@ def test_installing_something_that_is_not_a_named_callable_is_refused(
     assert crc32c_implementation() == PURE_IMPLEMENTATION_NAME
 
 
+class _AlwaysEqualChecksum:
+    """A non-integer result that used equality to impersonate every expected digest."""
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __format__(self, specification: str) -> str:
+        return "00000000"
+
+
+def test_a_non_integer_result_cannot_pass_validation_by_forging_equality(
+    restore_the_reference: None,
+) -> None:
+    candidate = lambda data, crc: _AlwaysEqualChecksum()  # noqa: E731
+    with pytest.raises(GrafxConfigurationError) as installed:
+        install_crc32c(candidate, name="always-equal")  # type: ignore[arg-type]
+    assert installed.value.details["field"] == "implementation"
+    with pytest.raises(GrafxConfigurationError) as adapted:
+        NativeCrc32c(candidate, provider_name="always-equal")  # type: ignore[arg-type]
+    assert adapted.value.details["field"] == "provider"
+    assert crc32c_implementation() == PURE_IMPLEMENTATION_NAME
+
+
+class _HostileChecksumInt(int):
+    def __eq__(self, other: object) -> bool:
+        raise RuntimeError("caller equality ran")
+
+    def __format__(self, specification: str) -> str:
+        raise RuntimeError("caller formatting ran")
+
+
+def test_an_integer_subclass_is_copied_before_comparison_and_runtime_use(
+    restore_the_reference: None,
+) -> None:
+    def candidate(data: bytes, crc: int) -> int:
+        return _HostileChecksumInt(crc32c_reference(data, crc))
+
+    install_crc32c(candidate, name="integer-subclass")
+    answer = crc32c(b"123456789")
+    assert type(answer) is int
+    assert answer == 0xE3069283
+
+
+def test_an_ordinary_candidate_failure_is_a_typed_refusal(
+    restore_the_reference: None,
+) -> None:
+    marker = RuntimeError("provider failed")
+
+    def candidate(data: bytes, crc: int) -> int:
+        raise marker
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        install_crc32c(candidate, name="raising")
+    assert raised.value.details["cause"] == "RuntimeError"
+    assert raised.value.__cause__ is marker
+    assert crc32c_implementation() == PURE_IMPLEMENTATION_NAME
+
+
+def test_a_huge_exact_integer_answer_is_a_typed_bounded_refusal(
+    restore_the_reference: None,
+) -> None:
+    huge = 10**10000
+    with pytest.raises(GrafxConfigurationError) as raised:
+        install_crc32c(lambda data, crc: huge, name="huge")
+    assert raised.value.details["field"] == "implementation"
+    assert raised.value.details["produced"].startswith("int<")
+    assert crc32c_implementation() == PURE_IMPLEMENTATION_NAME
+
+
+def test_an_injected_provider_is_verified_again_on_each_real_input(
+    restore_the_reference: None,
+) -> None:
+    armed = False
+
+    def selective(data: bytes, crc: int) -> int:
+        answer = crc32c_reference(data, crc)
+        return answer ^ 1 if armed else answer
+
+    adapter = NativeCrc32c(selective, provider_name="selective")
+    adapter.install()
+    armed = True
+
+    with pytest.raises(GrafxConfigurationError) as installed:
+        crc32c(bytes(32764))
+    assert installed.value.details["field"] == "implementation"
+    with pytest.raises(GrafxConfigurationError) as direct:
+        adapter.checksum(bytes(32764))
+    assert direct.value.details["field"] == "provider"
+
+
+def test_a_vendored_provider_can_explicitly_accept_the_corpus_trust_boundary(
+    restore_the_reference: None,
+) -> None:
+    adapter = NativeCrc32c(
+        mirror,
+        provider_name="vendored",
+        verify_runtime=False,
+    )
+    adapter.install()
+    assert crc32c(b"runtime") == crc32c_reference(b"runtime")
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        NativeCrc32c(
+            mirror,
+            provider_name="vendored",
+            verify_runtime=1,  # type: ignore[arg-type]
+        )
+    assert raised.value.details["field"] == "verify_runtime"
+
+
+@pytest.mark.parametrize("late_answer", ["float", "raise"])
+def test_a_closed_list_provider_still_has_runtime_shape_and_error_containment(
+    late_answer: str,
+    monkeypatch: pytest.MonkeyPatch,
+    restore_the_reference: None,
+) -> None:
+    armed = False
+    marker = RuntimeError("native provider failed after validation")
+
+    def provider(data: bytes, crc: int) -> object:
+        if armed:
+            if late_answer == "raise":
+                raise marker
+            return float(crc32c_reference(data, crc))
+        return crc32c_reference(data, crc)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            checksum_native, "load_provider", lambda: ("google_crc32c", provider)
+        )
+        adapter = NativeCrc32c()
+        adapter.install()
+    armed = True
+
+    with pytest.raises(GrafxConfigurationError) as installed:
+        crc32c(b"runtime")
+    with pytest.raises(GrafxConfigurationError) as direct:
+        adapter.checksum(b"runtime")
+    if late_answer == "float":
+        assert installed.value.details["result_type"] == "float"
+        assert direct.value.details["result_type"] == "float"
+    else:
+        assert installed.value.__cause__ is marker
+        assert direct.value.__cause__ is marker
+
+
+def test_explicit_runtime_verification_always_wins_for_a_closed_list_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    restore_the_reference: None,
+) -> None:
+    armed = False
+
+    def provider(data: bytes, crc: int) -> int:
+        answer = crc32c_reference(data, crc)
+        return answer ^ 1 if armed else answer
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            checksum_native, "load_provider", lambda: ("google_crc32c", provider)
+        )
+        adapter = NativeCrc32c(verify_runtime=True)
+        adapter.install()
+    armed = True
+
+    with pytest.raises(GrafxConfigurationError) as installed:
+        crc32c(b"runtime")
+    with pytest.raises(GrafxConfigurationError) as direct:
+        adapter.checksum(b"runtime")
+    assert installed.value.details["field"] == "implementation"
+    assert direct.value.details["field"] == "provider"
+
+
+@pytest.mark.parametrize("module_name", ["google_crc32c", "crc32c"])
+def test_native_adaptation_does_not_coerce_a_provider_result(
+    module_name: str,
+) -> None:
+    def float_answer(first: object, second: object) -> float:
+        data, seed = (
+            (second, first) if module_name == "google_crc32c" else (first, second)
+        )
+        return float(crc32c_reference(data, seed))  # type: ignore[arg-type]
+
+    adapted = checksum_native._adapt(module_name, "provider", float_answer)
+    with pytest.raises(GrafxConfigurationError) as raised:
+        NativeCrc32c(adapted, provider_name=module_name)
+    assert raised.value.details["field"] == "provider"
+    assert raised.value.details["result_type"] == "float"
+
+
 def test_the_reference_is_not_reachable_through_the_installer(
     restore_the_reference: None,
 ) -> None:
@@ -352,6 +568,31 @@ def test_a_bad_seed_is_refused_before_any_implementation_sees_it(
     assert seen == [7]
 
 
+def test_a_hostile_integer_seed_is_copied_without_running_its_hooks(
+    restore_the_reference: None,
+) -> None:
+    class HostileSeed(int):
+        def __le__(self, other: object) -> bool:
+            raise RuntimeError("caller comparison ran")
+
+        def __repr__(self) -> str:
+            raise RuntimeError("caller repr ran")
+
+    answer = crc32c(b"x", HostileSeed(7))
+    assert type(answer) is int
+    assert answer == crc32c_reference(b"x", 7)
+
+
+def test_checksum_function_and_name_share_one_atomic_publication() -> None:
+    from okto_grafx.domain.page import checksum as module
+
+    function, name = module._implementation_state
+    assert callable(function)
+    assert name == crc32c_implementation()
+    assert not hasattr(module, "_implementation")
+    assert not hasattr(module, "_implementation_name")
+
+
 # --- the adapters: pure is the reference, native is proved against it ---------------------------
 
 
@@ -384,13 +625,25 @@ def test_a_provider_that_disagrees_with_the_reference_can_never_be_installed(
     through both doors.
     """
     wrong: tuple[tuple[str, object], ...] = (
-        ("wrong polynomial (zlib CRC-32, not CRC-32C)", lambda data, crc=0: zlib.crc32(data, crc)),
-        ("arguments the wrong way round", lambda data, crc=0: crc32c_reference(
-            bytes([crc & 0xFF]), len(data))),
+        (
+            "wrong polynomial (zlib CRC-32, not CRC-32C)",
+            lambda data, crc=0: zlib.crc32(data, crc),
+        ),
+        (
+            "arguments the wrong way round",
+            lambda data, crc=0: crc32c_reference(bytes([crc & 0xFF]), len(data)),
+        ),
         ("seed ignored", lambda data, crc=0: crc32c_reference(data, 0)),
-        ("truncated to 16 bits", lambda data, crc=0: crc32c_reference(data, crc) & 0xFFFF),
-        ("off by one on a tail length", lambda data, crc=0: crc32c_reference(data, crc)
-            ^ (1 if len(data) % 8 == 5 else 0)),
+        (
+            "truncated to 16 bits",
+            lambda data, crc=0: crc32c_reference(data, crc) & 0xFFFF,
+        ),
+        (
+            "off by one on a tail length",
+            lambda data, crc=0: (
+                crc32c_reference(data, crc) ^ (1 if len(data) % 8 == 5 else 0)
+            ),
+        ),
     )
     for label, candidate in wrong:
         with pytest.raises(GrafxConfigurationError):
@@ -423,7 +676,9 @@ def test_an_adapter_over_a_correct_provider_installs_and_changes_no_digest(
     assert adapter.install() == PURE_IMPLEMENTATION_NAME
     assert crc32c_implementation() == "native"
 
-    assert [crc32c(payload, seed) for payload, seed in CRC32C_ACCEPTANCE_CORPUS] == before
+    assert [
+        crc32c(payload, seed) for payload, seed in CRC32C_ACCEPTANCE_CORPUS
+    ] == before
     assert codec.encode_page(page) == before_image
     assert codec.decode_page(before_image, verify=True) == page
     for payload, answer in CRC32C_KNOWN_ANSWERS:
@@ -448,7 +703,10 @@ def test_the_provider_list_is_closed_and_declares_what_it_takes_from_each() -> N
     rather than guessed.
     """
     assert CRC32C_PROVIDERS
-    assert [name for name, _attribute in CRC32C_PROVIDERS] == ["google_crc32c", "crc32c"]
+    assert [name for name, _attribute in CRC32C_PROVIDERS] == [
+        "google_crc32c",
+        "crc32c",
+    ]
     for name, attribute in CRC32C_PROVIDERS:
         assert isinstance(name, str) and name
         assert isinstance(attribute, str) and attribute
@@ -464,7 +722,9 @@ def test_the_missing_provider_failure_names_the_remedy(
     skip on some hosts, and a skip that no registered marker can attribute is a hole in G4 --
     which is exactly what happened when this was first written.
     """
-    monkeypatch.setattr(checksum_native, "CRC32C_PROVIDERS", (("okto_grafx_no_such_crc", "x"),))
+    monkeypatch.setattr(
+        checksum_native, "CRC32C_PROVIDERS", (("okto_grafx_no_such_crc", "x"),)
+    )
     with pytest.raises(ImportError) as raised:
         load_provider()
     assert "[accel]" in str(raised.value)

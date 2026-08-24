@@ -17,7 +17,9 @@ and undoing it is cheaper than reasoning about it.
 **A batch never spans two segments.** The roll decision is taken before the first byte is
 written, so a torn write damages one file and the repair is one truncation. A batch larger than
 ``segment_bytes`` makes its segment larger than ``segment_bytes`` rather than splitting; the
-caller chose the batch, and honouring it whole is what keeps the repair exact.
+caller chose the batch, and honouring it whole is what keeps the repair exact. Such a batch is
+still refused before any write when its segment would exceed the reader's hard ceiling: this
+writer never creates a file that this same build cannot reopen.
 
 **Damage closes the door.** When the scan at ``open`` finds bytes that are not a record, the
 manager remembers it and refuses every append with ``corruption_detected``. Appending after a
@@ -65,6 +67,7 @@ from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
     GrafxDurabilityBarrierFailed,
+    GrafxError,
     GrafxPortNotConfigured,
     GrafxSchemaVersionMismatch,
     GrafxStaleEpoch,
@@ -239,7 +242,9 @@ class SegmentHeader:
 
     __slots__ = ("number", "previous_last_lsn", "created_at_wall")
 
-    def __init__(self, number: int, previous_last_lsn: Lsn, created_at_wall: float) -> None:
+    def __init__(
+        self, number: int, previous_last_lsn: Lsn, created_at_wall: float
+    ) -> None:
         """Hold the three fields a segment header carries."""
         self.number = number
         self.previous_last_lsn = previous_last_lsn
@@ -575,7 +580,9 @@ class WalManager:
                         break
                     continue
                 record = item.record
-                if record is None:  # pragma: no cover - the walk sets exactly one of the two
+                if (
+                    record is None
+                ):  # pragma: no cover - the walk sets exactly one of the two
                     continue
                 counts[item.segment] += 1
                 if first[item.segment] == NO_LSN:
@@ -716,9 +723,15 @@ class WalManager:
         # The marks of a segment nobody removed still describe bytes nobody rewrote, so they
         # carry over; a name that has gone takes its marks with it.
         marks = {name: self._marks[name] for name in names if name in self._marks}
-        first = {name: (known[name].first_lsn if name in known else NO_LSN) for name in names}
-        last = {name: (known[name].last_lsn if name in known else NO_LSN) for name in names}
-        counts = {name: (known[name].record_count if name in known else 0) for name in names}
+        first = {
+            name: (known[name].first_lsn if name in known else NO_LSN) for name in names
+        }
+        last = {
+            name: (known[name].last_lsn if name in known else NO_LSN) for name in names
+        }
+        counts = {
+            name: (known[name].record_count if name in known else 0) for name in names
+        }
         last_lsn = self._last_lsn
         max_epoch = self._max_epoch
         damage = self._damage
@@ -735,7 +748,9 @@ class WalManager:
                     damage = item.failure
                     break
                 record = item.record
-                if record is None:  # pragma: no cover - the walk sets exactly one of the two
+                if (
+                    record is None
+                ):  # pragma: no cover - the walk sets exactly one of the two
                     continue
                 counts[item.segment] += 1
                 if first[item.segment] == NO_LSN:
@@ -835,9 +850,7 @@ class WalManager:
         self._require_healthy()
         batch, _body_length, rolling, terminal = self._plan_batch(records)
         if expected_terminal_lsn is not None:
-            expected = _require_lsn(
-                "expected_terminal_lsn", expected_terminal_lsn
-            )
+            expected = _require_lsn("expected_terminal_lsn", expected_terminal_lsn)
             if terminal != expected:
                 raise GrafxTransactionStateError(
                     "The WAL tail or segment-roll decision changed after the commit batch was "
@@ -859,7 +872,9 @@ class WalManager:
             lsn += 1
             header = WalRecord(
                 record_type=WalRecordType.SEGMENT_HEADER,
-                payload=SegmentHeader(number, self._last_lsn, self._clock.wall()).encode(),
+                payload=SegmentHeader(
+                    number, self._last_lsn, self._clock.wall()
+                ).encode(),
                 descriptor=self._descriptor,
                 lsn=lsn,
                 epoch=max(self._max_epoch, max(record.epoch for record in batch)),
@@ -908,7 +923,9 @@ class WalManager:
                     pass
             raise
         try:
-            self._register_append(number, name, size_before, blob, stamped, rolling, placed)
+            self._register_append(
+                number, name, size_before, blob, stamped, rolling, placed
+            )
         except BaseException as failure:
             (
                 self._segments,
@@ -938,6 +955,26 @@ class WalManager:
         batch = self._validate_batch(records)
         body_length = sum(record.encoded_length() for record in batch)
         rolling = self._needs_roll(body_length)
+        header_length = (
+            WalRecord(
+                record_type=WalRecordType.SEGMENT_HEADER,
+                payload=bytes(_SEGMENT_HEADER.size),
+                descriptor=self._descriptor,
+            ).encoded_length()
+            if rolling
+            else 0
+        )
+        size_before = 0 if rolling else self._segments[-1].size_bytes
+        projected_size = size_before + header_length + body_length
+        if projected_size > MAX_SEGMENT_READ_BYTES:
+            raise GrafxConfigurationError(
+                "The WAL batch would create a segment larger than this build can read; no "
+                "byte of the batch reached the device.",
+                field="records",
+                value=len(batch),
+                projected_segment_bytes=projected_size,
+                maximum_segment_bytes=MAX_SEGMENT_READ_BYTES,
+            )
         terminal = self._last_lsn + len(batch) + int(rolling)
         if terminal >= PROVISIONAL_CSN:
             raise GrafxConfigurationError(
@@ -954,7 +991,9 @@ class WalManager:
         Nothing here touches the device, which is what makes the epoch refusal of BR-7 exact:
         a stale writer is turned away before a single byte can reach the disk.
         """
-        if isinstance(records, (str, bytes, bytearray)) or not isinstance(records, Sequence):
+        if isinstance(records, (str, bytes, bytearray)) or not isinstance(
+            records, Sequence
+        ):
             raise GrafxConfigurationError(
                 f"A batch of log records must be a sequence; got {type(records).__name__}.",
                 field="records",
@@ -968,12 +1007,14 @@ class WalManager:
             )
         batch: list[WalRecord] = []
         for position, record in enumerate(records):
-            if not isinstance(record, WalRecord):
+            if type(record) is not WalRecord:
+                observed = _builtin_type_name(record)
                 raise GrafxConfigurationError(
-                    f"Entry {position} of the batch is a {type(record).__name__}, not a record.",
+                    f"Entry {position} of the batch is a {observed}, not an exact WalRecord.",
                     field="records",
                     value=position,
                 )
+            record = _canonical_record(record, position)
             if record.lsn != NO_LSN:
                 raise GrafxConfigurationError(
                     "The log assigns sequence numbers; entry "
@@ -996,7 +1037,9 @@ class WalManager:
                     position=position,
                 )
             batch.append(
-                record if record.descriptor else record.with_descriptor(self._descriptor)
+                record
+                if record.descriptor
+                else record.with_descriptor(self._descriptor)
             )
         return tuple(batch)
 
@@ -1085,9 +1128,13 @@ class WalManager:
                 # numbering dense; if the platform will not take it now, the number is burned so
                 # the next roll cannot land on a name that already exists.
                 self._storage.recycle(name)
-                self._next_number = max(
-                    self._next_number, parse_segment_number(self._directory, name) or 0
-                ) + 1
+                self._next_number = (
+                    max(
+                        self._next_number,
+                        parse_segment_number(self._directory, name) or 0,
+                    )
+                    + 1
+                )
         except BaseException as failure:
             # This latch is independent of the decoder's damage verdict.  A complete batch can
             # remain after recycle/truncate itself fails and decode cleanly on the next refresh;
@@ -1240,7 +1287,9 @@ class WalManager:
             if record is not None and record.lsn >= start:
                 yield record
 
-    def _read_plan(self, start: Lsn) -> tuple[tuple[str, ...], dict[str, int], dict[str, int]]:
+    def _read_plan(
+        self, start: Lsn
+    ) -> tuple[tuple[str, ...], dict[str, int], dict[str, int]]:
         """Return the segments a strict read must walk and the byte to begin each one at.
 
         Two facts make skipping safe, and both are checked here rather than assumed.
@@ -1347,7 +1396,9 @@ class WalManager:
                                 f"The log expected sequence number {expected} here and the "
                                 f"record carries {record.lsn}."
                             ),
-                            sample=data[offset - base : offset - base + MAX_FAILURE_SAMPLE_BYTES],
+                            sample=data[
+                                offset - base : offset - base + MAX_FAILURE_SAMPLE_BYTES
+                            ],
                         )
                         yield ScanItem(segment=name, offset=offset, failure=failure)
                     expected = record.lsn + 1
@@ -1366,7 +1417,9 @@ class WalManager:
                             length=len(data) - (offset - base),
                             expected_lsn=expected if expected is not None else NO_LSN,
                             detail=outcome.detail,
-                            sample=data[offset - base : offset - base + MAX_FAILURE_SAMPLE_BYTES],
+                            sample=data[
+                                offset - base : offset - base + MAX_FAILURE_SAMPLE_BYTES
+                            ],
                         ),
                     )
                     break
@@ -1383,7 +1436,9 @@ class WalManager:
                             length=outcome.consumed,
                             expected_lsn=expected if expected is not None else NO_LSN,
                             detail=outcome.detail,
-                            sample=data[offset - base : offset - base + MAX_FAILURE_SAMPLE_BYTES],
+                            sample=data[
+                                offset - base : offset - base + MAX_FAILURE_SAMPLE_BYTES
+                            ],
                         ),
                     )
                     offset += outcome.consumed
@@ -1402,7 +1457,9 @@ class WalManager:
                         length=end - (offset - base),
                         expected_lsn=expected if expected is not None else NO_LSN,
                         detail=outcome.detail,
-                        sample=data[offset - base : offset - base + MAX_FAILURE_SAMPLE_BYTES],
+                        sample=data[
+                            offset - base : offset - base + MAX_FAILURE_SAMPLE_BYTES
+                        ],
                     ),
                 )
                 if following is None:
@@ -1648,7 +1705,9 @@ class WalManager:
                 return position
         return -1
 
-    def recycle(self, horizon_lsn: Lsn, *, reader_present: bool = False) -> RecycleReport:
+    def recycle(
+        self, horizon_lsn: Lsn, *, reader_present: bool = False
+    ) -> RecycleReport:
         """Drop every segment whose records all sit below the horizon (FR-6, BR-10, AC-8, AC-9).
 
         The horizon is what :func:`okto_grafx.engine.coordination.recyclable_horizon` returns:
@@ -1836,11 +1895,19 @@ def _declared_length(data: bytes, offset: int) -> int | None:
 
 def _validate_directory(directory: object) -> str:
     """Return the log directory, refusing a name the storage port could not use."""
-    if not isinstance(directory, str) or not directory:
+    if not issubclass(type(directory), str):
+        observed = _builtin_type_name(directory)
+        raise GrafxConfigurationError(
+            f"The write-ahead log directory must be a non-empty string; got {observed}.",
+            field="directory",
+            value=observed,
+        )
+    directory = str.__str__(directory)
+    if not directory:
         raise GrafxConfigurationError(
             "The write-ahead log directory must be a non-empty string.",
             field="directory",
-            value=repr(directory),
+            value="",
         )
     if directory.endswith("/") or "\\" in directory or directory.startswith("/"):
         raise GrafxConfigurationError(
@@ -1852,17 +1919,108 @@ def _validate_directory(directory: object) -> str:
     return directory
 
 
-def _validate_segment_bytes(segment_bytes: object) -> int:
-    """Return the roll size, refusing a value too small to hold a segment header."""
-    if isinstance(segment_bytes, bool) or not isinstance(segment_bytes, int):
+def _builtin_type_name(value: object) -> str:
+    """Name a WAL argument without invoking a hostile metaclass descriptor."""
+    value_type = type(value)
+    declared = type.__dict__["__name__"].__get__(value_type, type(value_type))
+    return str.__str__(declared)
+
+
+def _canonical_record(record: WalRecord, position: int) -> WalRecord:
+    """Copy one exact record into exact built-ins before planning or virtual methods run."""
+
+    def value_of(field: str) -> object:
+        """Read one slot from the exact record without invoking subclass lookup."""
+        try:
+            return object.__getattribute__(record, field)
+        except Exception as failure:
+            cause = _builtin_type_name(failure)
+            raise GrafxConfigurationError(
+                f"Entry {position} of the WAL batch has no readable {field!r}; got {cause}.",
+                field="records",
+                value=position,
+                record_field=field,
+                cause=cause,
+            ) from failure
+
+    def integer(field: str) -> int:
+        """Copy one integer slot through the built-in implementation."""
+        value = value_of(field)
+        if type(value) is bool or not issubclass(type(value), int):
+            observed = _builtin_type_name(value)
+            raise GrafxConfigurationError(
+                f"Entry {position} of the WAL batch has a non-integer {field!r}: {observed}.",
+                field=field,
+                value=observed,
+                position=position,
+            )
+        return int.__int__(value)
+
+    raw_payload = value_of("payload")
+    if not isinstance(raw_payload, (bytes, bytearray, memoryview)):
+        observed = _builtin_type_name(raw_payload)
         raise GrafxConfigurationError(
-            f"The segment size must be an integer; got {type(segment_bytes).__name__}.",
-            field="segment_bytes",
-            value=repr(segment_bytes),
+            f"Entry {position} of the WAL batch has a non-bytes payload: {observed}.",
+            field="payload",
+            value=observed,
+            position=position,
         )
+    try:
+        payload = (
+            raw_payload
+            if type(raw_payload) is bytes
+            else memoryview(raw_payload).tobytes()
+        )
+    except GrafxError:
+        raise
+    except Exception as failure:
+        cause = _builtin_type_name(failure)
+        raise GrafxConfigurationError(
+            f"Entry {position} of the WAL batch has an unreadable payload; got {cause}.",
+            field="payload",
+            value=cause,
+            position=position,
+        ) from failure
+    raw_descriptor = value_of("descriptor")
+    if not issubclass(type(raw_descriptor), str):
+        observed = _builtin_type_name(raw_descriptor)
+        raise GrafxConfigurationError(
+            f"Entry {position} of the WAL batch has a non-string descriptor: {observed}.",
+            field="descriptor",
+            value=observed,
+            position=position,
+        )
+    return WalRecord(
+        record_type=integer("record_type"),
+        payload=payload,
+        descriptor=str.__str__(raw_descriptor),
+        lsn=integer("lsn"),
+        epoch=integer("epoch"),
+        txn_id=integer("txn_id"),
+        flags=integer("flags"),
+        format_version=integer("format_version"),
+    )
+
+
+def _validate_segment_bytes(segment_bytes: object) -> int:
+    """Return a roll size that every reader of this build can open."""
+    if type(segment_bytes) is bool or not issubclass(type(segment_bytes), int):
+        observed = _builtin_type_name(segment_bytes)
+        raise GrafxConfigurationError(
+            f"The segment size must be an integer; got {observed}.",
+            field="segment_bytes",
+            value=observed,
+        )
+    segment_bytes = int.__int__(segment_bytes)
     if segment_bytes < MIN_SEGMENT_BYTES:
         raise GrafxConfigurationError(
             f"A segment holds at least {MIN_SEGMENT_BYTES} bytes; got {segment_bytes}.",
+            field="segment_bytes",
+            value=segment_bytes,
+        )
+    if segment_bytes > MAX_SEGMENT_READ_BYTES:
+        raise GrafxConfigurationError(
+            f"A segment holds at most {MAX_SEGMENT_READ_BYTES} bytes; got {segment_bytes}.",
             field="segment_bytes",
             value=segment_bytes,
         )
@@ -1871,12 +2029,21 @@ def _validate_segment_bytes(segment_bytes: object) -> int:
 
 def _validate_descriptor(descriptor: object) -> str:
     """Return the granularity descriptor, refusing one the record header could not carry."""
-    if not isinstance(descriptor, str) or not descriptor:
+    if not issubclass(type(descriptor), str):
+        observed = _builtin_type_name(descriptor)
+        raise GrafxConfigurationError(
+            "The granularity descriptor must be a non-empty string; it is what makes a record "
+            f"readable without the configuration that produced it; got {observed}.",
+            field="descriptor",
+            value=observed,
+        )
+    descriptor = str.__str__(descriptor)
+    if not descriptor:
         raise GrafxConfigurationError(
             "The granularity descriptor must be a non-empty string; it is what makes a record "
             "readable without the configuration that produced it.",
             field="descriptor",
-            value=repr(descriptor),
+            value="",
         )
     try:
         encoded = descriptor.encode("utf-8")

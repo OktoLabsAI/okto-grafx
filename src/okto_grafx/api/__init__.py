@@ -22,7 +22,7 @@ import os
 from dataclasses import fields
 
 from okto_grafx.api.assembly import assemble_database
-from okto_grafx.domain.errors import GrafxConfigurationError
+from okto_grafx.domain.errors import GrafxConfigurationError, GrafxError
 from okto_grafx.engine.database import Database, DatabaseIdentity, Transaction
 from okto_grafx.engine.query_engine import QueryResult
 from okto_grafx.runtime.bootstrap import build_default_registry, open_database
@@ -99,12 +99,16 @@ def _as_path_string(path: str | os.PathLike[str]) -> str:
         return str.__str__(path)
     try:
         resolved = os.fspath(path)
-    except TypeError as failure:
+    except GrafxError:
+        raise
+    except Exception as failure:
         path_type = _builtin_type_name(path)
         raise GrafxConfigurationError(
-            f"A database path is a string or an os.PathLike; got {path_type}.",
+            f"A database path is a string or an os.PathLike; {path_type} could not provide "
+            f"one because {_builtin_type_name(failure)} was raised.",
             field="path",
             value=path_type,
+            cause=_builtin_type_name(failure),
         ) from failure
     if not issubclass(type(resolved), str):
         path_type = _builtin_type_name(path)

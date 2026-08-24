@@ -46,6 +46,49 @@ def test_connect_opens_an_in_memory_database_and_closes_it() -> None:
     assert db.closed is True
 
 
+class _FailingPath:
+    def __init__(self, failure: BaseException) -> None:
+        self.failure = failure
+
+    def __fspath__(self) -> str:
+        raise self.failure
+
+
+def test_a_pathlike_ordinary_failure_is_a_typed_refusal_before_open() -> None:
+    marker = RuntimeError("caller path callback")
+    with pytest.raises(GrafxConfigurationError) as raised:
+        connect(_FailingPath(marker))  # type: ignore[arg-type]
+    assert raised.value.details["field"] == "path"
+    assert raised.value.details["cause"] == "RuntimeError"
+    assert raised.value.__cause__ is marker
+
+
+def test_a_pathlike_grafx_failure_keeps_its_identity() -> None:
+    marker = GrafxConfigurationError("path owner refusal", field="external_path")
+    with pytest.raises(GrafxConfigurationError) as raised:
+        connect(_FailingPath(marker))  # type: ignore[arg-type]
+    assert raised.value is marker
+
+
+@pytest.mark.parametrize("signal", [KeyboardInterrupt(), SystemExit(91)])
+def test_a_pathlike_process_control_signal_keeps_its_identity(
+    signal: BaseException,
+) -> None:
+    with pytest.raises(type(signal)) as raised:
+        connect(_FailingPath(signal))  # type: ignore[arg-type]
+    assert raised.value is signal
+
+
+def test_an_invalid_registry_is_refused_before_a_database_root_is_created(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "must-not-exist"
+    with pytest.raises(GrafxConfigurationError) as raised:
+        connect(root, registry=object())  # type: ignore[arg-type]
+    assert raised.value.details["field"] == "registry"
+    assert not root.exists()
+
+
 def test_connect_creates_the_directory_and_the_files_a_database_needs(
     tmp_path: Path,
 ) -> None:

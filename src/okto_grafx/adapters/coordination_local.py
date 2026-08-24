@@ -41,6 +41,7 @@ import zlib
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
+from math import isfinite
 from typing import TypeVar
 
 from okto_grafx.domain.errors import (
@@ -202,6 +203,9 @@ by a wait whose clock moves, and it stops one whose clock does not in millisecon
 in minutes.
 """
 
+_MAX_WAIT_ITERATIONS: int = (1 << 63) - 1
+"""Saturation point for the frozen-clock guard of an exceptionally large finite timeout."""
+
 _MAX_IDENTIFIER_LENGTH: int = 96
 """Longest accepted identifier of any kind. It has to fit in a file name on every platform."""
 
@@ -226,7 +230,9 @@ owner identifier plus a counter, so an owner accepted at the ceiling would make
 ``register_reader`` fail forever. The two doors have to agree.
 """
 
-_MAX_CONFIGURED_OWNER_LENGTH: int = _MAX_STORED_OWNER_LENGTH - _INSTANCE_NONCE_LENGTH - 1
+_MAX_CONFIGURED_OWNER_LENGTH: int = (
+    _MAX_STORED_OWNER_LENGTH - _INSTANCE_NONCE_LENGTH - 1
+)
 """Longest owner identifier a CALLER may configure.
 
 The instance nonce and its separator are added before the identity reaches the disk, so the
@@ -405,7 +411,9 @@ def _reject(message: str, **details: object) -> GrafxConfigurationError:
     return GrafxConfigurationError(message, **details)
 
 
-def _validate_identifier(label: str, value: str, *, limit: int = _MAX_IDENTIFIER_LENGTH) -> str:
+def _validate_identifier(
+    label: str, value: str, *, limit: int = _MAX_IDENTIFIER_LENGTH
+) -> str:
     """Return the identifier when it is safe as a file name, else raise a configuration error.
 
     Identifiers become file names, and file identity must never depend on case (CONTRACT.md
@@ -414,7 +422,9 @@ def _validate_identifier(label: str, value: str, *, limit: int = _MAX_IDENTIFIER
     would put the lease outside the database it is supposed to protect.
     """
     if not isinstance(value, str) or not value:
-        raise _reject(f"The {label} must be a non-empty string.", field=label, value=repr(value))
+        raise _reject(
+            f"The {label} must be a non-empty string.", field=label, value=repr(value)
+        )
     if len(value) > limit:
         raise _reject(
             f"The {label} must be at most {limit} characters long.",
@@ -452,7 +462,9 @@ def _require_positive(label: str, value: float) -> float:
         raise _reject(f"The {label} must be a number.", field=label, value=repr(value))
     number = float(value)
     if not number > 0.0 or number != number:
-        raise _reject(f"The {label} must be greater than zero.", field=label, value=number)
+        raise _reject(
+            f"The {label} must be greater than zero.", field=label, value=number
+        )
     return number
 
 
@@ -469,7 +481,9 @@ def _require_non_negative(label: str, value: float) -> float:
 def _require_index(label: str, value: int) -> int:
     """Return the value when it is a non-negative integer, else raise."""
     if isinstance(value, bool) or not isinstance(value, int):
-        raise _reject(f"The {label} must be an integer.", field=label, value=repr(value))
+        raise _reject(
+            f"The {label} must be an integer.", field=label, value=repr(value)
+        )
     if value < 0:
         raise _reject(f"The {label} must not be negative.", field=label, value=value)
     if value > _MAX_UINT64:
@@ -573,7 +587,9 @@ def encode_reader_record(record: ReaderRecord) -> bytes:
     return _finish(header, record.reader_id)
 
 
-def _decoded_identifier(raw: bytes, start: int, length: int, file: str, limit: int) -> str:
+def _decoded_identifier(
+    raw: bytes, start: int, length: int, file: str, limit: int
+) -> str:
     """Return the ASCII identifier stored at the given offset, or report corruption.
 
     The decoder accepts exactly what the encoder can produce and nothing else: a stored
@@ -633,7 +649,9 @@ def decode_lease_record(raw: bytes, *, file: str = LEASE_FILE_NAME) -> LeaseReco
     """Decode a lease record, refusing anything that is not exactly one whole valid record."""
     if len(raw) < _LEASE_HEADER_SIZE + _CHECKSUM_SIZE:
         raise GrafxCorruptionDetected(
-            "The lease record is shorter than its own header.", file=file, length=len(raw)
+            "The lease record is shorter than its own header.",
+            file=file,
+            length=len(raw),
         )
     try:
         fields = struct.unpack_from(_LEASE_HEADER, raw, 0)
@@ -644,7 +662,9 @@ def decode_lease_record(raw: bytes, *, file: str = LEASE_FILE_NAME) -> LeaseReco
     magic, version, flags, owner_len = fields[0:4]
     epoch, sequence, ttl, wall, superseded, total = fields[4:10]
     if magic != LEASE_MAGIC:
-        raise GrafxCorruptionDetected("The lease record carries a foreign magic.", file=file)
+        raise GrafxCorruptionDetected(
+            "The lease record carries a foreign magic.", file=file
+        )
     _verify_envelope(
         raw,
         version=version,
@@ -667,11 +687,15 @@ def decode_lease_record(raw: bytes, *, file: str = LEASE_FILE_NAME) -> LeaseReco
     )
 
 
-def decode_reader_record(raw: bytes, *, file: str = READERS_DIRECTORY_NAME) -> ReaderRecord:
+def decode_reader_record(
+    raw: bytes, *, file: str = READERS_DIRECTORY_NAME
+) -> ReaderRecord:
     """Decode a reader registration, refusing anything that is not one whole valid record."""
     if len(raw) < _READER_HEADER_SIZE + _CHECKSUM_SIZE:
         raise GrafxCorruptionDetected(
-            "The reader record is shorter than its own header.", file=file, length=len(raw)
+            "The reader record is shorter than its own header.",
+            file=file,
+            length=len(raw),
         )
     try:
         fields = struct.unpack_from(_READER_HEADER, raw, 0)
@@ -679,9 +703,13 @@ def decode_reader_record(raw: bytes, *, file: str = READERS_DIRECTORY_NAME) -> R
         raise GrafxCorruptionDetected(
             "The reader record header is unreadable.", file=file
         ) from failure
-    magic, version, flags, reader_len, snapshot, sequence, wall, total, _reserved = fields
+    magic, version, flags, reader_len, snapshot, sequence, wall, total, _reserved = (
+        fields
+    )
     if magic != READER_MAGIC:
-        raise GrafxCorruptionDetected("The reader record carries a foreign magic.", file=file)
+        raise GrafxCorruptionDetected(
+            "The reader record carries a foreign magic.", file=file
+        )
     _verify_envelope(
         raw,
         version=version,
@@ -761,9 +789,13 @@ class LocalProcessCoordinator:
             # cannot know which metrics a component intends to emit.
             for name in EMITTED_METRICS:
                 metrics.register(metric(name))
-        self._sleeper: Callable[[float], None] = time.sleep if sleeper is None else sleeper
+        self._sleeper: Callable[[float], None] = (
+            time.sleep if sleeper is None else sleeper
+        )
         configured = (
-            _validate_identifier("owner_id", owner_id, limit=_MAX_CONFIGURED_OWNER_LENGTH)
+            _validate_identifier(
+                "owner_id", owner_id, limit=_MAX_CONFIGURED_OWNER_LENGTH
+            )
             if owner_id is not None
             else f"p{os.getpid():d}-{uuid.uuid4().hex[:12]}"
         )
@@ -781,11 +813,15 @@ class LocalProcessCoordinator:
         self._lease_file: str = f"{control}/{LEASE_FILE_NAME}"
         self._readers_prefix: str = f"{control}/{READERS_DIRECTORY_NAME}/"
         self._ttl: float = _require_positive("ttl_seconds", ttl_seconds)
-        self._owner_stall: float = _require_positive("owner_stall_threshold", owner_stall_threshold)
+        self._owner_stall: float = _require_positive(
+            "owner_stall_threshold", owner_stall_threshold
+        )
         self._reader_stall: float = _require_positive(
             "reader_stall_threshold", reader_stall_threshold
         )
-        self._section_timeout: float = _require_non_negative("section_timeout", section_timeout)
+        self._section_timeout: float = _require_non_negative(
+            "section_timeout", section_timeout
+        )
         self._poll: float = _require_positive("poll_interval", poll_interval)
         self._lock_directory: str | None = self._prepare_lock_directory(lock_directory)
         self._namespace: object = storage if namespace is None else namespace
@@ -905,11 +941,15 @@ class LocalProcessCoordinator:
                 self._observe_wait("granted", now - started)
                 return existing
             vacant = record is None or not record.held
-            stalled = not vacant and self._owner_stalled(now, self._owner_stall) is not None
+            stalled = (
+                not vacant and self._owner_stalled(now, self._owner_stall) is not None
+            )
             if vacant or stalled:
                 claimed = self._try_claim(record, budget=max(deadline - now, 0.0))
                 if claimed is not None:
-                    self._observe_wait("takeover" if stalled else "granted", claimed[1] - started)
+                    self._observe_wait(
+                        "takeover" if stalled else "granted", claimed[1] - started
+                    )
                     return claimed[0]
             now = self._clock.monotonic()
             if now >= deadline or iterations >= allowance:
@@ -1089,7 +1129,11 @@ class LocalProcessCoordinator:
         if not self._basis_seen:
             self._observe_lease(self._read_lease_record(), now)
         basis = self._basis
-        if basis is not None and basis.held and self._owner_stalled(now, self._owner_stall) is None:
+        if (
+            basis is not None
+            and basis.held
+            and self._owner_stalled(now, self._owner_stall) is None
+        ):
             raise GrafxLeaseTimeout(
                 "The lease owner has not been observed to stall, so there is nothing to take over.",
                 owner_id=self._owner,
@@ -1232,7 +1276,9 @@ class LocalProcessCoordinator:
                 horizon = record.snapshot_lsn
         self._sweep_reader_temporaries(strays, now)
         with self._state_lock:
-            for reader_id in [key for key in self._reader_samples if key not in observed]:
+            for reader_id in [
+                key for key in self._reader_samples if key not in observed
+            ]:
                 if reader_id not in self._readers:
                     self._reader_samples.pop(reader_id, None)
         return horizon
@@ -1249,7 +1295,9 @@ class LocalProcessCoordinator:
         """
         if not isinstance(name, str):
             raise _reject("The section name must be a string.", value=repr(name))
-        return self._section(_validate_identifier("section name", name.lower()), timeout)
+        return self._section(
+            _validate_identifier("section name", name.lower()), timeout
+        )
 
     @contextmanager
     def _section(self, name: str, timeout: float) -> Iterator[None]:
@@ -1305,14 +1353,18 @@ class LocalProcessCoordinator:
         self._installed_epochs.add(lease.epoch)
         return lease
 
-    def _try_claim(self, basis: LeaseRecord | None, *, budget: float) -> tuple[Lease, float] | None:
+    def _try_claim(
+        self, basis: LeaseRecord | None, *, budget: float
+    ) -> tuple[Lease, float] | None:
         """Attempt the compare-and-set that installs this participant, returning None when it lost.
 
         The section attempt is bounded by what is left of the budget the caller gave to the
         acquisition, so waiting for the section can never outlast the timeout that was asked for.
         """
         try:
-            with self.exclusive(LEASE_SECTION, timeout=min(self._section_timeout, budget)):
+            with self.exclusive(
+                LEASE_SECTION, timeout=min(self._section_timeout, budget)
+            ):
                 moment = self._clock.monotonic()
                 current = self._read_lease_record()
                 if not _same_record(current, basis):
@@ -1333,7 +1385,9 @@ class LocalProcessCoordinator:
             stall = now - self._owner_key_at
         return stall if stall > threshold else None
 
-    def _observe_lease(self, record: LeaseRecord | None, now: float) -> LeaseRecord | None:
+    def _observe_lease(
+        self, record: LeaseRecord | None, now: float
+    ) -> LeaseRecord | None:
         """Record one observation of the lease file and return the record that was observed."""
         # No held term here: every caller establishes that the lease is held before it asks
         # about a stall, and the 2x2 shows either check alone holds the property. Keeping
@@ -1559,7 +1613,9 @@ class LocalProcessCoordinator:
                 self._publish_once(target, payload)
                 return
             except GrafxError as failure:
-                if attempts >= _PUBLISH_ATTEMPTS or not _worth_publishing_again(failure):
+                if attempts >= _PUBLISH_ATTEMPTS or not _worth_publishing_again(
+                    failure
+                ):
                     # The class the device chose is part of the answer and is kept: A25 counts
                     # exactly GrafxDurabilityBarrierFailed into the barrier metric, and a device
                     # that is full has to reach the caller as a device that is full.
@@ -1569,7 +1625,9 @@ class LocalProcessCoordinator:
                 self._sleep(backoff)
                 backoff = min(backoff * 2.0, _MAX_PUBLISH_BACKOFF)
             except OSError as failure:
-                if attempts >= _PUBLISH_ATTEMPTS or not _worth_publishing_again(failure):
+                if attempts >= _PUBLISH_ATTEMPTS or not _worth_publishing_again(
+                    failure
+                ):
                     raise _storage_failure(
                         "The control record could not be published.",
                         failure,
@@ -1681,7 +1739,9 @@ class LocalProcessCoordinator:
     def _take_file_lock(self, name: str, timeout: float) -> object:
         """Take the operating-system advisory lock that backs a section between processes."""
         directory = self._lock_directory
-        path = os.path.join("" if directory is None else directory, f"{name}{LOCK_FILE_SUFFIX}")
+        path = os.path.join(
+            "" if directory is None else directory, f"{name}{LOCK_FILE_SUFFIX}"
+        )
         deadline = self._clock.monotonic() + timeout
         handle = self._open_lock_file(path, name, deadline)
         try:
@@ -1696,7 +1756,9 @@ class LocalProcessCoordinator:
             raise
         return handle
 
-    def _wait_for_os_lock(self, handle: int, name: str, timeout: float, deadline: float) -> None:
+    def _wait_for_os_lock(
+        self, handle: int, name: str, timeout: float, deadline: float
+    ) -> None:
         """Take the advisory lock on an open handle, waiting on the injected clock until expiry.
 
         Only contention is a busy section. A mount without advisory locking answers ENOLCK for
@@ -1780,7 +1842,13 @@ class LocalProcessCoordinator:
 
     def _iteration_budget(self, timeout: float) -> int:
         """Return how many polls a wait of this length may spend before it gives up."""
-        return _WAIT_ITERATION_FLOOR + int(_WAIT_ITERATION_MARGIN * timeout / self._poll)
+        expected = timeout / self._poll
+        largest_expected = (
+            _MAX_WAIT_ITERATIONS - _WAIT_ITERATION_FLOOR
+        ) / _WAIT_ITERATION_MARGIN
+        if not isfinite(expected) or expected >= largest_expected:
+            return _MAX_WAIT_ITERATIONS
+        return _WAIT_ITERATION_FLOOR + int(_WAIT_ITERATION_MARGIN * expected)
 
     def _sleep(self, seconds: float) -> None:
         """Wait for the given interval through the injected sleeper, never below zero."""

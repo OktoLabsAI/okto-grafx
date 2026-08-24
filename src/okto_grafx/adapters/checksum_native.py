@@ -35,11 +35,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from importlib import import_module
 
-from okto_grafx.domain.errors import GrafxConfigurationError
+from okto_grafx.domain.errors import GrafxConfigurationError, GrafxError
 from okto_grafx.domain.page.checksum import (
     CRC32C_ACCEPTANCE_CORPUS,
     CRC32C_INITIAL,
     CRC32C_KNOWN_ANSWERS,
+    _install_validated_crc32c,
+    _require_crc32c_agreement,
+    _require_crc32c_answer,
     crc32c_reference,
     install_crc32c,
 )
@@ -67,7 +70,16 @@ somewhere to be clever about provenance.
 """
 
 
-def _adapt(module_name: str, attribute: str, provider: object) -> Callable[[bytes, int], int]:
+def _builtin_type_name(value: object) -> str:
+    """Name a provider value without executing a metaclass descriptor."""
+    value_type = type(value)
+    declared = type.__dict__["__name__"].__get__(value_type, type(value_type))
+    return str.__str__(declared)
+
+
+def _adapt(
+    module_name: str, attribute: str, provider: object
+) -> Callable[[bytes, int], int]:
     """Return the provider as ``(data, crc) -> int``, whatever argument order it was written in.
 
     The adaptation is per provider and explicit. Guessing the order from a trial call would
@@ -80,8 +92,8 @@ def _adapt(module_name: str, attribute: str, provider: object) -> Callable[[byte
             f"{module_name}.{attribute} is not callable, so it cannot compute a checksum."
         )
     if module_name == "google_crc32c":
-        return lambda data, crc=CRC32C_INITIAL: int(provider(crc, data))
-    return lambda data, crc=CRC32C_INITIAL: int(provider(data, crc))
+        return lambda data, crc=CRC32C_INITIAL: provider(crc, data)
+    return lambda data, crc=CRC32C_INITIAL: provider(data, crc)
 
 
 def load_provider() -> tuple[str, Callable[[bytes, int], int]]:
@@ -109,13 +121,14 @@ def load_provider() -> tuple[str, Callable[[bytes, int], int]]:
 class NativeCrc32c:
     """A native CRC-32C, proved byte-identical to the pure reference before it is usable."""
 
-    __slots__ = ("_provider", "_provider_name")
+    __slots__ = ("_provider", "_provider_name", "_verify_runtime")
 
     def __init__(
         self,
         provider: Callable[[bytes, int], int] | None = None,
         *,
         provider_name: str | None = None,
+        verify_runtime: bool | None = None,
     ) -> None:
         """Adopt a provider, or find one, and refuse it unless it reproduces the reference.
 
@@ -125,6 +138,12 @@ class NativeCrc32c:
         already has. The default path takes it from :func:`load_provider`, so production
         behaviour with no argument is exactly what it would be without the parameter (A81).
 
+        ``verify_runtime=None`` chooses the safe useful default: closed-list packages are
+        corpus-validated and run fast, while an injected callable is checked against the oracle
+        on every call. An explicit bool always wins. A host can set ``False`` for a vendored
+        extension it trusts in-process, or ``True`` to put even a closed-list package behind the
+        per-call oracle; the latter trades away acceleration deliberately.
+
         The check runs HERE as well as inside :func:`install_crc32c`, and that is not redundant
         defence: this one makes a wrong provider fail where it is CONSTRUCTED, naming the
         provider, while the installer's protects the domain from any candidate at all, including
@@ -132,19 +151,83 @@ class NativeCrc32c:
         the case A67 asks about -- and for a value that silently converts healthy pages into
         quarantined ones, that is the side to err on (LESSONS L17).
         """
+        if verify_runtime is not None and type(verify_runtime) is not bool:
+            raise GrafxConfigurationError(
+                "verify_runtime must be a bool or None.",
+                field="verify_runtime",
+                value=_builtin_type_name(verify_runtime),
+            )
+        verify_answers = (
+            provider is not None if verify_runtime is None else verify_runtime
+        )
         if provider is None:
             resolved_name, resolved = load_provider()
         else:
             if not callable(provider):
+                observed = _builtin_type_name(provider)
                 raise GrafxConfigurationError(
-                    f"A CRC-32C provider must be callable; got {type(provider).__name__}.",
+                    f"A CRC-32C provider must be callable; got {observed}.",
                     field="provider",
-                    value=type(provider).__name__,
+                    value=observed,
                 )
-            resolved_name, resolved = provider_name or "supplied", provider
+            if provider_name is None:
+                resolved_name = "supplied"
+            elif not issubclass(type(provider_name), str):
+                raise GrafxConfigurationError(
+                    "A CRC-32C provider name must be a string.",
+                    field="provider_name",
+                    value=_builtin_type_name(provider_name),
+                )
+            else:
+                resolved_name = str.__str__(provider_name)
+                if not resolved_name:
+                    raise GrafxConfigurationError(
+                        "A CRC-32C provider name must not be empty.",
+                        field="provider_name",
+                        value="",
+                    )
+            resolved = provider
         self._provider: Callable[[bytes, int], int] = resolved
         self._provider_name: str = resolved_name
+        self._verify_runtime: bool = verify_answers
         self._require_agreement()
+
+    def _raw_answer(self, data: bytes, crc: int) -> int:
+        """Call the provider and return an exact bounded checksum or a typed refusal."""
+        try:
+            observed = self._provider(data, crc)
+        except GrafxError:
+            raise
+        except Exception as failure:
+            cause = _builtin_type_name(failure)
+            raise GrafxConfigurationError(
+                f"The native CRC-32C provider {self._provider_name!r} raised {cause}.",
+                field="provider",
+                value=self._provider_name,
+                cause=cause,
+                length=len(data),
+                seed=crc,
+            ) from failure
+        return _require_crc32c_answer(
+            observed,
+            field="provider",
+            name=self._provider_name,
+            length=len(data),
+            seed=crc,
+        )
+
+    def _answer(self, data: bytes, crc: int) -> int:
+        """Return the provider answer only after the reference verifies these exact bytes."""
+        produced = self._raw_answer(data, crc)
+        if not self._verify_runtime:
+            return produced
+        return _require_crc32c_agreement(
+            produced,
+            data,
+            crc,
+            name=self._provider_name,
+            field="provider",
+        )
 
     def _require_agreement(self) -> None:
         """Refuse a provider that is not computing Castagnoli CRC-32C, before anything uses it.
@@ -161,7 +244,7 @@ class NativeCrc32c:
         uses are the inputs every implementation already gets right.
         """
         for payload, answer in CRC32C_KNOWN_ANSWERS:
-            produced = self._provider(payload, CRC32C_INITIAL)
+            produced = self._raw_answer(payload, CRC32C_INITIAL)
             if produced != answer:
                 raise GrafxConfigurationError(
                     f"The native CRC-32C provider {self._provider_name!r} answered "
@@ -176,7 +259,7 @@ class NativeCrc32c:
                 )
         for payload, seed in CRC32C_ACCEPTANCE_CORPUS:
             expected = crc32c_reference(payload, seed)
-            produced = self._provider(payload, seed)
+            produced = self._raw_answer(payload, seed)
             if produced != expected:
                 raise GrafxConfigurationError(
                     f"The native CRC-32C provider {self._provider_name!r} answered "
@@ -202,7 +285,7 @@ class NativeCrc32c:
 
     def checksum(self, data: bytes, crc: int = CRC32C_INITIAL) -> int:
         """Return the CRC-32C of the data, continuing a previous result when one is given."""
-        return self._provider(data, crc)
+        return self._answer(data, crc)
 
     def install(self) -> str:
         """Make this the implementation :func:`crc32c` calls, and say which one it replaced.
@@ -211,6 +294,8 @@ class NativeCrc32c:
         happens before any real page is checksummed by this provider, and a provider that fails
         it anywhere is not installed at all.
         """
+        if not self._verify_runtime:
+            return _install_validated_crc32c(self._provider, name=NATIVE_ADAPTER_NAME)
         return install_crc32c(self._provider, name=NATIVE_ADAPTER_NAME)
 
     def __repr__(self) -> str:

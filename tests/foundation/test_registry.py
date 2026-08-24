@@ -6,7 +6,11 @@ import pytest
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxPortNotConfigured
 from okto_grafx.domain.ports import Clock, StorageDevice
-from okto_grafx.runtime.registry import PortRegistry, _protocol_members
+from okto_grafx.runtime.registry import (
+    PortRegistry,
+    _protocol_members,
+    _snapshot_port_registry,
+)
 
 
 class TinyClock:
@@ -31,7 +35,9 @@ def test_required_slots_match_the_contract() -> None:
     )
 
 
-def test_every_slot_that_can_be_bound_is_a_required_slot(fake_ports: dict[str, object]) -> None:
+def test_every_slot_that_can_be_bound_is_a_required_slot(
+    fake_ports: dict[str, object],
+) -> None:
     # The slot table and the required list cannot drift apart: a slot nobody requires would be
     # a port that startup never checks.
     assert set(fake_ports) == set(PortRegistry.REQUIRED)
@@ -49,7 +55,7 @@ def test_a_fresh_registry_is_empty_and_refuses_to_pass() -> None:
 
 
 def test_require_complete_lists_every_missing_slot_in_one_error(
-    fake_ports: dict[str, object]
+    fake_ports: dict[str, object],
 ) -> None:
     registry = PortRegistry()
     registry.bind("storage", fake_ports["storage"])
@@ -95,7 +101,7 @@ def test_get_on_an_unknown_slot_is_a_configuration_error() -> None:
 
 
 def test_bind_on_an_unknown_slot_is_a_configuration_error(
-    fake_ports: dict[str, object]
+    fake_ports: dict[str, object],
 ) -> None:
     registry = PortRegistry()
     with pytest.raises(GrafxConfigurationError) as raised:
@@ -106,11 +112,41 @@ def test_bind_on_an_unknown_slot_is_a_configuration_error(
 
 
 def test_bind_on_an_unhashable_slot_name_is_a_configuration_error(
-    fake_ports: dict[str, object]
+    fake_ports: dict[str, object],
 ) -> None:
     registry = PortRegistry()
     with pytest.raises(GrafxConfigurationError):
         registry.bind(["storage"], fake_ports["storage"])  # type: ignore[arg-type]
+
+
+def test_a_string_subclass_cannot_run_hashing_at_the_slot_boundary() -> None:
+    class HostileSlot(str):
+        def __hash__(self) -> int:
+            raise RuntimeError("caller hash ran")
+
+    clock = TinyClock()
+    registry = PortRegistry()
+    registry.bind(HostileSlot("clock"), clock)
+    assert registry.get(HostileSlot("clock")) is clock
+
+
+def test_a_hostile_class_name_cannot_escape_the_class_refusal() -> None:
+    class HostileMeta(type):
+        @property
+        def __name__(cls) -> str:
+            raise RuntimeError("caller class name ran")
+
+    class HostileClock(metaclass=HostileMeta):
+        def monotonic(self) -> float:
+            return 0.0
+
+        def wall(self) -> float:
+            return 0.0
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        PortRegistry().bind("clock", HostileClock)
+    assert raised.value.details["slot"] == "clock"
+    assert raised.value.__cause__ is None
 
 
 def test_binding_a_wrong_shape_names_the_slot_and_the_missing_members() -> None:
@@ -160,7 +196,7 @@ def test_a_rejected_bind_leaves_the_slot_empty() -> None:
 
 
 def test_binding_the_right_shape_to_the_wrong_slot_is_rejected(
-    fake_ports: dict[str, object]
+    fake_ports: dict[str, object],
 ) -> None:
     registry = PortRegistry()
     with pytest.raises(GrafxConfigurationError) as raised:
@@ -184,6 +220,29 @@ def test_registries_do_not_share_state() -> None:
     first.bind("clock", TinyClock())
     with pytest.raises(GrafxPortNotConfigured):
         second.get("clock")
+
+
+def test_a_registry_snapshot_cannot_mix_bindings_from_a_concurrent_mutation(
+    complete_registry: PortRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = complete_registry
+    original_clock = source.get("clock")
+    replacement_clock = TinyClock()
+    original_bind = PortRegistry.bind
+
+    def mutate_after_first_copy(
+        self: PortRegistry, slot: str, instance: object
+    ) -> None:
+        if self is not source and slot == "storage":
+            source._bindings["clock"] = replacement_clock
+        original_bind(self, slot, instance)
+
+    monkeypatch.setattr(PortRegistry, "bind", mutate_after_first_copy)
+    snapshot = _snapshot_port_registry(source)
+
+    assert source.get("clock") is replacement_clock
+    assert snapshot.get("clock") is original_clock
 
 
 def test_protocol_members_reads_the_declared_protocol_attributes() -> None:

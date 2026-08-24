@@ -13,7 +13,11 @@ from inspect import getattr_static
 from types import MappingProxyType
 from typing import ClassVar
 
-from okto_grafx.domain.errors import GrafxConfigurationError, GrafxPortNotConfigured
+from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
+    GrafxError,
+    GrafxPortNotConfigured,
+)
 from okto_grafx.domain.ports import (
     Clock,
     EventSink,
@@ -81,7 +85,9 @@ def _declared_as_method(protocol: type, name: str) -> bool:
             continue
         if isinstance(declaration, property):
             return False
-        return callable(declaration) or isinstance(declaration, (staticmethod, classmethod))
+        return callable(declaration) or isinstance(
+            declaration, (staticmethod, classmethod)
+        )
     return False
 
 
@@ -115,7 +121,9 @@ def _member_defects(protocol: type, instance: object) -> dict[str, str]:
             defects[name] = "bound to None"
             continue
         if _declared_as_method(protocol, name) and not _is_usable_method(value):
-            defects[name] = f"declared as a method but bound to {type(value).__name__}"
+            defects[name] = (
+                f"declared as a method but bound to {_builtin_type_name(value)}"
+            )
     return defects
 
 
@@ -156,50 +164,88 @@ class PortRegistry:
         A later bind on the same slot replaces the previous one, so a caller can override a
         default adapter it does not want.
         """
+        slot = _require_slot(slot)
         protocol = self._protocol_for(slot)
         if isinstance(instance, type):
+            observed = _builtin_class_name(instance)
             raise GrafxConfigurationError(
                 f"Port slot {slot!r} takes an instance, not the class itself; "
-                f"pass {instance.__name__}(...) rather than {instance.__name__}.",
+                f"instantiate {observed!r} before binding it.",
                 slot=slot,
                 protocol=protocol.__name__,
             )
         try:
             defects = _member_defects(protocol, instance)
-        except Exception as failure:  # an exotic object must never escape as a foreign error
+        except (
+            Exception
+        ) as failure:  # an exotic object must never escape as a foreign error
+            cause = _builtin_type_name(failure)
             raise GrafxConfigurationError(
                 f"Port slot {slot!r} could not be inspected against {protocol.__name__}: "
-                f"{type(failure).__name__}.",
+                f"{cause}.",
                 slot=slot,
                 protocol=protocol.__name__,
+                cause=cause,
             ) from failure
         if defects:
             detail = ", ".join(f"{name} ({reason})" for name, reason in defects.items())
+            observed = _builtin_type_name(instance)
             raise GrafxConfigurationError(
                 f"Port slot {slot!r} needs an implementation of {protocol.__name__}; "
-                f"{type(instance).__name__} does not provide: {detail}.",
+                f"{observed} does not provide: {detail}.",
                 slot=slot,
                 protocol=protocol.__name__,
                 missing=list(defects),
                 reasons=dict(defects),
             )
-        self._bindings[slot] = instance
+        bindings = _bindings_of(self)
+        try:
+            dict.__setitem__(bindings, slot, instance)
+        except Exception as failure:
+            cause = _builtin_type_name(failure)
+            raise GrafxConfigurationError(
+                f"Registry slot {slot!r} could not be stored safely; got {cause}.",
+                field="registry",
+                slot=slot,
+                cause=cause,
+            ) from failure
 
     def get(self, slot: str) -> object:
         """Return the adapter bound to the slot, raising GrafxPortNotConfigured when it is empty."""
+        slot = _require_slot(slot)
         self._protocol_for(slot)
+        bindings = _bindings_of(self)
         try:
-            return self._bindings[slot]
+            return dict.__getitem__(bindings, slot)
         except KeyError:
             raise GrafxPortNotConfigured(
                 f"Port slot {slot!r} is not configured. Bind an implementation of "
                 f"{_SLOT_PROTOCOLS[slot].__name__} before opening a database.",
                 missing=[slot],
             ) from None
+        except Exception as failure:
+            cause = _builtin_type_name(failure)
+            raise GrafxConfigurationError(
+                f"Registry slot {slot!r} could not be read safely; got {cause}.",
+                field="registry",
+                slot=slot,
+                cause=cause,
+            ) from failure
 
     def require_complete(self) -> None:
         """Raise GrafxPortNotConfigured listing every empty slot, or return when all are bound."""
-        missing = tuple(slot for slot in self.REQUIRED if slot not in self._bindings)
+        bindings = _bindings_of(self)
+        try:
+            missing = tuple(
+                slot for slot in self.REQUIRED if not dict.__contains__(bindings, slot)
+            )
+        except Exception as failure:
+            cause = _builtin_type_name(failure)
+            raise GrafxConfigurationError(
+                f"Registry completeness could not be checked safely; got {cause}.",
+                field="registry",
+                cause=cause,
+            ) from failure
         if not missing:
             return
         raise GrafxPortNotConfigured(
@@ -211,10 +257,108 @@ class PortRegistry:
 
     def _protocol_for(self, slot: str) -> type:
         """Return the protocol that owns the slot, rejecting an unknown slot name."""
+        slot = _require_slot(slot)
         try:
             return _SLOT_PROTOCOLS[slot]
-        except (KeyError, TypeError):
+        except KeyError:
             raise GrafxConfigurationError(
                 f"Unknown port slot {slot!r}. Known slots: {', '.join(self.REQUIRED)}.",
                 slot=slot,
             ) from None
+
+
+def _builtin_type_name(value: object) -> str:
+    """Name a registry value without executing a hostile metaclass descriptor."""
+    value_type = type(value)
+    declared = type.__dict__["__name__"].__get__(value_type, type(value_type))
+    return str.__str__(declared)
+
+
+def _builtin_class_name(value: type) -> str:
+    """Name a class without consulting descriptors supplied by its metaclass."""
+    declared = type.__dict__["__name__"].__get__(value, type(value))
+    return str.__str__(declared)
+
+
+def _require_slot(value: object) -> str:
+    """Return an exact slot name without executing string-subclass hooks."""
+    if not issubclass(type(value), str):
+        observed = _builtin_type_name(value)
+        raise GrafxConfigurationError(
+            f"A port slot must be a string; got {observed}.",
+            field="slot",
+            value=observed,
+        )
+    return str.__str__(value)
+
+
+def _bindings_of(value: PortRegistry) -> dict[str, object]:
+    """Return the exact internal map or classify forged registry state."""
+    try:
+        bindings = object.__getattribute__(value, "_bindings")
+    except Exception as failure:
+        cause = _builtin_type_name(failure)
+        raise GrafxConfigurationError(
+            f"registry has no validated binding map; got {cause}.",
+            field="registry",
+            cause=cause,
+        ) from failure
+    if type(bindings) is not dict:
+        observed = _builtin_type_name(bindings)
+        raise GrafxConfigurationError(
+            f"registry has an invalid binding map of type {observed}.",
+            field="registry",
+            value=observed,
+        )
+    return bindings
+
+
+def _snapshot_port_registry(value: object) -> PortRegistry:
+    """Return a validated registry snapshot, refusing forged internal state before open.
+
+    An exact instance may still have been made with ``object.__new__`` or altered through
+    ``object.__setattr__``. Copying only the declared slots into a fresh registry re-runs every
+    static port-shape check and prevents concurrent caller mutation from changing an in-flight
+    assembly.
+    """
+    if type(value) is not PortRegistry:
+        observed = _builtin_type_name(value)
+        raise GrafxConfigurationError(
+            f"registry must be an exact PortRegistry; got {observed}.",
+            field="registry",
+            value=observed,
+        )
+    bindings = dict.copy(_bindings_of(value))
+    snapshot = PortRegistry()
+    for slot in PortRegistry.REQUIRED:
+        try:
+            instance = dict.__getitem__(bindings, slot)
+        except KeyError:
+            continue
+        except Exception as failure:
+            cause = _builtin_type_name(failure)
+            raise GrafxConfigurationError(
+                f"registry bindings could not be read safely; got {cause}.",
+                field="registry",
+                cause=cause,
+            ) from failure
+        try:
+            snapshot.bind(slot, instance)
+        except GrafxConfigurationError as failure:
+            raise GrafxConfigurationError(
+                f"registry binding {slot!r} does not satisfy its port contract.",
+                field="registry",
+                slot=slot,
+            ) from failure
+        except GrafxError:
+            raise
+        except Exception as failure:
+            cause = _builtin_type_name(failure)
+            raise GrafxConfigurationError(
+                f"registry binding {slot!r} could not be validated safely; got {cause}.",
+                field="registry",
+                slot=slot,
+                cause=cause,
+            ) from failure
+    snapshot.require_complete()
+    return snapshot

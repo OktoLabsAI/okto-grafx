@@ -46,8 +46,9 @@ from okto_grafx.runtime.config import (
     DEFAULT_OPENMETRICS_DESTINATION,
     MEMORY_PATH,
     DatabaseConfig,
+    _canonical_database_config,
 )
-from okto_grafx.runtime.registry import PortRegistry
+from okto_grafx.runtime.registry import PortRegistry, _snapshot_port_registry
 
 if TYPE_CHECKING:
     from okto_grafx.engine.database import Database
@@ -223,21 +224,24 @@ def install_checksum(config: DatabaseConfig) -> str:
     databases in one process disagree about what a byte range hashes to.
 
     Installing is safe in a way that binding a vector math adapter is not, and that is why
-    ``"auto"`` accelerates here and does not there. ``install_crc32c`` replays the acceptance
-    corpus against :func:`crc32c_reference` and refuses a candidate that disagrees on any input,
-    so a provider either produces byte-identical digests or never becomes the implementation. The
-    file format cannot depend on which machine wrote it.
+    ``"auto"`` accelerates here and does not there. The native path is a closed provider list,
+    replays the acceptance corpus through :func:`crc32c_reference`, and contains every runtime
+    result as an exact u32. Arbitrary injected callables take the stricter per-call oracle path;
+    the closed-list trust boundary is what lets the shipped native selector remain fast.
 
     ``"native"`` refuses when no provider is installed rather than falling back, for the reason
     every selector in this module refuses: a caller who asked for the accelerator and silently
     got the reference would measure the wrong thing and report it as the product's speed.
     """
+    config = _require_database_config(config)
     selector = config.checksum
     if selector == "pure":
         return _install(PureCrc32c())
     try:
         from okto_grafx.adapters.checksum_native import NativeCrc32c
-    except ImportError as failure:  # pragma: no cover - the module is part of this package
+    except (
+        ImportError
+    ) as failure:  # pragma: no cover - the module is part of this package
         if selector == "native":
             raise GrafxConfigurationError(
                 "The native checksum adapter could not be imported.",
@@ -247,7 +251,7 @@ def install_checksum(config: DatabaseConfig) -> str:
         return _install(PureCrc32c())
     try:
         return _install(NativeCrc32c())
-    except (ImportError, GrafxConfigurationError) as failure:
+    except ImportError as failure:
         if selector == "native":
             raise GrafxConfigurationError(
                 "The native CRC-32C adapter needs a provider from the optional 'accel' extra; "
@@ -256,6 +260,25 @@ def install_checksum(config: DatabaseConfig) -> str:
                 value=selector,
             ) from failure
         # "auto" asked for the fastest correct answer, and the reference is a correct answer.
+        return _install(PureCrc32c())
+    except GrafxConfigurationError:
+        if selector == "native":
+            raise
+        # An installed but invalid optional provider is no reason to abandon the safe reference.
+        return _install(PureCrc32c())
+    except GrafxError:
+        # A provider that already classified its own failure keeps that exact public answer.
+        raise
+    except Exception as failure:
+        cause = _builtin_type_name(failure)
+        if selector == "native":
+            raise GrafxConfigurationError(
+                f"The native CRC-32C provider failed with {cause} during validation.",
+                field="checksum",
+                value=selector,
+                cause=cause,
+            ) from failure
+        # A broken optional provider cannot make the safe, always-available reference unusable.
         return _install(PureCrc32c())
 
 
@@ -404,6 +427,7 @@ def build_default_registry(config: DatabaseConfig) -> PortRegistry:
     holding descriptors -- and on Windows a held descriptor is exactly what stops the next
     attempt from publishing over the same names.
     """
+    config = _require_database_config(config)
     install_checksum(config)
     registry = PortRegistry()
     built: dict[str, object] = {}
@@ -412,7 +436,11 @@ def build_default_registry(config: DatabaseConfig) -> PortRegistry:
             factory = _DEFAULT_PORT_FACTORIES.get(slot)
             if factory is None:
                 continue
-            if slot == "coordinator" and config.read_only and config.path != MEMORY_PATH:
+            if (
+                slot == "coordinator"
+                and config.read_only
+                and config.path != MEMORY_PATH
+            ):
                 # The coordinator constructor creates ``control/`` for its advisory locks. A
                 # default observational open must first prove that the path carries Grafx-owned
                 # evidence; otherwise even the expected "there is no database" refusal would
@@ -447,12 +475,13 @@ def build_default_registry(config: DatabaseConfig) -> PortRegistry:
         # did not -- one invariant kept in two places with only one of them holding it
         # (A66).
         _release_ports(registry, observational_storage=config.read_only)
+        cause = _builtin_type_name(failure)
         raise GrafxConfigurationError(
             f"A port could not be built for the database at {config.path!r}: an adapter "
-            f"raised {type(failure).__name__}: {failure}",
+            f"raised {cause}.",
             field="ports",
             path=config.path,
-            cause=type(failure).__name__,
+            cause=cause,
         ) from failure
     except BaseException:
         # KeyboardInterrupt and SystemExit are not failures of this build and are never
@@ -462,7 +491,9 @@ def build_default_registry(config: DatabaseConfig) -> PortRegistry:
     return registry
 
 
-def open_database(config: DatabaseConfig, *, registry: PortRegistry | None = None) -> Database:
+def open_database(
+    config: DatabaseConfig, *, registry: PortRegistry | None = None
+) -> Database:
     """Open a database against the given configuration.
 
     With no registry the default adapters are built for the configuration; with a registry the
@@ -477,10 +508,34 @@ def open_database(config: DatabaseConfig, *, registry: PortRegistry | None = Non
     own guard, which is the only one that also knows about the resources no port slot holds. A
     second release here would make neither observable on its own (A67).
     """
+    config = _require_database_config(config)
     owns_ports = registry is None
-    ports: PortRegistry = build_default_registry(config) if registry is None else registry
+    if registry is None:
+        ports = build_default_registry(config)
+    else:
+        ports = _require_port_registry(registry)
+        # CRC-32C is deliberately process-global rather than a port. A custom port registry
+        # replaces the seven adapters, not this explicit configuration choice.
+        install_checksum(config)
     ports.require_complete()
     return _assemble_database(config, ports, owns_ports=owns_ports)
+
+
+def _builtin_type_name(value: object) -> str:
+    """Name a caller value without executing a descriptor on its metaclass."""
+    value_type = type(value)
+    declared = type.__dict__["__name__"].__get__(value_type, type(value_type))
+    return str.__str__(declared)
+
+
+def _require_database_config(value: object) -> DatabaseConfig:
+    """Return a fresh validated snapshot, even when an exact instance was forged or changed."""
+    return _canonical_database_config(value)
+
+
+def _require_port_registry(value: object) -> PortRegistry:
+    """Return a statically revalidated snapshot of the caller's exact registry."""
+    return _snapshot_port_registry(value)
 
 
 def _assemble_database(

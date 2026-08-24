@@ -7,13 +7,16 @@ the first transaction.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from math import isfinite
 
 from okto_grafx.domain.errors import GrafxConfigurationError
 from okto_grafx.domain.page import MAX_PAGE_SIZE as CORE_MAX_PAGE_SIZE
 from okto_grafx.domain.page import MIN_PAGE_SIZE as CORE_MIN_PAGE_SIZE
 from okto_grafx.domain.page import validate_page_size
+from okto_grafx.engine.catalog_store import MINIMUM_FRAMES as CATALOG_FRAMES
+from okto_grafx.engine.heap_store import MINIMUM_FRAMES as HEAP_FRAMES
+from okto_grafx.engine.wal_manager import MAX_SEGMENT_READ_BYTES, MIN_SEGMENT_BYTES
 
 __all__ = [
     "MIN_PAGE_SIZE",
@@ -21,6 +24,7 @@ __all__ = [
     "CORE_MIN_PAGE_SIZE",
     "CORE_MAX_PAGE_SIZE",
     "MAX_PARTITIONS_PER_TABLE",
+    "MINIMUM_STORE_FRAMES",
     "RECOVERY_POLICIES",
     "METRICS_SINKS",
     "VECTOR_MATH_SELECTORS",
@@ -47,6 +51,9 @@ have exactly one definition, in :mod:`okto_grafx.domain.page`.
 
 MAX_PARTITIONS_PER_TABLE: int = 65535
 """Largest partition count: the meta page stores it as an unsigned 16-bit field."""
+
+MINIMUM_STORE_FRAMES: int = max(CATALOG_FRAMES, HEAP_FRAMES)
+"""Fewest pages the catalog and heap stores can operate over at once."""
 
 RECOVERY_POLICIES: frozenset[str] = frozenset({"replay", "refuse"})
 """Replay up to the last intact record (default), or refuse to open a damaged database."""
@@ -81,20 +88,61 @@ because a fixed port was taken (amendment A8).
 """
 
 
+def _builtin_type_name(value: object) -> str:
+    """Name a value's type without invoking a hostile metaclass descriptor."""
+    value_type = type(value)
+    declared = type.__dict__["__name__"].__get__(value_type, type(value_type))
+    return str.__str__(declared)
+
+
+def _diagnostic_value(value: object) -> object:
+    """Return a capability-free value suitable for a public error detail."""
+    value_type = type(value)
+    if value is None or value_type is bool:
+        return value
+    if issubclass(value_type, str):
+        plain = str.__str__(value)
+        return (
+            plain if str.__len__(plain) <= 256 else f"str<{str.__len__(plain)} chars>"
+        )
+    if issubclass(value_type, int):
+        plain = int.__int__(value)
+        return (
+            plain
+            if int.bit_length(plain) <= 256
+            else f"int<{int.bit_length(plain)} bits>"
+        )
+    if issubclass(value_type, float):
+        return float.__float__(value)
+    return _builtin_type_name(value)
+
+
 def _reject(field: str, value: object, reason: str) -> GrafxConfigurationError:
-    """Build the configuration error for one field, naming the field, the value and the reason."""
+    """Build a typed refusal without executing caller-controlled formatting hooks."""
+    observed = _diagnostic_value(value)
     return GrafxConfigurationError(
-        f"Invalid configuration for {field!r}: {reason} Got {value!r}.",
+        f"Invalid configuration for {field!r}: {reason} Got {observed!r}.",
         field=field,
-        value=value,
+        value=observed,
     )
 
 
+def _require_text(field: str, value: object, *, empty: bool = True) -> str:
+    """Copy a string into an exact built-in value without invoking subclass hooks."""
+    if not issubclass(type(value), str):
+        qualification = "a string" if empty else "a non-empty string"
+        raise _reject(field, value, f"{qualification} is required.")
+    plain = str.__str__(value)
+    if not empty and str.__len__(plain) == 0:
+        raise _reject(field, plain, "a non-empty string is required.")
+    return plain
+
+
 def _require_int(field: str, value: object) -> int:
-    """Return the value as an int, rejecting booleans and anything that is not an integer."""
-    if isinstance(value, bool) or not isinstance(value, int):
+    """Copy an integer into an exact built-in value without invoking subclass hooks."""
+    if type(value) is bool or not issubclass(type(value), int):
         raise _reject(field, value, "an integer is required.")
-    return value
+    return int.__int__(value)
 
 
 def _require_positive_int(field: str, value: object) -> int:
@@ -106,10 +154,17 @@ def _require_positive_int(field: str, value: object) -> int:
 
 
 def _require_positive_number(field: str, value: object) -> float:
-    """Return the value as a finite, strictly positive number."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    """Copy a finite positive real into an exact float without caller callbacks."""
+    value_type = type(value)
+    if value_type is bool or not issubclass(value_type, (int, float)):
         raise _reject(field, value, "a number is required.")
-    number = float(value)
+    try:
+        if issubclass(value_type, float):
+            number = float.__float__(value)
+        else:
+            number = float(int.__int__(value))
+    except OverflowError:
+        raise _reject(field, value, "a finite number is required.") from None
     if not isfinite(number):
         raise _reject(field, value, "a finite number is required.")
     if number <= 0.0:
@@ -118,10 +173,13 @@ def _require_positive_number(field: str, value: object) -> float:
 
 
 def _require_choice(field: str, value: object, choices: frozenset[str]) -> str:
-    """Return the value as one of the allowed string choices."""
-    if not isinstance(value, str) or value not in choices:
+    """Return an exact built-in string when it names one of the allowed choices."""
+    if not issubclass(type(value), str):
         raise _reject(field, value, f"one of {', '.join(sorted(choices))} is required.")
-    return value
+    plain = str.__str__(value)
+    if plain not in choices:
+        raise _reject(field, plain, f"one of {', '.join(sorted(choices))} is required.")
+    return plain
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,10 +207,11 @@ class DatabaseConfig:
 
     def __post_init__(self) -> None:
         """Reject any unusable field with a GrafxConfigurationError that names it."""
-        if not isinstance(self.path, str) or not self.path:
-            raise _reject("path", self.path, "a non-empty string is required.")
+        path = _require_text("path", self.path, empty=False)
+        object.__setattr__(self, "path", path)
 
         page_size = _require_positive_int("page_size", self.page_size)
+        object.__setattr__(self, "page_size", page_size)
         if page_size & (page_size - 1) != 0:
             raise _reject("page_size", self.page_size, "a power of two is required.")
         if not (MIN_PAGE_SIZE <= page_size <= MAX_PAGE_SIZE):
@@ -166,7 +225,10 @@ class DatabaseConfig:
         # which is the drift amendment A20 exists to prevent.
         validate_page_size(page_size)
 
-        partitions = _require_positive_int("partitions_per_table", self.partitions_per_table)
+        partitions = _require_positive_int(
+            "partitions_per_table", self.partitions_per_table
+        )
+        object.__setattr__(self, "partitions_per_table", partitions)
         if partitions > MAX_PARTITIONS_PER_TABLE:
             raise _reject(
                 "partitions_per_table",
@@ -174,11 +236,35 @@ class DatabaseConfig:
                 f"a value of at most {MAX_PARTITIONS_PER_TABLE} is required.",
             )
 
-        _require_positive_int("buffer_budget_bytes", self.buffer_budget_bytes)
-        _require_positive_int("wal_segment_bytes", self.wal_segment_bytes)
-        _require_positive_int("checkpoint_interval_records", self.checkpoint_interval_records)
+        for field in (
+            "buffer_budget_bytes",
+            "wal_segment_bytes",
+            "checkpoint_interval_records",
+        ):
+            object.__setattr__(
+                self, field, _require_positive_int(field, getattr(self, field))
+            )
+        minimum_budget = MINIMUM_STORE_FRAMES * page_size
+        if self.buffer_budget_bytes < minimum_budget:
+            raise GrafxConfigurationError(
+                f"Invalid configuration for 'buffer_budget_bytes': at least "
+                f"{MINIMUM_STORE_FRAMES} pages ({minimum_budget} bytes) are required. "
+                f"Got {self.buffer_budget_bytes!r}.",
+                field="buffer_budget_bytes",
+                value=self.buffer_budget_bytes,
+                required_bytes=minimum_budget,
+            )
+        if not MIN_SEGMENT_BYTES <= self.wal_segment_bytes <= MAX_SEGMENT_READ_BYTES:
+            raise _reject(
+                "wal_segment_bytes",
+                self.wal_segment_bytes,
+                f"a value between {MIN_SEGMENT_BYTES} and {MAX_SEGMENT_READ_BYTES} is required.",
+            )
 
-        threshold = _require_int("vector_exact_scan_threshold", self.vector_exact_scan_threshold)
+        threshold = _require_int(
+            "vector_exact_scan_threshold", self.vector_exact_scan_threshold
+        )
+        object.__setattr__(self, "vector_exact_scan_threshold", threshold)
         if threshold < 0:
             raise _reject(
                 "vector_exact_scan_threshold",
@@ -186,14 +272,20 @@ class DatabaseConfig:
                 "a value of zero or more is required.",
             )
 
-        _require_positive_number("lease_ttl_seconds", self.lease_ttl_seconds)
-        _require_positive_number("lease_timeout_seconds", self.lease_timeout_seconds)
-        _require_positive_number("commit_lock_timeout_seconds", self.commit_lock_timeout_seconds)
-        _require_positive_number(
-            "reader_stall_threshold_seconds", self.reader_stall_threshold_seconds
-        )
+        for field in (
+            "lease_ttl_seconds",
+            "lease_timeout_seconds",
+            "commit_lock_timeout_seconds",
+            "reader_stall_threshold_seconds",
+        ):
+            object.__setattr__(
+                self, field, _require_positive_number(field, getattr(self, field))
+            )
 
-        recall_target = _require_positive_number("vector_recall_target", self.vector_recall_target)
+        recall_target = _require_positive_number(
+            "vector_recall_target", self.vector_recall_target
+        )
+        object.__setattr__(self, "vector_recall_target", recall_target)
         if recall_target > 1.0:
             raise _reject(
                 "vector_recall_target",
@@ -201,13 +293,18 @@ class DatabaseConfig:
                 "a value greater than zero and at most one is required.",
             )
 
-        _require_choice("recovery_policy", self.recovery_policy, RECOVERY_POLICIES)
-        _require_choice("metrics", self.metrics, METRICS_SINKS)
-        _require_choice("vector_math", self.vector_math, VECTOR_MATH_SELECTORS)
-        _require_choice("checksum", self.checksum, CHECKSUM_SELECTORS)
+        for field, choices in (
+            ("recovery_policy", RECOVERY_POLICIES),
+            ("metrics", METRICS_SINKS),
+            ("vector_math", VECTOR_MATH_SELECTORS),
+            ("checksum", CHECKSUM_SELECTORS),
+        ):
+            object.__setattr__(
+                self, field, _require_choice(field, getattr(self, field), choices)
+            )
         self._validate_metrics_destination()
 
-        if not isinstance(self.read_only, bool):
+        if type(self.read_only) is not bool:
             raise _reject("read_only", self.read_only, "a boolean is required.")
 
     def _validate_metrics_destination(self) -> None:
@@ -218,8 +315,9 @@ class DatabaseConfig:
         so a destination there is a configuration mistake worth naming rather than ignoring.
         """
         destination = self.metrics_destination
-        if destination is not None and not isinstance(destination, str):
-            raise _reject("metrics_destination", destination, "a string or None is required.")
+        if destination is not None:
+            destination = _require_text("metrics_destination", destination)
+            object.__setattr__(self, "metrics_destination", destination)
 
         if self.metrics == "noop":
             if destination is not None:
@@ -248,7 +346,15 @@ class DatabaseConfig:
                 f"a non-empty host:port is required, or None for {DEFAULT_OPENMETRICS_DESTINATION}.",
             )
         host, separator, port = destination.rpartition(":")
-        if not separator or not host or not port.isdigit() or not 0 <= int(port) <= 65535:
+        port_is_valid = (
+            bool(separator)
+            and bool(host)
+            and 1 <= len(port) <= 5
+            and port.isascii()
+            and port.isdigit()
+            and 0 <= int(port) <= 65535
+        )
+        if not port_is_valid:
             raise _reject(
                 "metrics_destination",
                 destination,
@@ -259,3 +365,40 @@ class DatabaseConfig:
     def granularity_descriptor(self) -> str:
         """Return the self-describing granularity string every transaction record carries (TR-4)."""
         return f"hash-v1;partitions_per_table={self.partitions_per_table}"
+
+
+_DATABASE_CONFIG_FIELDS: tuple[str, ...] = tuple(
+    definition.name for definition in fields(DatabaseConfig)
+)
+"""Literal state copied at every public composition boundary before it can be consumed."""
+
+
+def _canonical_database_config(value: object) -> DatabaseConfig:
+    """Rebuild an exact config so even an uninitialised or tampered instance fails closed.
+
+    ``frozen=True`` protects ordinary callers, but Python deliberately leaves
+    ``object.__setattr__`` and ``object.__new__`` available. Exact type identity therefore is
+    not proof that ``__post_init__`` ran or that its canonical values still occupy the slots.
+    A fresh construction is both the validation seal and a value detached from later changes to
+    the original object.
+    """
+    if type(value) is not DatabaseConfig:
+        observed = _builtin_type_name(value)
+        raise GrafxConfigurationError(
+            f"A database operation needs an exact DatabaseConfig; got {observed}.",
+            field="config",
+            value=observed,
+        )
+    copied: dict[str, object] = {}
+    for field in _DATABASE_CONFIG_FIELDS:
+        try:
+            copied[field] = object.__getattribute__(value, field)
+        except Exception as failure:
+            cause = _builtin_type_name(failure)
+            raise GrafxConfigurationError(
+                f"DatabaseConfig is missing validated field {field!r}; got {cause}.",
+                field="config",
+                missing=field,
+                cause=cause,
+            ) from failure
+    return DatabaseConfig(**copied)  # type: ignore[arg-type]

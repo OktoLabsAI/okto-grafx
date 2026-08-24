@@ -8,8 +8,10 @@ from types import MappingProxyType
 
 import pytest
 
+from okto_grafx.api.assembly import assemble_database
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
+    GrafxDeviceFull,
     GrafxPortNotConfigured,
 )
 from okto_grafx.runtime import bootstrap
@@ -40,7 +42,10 @@ def test_building_the_default_registry_fills_every_required_slot() -> None:
             assert port is not None, slot
             # A default build must reach for a shipped adapter, never a test double: the module
             # is asserted rather than the class name so C1-C9 stay free to rename their types.
-            assert type(port).__module__.startswith("okto_grafx.adapters"), (slot, type(port))
+            assert type(port).__module__.startswith("okto_grafx.adapters"), (
+                slot,
+                type(port),
+            )
     finally:
         bootstrap.release_ports(registry)
 
@@ -70,7 +75,9 @@ def test_open_database_without_a_registry_builds_the_defaults(tmp_path: Path) ->
     # Written against a real path rather than ":memory:" so the storage adapter takes its file
     # path, and closed in a finally because a descriptor left open on Windows is what stops the
     # next test from publishing over the same names.
-    database = bootstrap.open_database(DatabaseConfig(path=str(tmp_path / "graph.okto")))
+    database = bootstrap.open_database(
+        DatabaseConfig(path=str(tmp_path / "graph.okto"))
+    )
     try:
         assert not database.closed
     finally:
@@ -79,7 +86,7 @@ def test_open_database_without_a_registry_builds_the_defaults(tmp_path: Path) ->
 
 
 def test_open_database_with_an_incomplete_registry_lists_the_gaps(
-    fake_ports: dict[str, object]
+    fake_ports: dict[str, object],
 ) -> None:
     registry = PortRegistry()
     registry.bind("storage", fake_ports["storage"])
@@ -89,7 +96,155 @@ def test_open_database_with_an_incomplete_registry_lists_the_gaps(
     with pytest.raises(GrafxPortNotConfigured) as raised:
         bootstrap.open_database(DatabaseConfig(path=":memory:"), registry=registry)
 
-    assert raised.value.details["missing"] == ["codec", "metrics", "vector_math", "events"]
+    assert raised.value.details["missing"] == [
+        "codec",
+        "metrics",
+        "vector_math",
+        "events",
+    ]
+
+
+@pytest.mark.parametrize(
+    "registry",
+    [object(), pytest.param(type("R", (PortRegistry,), {})(), id="subclass")],
+)
+def test_open_database_refuses_anything_but_the_exact_registry(
+    registry: object,
+) -> None:
+    with pytest.raises(GrafxConfigurationError) as raised:
+        bootstrap.open_database(  # type: ignore[arg-type]
+            DatabaseConfig(path=":memory:"), registry=registry
+        )
+    assert raised.value.details["field"] == "registry"
+
+
+class _SkippedConfig(DatabaseConfig):
+    def __post_init__(self) -> None:
+        """Deliberately skip every invariant of the frozen base dataclass."""
+
+
+def test_bootstrap_refuses_a_config_subclass_that_skipped_validation() -> None:
+    skipped = _SkippedConfig(path="", page_size=3)
+    with pytest.raises(GrafxConfigurationError) as raised:
+        bootstrap.open_database(skipped)
+    assert raised.value.details["field"] == "config"
+
+
+def test_bootstrap_revalidates_even_an_exact_config_instance() -> None:
+    tampered = DatabaseConfig(path=":memory:", checksum="pure")
+    object.__setattr__(tampered, "checksum", "bogus")
+    with pytest.raises(GrafxConfigurationError) as invalid:
+        bootstrap.open_database(tampered)
+    assert invalid.value.details["field"] == "checksum"
+
+    uninitialised = object.__new__(DatabaseConfig)
+    with pytest.raises(GrafxConfigurationError) as missing:
+        bootstrap.open_database(uninitialised)
+    assert missing.value.details["field"] == "config"
+
+
+def test_bootstrap_revalidates_even_an_exact_registry_instance(
+    complete_registry: PortRegistry,
+) -> None:
+    uninitialised = object.__new__(PortRegistry)
+    with pytest.raises(GrafxConfigurationError) as missing:
+        bootstrap.open_database(DatabaseConfig(path=":memory:"), registry=uninitialised)
+    assert missing.value.details["field"] == "registry"
+
+    corrupted = PortRegistry()
+    corrupted._bindings = object()  # type: ignore[assignment]
+    with pytest.raises(GrafxConfigurationError) as invalid:
+        bootstrap.open_database(DatabaseConfig(path=":memory:"), registry=corrupted)
+    assert invalid.value.details["field"] == "registry"
+
+    class HostileMeta(type):
+        @property
+        def __name__(cls) -> str:
+            raise RuntimeError("caller type name ran")
+
+    class HostileStorage(metaclass=HostileMeta):
+        pass
+
+    complete_registry._bindings["storage"] = HostileStorage()
+    with pytest.raises(GrafxConfigurationError) as hostile:
+        bootstrap.open_database(
+            DatabaseConfig(path=":memory:"), registry=complete_registry
+        )
+    assert hostile.value.details["field"] == "registry"
+
+
+def test_a_hostile_adapter_exception_is_contained_without_stringifying_it(
+    complete_registry: PortRegistry,
+) -> None:
+    class HostileFailure(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("exception __str__ escaped")
+
+    marker = HostileFailure()
+
+    class FailingClock:
+        def monotonic(self) -> float:
+            raise marker
+
+        def wall(self) -> float:
+            raise marker
+
+    complete_registry.bind("clock", FailingClock())
+    with pytest.raises(GrafxConfigurationError) as raised:
+        bootstrap.open_database(
+            DatabaseConfig(path=":memory:"), registry=complete_registry
+        )
+    assert raised.value.details["field"] == "ports"
+    assert raised.value.details["cause"] == "HostileFailure"
+    assert raised.value.__cause__ is marker
+
+
+def test_direct_assembly_applies_the_same_exact_boundary_guards(
+    complete_registry: PortRegistry,
+) -> None:
+    skipped = _SkippedConfig(path="", page_size=3)
+    with pytest.raises(GrafxConfigurationError) as bad_config:
+        assemble_database(skipped, complete_registry)
+    assert bad_config.value.details["field"] == "config"
+
+    class RegistrySubclass(PortRegistry):
+        pass
+
+    with pytest.raises(GrafxConfigurationError) as bad_registry:
+        assemble_database(DatabaseConfig(path=":memory:"), RegistrySubclass())
+    assert bad_registry.value.details["field"] == "registry"
+
+    with pytest.raises(GrafxConfigurationError) as bad_ownership:
+        assemble_database(
+            DatabaseConfig(path=":memory:"),
+            complete_registry,
+            owns_ports=1,  # type: ignore[arg-type]
+        )
+    assert bad_ownership.value.details["field"] == "owns_ports"
+
+
+def test_a_huge_finite_section_timeout_is_supported_without_numeric_overflow() -> None:
+    database = bootstrap.open_database(
+        DatabaseConfig(path=":memory:", commit_lock_timeout_seconds=1e308)
+    )
+    database.close()
+
+
+def test_custom_registry_does_not_disable_the_process_global_checksum_selector(
+    complete_registry: PortRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed: list[str] = []
+
+    def install(config: DatabaseConfig) -> str:
+        observed.append(config.checksum)
+        return "pure"
+
+    monkeypatch.setattr(bootstrap, "install_checksum", install)
+    database = bootstrap.open_database(
+        DatabaseConfig(path=":memory:", checksum="pure"), registry=complete_registry
+    )
+    database.close()
+    assert observed == ["pure"]
 
 
 def test_open_database_with_a_complete_registry_assembles_on_the_caller_ports(
@@ -138,7 +293,9 @@ def test_the_default_adapter_table_cannot_be_mutated_by_a_caller() -> None:
         bootstrap._DEFAULT_PORT_FACTORIES["storage"] = lambda config: None  # type: ignore[index]
 
 
-def test_the_bootstrap_keeps_the_caller_registry(complete_registry: PortRegistry) -> None:
+def test_the_bootstrap_keeps_the_caller_registry(
+    complete_registry: PortRegistry,
+) -> None:
     # A caller-supplied composition is used as given; the bootstrap never silently replaces a
     # bound adapter with a default one. Now that the open succeeds, the substitution this guards
     # against would be invisible without checking the registry after the call, not just before.
@@ -220,9 +377,7 @@ def test_the_coordinator_accepts_the_whole_mapping_at_once() -> None:
 
     signature = inspect.signature(LocalProcessCoordinator.__init__)
     settings = coordinator_settings(DatabaseConfig(path="./mydb"))
-    bound = signature.bind_partial(
-        None, storage=None, clock=None, **settings
-    )
+    bound = signature.bind_partial(None, storage=None, clock=None, **settings)
     assert set(settings) <= set(bound.arguments)
 
 
@@ -238,7 +393,7 @@ def test_the_owner_stall_threshold_follows_the_lease_not_the_reader() -> None:
 
 
 def test_a_context_hands_back_a_port_that_is_already_built(
-    fake_ports: dict[str, object]
+    fake_ports: dict[str, object],
 ) -> None:
     context = PortContext(
         config=DatabaseConfig(path="./mydb"),
@@ -250,7 +405,7 @@ def test_a_context_hands_back_a_port_that_is_already_built(
 
 
 def test_a_context_refuses_a_dependency_that_is_not_built_yet(
-    fake_ports: dict[str, object]
+    fake_ports: dict[str, object],
 ) -> None:
     context = PortContext(
         config=DatabaseConfig(path="./mydb"),
@@ -350,24 +505,32 @@ def test_the_openmetrics_default_is_applied_where_the_composition_happens() -> N
     # than sitting unused.
     assert bootstrap.metrics_destination(DatabaseConfig(path="./mydb")) is None
     assert (
-        bootstrap.metrics_destination(DatabaseConfig(path="./mydb", metrics="openmetrics"))
+        bootstrap.metrics_destination(
+            DatabaseConfig(path="./mydb", metrics="openmetrics")
+        )
         == DEFAULT_OPENMETRICS_DESTINATION
     )
     assert (
         bootstrap.metrics_destination(
-            DatabaseConfig(path="./mydb", metrics="openmetrics", metrics_destination="0.0.0.0:9100")
+            DatabaseConfig(
+                path="./mydb", metrics="openmetrics", metrics_destination="0.0.0.0:9100"
+            )
         )
         == "0.0.0.0:9100"
     )
     assert (
         bootstrap.metrics_destination(
-            DatabaseConfig(path="./mydb", metrics="json", metrics_destination="./m.json")
+            DatabaseConfig(
+                path="./mydb", metrics="json", metrics_destination="./m.json"
+            )
         )
         == "./m.json"
     )
 
 
-def test_the_json_sink_never_reaches_the_composition_root_without_a_destination() -> None:
+def test_the_json_sink_never_reaches_the_composition_root_without_a_destination() -> (
+    None
+):
     # The configuration refuses it first, so the resolver never has to invent one.
     with pytest.raises(GrafxConfigurationError):
         DatabaseConfig(path="./mydb", metrics="json")
@@ -397,12 +560,15 @@ def _restore_checksum() -> object:
 
 def test_the_pure_selector_installs_the_reference() -> None:
     """The reference is always installable: it is the thing every candidate is measured against."""
-    assert bootstrap.install_checksum(DatabaseConfig(path=":memory:", checksum="pure")) == "pure"
+    assert (
+        bootstrap.install_checksum(DatabaseConfig(path=":memory:", checksum="pure"))
+        == "pure"
+    )
     assert crc32c_implementation() == "pure"
 
 
 def test_auto_never_refuses_and_leaves_a_working_implementation() -> None:
-    """"auto" asks for the fastest CORRECT answer, and the reference is a correct answer.
+    """ "auto" asks for the fastest CORRECT answer, and the reference is a correct answer.
 
     A composition root that refused to open a database because an optional accelerator was absent
     would make an optional extra mandatory.
@@ -426,6 +592,23 @@ def test_the_native_selector_refuses_rather_than_quietly_using_the_reference() -
         bootstrap.install_checksum(DatabaseConfig(path=":memory:", checksum="pure"))
 
 
+@pytest.mark.parametrize("selector", ["native", "auto"])
+def test_a_typed_native_provider_failure_keeps_its_identity(
+    selector: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from okto_grafx.adapters import checksum_native
+
+    marker = GrafxDeviceFull("provider storage refusal")
+
+    def refuse() -> object:
+        raise marker
+
+    monkeypatch.setattr(checksum_native, "NativeCrc32c", refuse)
+    with pytest.raises(GrafxDeviceFull) as raised:
+        bootstrap.install_checksum(DatabaseConfig(path=":memory:", checksum=selector))
+    assert raised.value is marker
+
+
 def test_an_unknown_checksum_selector_is_refused_by_the_configuration() -> None:
     with pytest.raises(GrafxConfigurationError) as refusal:
         DatabaseConfig(path=":memory:", checksum="fastest")
@@ -444,4 +627,6 @@ def test_whatever_is_installed_agrees_with_the_reference_byte_for_byte() -> None
     for payload in corpus:
         assert crc32c(payload) == crc32c_reference(payload)
         # Chained: the seed is where a provider written for a different argument order goes wrong.
-        assert crc32c(payload, crc32c(b"seed")) == crc32c_reference(payload, crc32c_reference(b"seed"))
+        assert crc32c(payload, crc32c(b"seed")) == crc32c_reference(
+            payload, crc32c_reference(b"seed")
+        )

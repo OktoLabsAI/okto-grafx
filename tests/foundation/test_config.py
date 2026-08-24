@@ -9,6 +9,7 @@ import pytest
 
 from okto_grafx.domain.errors import GrafxConfigurationError
 from okto_grafx.domain.page import validate_page_size
+from okto_grafx.engine.wal_manager import MAX_SEGMENT_READ_BYTES, MIN_SEGMENT_BYTES
 from okto_grafx.runtime.config import (
     CORE_MAX_PAGE_SIZE,
     CORE_MIN_PAGE_SIZE,
@@ -17,6 +18,7 @@ from okto_grafx.runtime.config import (
     MAX_PARTITIONS_PER_TABLE,
     METRICS_SINKS,
     MIN_PAGE_SIZE,
+    MINIMUM_STORE_FRAMES,
     RECOVERY_POLICIES,
     VECTOR_MATH_SELECTORS,
     DatabaseConfig,
@@ -93,8 +95,14 @@ def test_an_invalid_page_size_is_rejected(page_size: object) -> None:
 
 
 def test_the_page_size_bounds_are_the_declared_ones() -> None:
-    assert DatabaseConfig(path=":memory:", page_size=MIN_PAGE_SIZE).page_size == MIN_PAGE_SIZE
-    assert DatabaseConfig(path=":memory:", page_size=MAX_PAGE_SIZE).page_size == MAX_PAGE_SIZE
+    assert (
+        DatabaseConfig(path=":memory:", page_size=MIN_PAGE_SIZE).page_size
+        == MIN_PAGE_SIZE
+    )
+    assert (
+        DatabaseConfig(path=":memory:", page_size=MAX_PAGE_SIZE).page_size
+        == MAX_PAGE_SIZE
+    )
     with pytest.raises(GrafxConfigurationError):
         DatabaseConfig(path=":memory:", page_size=MIN_PAGE_SIZE // 2)
     with pytest.raises(GrafxConfigurationError):
@@ -121,9 +129,7 @@ def test_the_partition_ceiling_is_the_number_the_format_can_store() -> None:
             DatabaseConfig(path=":memory:", partitions_per_table=unstorable)
 
 
-@pytest.mark.parametrize(
-    "partitions", [0, -1, 65536, 70000, "64", 64.0, None, True]
-)
+@pytest.mark.parametrize("partitions", [0, -1, 65536, 70000, "64", 64.0, None, True])
 def test_an_invalid_partition_count_is_rejected(partitions: object) -> None:
     with pytest.raises(GrafxConfigurationError) as raised:
         DatabaseConfig(path=":memory:", partitions_per_table=partitions)  # type: ignore[arg-type]
@@ -137,11 +143,43 @@ def test_an_invalid_partition_count_is_rejected(partitions: object) -> None:
     "field",
     ["buffer_budget_bytes", "wal_segment_bytes", "checkpoint_interval_records"],
 )
-@pytest.mark.parametrize("value", [0, -1, "1024", 1024.5, None])
+@pytest.mark.parametrize("value", [0, -1, "1024", 1024.5, None, True])
 def test_a_non_positive_integer_budget_is_rejected(field: str, value: object) -> None:
     with pytest.raises(GrafxConfigurationError) as raised:
         DatabaseConfig(path=":memory:", **{field: value})
     assert raised.value.details["field"] == field
+
+
+def test_the_buffer_budget_must_hold_both_store_working_sets() -> None:
+    page_size = 4096
+    minimum = MINIMUM_STORE_FRAMES * page_size
+    assert (
+        DatabaseConfig(
+            path=":memory:", page_size=page_size, buffer_budget_bytes=minimum
+        ).buffer_budget_bytes
+        == minimum
+    )
+    with pytest.raises(GrafxConfigurationError) as raised:
+        DatabaseConfig(
+            path=":memory:", page_size=page_size, buffer_budget_bytes=minimum - 1
+        )
+    assert raised.value.details["field"] == "buffer_budget_bytes"
+
+
+def test_the_wal_segment_bounds_are_exactly_the_reader_bounds() -> None:
+    assert MIN_SEGMENT_BYTES == 256
+    assert MAX_SEGMENT_READ_BYTES == 1024 * 1024 * 1024
+    for accepted in (MIN_SEGMENT_BYTES, MAX_SEGMENT_READ_BYTES):
+        assert (
+            DatabaseConfig(
+                path=":memory:", wal_segment_bytes=accepted
+            ).wal_segment_bytes
+            == accepted
+        )
+    for rejected in (MIN_SEGMENT_BYTES - 1, MAX_SEGMENT_READ_BYTES + 1):
+        with pytest.raises(GrafxConfigurationError) as raised:
+            DatabaseConfig(path=":memory:", wal_segment_bytes=rejected)
+        assert raised.value.details["field"] == "wal_segment_bytes"
 
 
 @pytest.mark.parametrize(
@@ -189,14 +227,19 @@ def test_an_invalid_path_is_rejected(path: object) -> None:
 
 @pytest.mark.parametrize("policy", sorted(RECOVERY_POLICIES))
 def test_every_recovery_policy_is_accepted(policy: str) -> None:
-    assert DatabaseConfig(path=":memory:", recovery_policy=policy).recovery_policy == policy
+    assert (
+        DatabaseConfig(path=":memory:", recovery_policy=policy).recovery_policy
+        == policy
+    )
 
 
 @pytest.mark.parametrize("sink", sorted(METRICS_SINKS))
 def test_every_metrics_sink_is_accepted(sink: str) -> None:
     # The JSON sink writes to a file, so it is the one sink that needs a destination (A8).
     destination = "./metrics.json" if sink == "json" else None
-    config = DatabaseConfig(path=":memory:", metrics=sink, metrics_destination=destination)
+    config = DatabaseConfig(
+        path=":memory:", metrics=sink, metrics_destination=destination
+    )
     assert config.metrics == sink
     assert config.metrics_destination == destination
 
@@ -220,7 +263,9 @@ def test_every_vector_math_selector_is_accepted(selector: str) -> None:
         ("vector_math", None),
     ],
 )
-def test_a_value_outside_an_enumerated_choice_is_rejected(field: str, value: object) -> None:
+def test_a_value_outside_an_enumerated_choice_is_rejected(
+    field: str, value: object
+) -> None:
     with pytest.raises(GrafxConfigurationError) as raised:
         DatabaseConfig(path=":memory:", **{field: value})
     assert raised.value.details["field"] == field
@@ -248,7 +293,19 @@ def test_a_recall_target_in_the_open_unit_interval_is_accepted(target: float) ->
     assert config.vector_recall_target == target
 
 
-@pytest.mark.parametrize("target", [0.0, -0.1, 1.0001, 2, "0.9", None, float("nan")])
+@pytest.mark.parametrize(
+    "target",
+    [
+        0.0,
+        -0.1,
+        1.0001,
+        2,
+        "0.9",
+        None,
+        float("nan"),
+        pytest.param(10**10_000, id="huge_integer"),
+    ],
+)
 def test_an_invalid_recall_target_is_rejected(target: object) -> None:
     with pytest.raises(GrafxConfigurationError) as raised:
         DatabaseConfig(path=":memory:", vector_recall_target=target)  # type: ignore[arg-type]
@@ -288,7 +345,9 @@ def test_the_rejection_message_names_the_field_and_the_value() -> None:
 
 
 def test_the_json_sink_requires_a_destination() -> None:
-    config = DatabaseConfig(path=":memory:", metrics="json", metrics_destination="./m.json")
+    config = DatabaseConfig(
+        path=":memory:", metrics="json", metrics_destination="./m.json"
+    )
     assert config.metrics_destination == "./m.json"
     with pytest.raises(GrafxConfigurationError) as raised:
         DatabaseConfig(path=":memory:", metrics="json")
@@ -320,11 +379,27 @@ def test_the_openmetrics_publisher_accepts_a_host_and_port(destination: str) -> 
 
 
 @pytest.mark.parametrize(
-    "destination", ["9100", "localhost", "localhost:", ":9100", "host:abc", "host:65536", "host:-1", "   "]
+    "destination",
+    [
+        "9100",
+        "localhost",
+        "localhost:",
+        ":9100",
+        "host:abc",
+        "host:²",
+        "host:65536",
+        "host:-1",
+        "host:" + "9" * 5000,
+        "   ",
+    ],
 )
-def test_the_openmetrics_publisher_refuses_a_malformed_destination(destination: str) -> None:
+def test_the_openmetrics_publisher_refuses_a_malformed_destination(
+    destination: str,
+) -> None:
     with pytest.raises(GrafxConfigurationError) as raised:
-        DatabaseConfig(path=":memory:", metrics="openmetrics", metrics_destination=destination)
+        DatabaseConfig(
+            path=":memory:", metrics="openmetrics", metrics_destination=destination
+        )
     assert raised.value.details["field"] == "metrics_destination"
 
 
@@ -339,9 +414,7 @@ def test_the_noop_sink_refuses_any_destination() -> None:
 @pytest.mark.parametrize("destination", [7, 0, b"./m.json", ["./m.json"], True])
 def test_a_destination_that_is_not_a_string_is_refused(destination: object) -> None:
     with pytest.raises(GrafxConfigurationError) as raised:
-        DatabaseConfig(
-            path=":memory:", metrics="json", metrics_destination=destination
-        )  # type: ignore[arg-type]
+        DatabaseConfig(path=":memory:", metrics="json", metrics_destination=destination)  # type: ignore[arg-type]
     assert raised.value.details["field"] == "metrics_destination"
 
 
@@ -389,9 +462,15 @@ def test_the_config_and_the_storage_core_accept_exactly_the_same_page_sizes() ->
     # and refused on the first page write is the integration failure; a size accepted by the
     # core and refused here is the drift that shows the two definitions have parted company.
     accepted_here = {size for size in CANDIDATE_PAGE_SIZES if _config_accepts(size)}
-    accepted_by_core = {size for size in CANDIDATE_PAGE_SIZES if _storage_core_accepts(size)}
-    assert accepted_here - accepted_by_core == set(), "the config accepts a page the core refuses"
-    assert accepted_by_core - accepted_here == set(), "the core accepts a page the config refuses"
+    accepted_by_core = {
+        size for size in CANDIDATE_PAGE_SIZES if _storage_core_accepts(size)
+    }
+    assert accepted_here - accepted_by_core == set(), (
+        "the config accepts a page the core refuses"
+    )
+    assert accepted_by_core - accepted_here == set(), (
+        "the core accepts a page the config refuses"
+    )
     assert accepted_here == {512, 1024, 2048, 4096, 8192, 16384, 32768}
 
 
@@ -409,10 +488,16 @@ def test_the_configuration_defers_to_the_storage_core_validator() -> None:
     # which is its entire purpose under A20/A24. Pinned structurally, for want of a behavioural
     # signal that could exist while the two agree.
     config_module = (
-        Path(__file__).resolve().parents[2] / "src" / "okto_grafx" / "runtime" / "config.py"
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "okto_grafx"
+        / "runtime"
+        / "config.py"
     )
     source = config_module.read_text(encoding="utf-8")
-    body = source[source.index("def __post_init__") : source.index("def _validate_metrics")]
+    body = source[
+        source.index("def __post_init__") : source.index("def _validate_metrics")
+    ]
     assert "validate_page_size(page_size)" in body, (
         "__post_init__ must put the surviving size to the storage core, so a disagreement "
         "between the two bounds is impossible rather than merely untested"
@@ -431,3 +516,149 @@ def test_the_page_that_cannot_address_its_own_tail_is_refused() -> None:
     assert raised.value.details["field"] == "page_size"
     assert "65536" in raised.value.message
     assert "page_size" in raised.value.message
+
+
+# --- hostile scalar subclasses ---------------------------------------------------------------
+
+
+class _HostileInt(int):
+    """An integer-shaped caller value whose Python-level hooks must never run."""
+
+    def __int__(self) -> int:
+        raise RuntimeError("caller __int__ ran")
+
+    def __index__(self) -> int:
+        raise RuntimeError("caller __index__ ran")
+
+    def __format__(self, specification: str) -> str:
+        raise RuntimeError("caller __format__ ran")
+
+    def __repr__(self) -> str:
+        raise RuntimeError("caller __repr__ ran")
+
+
+class _HostileFloat(float):
+    """A float subclass that carries callbacks instead of being a plain configuration leaf."""
+
+    def __float__(self) -> float:
+        raise RuntimeError("caller __float__ ran")
+
+    def __repr__(self) -> str:
+        raise RuntimeError("caller __repr__ ran")
+
+
+class _HostileStr(str):
+    """A string subclass whose comparison, formatting and text methods are capabilities."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("caller __str__ ran")
+
+    def __repr__(self) -> str:
+        raise RuntimeError("caller __repr__ ran")
+
+    def __format__(self, specification: str) -> str:
+        raise RuntimeError("caller __format__ ran")
+
+    def __hash__(self) -> int:
+        raise RuntimeError("caller __hash__ ran")
+
+    def __eq__(self, other: object) -> bool:
+        raise RuntimeError("caller __eq__ ran")
+
+    def strip(self, characters: str | None = None) -> str:
+        raise RuntimeError("caller strip ran")
+
+
+def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> None:
+    config = DatabaseConfig(
+        path=":memory:",
+        page_size=_HostileInt(8192),
+        partitions_per_table=_HostileInt(256),
+        buffer_budget_bytes=_HostileInt(8192 * 8),
+        wal_segment_bytes=_HostileInt(4096),
+        checkpoint_interval_records=_HostileInt(32),
+        vector_exact_scan_threshold=_HostileInt(128),
+    )
+
+    for field in (
+        "page_size",
+        "partitions_per_table",
+        "buffer_budget_bytes",
+        "wal_segment_bytes",
+        "checkpoint_interval_records",
+        "vector_exact_scan_threshold",
+    ):
+        assert type(getattr(config, field)) is int
+    assert config.granularity_descriptor == "hash-v1;partitions_per_table=256"
+
+
+def test_configuration_canonicalizes_every_real_leaf_before_using_it() -> None:
+    config = DatabaseConfig(
+        path=":memory:",
+        lease_ttl_seconds=_HostileFloat(1.0),
+        lease_timeout_seconds=_HostileInt(2),
+        commit_lock_timeout_seconds=_HostileFloat(3.0),
+        reader_stall_threshold_seconds=_HostileInt(4),
+        vector_recall_target=_HostileFloat(0.9),
+    )
+
+    for field in (
+        "lease_ttl_seconds",
+        "lease_timeout_seconds",
+        "commit_lock_timeout_seconds",
+        "reader_stall_threshold_seconds",
+        "vector_recall_target",
+    ):
+        assert type(getattr(config, field)) is float
+
+
+def test_configuration_canonicalizes_every_text_leaf_before_using_it() -> None:
+    config = DatabaseConfig(
+        path=_HostileStr("./db"),
+        recovery_policy=_HostileStr("replay"),
+        metrics=_HostileStr("json"),
+        metrics_destination=_HostileStr("./metrics.json"),
+        vector_math=_HostileStr("pure"),
+        checksum=_HostileStr("pure"),
+    )
+
+    for field in (
+        "path",
+        "recovery_policy",
+        "metrics",
+        "metrics_destination",
+        "vector_math",
+        "checksum",
+    ):
+        assert type(getattr(config, field)) is str
+
+
+class _HostileObject:
+    def __repr__(self) -> str:
+        raise RuntimeError("caller __repr__ ran")
+
+
+def test_configuration_refusal_never_formats_a_hostile_caller_value() -> None:
+    with pytest.raises(GrafxConfigurationError) as raised:
+        DatabaseConfig(path=":memory:", page_size=_HostileObject())  # type: ignore[arg-type]
+
+    assert raised.value.details == {"field": "page_size", "value": "_HostileObject"}
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "lease_ttl_seconds",
+        "lease_timeout_seconds",
+        "commit_lock_timeout_seconds",
+        "reader_stall_threshold_seconds",
+    ],
+)
+def test_a_real_too_large_for_float_is_a_typed_configuration_refusal(
+    field: str,
+) -> None:
+    with pytest.raises(GrafxConfigurationError) as raised:
+        DatabaseConfig(path=":memory:", **{field: 10**10_000})
+
+    assert raised.value.details["field"] == field
+    assert "finite" in raised.value.message

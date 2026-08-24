@@ -445,7 +445,12 @@ and never degrades into a no-op — opening a database with an incomplete regist
 There is an eighth pluggable thing that is **not** a registry slot, because it is installed
 process-wide rather than injected per object: the **CRC-32C implementation**. `checksum="pure"`
 always binds the reference; `checksum="auto"` accelerates when `google-crc32c` is installed, and
-`install_crc32c` proves byte-identical digests against the reference before installing anything.
+`install_crc32c` checks byte-identical, unsigned 32-bit digests against the reference before
+installing anything and checks injected callables again on real inputs. The closed
+`google-crc32c`/`crc32c` provider list uses the corpus-validated fast path; a vendored provider can
+make the same trust decision explicitly through `NativeCrc32c(..., verify_runtime=False)`.
+Supplying a custom registry replaces the seven ports, but does not disable this process-wide
+`checksum` selection.
 
 ### Substituting an adapter
 
@@ -477,20 +482,21 @@ half-written page.
 
 ## Configuration
 
-`connect(path, **options)` builds a `DatabaseConfig`. Every option is validated at open, and an
-invalid one is refused with the field name the caller actually wrote.
+`connect(path, **options)` builds a `DatabaseConfig`. Every option is validated and copied to exact
+built-in scalar values before any adapter or persisted descriptor sees it; an invalid option is
+refused with the field name the caller actually wrote.
 
 | Option | Default | Notes |
 |---|---|---|
 | `page_size` | `8192` | Fixed for the life of the database |
 | `partitions_per_table` | `64` | Conflict granularity — more partitions, fewer false conflicts |
-| `buffer_budget_bytes` | `64 MiB` | Per database, never shared between two databases in one process |
+| `buffer_budget_bytes` | `64 MiB` | Per database, never shared; must hold at least two configured pages |
 | `recovery_policy` | `"replay"` | What the pass at open is allowed to do |
 | `lease_ttl_seconds` | `5.0` | How long a writer's lease stays valid without renewal |
 | `lease_timeout_seconds` | `10.0` | How long to wait for another writer's lease |
 | `commit_lock_timeout_seconds` | `30.0` | How long to wait at the commit section |
 | `reader_stall_threshold_seconds` | `15.0` | When a reader stops holding the horizon down |
-| `wal_segment_bytes` | `4 MiB` | Log segment size |
+| `wal_segment_bytes` | `4 MiB` | Log segment target, from 256 B through the reader's 1 GiB ceiling; an exceptional batch that would cross the ceiling is refused before writing |
 | `checkpoint_interval_records` | `512` | After a durable write, checkpoint when the published WAL distance reaches this many records; a failed attempt is reported and retried after the next write |
 | `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
 | `metrics_destination` | `None` | Required for `"json"` |

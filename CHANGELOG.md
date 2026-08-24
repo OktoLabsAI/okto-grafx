@@ -9,6 +9,14 @@ including the on-disk format.
 
 ### Changed
 
+- **Configuration is now canonical and enforced at the first public boundary.** Every accepted
+  scalar is copied to an exact built-in value before it can reach persisted identity/WAL metadata
+  or an adapter. Buffer budgets must hold both store working sets; WAL segments are constrained to
+  the reader's 256-byte through 1-GiB domain, including exceptional batches; malformed
+  Unicode/oversized OpenMetrics ports, hostile `PathLike` objects, invalid or concurrently changed
+  registries, and forged/uninitialised configuration instances receive typed refusals before a
+  database root is created. The process-global `checksum` selector remains effective with a
+  caller-supplied registry.
 - **`checkpoint_interval_records` now drives automatic WAL maintenance.** After a durable write
   commit and schema settlement, writable databases checkpoint when
   `last_committed_lsn - checkpoint_lsn` reaches the configured threshold. The decision is
@@ -25,6 +33,12 @@ including the on-disk format.
 
 ### Fixed
 
+- **A checksum provider could forge equality and be installed without returning an integer.** The
+  installer and native adapter now require and copy an exact unsigned 32-bit result before every
+  comparison and runtime use, contain ordinary provider failures, cover the largest legal page in
+  the acceptance corpus, and leave the previous safe implementation installed on any refusal.
+  Injected callables are oracle-checked at runtime by default; the closed native-provider list
+  remains accelerated after corpus validation, with an explicit opt-in to runtime verification.
 - **Vector search: a search arriving while the HNSW graph was being built could answer from a
   fragment** (Codex audit, P0.5). The derived graph was published before it was filled, so two
   searches meeting on the first use raced: one answered three of eight rows with `stale` False

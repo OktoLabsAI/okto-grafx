@@ -66,10 +66,8 @@ from okto_grafx.domain.ports.vectormath import VectorMath
 from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.catalog_store import CATALOG_FILE, CatalogStore
-from okto_grafx.engine.catalog_store import MINIMUM_FRAMES as CATALOG_FRAMES
 from okto_grafx.engine.database import META_FILE, Database, DatabaseIdentity, MetaStore
 from okto_grafx.engine.heap_store import HEAP_FILE, HeapStore
-from okto_grafx.engine.heap_store import MINIMUM_FRAMES as HEAP_FRAMES
 from okto_grafx.engine.index_manager import (
     IndexManager,
     edge_from_index_name,
@@ -88,8 +86,13 @@ from okto_grafx.engine.txn_manager import TransactionManager
 from okto_grafx.engine.vector_engine import VectorEngine
 from okto_grafx.engine.verifier import Verifier
 from okto_grafx.engine.wal_manager import WalManager
-from okto_grafx.runtime.config import MEMORY_PATH, DatabaseConfig
-from okto_grafx.runtime.registry import PortRegistry
+from okto_grafx.runtime.config import (
+    MEMORY_PATH,
+    MINIMUM_STORE_FRAMES,
+    DatabaseConfig,
+    _canonical_database_config,
+)
+from okto_grafx.runtime.registry import PortRegistry, _snapshot_port_registry
 
 __all__ = [
     "LABEL_DIGEST_BYTES",
@@ -109,14 +112,6 @@ LABEL_PREFIX: str = "db"
 
 LABEL_DIGEST_BYTES: int = 8
 """Bytes of digest behind a database label: sixteen hex characters, well inside the bound."""
-
-MINIMUM_STORE_FRAMES: int = max(CATALOG_FRAMES, HEAP_FRAMES)
-"""Frames the stores of one database need at once, taken from the stores themselves (A24).
-
-The catalog and the heap each declare their own floor; the composition root needs the larger of
-the two and must never re-state either number, because a second copy of a bound is how two
-validators that agree today stop agreeing tomorrow.
-"""
 
 _FIRST_OPEN_SECTION: str = "first-open"
 """Cross-process section that publishes a fresh database exactly once."""
@@ -186,9 +181,10 @@ _FIRST_OPEN_STAGING_FILES: frozenset[str] = frozenset(
 )
 """Names this protocol may retire as unpublished debris on an otherwise empty path."""
 
-_FIRST_OPEN_PROTOCOL_FILES: frozenset[str] = (
-    _FIRST_OPEN_STAGING_FILES | {_FIRST_OPEN_INTENT, _FIRST_OPEN_COMPLETE}
-)
+_FIRST_OPEN_PROTOCOL_FILES: frozenset[str] = _FIRST_OPEN_STAGING_FILES | {
+    _FIRST_OPEN_INTENT,
+    _FIRST_OPEN_COMPLETE,
+}
 """Complete whitelist of names owned by the first-open state machine."""
 
 _Port = TypeVar("_Port")
@@ -212,7 +208,9 @@ def database_label(path: str) -> str:
     # input. fsencode is the exact inverse of the decode that produced the string on both
     # families, so it never raises for a name the file system itself yielded, and it keeps
     # the digest injective.
-    digest = hashlib.blake2s(os.fsencode(path), digest_size=LABEL_DIGEST_BYTES).hexdigest()
+    digest = hashlib.blake2s(
+        os.fsencode(path), digest_size=LABEL_DIGEST_BYTES
+    ).hexdigest()
     return f"{LABEL_PREFIX}{digest}"
 
 
@@ -225,6 +223,13 @@ def new_database_uuid() -> bytes:
     return uuid.uuid4().bytes
 
 
+def _builtin_type_name(value: object) -> str:
+    """Name a public argument without invoking a hostile metaclass descriptor."""
+    value_type = type(value)
+    declared = type.__dict__["__name__"].__get__(value_type, type(value_type))
+    return str.__str__(declared)
+
+
 def assemble_database(
     config: DatabaseConfig, ports: PortRegistry, *, owns_ports: bool = False
 ) -> Database:
@@ -233,6 +238,15 @@ def assemble_database(
     ``owns_ports`` says whether this composition built the adapters. When it did, closing the
     database closes them; when the caller bound its own registry, they are left open.
     """
+    config = _canonical_database_config(config)
+    ports = _snapshot_port_registry(ports)
+    if type(owns_ports) is not bool:
+        observed = _builtin_type_name(owns_ports)
+        raise GrafxConfigurationError(
+            f"owns_ports must be a bool; got {observed}.",
+            field="owns_ports",
+            value=observed,
+        )
     raw_storage = _port(ports, "storage", StorageDevice)
     storage: StorageDevice = (
         ReadOnlyStorageDevice(raw_storage) if config.read_only else raw_storage
@@ -488,12 +502,13 @@ def assemble_database(
         # brought into the taxonomy rather than allowed to escape. Nothing is hidden: the
         # original is chained, so its type, message and traceback all survive.
         _release(closers)
+        cause = _builtin_type_name(failure)
         raise GrafxConfigurationError(
             f"A database could not be assembled at {config.path!r}: an adapter did not honour "
-            f"its port and raised {type(failure).__name__}: {failure}",
+            f"its port and raised {cause}.",
             field="ports",
             path=config.path,
-            cause=type(failure).__name__,
+            cause=cause,
         ) from failure
     except BaseException:
         # KeyboardInterrupt and SystemExit are not failures of this composition and are never
@@ -707,7 +722,9 @@ def _require_budget_for_the_stores(config: DatabaseConfig) -> None:
     )
 
 
-def _require_page_size_of_record(config: DatabaseConfig, storage: StorageDevice) -> None:
+def _require_page_size_of_record(
+    config: DatabaseConfig, storage: StorageDevice
+) -> None:
     """Refuse to open an existing database at a page size it was not created with (FR-1).
 
     Every paged door of the device divides a file by the page size it was built with, so a
@@ -1118,7 +1135,9 @@ def _read_existing_identity(
     return stored
 
 
-def _require_existing_identity_name(config: DatabaseConfig, storage: StorageDevice) -> None:
+def _require_existing_identity_name(
+    config: DatabaseConfig, storage: StorageDevice
+) -> None:
     """Require ``grafx.meta`` or issue the one authoritative absent-identity classification."""
     if storage.exists(META_FILE):
         return
@@ -1368,9 +1387,7 @@ def _read_first_open_intent_file(
             maximum=_FIRST_OPEN_IDENTITY_MAX_BYTES,
         )
     expected = (
-        _FIRST_OPEN_INTENT_HEAD.size
-        + identity_length
-        + _FIRST_OPEN_INTENT_TAIL.size
+        _FIRST_OPEN_INTENT_HEAD.size + identity_length + _FIRST_OPEN_INTENT_TAIL.size
     )
     if size != expected:
         raise GrafxCorruptionDetected(

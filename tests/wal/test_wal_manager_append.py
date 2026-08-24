@@ -17,6 +17,8 @@ from typing import Any
 
 import pytest
 
+from okto_grafx.engine import wal_manager as wal_module
+
 from okto_grafx.adapters.metrics_noop import NoOpMetricsSink
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
 from okto_grafx.domain.errors import (
@@ -327,6 +329,84 @@ def test_sequence_numbers_start_at_one_and_never_skip(wal: WalManager) -> None:
     assert lsns == [1, 2, 3, 4, 5, 6]
 
 
+def test_a_configured_segment_can_never_exceed_the_reader_ceiling(
+    make_wal: Callable[..., WalManager],
+    memory_device: MemoryStorageDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wal_module, "MAX_SEGMENT_READ_BYTES", MIN_SEGMENT_BYTES)
+    with pytest.raises(GrafxConfigurationError) as raised:
+        make_wal(memory_device, segment_bytes=MIN_SEGMENT_BYTES + 1)
+    assert raised.value.details["field"] == "segment_bytes"
+    assert memory_device.list_files("wal/") == ()
+
+
+def test_an_oversized_batch_is_refused_before_it_creates_an_unreadable_segment(
+    make_wal: Callable[..., WalManager],
+    memory_device: MemoryStorageDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wal_module, "MAX_SEGMENT_READ_BYTES", MIN_SEGMENT_BYTES)
+    manager = make_wal(memory_device, segment_bytes=MIN_SEGMENT_BYTES)
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        manager.append(make_record(payload=bytes(MIN_SEGMENT_BYTES)))
+
+    assert raised.value.details["field"] == "records"
+    assert raised.value.details["projected_segment_bytes"] > MIN_SEGMENT_BYTES
+    assert manager.last_lsn == 0
+    assert manager.total_bytes() == 0
+    assert memory_device.list_files("wal/") == ()
+
+
+def test_a_record_subclass_cannot_lie_about_the_segment_size(
+    make_wal: Callable[..., WalManager],
+    memory_device: MemoryStorageDevice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LyingRecord(WalRecord):
+        def encoded_length(self) -> int:
+            return 1
+
+    monkeypatch.setattr(wal_module, "MAX_SEGMENT_READ_BYTES", MIN_SEGMENT_BYTES)
+    manager = make_wal(memory_device, segment_bytes=MIN_SEGMENT_BYTES)
+    record = LyingRecord(
+        record_type=WalRecordType.WRITE_PAGE,
+        payload=bytes(220),
+        epoch=1,
+        txn_id=1,
+    )
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        manager.append(record)
+
+    assert raised.value.details["field"] == "records"
+    assert manager.last_lsn == 0
+    assert manager.total_bytes() == 0
+    assert memory_device.list_files("wal/") == ()
+
+
+def test_a_tampered_record_with_an_unreadable_payload_fails_typed_before_write(
+    make_wal: Callable[..., WalManager],
+    memory_device: MemoryStorageDevice,
+) -> None:
+    manager = make_wal(memory_device)
+    record = make_record()
+    released = memoryview(b"payload")
+    released.release()
+    object.__setattr__(record, "payload", released)
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        manager.append(record)
+
+    assert raised.value.details["field"] == "payload"
+    assert raised.value.details["position"] == 0
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert manager.last_lsn == 0
+    assert manager.total_bytes() == 0
+    assert memory_device.list_files("wal/") == ()
+
+
 def test_the_first_record_of_a_segment_describes_the_segment(wal: WalManager) -> None:
     """A segment that says which one it is and where the previous one ended is self-describing."""
     wal.append(make_record())
@@ -357,7 +437,9 @@ def test_a_second_segment_names_where_the_first_one_ended(
     assert all(header.previous_last_lsn > 0 for header in headers[1:])
 
 
-def test_a_record_without_a_descriptor_is_stamped_with_the_log_one(wal: WalManager) -> None:
+def test_a_record_without_a_descriptor_is_stamped_with_the_log_one(
+    wal: WalManager,
+) -> None:
     """TR-4 puts the granularity in the record, so a record read alone still describes itself."""
     wal.append(make_record(descriptor=""))
     assert all(record.descriptor == DESCRIPTOR for record in wal.read_from(0))
@@ -366,7 +448,11 @@ def test_a_record_without_a_descriptor_is_stamped_with_the_log_one(wal: WalManag
 def test_a_record_that_carries_its_own_descriptor_keeps_it(wal: WalManager) -> None:
     """An index writes its own granularity, and the log must not overwrite what it was told."""
     wal.append(make_record(descriptor="hash-v1;buckets=8"))
-    written = [record for record in wal.read_from(0) if record.record_type != WalRecordType.SEGMENT_HEADER]
+    written = [
+        record
+        for record in wal.read_from(0)
+        if record.record_type != WalRecordType.SEGMENT_HEADER
+    ]
     assert [record.descriptor for record in written] == ["hash-v1;buckets=8"]
 
 
@@ -387,12 +473,20 @@ def test_changing_the_granularity_changes_only_the_descriptor(
 
 def test_a_batch_gets_consecutive_numbers_and_returns_the_last(wal: WalManager) -> None:
     """The commit protocol reads the return value as the commit sequence number."""
-    last = wal.append_many([make_record(1), make_record(2), make_record(3, record_type=WalRecordType.COMMIT)])
+    last = wal.append_many(
+        [
+            make_record(1),
+            make_record(2),
+            make_record(3, record_type=WalRecordType.COMMIT),
+        ]
+    )
     assert last == wal.last_lsn
     assert [record.lsn for record in wal.read_from(0)] == [1, 2, 3, 4]
 
 
-def test_the_log_assigns_sequence_numbers_and_refuses_one_from_the_caller(wal: WalManager) -> None:
+def test_the_log_assigns_sequence_numbers_and_refuses_one_from_the_caller(
+    wal: WalManager,
+) -> None:
     """A caller-chosen number is how the same number gets written twice."""
     with pytest.raises(GrafxConfigurationError) as caught:
         wal.append(WalRecord(record_type=WalRecordType.COMMIT, lsn=7))
@@ -523,7 +617,9 @@ def test_a_participant_sees_a_segment_another_one_rolled(
     second.barrier()
 
     assert last == before + 1
-    assert first.last_lsn == last, "the first participant must see the second one's record"
+    assert first.last_lsn == last, (
+        "the first participant must see the second one's record"
+    )
     assert [segment.name for segment in second.segments()] == [
         segment.name for segment in first.segments()
     ]
@@ -559,7 +655,9 @@ def test_an_unchanged_log_is_not_read_again_on_every_append(
     for index in range(20):
         manager.append(make_record(index))
     manager.barrier()
-    assert len(manager.segments()) >= 3, "one size query must be cheaper than sizing them all"
+    assert len(manager.segments()) >= 3, (
+        "one size query must be cheaper than sizing them all"
+    )
 
     device.calls.clear()
     manager.append(make_record(99))
@@ -660,8 +758,12 @@ def test_recycling_by_another_participant_leaves_the_log_readable(
     second.append(make_record(99))
 
     held = [segment.name for segment in second.segments()]
-    assert set(surviving).issubset(set(held)), "a surviving segment must stay in the index"
-    assert set(held).isdisjoint(set(recycled)), "a recycled segment must leave the index"
+    assert set(surviving).issubset(set(held)), (
+        "a surviving segment must stay in the index"
+    )
+    assert set(held).isdisjoint(set(recycled)), (
+        "a recycled segment must leave the index"
+    )
     assert second.damage is None
     lsns = [record.lsn for record in second.read_from(0)]
     assert lsns == list(range(lsns[0], lsns[0] + len(lsns)))
@@ -707,7 +809,9 @@ def test_a_segment_that_cannot_be_read_refuses_the_append_without_wedging(
     tail = first.segments()[-1].name
     lying = OversizedTailDevice(memory_device)
     second = make_wal(lying)
-    assert second.damage is None, "the log has to be healthy when this participant opens it"
+    assert second.damage is None, (
+        "the log has to be healthy when this participant opens it"
+    )
     lying.oversized = tail
 
     with pytest.raises(GrafxCorruptionDetected):
@@ -802,7 +906,9 @@ def test_a_repair_that_removed_a_whole_segment_is_seen(
     report = first.truncate_after(target)
 
     assert report.completed is True
-    assert report.truncated_segment is None, "the cut fell on a boundary, so nothing was rolled"
+    assert report.truncated_segment is None, (
+        "the cut fell on a boundary, so nothing was rolled"
+    )
     following = second.append(make_record(99))
     second.barrier()
     # The number follows the repaired tail. It is not target + 1 exactly, because a full tail
@@ -1067,7 +1173,9 @@ def test_a_full_pass_also_drops_an_obligation_for_a_file_that_is_gone(
 
     cold = make_wal(memory_device, segment_bytes=512)
     assert cold.damage is None
-    assert [record.lsn for record in cold.read_from(0)] == list(range(1, cold.last_lsn + 1))
+    assert [record.lsn for record in cold.read_from(0)] == list(
+        range(1, cold.last_lsn + 1)
+    )
 
 
 def test_a_repair_reports_only_the_success_it_really_had(
@@ -1092,7 +1200,9 @@ def test_a_repair_reports_only_the_success_it_really_had(
 
     assert report.completed is True
     cold = make_wal(memory_device, segment_bytes=512)
-    assert cold.last_lsn == target, "a repair that reported success must have taken effect"
+    assert cold.last_lsn == target, (
+        "a repair that reported success must have taken effect"
+    )
     assert [record.lsn for record in cold.read_from(0)] == list(range(1, target + 1))
 
 
@@ -1410,7 +1520,9 @@ def test_an_unfilled_port_refuses_construction(
     assert caught.value.details["slot"] == slot
 
 
-@pytest.mark.parametrize("segment_bytes", [0, -1, MIN_SEGMENT_BYTES - 1, True, "4096", 1.5])
+@pytest.mark.parametrize(
+    "segment_bytes", [0, -1, MIN_SEGMENT_BYTES - 1, True, "4096", 1.5]
+)
 def test_a_segment_size_too_small_to_hold_a_header_is_refused(
     segment_bytes: object, memory_device: MemoryStorageDevice, clock: FrozenClock
 ) -> None:

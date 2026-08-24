@@ -16,21 +16,22 @@ behind a port, so the pure implementation below is the FALLBACK and the REFERENC
 never replaced, never accelerated in place and never deleted -- :func:`crc32c_reference` is the
 authority and :func:`install_crc32c` cannot touch it.
 
-WHY THE INSTALLER VALIDATES. A checksum accelerator that disagrees with the reference on one
-input does not fail loudly: it reports corruption on a healthy page, which is data the caller is
-then told to quarantine. That is the worst outcome in the taxonomy arriving from an optimisation,
-so byte-identity is not left to a test somebody might not run -- :func:`install_crc32c` proves it
-against :data:`CRC32C_ACCEPTANCE_CORPUS` before the candidate can ever be called on real bytes,
-and a candidate that differs anywhere is refused with the input that separated them. The corpus
-is hostile where accelerators actually break: every short length, the bytes either side of the
-word and block boundaries a slice-by-N loop steps over, and non-zero seeds.
+WHY THE INSTALLER AND RUNTIME VALIDATE. A checksum accelerator that disagrees with the reference
+on one input does not fail loudly: it reports corruption on a healthy page, which is data the
+caller is then told to quarantine. :func:`install_crc32c` therefore preflights a candidate and
+verifies every actual answer against the immutable reference. The shipped native adapter has a
+narrower trust boundary: only its closed list of established packages may use the corpus-checked
+fast path; a caller-supplied Python callable remains runtime-verified. In-process code can already
+replace modules and write files, so this boundary protects against provider defects without
+pretending arbitrary executable code can be proved by a finite corpus.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 
-from okto_grafx.domain.errors import GrafxConfigurationError
+from okto_grafx.domain.errors import GrafxConfigurationError, GrafxError
+from okto_grafx.domain.page.layout import CHECKSUM_SIZE, MAX_PAGE_SIZE
 
 __all__ = [
     "CRC32C_POLYNOMIAL",
@@ -92,17 +93,30 @@ def _require_seed(crc: object) -> int:
     place in the build that decides what a bad seed means, rather than one per implementation
     (A67).
     """
-    if not isinstance(crc, int) or isinstance(crc, bool) or not 0 <= crc <= _MASK_32:
+    if type(crc) is bool or not issubclass(type(crc), int):
         # The seed is an argument, not a byte off a page. corruption_detected is reserved for
         # damage, because FR-8 and FR-10 turn that code into truncation, quarantine and a
         # forensic ledger entry -- a caller passing the wrong type must not manufacture an
         # integrity incident (A11-revised).
+        observed: object = _builtin_type_name(crc)
         raise GrafxConfigurationError(
-            f"A CRC-32C seed must be an unsigned 32-bit integer; got {crc!r}.",
+            f"A CRC-32C seed must be an unsigned 32-bit integer; got {observed!r}.",
             field="crc",
-            value=repr(crc),
+            value=observed,
         )
-    return crc
+    plain = int.__int__(crc)
+    if not 0 <= plain <= _MASK_32:
+        observed = (
+            plain
+            if int.bit_length(plain) <= 256
+            else f"int<{int.bit_length(plain)} bits>"
+        )
+        raise GrafxConfigurationError(
+            f"A CRC-32C seed must be an unsigned 32-bit integer; got {observed!r}.",
+            field="crc",
+            value=observed,
+        )
+    return plain
 
 
 def crc32c_reference(data: bytes, crc: int = CRC32C_INITIAL) -> int:
@@ -145,18 +159,42 @@ def _acceptance_inputs() -> tuple[tuple[bytes, int], ...]:
 
     * every length from 0 to 40, which is the tail a slice-by-4, -8 or -16 loop hands to its
       byte-at-a-time remainder -- the single most common defect in a fast CRC;
-    * the bytes either side of 255/256, 511/512, 4095/4096 and 8191/8192, which are the word,
-      page and block boundaries such a loop steps over;
+    * the bytes either side of 255/256, 511/512, 4095/4096, 8191/8192 and the largest legal page
+      checksum range, which are the word, page and block boundaries such a loop steps over;
     * non-zero seeds, because this module's chaining convention passes the previous RESULT (an
       already-finalised value) and a library that expects a raw internal register instead is
       wrong only when the seed is not zero -- which is exactly the case a page checksum of one
       contiguous range never exercises;
     * the published vectors, so the corpus pins the algorithm and not merely the reference.
     """
-    pattern = bytes((index * 37 + 11) % 256 for index in range(8200))
+    pattern = bytes((index * 37 + 11) % 256 for index in range(MAX_PAGE_SIZE + 1))
     lengths = list(range(0, 41))
-    for boundary in (63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513,
-                     1023, 1024, 1025, 4095, 4096, 4097, 8191, 8192):
+    for boundary in (
+        63,
+        64,
+        65,
+        127,
+        128,
+        129,
+        255,
+        256,
+        257,
+        511,
+        512,
+        513,
+        1023,
+        1024,
+        1025,
+        4095,
+        4096,
+        4097,
+        8191,
+        8192,
+        MAX_PAGE_SIZE - CHECKSUM_SIZE - 1,
+        MAX_PAGE_SIZE - CHECKSUM_SIZE,
+        MAX_PAGE_SIZE - CHECKSUM_SIZE + 1,
+        MAX_PAGE_SIZE,
+    ):
         lengths.append(boundary)
     seeds = (CRC32C_INITIAL, 1, 0xFFFFFFFF, CRC32C_POLYNOMIAL_REFLECTED, 0x12345678)
     inputs: list[tuple[bytes, int]] = []
@@ -174,6 +212,115 @@ CRC32C_ACCEPTANCE_CORPUS: tuple[tuple[bytes, int], ...] = _acceptance_inputs()
 """Every (data, seed) an accelerator must reproduce byte for byte before it may be installed."""
 
 
+def _builtin_type_name(value: object) -> str:
+    """Name a candidate result without consulting a hostile metaclass descriptor."""
+    value_type = type(value)
+    declared = type.__dict__["__name__"].__get__(value_type, type(value_type))
+    return str.__str__(declared)
+
+
+def _require_crc32c_answer(
+    value: object,
+    *,
+    field: str,
+    name: str,
+    length: int,
+    seed: int,
+) -> int:
+    """Return an exact unsigned 32-bit checksum without invoking result hooks."""
+    if type(value) is int:
+        if 0 <= value <= _MASK_32:
+            return value
+        observed = _integer_diagnostic(value)
+        raise GrafxConfigurationError(
+            f"The CRC-32C {field} {name!r} returned {observed}, outside unsigned 32-bit range.",
+            field=field,
+            value=name,
+            produced=observed,
+            length=length,
+            seed=seed,
+        )
+    if type(value) is bool or not issubclass(type(value), int):
+        observed = _builtin_type_name(value)
+        raise GrafxConfigurationError(
+            f"The CRC-32C {field} {name!r} returned {observed}, not an unsigned 32-bit int.",
+            field=field,
+            value=name,
+            result_type=observed,
+            length=length,
+            seed=seed,
+        )
+    answer = int.__int__(value)
+    if not 0 <= answer <= _MASK_32:
+        observed = _integer_diagnostic(answer)
+        raise GrafxConfigurationError(
+            f"The CRC-32C {field} {name!r} returned {observed}, outside unsigned 32-bit range.",
+            field=field,
+            value=name,
+            produced=observed,
+            length=length,
+            seed=seed,
+        )
+    return answer
+
+
+def _integer_diagnostic(value: int) -> int | str:
+    """Describe an integer without triggering Python's decimal digit conversion limit."""
+    bits = int.bit_length(value)
+    return value if bits <= 256 else f"int<{bits} bits>"
+
+
+def _require_crc32c_agreement(
+    produced: int,
+    payload: bytes,
+    seed: int,
+    *,
+    name: str,
+    field: str,
+) -> int:
+    """Return an answer only when the immutable reference agrees on these exact bytes."""
+    expected = crc32c_reference(payload, seed)
+    if produced != expected:
+        raise GrafxConfigurationError(
+            f"The CRC-32C {field} {name!r} answered {produced:#010x} where the reference "
+            f"answers {expected:#010x}; using it would corrupt or falsely reject stored data.",
+            field=field,
+            value=name,
+            length=len(payload),
+            seed=seed,
+            expected=expected,
+            produced=produced,
+        )
+    return produced
+
+
+def _candidate_answer(
+    function: Callable[[bytes, int], int], payload: bytes, seed: int, name: str
+) -> int:
+    """Call one candidate and contain every ordinary provider failure as configuration."""
+    try:
+        observed = function(payload, seed)
+    except GrafxError:
+        raise
+    except Exception as failure:
+        cause = _builtin_type_name(failure)
+        raise GrafxConfigurationError(
+            f"The CRC-32C implementation {name!r} raised {cause} during validation.",
+            field="crc32c",
+            value=name,
+            cause=cause,
+            length=len(payload),
+            seed=seed,
+        ) from failure
+    return _require_crc32c_answer(
+        observed,
+        field="implementation",
+        name=name,
+        length=len(payload),
+        seed=seed,
+    )
+
+
 def _validate_candidate(function: Callable[[bytes, int], int], name: str) -> None:
     """Refuse an accelerator that does not reproduce the reference exactly, anywhere.
 
@@ -183,7 +330,7 @@ def _validate_candidate(function: Callable[[bytes, int], int], name: str) -> Non
     it, because "the checksums differ" is not something a caller can act on.
     """
     for payload, answer in CRC32C_KNOWN_ANSWERS:
-        produced = function(payload, CRC32C_INITIAL)
+        produced = _candidate_answer(function, payload, CRC32C_INITIAL, name)
         if produced != answer:
             raise GrafxConfigurationError(
                 f"The CRC-32C implementation {name!r} answered {produced:#010x} for a published "
@@ -196,7 +343,7 @@ def _validate_candidate(function: Callable[[bytes, int], int], name: str) -> Non
             )
     for payload, seed in CRC32C_ACCEPTANCE_CORPUS:
         expected = crc32c_reference(payload, seed)
-        produced = function(payload, seed)
+        produced = _candidate_answer(function, payload, seed, name)
         if produced != expected:
             raise GrafxConfigurationError(
                 f"The CRC-32C implementation {name!r} answered {produced:#010x} where the "
@@ -211,8 +358,11 @@ def _validate_candidate(function: Callable[[bytes, int], int], name: str) -> Non
             )
 
 
-_implementation: Callable[[bytes, int], int] = crc32c_reference
-_implementation_name: str = PURE_IMPLEMENTATION_NAME
+_implementation_state: tuple[Callable[[bytes, int], int], str] = (
+    crc32c_reference,
+    PURE_IMPLEMENTATION_NAME,
+)
+"""Atomically published checksum function and the name that describes that same function."""
 
 
 def crc32c_implementation() -> str:
@@ -221,7 +371,7 @@ def crc32c_implementation() -> str:
     A database that reports what computed its checksums is a database whose numbers can be
     reproduced. It is the same disclosure the vector adapters make through ``name``.
     """
-    return _implementation_name
+    return _implementation_state[1]
 
 
 def install_crc32c(function: Callable[[bytes, int], int], *, name: str) -> str:
@@ -244,22 +394,90 @@ def install_crc32c(function: Callable[[bytes, int], int], *, name: str) -> str:
     why it is a validating installer and not an assignment.
     """
     if not callable(function):
+        observed = _builtin_type_name(function)
         raise GrafxConfigurationError(
-            f"A CRC-32C implementation must be callable; got {type(function).__name__}.",
+            f"A CRC-32C implementation must be callable; got {observed}.",
             field="crc32c",
-            value=type(function).__name__,
+            value=observed,
         )
-    if not isinstance(name, str) or not name:
+    if not issubclass(type(name), str):
+        observed = _builtin_type_name(name)
         raise GrafxConfigurationError(
-            f"A CRC-32C implementation must be named so a database can report it; got {name!r}.",
+            f"A CRC-32C implementation must have a string name; got {observed}.",
             field="name",
-            value=repr(name),
+            value=observed,
         )
-    _validate_candidate(function, name)
-    global _implementation, _implementation_name
-    replaced = _implementation_name
-    _implementation = function
-    _implementation_name = name
+    name = str.__str__(name)
+    if not name:
+        raise GrafxConfigurationError(
+            "A CRC-32C implementation must have a non-empty name.",
+            field="name",
+            value="",
+        )
+    if function is not crc32c_reference:
+        _validate_candidate(function, name)
+
+    def checked(data: bytes, crc: int) -> int:
+        """Contain and oracle-check one answer from an injected implementation."""
+        produced = _candidate_answer(function, data, crc, name)
+        return _require_crc32c_agreement(
+            produced,
+            data,
+            crc,
+            name=name,
+            field="implementation",
+        )
+
+    return _publish_implementation(
+        crc32c_reference if function is crc32c_reference else checked,
+        name,
+    )
+
+
+def _install_validated_crc32c(
+    function: Callable[[bytes, int], int], *, name: str
+) -> str:
+    """Install a corpus-validated callable from the native adapter's closed provider list.
+
+    This private door exists so ``checksum='native'`` remains an honest acceleration. It is not
+    used for injected providers: :class:`NativeCrc32c` routes those through
+    :func:`install_crc32c`, whose runtime oracle makes arbitrary callables fail closed.
+    """
+    if not callable(function):
+        observed = _builtin_type_name(function)
+        raise GrafxConfigurationError(
+            f"A CRC-32C implementation must be callable; got {observed}.",
+            field="crc32c",
+            value=observed,
+        )
+    if not issubclass(type(name), str):
+        observed = _builtin_type_name(name)
+        raise GrafxConfigurationError(
+            f"A CRC-32C implementation must have a string name; got {observed}.",
+            field="name",
+            value=observed,
+        )
+    plain_name = str.__str__(name)
+    if not plain_name:
+        raise GrafxConfigurationError(
+            "A CRC-32C implementation must have a non-empty name.",
+            field="name",
+            value="",
+        )
+    _validate_candidate(function, plain_name)
+
+    def checked(data: bytes, crc: int) -> int:
+        """Contain one fast-path answer without adding the Python oracle."""
+        return _candidate_answer(function, data, crc, plain_name)
+
+    return _publish_implementation(checked, plain_name)
+
+
+def _publish_implementation(function: Callable[[bytes, int], int], name: str) -> str:
+    """Atomically publish a validated function/name pair and return the replaced name."""
+    global _implementation_state
+    replaced = _implementation_state[1]
+    _implementation_state = (function, name)
     return replaced
 
 
@@ -269,8 +487,10 @@ def crc32c(data: bytes, crc: int = CRC32C_INITIAL) -> int:
     Passing the result of an earlier call as crc checksums the concatenation of the two byte
     ranges, which is what lets a caller checksum a page without first joining its parts.
 
-    The answer is the reference's answer whatever is installed: an accelerator reached this door
-    only by reproducing :func:`crc32c_reference` on every input of the acceptance corpus, so the
-    bytes on disk do not depend on which implementation a given process happened to load.
+    Injected implementations are compared with the reference on these exact bytes before an
+    answer may reach storage. The shipped native adapter's closed provider list is the explicit
+    trust boundary: those packages are corpus-validated and then run without the Python oracle,
+    which keeps ``checksum='native'`` an honest acceleration.
     """
-    return _implementation(data, _require_seed(crc))
+    implementation = _implementation_state[0]
+    return implementation(data, _require_seed(crc))

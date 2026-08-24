@@ -1252,6 +1252,13 @@ option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`
   maintenance failures stay pending and cannot invalidate the commit; read/no-op commits do
   nothing. Fifteen regressions in `tests/api/test_auto_checkpoint.py` include WAL recycle/reopen,
   hostile diagnostics, broken/re-entrant EventSinks and process-control signals.
+- **CLOSED** — configuration scalars are canonical exact built-ins before they reach adapters or
+  persisted descriptors. WAL segment configuration now matches the reader's `[256 B, 1 GiB]`
+  domain, including oversized batches; the buffer minimum is rejected in `DatabaseConfig`;
+  hostile `PathLike`, registry state, config subclasses and forged exact config instances fail
+  typed before first-open. Registry composition uses one validated atomic snapshot. The
+  process-global checksum selector also runs with custom registries, and checksum providers can no
+  longer pass validation with forged equality or a non-`u32` result.
 - **IN PROGRESS (C13)** — `vector_recall_target` remains non-certifying until the deterministic
   pure/NumPy recall calibration publishes its gauge and CI enables `--require-recall`. It must not
   be described as an active runtime guarantee before that gate lands.
