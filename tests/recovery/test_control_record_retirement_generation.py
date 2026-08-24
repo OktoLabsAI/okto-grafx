@@ -259,11 +259,31 @@ def test_only_the_lease_and_canonical_reader_records_pass_the_target_gate(
         "control/other.bin",
         "control/readers/.reader",
         "control/readers/nested.lease",
+        "control/readers/UPPER.reader",
+        "control/readers/a..b.reader",
     ):
         _seed(stack, name)
         with pytest.raises(GrafxRecoveryRefused, match="canonical retirement target"):
             manager.retire_control_record(name)
         assert _bytes_of(stack, name) == DAMAGED, name
+
+
+def test_a_near_canonical_reader_id_refuses_before_any_byte_is_read(
+    stack: Stack,
+) -> None:
+    """Ids the coordination adapter could never have written are refused at the gate:
+    slashes, traversal, over-length and non-ASCII never reach the device or the probe."""
+    probe = _DamageProbe()
+    manager = _manager(stack, control_probe=probe)
+    for name in (
+        "control/readers/a/b.reader",
+        "control/readers/" + "x" * 97 + ".reader",
+        "control/readers/n\u00e3o.reader",
+        "control/readers/..reader",
+    ):
+        with pytest.raises(GrafxRecoveryRefused, match="canonical retirement target"):
+            manager.retire_control_record(name)
+    assert probe.calls == 0
 
 
 def test_commit_state_can_never_leave_through_the_retirement_door(stack: Stack) -> None:

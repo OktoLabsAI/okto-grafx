@@ -231,6 +231,15 @@ def test_a_forged_permit_is_refused_at_every_fenced_door(stack: Stack) -> None:
         lambda: manager._require_read_only_consistent_fenced(object()),  # noqa: SLF001
         lambda: manager._preserve(None, [], object()),  # type: ignore[arg-type]  # noqa: SLF001
         lambda: manager._truncate(None, [], object()),  # type: ignore[arg-type]  # noqa: SLF001
+        lambda: manager._repair_ledger([], object()),  # type: ignore[arg-type]  # noqa: SLF001
+        lambda: manager._redo(  # noqa: SLF001
+            None,  # type: ignore[arg-type]
+            [],
+            replay=None,  # type: ignore[arg-type]
+            state=None,  # type: ignore[arg-type]
+            state_was_damaged=False,
+            permit=object(),  # type: ignore[arg-type]
+        ),
     ):
         with pytest.raises(GrafxRecoveryRefused, match="forged or absent"):
             door()
@@ -279,6 +288,8 @@ def test_a_permit_dies_with_its_section_and_cannot_be_replayed(stack: Stack) -> 
         manager._run_fenced(manager.seen)  # noqa: SLF001
     with pytest.raises(GrafxRecoveryRefused, match="revoked"):
         manager._truncate(None, [], manager.seen)  # type: ignore[arg-type]  # noqa: SLF001
+    with pytest.raises(GrafxRecoveryRefused, match="revoked"):
+        manager._repair_ledger([], manager.seen)  # type: ignore[arg-type]  # noqa: SLF001
 
 
 def test_a_base_exception_inside_the_section_still_revokes_the_permit(

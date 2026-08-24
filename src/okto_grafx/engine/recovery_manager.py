@@ -189,20 +189,49 @@ _READER_SUFFIX: str = ".reader"
 """Canonical reader records: ``control/readers/<reader_id>.reader`` and nothing else."""
 
 
+_MAX_READER_ID_LENGTH: int = 96
+"""The identifier bound the coordination adapter enforces (its ``_MAX_IDENTIFIER_LENGTH``)."""
+
+_READER_ID_EXTRA_CHARACTERS: frozenset[str] = frozenset(".-_")
+"""Beyond lower-case letters and digits, exactly what the adapter's validator accepts."""
+
+
+def _is_canonical_reader_id(value: str) -> bool:
+    """True when the id is byte-for-byte one the coordination adapter could have written.
+
+    This mirrors the adapter's ``_validate_identifier`` -- non-empty, at most 96 characters,
+    ASCII, never ``.``/``..`` nor containing ``..``, and drawn from lower-case letters, digits,
+    ``.``, ``-`` and ``_`` only (file identity must not depend on case, CONTRACT.md section 11
+    item 9). The engine may not import the adapter (G2), so the rule is restated here and
+    pinned against near-canonical names by the retirement battery; a slash can never appear
+    because the id is taken between the canonical directory and the suffix.
+    """
+    if not value or len(value) > _MAX_READER_ID_LENGTH:
+        return False
+    if value in {".", ".."} or ".." in value or not value.isascii():
+        return False
+    return all(
+        character.isdigit()
+        or (character.isalpha() and character.islower())
+        or character in _READER_ID_EXTRA_CHARACTERS
+        for character in value
+    )
+
+
 def _is_canonical_retirement_target(name: str) -> bool:
     """True only for the writer lease and canonical reader records (M0C).
 
     The retirement door destroys a name, so the names it accepts are enumerated rather than
-    pattern-matched broadly: the lease, and readers under their canonical directory with a
-    non-empty id. ``commit.state`` is already protected upstream and can never reach this.
+    pattern-matched broadly: the lease, and readers directly under their canonical directory
+    whose ``<reader_id>`` the coordination adapter itself would accept. ``commit.state`` is
+    already protected upstream and can never reach this.
     """
     if name == _LEASE_RECORD:
         return True
-    return (
-        name.startswith(_READERS_PREFIX)
-        and name.endswith(_READER_SUFFIX)
-        and len(name) > len(_READERS_PREFIX) + len(_READER_SUFFIX)
-    )
+    if not name.startswith(_READERS_PREFIX) or not name.endswith(_READER_SUFFIX):
+        return False
+    reader_id = name[len(_READERS_PREFIX) : -len(_READER_SUFFIX)]
+    return "/" not in reader_id and _is_canonical_reader_id(reader_id)
 
 
 def _generation_detail(damage: str, digest: str) -> str:
@@ -660,7 +689,7 @@ class RecoveryManager:
                     last_good_lsn=plan.last_good_lsn,
                     discards=plan.discards,
                 )
-            self._repair_ledger(findings)
+            self._repair_ledger(findings, permit)
             entries_created = self._preserve(plan, findings, permit)
             self._truncate(plan, findings, permit)
             outcome = stronger_outcome(outcome, OUTCOME_TRUNCATED)
@@ -673,7 +702,7 @@ class RecoveryManager:
             # branch above raises before it can be reached. Pinned by
             # ``test_a_clean_log_under_refuse_leaves_a_damaged_ledger_exactly_as_it_was``.
             if self._policy != POLICY_REFUSE:
-                self._repair_ledger(findings)
+                self._repair_ledger(findings, permit)
         if (
             manager is not None
             and not state_was_damaged
@@ -688,6 +717,7 @@ class RecoveryManager:
             replay=replay,
             state=state,
             state_was_damaged=state_was_damaged,
+            permit=permit,
         )
         self._count_outcome(outcome)
         report = RecoveryReport(
@@ -968,7 +998,9 @@ class RecoveryManager:
         page = self._pool.codec.decode_page(raw, verify=True)
         FileHeaderPage.read(page)
 
-    def _repair_ledger(self, findings: list[RecoveryFinding]) -> None:
+    def _repair_ledger(
+        self, findings: list[RecoveryFinding], permit: _RecoveryPermit
+    ) -> None:
         """Make the ledger writable again after a crash during one of its own appends (TR-5).
 
         The interrupted bytes are quarantined before they are cut, exactly like a damaged log
@@ -979,6 +1011,7 @@ class RecoveryManager:
         destroy are one door there, so this component cannot skip the first half by editing the
         second. What is left here is the reporting.
         """
+        self._require_permit(permit)
         damage = self._ledger.damage
         if damage is None:
             return
@@ -1249,6 +1282,7 @@ class RecoveryManager:
         replay: CommittedReplay,
         state: CommitState,
         state_was_damaged: bool,
+        permit: _RecoveryPermit,
     ) -> int:
         """Complete committed WAL work and publish it as one fail-closed unit.
 
@@ -1257,6 +1291,7 @@ class RecoveryManager:
         into a successful report: publishing a watermark after skipping one mandatory effect
         would make a partial commit visible permanently.
         """
+        self._require_permit(permit)
         del (
             plan
         )  # the committed replay is the only part of the scan this stage consumes
