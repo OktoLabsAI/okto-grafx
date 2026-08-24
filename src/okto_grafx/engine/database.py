@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
 
@@ -174,7 +174,10 @@ class DatabaseIdentity:
 
     def __post_init__(self) -> None:
         """Reject an identity that could not be encoded or could not be true."""
-        if not isinstance(self.database_uuid, bytes) or len(self.database_uuid) != _UUID_BYTES:
+        if (
+            not isinstance(self.database_uuid, bytes)
+            or len(self.database_uuid) != _UUID_BYTES
+        ):
             raise GrafxConfigurationError(
                 f"A database identity is exactly {_UUID_BYTES} bytes; got "
                 f"{len(self.database_uuid) if isinstance(self.database_uuid, bytes) else '?'}.",
@@ -186,7 +189,11 @@ class DatabaseIdentity:
             ("page_size", self.page_size, 0xFFFFFFFF),
             ("partitions_per_table", self.partitions_per_table, 0xFFFF),
         ):
-            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= ceiling:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= ceiling
+            ):
                 raise GrafxConfigurationError(
                     f"The identity field {field!r} is outside its width: {value!r}.",
                     field=field,
@@ -488,20 +495,22 @@ class Transaction:
         transaction that lost is still active and still free of side effects, so a caller may
         call :meth:`retry` on the database and try again.
         """
-        self._require_active()
-        report = self._database.transactions.commit(self._context)
-        self._report = report
-        self._finished = True
-        self._database._settle_schema(self._context, committed=True)
-        return report
+        with self._database._public_transition():
+            self._require_active()
+            report = self._database.transactions.commit(self._context)
+            self._report = report
+            self._finished = True
+            self._database._settle_schema(self._context, committed=True)
+            return report
 
     def rollback(self) -> None:
         """Abandon this transaction. Rolling back twice is a no-op, never an error."""
-        if self._finished:
-            return
-        self._finished = True
-        self._database.transactions.rollback(self._context)
-        self._database._settle_schema(self._context, committed=False)
+        with self._database._public_transition():
+            if self._finished:
+                return
+            self._finished = True
+            self._database.transactions.rollback(self._context)
+            self._database._settle_schema(self._context, committed=False)
 
     def __enter__(self) -> Self:
         """Return this transaction so a ``with`` block can use it."""
@@ -581,6 +590,9 @@ class Database:
         "_read_only",
         "_closers",
         "_closed",
+        "_close_releasing",
+        "_close_released",
+        "_close_failure",
         "_recovery_report",
         "_attached_indexes",
         "_stale_indexes",
@@ -650,6 +662,9 @@ class Database:
         self._metrics_endpoint: str | None = metrics_endpoint
         self._closers: tuple[Callable[[], None], ...] = tuple(closers)
         self._closed: bool = False
+        self._close_releasing: bool = False
+        self._close_released: bool = False
+        self._close_failure: BaseException | None = None
         self._recovery_report: object = recovery_report
         self._attached_indexes: tuple[str, ...] = tuple(attached_indexes)
         self._stale_indexes: tuple[str, ...] = tuple(stale_indexes)
@@ -685,6 +700,21 @@ class Database:
     def closed(self) -> bool:
         """Return True once :meth:`close` has run; a closed database refuses every door."""
         return self._closed
+
+    @property
+    def close_complete(self) -> bool:
+        """Return True once the elected caller finished lower-layer release.
+
+        A concurrent or reentrant ``close`` that observes a release already in progress returns
+        without waiting on host-owned closer code. Terminal refusal is already effective, while
+        this property remains False until that elected caller exhausts every release step.
+        """
+        return self._close_released
+
+    @property
+    def close_failure(self) -> BaseException | None:
+        """Return a deferred close failure that could not replace a transaction outcome."""
+        return self._close_failure
 
     @property
     def metrics_endpoint(self) -> str | None:
@@ -805,7 +835,9 @@ class Database:
 
         Refuses with GrafxUnsupportedOperation when the composition has no index manager.
         """
-        return self._require_component("indexes", self._indexes, "the index framework (C7)")
+        return self._require_component(
+            "indexes", self._indexes, "the index framework (C7)"
+        )
 
     @property
     def ledger(self) -> object:
@@ -821,7 +853,9 @@ class Database:
 
         Refuses with GrafxUnsupportedOperation when the composition has no quarantine store.
         """
-        return self._require_component("quarantine", self._quarantine, "quarantine (C6)")
+        return self._require_component(
+            "quarantine", self._quarantine, "quarantine (C6)"
+        )
 
     @property
     def vectors(self) -> object:
@@ -829,7 +863,9 @@ class Database:
 
         Refuses with GrafxUnsupportedOperation when the composition has no vector engine.
         """
-        return self._require_component("vectors", self._vectors, "the vector engine (C9)")
+        return self._require_component(
+            "vectors", self._vectors, "the vector engine (C9)"
+        )
 
     @property
     def queries(self) -> object:
@@ -837,7 +873,9 @@ class Database:
 
         Refuses with GrafxUnsupportedOperation when the composition has no query engine.
         """
-        return self._require_component("queries", self._queries, "the query engine (C10)")
+        return self._require_component(
+            "queries", self._queries, "the query engine (C10)"
+        )
 
     # --- transactions -------------------------------------------------------------------------
 
@@ -853,7 +891,19 @@ class Database:
         parsed = TransactionMode.parse(mode)
         if parsed is TransactionMode.WRITE:
             self._require_writable("begin a write transaction")
-        return Transaction(self, self._transactions.begin(parsed.value))
+        with self._public_transition():
+            context = self._transactions.begin(parsed.value)
+            if self._closed or not context.active:
+                # A clock/telemetry callback may request close and return normally. The manager
+                # performs the same revalidation, but the facade owns the final publication of
+                # the wrapper and therefore seals this boundary too.
+                self._transactions.close()
+                raise GrafxUnsupportedOperation(
+                    f"This database at {self._path!r} closed while beginning a transaction.",
+                    path=self._path,
+                    operation="begin a transaction",
+                )
+            return Transaction(self, context)
 
     def retry(self, transaction: Transaction) -> Transaction:
         """Open the successor of a transaction optimistic validation refused (BR-6).
@@ -874,8 +924,17 @@ class Database:
         # DDL registers cleanly instead of being refused by its own predecessor's leftovers --
         # which made the documented BR-6 retry loop unable to ever succeed for a schema change,
         # and let the successor's later rows commit against a phantom table.
-        self._settle_schema(transaction.context, committed=False)
-        return Transaction(self, self._transactions.retry(transaction.context))
+        with self._public_transition():
+            self._settle_schema(transaction.context, committed=False)
+            context = self._transactions.retry(transaction.context)
+            if self._closed or not context.active:
+                self._transactions.close()
+                raise GrafxUnsupportedOperation(
+                    f"This database at {self._path!r} closed while retrying a transaction.",
+                    path=self._path,
+                    operation="retry a transaction",
+                )
+            return Transaction(self, context)
 
     @contextmanager
     def transaction(self, mode: str = "write") -> Iterator[Transaction]:
@@ -917,7 +976,9 @@ class Database:
         """
         self._require_open()
         _require_text("statement", text)
-        engine = self._require_component("queries", self._queries, "the query engine (C10)")
+        engine = self._require_component(
+            "queries", self._queries, "the query engine (C10)"
+        )
         with self._transactions.page_access_section():
             return engine.execute(text, context, parameters)  # type: ignore[attr-defined]
 
@@ -1036,17 +1097,20 @@ class Database:
     def close(self) -> None:
         """Release everything this database opened, and never corrupt anything doing it (FR-1).
 
-        The order is the reverse of the order things were acquired, and every step runs even when
-        an earlier one failed: an open transaction is aborted, its reader registration withdrawn,
-        the dirty pages written back, and whatever the composition root opened is released. A
-        database that fails to release something is still CLOSED afterwards -- refusing to record
-        that would leave a caller with an object it can neither use nor retire -- and the first
-        failure is raised once every step has been attempted.
+        The order is the reverse of the order things were acquired. Transaction close must first
+        prove quiescence; if acquiring that proof fails, lower dependencies stay open and a later
+        call retries the safe leak. Once quiescent, every release step runs even when an earlier
+        one failed. A database that fails to release something is still CLOSED afterwards --
+        refusing to record that would leave a caller with an object it can neither use nor retire
+        -- and the first failure is raised once every safe step has been attempted.
 
         Closing twice is a no-op. Closing with a transaction open aborts it: nothing of an open
-        transaction has reached the device, so abandoning it is the whole of that promise.
+        transaction has reached the device, so abandoning it is the whole of that promise. A
+        concurrent or reentrant caller does not join an already elected releaser across foreign
+        hooks; it returns terminal but incomplete, observable through :attr:`close_complete`,
+        and the elected caller finishes the release exactly once.
         """
-        if self._closed:
+        if self._close_released:
             return
         # Marked closed BEFORE anything is released. A release path calls host-supplied code --
         # an event sink, a metrics publisher, a storage device -- and any of it may re-enter this
@@ -1054,9 +1118,58 @@ class Database:
         # time (A91). There is no lock here to make re-entry safe by exclusion, deliberately:
         # a lock held across foreign code is the defect A91 names.
         self._closed = True
+        self._transactions.request_close()
+        if (
+            self._facade_transition_reentrant()
+            or self._transactions.transition_active
+            or self._close_releasing
+        ):
+            # A callback arrived inside begin/commit/rollback/retry or inside this close's own
+            # host release phase. Terminal state is visible now, but cleanup is deliberately a
+            # safe leak until a later explicit close can prove quiescence.
+            return
         failures: list[BaseException] = []
+        try:
+            self._close_transactions()
+        except BaseException as failure:
+            failures.append(failure)
+        if not self._transactions.close_complete:
+            # A participant-section pre-enter failure or a same-context transition means a
+            # transaction winner may still touch WAL/pool/storage. Never flush or release a
+            # dependency under it; unlike a completed release, this state is retryable by close.
+            if failures:
+                if self._close_failure is None:
+                    self._close_failure = failures[0]
+                raise failures[0]
+            return
+        if self._facade_transition_active():
+            # Manager settlement may finish while another thread is still publishing the
+            # wrapper outcome or settling QueryEngine schema state. Terminal refusal is already
+            # visible, but pool/storage release waits for that thread's transition-finally to
+            # retry close after the adapter's global count reaches zero.
+            if failures:
+                if self._close_failure is None:
+                    self._close_failure = failures[0]
+                raise failures[0]
+            return
+        # Two callers can both return from manager.close after it becomes complete. Elect exactly
+        # one lower-layer releaser while holding the same participant exclusion that established
+        # quiescence, then drop that exclusion before invoking any host-owned release hook. A
+        # failed claim changes no release flag: dependencies remain safely open and close can be
+        # retried.
+        if self._close_released or self._close_releasing:
+            return
+        try:
+            with self._transactions.database_release_section():
+                if self._close_released or self._close_releasing:
+                    return
+                self._close_releasing = True
+        except BaseException as failure:
+            failures.append(failure)
+            if self._close_failure is None:
+                self._close_failure = failures[0]
+            raise failures[0]
         for step in (
-            self._close_transactions,
             self._flush_pages,
             self._publish_metrics,
             self._release_closers,
@@ -1065,7 +1178,11 @@ class Database:
                 step()
             except BaseException as failure:
                 failures.append(failure)
+        self._close_released = True
+        self._close_releasing = False
         if failures:
+            if self._close_failure is None:
+                self._close_failure = failures[0]
             raise failures[0]
 
     def __enter__(self) -> Self:
@@ -1158,6 +1275,47 @@ class Database:
             raise failures[0]
 
     # --- internals ----------------------------------------------------------------------------
+
+    @contextmanager
+    def _public_transition(self) -> Iterator[None]:
+        """Defer dependency release until one wrapper outcome and schema settlement finish.
+
+        The contained metrics adapter owns the process-local transition mechanism required by
+        G2; the pure facade only consumes its injected context. A clock or telemetry callback can
+        publish terminal state immediately, while lower dependency release waits for its wrapper
+        transition to leave. Another thread still contends through the participant section. The
+        supported ``connect`` assembly always supplies this capability; the null context is only
+        a compatibility fallback for direct internal construction and offers no reentrancy seam.
+        """
+        transition = getattr(self._metrics, "transition", None)
+        boundary = transition() if callable(transition) else nullcontext()
+        try:
+            with boundary:
+                yield
+        finally:
+            if self._closed and not self._close_released:
+                try:
+                    self.close()
+                except BaseException as failure:
+                    # A close requested by host telemetry/clock is resumed only after the
+                    # transaction and schema outcome settle. Its failure is diagnostics, not a
+                    # reason to turn a durable commit into an apparent failure and invite retry.
+                    if self._close_failure is None:
+                        self._close_failure = failure
+
+    def _facade_transition_active(self) -> bool:
+        """Read the contained adapter's host-free cross-thread settlement capability."""
+        try:
+            return bool(getattr(self._metrics, "facade_transition_active", False))
+        except BaseException:  # noqa: BLE001 - telemetry cannot control dependency release
+            return False
+
+    def _facade_transition_reentrant(self) -> bool:
+        """Read whether this execution context re-entered its own facade transition."""
+        try:
+            return bool(getattr(self._metrics, "transition_active", False))
+        except BaseException:  # noqa: BLE001 - telemetry cannot control dependency release
+            return False
 
     def _require_writable(self, operation: str) -> None:
         """Refuse an operation that would write, on a database opened read-only.

@@ -45,7 +45,9 @@ def test_connect_opens_an_in_memory_database_and_closes_it() -> None:
     assert db.closed is True
 
 
-def test_connect_creates_the_directory_and_the_files_a_database_needs(tmp_path: Path) -> None:
+def test_connect_creates_the_directory_and_the_files_a_database_needs(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "created"
     with connect(root) as db:
         names = set(db.storage.list_files())
@@ -54,7 +56,9 @@ def test_connect_creates_the_directory_and_the_files_a_database_needs(tmp_path: 
     assert {"grafx.meta", "catalog.dat", "heap.dat"} <= names
 
 
-def test_the_database_is_a_context_manager_that_closes_on_the_way_out(tmp_path: Path) -> None:
+def test_the_database_is_a_context_manager_that_closes_on_the_way_out(
+    tmp_path: Path,
+) -> None:
     with connect(tmp_path / "db") as db:
         assert db.closed is False
     assert db.closed is True
@@ -368,6 +372,9 @@ def test_close_finishes_every_step_and_reraises_the_first_base_exception(
     ran: list[str] = []
 
     def close_transactions(_database: Database) -> None:
+        # Failure is AFTER transaction quiescence. A pre-enter failure has a different safety
+        # contract: lower dependencies must remain open for retry (terminal-close regression).
+        _database.transactions.close()
         ran.append("transactions")
         raise first
 
@@ -479,7 +486,9 @@ def test_the_public_names_of_the_package_resolve() -> None:
     assert okto_grafx.connect is connect
 
 
-def test_a_connect_that_fails_mid_assembly_closes_the_device_it_opened(tmp_path: Path) -> None:
+def test_a_connect_that_fails_mid_assembly_closes_the_device_it_opened(
+    tmp_path: Path,
+) -> None:
     # The window between "the device is open" and "the database exists". Nothing but the
     # assembly's own guard covers it, so a mutation that removes that guard leaves a device
     # holding descriptors on every failed open -- and on Windows a held descriptor is what stops

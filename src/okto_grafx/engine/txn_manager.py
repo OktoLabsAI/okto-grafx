@@ -62,7 +62,7 @@ participants cannot hold one section each and wait for the other. Proved by
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, is_dataclass, replace
 from typing import Any
 
@@ -70,8 +70,10 @@ from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxError,
     GrafxLeaseStolen,
+    GrafxLeaseTimeout,
     GrafxRecoveryRefused,
     GrafxTransactionStateError,
+    GrafxUnsupportedOperation,
     GrafxWriteConflict,
 )
 from okto_grafx.domain.ids import (
@@ -148,7 +150,8 @@ COMMIT_RETRIES_TOTAL: str = "oktografx_commit_retries_total"
 ACTIVE_TRANSACTIONS: str = "oktografx_active_transactions"
 
 TRANSACTION_MANAGER_METRICS: tuple[MetricDescriptor, ...] = tuple(
-    metric(name) for name in (WRITE_CONFLICTS_TOTAL, COMMIT_RETRIES_TOTAL, ACTIVE_TRANSACTIONS)
+    metric(name)
+    for name in (WRITE_CONFLICTS_TOTAL, COMMIT_RETRIES_TOTAL, ACTIVE_TRANSACTIONS)
 )
 """The descriptors this component registers and emits, taken from the frozen catalog (G7).
 
@@ -236,6 +239,11 @@ class TransactionManager:
         "_recovery_required",
         "_page_staging_capability",
         "_mode_counts",
+        "_writable",
+        "_closed",
+        "_close_quiesced",
+        "_close_complete",
+        "_close_finalizing",
     )
 
     def __init__(
@@ -256,10 +264,11 @@ class TransactionManager:
         descriptor: str = "",
         retain_lease: bool = False,
         index_sync: Callable[[], object] | None = None,
+        writable: bool = True,
     ) -> None:
         """Build a manager over one database.
 
-        The three keyword arguments after the two the contract names are configuration this
+        The keyword arguments after the two the contract names are configuration this
         component cannot invent and must not guess:
 
         * ``lease_timeout`` -- how long a commit waits for the writer lease. It defaults to
@@ -272,7 +281,17 @@ class TransactionManager:
         * ``descriptor`` -- the granularity descriptor of SD-1. It is passed in rather than
           rebuilt here because ``DatabaseConfig`` already produces that exact string and two
           places producing one format string is how the two stop agreeing (amendment A24).
+        * ``writable`` -- the capability to open write transactions or checkpoint. Read-only
+          composition passes ``False`` so both doors refuse before coordination, WAL or storage;
+          the compatible default remains ``True`` for existing composition roots.
         """
+        if not isinstance(writable, bool):
+            raise GrafxConfigurationError(
+                f"writable is a capability flag; got {type(writable).__name__}.",
+                field="writable",
+                value=type(writable).__name__,
+            )
+        self._writable: bool = writable
         self._wal: Any = wal
         self._pool: BufferPool = pool
         self._heap: Any = heap
@@ -286,7 +305,9 @@ class TransactionManager:
         self._metrics: MetricsSink = metrics
         self._index_manager: Any = index_manager
         self._index_sync: Callable[[], object] | None = index_sync
-        self._partitions_per_table: int = validate_partitions_per_table(partitions_per_table)
+        self._partitions_per_table: int = validate_partitions_per_table(
+            partitions_per_table
+        )
         self._commit_lock_timeout: float = _require_timeout(
             "commit_lock_timeout", commit_lock_timeout
         )
@@ -333,6 +354,10 @@ class TransactionManager:
         self._pins: dict[TxnId, _ReaderPin] = {}
         self._published_high_water: Lsn = NO_LSN
         self._recovery_required: bool = False
+        self._closed: bool = False
+        self._close_quiesced: bool = False
+        self._close_complete: bool = False
+        self._close_finalizing: bool = False
         # An identity token, never exported through a public door. QueryEngine receives only the
         # bound private staging callback, so encoded physical pages cannot be supplied through a
         # caller-reachable TransactionContext and later mistaken for store-produced state.
@@ -394,6 +419,11 @@ class TransactionManager:
         return self._index_manager
 
     @property
+    def writable(self) -> bool:
+        """Return whether this manager may open or perform persistent write work."""
+        return self._writable
+
+    @property
     def open_transactions(self) -> int:
         """Return how many transactions this manager currently has open."""
         return len(self._open)
@@ -403,22 +433,78 @@ class TransactionManager:
         """Return True while a durable commit gap forbids new snapshots and writes."""
         return self._recovery_required
 
+    @property
+    def closed(self) -> bool:
+        """Return True once terminal close has started for this manager."""
+        return self._closed
+
+    @property
+    def close_quiesced(self) -> bool:
+        """Return True once no transaction, reader pin, or retained guard is still attached."""
+        return self._close_quiesced
+
+    @property
+    def close_complete(self) -> bool:
+        """Return True once terminal cleanup and its outcome-neutral telemetry are complete."""
+        return self._close_complete
+
+    @property
+    def transition_active(self) -> bool:
+        """Return True while an injected lifecycle/participant boundary is active.
+
+        Every supported ``connect`` assembly shares one ContainedMetrics capability with this
+        manager and its facade. False for a sink without that optional capability is retained
+        only for direct internal construction; it does not promise callback reentrancy safety.
+        """
+        try:
+            return bool(getattr(self._metrics, "transition_active", False))
+        except BaseException:  # noqa: BLE001 - host telemetry cannot control lifecycle
+            return False
+
+    def request_close(self) -> None:
+        """Publish the terminal latch without trying to interrupt an in-flight transition."""
+        self._closed = True
+
+    @contextmanager
+    def database_release_section(self) -> Iterator[None]:
+        """Serialize the facade's short claim to release this manager's dependencies."""
+        if not self._close_complete:
+            raise GrafxTransactionStateError(
+                "Database dependencies cannot be released before transaction close completes.",
+                operation="release database dependencies",
+                close_complete=False,
+            )
+        with self._participant_section():
+            if not self._close_complete:
+                raise GrafxTransactionStateError(
+                    "Transaction close changed before dependency release could be claimed.",
+                    operation="release database dependencies",
+                    close_complete=False,
+                )
+            yield
+
     def require_recovery(self) -> None:
         """Latch this participant closed until a complete operator recovery succeeds."""
-        self._recovery_required = True
+        self._require_not_closed("require recovery")
+        with self._participant_section():
+            self._require_not_closed("require recovery")
+            self._recovery_required = True
 
     def recovery_completed(self) -> None:
         """Release the latch only after durable state covers this process's high-water mark."""
-        durable = self._read_commit_state()
-        if durable.last_committed_lsn < self._published_high_water:
-            raise GrafxRecoveryRefused(
-                "Recovery returned without publishing every durable commit this participant "
-                "already observed; the handle remains recovery-required.",
-                field="recovery_required",
-                published_lsn=durable.last_committed_lsn,
-                required_lsn=self._published_high_water,
-            )
-        self._recovery_required = False
+        self._require_not_closed("complete recovery")
+        with self._participant_section():
+            self._require_not_closed("complete recovery")
+            durable = self._read_commit_state()
+            if durable.last_committed_lsn < self._published_high_water:
+                raise GrafxRecoveryRefused(
+                    "Recovery returned without publishing every durable commit this participant "
+                    "already observed; the handle remains recovery-required.",
+                    field="recovery_required",
+                    published_lsn=durable.last_committed_lsn,
+                    required_lsn=self._published_high_water,
+                )
+            self._recovery_required = False
 
     # --- snapshots --------------------------------------------------------------------------
 
@@ -449,6 +535,13 @@ class TransactionManager:
 
     def published_state(self) -> CommitState:
         """Return the published commit state, or an empty one when nothing was ever published."""
+        self._require_not_closed("read published state")
+        with self._participant_section():
+            self._require_not_closed("read published state")
+            return self._published_state_in_section()
+
+    def _published_state_in_section(self) -> CommitState:
+        """Read published state for an operation that already owns lifecycle serialisation."""
         self._require_recovery_complete()
         durable = self._read_commit_state()
         if durable.last_committed_lsn >= self._published_high_water:
@@ -476,8 +569,16 @@ class TransactionManager:
         decision -- on a checkpoint, on close, on a maintenance pass -- and that belongs to
         whoever owns the lifecycle. This is the number that decision needs.
         """
+        self._require_not_closed("read the recyclable horizon")
+        with self._participant_section():
+            self._require_not_closed("read the recyclable horizon")
+            return self._recyclable_horizon_in_section()
+
+    def _recyclable_horizon_in_section(self) -> Lsn:
+        """Compute the horizon for an operation that already owns lifecycle serialisation."""
         return recyclable_horizon(
-            self._coordinator.reader_horizon(), self.published_state().checkpoint_lsn
+            self._coordinator.reader_horizon(),
+            self._published_state_in_section().checkpoint_lsn,
         )
 
     def published_lsn(self) -> Lsn:
@@ -492,6 +593,7 @@ class TransactionManager:
         that cause eviction and explicit flushes can write that old frame too, so the database
         facade uses this assertion before every page-touching operator door.
         """
+        self._require_not_closed("assert recovery is complete")
         self._require_recovery_complete()
 
     @contextmanager
@@ -505,7 +607,9 @@ class TransactionManager:
         durable commit holds the same section. An operation that enters first finishes before the
         latch can be set; one that enters afterwards refuses before touching the pool.
         """
+        self._require_not_closed("access database pages")
         with self._participant_section():
+            self._require_not_closed("access database pages")
             self._require_recovery_complete()
             yield
 
@@ -519,6 +623,26 @@ class TransactionManager:
             "committing more work.",
             field="recovery_required",
             required_lsn=self._published_high_water,
+        )
+
+    def _require_writable(self, operation: str) -> None:
+        """Refuse persistent work before a lease, WAL, pool, or device door is reached."""
+        if self._writable:
+            return
+        raise GrafxUnsupportedOperation(
+            f"Cannot {operation} through a read-only transaction manager.",
+            operation=operation,
+            read_only=True,
+        )
+
+    def _require_not_closed(self, operation: str) -> None:
+        """Refuse work after terminal close before a collaborator can be reached."""
+        if not self._closed:
+            return
+        raise GrafxTransactionStateError(
+            f"Cannot {operation} after this transaction manager has been closed.",
+            operation=operation,
+            closed=True,
         )
 
     # --- life of a transaction ----------------------------------------------------------------
@@ -541,43 +665,108 @@ class TransactionManager:
         that is returned, which is exactly what CF-2 asks C5 to guarantee. Registering AFTER
         selecting -- the obvious order -- gives that guarantee away.
         """
+        self._require_not_closed("begin a transaction")
         parsed = TransactionMode.parse(mode)
+        if parsed is TransactionMode.WRITE:
+            self._require_writable("begin a write transaction")
         with self._participant_section():
-            self._require_recovery_complete()
-            self._refresh_due_readers()
-            floor = self.published_lsn()
-            registration = ReaderRegistration.open(self._coordinator, floor)
-            try:
-                selected = self.published_lsn()
-                read_lsn = selected if selected > floor else floor
-                # L22: derived state needs a SHARED signal to invalidate it, and the published
-                # commit number is the one this component already watches -- it moves whenever any
-                # participant commits and nowhere else. Without this, a transaction opened in a
-                # participant that had already read a table answers from frames cached before
-                # somebody else committed: no error, no missing file, just fewer rows than exist.
-                self._pool.begin_read_view(read_lsn)
-                txn = TransactionContext(
-                    txn_id=self._next_txn_id,
-                    mode=parsed,
-                    snapshot=Snapshot(read_lsn),
-                    epoch=_NO_EPOCH,
-                    owner=self,
-                    page_staging_capability=self._page_staging_capability,
-                )
-            except BaseException:
-                # Everything from the registration onwards is inside the guard: a pin that
-                # outlived the call that made it would hold the horizon down for the life of
-                # the database, with no caller holding anything to withdraw it with.
-                _close_quietly(registration)
-                raise
-            self._next_txn_id += 1
-            self._open[txn.txn_id] = txn
-            self._pins[txn.txn_id] = _ReaderPin(registration, self._clock.monotonic())
-            self._mode_counts[parsed.value] += 1
-            open_now = self._mode_counts[parsed.value]
+            self._require_not_closed("begin a transaction")
+            txn, open_now = self._begin_in_section(parsed)
+        self._ensure_begin_publishable(txn)
         # A91: the metrics sink is host code and is called with nothing of this component held.
         self._publish_gauge(parsed.value, open_now)
+        # A raw MetricsSink is legal in an explicitly composed manager. Its callback may request
+        # close and return normally, so revalidate after telemetry as well as after section-exit
+        # deferrals. No caller may receive an ACTIVE context from a terminal manager.
+        self._ensure_begin_publishable(txn)
         return txn
+
+    def _begin_in_section(
+        self, mode: TransactionMode
+    ) -> tuple[TransactionContext, int]:
+        """Open and register one transaction while the participant section is held.
+
+        This helper emits no host metric.  Retry uses it immediately after forgetting the old
+        context, so no close or competing lifecycle door can enter between withdrawal of the old
+        pin and publication of its successor.  Every failure after registration attempts to
+        withdraw the partial pin and leaves no local tracking entry behind.
+        """
+        self._require_not_closed("begin a transaction")
+        if mode is TransactionMode.WRITE:
+            self._require_writable("begin a write transaction")
+        self._require_recovery_complete()
+        registration: ReaderRegistration | None = None
+        transaction: TransactionContext | None = None
+        counted = False
+        try:
+            self._refresh_due_readers()
+            self._require_not_closed("begin a transaction")
+            floor = self._published_state_in_section().last_committed_lsn
+            self._require_not_closed("begin a transaction")
+            registration = ReaderRegistration.open(self._coordinator, floor)
+            self._require_not_closed("begin a transaction")
+            selected = self._published_state_in_section().last_committed_lsn
+            self._require_not_closed("begin a transaction")
+            read_lsn = selected if selected > floor else floor
+            # L22: derived state needs a SHARED signal to invalidate it, and the published
+            # commit number is the one this component already watches -- it moves whenever any
+            # participant commits and nowhere else. Without this, a transaction opened in a
+            # participant that had already read a table answers from frames cached before
+            # somebody else committed: no error, no missing file, just fewer rows than exist.
+            self._pool.begin_read_view(read_lsn)
+            self._require_not_closed("begin a transaction")
+            transaction = TransactionContext(
+                txn_id=self._next_txn_id,
+                mode=mode,
+                snapshot=Snapshot(read_lsn),
+                epoch=_NO_EPOCH,
+                owner=self,
+                page_staging_capability=self._page_staging_capability,
+            )
+            opened_at = self._clock.monotonic()
+            self._require_not_closed("begin a transaction")
+            self._open[transaction.txn_id] = transaction
+            self._pins[transaction.txn_id] = _ReaderPin(registration, opened_at)
+            self._mode_counts[mode.value] += 1
+            counted = True
+            self._next_txn_id += 1
+            return transaction, self._mode_counts[mode.value]
+        except BaseException as failure:
+            if transaction is not None:
+                self._open.pop(transaction.txn_id, None)
+                self._pins.pop(transaction.txn_id, None)
+            if counted and self._mode_counts[mode.value] > 0:
+                self._mode_counts[mode.value] -= 1
+            cleanup_failure = (
+                None if registration is None else _close_quietly(registration)
+            )
+            if cleanup_failure is not None:
+                _note_cleanup_failure(failure, cleanup_failure)
+            raise
+
+    def _ensure_begin_publishable(self, txn: TransactionContext) -> None:
+        """Never return a live context after close won during a deferred/host callback."""
+        if not self._closed and txn.active:
+            return
+        cleanup_failure: BaseException | None = None
+        # A deferred callback at section exit can run close to completion: the context is then
+        # already ABORTED/forgotten and the coordinator/storage may already be released. That is
+        # a terminal answer requiring no new collaborator call. Reacquire only for the one state
+        # proving dependencies are still owned: this exact context remains ACTIVE in `_open`.
+        if self._open.get(txn.txn_id) is txn and txn.active:
+            try:
+                self.close()
+            except BaseException as failure:
+                cleanup_failure = failure
+        refusal = GrafxTransactionStateError(
+            "Close won while a transaction was being opened; no live context was returned.",
+            operation="begin a transaction",
+            txn_id=txn.txn_id,
+            closed=True,
+        )
+        if cleanup_failure is not None:
+            _note_cleanup_failure(refusal, cleanup_failure)
+        raise refusal
 
     def rollback(self, txn: TransactionContext) -> None:
         """Abandon a transaction, leaving no trace of it anywhere.
@@ -593,32 +782,28 @@ class TransactionManager:
         in (CONTRACT.md section 10).
         """
         self._require_owned(txn)
-        cleanup_failure: BaseException | None = None
+        if self._closed and txn.state is TransactionState.ABORTED:
+            return
+        self._require_not_closed("roll back an active transaction")
         with self._participant_section():
+            # Ownership and state are re-read while settlement is serialised.  A preliminary
+            # check cannot carry across the wait for this section: commit, retry or another
+            # rollback may have settled this exact context in that window.
+            self._require_owned(txn)
             if txn.state is TransactionState.ABORTED:
                 return
-            self._require_active(txn)
-            self._refresh_due_readers(skip=txn.txn_id)
-            mode = txn.mode.value
-            try:
-                self._drop_index_changes(txn)
-            except BaseException as failure:
-                cleanup_failure = failure
-                self._recovery_required = True
-            txn.mark_aborted()
-            cleanup_failure = _first_failure(
-                cleanup_failure,
-                self._release_reader(txn),
-            )
-            open_now = self._forget(txn, mode)
+            mode, open_now, cleanup_failure = self._rollback_active_in_section(txn)
         if cleanup_failure is not None:
             raise cleanup_failure
         self._publish_gauge(mode, open_now)
 
     def commit(self, txn: TransactionContext) -> CommitReport:
         """Run the frozen commit protocol of CONTRACT.md section 8.5 and report the outcome."""
+        self._require_not_closed("commit a transaction")
         self._require_owned(txn)
         self._require_active(txn)
+        if txn.mode is TransactionMode.WRITE:
+            self._require_writable("commit a write transaction")
         if txn.mode is TransactionMode.READ or not txn.wrote:
             return self._commit_without_writing(txn)
         return self._commit_with_writing(txn)
@@ -637,21 +822,120 @@ class TransactionManager:
         nobody who could honestly emit it: a manager cannot tell a caller's second attempt from
         its first unless the two are linked.
         """
+        self._require_not_closed("retry a transaction")
         self._require_owned(txn)
-        if txn.conflicts <= 0:
-            raise GrafxTransactionStateError(
-                "Only a transaction that optimistic validation refused can be retried through "
-                "this door; nothing has refused this one.",
-                txn_id=txn.txn_id,
-                conflicts=txn.conflicts,
+        if txn.mode is TransactionMode.WRITE:
+            self._require_writable("retry a write transaction")
+        settlement_failure: BaseException | None = None
+        with self._participant_section():
+            self._require_not_closed("retry a transaction")
+            self._require_current_active(txn)
+            if txn.mode is TransactionMode.WRITE:
+                self._require_writable("retry a write transaction")
+            if txn.conflicts <= 0:
+                raise GrafxTransactionStateError(
+                    "Only a transaction that optimistic validation refused can be retried "
+                    "through this door; nothing has refused this one.",
+                    txn_id=txn.txn_id,
+                    conflicts=txn.conflicts,
+                )
+            carried = txn.conflicts
+            mode = txn.mode
+            finished_mode, open_now, cleanup_failure = self._rollback_active_in_section(
+                txn
             )
-        carried = txn.conflicts
-        mode = txn.mode
-        if txn.active:
-            self.rollback(txn)
-        successor = self.begin(mode.value)
-        successor.adopt_conflicts(carried)
+            if cleanup_failure is not None:
+                settlement_failure = cleanup_failure
+            else:
+                try:
+                    successor, _successor_count = self._begin_in_section(mode)
+                    successor.adopt_conflicts(carried)
+                except BaseException as failure:
+                    # The old context is already ABORTED. _begin_in_section has withdrawn any
+                    # partial registration, so the decremented count is the final state this
+                    # failed retry must publish after releasing the section.
+                    settlement_failure = failure
+        if settlement_failure is not None:
+            try:
+                self._publish_gauge(finished_mode, open_now)
+            except BaseException as metric_failure:
+                _note_cleanup_failure(settlement_failure, metric_failure)
+            raise settlement_failure
+        # Success replaced one context with another in the same mode, so the externally visible
+        # gauge did not change. Emitting zero and then one would expose a state that never existed
+        # outside the participant section and would put host callbacks between the two pins.
+        self._ensure_begin_publishable(successor)
         return successor
+
+    def _rollback_active_in_section(
+        self, txn: TransactionContext
+    ) -> tuple[str, int, BaseException | None]:
+        """Settle one current transaction as aborted while the participant section is held.
+
+        The exact context and ACTIVE state are checked again here, immediately before reader
+        refresh or index cleanup can reach a collaborator.  Both public rollback and retry use
+        this one transition so two lifecycle doors cannot each believe they won.
+        """
+        self._require_current_active(txn)
+        self._refresh_due_readers(skip=txn.txn_id)
+        mode = txn.mode.value
+        cleanup_failure: BaseException | None = None
+        try:
+            self._drop_index_changes(txn)
+        except BaseException as failure:
+            cleanup_failure = failure
+            self._recovery_required = True
+        txn.mark_aborted()
+        cleanup_failure = _first_failure(
+            cleanup_failure,
+            self._release_reader(txn),
+        )
+        open_now = self._forget(txn, mode)
+        return mode, open_now, cleanup_failure
+
+    def _abort_for_close_in_section(
+        self, txn: TransactionContext
+    ) -> BaseException | None:
+        """Abort and forget one context without letting any cleanup failure stop the next.
+
+        Close is terminal, so it has a stronger obligation than an ordinary rollback: reader
+        refresh, index cleanup and pin withdrawal each get their attempt, but none may leave the
+        context ACTIVE or tracked.  The first failure is retained and later failures become
+        notes; the caller raises it only after every context, pin, lease and metric is handled.
+        """
+        failure: BaseException | None = None
+        try:
+            self._refresh_due_readers(skip=txn.txn_id)
+        except BaseException as refresh_failure:
+            failure = _accumulate_failure(failure, refresh_failure)
+        try:
+            self._drop_index_changes(txn)
+        except BaseException as index_failure:
+            self._recovery_required = True
+            failure = _accumulate_failure(failure, index_failure)
+        if txn.state is TransactionState.ACTIVE:
+            try:
+                txn.mark_aborted()
+            except BaseException as mark_failure:
+                # A host can monkeypatch even an internal context method.  Terminal close still
+                # cannot leave that wrapper ACTIVE, so reproduce the method's data-only final
+                # state after retaining the hostile failure.
+                failure = _accumulate_failure(failure, mark_failure)
+                txn._state = TransactionState.ABORTED
+                txn.read_partitions.clear()
+                txn.write_partitions.clear()
+                txn.pending_records.clear()
+                txn.page_images.clear()
+                txn._page_image_proofs.clear()
+                txn.row_intents.clear()
+                txn.row_refs.clear()
+        reader_failure = self._release_reader(txn)
+        failure = _accumulate_failure(failure, reader_failure)
+        self._open.pop(txn.txn_id, None)
+        mode = txn.mode.value
+        if self._mode_counts[mode] > 0:
+            self._mode_counts[mode] -= 1
+        return failure
 
     # --- reader scheduling (amendment A46) -----------------------------------------------------
 
@@ -667,7 +951,9 @@ class TransactionManager:
         shape lease renewal uses, and for the same reason: a monotonic reading is local to a
         process and this layer owns no clock of its own.
         """
+        self._require_not_closed("refresh readers")
         with self._participant_section():
+            self._require_not_closed("refresh readers")
             return self._refresh_due_readers(now_monotonic, skip=None)
 
     def _refresh_due_readers(
@@ -722,7 +1008,10 @@ class TransactionManager:
         checkpoint allow together. A reader still pinned below the checkpoint holds the horizon
         back on its own account; nothing here evicts it.
         """
+        self._require_not_closed("checkpoint")
+        self._require_writable("checkpoint")
         with self._participant_section():
+            self._require_not_closed("checkpoint")
             self._require_recovery_complete()
             lease = self._hold_lease()
             try:
@@ -733,7 +1022,9 @@ class TransactionManager:
                     lease.validate()
                     state = self._complete_committed_gap()
                     self._pool.begin_read_view(state.last_committed_lsn)
-                    self._redo_onto_device(state.checkpoint_lsn, state.last_committed_lsn)
+                    self._redo_onto_device(
+                        state.checkpoint_lsn, state.last_committed_lsn
+                    )
                     self._pool.checkpoint()
                     self._publish(
                         CommitState(
@@ -747,7 +1038,8 @@ class TransactionManager:
                     # recovery scan while segments were disappearing underneath it.
                     reader_present = self._coordinator.reader_horizon() is not None
                     recycled = self._wal.recycle(
-                        self.recyclable_horizon(), reader_present=reader_present
+                        self._recyclable_horizon_in_section(),
+                        reader_present=reader_present,
                     )
             except BaseException as failure:
                 cleanup_failure = self._drop_lease(lease)
@@ -772,9 +1064,7 @@ class TransactionManager:
         """
         try:
             durable = self._read_commit_state()
-            tail = committed_replay(
-                self._wal.read_from(durable.last_committed_lsn + 1)
-            )
+            tail = committed_replay(self._wal.read_from(durable.last_committed_lsn + 1))
             if tail.incomplete_effects:
                 pending = tail.incomplete_effects
                 raise GrafxRecoveryRefused(
@@ -873,7 +1163,11 @@ class TransactionManager:
                         observed_lsn=record.lsn,
                     )
                 expected += 1
-            if not records or records[-1].lsn != through or replay.last_committed_lsn != through:
+            if (
+                not records
+                or records[-1].lsn != through
+                or replay.last_committed_lsn != through
+            ):
                 raise GrafxRecoveryRefused(
                     "The retained WAL does not prove the commit watermark checkpoint was asked "
                     "to publish; no page, watermark or segment was changed.",
@@ -934,35 +1228,104 @@ class TransactionManager:
         return page_result.effects_replayed + index_result.effects_replayed
 
     def close(self) -> None:
-        """Abandon every open transaction and withdraw every reader registration.
+        """Terminally close this manager after attempting every owned cleanup.
 
         CONTRACT.md section 10 says closing a database with an open transaction aborts it and
-        never corrupts. Nothing of an open transaction is on the device, so abandoning it is the
-        whole of that promise.
+        never corrupts. RuntimeError, KeyboardInterrupt and SystemExit from one cleanup are
+        evidence to report only after every other context, pin, retained lease and metric has
+        received its attempt. The terminal latch is set before waiting for the participant
+        section, so a failed or delayed close can never leave the wrapper able to commit later;
+        cleanup itself starts only after every lifecycle winner already in flight is quiescent.
         """
-        with self._participant_section():
-            for txn in list(self._open.values()):
+        self.request_close()
+        if self._close_complete:
+            return
+        # Same-context callbacks (metrics, clock, coordinator hooks) can ask the Database to
+        # close while this manager is halfway through begin/commit. The coordinator deliberately
+        # permits re-entry, so exclusion alone cannot identify that recursion. Defer cleanup;
+        # the terminal request remains published and a later close retries after the winner has
+        # returned. Safe leak is preferable to releasing its pool/device underneath it.
+        if self.transition_active or self._close_finalizing:
+            return
+        self._close_finalizing = True
+        failure: BaseException | None = None
+        guard: LeaseGuard | None = None
+        try:
+            while not self._close_quiesced:
+                entered = False
                 try:
-                    self.rollback(txn)
-                except GrafxError:
-                    # A rollback that cannot withdraw its registration must not stop the next
-                    # one from being withdrawn: the pins that remain are what a horizon pass
-                    # would carry forever.
-                    continue
-            for pin in list(self._pins.values()):
-                _close_quietly(pin.registration)
-            self._pins.clear()
-            self._open.clear()
+                    with self._participant_section():
+                        entered = True
+                        for txn in list(self._open.values()):
+                            try:
+                                txn_failure = self._abort_for_close_in_section(txn)
+                            except BaseException as unexpected_failure:
+                                # Defence in depth around the fail-complete helper. Even a
+                                # monkeypatched helper cannot skip the remaining wrappers/maps.
+                                txn_failure = unexpected_failure
+                                if txn.state is TransactionState.ACTIVE:
+                                    try:
+                                        txn.mark_aborted()
+                                    except BaseException as mark_failure:
+                                        txn_failure = _accumulate_failure(
+                                            txn_failure,
+                                            mark_failure,
+                                        )
+                                        txn._state = TransactionState.ABORTED
+                                        txn.read_partitions.clear()
+                                        txn.write_partitions.clear()
+                                        txn.pending_records.clear()
+                                        txn.page_images.clear()
+                                        txn._page_image_proofs.clear()
+                                        txn.row_intents.clear()
+                                        txn.row_refs.clear()
+                                self._open.pop(txn.txn_id, None)
+                                pin = self._pins.pop(txn.txn_id, None)
+                                if pin is not None:
+                                    txn_failure = _accumulate_failure(
+                                        txn_failure,
+                                        _close_quietly(pin.registration),
+                                    )
+                            failure = _accumulate_failure(failure, txn_failure)
+                        for pin in list(self._pins.values()):
+                            failure = _accumulate_failure(
+                                failure,
+                                _close_quietly(pin.registration),
+                            )
+                        self._pins.clear()
+                        self._open.clear()
+                        for mode_name in self._mode_counts:
+                            self._mode_counts[mode_name] = 0
+                        guard = self._lease_guard
+                        self._lease_guard = None
+                        self._close_quiesced = True
+                except GrafxLeaseTimeout as timeout_failure:
+                    if not entered:
+                        # A live winner still holds the participant section. Close is quiescence,
+                        # so a configured attempt timeout is not permission to release resources.
+                        continue
+                    failure = _accumulate_failure(failure, timeout_failure)
+                except BaseException as section_failure:
+                    failure = _accumulate_failure(failure, section_failure)
+                break
+            if not self._close_quiesced:
+                if failure is not None:
+                    raise failure
+                return
+            if guard is not None and not guard.released:
+                # A retained lease outliving its manager makes every other participant wait out
+                # the stall threshold before it can write at all.
+                failure = _accumulate_failure(failure, _release_quietly(guard))
             for mode_name in self._mode_counts:
-                self._mode_counts[mode_name] = 0
-        guard = self._lease_guard
-        self._lease_guard = None
-        if guard is not None and not guard.released:
-            # A retained lease outliving its manager would make every other participant wait out
-            # the stall threshold before it could write at all.
-            _release_quietly(guard)
-        for mode_name in self._mode_counts:
-            self._publish_gauge(mode_name, 0)
+                self._publish_gauge(mode_name, 0)
+            # Outcome-neutral gauges have received their attempt and cannot fail this line. Mark
+            # completion before surfacing cleanup evidence so Database may safely release the
+            # lower layers even when this call reports a reader/index/lease cleanup failure.
+            self._close_complete = True
+            if failure is not None:
+                raise failure
+        finally:
+            self._close_finalizing = False
 
     @contextmanager
     def recovery_section(self) -> Iterator[None]:
@@ -973,7 +1336,9 @@ class TransactionManager:
         no TransactionManager exists yet. Cross-process exclusion remains RecoveryManager's own
         responsibility through ``COMMIT_SECTION``.
         """
+        self._require_not_closed("run recovery")
         with self._participant_section():
+            self._require_not_closed("run recovery")
             if self._open:
                 raise GrafxTransactionStateError(
                     "Recovery requires this database handle to have no open transactions.",
@@ -994,6 +1359,10 @@ class TransactionManager:
         csn: Csn = txn.snapshot.read_lsn
         mode = txn.mode.value
         with self._participant_section():
+            self._require_not_closed("commit a transaction")
+            self._require_current_active(txn)
+            if txn.mode is TransactionMode.WRITE:
+                self._require_writable("commit a write transaction")
             self._refresh_due_readers(skip=txn.txn_id)
             txn.mark_committed(csn)
             # Reader withdrawal is best-effort after the outcome is settled. Its registration
@@ -1023,6 +1392,9 @@ class TransactionManager:
         post_barrier_failure: BaseException | None = None
         cleanup_failure: BaseException | None = None
         with self._participant_section():
+            self._require_not_closed("commit a transaction")
+            self._require_current_active(txn)
+            self._require_writable("commit a write transaction")
             self._require_recovery_complete()
             self._validate_staged_inputs(txn)
             self._refresh_due_readers(skip=txn.txn_id)
@@ -1034,7 +1406,7 @@ class TransactionManager:
                 with self._coordinator.exclusive(
                     COMMIT_SECTION, timeout=self._commit_lock_timeout
                 ):
-                    lease.validate()                                 # step 3.1
+                    lease.validate()  # step 3.1
                     current = self._complete_committed_gap().last_committed_lsn
                     # The commit decides against the picture as it is NOW, not as this pool last
                     # cached it. Optimistic validation reads the log, but everything else the commit
@@ -1053,7 +1425,7 @@ class TransactionManager:
                     # ended, and it refuses with transaction_state, which tells a caller to stop
                     # where write_conflict would tell it to retry. Comparing what the caller
                     # declared BEFORE touching the heap keeps a real conflict reported as one.
-                    conflict = self._find_conflict(txn)              # step 3.3
+                    conflict = self._find_conflict(txn)  # step 3.3
                     rows: tuple[_RowWrite, ...] = ()
                     staging_mark = len(txn.pending_records)
                     # The mark this attempt's page set is measured against. The window opens
@@ -1071,7 +1443,7 @@ class TransactionManager:
                             # published (C5 round-2 B1).
                             rows = self._write_rows(txn)
                             self._declare_page_interest(txn, rows)
-                            conflict = self._find_conflict(txn)      # step 3.3, page half
+                            conflict = self._find_conflict(txn)  # step 3.3, page half
                         if conflict is None:
                             records, images, materialized_csn = self._build_records(
                                 txn, lease.epoch, rows
@@ -1090,9 +1462,9 @@ class TransactionManager:
                             committed = self._wal.append_many(
                                 records,
                                 expected_terminal_lsn=planned_csn,
-                            )                                               # step 3.4
+                            )  # step 3.4
                             _require_forward_commit(committed, current)
-                            self._wal.barrier()                      # step 3.5 -- durable here
+                            self._wal.barrier()  # step 3.5 -- durable here
                             # The WAL outcome is irrevocable at this instant. Settle it before
                             # page/index apply, publication, lease release, reader cleanup or any
                             # other fallible callback can run and tempt a caller to retry an ACTIVE
@@ -1126,9 +1498,9 @@ class TransactionManager:
                             self._published_high_water, committed
                         )
                         try:
-                            self._apply_images(images)               # step 3.6
-                            self._apply_index_changes(txn, committed)   # step 3.6
-                            self._publish_commit_state(current, committed)   # step 3.7
+                            self._apply_images(images)  # step 3.6
+                            self._apply_index_changes(txn, committed)  # step 3.6
+                            self._publish_commit_state(current, committed)  # step 3.7
                         except BaseException as failure:
                             post_barrier_failure = failure
                             if isinstance(failure, GrafxError):
@@ -1183,8 +1555,7 @@ class TransactionManager:
         # RuntimeError or KeyboardInterrupt here would make a confirmed COMMIT look retryable;
         # the coordinator TTL is the recovery mechanism for a foreign cleanup that did not take.
         if conflict is not None:
-            if self._metrics.enabled:
-                self._metrics.increment(WRITE_CONFLICTS_TOTAL)
+            self._increment_metric(WRITE_CONFLICTS_TOTAL)
             raise GrafxWriteConflict(
                 "This transaction read or wrote a partition that another commit wrote after "
                 "its snapshot was taken.",
@@ -1192,8 +1563,8 @@ class TransactionManager:
                 snapshot_lsn=txn.snapshot.read_lsn,
                 partitions=list(conflict),
             )
-        if retried and self._metrics.enabled:
-            self._metrics.increment(COMMIT_RETRIES_TOTAL)
+        if retried:
+            self._increment_metric(COMMIT_RETRIES_TOTAL)
         self._publish_gauge(mode, open_now)
         return CommitReport(csn=committed, durable=True, wrote=True)
 
@@ -1621,7 +1992,9 @@ class TransactionManager:
             if table_id is None:
                 continue
             if row.ended is not None:
-                manager.stage_row_delete(txn, table_id, row.ended, row.ended_values, csn)
+                manager.stage_row_delete(
+                    txn, table_id, row.ended, row.ended_values, csn
+                )
             if row.born is not None:
                 manager.stage_row_insert(txn, table_id, row.born, row.born_values, csn)
         produced = len(txn.pending_records) - before
@@ -1825,9 +2198,7 @@ class TransactionManager:
             return failure
         return None
 
-    def _abandon_rows(
-        self, rows: Sequence[_RowWrite]
-    ) -> BaseException | None:
+    def _abandon_rows(self, rows: Sequence[_RowWrite]) -> BaseException | None:
         """Make rows written by a commit that then failed unreachable to every snapshot.
 
         The rows are in the buffer pool by the time the log is asked for anything, and the pool
@@ -1858,7 +2229,9 @@ class TransactionManager:
                 failure = _first_failure(failure, cleanup_failure)
         # The restamp keeps any live holder of these pages coherent; what happens to the FRAMES
         # is decided below, and it is decided for the whole attempt at once.
-        touched = {(self._heap_file, page_index) for page_index in self._pages_touched_by(rows)}
+        touched = {
+            (self._heap_file, page_index) for page_index in self._pages_touched_by(rows)
+        }
         if rows:
             touched.add((self._heap_file, HEADER_PAGE_INDEX))
         # The measured set, and the reason the enumeration above stopped being enough on its own.
@@ -1871,9 +2244,7 @@ class TransactionManager:
             failure = _first_failure(failure, cleanup_failure)
         return _first_failure(failure, self._undo_pages(touched))
 
-    def _undo_pages(
-        self, touched: set[tuple[str, PageIndex]]
-    ) -> BaseException | None:
+    def _undo_pages(self, touched: set[tuple[str, PageIndex]]) -> BaseException | None:
         """Take back the pages of a commit that did not happen -- all of them the same way.
 
         TWO WAYS TO TAKE A PAGE BACK, and which one is available is not a choice.
@@ -2006,9 +2377,7 @@ class TransactionManager:
         """
         return tuple(sorted(self._pool.modified_pages() - self._dirty_mark))
 
-    def _pages_touched_by(
-        self, rows: Sequence[_RowWrite]
-    ) -> tuple[PageIndex, ...]:
+    def _pages_touched_by(self, rows: Sequence[_RowWrite]) -> tuple[PageIndex, ...]:
         """Return every heap page a row write can have changed, in a fixed order.
 
         The reserved header page is always included: it carries the table directory, and every
@@ -2173,7 +2542,8 @@ class TransactionManager:
             return None
         return _release_quietly(lease)
 
-    def _participant_section(self) -> AbstractContextManager[None]:
+    @contextmanager
+    def _participant_section(self) -> Iterator[None]:
         """Enter the section that serialises the THREADS of this participant.
 
         FR-3 asks for N processes AND N threads holding write transactions, and for every commit
@@ -2199,9 +2569,18 @@ class TransactionManager:
         hold another participant up is proved by the two-process tests, which still run
         concurrently with it in place.
         """
-        return self._coordinator.exclusive(
-            self._participant_section_name, timeout=self._commit_lock_timeout
-        )
+        defer = getattr(self._metrics, "defer", None)
+        deferred = defer() if callable(defer) else nullcontext()
+        # Deferral surrounds lock acquisition too: coordinator wait metrics are host callbacks,
+        # and a callback that asks Database.close() while this thread is trying to enter must
+        # request terminal state without recursively releasing dependencies. The adapter lowers
+        # its deferral depth before draining the FIFO, after the real section has been released.
+        with deferred:
+            with self._coordinator.exclusive(
+                self._participant_section_name,
+                timeout=self._commit_lock_timeout,
+            ):
+                yield
 
     def _require_owned(self, txn: TransactionContext) -> None:
         """Refuse a transaction this manager did not open (amendment A74).
@@ -2211,6 +2590,13 @@ class TransactionManager:
         through a different manager would be validated against a lease that has nothing to do
         with the work it is about to write. Binding the transaction to its manager makes that
         unrepresentable rather than merely discouraged.
+
+        The owner pointer is necessary but not sufficient: ``TransactionContext`` is public and
+        a caller can construct one that names this manager and reuses a live transaction number.
+        An ACTIVE context must therefore be the exact object in ``_open``.  Settled contexts are
+        no longer registered because retaining them would leak one object per transaction, so
+        their private manager capability distinguishes a genuine idempotent rollback from a
+        caller-built lookalike.
         """
         if not isinstance(txn, TransactionContext):
             raise GrafxConfigurationError(
@@ -2224,6 +2610,37 @@ class TransactionManager:
                 "committed or rolled back here.",
                 txn_id=txn.txn_id,
             )
+        tracked = self._open.get(txn.txn_id)
+        if tracked is not None and tracked is not txn:
+            raise GrafxTransactionStateError(
+                "That transaction identity does not match the context this manager opened "
+                "under the same transaction number.",
+                txn_id=txn.txn_id,
+                reason="transaction_identity_mismatch",
+            )
+        if txn.active and tracked is not txn:
+            raise GrafxTransactionStateError(
+                "This active transaction is not the exact context registered by this manager.",
+                txn_id=txn.txn_id,
+                reason="transaction_not_registered",
+            )
+        if txn._page_staging_capability is not self._page_staging_capability:
+            raise GrafxTransactionStateError(
+                "This settled transaction does not carry the private capability of a context "
+                "opened by this manager.",
+                txn_id=txn.txn_id,
+                reason="transaction_capability_mismatch",
+            )
+
+    def _require_current_active(self, txn: TransactionContext) -> None:
+        """Require the exact registered context to remain ACTIVE at the settlement instant.
+
+        Callers use this only while holding the participant section.  The same checks outside
+        that section are useful fail-fast diagnostics but cannot authorise lifecycle work: a
+        competing thread can settle the transaction before the section is acquired.
+        """
+        self._require_owned(txn)
+        self._require_active(txn)
 
     def _require_active(self, txn: TransactionContext) -> None:
         """Refuse a transaction that has already committed or rolled back."""
@@ -2252,9 +2669,24 @@ class TransactionManager:
         return self._mode_counts[mode]
 
     def _publish_gauge(self, mode: str, open_now: int) -> None:
-        """Publish how many transactions of one mode are open."""
-        if self._metrics.enabled:
-            self._metrics.set_gauge(ACTIVE_TRANSACTIONS, float(open_now), {"mode": mode})
+        """Publish one gauge without letting telemetry change a lifecycle outcome."""
+        try:
+            if self._metrics.enabled:
+                self._metrics.set_gauge(
+                    ACTIVE_TRANSACTIONS,
+                    float(open_now),
+                    {"mode": mode},
+                )
+        except BaseException:  # noqa: BLE001 - telemetry is strictly outcome-neutral
+            return
+
+    def _increment_metric(self, name: str) -> None:
+        """Increment one counter without exposing a raw host BaseException."""
+        try:
+            if self._metrics.enabled:
+                self._metrics.increment(name)
+        except BaseException:  # noqa: BLE001 - telemetry is strictly outcome-neutral
+            return
 
     def __repr__(self) -> str:
         """Return a representation naming the granularity and how many transactions are open."""
@@ -2424,12 +2856,22 @@ def _first_failure(
     return first if first is not None else second
 
 
+def _accumulate_failure(
+    first: BaseException | None, later: BaseException | None
+) -> BaseException | None:
+    """Retain the first failure and attach every later cleanup failure as evidence."""
+    if later is None:
+        return first
+    if first is None:
+        return later
+    _note_cleanup_failure(first, later)
+    return first
+
+
 def _note_cleanup_failure(primary: BaseException, cleanup: BaseException) -> None:
     """Attach cleanup evidence without changing the exception identity being propagated."""
     try:
-        primary.add_note(
-            f"Cleanup also failed ({type(cleanup).__name__}): {cleanup}"
-        )
+        primary.add_note(f"Cleanup also failed ({type(cleanup).__name__}): {cleanup}")
     except BaseException:  # noqa: BLE001 - diagnostics must never replace either failure
         return
 

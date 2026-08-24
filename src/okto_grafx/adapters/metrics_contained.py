@@ -18,7 +18,10 @@ typed refusal rather than an escape.
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from threading import Lock, local
+from time import perf_counter
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxError
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
@@ -48,13 +51,59 @@ class _ContainedTimer(AbstractContextManager):
         return False
 
 
+class _DeferredTimer(AbstractContextManager):
+    """Measure locally and enqueue one histogram observation without calling host code."""
+
+    __slots__ = ("_labels", "_name", "_owner", "_started")
+
+    def __init__(self, owner: ContainedMetricsSink, name: str, labels: object) -> None:
+        self._owner = owner
+        self._name = name
+        self._labels = labels
+        self._started = 0.0
+
+    def __enter__(self) -> None:
+        self._started = perf_counter()
+
+    def __exit__(self, kind: object, value: object, trace: object) -> bool:
+        self._owner._defer_call(
+            "observe",
+            self._name,
+            perf_counter() - self._started,
+            self._labels,
+        )
+        return False
+
+
+class _DeferredState(local):
+    """Per-thread nesting and callbacks waiting for the outer critical section to leave."""
+
+    def __init__(self) -> None:
+        self.depth: int = 0
+        self.transition_depth: int = 0
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+
 class ContainedMetricsSink:
     """The sink the ENGINE sees: every recording door absorbs what the inner sink raises."""
 
-    __slots__ = ("_inner",)
+    __slots__ = (
+        "_enabled_hint",
+        "_inner",
+        "_state",
+        "_transition_guard",
+        "_transitions",
+    )
 
     def __init__(self, inner: MetricsSink) -> None:
         self._inner = inner
+        self._state = _DeferredState()
+        self._transition_guard = Lock()
+        self._transitions = 0
+        try:
+            self._enabled_hint = bool(inner.enabled)
+        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
+            self._enabled_hint = False
 
     @property
     def inner(self) -> MetricsSink:
@@ -64,41 +113,108 @@ class ContainedMetricsSink:
     @property
     def enabled(self) -> bool:
         """Return the inner sink's answer, and False when even asking raises."""
+        if self._state.depth > 0:
+            # Asking the host is itself a callback. During an engine transition use the last
+            # answer observed outside it; recording calls are queued behind the same boundary.
+            return self._enabled_hint
         try:
-            return bool(self._inner.enabled)
+            self._enabled_hint = bool(self._inner.enabled)
         except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
-            return False
+            self._enabled_hint = False
+        return self._enabled_hint
+
+    @property
+    def transition_active(self) -> bool:
+        """Return whether this execution thread is inside a contained engine transition."""
+        state = self._state
+        return state.depth > 0 or state.transition_depth > 0
+
+    @property
+    def facade_transition_active(self) -> bool:
+        """Return whether any thread still owes publication of one facade outcome."""
+        with self._transition_guard:
+            return self._transitions > 0
+
+    @contextmanager
+    def transition(self) -> Iterator[None]:
+        """Track one facade lifecycle outcome without invoking or delaying host callbacks.
+
+        The thread-local count is process mechanism and therefore belongs in this adapter, not
+        the pure engine. It distinguishes a callback re-entering its own transition from another
+        thread that must contend for the manager's participant section normally. A separately
+        guarded total lets the facade quiesce that manager without releasing lower dependencies
+        until every thread has finished publishing its wrapper/schema outcome.
+        """
+        state = self._state
+        state.transition_depth += 1
+        with self._transition_guard:
+            self._transitions += 1
+        try:
+            yield
+        finally:
+            with self._transition_guard:
+                self._transitions -= 1
+            state.transition_depth -= 1
+
+    @contextmanager
+    def defer(self) -> Iterator[None]:
+        """Queue host callbacks until the outermost transition on this thread has left.
+
+        The engine wraps participant lifecycle sections with this context. WAL, coordinator and
+        pool metrics may therefore be *recorded* while a transaction is changing state, but the
+        host sink cannot re-enter ``Database.close`` until the section and its lease/commit
+        nesting are gone. Nested sections share one FIFO and only the outermost exit drains it.
+        """
+        state = self._state
+        state.depth += 1
+        try:
+            yield
+        finally:
+            state.depth -= 1
+            if state.depth == 0:
+                calls = state.calls
+                state.calls = []
+                for method, arguments in calls:
+                    self._deliver(method, arguments)
+
+    def _defer_call(self, method: str, *arguments: object) -> None:
+        """Append one recording call to the current thread's FIFO."""
+        self._state.calls.append((method, arguments))
+
+    def _record(self, method: str, *arguments: object) -> None:
+        """Queue one recording call in a transition, otherwise contain and deliver it now."""
+        if self._state.depth > 0:
+            self._defer_call(method, *arguments)
+            return
+        self._deliver(method, arguments)
+
+    def _deliver(self, method: str, arguments: tuple[object, ...]) -> None:
+        """Call one host recording door without letting it control the engine outcome."""
+        try:
+            getattr(self._inner, method)(*arguments)
+        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
+            return
 
     def register(self, descriptor: MetricDescriptor) -> None:
         """Register on the inner sink, absorbing a refusal of a catalogued descriptor."""
-        try:
-            self._inner.register(descriptor)
-        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
-            return
+        self._record("register", descriptor)
 
     def increment(self, name: str, value: float = 1.0, labels: object = None) -> None:
         """Record a counter movement, absorbing whatever the inner sink raises."""
-        try:
-            self._inner.increment(name, value, labels)
-        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
-            return
+        self._record("increment", name, value, labels)
 
     def set_gauge(self, name: str, value: float, labels: object = None) -> None:
         """Record a gauge, absorbing whatever the inner sink raises."""
-        try:
-            self._inner.set_gauge(name, value, labels)
-        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
-            return
+        self._record("set_gauge", name, value, labels)
 
     def observe(self, name: str, value: float, labels: object = None) -> None:
         """Record an observation, absorbing whatever the inner sink raises."""
-        try:
-            self._inner.observe(name, value, labels)
-        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
-            return
+        self._record("observe", name, value, labels)
 
     def time(self, name: str, labels: object = None) -> AbstractContextManager:
         """Return the inner timer wrapped so neither entering nor leaving it can raise."""
+        if self._state.depth > 0:
+            return _DeferredTimer(self, name, labels)
         try:
             return _ContainedTimer(self._inner.time(name, labels))
         except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
