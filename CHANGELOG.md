@@ -61,6 +61,10 @@ all change, and there is no migration path yet.
   before it is installed, and numpy vector math selected only by explicit configuration.
 - **Windows and POSIX as equal citizens** (D9), with a suite that requires a platform-specific test
   to declare its counterpart and every skip to be attributed.
+- **Performance documentation with in-tree instruments**: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)
+  records measured numbers with their machine, build and load conditions —
+  `tools/measure_concurrency.py` (multi-process read/write latency under load, correctness-gated)
+  and `tools/measure_traversal.py` (traversal shapes with index-vs-scan equality) reproduce them.
 - **Documentation**: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
   [`docs/PORTS.md`](docs/PORTS.md), the frozen `docs/architecture/CONTRACT.md`, the component
   register, the lessons, and the punch list of known gaps.

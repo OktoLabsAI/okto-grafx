@@ -519,6 +519,10 @@ practice:
 
 - **The on-disk format is not stable.** A database written by 0.0.1 may not open in the next version.
   There is no migration path yet.
+- **Write throughput is currently platform-bound and serialized** — ~300 ms per durable commit on
+  Windows, and all writers intersect on the table directory page, so disjoint writers queue. Reads
+  are unaffected (measured: 1.5 ms indexed point reads under full write load). The numbers, their
+  conditions, and the instruments to re-run them are in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 - **Performance is not at parity on Windows.** Binding decision D5 sets relative ceilings against a
   reference engine; they are met on POSIX with `[accel]` and missed on Windows, where control-file
   publication costs ~16.5 ms against ~0.13 ms on Linux. The measurements and the analysis are in
@@ -543,6 +547,7 @@ semantics differ from a local disk.
 | Document | What it holds |
 |---|---|
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | The detailed architecture: components, protocols, data flow, on-disk formats |
+| [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | Measured numbers with their conditions and the in-tree instruments that reproduce them — reads under load, traversal, scaling, and the D5 cross-platform record |
 | [`docs/PORTS.md`](docs/PORTS.md) | Every port, its protocol, its default adapter, and how to write your own |
 | `docs/specs/` | The two validated specifications this is built against |
 | `docs/architecture/CONTRACT.md` | The frozen coordination substrate: error taxonomy, on-disk formats, the commit protocol, the metric catalogue, and the Definition of Done every component is reviewed against |
