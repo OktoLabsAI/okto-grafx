@@ -175,6 +175,39 @@ class HealthyProbe:
         self.reads.append(file)
 
 
+class StackCoordinator:
+    """The minimal COMPLETE coordinator a single-process stack needs (M0C fencing).
+
+    Recovery refuses to scan or mutate without one, so the stack wires this deterministic
+    double by default: ``exclusive`` records section entries and exits, ``reader_horizon``
+    answers what a test set. Tests about the fence itself override or remove it.
+    """
+
+    def __init__(self) -> None:
+        self.sections: list[tuple[str, str, float]] = []
+        self.active: int = 0
+        self.horizon: int | None = None
+
+    def owner_id(self) -> str:
+        """Name the recovery owner the commit-state store records."""
+        return "stack"
+
+    def reader_horizon(self) -> int | None:
+        """Answer the horizon a test seeded; None means no live reader holds the log."""
+        return self.horizon
+
+    @contextmanager
+    def exclusive(self, name: str, *, timeout: float) -> Iterator[None]:
+        """Record one section acquisition and hold it for the body."""
+        self.sections.append(("enter", name, timeout))
+        self.active += 1
+        try:
+            yield
+        finally:
+            self.active -= 1
+            self.sections.append(("exit", name, timeout))
+
+
 @dataclass
 class Stack:
     """One assembled database: its device, its stores, and the C6 components over them."""
@@ -192,7 +225,10 @@ class Stack:
 
     def recovery(self, **overrides: object) -> RecoveryManager:
         """Return a recovery manager over this stack, with anything the test wants changed."""
-        settings: dict[str, object] = {"catalog": self.catalog}
+        settings: dict[str, object] = {
+            "catalog": self.catalog,
+            "coordinator": StackCoordinator(),
+        }
         settings.update(overrides)
         return RecoveryManager(
             self.storage,  # type: ignore[arg-type]
@@ -245,7 +281,10 @@ def build_stack(
     wal.open()
     quarantine = QuarantineStore(device, the_clock, the_metrics)  # type: ignore[arg-type]
     ledger = LedgerStore(
-        device, the_clock, the_metrics, quarantine=quarantine  # type: ignore[arg-type]
+        device,
+        the_clock,
+        the_metrics,
+        quarantine=quarantine,  # type: ignore[arg-type]
     )
     return Stack(
         storage=device,
@@ -390,19 +429,27 @@ def fault_device(memory_device: MemoryStorageDevice) -> FaultInjectingStorageDev
 
 
 @pytest.fixture
-def stack(memory_device: MemoryStorageDevice, clock: FrozenClock, metrics: RecordingMetricsSink) -> Stack:
+def stack(
+    memory_device: MemoryStorageDevice,
+    clock: FrozenClock,
+    metrics: RecordingMetricsSink,
+) -> Stack:
     """Return a bootstrapped database over the memory device."""
     return build_stack(memory_device, clock=clock, metrics=metrics)
 
 
 @pytest.fixture
-def local_stack(local_device: LocalStorageDevice, clock: FrozenClock, metrics: RecordingMetricsSink) -> Stack:
+def local_stack(
+    local_device: LocalStorageDevice, clock: FrozenClock, metrics: RecordingMetricsSink
+) -> Stack:
     """Return a bootstrapped database over a real directory."""
     return build_stack(local_device, clock=clock, metrics=metrics)
 
 
 @pytest.fixture
-def make_stack(clock: FrozenClock, metrics: RecordingMetricsSink) -> Callable[..., Stack]:
+def make_stack(
+    clock: FrozenClock, metrics: RecordingMetricsSink
+) -> Callable[..., Stack]:
     """Return a factory that builds another stack over any device the test supplies."""
 
     def build(device: object, **overrides: object) -> Stack:

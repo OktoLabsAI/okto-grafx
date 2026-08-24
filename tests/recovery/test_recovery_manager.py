@@ -63,7 +63,13 @@ def _commit(stack: Stack, page_index: int, payload: bytes, *, txn_id: int = 1) -
     """Commit one heap page carrying this payload and return the commit number."""
     return commit_pages(
         stack,
-        [(HEAP_FILE, page_index, make_page_image(stack.codec, [payload], page_index=page_index))],
+        [
+            (
+                HEAP_FILE,
+                page_index,
+                make_page_image(stack.codec, [payload], page_index=page_index),
+            )
+        ],
         txn_id=txn_id,
     )
 
@@ -94,7 +100,9 @@ def _stored_bytes(stack: Stack) -> dict[str, bytes]:
     names = stack.storage.list_files("")  # type: ignore[attr-defined]
     return {
         name: stack.storage.read_log(  # type: ignore[attr-defined]
-            name, 0, stack.storage.file_size(name)  # type: ignore[attr-defined]
+            name,
+            0,
+            stack.storage.file_size(name),  # type: ignore[attr-defined]
         )
         for name in names
     }
@@ -105,7 +113,9 @@ def _stored_bytes(stack: Stack) -> dict[str, bytes]:
 
 def test_the_outcome_words_are_a_closed_set_and_order_by_what_recovery_did() -> None:
     assert stronger_outcome(OUTCOME_CLEAN, OUTCOME_TRUNCATED) == OUTCOME_TRUNCATED
-    assert stronger_outcome(OUTCOME_QUARANTINED, OUTCOME_TRUNCATED) == OUTCOME_QUARANTINED
+    assert (
+        stronger_outcome(OUTCOME_QUARANTINED, OUTCOME_TRUNCATED) == OUTCOME_QUARANTINED
+    )
     with pytest.raises(GrafxConfigurationError):
         RecoveryReport(outcome="repaired")
     with pytest.raises(GrafxConfigurationError):
@@ -151,7 +161,9 @@ def test_writable_recovery_barriers_a_clean_foreign_tail_before_publication(
     original_barrier = WalManager.force_barrier_range
     original_publish = CommitStateStore.publish
 
-    def barrier(manager: WalManager, first_lsn: int, through_lsn: int) -> tuple[str, ...]:
+    def barrier(
+        manager: WalManager, first_lsn: int, through_lsn: int
+    ) -> tuple[str, ...]:
         events.append("barrier")
         return original_barrier(manager, first_lsn, through_lsn)
 
@@ -189,7 +201,9 @@ def test_recovery_never_publishes_when_its_wal_barrier_escapes(
         raise failure
 
     def forbidden_publish(_store: CommitStateStore, _state: CommitState) -> None:
-        raise AssertionError("recovery published state without a successful WAL barrier")
+        raise AssertionError(
+            "recovery published state without a successful WAL barrier"
+        )
 
     monkeypatch.setattr(WalManager, "force_barrier_range", fail_barrier)
     monkeypatch.setattr(CommitStateStore, "publish", forbidden_publish)
@@ -258,7 +272,9 @@ def test_a_clean_recovery_counts_itself_under_its_outcome(stack: Stack) -> None:
 # --- a damaged tail ---------------------------------------------------------------------------------
 
 
-def test_a_run_of_interior_zeros_truncates_at_the_last_valid_record(stack: Stack) -> None:
+def test_a_run_of_interior_zeros_truncates_at_the_last_valid_record(
+    stack: Stack,
+) -> None:
     _commit(stack, 3, b"kept")
     good = stack.wal.last_lsn
     offset = _append_garbage(stack, bytes(96))
@@ -338,10 +354,14 @@ def test_recovery_refuses_to_cut_below_the_checkpoint_before_any_mutation(
     reopened = _reopened(stack)
     names_before = device.list_files("")  # type: ignore[attr-defined]
     wal_before = device.read_log(  # type: ignore[attr-defined]
-        segment, 0, device.log_size(segment)  # type: ignore[attr-defined]
+        segment,
+        0,
+        device.log_size(segment),  # type: ignore[attr-defined]
     )
     state_before = device.read_log(  # type: ignore[attr-defined]
-        COMMIT_STATE_FILE, 0, device.log_size(COMMIT_STATE_FILE)  # type: ignore[attr-defined]
+        COMMIT_STATE_FILE,
+        0,
+        device.log_size(COMMIT_STATE_FILE),  # type: ignore[attr-defined]
     )
     heap_before = digest_of_file(device, HEAP_FILE)
 
@@ -371,7 +391,9 @@ def test_recovery_refuses_to_cut_below_the_checkpoint_before_any_mutation(
     assert reopened.wal.damage is not None
 
 
-def test_the_forensic_entry_carries_the_offset_the_digest_and_the_bytes(stack: Stack) -> None:
+def test_the_forensic_entry_carries_the_offset_the_digest_and_the_bytes(
+    stack: Stack,
+) -> None:
     _commit(stack, 3, b"kept")
     body = bytes(96)
     # A44: the segment is captured by identity BEFORE the repair, never read back as "the
@@ -401,7 +423,9 @@ def test_the_quarantined_copy_holds_the_damaged_bytes(stack: Stack) -> None:
     assert reopened.quarantine.read(entries[0].name) == body
 
 
-def test_the_main_data_files_are_untouched_byte_for_byte_by_a_truncation(stack: Stack) -> None:
+def test_the_main_data_files_are_untouched_byte_for_byte_by_a_truncation(
+    stack: Stack,
+) -> None:
     _commit(stack, 3, b"kept")
     stack.pool.flush()
     before_heap = digest_of_file(stack.storage, HEAP_FILE)
@@ -488,8 +512,10 @@ def test_no_two_ledger_entries_describe_the_same_bytes(stack: Stack) -> None:
 
     entries = reopened.ledger.list(limit=100)
     places = [
-        (reopened.ledger.provenance(entry.entry_id).origin,
-         reopened.ledger.provenance(entry.entry_id).offset)
+        (
+            reopened.ledger.provenance(entry.entry_id).origin,
+            reopened.ledger.provenance(entry.entry_id).offset,
+        )
         for entry in entries
     ]
     assert len(places) == len(set(places)), places
@@ -525,7 +551,8 @@ def test_a_discard_is_counted_under_its_origin_class(stack: Stack) -> None:
     _append_garbage(stack, bytes(64))
     _reopened(stack).recovery().run()
     assert (
-        stack.metrics.counter(RECOVERY_DISCARDED_RECORDS_TOTAL, origin_class="forensic") == 1.0
+        stack.metrics.counter(RECOVERY_DISCARDED_RECORDS_TOTAL, origin_class="forensic")
+        == 1.0
     )
     assert stack.metrics.counter(RECOVERIES_TOTAL, outcome="truncated") == 1.0
 
@@ -533,7 +560,9 @@ def test_a_discard_is_counted_under_its_origin_class(stack: Stack) -> None:
 # --- the refuse policy --------------------------------------------------------------------------------
 
 
-def test_the_refuse_policy_raises_and_leaves_every_byte_where_it_was(stack: Stack) -> None:
+def test_the_refuse_policy_raises_and_leaves_every_byte_where_it_was(
+    stack: Stack,
+) -> None:
     _commit(stack, 3, b"kept")
     name = _segment(stack)
     _append_garbage(stack, bytes(96))
@@ -755,7 +784,10 @@ def test_an_aborted_transaction_contributes_nothing_to_the_redo(stack: Stack) ->
                 descriptor=DESCRIPTOR,
             ),
             WalRecord(
-                record_type=int(WalRecordType.ABORT), epoch=1, txn_id=8, descriptor=DESCRIPTOR
+                record_type=int(WalRecordType.ABORT),
+                epoch=1,
+                txn_id=8,
+                descriptor=DESCRIPTOR,
             ),
         ]
     )
@@ -764,7 +796,9 @@ def test_an_aborted_transaction_contributes_nothing_to_the_redo(stack: Stack) ->
     assert report.records_replayed == 0
 
 
-def test_a_commit_after_an_abort_is_refused_before_recovery_mutates_bytes(stack: Stack) -> None:
+def test_a_commit_after_an_abort_is_refused_before_recovery_mutates_bytes(
+    stack: Stack,
+) -> None:
     """A legacy staged ABORT cannot make recovery skip an applied page and publish past it."""
     from okto_grafx.domain.txn.commit_record import CommitPayload
     from okto_grafx.domain.txn.records import encode_page_write
@@ -780,7 +814,10 @@ def test_a_commit_after_an_abort_is_refused_before_recovery_mutates_bytes(stack:
                 descriptor=DESCRIPTOR,
             ),
             WalRecord(
-                record_type=int(WalRecordType.ABORT), epoch=1, txn_id=12, descriptor=DESCRIPTOR
+                record_type=int(WalRecordType.ABORT),
+                epoch=1,
+                txn_id=12,
+                descriptor=DESCRIPTOR,
             ),
             WalRecord(
                 record_type=int(WalRecordType.COMMIT),
@@ -960,14 +997,20 @@ def test_a_meta_page_that_is_not_a_header_page_is_damage(stack: Stack) -> None:
     assert caught.value.details["field"] == "page_type"
 
 
-def test_a_database_with_no_meta_page_yet_is_not_a_version_mismatch(stack: Stack) -> None:
+def test_a_database_with_no_meta_page_yet_is_not_a_version_mismatch(
+    stack: Stack,
+) -> None:
     assert stack.recovery().run().outcome == OUTCOME_CLEAN
 
 
 # --- carried finding CF-1: retiring a damaged control record -------------------------------------------
 
 
-def _control(stack: Stack, name: str = "control/reader-a.reader", body: bytes = b"damaged") -> str:
+def _control(
+    stack: Stack,
+    name: str = "control/writer.lease",
+    body: bytes = b"damaged",
+) -> str:
     """Put a control record on the device and return its name."""
     device = stack.storage
     device.create(name, exclusive=False)  # type: ignore[attr-defined]
@@ -993,7 +1036,9 @@ def test_retiring_a_healthy_control_record_is_refused(stack: Stack) -> None:
     assert stack.storage.exists(name)  # type: ignore[attr-defined]
 
 
-def test_retiring_a_damaged_record_quarantines_then_records_then_retires(stack: Stack) -> None:
+def test_retiring_a_damaged_record_quarantines_then_records_then_retires(
+    stack: Stack,
+) -> None:
     name = _control(stack, body=b"a damaged reader record")
     probe = RefusingProbe(GrafxCorruptionDetected("The reader record is unreadable."))
     report = stack.recovery(control_probe=probe).retire_control_record(name)
@@ -1024,6 +1069,16 @@ def test_a_retirement_reports_that_the_reader_horizon_must_be_derived_again(
 def test_a_retirement_asks_the_coordinator_for_the_horizon_again_when_one_is_wired(
     stack: Stack,
 ) -> None:
+    class _Section:
+        """A held section that releases on exit."""
+
+        def __enter__(self) -> None:
+            """Hold."""
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            """Release."""
+            return False
+
     class Coordinator:
         """A coordinator that answers a horizon and counts how often it was asked."""
 
@@ -1036,12 +1091,16 @@ def test_a_retirement_asks_the_coordinator_for_the_horizon_again_when_one_is_wir
             self.calls += 1
             return 12
 
+        def exclusive(self, name: str, *, timeout: float) -> "_Section":
+            """Grant the commit section; the fence is not what this test is about."""
+            return _Section()
+
     name = _control(stack)
     coordinator = Coordinator()
     probe = RefusingProbe(GrafxCorruptionDetected("The reader record is unreadable."))
-    report = stack.recovery(control_probe=probe, coordinator=coordinator).retire_control_record(
-        name
-    )
+    report = stack.recovery(
+        control_probe=probe, coordinator=coordinator
+    ).retire_control_record(name)
     assert coordinator.calls == 1
     horizon = report.findings_of(FindingKind.READER_HORIZON_REDERIVED)
     assert horizon and horizon[0].lsn == 12
@@ -1059,7 +1118,9 @@ def test_a_file_outside_the_control_directory_is_never_retired_by_this_door(
     assert stack.storage.exists(HEAP_FILE)  # type: ignore[attr-defined]
 
 
-def test_commit_state_is_never_retired_as_a_generic_control_record(stack: Stack) -> None:
+def test_commit_state_is_never_retired_as_a_generic_control_record(
+    stack: Stack,
+) -> None:
     """Only commit/recovery publication may replace the snapshot/checkpoint fence."""
     name = "control/commit.state"
     probe = RefusingProbe(GrafxCorruptionDetected("Damaged."))
@@ -1074,7 +1135,9 @@ def test_commit_state_is_never_retired_as_a_generic_control_record(stack: Stack)
 def test_retiring_a_control_record_that_is_not_there_is_refused(stack: Stack) -> None:
     probe = RefusingProbe(GrafxCorruptionDetected("Damaged."))
     with pytest.raises(GrafxRecoveryRefused):
-        stack.recovery(control_probe=probe).retire_control_record("control/missing.reader")
+        stack.recovery(control_probe=probe).retire_control_record(
+            "control/writer.lease"
+        )
 
 
 def test_a_retryable_access_failure_is_never_evidence_of_damage(stack: Stack) -> None:
@@ -1102,7 +1165,9 @@ def test_a_retryable_access_failure_is_never_evidence_of_damage(stack: Stack) ->
     assert stack.ledger.list() == ()
 
 
-def test_a_probe_that_fails_with_a_foreign_exception_retires_nothing(stack: Stack) -> None:
+def test_a_probe_that_fails_with_a_foreign_exception_retires_nothing(
+    stack: Stack,
+) -> None:
     """An unclassifiable failure is evidence of nothing, and this door needs evidence."""
     name = _control(stack)
     probe = RefusingProbe(RuntimeError("the decoder exploded"))
@@ -1141,7 +1206,9 @@ def _table() -> TableDef:
     )
 
 
-def test_the_catalog_is_re_derived_from_the_replayed_pages_and_adopted(stack: Stack) -> None:
+def test_the_catalog_is_re_derived_from_the_replayed_pages_and_adopted(
+    stack: Stack,
+) -> None:
     from okto_grafx.domain.txn.commit_record import CommitPayload
     from okto_grafx.domain.txn.records import encode_page_write
 
@@ -1162,7 +1229,9 @@ def test_the_catalog_is_re_derived_from_the_replayed_pages_and_adopted(stack: St
                 record_type=int(WalRecordType.WRITE_PAGE),
                 epoch=1,
                 txn_id=2,
-                payload=encode_page_write(file, page_index, stack.codec.encode_page(decoded)),
+                payload=encode_page_write(
+                    file, page_index, stack.codec.encode_page(decoded)
+                ),
                 descriptor=DESCRIPTOR,
             )
         )
@@ -1192,7 +1261,9 @@ def test_the_catalog_can_save_after_recovery_replayed_its_pages(stack: Stack) ->
     reopened.recovery().run()
     # The whole point of the CF-4 route: the store is not left refusing its next save.
     reopened.catalog.save()
-    assert [table.name for table in reopened.catalog.read_from_pages().tables()] == ["Person"]
+    assert [table.name for table in reopened.catalog.read_from_pages().tables()] == [
+        "Person"
+    ]
 
 
 def test_recovery_says_the_caller_owes_the_route_when_no_catalog_store_is_wired(
@@ -1240,7 +1311,9 @@ def test_a_collaborator_of_the_wrong_type_is_refused_at_construction(
         )
 
 
-def test_a_log_that_cannot_answer_the_doors_recovery_opens_is_refused(stack: Stack) -> None:
+def test_a_log_that_cannot_answer_the_doors_recovery_opens_is_refused(
+    stack: Stack,
+) -> None:
     from okto_grafx.domain.errors import GrafxPortNotConfigured
 
     class Half:
@@ -1283,7 +1356,9 @@ def test_the_checkpoint_narrows_the_redo_without_moving_the_cut(stack: Stack) ->
     assert report.last_good_lsn == stack.wal.last_lsn
 
 
-def test_a_commit_state_that_will_not_parse_only_makes_recovery_redo_more(stack: Stack) -> None:
+def test_a_commit_state_that_will_not_parse_only_makes_recovery_redo_more(
+    stack: Stack,
+) -> None:
     from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE
 
     _commit(stack, 3, b"first")
@@ -1307,12 +1382,20 @@ def test_a_second_database_over_a_second_device_is_recovered_independently(
         first_segment = first.wal.segments()[-1].name
         first_device.append_log(first_segment, bytes(96))
         first.wal.open()
-        assert build_stack(
-            first_device, clock=clock, metrics=metrics, bootstrap=False
-        ).recovery().run().outcome == OUTCOME_TRUNCATED
-        assert build_stack(
-            second_device, clock=clock, metrics=metrics, bootstrap=False
-        ).recovery().run().outcome == OUTCOME_CLEAN
+        assert (
+            build_stack(first_device, clock=clock, metrics=metrics, bootstrap=False)
+            .recovery()
+            .run()
+            .outcome
+            == OUTCOME_TRUNCATED
+        )
+        assert (
+            build_stack(second_device, clock=clock, metrics=metrics, bootstrap=False)
+            .recovery()
+            .run()
+            .outcome
+            == OUTCOME_CLEAN
+        )
     finally:
         first_device.close()
         second_device.close()
@@ -1334,7 +1417,9 @@ def test_a_reopened_log_is_the_one_recovery_repaired(stack: Stack) -> None:
     assert fresh.damage is None and fresh.last_lsn == good
 
 
-def test_the_ledger_of_a_repaired_database_still_reads_after_a_reopen(stack: Stack) -> None:
+def test_the_ledger_of_a_repaired_database_still_reads_after_a_reopen(
+    stack: Stack,
+) -> None:
     _commit(stack, 3, b"kept")
     _append_garbage(stack, bytes(96))
     report = _reopened(stack).recovery().run()
@@ -1362,18 +1447,32 @@ def _non_damage_refusals() -> list[tuple[str, Exception]]:
     )
 
     return [
-        ("port_not_configured", GrafxPortNotConfigured("No decoder is wired.", slot="codec")),
+        (
+            "port_not_configured",
+            GrafxPortNotConfigured("No decoder is wired.", slot="codec"),
+        ),
         ("configuration_error", GrafxConfigurationError("Bad argument.", field="file")),
-        ("lease_stolen", GrafxLeaseStolen("The lease moved to another writer.", epoch=7)),
+        (
+            "lease_stolen",
+            GrafxLeaseStolen("The lease moved to another writer.", epoch=7),
+        ),
         ("stale_epoch", GrafxStaleEpoch("Your epoch is behind the record's.", epoch=3)),
-        ("unsupported_operation", GrafxUnsupportedOperation("Not this build.", field="x")),
+        (
+            "unsupported_operation",
+            GrafxUnsupportedOperation("Not this build.", field="x"),
+        ),
         ("grafx_error", GrafxError("Something went wrong.")),
-        ("schema_version_mismatch", GrafxSchemaVersionMismatch("A newer build wrote this.")),
+        (
+            "schema_version_mismatch",
+            GrafxSchemaVersionMismatch("A newer build wrote this."),
+        ),
     ]
 
 
 @pytest.mark.parametrize(
-    ("code", "failure"), _non_damage_refusals(), ids=[code for code, _ in _non_damage_refusals()]
+    ("code", "failure"),
+    _non_damage_refusals(),
+    ids=[code for code, _ in _non_damage_refusals()],
 )
 def test_only_corruption_detected_is_evidence_a_control_record_is_damaged(
     stack: Stack, code: str, failure: Exception
@@ -1400,7 +1499,9 @@ def test_only_corruption_detected_is_evidence_a_control_record_is_damaged(
     assert stack.ledger.list() == ()
 
 
-def test_a_stale_writer_cannot_delete_the_lease_that_is_refusing_it(stack: Stack) -> None:
+def test_a_stale_writer_cannot_delete_the_lease_that_is_refusing_it(
+    stack: Stack,
+) -> None:
     """Carried finding CF-1 point 4, stated as a test rather than as a promise.
 
     ``stale_epoch`` and ``lease_stolen`` are what the coordination adapter raises about a HEALTHY
@@ -1417,7 +1518,9 @@ def test_a_stale_writer_cannot_delete_the_lease_that_is_refusing_it(stack: Stack
         GrafxLeaseStolen("The lease is held at epoch 4 by another writer.", epoch=4),
     ):
         with pytest.raises(GrafxRecoveryRefused) as caught:
-            stack.recovery(control_probe=RefusingProbe(failure)).retire_control_record(lease)
+            stack.recovery(control_probe=RefusingProbe(failure)).retire_control_record(
+                lease
+            )
         assert "not evidence that its bytes are damaged" in caught.value.message
         assert stack.storage.exists(lease)  # type: ignore[attr-defined]
     kept = stack.storage.read_log(lease, 0, stack.storage.log_size(lease))  # type: ignore[attr-defined]
@@ -1505,7 +1608,9 @@ def test_the_policy_is_named_recovery_policy_the_way_the_configuration_names_it(
     assert stack.recovery().recovery_policy == "replay"
 
 
-def test_naming_the_policy_twice_with_two_different_words_is_refused(stack: Stack) -> None:
+def test_naming_the_policy_twice_with_two_different_words_is_refused(
+    stack: Stack,
+) -> None:
     """No ordering rule visible from the call site could make one of the two the answer."""
     with pytest.raises(GrafxConfigurationError) as caught:
         stack.recovery(recovery_policy=POLICY_REFUSE, policy="replay")
