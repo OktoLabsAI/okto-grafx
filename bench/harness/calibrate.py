@@ -448,6 +448,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out", default=None, help="write calibration.json here")
     parser.add_argument("--metrics", default=None, help="write the published metrics document here")
     parser.add_argument("--workspace", default=None, help="a directory to build databases in")
+    parser.add_argument(
+        "--vector-recall",
+        action="store_true",
+        help="run the C13 recall stage and append its section and gauge (SPEC-VEC FR-8)",
+    )
+    parser.add_argument(
+        "--recall-profile",
+        default="smoke",
+        choices=("smoke", "full", "tiny"),
+        help="the frozen recall profile; smoke on pushes, full on the schedule",
+    )
+    parser.add_argument(
+        "--recall-gt",
+        default="auto",
+        choices=("auto", "pure"),
+        help="oracle mode: auto follows the profile, pure forces the canonical fsum oracle",
+    )
     arguments = parser.parse_args(argv)
 
     workspace = (
@@ -470,6 +487,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         Path(arguments.out).write_text(
             json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+    # The vector recall stage is FINAL and ADDITIVE (C13 v4): every legacy output above is
+    # already on disk, unconditionally. A recall failure exits non-zero with those intact;
+    # success appends the section to --out first and the gauge to --metrics LAST, so a gauge
+    # can never exist without its section.
+    if arguments.vector_recall:
+        from bench.harness.recall_wiring import append_vector_recall
+
+        vector_exit = append_vector_recall(
+            profile=arguments.recall_profile,
+            gt_mode=arguments.recall_gt,
+            out=Path(arguments.out) if arguments.out else None,
+            metrics=Path(arguments.metrics) if arguments.metrics else None,
+            workspace=workspace,
+        )
+        if vector_exit != 0:
+            return vector_exit
     return result.exit_code
 
 
