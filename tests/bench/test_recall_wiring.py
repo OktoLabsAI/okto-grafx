@@ -531,7 +531,38 @@ def test_an_ordinary_worker_exception_is_a_typed_exit_not_a_traceback(
     assert metrics.read_text(encoding="utf-8") == metrics_before
 
 
-@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0, -5, True])
+@pytest.mark.parametrize(
+    "bad",
+    [10**10000, "0.9", True, float("nan"), float("inf"), -0.1, 1.5, None],
+    # Explicit ids: str(10**10000) in pytest's id generation exceeds the digit limit.
+    ids=["huge-int", "string", "bool", "nan", "inf", "negative", "above-one", "absent"],
+)
+def test_an_invalid_worker_gauge_is_refused_before_any_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: object
+) -> None:
+    """The verdict's gauge is validated BEFORE the section append: huge int (float()
+    itself raises OverflowError), string, bool, non-finite and out-of-range are all
+    typed exit 3 with both documents exactly as the strip left them."""
+    out, metrics = _seed_documents(tmp_path)
+    out_before = out.read_text(encoding="utf-8")
+    metrics_before = metrics.read_text(encoding="utf-8")
+    verdict = _verdict_stub()
+    verdict["gauge"] = bad
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: verdict)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    assert out.read_text(encoding="utf-8") == out_before, "no section may land"
+    assert metrics.read_text(encoding="utf-8") == metrics_before, "no gauge may land"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [float("nan"), float("inf"), 0, -5, True, 10**10000, -(10**10000)],
+    # Explicit ids: str(10**10000) in pytest's id generation exceeds the digit limit.
+    ids=["nan", "inf", "zero", "negative", "bool", "huge-int", "huge-negative-int"],
+)
 def test_an_invalid_timeout_is_refused_before_mkdir_or_spawn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: object
 ) -> None:

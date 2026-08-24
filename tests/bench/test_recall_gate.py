@@ -293,7 +293,21 @@ def test_wrong_kind_or_unit_or_extra_fields_are_unmeasured(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize(
-    "target", [float("nan"), float("inf"), 0.0, 1.5, -1.0, True, "0.9"]
+    "target",
+    [float("nan"), float("inf"), 0.0, 1.5, -1.0, True, "0.9", 10**10000, -(10**10000)],
+    # Explicit ids: pytest's own id generation calls str() on parameters, and
+    # str(10**10000) exceeds CPython's digit limit -- the collection itself crashed.
+    ids=[
+        "nan",
+        "inf",
+        "zero",
+        "above-one",
+        "negative",
+        "bool",
+        "string",
+        "huge-int",
+        "huge-negative-int",
+    ],
 )
 def test_check_called_directly_with_an_invalid_target_is_unmeasured(
     tmp_path: Path, target: object
@@ -314,3 +328,46 @@ def test_a_non_utf8_metrics_file_is_unmeasured_not_a_traceback(tmp_path: Path) -
     document = tmp_path / "metrics.json"
     document.write_bytes(b"\xff\xfe\x00garbage")
     assert main(["--metrics", str(document)]) == 2
+
+
+def test_a_huge_integer_gauge_value_is_refused_not_an_overflow(tmp_path: Path) -> None:
+    """The reaudit's OverflowError probe, gauge side: float(10**400) raises BEFORE
+    isfinite unless the conversion is guarded. 10**400 is used because it still parses
+    as JSON (CPython refuses integer literals past its digit limit) yet overflows float.
+    """
+    document = _document_with_recall_entries(tmp_path, [_shaped([{"value": 10**400}])])
+    assert main(["--metrics", str(document)]) == 2
+
+
+def test_a_huge_integer_ceiling_sample_is_skipped_not_an_overflow(
+    tmp_path: Path,
+) -> None:
+    """Third-order: read_multiples also coerced with bare float() -- a huge integer in a
+    LEGACY ceiling sample crashed the gate. Skipped now, so the ceiling is UNMEASURED."""
+    document = tmp_path / "metrics.json"
+    document.write_text(
+        json.dumps(
+            {
+                "metrics": [
+                    {
+                        "name": "oktografx_baseline_ceiling_multiple",
+                        "samples": [
+                            {"value": 10**400, "labels": {"ceiling": "durable_commit"}},
+                            {"value": 1.0, "labels": {"ceiling": "point_read"}},
+                            {"value": 1.0, "labels": {"ceiling": "open_replay"}},
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert main(["--metrics", str(document)]) == 2
+
+
+def test_a_huge_integer_explicit_target_raises_the_typed_error_not_overflow() -> None:
+    """_resolve refuses programmatic 10**10000 with its DOCUMENTED ValueError."""
+    with pytest.raises(ValueError, match="finite number"):
+        _resolve_recall_target(10**10000, None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="finite number"):
+        _resolve_recall_target(-(10**10000), None)  # type: ignore[arg-type]

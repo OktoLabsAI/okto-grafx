@@ -17,6 +17,7 @@ Any recall failure returns non-zero with the legacy outputs already intact on di
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -176,19 +177,42 @@ def append_vector_recall(
         # a strip failure aborts before any measurement begins.
         print(f"vector recall: stage failed before publication -- {failure}")
         return 3
+    # The verdict's gauge is validated BEFORE any publication: an exact non-bool number,
+    # convertible without OverflowError (a huge integer raises inside float() itself),
+    # finite, in [0, 1]. A worker that emitted anything else did not measure a ratio, and
+    # normalizing junk into the metrics document would hand the gate a lie -- so nothing
+    # vectorial is written and the stage exits 3 typed, with out/metrics exactly as the
+    # strip left them. The value is deliberately NOT interpolated into the message: a
+    # huge integer's repr can itself raise past CPython's digit limit.
+    gauge = verdict.get("gauge") if isinstance(verdict, dict) else None
+    gauge_valid = not isinstance(gauge, bool) and type(gauge) in (int, float)
+    gauge_value = 0.0
+    if gauge_valid:
+        try:
+            gauge_value = float(gauge)  # type: ignore[arg-type]
+        except OverflowError:
+            gauge_valid = False
+        else:
+            gauge_valid = math.isfinite(gauge_value) and 0.0 <= gauge_value <= 1.0
+    if not gauge_valid:
+        print(
+            "vector recall: FAIL-CLOSED -- the worker verdict's gauge is not a finite "
+            "ratio in [0, 1]; nothing vectorial was published."
+        )
+        return 3
     try:
         section = build_section(verdict)
         if out is not None:
             _append_section(out, section)
         if metrics is not None:
-            _append_gauge(metrics, float(verdict["gauge"]))  # type: ignore[arg-type]
+            _append_gauge(metrics, gauge_value)
     except (OSError, ValueError, TypeError, RuntimeError) as failure:
         print(f"vector recall: publication failed after measurement -- {failure}")
         return 3
     home = next(iter(section["observed"]))  # type: ignore[call-overload]
     print(
         f"vector recall: profile {profile} mean recall@k "
-        f"{float(verdict['gauge']):.4f} ({home}); section first, gauge last."  # type: ignore[arg-type]
+        f"{gauge_value:.4f} ({home}); section first, gauge last."
     )
     return 0
 

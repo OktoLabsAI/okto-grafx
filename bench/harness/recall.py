@@ -63,6 +63,17 @@ resolves these when the caller passes no explicit timeout; an explicit value alw
 wins after validation."""
 
 
+def _describe(value: object) -> str:
+    """repr(), guarded and bounded: ``repr(10**10000)`` raises past CPython's digit
+    limit, and the refusal message must not crash the refusal (mirrors gate._describe).
+    """
+    try:
+        text = repr(value)
+    except (ValueError, OverflowError):
+        return f"<{type(value).__name__} too large to print>"
+    return text if len(text) <= 80 else text[:77] + "..."
+
+
 def run_recall(
     profile: str,
     *,
@@ -83,17 +94,26 @@ def run_recall(
         )
     if timeout_seconds is None:
         timeout_seconds = PROFILE_TIMEOUTS[profile]
-    if (
-        isinstance(timeout_seconds, bool)
-        or type(timeout_seconds) not in (int, float)
-        or not math.isfinite(float(timeout_seconds))
-        or not float(timeout_seconds) > 0.0
-    ):
+    invalid = isinstance(timeout_seconds, bool) or type(timeout_seconds) not in (
+        int,
+        float,
+    )
+    if not invalid:
+        try:
+            # float(10**10000) raises OverflowError BEFORE isfinite could refuse it, so
+            # the conversion itself is guarded -- the reaudit's huge-integer probe.
+            as_float = float(timeout_seconds)
+        except OverflowError:
+            invalid = True
+        else:
+            invalid = not math.isfinite(as_float) or not as_float > 0.0
+    if invalid:
         raise RecallStageError(
-            f"timeout_seconds must be a finite positive number; got {timeout_seconds!r} "
+            "timeout_seconds must be a finite positive number; "
+            f"got {_describe(timeout_seconds)} "
             "-- refused before any directory or process exists."
         )
-    timeout_seconds = float(timeout_seconds)
+    timeout_seconds = as_float
     scratch.mkdir(parents=True, exist_ok=True)
     verdict_path = scratch / f"recall-{profile}.json"
     environment = dict(os.environ)

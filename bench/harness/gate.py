@@ -49,6 +49,40 @@ DEFAULT_RECALL_TARGET: float = 0.90
 """The recall target this build calibrates against until the vector wave freezes its own."""
 
 
+def _as_finite_float(value: object) -> float | None:
+    """The value as a finite float, or None -- the CONVERSION is part of the validation.
+
+    ``float(10**10000)`` raises OverflowError BEFORE ``math.isfinite`` can ever see a
+    result, so any guard written as ``math.isfinite(float(value))`` raises on a huge
+    integer instead of refusing it -- the reaudit probe that broke the never-raise
+    contract. Bools are excluded first (``True`` converts to ``1.0``), exotic subclasses
+    with it; a JSON document cannot even carry an integer above CPython's digit limit,
+    but a direct caller can, and this boundary owes them a refusal, not a traceback.
+    """
+    if isinstance(value, bool) or type(value) not in (float, int):
+        return None
+    try:
+        coerced = float(value)
+    except OverflowError:
+        return None
+    return coerced if math.isfinite(coerced) else None
+
+
+def _describe(value: object) -> str:
+    """repr(), guarded and bounded -- because the REFUSAL path must not raise either.
+
+    ``repr(10**10000)`` exceeds CPython's integer-to-string digit limit and raises
+    ValueError, so a refusal message formatted with ``{value!r}`` crashes exactly the
+    code path whose whole job is to refuse without crashing. Second-order, found by the
+    post-fix probe of the first-order OverflowError fix.
+    """
+    try:
+        text = repr(value)
+    except (ValueError, OverflowError):
+        return f"<{type(value).__name__} too large to print>"
+    return text if len(text) <= 80 else text[:77] + "..."
+
+
 @dataclass(frozen=True, slots=True)
 class GateResult:
     """What the gate concluded about one published metrics document."""
@@ -105,16 +139,21 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
         for sample in entry.get("samples", []):
             if not isinstance(sample, Mapping) or "value" not in sample:
                 continue
-            value = sample["value"]
-            if not isinstance(value, (int, float)):
+            # The guarded coercion is load-bearing here too: float(10**400) raises
+            # OverflowError, and a huge integer CAN arrive in a JSON sample. A value
+            # that is not a non-bool finite number is SKIPPED -- the sample was never a
+            # measurement -- which leaves its ceiling UNMEASURED rather than letting a
+            # NaN read as EXCEEDED or a traceback read as exit 1.
+            coerced = _as_finite_float(sample["value"])
+            if coerced is None:
                 continue
             labels = sample.get("labels", {})
             if name == METRIC_NAME and isinstance(labels, Mapping):
                 ceiling = labels.get("ceiling")
                 if isinstance(ceiling, str):
-                    multiples[ceiling] = float(value)
+                    multiples[ceiling] = coerced
             elif isinstance(name, str):
-                gauges[name] = float(value)
+                gauges[name] = coerced
     return multiples, gauges, ""
 
 
@@ -195,20 +234,16 @@ def check(
     passing bool/NaN/Inf or a value outside (0, 1] gets UNMEASURED, never an exception and
     never a verdict computed against nonsense.
     """
-    if (
-        isinstance(recall_target, bool)
-        or type(recall_target) not in (float, int)
-        or not math.isfinite(float(recall_target))
-        or not 0.0 < float(recall_target) <= 1.0
-    ):
+    coerced_target = _as_finite_float(recall_target)
+    if coerced_target is None or not 0.0 < coerced_target <= 1.0:
         return GateResult(
             status=STATUS_UNMEASURED,
             lines=(
-                f"vector_recall: UNMEASURED -- recall_target {recall_target!r} is not a "
-                "finite number in (0, 1]; the gate cannot be taken",
+                f"vector_recall: UNMEASURED -- recall_target {_describe(recall_target)} "
+                "is not a finite number in (0, 1]; the gate cannot be taken",
             ),
         )
-    recall_target = float(recall_target)
+    recall_target = coerced_target
     multiples, _, error = read_multiples(document)
     if error:
         return GateResult(status=STATUS_UNMEASURED, lines=(error,))
@@ -258,26 +293,22 @@ def check(
         lines.append(f"vector_recall: UNMEASURED -- {RECALL_METRIC} {value}")
         status = STATUS_UNMEASURED
     else:
-        usable = (
-            not isinstance(value, bool)
-            and isinstance(value, (int, float))
-            and math.isfinite(float(value))
-            and 0.0 <= float(value) <= 1.0
-        )
-        if not usable:
+        measured = _as_finite_float(value)
+        if measured is None or not 0.0 <= measured <= 1.0:
             lines.append(
-                f"vector_recall: UNMEASURED -- published value {value!r} is not a recall "
-                "measurement (a ratio must be a non-bool finite number in [0, 1])"
+                f"vector_recall: UNMEASURED -- published value {_describe(value)} is "
+                "not a recall measurement (a ratio must be a non-bool finite number "
+                "in [0, 1])"
             )
             status = STATUS_UNMEASURED
-        elif float(value) >= recall_target:
+        elif measured >= recall_target:
             lines.append(
-                f"vector_recall: {float(value):.4f} at or above the "
+                f"vector_recall: {measured:.4f} at or above the "
                 f"{recall_target:g} target -- met"
             )
         else:
             lines.append(
-                f"vector_recall: {float(value):.4f} BELOW the {recall_target:g} "
+                f"vector_recall: {measured:.4f} BELOW the {recall_target:g} "
                 "target -- EXCEEDED"
             )
             if status == STATUS_MET:
@@ -300,16 +331,13 @@ def _resolve_recall_target(
     default applies only when neither source was given at all.
     """
     if explicit is not None:
-        if (
-            isinstance(explicit, bool)
-            or type(explicit) not in (float, int)
-            or not math.isfinite(float(explicit))
-            or not 0.0 < float(explicit) <= 1.0
-        ):
+        coerced = _as_finite_float(explicit)
+        if coerced is None or not 0.0 < coerced <= 1.0:
             raise ValueError(
-                f"--recall-target must be a finite number in (0, 1]; got {explicit!r}"
+                "--recall-target must be a finite number in (0, 1]; "
+                f"got {_describe(explicit)}"
             )
-        return float(explicit), "explicit flag"
+        return coerced, "explicit flag"
     if calibration:
         try:
             payload = json.loads(Path(calibration).read_text(encoding="utf-8"))
@@ -323,13 +351,9 @@ def _resolve_recall_target(
             if isinstance(payload, dict)
             else None
         )
-        if (
-            isinstance(candidate, (int, float))
-            and not isinstance(candidate, bool)
-            and math.isfinite(float(candidate))
-            and 0.0 < float(candidate) <= 1.0
-        ):
-            return float(candidate), f"frozen in {calibration}"
+        frozen = _as_finite_float(candidate)
+        if frozen is not None and 0.0 < frozen <= 1.0:
+            return frozen, f"frozen in {calibration}"
         raise ValueError(
             f"--calibration {calibration!r} holds no usable frozen vector_recall target; "
             "refusing to fall back to a floor nobody chose"
