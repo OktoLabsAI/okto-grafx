@@ -83,6 +83,8 @@ def _configure(
     names here turns that into a GrafxConfigurationError that names the option and lists the ones
     that exist, which is the difference between a typed refusal and a stack trace (section 2).
     """
+    if "vector_recall_target" in options:
+        raise _removed_recall_target()
     unknown = sorted(name for name in options if name not in _CONFIG_FIELDS)
     if unknown:
         raise _unknown_options(unknown)
@@ -135,6 +137,18 @@ def _unknown_options(unknown: list[str]) -> GrafxConfigurationError:
         f"Unknown connection option(s): {', '.join(unknown)}. The options are: {known}.",
         field="options",
         value=unknown,
+    )
+
+
+def _removed_recall_target() -> GrafxConfigurationError:
+    """Refuse the former runtime knob with its honest offline replacement."""
+    return GrafxConfigurationError(
+        "Connection option 'vector_recall_target' was removed because recall is an offline "
+        "calibration gate, not a per-database runtime guarantee. Use "
+        "bench.harness.gate --recall-target for that gate; use 'vector_ef_search' to configure "
+        "runtime HNSW search effort.",
+        field="vector_recall_target",
+        replacement="bench.harness.gate --recall-target",
     )
 
 

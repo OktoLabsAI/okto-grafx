@@ -17,12 +17,12 @@ from __future__ import annotations
 
 import pytest
 
+from bench.harness.gate import DEFAULT_RECALL_TARGET
 from okto_grafx.adapters.vectormath_pure import PureVectorMath
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.domain.vector.hnsw import HnswGraph
 from okto_grafx.domain.vector.planner import REGIME_APPROXIMATE
-from okto_grafx.runtime.config import DatabaseConfig
 
 from .conftest import (
     RecordingMetrics,
@@ -88,11 +88,10 @@ def test_the_traversal_meets_the_calibrated_recall_target(
     """AC-6 and BR-8: recall is measured against ground truth, not asserted."""
     corpus = seeded_vectors(RECALL_CORPUS, RECALL_DIMENSION, seed=0xBEEF)
     graph = _recall_graph(corpus)
-    target = DatabaseConfig(path=":memory:").vector_recall_target
     recall = _measure_recall(
         graph, corpus, set(range(1, RECALL_CORPUS + 1)), range(0, RECALL_CORPUS, 10)
     )
-    assert recall >= target, recall
+    assert recall >= DEFAULT_RECALL_TARGET, recall
     assert metrics is not None
 
 
@@ -122,7 +121,7 @@ def test_recall_survives_heavy_reconciliation() -> None:
     assert graph.is_connected_at_layer_zero()
     live = set(range(1, RECALL_CORPUS + 1)) - removed
     recall = _measure_recall(graph, corpus, live, range(0, RECALL_CORPUS, 10))
-    assert recall >= DatabaseConfig(path=":memory:").vector_recall_target, recall
+    assert recall >= DEFAULT_RECALL_TARGET, recall
 
 
 # --- determinism ---------------------------------------------------------------------------------

@@ -11,7 +11,8 @@ The items, in the order they must land (each its own commit, suite-green before 
 
 1. **HNSW partial-graph race** — wrong results through a public door. Fix now.
 2. **WAL truncation race** — a second `connect()` truncates another process's in-flight append.
-3. **Dead configuration knobs** — `checkpoint_interval_records`, `vector_recall_target`.
+3. **Honest configuration** — wire `checkpoint_interval_records`; remove the inert runtime recall
+   target and leave recall ownership with the offline calibration gate.
 4. **Option 1: identity-range leasing** — the authorized §8.5-adjacent amendment (W6 record).
 
 A blind-critic round reviews the whole series at the end (§9). History says plan for it to find
@@ -300,12 +301,12 @@ writer); CHANGELOG.
 
 ---
 
-## 3. The two dead knobs (public-contract lies)
+## 3. Honest outcomes for the two dead knobs
 
-Both are in `DatabaseConfig` (anchor block `path: str` → `read_only: bool = False` in
-`src/okto_grafx/runtime/config.py`), both validated, both documented in README §Configuration,
-neither consulted anywhere *(Codex, static — re-verify with grep before wiring:
-`grep -rn checkpoint_interval_records src/` shows config/validation only)*.
+The audit found two accepted values with no consumer. They have deliberately different outcomes:
+`checkpoint_interval_records` controls runtime maintenance and is wired below;
+`vector_recall_target` described an offline SLO as if it were a per-database control and is removed
+below. Validation alone is never evidence that a configuration value is operational.
 
 ### 3a. `checkpoint_interval_records` — auto-checkpoint
 
@@ -336,31 +337,26 @@ Tests (`tests/api/test_auto_checkpoint.py`):
   refusing the checkpoint's barrier; the commit still returns durable; the next commit retries.
 - Kill-check: neuter `_maybe_checkpoint` body → first test fails.
 
-### 3b. `vector_recall_target` — wire it to what the spec says, not to an invention
+### 3b. `vector_recall_target` — remove the runtime lie
 
-Protocol (the semantics must come from the spec, per L31-style honesty):
-1. `grep -rn -i "recall" docs/specs/ docs/architecture/CONTRACT.md src/okto_grafx/engine/vector_engine.py bench/`
-   and read SPEC-VEC's clauses (FR-7/VTS — the round-6 session recalls `vector_recall_target:
-   float = 0.90` beside `vector_exact_scan_threshold: int = 4096`, and a C13 note that the bench
-   gate's `require_recall` is "not passed in the workflow").
-2. Two legitimate outcomes; implement whichever the spec supports, and say which in the CF entry:
-   - **Runtime semantics** (if SPEC-VEC binds the approximate regime to a recall target): pass
-     the value into `VectorEngine` (assembly → ctor → slot) and use it where the two-regime
-     search chooses parameters — the defensible mechanical wiring is
-     `effective_ef_search = max(self._ef_search, ceil(k * calibration(target)))` ONLY if a
-     calibration mapping already exists in `bench/` (grep `recall` there); if no principled
-     mapping exists in-tree, do NOT invent one — fall through to:
-   - **Calibration-gate semantics**: the knob is the target the calibration harness verifies
-     (`bench/harness/gate` has a recall input; the C13 CI job runs it). Wire the gate's
-     `require_recall` default from the config value, close the C13 observation, and update
-     README's table to say the knob "sets the recall target the calibration gate enforces; it
-     does not reshape an individual query". A documented knob that does exactly what its docs
-     say is the fix; a knob secretly steering ef_search by a made-up formula is a new lie.
-3. Either way: a test that fails when the knob is disconnected again (gate: pass a config with
-   target 0.99 against a calibration report below it → gate exit nonzero; runtime: ef grows).
+The codebase contains no measured mapping from a requested recall floor to `ef_search`, and an
+offline CI process cannot consume a value passed to `connect()` in an application process.
+Importing the runtime default into the gate would only make the two default constants agree; it
+would leave every caller override inert. The accepted outcome is therefore:
 
-Docs: CF-21 covering both knobs; README §Configuration rows updated to describe the REAL
-behavior; CHANGELOG "Fixed: two accepted-but-inert configuration options".
+1. remove `vector_recall_target` from `DatabaseConfig` and its validation;
+2. make `connect(..., vector_recall_target=...)` fail with `GrafxConfigurationError` naming
+   `bench.harness.gate --recall-target` as the migration;
+3. let vector regression tests read the offline gate's target, never runtime configuration;
+4. retain `vector_ef_search` as the bounded, behaviourally wired runtime effort control;
+5. do not invent a target-to-beam formula.
+
+Kill-checks: restoring the dataclass field fails the config surface assertion; treating the former
+option as generic unknown fails the migration assertion; disconnecting `vector_ef_search` fails the
+new/reopened index wiring regression in `tests/api/test_end_to_end.py`.
+
+Docs: CF-21 covering both honest outcomes; README and CONTRACT name the separate runtime and
+offline controls; CHANGELOG records the pre-alpha removal.
 
 ---
 

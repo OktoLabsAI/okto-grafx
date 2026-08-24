@@ -29,6 +29,11 @@ including the on-disk format.
   assembled or reattached by that database handle, and is exposed by the detached vector index
   view. The setting changes derived search effort only; it neither changes the exact/approximate
   regime boundary nor writes a new on-disk format.
+- **The inert `vector_recall_target` runtime option was removed.** Recall is an offline benchmark
+  result owned by `bench.harness.gate --recall-target`, not a guarantee one database handle can
+  enforce without an exact oracle. Passing the former keyword to `connect()` now produces a typed
+  migration refusal; runtime HNSW effort remains configurable through `vector_ef_search`. No
+  target-to-beam formula was invented.
 - **`Database` no longer exposes mutable engine collaborators, and `Transaction.context` was
   removed.** Composition properties now return detached frozen schema, inventory and diagnostic
   snapshots with no `inner`, callback or raw-object backdoor. Vector reads use

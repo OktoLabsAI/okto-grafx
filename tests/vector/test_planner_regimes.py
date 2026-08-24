@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 
+from bench.harness.gate import DEFAULT_RECALL_TARGET
 from okto_grafx.domain.errors import GrafxConfigurationError
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.vector.filter import RecordIdFilter, admits_everything
@@ -236,7 +237,7 @@ def test_a_broad_filter_is_answered_by_a_traversal_that_meets_the_recall_target(
     assert result.regime == REGIME_APPROXIMATE
     truth = _brute_force(database, corpus, query, 10)
     recall = len(set(hit.record_id for hit in result.hits) & set(truth)) / len(truth)
-    assert recall >= DatabaseConfig(path=":memory:").vector_recall_target
+    assert recall >= DEFAULT_RECALL_TARGET
     assert result.achieved_k == 10
 
 

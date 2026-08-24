@@ -208,7 +208,6 @@ class DatabaseConfig:
     checksum: str = "auto"
     vector_exact_scan_threshold: int = 4096
     vector_ef_search: int = DEFAULT_EF_SEARCH
-    vector_recall_target: float = 0.90
     read_only: bool = False
 
     def __post_init__(self) -> None:
@@ -295,17 +294,6 @@ class DatabaseConfig:
         ):
             object.__setattr__(
                 self, field, _require_positive_number(field, getattr(self, field))
-            )
-
-        recall_target = _require_positive_number(
-            "vector_recall_target", self.vector_recall_target
-        )
-        object.__setattr__(self, "vector_recall_target", recall_target)
-        if recall_target > 1.0:
-            raise _reject(
-                "vector_recall_target",
-                self.vector_recall_target,
-                "a value greater than zero and at most one is required.",
             )
 
         for field, choices in (

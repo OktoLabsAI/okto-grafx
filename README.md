@@ -504,8 +504,13 @@ refused with the field name the caller actually wrote.
 | `checksum` | `"auto"` | `"auto"` accelerates when available; `"pure"` pins the reference |
 | `vector_exact_scan_threshold` | `4096` | Below this many candidates, search is exhaustive |
 | `vector_ef_search` | `320` | Base HNSW beam in the approximate regime; integer from 1 through 1,048,576 |
-| `vector_recall_target` | `0.90` | |
 | `read_only` | `False` | Opens without writing anything, including recovery |
+
+Recall is an offline calibration result, not a per-database runtime promise. The former
+`vector_recall_target` connection option was removed; passing it now returns a typed migration
+error. Set the benchmark floor with
+`python -m bench.harness.gate --metrics <metrics.json> --require-recall --recall-target <floor>`.
+Use `vector_ef_search` when the intended change is the HNSW work performed by runtime queries.
 
 ---
 

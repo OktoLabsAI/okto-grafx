@@ -397,7 +397,6 @@ class DatabaseConfig:
     vector_math: str = "auto"              # "auto" | "pure" | "numpy"
     vector_exact_scan_threshold: int = 4096   # calibrated (SPEC-VEC FR-5/FR-8)
     vector_ef_search: int = 320                # calibrated HNSW beam, 1..1_048_576
-    vector_recall_target: float = 0.90        # calibrated
     read_only: bool = False
 
 class PortRegistry:
@@ -407,6 +406,12 @@ class PortRegistry:
     def get(self, slot: str) -> object:  # GrafxPortNotConfigured when empty
     def require_complete(self) -> None:  # GrafxPortNotConfigured listing every missing slot
 ```
+
+Recall has no runtime configuration field. Its floor belongs to the offline calibration gate,
+`bench.harness.gate --recall-target`; it cannot honestly promise recall for an individual query
+without an exact oracle. `vector_ef_search` is the runtime control for approximate-search effort.
+`connect(..., vector_recall_target=...)` is retained only as a typed migration refusal and never
+opens a database.
 
 `bootstrap.open_database(config, *, registry=None) -> engine.database.Database` builds the default
 adapters when `registry is None`, then always calls `require_complete()`.
