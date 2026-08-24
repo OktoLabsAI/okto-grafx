@@ -17,6 +17,7 @@ import pytest
 from okto_grafx.domain.errors import GrafxConfigurationError
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.vector.filter import RecordIdFilter, admits_everything
+from okto_grafx.domain.vector.hnsw import HnswGraph
 from okto_grafx.domain.vector.planner import (
     DEFAULT_EXACT_SCAN_THRESHOLD,
     REGIME_APPROXIMATE,
@@ -100,6 +101,59 @@ def test_the_threshold_agrees_with_the_composition_root() -> None:
     assert DatabaseConfig(path=":memory:").vector_exact_scan_threshold == (
         DEFAULT_EXACT_SCAN_THRESHOLD
     )
+
+
+def test_the_hnsw_beam_does_not_move_the_exact_to_approximate_boundary() -> None:
+    """Search effort changes ANN quality, never which side of the calibrated boundary runs."""
+    config = DatabaseConfig(path=":memory:", vector_ef_search=777)
+    at_boundary = plan_regime(
+        space_size=config.vector_exact_scan_threshold,
+        filter_cardinality=None,
+        threshold=config.vector_exact_scan_threshold,
+    )
+    above_boundary = plan_regime(
+        space_size=config.vector_exact_scan_threshold + 1,
+        filter_cardinality=None,
+        threshold=config.vector_exact_scan_threshold,
+    )
+
+    assert at_boundary.regime == REGIME_EXACT
+    assert above_boundary.regime == REGIME_APPROXIMATE
+
+
+def test_only_the_approximate_regime_uses_the_configured_hnsw_beam(
+    metrics: RecordingMetrics, clock: StepClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At 4,096 the graph is untouched; at 4,097 its traversal receives this handle's beam."""
+    database, corpus = _corpus_database(metrics, clock, threshold=4096, ef_search=777)
+    index = database.engine.index("space")
+    reported_count = [4096]
+    traversed_with: list[int] = []
+    original_search = HnswGraph.search
+
+    monkeypatch.setattr(type(index), "live_count", lambda _index: reported_count[0])
+
+    def recording_search(self, query, ef, admits=None):
+        traversed_with.append(ef)
+        return original_search(self, query, ef, admits)
+
+    monkeypatch.setattr(HnswGraph, "search", recording_search)
+    at_boundary = database.engine.search(
+        space="space", query=corpus[0], k=5, snapshot=SnapshotDouble(1000)
+    )
+    assert at_boundary.regime == REGIME_EXACT
+    assert traversed_with == []
+
+    reported_count[0] = 4097
+    above_boundary = database.engine.search(
+        space="space", query=corpus[0], k=5, snapshot=SnapshotDouble(1000)
+    )
+    assert above_boundary.regime == REGIME_APPROXIMATE
+    assert traversed_with == [777]
+
+    # The per-call diagnostic/testing override remains more specific than the database default.
+    index.search(corpus[0], 5, SnapshotDouble(1000), ef=33)
+    assert traversed_with == [777, 33]
 
 
 def test_the_two_regime_labels_are_the_bounded_domain_of_the_metric_label() -> None:

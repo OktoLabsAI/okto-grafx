@@ -350,6 +350,7 @@ def assemble_database(
             pool=pool,
             indexes=indexes,
             exact_scan_threshold=config.vector_exact_scan_threshold,
+            ef_search=config.vector_ef_search,
             # P0.5: the derived HNSW graph of every vector index is published under this
             # guard -- one complete picture per reference assignment, one build in flight per
             # index. Mechanism, so it is handed in here like the pool's guard above rather than

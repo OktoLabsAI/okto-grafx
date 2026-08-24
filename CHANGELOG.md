@@ -24,6 +24,11 @@ including the on-disk format.
   write, while maintenance and diagnostic failures can never turn the already-durable commit into
   an apparent transactional failure. Read transactions and empty write transactions do not run
   maintenance, and explicit `Database.checkpoint()` remains available.
+- **The calibrated HNSW search beam is now an operational database option.**
+  `vector_ef_search` defaults to `320`, is bounded to `1..1_048_576`, reaches every vector index
+  assembled or reattached by that database handle, and is exposed by the detached vector index
+  view. The setting changes derived search effort only; it neither changes the exact/approximate
+  regime boundary nor writes a new on-disk format.
 - **`Database` no longer exposes mutable engine collaborators, and `Transaction.context` was
   removed.** Composition properties now return detached frozen schema, inventory and diagnostic
   snapshots with no `inner`, callback or raw-object backdoor. Vector reads use

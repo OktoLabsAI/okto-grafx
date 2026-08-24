@@ -104,6 +104,7 @@ from okto_grafx.domain.vector.hnsw import (
     DEFAULT_EF_SEARCH,
     DEFAULT_NEIGHBOURS,
     HnswGraph,
+    MAX_EF_SEARCH,
     TraversalStats,
 )
 from okto_grafx.domain.vector.planner import (
@@ -242,6 +243,23 @@ def _require_positive_k(k: int) -> int:
             value=k,
         )
     return k
+
+
+def _require_ef_search(value: int) -> int:
+    """Return an exact configured HNSW beam inside its operational work bound."""
+    if type(value) is not int:
+        raise GrafxConfigurationError(
+            f"The HNSW search beam must be an exact integer; got {type(value).__name__}.",
+            field="ef_search",
+            value=type(value).__name__,
+        )
+    if not 1 <= value <= MAX_EF_SEARCH:
+        raise GrafxConfigurationError(
+            f"The HNSW search beam must be between 1 and {MAX_EF_SEARCH}; got {value}.",
+            field="ef_search",
+            value=value,
+        )
+    return value
 
 
 def _require_snapshot(snapshot: object) -> SnapshotLike:
@@ -516,6 +534,7 @@ class VectorHnswIndex(ProximityIndex):
         ``guard`` is the lock the published picture is replaced under (see :class:`GraphGuard`);
         without one the index is fit for a single thread only.
         """
+        search_width = _require_ef_search(ef_search)
         super().__init__(definition, pool, metrics)  # type: ignore[arg-type]
         self._space_id = space_id
         self._space_name = space_name
@@ -527,7 +546,7 @@ class VectorHnswIndex(ProximityIndex):
         self._seed = seed
         self._neighbours = neighbours
         self._ef_construction = ef_construction
-        self._ef_search = ef_search
+        self._ef_search = search_width
         self._guard: GraphGuard = _UnguardedBuild() if guard is None else guard
         # The published picture, or None while there is none. Replaced by ONE assignment under
         # the guard, captured by ONE read; never edited into a different picture in place.
@@ -1131,6 +1150,7 @@ class VectorEngine:
                 field="exact_scan_threshold",
                 value=exact_scan_threshold,
             )
+        search_width = _require_ef_search(ef_search)
         self._catalog = catalog
         self._heap = heap
         self._math = math
@@ -1143,7 +1163,7 @@ class VectorEngine:
         self._seed = seed
         self._neighbours = neighbours
         self._ef_construction = ef_construction
-        self._ef_search = ef_search
+        self._ef_search = search_width
         self._by_space: dict[str, VectorHnswIndex] = {}
         self._maintained_at: dict[str, float] = {}
         self._guard = guard

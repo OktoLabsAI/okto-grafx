@@ -14,6 +14,7 @@ from okto_grafx.domain.errors import GrafxConfigurationError
 from okto_grafx.domain.page import MAX_PAGE_SIZE as CORE_MAX_PAGE_SIZE
 from okto_grafx.domain.page import MIN_PAGE_SIZE as CORE_MIN_PAGE_SIZE
 from okto_grafx.domain.page import validate_page_size
+from okto_grafx.domain.vector.hnsw import DEFAULT_EF_SEARCH, MAX_EF_SEARCH
 from okto_grafx.engine.catalog_store import MINIMUM_FRAMES as CATALOG_FRAMES
 from okto_grafx.engine.heap_store import MINIMUM_FRAMES as HEAP_FRAMES
 from okto_grafx.engine.wal_manager import MAX_SEGMENT_READ_BYTES, MIN_SEGMENT_BYTES
@@ -24,6 +25,7 @@ __all__ = [
     "CORE_MIN_PAGE_SIZE",
     "CORE_MAX_PAGE_SIZE",
     "MAX_PARTITIONS_PER_TABLE",
+    "MAX_VECTOR_EF_SEARCH",
     "MINIMUM_STORE_FRAMES",
     "RECOVERY_POLICIES",
     "METRICS_SINKS",
@@ -51,6 +53,9 @@ have exactly one definition, in :mod:`okto_grafx.domain.page`.
 
 MAX_PARTITIONS_PER_TABLE: int = 65535
 """Largest partition count: the meta page stores it as an unsigned 16-bit field."""
+
+MAX_VECTOR_EF_SEARCH: int = MAX_EF_SEARCH
+"""Largest HNSW base beam accepted from public database configuration."""
 
 MINIMUM_STORE_FRAMES: int = max(CATALOG_FRAMES, HEAP_FRAMES)
 """Fewest pages the catalog and heap stores can operate over at once."""
@@ -202,6 +207,7 @@ class DatabaseConfig:
     vector_math: str = "auto"
     checksum: str = "auto"
     vector_exact_scan_threshold: int = 4096
+    vector_ef_search: int = DEFAULT_EF_SEARCH
     vector_recall_target: float = 0.90
     read_only: bool = False
 
@@ -270,6 +276,15 @@ class DatabaseConfig:
                 "vector_exact_scan_threshold",
                 self.vector_exact_scan_threshold,
                 "a value of zero or more is required.",
+            )
+
+        ef_search = _require_positive_int("vector_ef_search", self.vector_ef_search)
+        object.__setattr__(self, "vector_ef_search", ef_search)
+        if ef_search > MAX_VECTOR_EF_SEARCH:
+            raise _reject(
+                "vector_ef_search",
+                self.vector_ef_search,
+                f"a value of at most {MAX_VECTOR_EF_SEARCH} is required.",
             )
 
         for field in (

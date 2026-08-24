@@ -47,6 +47,7 @@ __all__ = [
     "DEFAULT_NEIGHBOURS",
     "DEFAULT_EF_CONSTRUCTION",
     "DEFAULT_EF_SEARCH",
+    "MAX_EF_SEARCH",
     "MAX_LEVEL",
     "TraversalStats",
     "HnswGraph",
@@ -64,8 +65,24 @@ greedy descent is not trapped by a single bad edge.
 DEFAULT_EF_CONSTRUCTION: int = 200
 """How wide the beam is while building. Construction happens once; search happens forever."""
 
-DEFAULT_EF_SEARCH: int = 64
-"""How wide the beam is while searching, before the requested neighbour count raises it."""
+DEFAULT_EF_SEARCH: int = 320
+"""Calibrated search beam, before the requested neighbour count raises it.
+
+The 8,192-by-384 frozen recall corpus needs a beam materially wider than 64 to meet the 0.90
+recall floor without turning the approximate regime into an exhaustive scan.  The calibration is
+an observable runtime default rather than a harness-only override, so every newly composed vector
+index starts from this value unless its database configuration says otherwise.
+"""
+
+MAX_EF_SEARCH: int = 1 << 20
+"""Largest configurable base beam: one million graph nodes per approximate traversal.
+
+``ef`` is working-set policy, not an on-disk field, so no format supplies a natural upper bound.
+This operational ceiling is deliberately far above the calibrated default while refusing an
+accidental giant integer before it can turn every approximate query into unbounded work.  A query
+asking for more than this many results may still raise its effective beam to ``k``; this bound is
+on the configured baseline, not on the result cardinality API.
+"""
 
 MAX_LEVEL: int = 32
 """The tallest tower a node may be given, which bounds the per-node cost of a graph."""
