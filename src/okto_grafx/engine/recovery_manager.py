@@ -180,6 +180,67 @@ _ORIGIN_LABELS: dict[LedgerOriginClass, dict[str, str]] = {
 
 _CONTROL_PREFIX: str = "control/"
 
+_COORDINATOR_METHODS: tuple[str, ...] = ("exclusive", "reader_horizon")
+"""What a COMPLETE coordinator must answer: the fence itself, and the reader horizon
+C4 asks this manager to re-derive after a retirement. A coordinator missing either is
+PARTIAL, and a partial fence is no fence."""
+
+_PERMIT_SEAL: object = object()
+"""The module-private seal a genuine recovery permit is minted with.
+
+Python offers no unforgeable capability inside one interpreter; what the seal provides is the
+COOPERATIVE guarantee the fencing contract asks for: a permit cannot be built by accident, by a
+subclass, or by code outside this module without reaching into module privates by name -- the
+same deliberate act as reading a mangled attribute. A door that demands one therefore proves it
+was reached from :meth:`RecoveryManager.run` or its siblings, INSIDE the commit section, rather
+than by a caller that skipped the fence.
+"""
+
+
+class _RecoveryPermit:
+    """The capability one fenced pass holds exactly as long as its commit section.
+
+    It is minted by the manager itself immediately after entering ``COMMIT_SECTION`` and revoked
+    on the way out, so its liveness IS the section's: presenting it proves the holder is inside
+    the exclusion writers share. It is bound to one manager instance; a permit from another
+    manager -- even one over the same files -- says nothing about THIS pass and is refused.
+    """
+
+    __slots__ = ("_live", "_manager")
+
+    def __init__(self, manager: RecoveryManager, seal: object) -> None:
+        """Mint the permit for one manager; refuse any caller without the module seal."""
+        if seal is not _PERMIT_SEAL:
+            raise GrafxRecoveryRefused(
+                "A recovery permit is minted only by the recovery manager itself, inside the "
+                "commit section it shares with writers. This one was forged, so it proves "
+                "nothing about the fence. Nothing was scanned or changed.",
+                field="recovery_permit",
+            )
+        self._manager = manager
+        self._live = True
+
+    def revoke(self) -> None:
+        """Kill the permit: the section it certified is being left."""
+        self._live = False
+
+    def require(self, manager: RecoveryManager) -> None:
+        """Refuse unless this permit is live and belongs to exactly that manager."""
+        if self._manager is not manager:
+            raise GrafxRecoveryRefused(
+                "The recovery permit presented belongs to another manager, so it does not "
+                "prove that THIS pass is inside the commit section. Nothing was scanned or "
+                "changed.",
+                field="recovery_permit",
+            )
+        if not self._live:
+            raise GrafxRecoveryRefused(
+                "The recovery permit presented has been revoked: the commit section it "
+                "certified was left, and with it every right to scan or mutate. Nothing was "
+                "scanned or changed.",
+                field="recovery_permit",
+            )
+
 
 @runtime_checkable
 class ControlRecordProbe(Protocol):
@@ -241,11 +302,13 @@ class RecoveryManager:
     ) -> None:
         """Build the manager over the stores and ports one recovery pass needs.
 
-        ``catalog``, ``control_probe`` and ``coordinator`` are optional because a database can be
-        recovered without any of them: a catalog store is needed only to complete the CF-4 route,
-        a probe only to retire a damaged control record, and a coordinator only to re-derive the
-        reader horizon C4 asks about after a retirement. Each absent one disables exactly its own
-        step and says so in the report rather than guessing.
+        ``catalog`` and ``control_probe`` are optional because a database can be recovered
+        without them: a catalog store is needed only to complete the CF-4 route, and a probe
+        only to retire a damaged control record. Each absent one disables exactly its own step
+        and says so in the report rather than guessing. ``coordinator`` may be absent only AT
+        CONSTRUCTION, for wiring order: since M0C every public door of this manager refuses,
+        typed and before its first read, unless a COMPLETE coordinator can fence the pass
+        inside the commit section writers share. There is no unfenced mode.
 
         **The policy is spelled ``recovery_policy``**, the name ``DatabaseConfig`` and section 5
         give it, so the composition root passes one word through rather than translating it.
@@ -336,18 +399,68 @@ class RecoveryManager:
 
     # --- the pass ----------------------------------------------------------------------------
 
-    def run(self) -> RecoveryReport:
-        """Recover the database and return what was done (CONTRACT.md section 8.6)."""
+    def _require_complete_coordinator(self, purpose: str) -> object:
+        """Return the coordinator the fence needs, or refuse typed BEFORE any scan or mutation.
+
+        M0C removed the unfenced fallback. Without the cross-process commit section there is no
+        stable WAL picture: a scan could classify an append a live writer was still moving, and
+        a truncation could cut it. A manager without a COMPLETE coordinator therefore may not
+        scan, prove or mutate anything; the refusal happens before the first read of state or
+        log, and it names what is missing instead of inventing a degraded mode.
+        """
         coordinator = self._coordinator
         if coordinator is None:
-            return self._run_fail_closed()
+            raise GrafxPortNotConfigured(
+                f"Recovery cannot {purpose}: no process coordinator is wired, and the commit "
+                "section it provides is the only thing that isolates the WAL picture from live "
+                "writers. There is no unfenced fallback; configure coordination and retry.",
+                missing=["coordinator"],
+            )
+        absent = [
+            method
+            for method in _COORDINATOR_METHODS
+            if not callable(getattr(coordinator, method, None))
+        ]
+        if absent:
+            raise GrafxPortNotConfigured(
+                f"Recovery cannot {purpose}: the coordinator is missing "
+                f"{', '.join(repr(name) for name in absent)}, so it cannot fence the pass or "
+                "re-derive the reader horizon. Nothing was scanned or changed.",
+                missing=absent,
+            )
+        return coordinator
+
+    def _require_permit(self, permit: object) -> None:
+        """Refuse unless the permit is this manager's own live, section-scoped capability."""
+        if not isinstance(permit, _RecoveryPermit):
+            raise GrafxRecoveryRefused(
+                "This step demands the recovery permit minted inside the commit section, and "
+                f"was handed {type(permit).__name__} instead: a forged or absent capability. "
+                "Nothing was scanned or changed.",
+                field="recovery_permit",
+            )
+        permit.require(self)
+
+    def run(self) -> RecoveryReport:
+        """Recover the database and return what was done (CONTRACT.md section 8.6).
+
+        The pass exists only fenced (M0C): a complete coordinator is demanded first, and its
+        timeout or refusal happens BEFORE the first scan or mutation. The permit minted on
+        entering the section is the capability every destructive step demands, and it dies with
+        the section, so no step can outlive or precede the exclusion writers share.
+        """
+        coordinator = self._require_complete_coordinator("run")
         # The whole destructive decision uses the exact section commits use: scan, forensic
         # preservation, truncation, redo and publication must all see one stable WAL picture.
         # Acquiring only around truncate would still let the scan classify an in-flight append.
         with coordinator.exclusive(COMMIT_SECTION, timeout=self._commit_lock_timeout):
-            return self._run_fail_closed()
+            permit = _RecoveryPermit(self, _PERMIT_SEAL)
+            try:
+                return self._run_fail_closed(permit)
+            finally:
+                permit.revoke()
 
-    def _run_fail_closed(self) -> RecoveryReport:
+    def _run_fail_closed(self, permit: _RecoveryPermit) -> RecoveryReport:
         """Run one fenced pass and poison this handle's indexes if it cannot finish.
 
         A redo can fail after installing only a prefix of heap pages and before the first logical
@@ -358,7 +471,7 @@ class RecoveryManager:
         retained WAL lets a later open retry the pass.
         """
         try:
-            return self._run_fenced()
+            return self._run_fenced(permit)
         except BaseException as failure:
             manager = self._index_manager
             exclude = getattr(manager, "mark_all_stale", None)
@@ -391,21 +504,25 @@ class RecoveryManager:
         The state and WAL must be one atomic observation against commit, so this door takes the
         same ``COMMIT_SECTION`` as :meth:`run`. Taking an advisory lock changes no database byte;
         the proof itself calls no persistence door and is byte-identical even when it refuses.
-        """
-        coordinator = self._coordinator
-        if coordinator is None:
-            self._require_read_only_consistent_fenced()
-            return
-        with coordinator.exclusive(COMMIT_SECTION, timeout=self._commit_lock_timeout):
-            self._require_read_only_consistent_fenced()
 
-    def _require_read_only_consistent_fenced(self) -> None:
-        """Run the read-only proof after commit/checkpoint WAL mutation is excluded."""
+        M0C makes the fence mandatory here too: without a COMPLETE coordinator this door
+        refuses, typed, before its first read of state or log -- an unfenced proof could bless
+        a picture a live writer was still moving.
+        """
+        coordinator = self._require_complete_coordinator("prove read-only consistency")
+        with coordinator.exclusive(COMMIT_SECTION, timeout=self._commit_lock_timeout):
+            permit = _RecoveryPermit(self, _PERMIT_SEAL)
+            try:
+                self._require_read_only_consistent_fenced(permit)
+            finally:
+                permit.revoke()
+
+    def _require_read_only_consistent_fenced(self, permit: _RecoveryPermit) -> None:
+        """Run the read-only proof; the permit proves the commit section is held around it."""
+        self._require_permit(permit)
         self._check_meta()
         state = self._state_store.read()
-        plan = plan_recovery(
-            self._wal.scan_all(), floor_lsn=state.checkpoint_lsn
-        )
+        plan = plan_recovery(self._wal.scan_all(), floor_lsn=state.checkpoint_lsn)
         if plan.unsupported is not None:
             raise GrafxSchemaVersionMismatch(
                 f"The log holds a record this build cannot read at byte "
@@ -422,7 +539,9 @@ class RecoveryManager:
         state_needs_replay = state.last_committed_lsn > state.checkpoint_lsn
         wal_needs_replay = replay.last_committed_lsn > state.checkpoint_lsn
         wal_has_ambiguous_effects = bool(replay.incomplete_effects)
-        lineage_missing = observed_first is not None and observed_first != expected_first
+        lineage_missing = (
+            observed_first is not None and observed_first != expected_first
+        )
         if not (
             state_invalid
             or state_needs_replay
@@ -447,8 +566,9 @@ class RecoveryManager:
             wal_damaged=plan.damaged,
         )
 
-    def _run_fenced(self) -> RecoveryReport:
-        """Execute one pass after the caller has excluded commit/checkpoint WAL mutation."""
+    def _run_fenced(self, permit: _RecoveryPermit) -> RecoveryReport:
+        """Execute one pass; the permit proves the commit section is held around all of it."""
+        self._require_permit(permit)
         findings: list[RecoveryFinding] = []
         self._check_meta()
         state, state_was_damaged = self._read_recovery_state()
@@ -476,9 +596,7 @@ class RecoveryManager:
             # final mark_built_through would certify a permanently missing historical entry.
             # Even the in-memory verdict follows preflight so a byte-identical refusal has no
             # state transition to unwind.
-            manager.check_replay_floor(
-                state.checkpoint_lsn, persist_stale=False
-            )
+            manager.check_replay_floor(state.checkpoint_lsn, persist_stale=False)
         outcome = OUTCOME_CLEAN
         entries_created = 0
         if plan.damaged:
@@ -493,8 +611,8 @@ class RecoveryManager:
                     discards=plan.discards,
                 )
             self._repair_ledger(findings)
-            entries_created = self._preserve(plan, findings)
-            self._truncate(plan, findings)
+            entries_created = self._preserve(plan, findings, permit)
+            self._truncate(plan, findings, permit)
             outcome = stronger_outcome(outcome, OUTCOME_TRUNCATED)
         else:
             # A clean log still owes the ledger its repair: an append interrupted by the previous
@@ -513,9 +631,7 @@ class RecoveryManager:
         ):
             # Only after the policy has accepted mutation may the conservative verdict become a
             # durable stale bit. The refuse policy promises byte-for-byte non-interference.
-            manager.check_replay_floor(
-                state.checkpoint_lsn, persist_stale=True
-            )
+            manager.check_replay_floor(state.checkpoint_lsn, persist_stale=True)
         replayed = self._redo(
             plan,
             findings,
@@ -585,7 +701,9 @@ class RecoveryManager:
             )
         if not self._storage.exists(name):
             raise GrafxRecoveryRefused(
-                f"There is no control record {name!r} to retire.", field="file", file=name
+                f"There is no control record {name!r} to retire.",
+                field="file",
+                file=name,
             )
         damage = self._probe_damage(name)
         if damage is None:
@@ -754,7 +872,12 @@ class RecoveryManager:
             )
         return plan
 
-    def _preserve(self, plan: RecoveryPlan, findings: list[RecoveryFinding]) -> int:
+    def _preserve(
+        self,
+        plan: RecoveryPlan,
+        findings: list[RecoveryFinding],
+        permit: _RecoveryPermit,
+    ) -> int:
         """Steps 3 and 4: quarantine every discarded range, then write one ledger entry each.
 
         The order inside one item is copy, then record, then (later) cut. Across items it is all
@@ -768,6 +891,7 @@ class RecoveryManager:
         equality G8 and BR-3 want a caller to be able to assert, and it would be false exactly
         when recovery was interrupted -- the case where the trace matters most.
         """
+        self._require_permit(permit)
         created = 0
         for damaged in plan.ranges:
             created += self._record_range(damaged, findings)
@@ -775,7 +899,9 @@ class RecoveryManager:
             created += self._record_record(discarded, findings)
         return created
 
-    def _record_range(self, damaged: DiscardedRange, findings: list[RecoveryFinding]) -> int:
+    def _record_range(
+        self, damaged: DiscardedRange, findings: list[RecoveryFinding]
+    ) -> int:
         """Quarantine one undecodable range and write its forensic ledger entry."""
         origin_class, reason = classify_failure(damaged.reason)
         entry = self._quarantine.capture(
@@ -786,7 +912,9 @@ class RecoveryManager:
             detail=damaged.detail,
             expected_lsn=damaged.expected_lsn,
         )
-        body, detail = _carried_body(self._quarantine.read(entry.name), entry.name, damaged.detail)
+        body, detail = _carried_body(
+            self._quarantine.read(entry.name), entry.name, damaged.detail
+        )
         entry_id = self._ledger.record_discard(
             origin_class=origin_class,
             reason=reason,
@@ -894,7 +1022,12 @@ class RecoveryManager:
         self._count_discard(origin_class)
         return 1
 
-    def _truncate(self, plan: RecoveryPlan, findings: list[RecoveryFinding]) -> None:
+    def _truncate(
+        self,
+        plan: RecoveryPlan,
+        findings: list[RecoveryFinding],
+        permit: _RecoveryPermit,
+    ) -> None:
         """Step 3, second half: cut the log back to the last intact record.
 
         C4 leaves a log LONGER than asked when the platform will not release a segment, which is
@@ -902,6 +1035,7 @@ class RecoveryManager:
         inside a small budget and then reported. Reporting it is not a formality: until the cut
         completes the log still refuses appends, and the operator needs to know why.
         """
+        self._require_permit(permit)
         attempt = 1
         while True:
             report = self._wal.truncate_after(plan.last_good_lsn)
@@ -976,7 +1110,9 @@ class RecoveryManager:
         into a successful report: publishing a watermark after skipping one mandatory effect
         would make a partial commit visible permanently.
         """
-        del plan  # the committed replay is the only part of the scan this stage consumes
+        del (
+            plan
+        )  # the committed replay is the only part of the scan this stage consumes
         page_records = tuple(
             record
             for record in replay.effects
@@ -1252,7 +1388,9 @@ class RecoveryManager:
             )
         records = plan.replayable
         expected_first = NO_LSN + 1 if state_was_damaged else state.checkpoint_lsn + 1
-        needs_lineage = state_was_damaged or state.last_committed_lsn > state.checkpoint_lsn
+        needs_lineage = (
+            state_was_damaged or state.last_committed_lsn > state.checkpoint_lsn
+        )
         if records and records[0].lsn != expected_first:
             raise GrafxRecoveryRefused(
                 f"Recovery expected WAL record {expected_first} after its replay floor, but the "

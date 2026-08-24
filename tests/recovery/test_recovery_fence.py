@@ -25,6 +25,9 @@ class _Coordinator:
     def owner_id(self) -> str:
         return "recovery-fence-test"
 
+    def reader_horizon(self) -> int | None:
+        return None
+
     @contextmanager
     def exclusive(self, name: str, *, timeout: float) -> Iterator[None]:
         self.events.append(("enter", (name, timeout)))
