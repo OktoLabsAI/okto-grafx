@@ -858,8 +858,29 @@ class RecoveryManager:
                     permit.revoke()
 
     def _read_generation(self, name: str) -> bytes:
-        """Read the whole record as it is on the device right now."""
-        return self._storage.read_log(name, 0, self._storage.log_size(name))
+        """Read the whole record as it is right now, capped exactly like the first read.
+
+        The confirmation re-read and the last look are reads too: a non-cooperating
+        replacement (or fresh damage) between observations could otherwise declare an absurd
+        size and demand an arbitrary allocation at a point the entry cap no longer guards.
+        A size past the cap already answers the only question a re-read asks -- the inspected
+        generation is gone -- so it refuses, retryably, without reading a byte. Whatever
+        evidence this pass had already persisted stays where it is; a retry meets the entry
+        cap, which tells the same truth non-retryably.
+        """
+        size = self._storage.log_size(name)
+        if size > _MAX_CONTROL_RECORD_BYTES:
+            raise GrafxRecoveryRefused(
+                f"The control record {name!r} now claims {size} bytes, past the "
+                f"{_MAX_CONTROL_RECORD_BYTES} cap: the generation under inspection is gone, "
+                "and what replaced it is not worth reading blind. Whatever evidence this pass "
+                "had already persisted remains; nothing was read or removed.",
+                retryable=True,
+                field="length",
+                file=name,
+                length=size,
+            )
+        return self._storage.read_log(name, 0, size)
 
     def _retire_fenced(self, name: str, permit: _RecoveryPermit) -> RecoveryReport:
         """Retire one damaged, canonical control record as a single inspected generation."""

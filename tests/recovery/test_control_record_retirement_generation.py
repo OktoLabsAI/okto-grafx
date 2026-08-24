@@ -592,3 +592,67 @@ def test_a_real_lease_written_by_the_adapter_fits_the_cap(tmp_path: Path) -> Non
     lease_file = root / "control" / "writer.lease"
     assert lease_file.exists()
     assert lease_file.stat().st_size <= _MAX_CONTROL_RECORD_BYTES // 4
+
+
+class _SizeSequenceStorage:
+    """A device whose target size mutates at an exact observation, never to be read again."""
+
+    def __init__(self, inner: object, name: str, huge_at: int) -> None:
+        self._inner = inner
+        self._name = name
+        self._huge_at = huge_at
+        self.size_calls = 0
+        self.reads = 0
+
+    def __getattr__(self, attr: str) -> Any:
+        """Everything else is answered by the real device."""
+        return getattr(self._inner, attr)
+
+    def log_size(self, file: str) -> int:
+        """Answer the real size until the arranged observation, then claim a gigantic one."""
+        if file == self._name:
+            self.size_calls += 1
+            if self.size_calls >= self._huge_at:
+                return 10**9
+        return self._inner.log_size(file)  # type: ignore[attr-defined]
+
+    def read_log(self, file: str, offset: int, length: int) -> bytes:
+        """Count reads of the target and refuse loudly past the cap."""
+        if file == self._name:
+            self.reads += 1
+            assert length <= 10**6, "an oversized generation must never be read"
+        return self._inner.read_log(file, offset, length)  # type: ignore[attr-defined]
+
+
+def test_an_oversized_replacement_at_the_confirmation_refuses_with_nothing_captured(
+    stack: Stack,
+) -> None:
+    """Size observation 2 is the confirmation re-read: a gigantic claim there refuses
+    retryably with exactly one read ever issued and no evidence persisted."""
+    _seed(stack, LEASE)
+    quarantine_before = _quarantine_files(stack)
+    swap = _SizeSequenceStorage(stack.storage, LEASE, huge_at=2)
+    with pytest.raises(GrafxRecoveryRefused, match="now claims") as caught:
+        _manager(stack, storage=swap).retire_control_record(LEASE)
+    assert caught.value.details["length"] == 10**9
+    assert swap.reads == 1, "the confirmation must refuse on size, before its read"
+    assert len(stack.ledger.entries()) == 0
+    assert _quarantine_files(stack) == quarantine_before
+    assert _bytes_of(stack, LEASE) == DAMAGED
+
+
+def test_an_oversized_replacement_at_the_last_look_keeps_the_evidence_and_removes_nothing(
+    stack: Stack,
+) -> None:
+    """Size observation 3 is the last look: a gigantic claim there refuses retryably with
+    no third read, the quarantine and ledger entries intact, and the name untouched."""
+    _seed(stack, LEASE)
+    swap = _SizeSequenceStorage(stack.storage, LEASE, huge_at=3)
+    with pytest.raises(GrafxRecoveryRefused, match="now claims"):
+        _manager(stack, storage=swap).retire_control_record(LEASE)
+    assert swap.reads == 2, "the last look must refuse on size, before its read"
+    assert len(stack.ledger.entries()) == 1, "the forensic evidence legitimately stays"
+    assert stack.storage.exists(LEASE)  # type: ignore[attr-defined]
+    assert _bytes_of(stack, LEASE) == DAMAGED
+    quarantined = _quarantine_files(stack)
+    assert quarantined, "the inspected generation stays preserved in quarantine"
