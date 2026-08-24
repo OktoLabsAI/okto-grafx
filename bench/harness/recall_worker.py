@@ -31,6 +31,7 @@ from pathlib import Path
 from bench.recall_corpus import (
     GENERATOR_NAME,
     DtypeCheck,
+    compare_truths,
     generate_vectors,
     ground_truth,
     quantize_f32,
@@ -157,18 +158,9 @@ def _differential(corpus: list[list[float]], k: int) -> tuple[bool, str]:
     fast, _version = _numpy_truths(slice_corpus, slice_queries, k)
     for index, query in enumerate(slice_queries):
         canonical = ground_truth(slice_corpus, query, k)
-        if canonical.members != fast[index].members:
-            return False, f"differential query {index}: member sets differ"
-        fast_distances = {record: distance for distance, record in fast[index].ordered}
-        for distance, record in canonical.ordered:
-            if record not in canonical.members and record not in fast[index].members:
-                continue
-            delta = abs(fast_distances[record] - distance)
-            if delta / max(1.0, abs(distance)) > ACCEL_EPS_REL:
-                return False, (
-                    f"differential query {index}, record {record}: |Δ| {delta:.3e} beyond "
-                    f"eps_rel {ACCEL_EPS_REL:g}"
-                )
+        disagreement = compare_truths(canonical, fast[index], eps_rel=ACCEL_EPS_REL)
+        if disagreement:
+            return False, f"differential query {index}: {disagreement}"
     return True, ""
 
 

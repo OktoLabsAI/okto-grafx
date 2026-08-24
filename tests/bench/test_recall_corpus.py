@@ -172,3 +172,58 @@ def test_the_differential_refuses_a_membership_swap() -> None:
     verdict = differential(corpus, queries, 1, inverted, eps_rel=1e-9)
     assert not verdict.agreed
     assert "member sets differ" in verdict.first_disagreement
+
+
+def test_the_differential_checks_every_distance_not_only_members() -> None:
+    """A drift on a NON-member distance is a disagreement (v4: every distance of the subset)."""
+    corpus = [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]
+    queries = [[1.0, 0.0]]
+
+    def drifted_far_only(left: list[float], right: list[float]) -> float:
+        exact = cosine_distance(left, right)
+        return exact + 1000.0 if exact > 0.5 else exact
+
+    verdict = differential(corpus, queries, 1, drifted_far_only, eps_rel=1e-9)
+    assert not verdict.agreed
+    assert "exceeds eps_rel" in verdict.first_disagreement
+
+
+def test_a_nan_anywhere_in_the_subset_is_a_disagreement() -> None:
+    """NaN on a non-member refuses; a comparison that NaN can slip past is fail-open."""
+    corpus = [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]
+    queries = [[1.0, 0.0]]
+
+    def poisoned(left: list[float], right: list[float]) -> float:
+        exact = cosine_distance(left, right)
+        return float("nan") if exact > 0.5 else exact
+
+    verdict = differential(corpus, queries, 1, poisoned, eps_rel=1e-9)
+    assert not verdict.agreed
+    assert "non-finite" in verdict.first_disagreement
+
+
+@pytest.mark.parametrize("bad", (float("nan"), float("inf"), -1e-9))
+def test_an_unusable_tolerance_is_refused_before_any_comparison(bad: float) -> None:
+    """NaN, infinity and negative tolerances cannot refuse anything, so THEY are refused."""
+    corpus = [[1.0, 0.0], [0.0, 1.0]]
+    with pytest.raises(ValueError, match="finite non-negative"):
+        differential(corpus, [[1.0, 0.0]], 1, cosine_distance, eps_rel=bad)
+
+
+def test_compare_truths_agrees_on_identical_truths_and_names_nonfinite_sides() -> None:
+    """The shared comparator both oracles delegate to: agreement, and the NaN refusal path."""
+    from bench.recall_corpus import GroundTruth, compare_truths
+
+    corpus = [[1.0, 0.0], [0.0, 1.0]]
+    truth = ground_truth(corpus, [1.0, 0.0], 1)
+    assert compare_truths(truth, truth, eps_rel=1e-9) == ""
+    poisoned = GroundTruth(
+        ordered=tuple(
+            (float("nan") if index == 1 else score, index)
+            for score, index in truth.ordered
+        ),
+        cut_distance=truth.cut_distance,
+        members=truth.members,
+    )
+    disagreement = compare_truths(truth, poisoned, eps_rel=1e-9)
+    assert "non-finite" in disagreement

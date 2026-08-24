@@ -185,6 +185,50 @@ class DifferentialVerdict:
     first_disagreement: str
 
 
+def _require_eps_rel(eps_rel: float) -> float:
+    """Refuse a tolerance that cannot refuse anything: NaN, infinity or a negative number."""
+    if not isinstance(eps_rel, float) or not math.isfinite(eps_rel) or eps_rel < 0.0:
+        raise ValueError(
+            f"the accelerated-oracle tolerance must be a finite non-negative float; "
+            f"got {eps_rel!r}."
+        )
+    return eps_rel
+
+
+def compare_truths(
+    canonical: GroundTruth,
+    fast,
+    *,
+    eps_rel: float,
+) -> str:
+    """Return "" when a fast truth agrees with the canonical one, else the disagreement.
+
+    Agreement demands identical generous membership AND every distance of the WHOLE subset —
+    member or not — finite and within ``eps_rel`` relative tolerance. The comparison is
+    written to REFUSE on NaN: a non-finite distance on either side, anywhere, is a
+    disagreement, never a silent pass.
+    """
+    _require_eps_rel(eps_rel)
+    if canonical.members != fast.members:
+        return (
+            f"member sets differ ({sorted(canonical.members)[:5]}... vs "
+            f"{sorted(fast.members)[:5]}...)"
+        )
+    fast_distances = {index: score for score, index in fast.ordered}
+    if set(fast_distances) != {index for _, index in canonical.ordered}:
+        return "the fast truth scored a different record set"
+    for score, index in canonical.ordered:
+        other = fast_distances[index]
+        if not math.isfinite(score) or not math.isfinite(other):
+            return f"record {index}: non-finite distance ({score!r} vs {other!r})"
+        delta = abs(other - score)
+        if not delta / max(1.0, abs(score)) <= eps_rel:
+            return (
+                f"record {index}: |Δdistance| {delta:.3e} exceeds eps_rel {eps_rel:g}"
+            )
+    return ""
+
+
 def differential(
     corpus: list[list[float]],
     queries: list[list[float]],
@@ -195,36 +239,23 @@ def differential(
 ) -> DifferentialVerdict:
     """Compare an accelerated distance against the canonical one on a frozen subset.
 
-    Agreement demands BOTH: identical generous top-k membership per query, and every distance
-    of the union within ``eps_rel`` relative tolerance. Any disagreement is fail-closed at the
-    harness — the accelerated path may speed the canonical answer up, never replace it.
+    Agreement demands BOTH: identical generous top-k membership per query, and EVERY distance
+    of the subset — member or not — finite and within ``eps_rel`` relative tolerance
+    (c13_design_v4: "toda distância do subconjunto"). Any disagreement, any NaN anywhere, and
+    any unusable tolerance is fail-closed — the accelerated path may speed the canonical
+    answer up, never replace it.
     """
+    _require_eps_rel(eps_rel)
     for query_index, query in enumerate(queries):
         canonical = ground_truth(corpus, query, k)
         fast = ground_truth(corpus, query, k, distance=accelerated_distance)
-        if canonical.members != fast.members:
+        disagreement = compare_truths(canonical, fast, eps_rel=eps_rel)
+        if disagreement:
             return DifferentialVerdict(
                 agreed=False,
                 queries_checked=query_index + 1,
-                first_disagreement=(
-                    f"query {query_index}: member sets differ "
-                    f"({sorted(canonical.members)[:5]}... vs {sorted(fast.members)[:5]}...)"
-                ),
+                first_disagreement=f"query {query_index}: {disagreement}",
             )
-        fast_distances = {index: score for score, index in fast.ordered}
-        for score, index in canonical.ordered:
-            if index not in canonical.members and index not in fast.members:
-                continue
-            delta = abs(fast_distances[index] - score)
-            if delta / max(1.0, abs(score)) > eps_rel:
-                return DifferentialVerdict(
-                    agreed=False,
-                    queries_checked=query_index + 1,
-                    first_disagreement=(
-                        f"query {query_index}, record {index}: |Δdistance| {delta:.3e} "
-                        f"exceeds eps_rel {eps_rel:g}"
-                    ),
-                )
     return DifferentialVerdict(
         agreed=True, queries_checked=len(queries), first_disagreement=""
     )
