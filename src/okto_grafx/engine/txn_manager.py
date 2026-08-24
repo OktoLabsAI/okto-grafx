@@ -72,6 +72,7 @@ from okto_grafx.domain.errors import (
     GrafxLeaseStolen,
     GrafxRecoveryRefused,
     GrafxTransactionStateError,
+    GrafxUnsupportedOperation,
     GrafxWriteConflict,
 )
 from okto_grafx.domain.ids import (
@@ -236,6 +237,7 @@ class TransactionManager:
         "_recovery_required",
         "_page_staging_capability",
         "_mode_counts",
+        "_writable",
     )
 
     def __init__(
@@ -256,10 +258,11 @@ class TransactionManager:
         descriptor: str = "",
         retain_lease: bool = False,
         index_sync: Callable[[], object] | None = None,
+        writable: bool = True,
     ) -> None:
         """Build a manager over one database.
 
-        The three keyword arguments after the two the contract names are configuration this
+        The keyword arguments after the two the contract names are configuration this
         component cannot invent and must not guess:
 
         * ``lease_timeout`` -- how long a commit waits for the writer lease. It defaults to
@@ -272,7 +275,17 @@ class TransactionManager:
         * ``descriptor`` -- the granularity descriptor of SD-1. It is passed in rather than
           rebuilt here because ``DatabaseConfig`` already produces that exact string and two
           places producing one format string is how the two stop agreeing (amendment A24).
+        * ``writable`` -- the capability to open write transactions or checkpoint. Read-only
+          composition passes ``False`` so both doors refuse before coordination, WAL or storage;
+          the compatible default remains ``True`` for existing composition roots.
         """
+        if not isinstance(writable, bool):
+            raise GrafxConfigurationError(
+                f"writable is a capability flag; got {type(writable).__name__}.",
+                field="writable",
+                value=type(writable).__name__,
+            )
+        self._writable: bool = writable
         self._wal: Any = wal
         self._pool: BufferPool = pool
         self._heap: Any = heap
@@ -392,6 +405,11 @@ class TransactionManager:
         a missing row for an exact index, a silently short answer for a proximity one.
         """
         return self._index_manager
+
+    @property
+    def writable(self) -> bool:
+        """Return whether this manager may open or perform persistent write work."""
+        return self._writable
 
     @property
     def open_transactions(self) -> int:
@@ -521,6 +539,16 @@ class TransactionManager:
             required_lsn=self._published_high_water,
         )
 
+    def _require_writable(self, operation: str) -> None:
+        """Refuse persistent work before a lease, WAL, pool, or device door is reached."""
+        if self._writable:
+            return
+        raise GrafxUnsupportedOperation(
+            f"Cannot {operation} through a read-only transaction manager.",
+            operation=operation,
+            read_only=True,
+        )
+
     # --- life of a transaction ----------------------------------------------------------------
 
     def begin(self, mode: str) -> TransactionContext:
@@ -542,6 +570,8 @@ class TransactionManager:
         selecting -- the obvious order -- gives that guarantee away.
         """
         parsed = TransactionMode.parse(mode)
+        if parsed is TransactionMode.WRITE:
+            self._require_writable("begin a write transaction")
         with self._participant_section():
             self._require_recovery_complete()
             self._refresh_due_readers()
@@ -593,24 +623,14 @@ class TransactionManager:
         in (CONTRACT.md section 10).
         """
         self._require_owned(txn)
-        cleanup_failure: BaseException | None = None
         with self._participant_section():
+            # Ownership and state are re-read while settlement is serialised.  A preliminary
+            # check cannot carry across the wait for this section: commit, retry or another
+            # rollback may have settled this exact context in that window.
+            self._require_owned(txn)
             if txn.state is TransactionState.ABORTED:
                 return
-            self._require_active(txn)
-            self._refresh_due_readers(skip=txn.txn_id)
-            mode = txn.mode.value
-            try:
-                self._drop_index_changes(txn)
-            except BaseException as failure:
-                cleanup_failure = failure
-                self._recovery_required = True
-            txn.mark_aborted()
-            cleanup_failure = _first_failure(
-                cleanup_failure,
-                self._release_reader(txn),
-            )
-            open_now = self._forget(txn, mode)
+            mode, open_now, cleanup_failure = self._rollback_active_in_section(txn)
         if cleanup_failure is not None:
             raise cleanup_failure
         self._publish_gauge(mode, open_now)
@@ -619,6 +639,8 @@ class TransactionManager:
         """Run the frozen commit protocol of CONTRACT.md section 8.5 and report the outcome."""
         self._require_owned(txn)
         self._require_active(txn)
+        if txn.mode is TransactionMode.WRITE:
+            self._require_writable("commit a write transaction")
         if txn.mode is TransactionMode.READ or not txn.wrote:
             return self._commit_without_writing(txn)
         return self._commit_with_writing(txn)
@@ -638,20 +660,54 @@ class TransactionManager:
         its first unless the two are linked.
         """
         self._require_owned(txn)
-        if txn.conflicts <= 0:
-            raise GrafxTransactionStateError(
-                "Only a transaction that optimistic validation refused can be retried through "
-                "this door; nothing has refused this one.",
-                txn_id=txn.txn_id,
-                conflicts=txn.conflicts,
-            )
-        carried = txn.conflicts
-        mode = txn.mode
-        if txn.active:
-            self.rollback(txn)
+        if txn.mode is TransactionMode.WRITE:
+            self._require_writable("retry a write transaction")
+        with self._participant_section():
+            self._require_current_active(txn)
+            if txn.mode is TransactionMode.WRITE:
+                self._require_writable("retry a write transaction")
+            if txn.conflicts <= 0:
+                raise GrafxTransactionStateError(
+                    "Only a transaction that optimistic validation refused can be retried "
+                    "through this door; nothing has refused this one.",
+                    txn_id=txn.txn_id,
+                    conflicts=txn.conflicts,
+                )
+            carried = txn.conflicts
+            mode = txn.mode
+            finished_mode, open_now, cleanup_failure = self._rollback_active_in_section(txn)
+        if cleanup_failure is not None:
+            raise cleanup_failure
+        self._publish_gauge(finished_mode, open_now)
         successor = self.begin(mode.value)
         successor.adopt_conflicts(carried)
         return successor
+
+    def _rollback_active_in_section(
+        self, txn: TransactionContext
+    ) -> tuple[str, int, BaseException | None]:
+        """Settle one current transaction as aborted while the participant section is held.
+
+        The exact context and ACTIVE state are checked again here, immediately before reader
+        refresh or index cleanup can reach a collaborator.  Both public rollback and retry use
+        this one transition so two lifecycle doors cannot each believe they won.
+        """
+        self._require_current_active(txn)
+        self._refresh_due_readers(skip=txn.txn_id)
+        mode = txn.mode.value
+        cleanup_failure: BaseException | None = None
+        try:
+            self._drop_index_changes(txn)
+        except BaseException as failure:
+            cleanup_failure = failure
+            self._recovery_required = True
+        txn.mark_aborted()
+        cleanup_failure = _first_failure(
+            cleanup_failure,
+            self._release_reader(txn),
+        )
+        open_now = self._forget(txn, mode)
+        return mode, open_now, cleanup_failure
 
     # --- reader scheduling (amendment A46) -----------------------------------------------------
 
@@ -722,6 +778,7 @@ class TransactionManager:
         checkpoint allow together. A reader still pinned below the checkpoint holds the horizon
         back on its own account; nothing here evicts it.
         """
+        self._require_writable("checkpoint")
         with self._participant_section():
             self._require_recovery_complete()
             lease = self._hold_lease()
@@ -943,7 +1000,9 @@ class TransactionManager:
         with self._participant_section():
             for txn in list(self._open.values()):
                 try:
-                    self.rollback(txn)
+                    _mode, _open_now, cleanup_failure = self._rollback_active_in_section(txn)
+                    if cleanup_failure is not None:
+                        raise cleanup_failure
                 except GrafxError:
                     # A rollback that cannot withdraw its registration must not stop the next
                     # one from being withdrawn: the pins that remain are what a horizon pass
@@ -994,6 +1053,9 @@ class TransactionManager:
         csn: Csn = txn.snapshot.read_lsn
         mode = txn.mode.value
         with self._participant_section():
+            self._require_current_active(txn)
+            if txn.mode is TransactionMode.WRITE:
+                self._require_writable("commit a write transaction")
             self._refresh_due_readers(skip=txn.txn_id)
             txn.mark_committed(csn)
             # Reader withdrawal is best-effort after the outcome is settled. Its registration
@@ -1023,6 +1085,8 @@ class TransactionManager:
         post_barrier_failure: BaseException | None = None
         cleanup_failure: BaseException | None = None
         with self._participant_section():
+            self._require_current_active(txn)
+            self._require_writable("commit a write transaction")
             self._require_recovery_complete()
             self._validate_staged_inputs(txn)
             self._refresh_due_readers(skip=txn.txn_id)
@@ -2211,6 +2275,13 @@ class TransactionManager:
         through a different manager would be validated against a lease that has nothing to do
         with the work it is about to write. Binding the transaction to its manager makes that
         unrepresentable rather than merely discouraged.
+
+        The owner pointer is necessary but not sufficient: ``TransactionContext`` is public and
+        a caller can construct one that names this manager and reuses a live transaction number.
+        An ACTIVE context must therefore be the exact object in ``_open``.  Settled contexts are
+        no longer registered because retaining them would leak one object per transaction, so
+        their private manager capability distinguishes a genuine idempotent rollback from a
+        caller-built lookalike.
         """
         if not isinstance(txn, TransactionContext):
             raise GrafxConfigurationError(
@@ -2224,6 +2295,37 @@ class TransactionManager:
                 "committed or rolled back here.",
                 txn_id=txn.txn_id,
             )
+        tracked = self._open.get(txn.txn_id)
+        if tracked is not None and tracked is not txn:
+            raise GrafxTransactionStateError(
+                "That transaction identity does not match the context this manager opened "
+                "under the same transaction number.",
+                txn_id=txn.txn_id,
+                reason="transaction_identity_mismatch",
+            )
+        if txn.active and tracked is not txn:
+            raise GrafxTransactionStateError(
+                "This active transaction is not the exact context registered by this manager.",
+                txn_id=txn.txn_id,
+                reason="transaction_not_registered",
+            )
+        if txn._page_staging_capability is not self._page_staging_capability:
+            raise GrafxTransactionStateError(
+                "This settled transaction does not carry the private capability of a context "
+                "opened by this manager.",
+                txn_id=txn.txn_id,
+                reason="transaction_capability_mismatch",
+            )
+
+    def _require_current_active(self, txn: TransactionContext) -> None:
+        """Require the exact registered context to remain ACTIVE at the settlement instant.
+
+        Callers use this only while holding the participant section.  The same checks outside
+        that section are useful fail-fast diagnostics but cannot authorise lifecycle work: a
+        competing thread can settle the transaction before the section is acquired.
+        """
+        self._require_owned(txn)
+        self._require_active(txn)
 
     def _require_active(self, txn: TransactionContext) -> None:
         """Refuse a transaction that has already committed or rolled back."""
