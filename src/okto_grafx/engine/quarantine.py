@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -74,6 +75,8 @@ __all__ = [
     "STORAGE_PORT_METHODS",
     "CLOCK_PORT_METHODS",
     "METRICS_PORT_METHODS",
+    "QuarantineInventoryItem",
+    "QuarantineInventoryState",
     "QuarantineEntry",
     "QuarantineStore",
     "RestoreReport",
@@ -156,6 +159,55 @@ class QuarantineEntry:
     def directory(self) -> str:
         """Return the directory of this entry inside the quarantine."""
         return f"{QUARANTINE_DIRECTORY}/{self.name}"
+
+
+QuarantineInventoryState = Literal[
+    "complete",
+    "incomplete",
+    "corrupt_manifest",
+    "unreadable_manifest",
+    "missing_payload",
+    "manifest_mismatch",
+    "unexpected_layout",
+]
+"""Every conclusive state a read-only quarantine inventory can report."""
+
+
+@dataclass(frozen=True, slots=True)
+class QuarantineInventoryItem:
+    """One disjoint group of files observed by a quarantine namespace inventory.
+
+    ``files`` accounts for physical names from the one namespace snapshot; inventory items never
+    follow names supplied by a manifest. ``complete`` means that the manifest, canonical payload
+    and optional restore receipts have a self-consistent layout. Reading the payload remains the
+    door that verifies its digest, so listing evidence does not become an O(total payload bytes)
+    operation.
+    """
+
+    name: str
+    state: QuarantineInventoryState
+    files: tuple[str, ...]
+    manifest_file: str | None = None
+    payload_file: str | None = None
+    manifest: QuarantineManifest | None = None
+    detail: str = ""
+
+    @property
+    def entry(self) -> QuarantineEntry | None:
+        """Return the legacy entry view only when this item is structurally complete."""
+        if (
+            self.state != "complete"
+            or self.manifest is None
+            or self.payload_file is None
+            or self.manifest_file is None
+        ):
+            return None
+        return QuarantineEntry(
+            name=self.name,
+            manifest=self.manifest,
+            payload_file=self.payload_file,
+            manifest_file=self.manifest_file,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,20 +358,72 @@ class QuarantineStore:
 
     # --- reading -----------------------------------------------------------------------------
 
+    def inventory(self) -> tuple[QuarantineInventoryItem, ...]:
+        """Account exactly once for every file under the quarantine, without writing.
+
+        The namespace is listed once. A failed listing therefore makes the whole answer typed and
+        explicitly inconclusive instead of manufacturing the dangerous answer "nothing is
+        quarantined". Every later read uses a canonical path derived from that snapshot and the
+        entry directory; ``manifest.payload_file`` is evidence to compare, never a path to follow.
+        """
+        prefix = f"{self._directory}/"
+        try:
+            observed = self._storage.list_files(prefix)
+        except GrafxError as failure:
+            raise GrafxQuarantineError(
+                f"The quarantine inventory is inconclusive because {self._directory!r} could "
+                "not be listed.",
+                retryable=failure.retryable,
+                field="inventory",
+                operation="list_files",
+                directory=self._directory,
+                conclusive=False,
+                inconclusive=True,
+                cause=failure.code,
+            ) from failure
+
+        files = self._require_inventory_listing(observed, prefix)
+        grouped: dict[str, list[str]] = {}
+        unexpected: list[str] = []
+        for file in files:
+            remainder = file[len(prefix) :]
+            name, separator, tail = remainder.partition("/")
+            if (
+                separator != "/"
+                or not name
+                or not tail
+                or name in {".", ".."}
+                or "\\" in name
+            ):
+                unexpected.append(file)
+                continue
+            grouped.setdefault(name, []).append(file)
+
+        items = [self._inventory_item(name, tuple(grouped[name])) for name in sorted(grouped)]
+        items.extend(
+            QuarantineInventoryItem(
+                name=file[len(prefix) :],
+                state="unexpected_layout",
+                files=(file,),
+                detail="A quarantine file is not inside one entry directory.",
+            )
+            for file in unexpected
+        )
+        items.sort(key=lambda item: (item.name, item.files))
+        return tuple(items)
+
     def list(self) -> tuple[QuarantineEntry, ...]:
         """Return every complete entry, oldest first by the stamp its name begins with.
 
-        An entry whose manifest is missing or unreadable is left out of the listing and its bytes
-        are left where they are. It is an interrupted capture, and the next capture of the same
-        range completes it; deleting it here would be this component destroying evidence to tidy
-        up its own listing.
+        Incomplete or doubtful evidence remains visible through :meth:`inventory` but is excluded
+        here for compatibility with callers that only consume structurally complete entries. No
+        read door removes or repairs evidence.
         """
         entries: list[QuarantineEntry] = []
-        for name in self._entry_names():
-            entry = self._read_entry(name)
+        for item in self.inventory():
+            entry = item.entry
             if entry is not None:
                 entries.append(entry)
-        entries.sort(key=lambda item: item.name)
         return tuple(entries)
 
     def count(self) -> int:
@@ -422,6 +526,126 @@ class QuarantineStore:
         return tuple(sorted(name for name in found if name.startswith(prefix)))
 
     # --- internals ---------------------------------------------------------------------------
+
+    def _require_inventory_listing(
+        self, observed: object, prefix: str
+    ) -> tuple[str, ...]:
+        """Return one trustworthy namespace snapshot or refuse it as inconclusive."""
+        if not isinstance(observed, tuple):
+            raise GrafxQuarantineError(
+                "The quarantine inventory is inconclusive because list_files returned a value "
+                "that is not its tuple contract.",
+                field="inventory",
+                operation="list_files",
+                directory=self._directory,
+                conclusive=False,
+                inconclusive=True,
+                observed=type(observed).__name__,
+            )
+        for file in observed:
+            if not isinstance(file, str) or not file.startswith(prefix) or file == prefix:
+                raise GrafxQuarantineError(
+                    "The quarantine inventory is inconclusive because list_files returned a "
+                    "name outside the requested namespace.",
+                    field="inventory",
+                    operation="list_files",
+                    directory=self._directory,
+                    conclusive=False,
+                    inconclusive=True,
+                    observed=repr(file),
+                )
+        return tuple(sorted(set(observed)))
+
+    def _inventory_item(
+        self, name: str, files: tuple[str, ...]
+    ) -> QuarantineInventoryItem:
+        """Classify one entry directory using only paths from the namespace snapshot."""
+        directory = f"{self._directory}/{name}"
+        manifest_file = f"{directory}/{MANIFEST_FILE_NAME}"
+        if manifest_file not in files:
+            return QuarantineInventoryItem(
+                name=name,
+                state="incomplete",
+                files=files,
+                manifest_file=manifest_file,
+                detail="The entry directory contains evidence but no canonical manifest.",
+            )
+
+        try:
+            raw = self._storage.read_log(
+                manifest_file, 0, self._storage.log_size(manifest_file)
+            )
+        except GrafxError as failure:
+            return QuarantineInventoryItem(
+                name=name,
+                state="unreadable_manifest",
+                files=files,
+                manifest_file=manifest_file,
+                detail=f"{failure.code}: {failure.message}",
+            )
+
+        try:
+            manifest = QuarantineManifest.parse(raw)
+        except GrafxError as failure:
+            return QuarantineInventoryItem(
+                name=name,
+                state="corrupt_manifest",
+                files=files,
+                manifest_file=manifest_file,
+                detail=f"{failure.code}: {failure.message}",
+            )
+
+        payload_file = f"{directory}/{_payload_file_name(manifest.origin)}"
+        mismatch: list[str] = []
+        if manifest.entry_name != name:
+            mismatch.append("entry_name")
+        if manifest.payload_file != payload_file:
+            mismatch.append("payload_file")
+        if mismatch:
+            return QuarantineInventoryItem(
+                name=name,
+                state="manifest_mismatch",
+                files=files,
+                manifest_file=manifest_file,
+                payload_file=payload_file,
+                manifest=manifest,
+                detail="The manifest disagrees with its directory in: " + ", ".join(mismatch),
+            )
+        if payload_file not in files:
+            return QuarantineInventoryItem(
+                name=name,
+                state="missing_payload",
+                files=files,
+                manifest_file=manifest_file,
+                payload_file=payload_file,
+                manifest=manifest,
+                detail="The canonical payload named by this entry is absent.",
+            )
+
+        expected = {manifest_file, payload_file}
+        extra = tuple(
+            file
+            for file in files
+            if file not in expected and not _is_restore_receipt(file, directory)
+        )
+        if extra:
+            return QuarantineInventoryItem(
+                name=name,
+                state="unexpected_layout",
+                files=files,
+                manifest_file=manifest_file,
+                payload_file=payload_file,
+                manifest=manifest,
+                detail=f"Unexpected files share the entry directory: {extra!r}.",
+            )
+        return QuarantineInventoryItem(
+            name=name,
+            state="complete",
+            files=files,
+            manifest_file=manifest_file,
+            payload_file=payload_file,
+            manifest=manifest,
+        )
 
     def _entry_names(self) -> tuple[str, ...]:
         """Return the name of every directory directly under the quarantine."""
@@ -575,6 +799,20 @@ class QuarantineStore:
     def __repr__(self) -> str:
         """Return a short description naming the directory this quarantine keeps."""
         return f"QuarantineStore(directory={self._directory!r})"
+
+
+def _is_restore_receipt(file: str, directory: str) -> bool:
+    """Return whether one direct child has the exact numbered receipt shape capture writes."""
+    prefix = f"{directory}/{RESTORE_RECEIPT_PREFIX}"
+    if not file.startswith(prefix) or not file.endswith(".json"):
+        return False
+    sequence = file[len(prefix) : -len(".json")]
+    return (
+        sequence.isascii()
+        and sequence.isdigit()
+        and int(sequence) >= 1
+        and sequence == str(int(sequence))
+    )
 
 
 def _basename(name: str) -> str:
