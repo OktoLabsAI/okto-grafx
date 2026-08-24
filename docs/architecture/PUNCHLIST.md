@@ -1193,6 +1193,6 @@ instrument and the README example) and cannot move the curve.
 3. **Logical, merge-able records for directory state** instead of whole-page images -- the
    deepest option, touching the redo model itself.
 
-Recommended order: 1, then measure; 2 only if multi-table ingest is the workload; 3 only if the
-first two prove insufficient. Every option needs an amendment record and the full builder +
-blind-critic cycle. Instrument for before/after: `tools/measure_concurrency.py`.
+Full decision record with the evolutionary-server analysis, the exclusive-section framing (the
+throughput ceiling no option moves), the two complements (Windows publication fix, group commit as
+option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`. Awaiting JP.
