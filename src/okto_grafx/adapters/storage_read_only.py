@@ -10,7 +10,7 @@ persistent mutation before the wrapped device is invoked.
 from __future__ import annotations
 
 from types import TracebackType
-from typing import NoReturn
+from typing import NoReturn, Self
 
 from okto_grafx.domain.errors import GrafxUnsupportedOperation
 from okto_grafx.domain.ids import PageIndex
@@ -108,12 +108,14 @@ class ReadOnlyStorageDevice:
         self._refuse("durable_barrier")
 
     def close(self) -> None:
-        """Release the wrapped adapter when it owns a close door."""
-        closer = getattr(self.__device, "close", None)
-        if callable(closer):
-            closer()
+        """Do nothing because this view never owns the wrapped device's lifecycle.
 
-    def __enter__(self) -> ReadOnlyStorageDevice:
+        Closing a storage device is not observational: the local adapter retries pending
+        deletions after releasing handles.  Composition must therefore retain and close the raw
+        device through its separate ownership path; a read-only view cannot gain that authority.
+        """
+
+    def __enter__(self) -> Self:
         """Return this read-only handle for context-manager use."""
         return self
 
@@ -123,7 +125,7 @@ class ReadOnlyStorageDevice:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Release the wrapped adapter when leaving a context manager."""
+        """Leave the non-owning view without touching the wrapped adapter."""
         self.close()
 
     @staticmethod

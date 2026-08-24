@@ -8,7 +8,12 @@ import pytest
 
 from okto_grafx.adapters.storage_fault import FaultInjectingStorageDevice
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
-from okto_grafx.domain.errors import GrafxConfigurationError, GrafxUnsupportedOperation
+from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
+    GrafxTransactionStateError,
+    GrafxUnsupportedOperation,
+)
+from okto_grafx.domain.txn.context import TransactionContext, TransactionMode
 from okto_grafx.engine.txn_manager import TransactionManager
 from txn_support import Stack, build_stack
 
@@ -70,7 +75,7 @@ READ_ONLY_DOORS: tuple[tuple[str, Callable[[TransactionManager], object]], ...] 
 )
 
 
-@pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt))
+@pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt, SystemExit))
 @pytest.mark.parametrize(("_door", "operation"), READ_ONLY_DOORS)
 def test_persistent_work_is_refused_before_coordination_wal_or_storage(
     _door: str,
@@ -93,6 +98,155 @@ def test_persistent_work_is_refused_before_coordination_wal_or_storage(
     assert coordinator.calls == []
     assert wal.calls == []
     assert storage.trail() == ()
+
+
+def _stored_bytes(storage: FaultInjectingStorageDevice) -> tuple[tuple[str, bytes], ...]:
+    """Return every stored file and its exact bytes without crossing the recording wrapper."""
+    inner = storage.inner
+    return tuple(
+        (file, inner.read_log(file, 0, inner.file_size(file)))
+        for file in inner.list_files()
+    )
+
+
+def _forged(
+    manager: TransactionManager,
+    genuine: TransactionContext,
+    mode: TransactionMode,
+) -> TransactionContext:
+    """Return an owner-spoofed context carrying a live transaction's numeric identity."""
+    transaction = TransactionContext(
+        txn_id=genuine.txn_id,
+        mode=mode,
+        snapshot=genuine.snapshot,
+        epoch=genuine.epoch,
+        owner=manager,
+        page_staging_capability=object(),
+    )
+    if mode is TransactionMode.WRITE:
+        transaction.note_write(17)
+    return transaction
+
+
+FORGED_DOORS: tuple[
+    tuple[str, Callable[[TransactionManager, TransactionContext], object]], ...
+] = (
+    ("commit", lambda manager, transaction: manager.commit(transaction)),
+    ("rollback", lambda manager, transaction: manager.rollback(transaction)),
+    ("retry", lambda manager, transaction: manager.retry(transaction)),
+)
+
+
+@pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt, SystemExit))
+@pytest.mark.parametrize("writable", (True, False))
+@pytest.mark.parametrize("mode", (TransactionMode.READ, TransactionMode.WRITE))
+@pytest.mark.parametrize(("_door", "operation"), FORGED_DOORS)
+def test_a_forged_same_id_context_cannot_consume_the_real_transaction(
+    _door: str,
+    operation: Callable[[TransactionManager, TransactionContext], object],
+    mode: TransactionMode,
+    writable: bool,
+    failure_type: type[BaseException],
+) -> None:
+    storage = FaultInjectingStorageDevice(MemoryStorageDevice(page_size=512), seed=79)
+    stack = build_stack(storage=storage)
+    manager = _manager(stack, writable=writable)
+    genuine = manager.begin("read")
+    forged = _forged(manager, genuine, mode)
+    if _door == "retry":
+        forged.mark_conflicted()
+    horizon = stack.coordinator.reader_horizon()
+    bytes_before = _stored_bytes(storage)
+    storage.clear_trail()
+    wal = _UnreachableWal(failure_type("forged context reached WAL"))
+    coordinator = _UnreachableCoordinator(failure_type("forged context reached coordination"))
+    real_wal, real_coordinator = manager._wal, manager._coordinator
+    manager._wal, manager._coordinator = wal, coordinator
+    try:
+        with pytest.raises(GrafxTransactionStateError) as raised:
+            operation(manager, forged)
+    finally:
+        manager._wal, manager._coordinator = real_wal, real_coordinator
+
+    assert raised.value.details["reason"] == "transaction_identity_mismatch"
+    assert genuine.active
+    assert manager.open_transactions == 1
+    assert wal.calls == []
+    assert coordinator.calls == []
+    assert storage.trail() == ()
+    assert _stored_bytes(storage) == bytes_before
+    assert stack.coordinator.reader_horizon() == horizon
+    manager.rollback(genuine)
+
+
+WRITE_OUTCOME_DOORS: tuple[
+    tuple[str, Callable[[TransactionManager, TransactionContext], object]], ...
+] = (
+    ("commit", lambda manager, transaction: manager.commit(transaction)),
+    ("retry", lambda manager, transaction: manager.retry(transaction)),
+)
+
+
+@pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt, SystemExit))
+@pytest.mark.parametrize(("door", "operation"), WRITE_OUTCOME_DOORS)
+def test_write_commit_and_retry_recheck_capability_before_any_side_effect(
+    door: str,
+    operation: Callable[[TransactionManager, TransactionContext], object],
+    failure_type: type[BaseException],
+) -> None:
+    storage = FaultInjectingStorageDevice(MemoryStorageDevice(page_size=512), seed=83)
+    stack = build_stack(storage=storage)
+    manager = _manager(stack, writable=True)
+    transaction = manager.begin("write")
+    transaction.note_write(23)
+    if door == "retry":
+        transaction.mark_conflicted()
+    horizon = stack.coordinator.reader_horizon()
+    bytes_before = _stored_bytes(storage)
+    storage.clear_trail()
+    wal = _UnreachableWal(failure_type("read-only write reached WAL"))
+    coordinator = _UnreachableCoordinator(failure_type("read-only write reached coordination"))
+    real_wal, real_coordinator = manager._wal, manager._coordinator
+    manager._writable = False
+    manager._wal, manager._coordinator = wal, coordinator
+    try:
+        with pytest.raises(GrafxUnsupportedOperation) as raised:
+            operation(manager, transaction)
+    finally:
+        manager._wal, manager._coordinator = real_wal, real_coordinator
+        manager._writable = True
+
+    assert raised.value.details["read_only"] is True
+    assert transaction.active
+    assert manager.open_transactions == 1
+    assert wal.calls == []
+    assert coordinator.calls == []
+    assert storage.trail() == ()
+    assert _stored_bytes(storage) == bytes_before
+    assert stack.coordinator.reader_horizon() == horizon
+    manager.rollback(transaction)
+
+
+@pytest.mark.parametrize("settled", ("aborted", "committed"))
+def test_a_settled_fake_is_not_mistaken_for_an_idempotent_real_rollback(
+    stack: Stack, settled: str
+) -> None:
+    manager = stack.manager
+    genuine = manager.begin("read")
+    manager.rollback(genuine)
+    manager.rollback(genuine)
+    forged = _forged(manager, genuine, TransactionMode.READ)
+    if settled == "aborted":
+        forged.mark_aborted()
+    else:
+        forged.mark_committed(genuine.snapshot.read_lsn)
+
+    with pytest.raises(GrafxTransactionStateError) as raised:
+        manager.rollback(forged)
+
+    assert raised.value.details["reason"] == "transaction_capability_mismatch"
+    assert manager.open_transactions == 0
+    assert stack.coordinator.reader_horizon() is None
 
 
 def test_read_transactions_and_their_reader_pins_are_unchanged(stack: Stack) -> None:

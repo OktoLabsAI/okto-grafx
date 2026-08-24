@@ -649,6 +649,8 @@ class TransactionManager:
         """Run the frozen commit protocol of CONTRACT.md section 8.5 and report the outcome."""
         self._require_owned(txn)
         self._require_active(txn)
+        if txn.mode is TransactionMode.WRITE:
+            self._require_writable("commit a write transaction")
         if txn.mode is TransactionMode.READ or not txn.wrote:
             return self._commit_without_writing(txn)
         return self._commit_with_writing(txn)
@@ -668,6 +670,8 @@ class TransactionManager:
         its first unless the two are linked.
         """
         self._require_owned(txn)
+        if txn.mode is TransactionMode.WRITE:
+            self._require_writable("retry a write transaction")
         if txn.conflicts <= 0:
             raise GrafxTransactionStateError(
                 "Only a transaction that optimistic validation refused can be retried through "
@@ -2242,6 +2246,13 @@ class TransactionManager:
         through a different manager would be validated against a lease that has nothing to do
         with the work it is about to write. Binding the transaction to its manager makes that
         unrepresentable rather than merely discouraged.
+
+        The owner pointer is necessary but not sufficient: ``TransactionContext`` is public and
+        a caller can construct one that names this manager and reuses a live transaction number.
+        An ACTIVE context must therefore be the exact object in ``_open``.  Settled contexts are
+        no longer registered because retaining them would leak one object per transaction, so
+        their private manager capability distinguishes a genuine idempotent rollback from a
+        caller-built lookalike.
         """
         if not isinstance(txn, TransactionContext):
             raise GrafxConfigurationError(
@@ -2254,6 +2265,27 @@ class TransactionManager:
                 "This transaction was opened by another transaction manager and cannot be "
                 "committed or rolled back here.",
                 txn_id=txn.txn_id,
+            )
+        tracked = self._open.get(txn.txn_id)
+        if tracked is not None and tracked is not txn:
+            raise GrafxTransactionStateError(
+                "That transaction identity does not match the context this manager opened "
+                "under the same transaction number.",
+                txn_id=txn.txn_id,
+                reason="transaction_identity_mismatch",
+            )
+        if txn.active and tracked is not txn:
+            raise GrafxTransactionStateError(
+                "This active transaction is not the exact context registered by this manager.",
+                txn_id=txn.txn_id,
+                reason="transaction_not_registered",
+            )
+        if txn._page_staging_capability is not self._page_staging_capability:
+            raise GrafxTransactionStateError(
+                "This settled transaction does not carry the private capability of a context "
+                "opened by this manager.",
+                txn_id=txn.txn_id,
+                reason="transaction_capability_mismatch",
             )
 
     def _require_active(self, txn: TransactionContext) -> None:

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
+from okto_grafx.adapters import storage_local
+from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.adapters.storage_read_only import ReadOnlyStorageDevice
 from okto_grafx.domain.errors import GrafxUnsupportedOperation
 from okto_grafx.domain.ports import StorageDevice
@@ -89,6 +92,8 @@ class _RecordingDevice:
 
     def close(self) -> None:
         self.calls.append(("close",))
+        if self.failure is not None:
+            raise self.failure
 
     def _mutate(self, operation: str, *arguments: object) -> None:
         self.calls.append((operation, *arguments))
@@ -143,7 +148,7 @@ MUTATION_CASES: tuple[
 )
 
 
-@pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt))
+@pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt, SystemExit))
 @pytest.mark.parametrize(("door", "mutate"), MUTATION_CASES)
 def test_every_mutation_is_typed_and_refused_before_the_real_port(
     door: str,
@@ -167,8 +172,36 @@ def test_the_wrapper_satisfies_the_port_without_a_public_raw_escape() -> None:
     assert not hasattr(device, "__dict__")
 
 
-def test_closing_the_read_only_handle_releases_the_owned_resource() -> None:
-    inner = _RecordingDevice()
-    with ReadOnlyStorageDevice(inner):
+@pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt, SystemExit))
+def test_close_and_context_exit_are_non_owning(failure_type: type[BaseException]) -> None:
+    inner = _RecordingDevice(failure_type("raw close must remain unreachable"))
+    device = ReadOnlyStorageDevice(inner)
+    device.close()
+    with device:
         pass
-    assert inner.calls == [("close",)]
+    assert inner.calls == []
+
+
+def test_close_does_not_retry_or_remove_a_real_pending_delete(
+    local_device: LocalStorageDevice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    segment = "wal/read-only-pending.wal"
+    local_device.create(segment)
+    local_device.append_log(segment, b"must remain")
+
+    def refuse_removal(path: str) -> None:
+        raise PermissionError(13, f"held for the non-owning close probe: {path}")
+
+    monkeypatch.setattr(storage_local, "_remove_file", refuse_removal)
+    assert local_device.recycle(segment) is False
+    queued = local_device.pending_deletes()
+    queued_paths = tuple(Path(local_device.root).joinpath(*name.split("/")) for name in queued)
+    assert queued and all(path.exists() for path in queued_paths)
+    monkeypatch.undo()
+
+    with ReadOnlyStorageDevice(local_device):
+        pass
+
+    assert local_device.pending_deletes() == queued
+    assert all(path.exists() for path in queued_paths)
+    assert local_device.page_size == len(PAGE), "the raw owner remains open for its real closer"
