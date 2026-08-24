@@ -22,6 +22,7 @@ audits the WIRING, not the ceilings — those have their own suite.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -708,6 +709,190 @@ def test_a_held_publication_lock_refuses_a_second_stage(
     )
     assert code == 0
     assert not lock.exists(), "the stage releases its own lock on every exit"
+
+
+def test_a_zero_progress_writer_cannot_tear_a_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-4 final: a write() returning 0 used to replace valid JSON with an empty
+    file and report success. The byte-verified loop refuses; the stage exits typed;
+    both documents stay byte-identical."""
+    import tempfile as tempfile_module
+
+    out, metrics = _seed_documents(tmp_path)
+    before = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    captured: dict[str, int] = {}
+    real_mkstemp = tempfile_module.mkstemp
+
+    def spy_mkstemp(*args: object, **kwargs: object):
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        captured["fd"] = descriptor
+        return descriptor, name
+
+    real_write = os.write
+
+    def zero_write(descriptor: int, data: bytes) -> int:
+        if descriptor == captured.get("fd"):
+            return 0
+        return real_write(descriptor, data)
+
+    import os as os_module
+
+    monkeypatch.setattr(tempfile_module, "mkstemp", spy_mkstemp)
+    monkeypatch.setattr(os_module, "write", zero_write)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    after = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    assert after == before, "no torn or empty document may replace a valid one"
+    leftovers = [p.name for p in tmp_path.iterdir() if ".c13-" in p.name]
+    assert leftovers == [], "the scratch is cleaned when the write is refused"
+
+
+def test_a_hostile_exception_str_cannot_escape_the_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-4 final: printing {failure} re-executed a hostile __str__ inside the
+    catch-all. The guarded describer keeps the exit typed."""
+
+    class EvilError(RuntimeError):
+        def __str__(self) -> str:
+            raise RuntimeError("hostile str")
+
+        def __repr__(self) -> str:
+            raise RuntimeError("hostile repr")
+
+    out, metrics = _seed_documents(tmp_path)
+
+    def explode(*args: object, **kwargs: object) -> dict[str, object]:
+        raise EvilError()
+
+    monkeypatch.setattr(wiring, "run_recall", explode)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+
+
+def test_hardlinked_documents_are_refused_before_anything_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-4 final: os.replace breaks a hardlink relation, so no atomic publication
+    coherent across the names exists -- typed refusal, worker untouched."""
+    out, metrics = _seed_documents(tmp_path)
+    alias = tmp_path / "metrics-alias.json"
+    try:
+        os.link(metrics, alias)
+    except OSError:
+        pytest.skip("filesystem does not support hardlinks")
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=alias, workspace=tmp_path
+    )
+    assert code == 3
+    assert not called
+
+
+def test_out_and_metrics_resolving_to_one_file_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-4 final: the section and the gauge need DISTINCT physical documents."""
+    shared = tmp_path / "both.json"
+    shared.write_text(json.dumps({"metrics": []}), encoding="utf-8")
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=shared, metrics=shared, workspace=tmp_path
+    )
+    assert code == 3
+    assert not called
+
+
+def test_the_lock_identity_is_the_canonical_path_not_the_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-4 final: a lock held on the CANONICAL path refuses a run addressing the
+    same file through a dotted alias spelling -- text identity was not enough."""
+    out, metrics = _seed_documents(tmp_path)
+    canonical_metrics = metrics.resolve(strict=True)
+    lock = canonical_metrics.with_name(canonical_metrics.name + ".c13.lock")
+    lock.write_text("12345", encoding="ascii")
+    dotted = tmp_path / "." / "metrics.json"
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=dotted, workspace=tmp_path
+    )
+    assert code == 3
+    assert not called
+    lock.unlink()
+
+
+def test_negative_zero_scalars_are_refused_as_worker_impossibilities() -> None:
+    """Round-4 final: -0.0 == +0.0 and frozenset[float] collapse the signs; the
+    worker only produces +0.0. Coherent-but-negative-zero verdicts are refused."""
+    from bench.harness.recall import _validate_verdict
+
+    negative_min = _verdict_stub()
+    negative_min["observed"]["mean_recall_at_k"] = 0.875  # 28/32: one query at 0
+    negative_min["gauge"] = 0.875
+    negative_min["observed"]["min_recall_at_k"] = -0.0
+    reason = _validate_verdict(negative_min, "tiny")
+    assert reason is not None, "-0.0 min passed every pre-fix rule"
+    positive_control = _verdict_stub()
+    positive_control["observed"]["mean_recall_at_k"] = 0.875
+    positive_control["gauge"] = 0.875
+    positive_control["observed"]["min_recall_at_k"] = 0.0
+    assert _validate_verdict(positive_control, "tiny") is None, _validate_verdict(
+        positive_control, "tiny"
+    )
+    negative_gauge = _verdict_stub()
+    negative_gauge["observed"]["mean_recall_at_k"] = 0.0
+    negative_gauge["observed"]["min_recall_at_k"] = 0.0
+    negative_gauge["observed"]["queries_below_perfect"] = 8
+    negative_gauge["gauge"] = -0.0
+    assert _validate_verdict(negative_gauge, "tiny") is not None
+    negative_duration = _verdict_stub()
+    negative_duration["duration_seconds"] = -0.0
+    assert _validate_verdict(negative_duration, "tiny") is not None
+
+
+def test_run_recall_refuses_success_over_temp_residue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-4 final: a parsed verdict whose fresh file cannot be removed used to
+    return success with the temp left behind."""
+    import subprocess as subprocess_module
+
+    from bench.harness.recall import run_recall
+
+    scratch = tmp_path / "scratch"
+
+    def writes_verdict(command, **kwargs):
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.write_text(json.dumps(_verdict_stub()), encoding="utf-8")
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
+    real_unlink = Path.unlink
+
+    def sticky(self: Path, *args: object, **kwargs: object) -> None:
+        if self.name.startswith("recall-tiny-"):
+            raise OSError("sticky temp")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", sticky)
+    with pytest.raises(RecallStageError, match="residue"):
+        run_recall("tiny", scratch=scratch)
 
 
 def test_every_document_is_locked_not_just_one(

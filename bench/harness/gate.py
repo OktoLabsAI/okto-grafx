@@ -135,6 +135,20 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
     metrics = payload.get("metrics")
     if not isinstance(metrics, list):
         return {}, {}, "the metrics document holds no metric list"
+    try:
+        return _collect_multiples(metrics)
+    except Exception:  # noqa: BLE001 -- never-raise is absolute; KI/SE propagate
+        return (
+            {},
+            {},
+            "the metrics document raised while being read: UNMEASURED, not a verdict",
+        )
+
+
+def _collect_multiples(
+    metrics: list[object],
+) -> tuple[dict[str, float], dict[str, float], str]:
+    """The collection loop, guarded by ``read_multiples``'s absolute boundary."""
     multiples: dict[str, float] = {}
     gauges: dict[str, float] = {}
     for entry in metrics:
@@ -194,11 +208,14 @@ def _recall_measurement(document: str) -> tuple[str, object]:
     metrics = payload.get("metrics")
     if not isinstance(metrics, list):
         return ("absent", None)
-    entries = [
-        entry
-        for entry in metrics
-        if isinstance(entry, Mapping) and entry.get("name") == RECALL_METRIC
-    ]
+    try:
+        entries = [
+            entry
+            for entry in metrics
+            if isinstance(entry, Mapping) and entry.get("name") == RECALL_METRIC
+        ]
+    except Exception:  # noqa: BLE001 -- a hostile mapping is a malformed publication
+        return ("malformed", "raised while being enumerated")
     if not entries:
         return ("absent", None)
     if len(entries) != 1:
@@ -435,7 +452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # honest answer is that the gate could not be taken.
         print(
             "D5 ceiling gate: UNMEASURED (exit 2) -- the gate itself failed: "
-            f"{type(error).__name__}: {error}"
+            f"{_describe(error)}"
         )
         return 2
     print(f"D5 ceiling gate: {result.status.upper()} (exit {result.exit_code})")

@@ -136,7 +136,19 @@ def run_recall(
     descriptor, temp_name = tempfile.mkstemp(
         prefix=f"recall-{profile}-", suffix=".json", dir=str(scratch)
     )
-    os.close(descriptor)
+    try:
+        os.close(descriptor)
+    except Exception as failure:  # noqa: BLE001 -- one attempt, no retry
+        # The descriptor state is uncertain; the temp file is removed best-effort
+        # and the stage refuses typed before any process exists.
+        try:
+            os.unlink(temp_name)
+        except Exception:  # noqa: BLE001
+            pass
+        raise RecallStageError(
+            "the fresh per-run verdict file could not be prepared "
+            f"({_describe(failure)}); nothing was spawned."
+        ) from failure
     verdict_path = Path(temp_name)
     environment = dict(os.environ)
     for name in _BLAS_THREAD_VARIABLES:
@@ -201,8 +213,18 @@ def run_recall(
     finally:
         try:
             verdict_path.unlink()
-        except OSError:
-            pass
+        except Exception:  # noqa: BLE001 -- best-effort: an ordinary unlink failure
+            # must not replace the primary outcome (nor a propagating
+            # KeyboardInterrupt/SystemExit); the SUCCESS path re-checks below and
+            # refuses to report success over residue.
+            cleanup_failed = True
+        else:
+            cleanup_failed = False
+    if cleanup_failed and verdict_path.exists():
+        raise RecallStageError(
+            "the worker verdict was parsed but its fresh per-run file could not be "
+            "removed; refusing to report success over residue."
+        )
     verdict["duration_seconds"] = duration
     verdict["exit_code"] = completed.returncode
     if completed.returncode != 0 or not verdict.get("ok", False):
@@ -450,6 +472,8 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
             return f"observed.{label} {_describe(value)} is not a finite float"
         if not 0.0 <= value <= 1.0:
             return f"observed.{label} {_describe(value)} is outside [0, 1]"
+        if value == 0.0 and math.copysign(1.0, value) < 0.0:
+            return f"observed.{label} is negative zero, which the worker never produces"
     if minimum > mean:
         return "observed.min_recall_at_k exceeds the mean"
     below = observed["queries_below_perfect"]
@@ -472,7 +496,10 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
     # can only average 31/32. The comparisons work in integer grid units, where float
     # division noise is orders of magnitude below half a step, so no tolerance wide
     # enough to accept an impossible combination exists here.
-    m_min = next((m for m in range(profile.k + 1) if minimum == m / profile.k), None)
+    m_min = next(
+        (m for m in range(profile.k + 1) if minimum.hex() == (m / profile.k).hex()),
+        None,
+    )
     if m_min is None:
         return (
             f"observed.min_recall_at_k {_describe(minimum)} is not on the recall@k "
@@ -508,7 +535,12 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
     # k=10 only the means some REAL histogram produces are legitimate. The decisive
     # test is therefore the exact reachable SET (the auditor's benchmarked bitset DP),
     # not any interval around it.
-    if mean not in _reachable_means(profile.queries, profile.k, below, m_min, total):
+    if mean.hex() not in {
+        candidate.hex()
+        for candidate in _reachable_means(
+            profile.queries, profile.k, below, m_min, total
+        )
+    }:
         return (
             f"observed.mean_recall_at_k {_describe(mean)} is outside the exact "
             f"fsum-reachable set on the recall@k grid for total {total} at "
@@ -531,10 +563,15 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
             return f"dtype_check.{label} {_describe(value)} is not a finite float"
         if not floor <= value <= 1.0:
             return f"dtype_check.{label} {_describe(value)} is outside [{floor}, 1]"
+        if value == 0.0 and math.copysign(1.0, value) < 0.0:
+            return (
+                f"dtype_check.{label} is negative zero, which the worker never produces"
+            )
     if min_overlap > mean_overlap:
         return "dtype_check.min_overlap exceeds the mean overlap"
     gauge = verdict.get("gauge")
-    if isinstance(gauge, bool) or type(gauge) is not float or gauge != mean:
+    if isinstance(gauge, bool) or type(gauge) is not float or gauge.hex() != mean.hex():
+        # hex() is IEEE identity: unlike ==, it distinguishes -0.0 from +0.0.
         return "gauge does not EXACTLY equal observed.mean_recall_at_k"
     blas = verdict.get("blas_environment")
     if (
@@ -549,6 +586,7 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
         or type(duration) is not float
         or not math.isfinite(duration)
         or duration < 0.0
+        or (duration == 0.0 and math.copysign(1.0, duration) < 0.0)
     ):
         return (
             f"duration_seconds {_describe(duration)} is not a finite non-negative float"

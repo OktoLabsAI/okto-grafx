@@ -26,6 +26,7 @@ from bench.harness.recall import (
     RECALL_METRIC,
     RecallStageError,
     _canonical_verdict,
+    _describe,
     _validate_verdict,
     build_section,
     run_recall,
@@ -44,15 +45,33 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], None]) -> No
     descriptor, scratch_name = tempfile.mkstemp(
         prefix=path.name + ".c13-", suffix=".tmp", dir=str(path.parent)
     )
+    payload = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    closed = False
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
-            json.dump(document, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        written = 0
+        while written < len(payload):
+            progress = os.write(descriptor, payload[written:])
+            if not isinstance(progress, int) or progress <= 0:
+                raise RuntimeError(
+                    "the scratch write made no progress; refusing to replace a "
+                    "valid document with a torn one"
+                )
+            written += progress
+        closed = True
+        os.close(descriptor)
         os.replace(scratch_name, path)
     except BaseException:
+        # Ownership is explicit: the raw descriptor is ours until the single close
+        # attempt above. Cleanup is best-effort and can never replace the PRIMARY
+        # exception; ordinary shapes then die at the stage boundary as exit 3.
+        if not closed:
+            try:
+                os.close(descriptor)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             os.unlink(scratch_name)
-        except OSError:
+        except Exception:  # noqa: BLE001
             pass
         raise
 
@@ -139,7 +158,9 @@ def _release_publication_locks(held: list[Path]) -> list[str]:
     for lock_path in reversed(held):
         try:
             os.unlink(str(lock_path))
-        except OSError as failure:
+        except Exception as failure:  # noqa: BLE001 -- round-4: cleanup CONTINUES
+            # A hostile unlink (RuntimeError, not only OSError) must not abort the
+            # reverse cleanup of the REMAINING locks; it becomes residue diagnosis.
             residue.append(f"{lock_path} ({failure})")
     return residue
 
@@ -176,34 +197,64 @@ def _acquire_publication_locks(
             if residue:
                 reason += f" (release residue: {residue})"
             return [], reason
-        except OSError as failure:
+        except Exception as failure:  # noqa: BLE001 -- round-4: any ordinary shape
+            # RuntimeError from a hostile os.open/os.write is as ordinary as OSError:
+            # close best-effort, unwind, refuse typed. If the best-effort close ALSO
+            # fails, this lock's descriptor state is uncertain and its file is left
+            # in place (never unlink over an uncertain descriptor); only the certain
+            # locks are released, and the leftover is named in the reason.
+            close_ok = True
             if descriptor is not None:
                 try:
                     os.close(descriptor)
-                except OSError:
-                    pass
+                except Exception:  # noqa: BLE001 -- best-effort, never replaces
+                    close_ok = False
+            uncertain = None
+            if not close_ok and held and held[-1] == lock_path:
+                uncertain = held.pop()
             residue = _release_publication_locks(held)
             reason = (
                 f"the publication lock {lock_path} could not be taken or "
                 f"written ({failure})"
             )
+            if uncertain is not None:
+                reason += (
+                    f"; {uncertain} is left in place because the descriptor state "
+                    "is uncertain"
+                )
             if residue:
                 reason += f" (release residue: {residue})"
             return [], reason
         except BaseException:
+            # KeyboardInterrupt/SystemExit: unwind the same way, then propagate the
+            # PRIMARY -- every cleanup below is best-effort and cannot replace it;
+            # a lock whose close failed stays in place for the same uncertainty rule.
+            close_ok = True
             if descriptor is not None:
                 try:
                     os.close(descriptor)
-                except OSError:
-                    pass
+                except Exception:  # noqa: BLE001
+                    close_ok = False
+            if not close_ok and held and held[-1] == lock_path:
+                held.pop()
             _release_publication_locks(held)
             raise
         try:
             os.close(descriptor)
-        except OSError as failure:
+        except Exception as failure:  # noqa: BLE001 -- round-4: close is ordinary too
+            # ONE close attempt, never a retry: a close that closed and THEN raised
+            # would make a second close reach a possibly-reused descriptor number.
+            # And because the descriptor state is now UNCERTAIN, this lock file is
+            # deliberately LEFT IN PLACE -- unlinking it could let another process
+            # acquire while our descriptor possibly lives. The certain locks are
+            # released, the refusal is typed, and the leftover is named as residue.
+            # The OS closes the descriptor when the process ends.
+            uncertain = held.pop()
             residue = _release_publication_locks(held)
             reason = (
-                f"the lock descriptor for {lock_path} could not be closed ({failure})"
+                f"the lock descriptor for {lock_path} could not be closed "
+                f"({failure}); {uncertain} is left in place because the descriptor "
+                "state is uncertain"
             )
             if residue:
                 reason += f" (release residue: {residue})"
@@ -238,7 +289,7 @@ def _publish_documents(
         # typed line, exit 3, no traceback -- and because the strip precedes the spawn,
         # a strip failure aborts before any measurement begins. Exception, not
         # BaseException: KeyboardInterrupt and SystemExit still propagate.
-        print(f"vector recall: stage failed before publication -- {failure}")
+        print(f"vector recall: stage failed before publication -- {_describe(failure)}")
         return 3
     # Reaudit HIGH-1: the WHOLE verdict is validated before the first append -- an
     # adulterated verdict (gauge 0.99 beside observed 0.01, NaN inside observed, a
@@ -261,7 +312,8 @@ def _publish_documents(
         # validator; the boundary converts that into the same typed refusal. Exception,
         # never BaseException: KI and SystemExit still propagate.
         print(
-            f"vector recall: FAIL-CLOSED -- verdict validation itself failed: {failure}"
+            "vector recall: FAIL-CLOSED -- verdict validation itself failed: "
+            f"{_describe(failure)}"
         )
         return 3
     if reason is not None:
@@ -279,7 +331,10 @@ def _publish_documents(
         # the old four-type tuple missed. It runs INSIDE this boundary, before
         # _append_section, so a failure here leaves both documents exactly as the strip
         # left them. Exception, not BaseException: KI and SystemExit still propagate.
-        print(f"vector recall: publication failed after measurement -- {failure}")
+        print(
+            "vector recall: publication failed after measurement -- "
+            f"{_describe(failure)}"
+        )
         return 3
     home = next(iter(section["observed"]))  # type: ignore[call-overload]
     print(
@@ -311,6 +366,46 @@ def append_vector_recall(
             "gauge with no section; the gauge must be the LAST artifact, never the only one."
         )
         return 3
+    # Round-4 aliasing: locks by TEXT do not serialize physical identity -- symlinked
+    # and hardlinked names of one file acquired simultaneously in two processes. Every
+    # document is resolved to its canonical path (symlinks and parents), and THAT path
+    # is what the locks and the publication use. Hardlinked documents are refused
+    # outright: os.replace necessarily breaks the link relation, so no atomic
+    # publication coherent across all names exists. Two arguments resolving to the
+    # SAME file are refused for the same reason.
+    resolved: dict[str, Path] = {}
+    for alias_label, alias_path in (("--out", out), ("--metrics", metrics)):
+        if alias_path is None:
+            continue
+        try:
+            canonical = alias_path.resolve(strict=True)
+            link_count = os.stat(canonical).st_nlink
+        except Exception as failure:  # noqa: BLE001 -- absolute boundary; KI/SE pass
+            print(
+                f"vector recall stage: REFUSED -- {alias_label} {alias_path} could "
+                f"not be resolved to a physical document ({failure}); nothing was run."
+            )
+            return 3
+        if link_count > 1:
+            print(
+                f"vector recall stage: REFUSED -- {alias_label} {alias_path} is "
+                f"hardlinked (st_nlink={link_count}); os.replace would break the "
+                "aliases, so no coherent atomic publication exists. Nothing was run."
+            )
+            return 3
+        resolved[alias_label] = canonical
+    if (
+        "--out" in resolved
+        and "--metrics" in resolved
+        and resolved["--out"] == resolved["--metrics"]
+    ):
+        print(
+            "vector recall stage: REFUSED -- --out and --metrics resolve to the SAME "
+            "physical document; the section and the gauge need distinct files."
+        )
+        return 3
+    out = resolved.get("--out", out)
+    metrics = resolved.get("--metrics", metrics)
     for label, path in (("--out", out), ("--metrics", metrics)):
         if path is None:
             continue
@@ -352,8 +447,9 @@ def append_vector_recall(
     if lock_refusal is not None:
         print(f"vector recall stage: REFUSED -- {lock_refusal}")
         return 3
+    residue: list[str] = []
     try:
-        return _publish_documents(
+        outcome = _publish_documents(
             profile=profile,
             gt_mode=gt_mode,
             out=out,
@@ -362,11 +458,23 @@ def append_vector_recall(
             timeout_seconds=timeout_seconds,
         )
     finally:
-        for residue_line in _release_publication_locks(held_locks):
+        residue = _release_publication_locks(held_locks)
+        for residue_line in residue:
             print(
                 "vector recall stage: WARNING -- lock residue left behind: "
                 f"{residue_line}"
             )
+    if outcome == 0 and residue:
+        # Round-4: exit 0 with persisting locks would tell the next stage the field
+        # is clear while the files say otherwise. Success is demoted to the typed
+        # failure; the diagnostics above name every leftover.
+        print(
+            "vector recall stage: FAIL -- the publication succeeded but releasing "
+            "the locks left residue behind; refusing to report success over a "
+            "locked field."
+        )
+        return 3
+    return outcome
 
 
 def main(argv: list[str] | None = None) -> int:
