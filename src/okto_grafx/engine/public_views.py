@@ -31,7 +31,7 @@ from okto_grafx.domain.index.definition import IndexDefinition
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.header import INDEX_HEADER_SLOT, IndexHeader
 from okto_grafx.domain.index.visibility import IndexVisibility
-from okto_grafx.domain.ids import MAX_PAGE_INDEX, MAX_SLOT_ID, RecordRef
+from okto_grafx.domain.ids import MAX_PAGE_INDEX, MAX_SLOT_ID, NULL_REF, RecordRef
 from okto_grafx.domain.ledger.entry import (
     LedgerEntry,
     LedgerEntryType,
@@ -1742,14 +1742,21 @@ def _vector_hit_view(value: object) -> VectorHit:
             field="vector.hit.record_id",
             value="out_of_range",
         )
+    ref = _record_ref_view(
+        _domain_field(value, VectorHit, "ref"), field="vector.hit.ref"
+    )
+    if ref == NULL_REF:
+        raise GrafxConfigurationError(
+            "A vector hit must name a live record location, not the null reference.",
+            field="vector.hit.ref",
+            value="null_ref",
+        )
     return VectorHit(
         record_id=record_id,
         score=_finite_float(
             _domain_field(value, VectorHit, "score"), field="vector.hit.score"
         ),
-        ref=_record_ref_view(
-            _domain_field(value, VectorHit, "ref"), field="vector.hit.ref"
-        ),
+        ref=ref,
         retired=_builtin_bool(_domain_field(value, VectorHit, "retired")),
     )
 

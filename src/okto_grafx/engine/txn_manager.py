@@ -607,11 +607,17 @@ class TransactionManager:
         durable commit holds the same section. An operation that enters first finishes before the
         latch can be set; one that enters afterwards refuses before touching the pool.
         """
-        self._require_not_closed("access database pages")
-        with self._participant_section():
+        page_access = getattr(self._metrics, "page_access", None)
+        boundary = page_access() if callable(page_access) else nullcontext()
+        # Publish the cross-thread hazard before even trying the participant section. Close
+        # cannot otherwise distinguish the acquire-to-body window from ordinary facade outcome
+        # settlement and may wait on a section whose upcoming host callback waits for close.
+        with boundary:
             self._require_not_closed("access database pages")
-            self._require_recovery_complete()
-            yield
+            with self._participant_section():
+                self._require_not_closed("access database pages")
+                self._require_recovery_complete()
+                yield
 
     def _require_recovery_complete(self) -> None:
         """Refuse work that could publish over a durable commit missing from the pages."""

@@ -11,6 +11,7 @@ from typing import Any, Callable, Iterator
 import pytest
 
 from okto_grafx import connect
+from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
 from okto_grafx.adapters.vectormath_pure import PureVectorMath
 from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.adapters.storage_fault import FaultInjectingStorageDevice
@@ -1247,6 +1248,139 @@ def test_vector_math_can_wait_for_cross_thread_close_without_deadlock() -> None:
     assert database.close_complete
 
 
+def test_close_cannot_enter_the_page_access_acquire_to_body_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The global page marker closes the last window before the in-section recheck."""
+    database = connect(":memory:")
+    reader = database.begin("read")
+    manager = database._transactions
+    section_acquired = threading.Event()
+    release_body = threading.Event()
+    search_failures: list[BaseException] = []
+    close_failures: list[BaseException] = []
+    original_section = TransactionManager._participant_section
+
+    def pause_after_acquire(self: TransactionManager):  # noqa: ANN202
+        inner = original_section(self)
+
+        @contextmanager
+        def paused() -> Iterator[None]:
+            with inner:
+                if (
+                    self is manager
+                    and threading.current_thread().name == "page-window-search"
+                ):
+                    section_acquired.set()
+                    if not release_body.wait(_WAIT_SECONDS):
+                        raise AssertionError("test did not release page-access body")
+                yield
+
+        return paused()
+
+    def search() -> None:
+        try:
+            database.search_vectors(reader, space="s", query=(1.0,), k=1)
+        except BaseException as failure:  # noqa: BLE001 - exact evidence below
+            search_failures.append(failure)
+
+    def close() -> None:
+        try:
+            database.close()
+        except BaseException as failure:  # noqa: BLE001 - exact evidence below
+            close_failures.append(failure)
+
+    monkeypatch.setattr(TransactionManager, "_participant_section", pause_after_acquire)
+    search_worker = threading.Thread(target=search, name="page-window-search")
+    close_worker = threading.Thread(target=close, name="page-window-close")
+    try:
+        search_worker.start()
+        assert section_acquired.wait(_WAIT_SECONDS)
+        close_worker.start()
+        close_worker.join(_WAIT_SECONDS)
+        assert not close_worker.is_alive(), "close waited in the acquire-to-body window"
+        assert close_failures == []
+        assert database.closed and not database.close_complete
+        release_body.set()
+        search_worker.join(_WAIT_SECONDS)
+    finally:
+        release_body.set()
+        search_worker.join(_WAIT_SECONDS)
+        close_worker.join(_WAIT_SECONDS)
+        database.close()
+
+    assert not search_worker.is_alive()
+    assert len(search_failures) == 1
+    assert isinstance(search_failures[0], GrafxTransactionStateError)
+    assert database.close_complete
+
+
+def test_automatic_close_release_failure_remains_visible_without_double_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred release bomb is re-raised to explicit callers exactly as stored."""
+    database = connect(":memory:")
+    snapshot_inside = threading.Event()
+    release_snapshot = threading.Event()
+    snapshot_failures: list[BaseException] = []
+    close_failures: list[BaseException] = []
+    closer_calls = [0]
+    bomb = RuntimeError("automatic release sentinel")
+    original_snapshot = ContainedMetricsSink.snapshot
+
+    def pause_snapshot(self: ContainedMetricsSink) -> object:
+        if self is database._metrics:
+            snapshot_inside.set()
+            if not release_snapshot.wait(_WAIT_SECONDS):
+                raise AssertionError("test did not release metrics snapshot")
+        return original_snapshot(self)
+
+    def failing_closer() -> None:
+        closer_calls[0] += 1
+        raise bomb
+
+    def snapshot() -> None:
+        try:
+            database.snapshot_metrics()
+        except BaseException as failure:  # noqa: BLE001 - exact evidence below
+            snapshot_failures.append(failure)
+
+    def close() -> None:
+        try:
+            database.close()
+        except BaseException as failure:  # noqa: BLE001 - exact evidence below
+            close_failures.append(failure)
+
+    monkeypatch.setattr(ContainedMetricsSink, "snapshot", pause_snapshot)
+    object.__setattr__(database, "_closers", (*database._closers, failing_closer))
+    snapshot_worker = threading.Thread(target=snapshot, name="paused-metrics-snapshot")
+    close_worker = threading.Thread(target=close, name="snapshot-concurrent-close")
+    try:
+        snapshot_worker.start()
+        assert snapshot_inside.wait(_WAIT_SECONDS)
+        close_worker.start()
+        close_worker.join(_WAIT_SECONDS)
+        assert not close_worker.is_alive()
+        assert close_failures == []
+        assert database.closed and not database.close_complete
+        release_snapshot.set()
+        snapshot_worker.join(_WAIT_SECONDS)
+    finally:
+        release_snapshot.set()
+        snapshot_worker.join(_WAIT_SECONDS)
+        close_worker.join(_WAIT_SECONDS)
+
+    assert snapshot_failures == []
+    assert database.close_complete
+    assert database._close_failure is bomb
+    assert closer_calls == [1]
+    with pytest.raises(RuntimeError) as raised:
+        database.close()
+    assert raised.value is bomb
+    database.close()
+    assert closer_calls == [1]
+
+
 def test_close_drains_committed_schema_with_its_outcome_before_late_wrapper_returns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1305,12 +1439,12 @@ def test_close_drains_committed_schema_with_its_outcome_before_late_wrapper_retu
         "close waited for a wrapper after manager quiescence"
     )
     assert close_failures == []
-    assert settle_outcomes == []
-    assert tuple(database._public_contexts) == (transaction.txn_id,)
+    assert settle_outcomes == [True]
+    assert database._public_contexts == {}
     assert not database.close_complete
 
-    # The still-active facade wrapper owns its exact committed outcome and settlement. Leaving
-    # that transition then resumes the pending close and releases lower dependencies.
+    # The wrapper's absent-id settlement is a QueryEngine no-op; leaving its facade transition
+    # then resumes the pending close and releases lower dependencies.
     release_wrapper.set()
     commit_worker.join(_WAIT_SECONDS)
 
@@ -1348,6 +1482,8 @@ def test_close_owns_rollback_schema_unwind_in_the_manager_to_wrapper_gap(
     transaction.execute("CREATE NODE TABLE Ghost(id INT64, PRIMARY KEY(id))")
     manager_rolled_back = threading.Event()
     release_wrapper = threading.Event()
+    close_drain_started = threading.Event()
+    release_close_drain = threading.Event()
     settle_outcomes: list[bool] = []
     rollback_failures: list[BaseException] = []
     close_failures: list[BaseException] = []
@@ -1366,6 +1502,10 @@ def test_close_owns_rollback_schema_unwind_in_the_manager_to_wrapper_gap(
     def pause_close_drain(self: QueryEngine, txn_id: int, *, committed: bool) -> None:
         if self is database._queries and txn_id == transaction.txn_id:
             settle_outcomes.append(committed)
+            if threading.current_thread().name == "close-rolled-back-schema":
+                close_drain_started.set()
+                if not release_close_drain.wait(_WAIT_SECONDS):
+                    raise AssertionError("test did not release close's schema drain")
         original_settle(self, txn_id, committed=committed)
 
     monkeypatch.setattr(TransactionManager, "rollback", pause_after_manager_rollback)
@@ -1393,22 +1533,29 @@ def test_close_owns_rollback_schema_unwind_in_the_manager_to_wrapper_gap(
             "manager rollback never released its pin"
         )
         close_worker.start()
-        close_worker.join(_WAIT_SECONDS)
-        assert not close_worker.is_alive()
-        assert close_failures == []
+        assert close_drain_started.wait(_WAIT_SECONDS), (
+            "close did not adopt schema unwind"
+        )
         assert not storage_closed.is_set(), (
             "storage closed while speculative files were live"
         )
-        assert settle_outcomes == []
+        assert settle_outcomes == [False]
+        assert close_worker.is_alive()
+
+        release_close_drain.set()
+        close_worker.join(_WAIT_SECONDS)
+        assert not close_worker.is_alive()
+        assert close_failures == []
         assert not storage_closed.is_set()
         assert not database.close_complete
-        assert tuple(database._public_contexts) == (transaction.txn_id,)
+        assert database._public_contexts == {}
 
-        # The original wrapper owns rollback settlement. Its transition exit then resumes the
-        # safe pending close and releases storage only after speculative schema is gone.
+        # The original wrapper now returns from manager.rollback. Its settlement is absent-id
+        # and cannot reach QueryEngine again; transition exit resumes the safe pending close.
         release_wrapper.set()
         rollback_worker.join(_WAIT_SECONDS)
     finally:
+        release_close_drain.set()
         release_wrapper.set()
         rollback_worker.join(_WAIT_SECONDS)
         close_worker.join(_WAIT_SECONDS)

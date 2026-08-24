@@ -90,6 +90,7 @@ class ContainedMetricsSink:
     __slots__ = (
         "_enabled_hint",
         "_inner",
+        "_page_accesses",
         "_state",
         "_transition_guard",
         "_transitions",
@@ -100,6 +101,7 @@ class ContainedMetricsSink:
         self._state = _DeferredState()
         self._transition_guard = Lock()
         self._transitions = 0
+        self._page_accesses = 0
         try:
             self._enabled_hint = bool(inner.enabled)
         except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
@@ -135,6 +137,12 @@ class ContainedMetricsSink:
         with self._transition_guard:
             return self._transitions > 0
 
+    @property
+    def page_access_active(self) -> bool:
+        """Return whether host code may be running inside any page-access section."""
+        with self._transition_guard:
+            return self._page_accesses > 0
+
     @contextmanager
     def transition(self) -> Iterator[None]:
         """Track one facade lifecycle outcome without invoking or delaying host callbacks.
@@ -155,6 +163,25 @@ class ContainedMetricsSink:
             with self._transition_guard:
                 self._transitions -= 1
             state.transition_depth -= 1
+
+    @contextmanager
+    def page_access(self) -> Iterator[None]:
+        """Mark only the page-access body that may invoke a waiting host callback.
+
+        Unlike :meth:`transition`, this counter does not describe commit outcome settlement.
+        It is the narrow cross-thread capability Database.close needs to avoid waiting on a
+        participant section whose host VectorMath callback is itself waiting for close. The
+        manager raises it before attempting its participant section, closing the acquire-to-body
+        race, and leaves it after the section and its deferred callbacks finish. Neither counter
+        edge invokes host code.
+        """
+        with self._transition_guard:
+            self._page_accesses += 1
+        try:
+            yield
+        finally:
+            with self._transition_guard:
+                self._page_accesses -= 1
 
     @contextmanager
     def defer(self) -> Iterator[None]:

@@ -828,6 +828,8 @@ class Database:
         "_close_releasing",
         "_close_released",
         "_close_failure",
+        "_release_failure",
+        "_release_failure_pending",
         "_recovery_report",
         "_attached_indexes",
         "_stale_indexes",
@@ -908,6 +910,8 @@ class Database:
         self._close_releasing: bool = False
         self._close_released: bool = False
         self._close_failure: BaseException | None = None
+        self._release_failure: BaseException | None = None
+        self._release_failure_pending: bool = False
         self._recovery_report: object = _recovery_report_view(recovery_report)
         self._attached_indexes: tuple[str, ...] = tuple(
             _builtin_text(name, field="attached_index", empty=False)
@@ -1660,12 +1664,18 @@ class Database:
         Once quiescent, every release step runs even when an earlier one failed, and exactly one
         caller owns those steps even when close calls race or host callbacks re-enter.
 
-        Closing twice is a no-op. Closing with a transaction open aborts it: nothing of an open
-        transaction has reached the device, so abandoning it is the whole of that promise. A
-        concurrent/reentrant caller may return terminal but incomplete; :attr:`close_complete`
-        distinguishes that safe intermediate state from completed lower-layer release.
+        Closing twice after success is a no-op. A terminal dependency-release failure swallowed
+        by automatic cleanup is re-raised unchanged to the next explicit caller without running
+        any release twice. Closing with a
+        transaction open aborts it: nothing of an open transaction has reached the device, so
+        abandoning it is the whole of that promise. A concurrent/reentrant caller may return
+        terminal but incomplete; :attr:`close_complete` distinguishes that safe intermediate
+        state from completed lower-layer release.
         """
         if self._close_released:
+            if self._release_failure is not None and self._release_failure_pending:
+                self._release_failure_pending = False
+                raise self._release_failure
             return
         # Marked closed BEFORE anything is released. A release path calls host-supplied code --
         # an event sink, a metrics publisher, a storage device -- and any of it may re-enter this
@@ -1675,16 +1685,15 @@ class Database:
         self._closed = True
         self._transactions.request_close()
         if (
-            self._facade_transition_active()
-            or self._facade_transition_reentrant()
+            self._facade_transition_reentrant()
             or self._transactions.transition_active
             or self._close_releasing
+            or self._page_access_active()
         ):
-            # A facade wrapper (including one on another thread) is still inside its outcome
-            # boundary, a manager transition, or this close's host release phase. The terminal
-            # request is enough here; transition-finally resumes after wrapper settlement. In
-            # particular, do not wait for a participant held by host VectorMath that is waiting
-            # for this close call to return.
+            # A callback re-entered its own facade/manager transition, this close's host release
+            # phase, or page-access host code is active on some thread. The terminal request is
+            # enough here; transition-finally resumes after settlement. In particular, do not
+            # wait for a participant held by host VectorMath that is waiting for this call.
             return
 
         failures: list[BaseException] = []
@@ -1742,6 +1751,8 @@ class Database:
         if failures:
             if self._close_failure is None:
                 self._close_failure = failures[0]
+            if self._release_failure is None:
+                self._release_failure = failures[0]
             raise failures[0]
 
     def __enter__(self) -> Self:
@@ -1760,7 +1771,8 @@ class Database:
             return
         try:
             self.close()
-        except BaseException:
+        except BaseException as failure:
+            self._retain_unobserved_release_failure(failure)
             return
 
     def _close_transactions(self) -> None:
@@ -1933,6 +1945,7 @@ class Database:
                     # and schema outcome settlement. It cannot replace a durable commit result.
                     if self._close_failure is None:
                         self._close_failure = failure
+                    self._retain_unobserved_release_failure(failure)
 
     def _facade_transition_active(self) -> bool:
         """Read the contained adapter's host-free cross-thread settlement capability."""
@@ -1947,6 +1960,18 @@ class Database:
             return bool(getattr(self._metrics, "transition_active", False))
         except BaseException:  # noqa: BLE001 - telemetry cannot control dependency release
             return False
+
+    def _page_access_active(self) -> bool:
+        """Read the contained adapter's host-free cross-thread page-access capability."""
+        try:
+            return bool(getattr(self._metrics, "page_access_active", False))
+        except BaseException:  # noqa: BLE001 - telemetry cannot control dependency release
+            return False
+
+    def _retain_unobserved_release_failure(self, failure: BaseException) -> None:
+        """Make a swallowed terminal release failure visible to one later explicit close."""
+        if failure is self._release_failure:
+            self._release_failure_pending = True
 
     def _public_transaction(self, context: TransactionContext) -> Transaction:
         """Wrap a manager context only if it still belongs to an open public facade.

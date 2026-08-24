@@ -13,7 +13,7 @@ from okto_grafx.domain.errors import (
     GrafxIndexError,
     GrafxTransactionStateError,
 )
-from okto_grafx.domain.ids import MAX_PAGE_INDEX, MAX_SLOT_ID, RecordRef
+from okto_grafx.domain.ids import MAX_PAGE_INDEX, MAX_SLOT_ID, NULL_REF, RecordRef
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.model.value import VectorValue
 from okto_grafx.domain.page.layout import MAX_U64
@@ -571,6 +571,17 @@ _VECTOR_HIT_TWO = VectorHit(2, 0.5, RecordRef(1, 2), False)
         (
             VectorSearchResult(
                 (VectorHit(0, 1.0, RecordRef(1, 1), False),),
+                "exact",
+                1,
+                1,
+                "s",
+                None,
+            ),
+            None,
+        ),
+        (
+            VectorSearchResult(
+                (VectorHit(1, 1.0, NULL_REF, False),),
                 "exact",
                 1,
                 1,
