@@ -173,7 +173,7 @@ def test_marking_an_index_stale_drops_the_graph_derived_from_it(
     index = database.engine.index("space")
     index.graph()
     index.mark_stale("a test marked this index stale")
-    assert index._graph is None  # noqa: SLF001 - the derived state under test
+    assert index._snapshot is None  # noqa: SLF001 - the derived state under test
 
 
 # --- reconciliation ----------------------------------------------------------------------------

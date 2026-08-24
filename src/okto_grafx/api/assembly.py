@@ -283,6 +283,12 @@ def assemble_database(
             pool=pool,
             indexes=indexes,
             exact_scan_threshold=config.vector_exact_scan_threshold,
+            # P0.5: the derived HNSW graph of every vector index is published under this
+            # condition -- one complete picture per reference assignment, one build in flight
+            # per index. Mechanism, so it is handed in here like the pool's guard above rather
+            # than imported by the engine (the pure core imports none). A Condition and not a
+            # bare lock because a search that arrives mid-build waits on it for the build.
+            guard=threading.Condition(),
         )
         queries = QueryEngine(
             catalog=catalog,

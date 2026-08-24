@@ -299,6 +299,7 @@ class VectorFixture:
         seed: int = 0x5EED,
         page_size: int = PAGE_SIZE,
         math: object | None = None,
+        guard: object | None = None,
     ) -> None:
         self.device = MemoryStorageDevice(page_size=page_size)
         self.codec = PageCodecV1(page_size)
@@ -330,6 +331,7 @@ class VectorFixture:
             exact_scan_threshold=exact_scan_threshold,
             seed=seed,
             ef_search=ef_search,
+            guard=guard,  # type: ignore[arg-type]
         )
         self.table: TableDef | None = None
 

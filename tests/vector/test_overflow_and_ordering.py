@@ -136,10 +136,7 @@ def test_a_refused_graph_install_leaves_no_half_reachable_entry(
     # and the store would disagree about what exists. Asserting that a search still raises would
     # pass either way -- the same arithmetic refuses it in both -- so what is asserted is that
     # the derived state was DISCARDED, which is the only outcome that cannot disagree.
-    assert index._graph is None  # noqa: SLF001 - the derived state under test
-    assert index._node_of_ref == {}  # noqa: SLF001
-    assert index._entry_of_node == {}  # noqa: SLF001
-    assert index._record_of_node == {}  # noqa: SLF001
+    assert index._snapshot is None  # noqa: SLF001 - the derived state under test
 
     # And every door of the store still answers, none of them with a bare KeyError.
     for call in (
@@ -325,7 +322,7 @@ def test_a_refusal_on_a_COLD_graph_leaves_nothing_cached(
     for record_id in range(1, 6):
         database.insert_row(table, record_id, 0, space, (float(record_id), 1.0, 1.0), csn=10)
     index = database.engine.index("space")
-    assert index._graph is None  # noqa: SLF001 - the graph must be COLD
+    assert index._snapshot is None  # noqa: SLF001 - the graph must be COLD
 
     resolved = index._resolve  # noqa: SLF001
     calls = {"n": 0}
@@ -341,10 +338,7 @@ def test_a_refusal_on_a_COLD_graph_leaves_nothing_cached(
         index.graph()
     index._resolve = resolved  # type: ignore[assignment]  # noqa: SLF001
 
-    assert index._graph is None  # noqa: SLF001
-    assert index._node_of_ref == {}  # noqa: SLF001
-    assert index._entry_of_node == {}  # noqa: SLF001
-    assert index._record_of_node == {}  # noqa: SLF001
+    assert index._snapshot is None  # noqa: SLF001 - no picture, so no graph and no maps
 
     # The transient condition is over, so the very next search must answer completely rather than
     # out of the fragment the failed build left behind.
@@ -378,7 +372,7 @@ def test_a_refusal_on_a_WARM_graph_discards_it_too(
         space="space", query=(3.0, 1.0, 1.0), k=5, snapshot=SnapshotDouble(1000)
     )
     assert warm.achieved_k == 5
-    assert index._graph is not None  # noqa: SLF001 - the graph must be WARM
+    assert index._snapshot is not None  # noqa: SLF001 - the graph must be WARM
 
     resolved = index._resolve  # noqa: SLF001
     refusals = {"left": 1}
@@ -397,7 +391,7 @@ def test_a_refusal_on_a_WARM_graph_discards_it_too(
     # The property, not the symptom: the derived state was discarded, so the next search
     # rebuilds from the store and answers every live row -- including the sixth, whose entry
     # the store holds whether or not the graph was ready to take it.
-    assert index._graph is None  # noqa: SLF001
+    assert index._snapshot is None  # noqa: SLF001
     after = database.engine.search(
         space="space", query=(3.0, 1.0, 1.0), k=10, snapshot=SnapshotDouble(1000)
     )
@@ -470,7 +464,8 @@ def test_a_node_has_its_entry_before_the_graph_can_reach_it(
         def insert(self, node: int, components: object) -> None:  # type: ignore[override]
             index = owner.get("index")
             if index is not None:
-                observed.append(node in index._entry_of_node)  # noqa: SLF001 - the ordering
+                picture = index._snapshot  # noqa: SLF001 - the ordering under test
+                observed.append(picture is not None and node in picture.entry_of_node)
             return super().insert(node, components)
 
     monkeypatch.setattr(engine_module, "HnswGraph", ObservingGraph)

@@ -42,16 +42,34 @@ framework's ``IndexManager.verify``.
 
 Locks and host code
 -------------------
-This engine holds no lock, spawns no thread and shares no mutable state between instances, so the
-boundary amendment A91 guards -- calling host-supplied code while holding an internal lock --
-cannot arise. The host code it does call, a candidate filter and the metrics sink, runs with the
-engine's own invariants already established.
+This engine spawns no thread and shares no mutable state between instances. The one lock it
+uses, the guard over the derived graph, is handed in by the composition root (the engine imports
+no mechanism, CF-13) and is held across REFERENCE operations only: publishing a complete
+picture, retiring one, certifying one. Nothing under it reaches the pool, the heap, the resolver,
+the candidate filter, the metrics sink or the ``VectorMath`` port, so the boundary amendment
+A91 guards -- calling host-supplied code while holding an internal lock -- cannot arise, and
+neither can the lock-order inversion with the pool's own guard (pool, then graph guard; never
+the reverse). The host code the engine does call runs with its invariants already established.
+
+The derived graph and its publication rule (P0.5)
+-------------------------------------------------
+The graph is derived state: it, the three maps that translate between graph nodes and index
+entries, and the log position it reflects form ONE picture, :class:`_GraphSnapshot`, built in
+locals and published by a single reference assignment. A search captures the picture once and
+answers from it. That is what makes the fast path safe under concurrency: nothing that can be
+captured is ever partial, a build that fails leaves the published picture alone (it may be
+another thread's complete one), and two builds can never be mixed -- the graph of one with the
+maps of the other. A commit certifies a picture as current only when it verified, BEFORE the
+store moved, that the picture was current and then noted its own changes into it; a picture
+that was already behind is retired instead, because a mark that says "current" over a graph
+missing another process's rows is the silent short answer of LESSONS L22 one path over.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -104,6 +122,7 @@ from okto_grafx.engine.metrics_catalog import MetricEmitter, metric
 
 __all__ = [
     "DEFAULT_INDEX_SEED",
+    "GraphGuard",
     "PHASE_PLAN",
     "PHASE_TRAVERSE",
     "PHASE_VALIDATE",
@@ -302,6 +321,100 @@ def _guarded_admits(
     return admits
 
 
+class GraphGuard(Protocol):
+    """What the derived graph needs from a lock: a context manager that can also wait and wake.
+
+    A ``threading.Condition`` satisfies it, and the composition root hands one in (CF-13: the
+    mechanism arrives by construction, the engine imports none). It is held across reference
+    operations on the published picture only -- never across the walk, the resolver, the pool
+    or the ``VectorMath`` port (A91, LESSONS L2) -- and the same guard may be shared by every
+    index of one engine: a wake meant for another index costs its waiters one re-check.
+    """
+
+    def __enter__(self) -> object:
+        """Take the guard."""
+        ...
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> object:
+        """Release the guard, whether or not the body raised."""
+        ...
+
+    def wait_for(self, predicate: Callable[[], bool], timeout: float | None = None) -> bool:
+        """Release the guard while waiting for the predicate, up to the timeout; return its value."""
+        ...
+
+    def notify_all(self) -> None:
+        """Wake every thread waiting on this guard."""
+        ...
+
+
+class _UnguardedBuild:
+    """The guard of a composition that hands none in: nothing to take, nothing to wait for.
+
+    The engine's own suite builds the vector engine directly and drives it from one thread; a
+    wait that returns at once is what keeps that composition from waiting on a notification
+    nothing will send. A multi-threaded host composes through the assembly, which hands in a
+    real condition.
+    """
+
+    __slots__ = ()
+
+    def __enter__(self) -> object:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
+
+    def wait_for(self, predicate: Callable[[], bool], timeout: float | None = None) -> bool:
+        """Answer the predicate at once: with no other thread, there is nothing to wait for."""
+        return bool(predicate())
+
+    def notify_all(self) -> None:
+        """Wake nobody: an unguarded composition has no waiters."""
+        return None
+
+
+_BUILD_WAIT_SECONDS: float = 0.5
+"""One slice of waiting behind another thread's build of the same index."""
+
+_BUILD_WAIT_SLICES: int = 120
+"""Slices a waiter spends behind another thread's build before it builds for itself.
+
+A duplicate build is wasted work and never a wrong answer -- both pictures are complete, and the
+publication keeps the fresher one -- so the patience only bounds how long a search can be held
+behind a build that is slow past reason, or behind an unguarded composition's instant no.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class _GraphSnapshot:
+    """One complete, consistent picture of the index: the graph, its maps and the mark.
+
+    ``mark`` is the ``built_through_lsn`` the header held when the build STARTED, which is the
+    only reading a picture can honestly claim: an entry the store received after it was read is
+    either in the walk (then the picture is ahead of its mark, which costs one rebuild) or not
+    (then the mark says so). The maps are mutated in place by the warm path, under the same
+    discipline as the graph -- an entry is registered before its node becomes reachable -- and a
+    search that captured this picture keeps every part of it for as long as it runs.
+    """
+
+    graph: HnswGraph
+    node_of_ref: dict[int, int]
+    entry_of_node: dict[int, IndexEntry]
+    record_of_node: dict[int, RecordId]
+    mark: Lsn
+
+    def certified(self, mark: Lsn) -> _GraphSnapshot:
+        """Return this same picture -- same graph, same maps -- carrying a newer mark."""
+        return _GraphSnapshot(
+            graph=self.graph,
+            node_of_ref=self.node_of_ref,
+            entry_of_node=self.entry_of_node,
+            record_of_node=self.record_of_node,
+            mark=mark,
+        )
+
+
 class VectorHnswIndex(ProximityIndex):
     """A navigable small world graph over the framework's proximity store.
 
@@ -328,11 +441,9 @@ class VectorHnswIndex(ProximityIndex):
         "_neighbours",
         "_ef_construction",
         "_ef_search",
-        "_graph",
-        "_graph_mark",
-        "_node_of_ref",
-        "_entry_of_node",
-        "_record_of_node",
+        "_guard",
+        "_snapshot",
+        "_building",
     )
 
     def __init__(
@@ -352,8 +463,13 @@ class VectorHnswIndex(ProximityIndex):
         neighbours: int = DEFAULT_NEIGHBOURS,
         ef_construction: int = DEFAULT_EF_CONSTRUCTION,
         ef_search: int = DEFAULT_EF_SEARCH,
+        guard: GraphGuard | None = None,
     ) -> None:
-        """Build the index of one embedding space over one paged store."""
+        """Build the index of one embedding space over one paged store.
+
+        ``guard`` is the lock the published picture is replaced under (see :class:`GraphGuard`);
+        without one the index is fit for a single thread only.
+        """
         super().__init__(definition, pool, metrics)  # type: ignore[arg-type]
         self._space_id = space_id
         self._space_name = space_name
@@ -366,11 +482,12 @@ class VectorHnswIndex(ProximityIndex):
         self._neighbours = neighbours
         self._ef_construction = ef_construction
         self._ef_search = ef_search
-        self._graph: HnswGraph | None = None
-        self._graph_mark: Lsn | None = None
-        self._node_of_ref: dict[int, int] = {}
-        self._entry_of_node: dict[int, IndexEntry] = {}
-        self._record_of_node: dict[int, RecordId] = {}
+        self._guard: GraphGuard = _UnguardedBuild() if guard is None else guard
+        # The published picture, or None while there is none. Replaced by ONE assignment under
+        # the guard, captured by ONE read; never edited into a different picture in place.
+        self._snapshot: _GraphSnapshot | None = None
+        # True while a thread of this process builds a picture; other searches wait behind it.
+        self._building: bool = False
 
     # --- identity ---------------------------------------------------------------------------
 
@@ -479,102 +596,160 @@ class VectorHnswIndex(ProximityIndex):
     # --- the derived graph ------------------------------------------------------------------
 
     def invalidate_graph(self) -> None:
-        """Drop the graph, so the next search rebuilds it from the entries the store holds.
+        """Drop the published picture, so the next search rebuilds it from the entries the store holds.
 
-        The three maps are REPLACED, never cleared in place: a search in flight on another thread
-        holds references to the graph and the maps it started with and finishes on that
-        consistent picture, stale by at most one commit, rather than on a picture that changes
-        under it (C9 round-3 B5).
+        The picture is REPLACED, never edited in place: a search in flight on another thread
+        holds the picture it started with and finishes on it, stale by at most one commit, rather
+        than on one that changes under it (C9 round-3 B5).
+
+        This is the unconditional door -- a rebuild, a stale mark, a RESET -- and it is the ONLY
+        unconditional one. A builder that fails drops its locals and touches nothing published,
+        and a commit that finds its picture superseded retires THAT picture (``_retire``): the
+        picture either would otherwise drop may be another thread's complete, correct build, and
+        dropping a success on somebody else's failure was one of the P0.5 interleavings.
         """
-        self._graph = None
-        self._graph_mark = None
-        self._node_of_ref = {}
-        self._entry_of_node = {}
-        self._record_of_node = {}
-
-    def _graph_is_current(self) -> bool:
-        """Return True when the warm graph still reflects what the store holds on the device.
-
-        The graph is derived state over a file other PROCESSES write. Its only invalidation signals
-        used to be this process's own commits, so a participant with a warm graph answered from it
-        for ever while another process inserted, updated and deleted rows underneath: the
-        approximate regime returned deleted rows and scored updated rows against old vectors, with
-        ``stale`` False and ``verify()`` clean (C9 round-3 B6 -- LESSONS L22, a process-local
-        signal speaking for a shared file). Every commit that touches this index advances the
-        header's ``built_through_lsn`` on the device, and a read view taken at ``begin()`` drops
-        the cached header page when the published state moved, so comparing that number with the
-        one the graph was built at is the shared signal this derived state needs.
-        """
-        if self._graph is None:
-            return False
-        return self._graph_mark == self.built_through_lsn
+        with self._guard:
+            self._snapshot = None
 
     def graph(self) -> HnswGraph:
-        """Return the graph over the current entries, building it when there is none.
+        """Return the graph of the current picture, building one when there is none or it is behind."""
+        return self.snapshot().graph
+
+    def snapshot(self) -> _GraphSnapshot:
+        """Return one complete picture of the index as of now, building it when needed.
+
+        THE RULE (P0.5). A picture is built in locals and published by ONE reference
+        assignment, so nothing that can be captured is ever partial, and two builds can never be
+        mixed. A caller captures the picture ONCE and answers from it; it never reads
+        ``self._snapshot`` a second time.
+
+        Freshness is decided against the header's ``built_through_lsn`` read BEFORE the walk
+        begins, and the picture carries that reading as its mark. A commit that lands during the
+        build is neither noted into the picture (nothing is published to note into) nor
+        certified by it: its mark stays behind the header and the next search rebuilds. The
+        search that built it answers correctly regardless -- that commit's CSN is above its
+        snapshot, so nothing of it is visible to it.
+
+        One build at a time per index: a thread that finds a build in flight waits on the guard
+        for it, in bounded slices, and takes the published picture when it wakes. Past
+        ``_BUILD_WAIT_SLICES`` it builds for itself, which is wasted work and never a wrong
+        answer.
+
+        The header is read OUTSIDE the guard on every turn: reading it pins a page and takes the
+        pool's lock, and this process's lock order is pool, then guard, never the reverse.
+        Nothing under the guard reaches the pool, the heap, the resolver or the ``VectorMath``
+        port (A91, LESSONS L2).
+        """
+        waited = 0
+        while True:
+            header = self.built_through_lsn
+            with self._guard:
+                current = self._snapshot
+                if current is not None:
+                    if current.mark == header:
+                        return current
+                    # The store moved under this picture -- a commit of this process noted
+                    # elsewhere, or a commit of another process (LESSONS L22). Retire exactly
+                    # this one; whatever is published by the time the build ends is judged then.
+                    self._snapshot = None
+                if not self._building:
+                    self._building = True
+                    break
+                finished = self._guard.wait_for(
+                    lambda: not self._building, timeout=_BUILD_WAIT_SECONDS
+                )
+                waited += 1
+                if not finished and waited >= _BUILD_WAIT_SLICES:
+                    break
+        try:
+            built = self._build(header)
+        except BaseException:
+            # A build that does not finish leaves NOTHING behind -- and takes nothing away. Its
+            # locals go with this frame; the published picture, which may be another thread's
+            # complete build, is not touched. The two early refusals inside the build (the
+            # resolver failing, a dimension mismatch) used to re-raise with a partial graph
+            # published, and every later search answered out of the fragment (C9 round-2 B3).
+            with self._guard:
+                self._building = False
+                self._guard.notify_all()
+            raise
+        with self._guard:
+            current = self._snapshot
+            if current is None or current.mark < built.mark:
+                self._snapshot = built
+            else:
+                # Somebody published a picture at least as fresh while this one was built --
+                # the duplicate-build case. Both are complete; the published one is kept, and
+                # this search answers from it rather than from a picture nobody else can see.
+                built = current
+            self._building = False
+            self._guard.notify_all()
+        return built
+
+    def _build(self, mark: Lsn) -> _GraphSnapshot:
+        """Build a complete picture in locals over the entries the store holds, marked at ``mark``.
 
         A tombstoned entry is inserted with the live ones: it must not be RETURNED, and it must
         stay traversable as a bridge while an older snapshot can still see it, which is the same
-        rule the ACORN traversal applies to a filtered node.
+        rule the ACORN traversal applies to a filtered node. Every refusal on the way in
+        propagates, and the caller drops the picture with the frame.
         """
-        if self._graph is not None:
-            return self._graph
-        graph = HnswGraph(
-            self._math,
-            self._metric,
-            seed=self._seed ^ self._space_id,
-            neighbours=self._neighbours,
-            ef_construction=self._ef_construction,
+        picture = _GraphSnapshot(
+            graph=HnswGraph(
+                self._math,
+                self._metric,
+                seed=self._seed ^ self._space_id,
+                neighbours=self._neighbours,
+                ef_construction=self._ef_construction,
+            ),
+            node_of_ref={},
+            entry_of_node={},
+            record_of_node={},
+            mark=mark,
         )
-        self._graph = graph
-        self._node_of_ref = {}
-        self._entry_of_node = {}
-        self._record_of_node = {}
-        try:
-            for entry in sorted(
-                self.walk(), key=lambda item: (item.born_csn, item.ref.encode())
-            ):
-                self._install(entry)
-            self._graph_mark = self.built_through_lsn
-        except BaseException:
-            # A build that does not finish must leave NOTHING cached. The graph is published
-            # before the loop because `_install` reaches it through `self._graph`, and the two
-            # early refusals inside it -- the resolver failing, and a dimension mismatch -- used
-            # to re-raise with the partial graph still in place. Every later call then took the
-            # `self._graph is not None` fast path and answered out of a fragment: five live rows,
-            # one node, `stale` False, `live_count` right, `achieved_k` reported as if complete.
-            #
-            # It never recovered, because nothing re-checks freshness after open. A transient
-            # frame-pressure blip -- a retryable refusal, no caller error, no damage -- was enough
-            # to make the approximate regime answer wrongly for the rest of the session while the
-            # exact regime, which reads the heap, stayed correct. That asymmetry is why the tested
-            # path was the safe one (LESSONS L24), and why the discard has to be unconditional
-            # rather than a list of the failures anyone thought of.
-            self.invalidate_graph()
-            raise
-        return graph
+        for entry in sorted(self.walk(), key=lambda item: (item.born_csn, item.ref.encode())):
+            self._install(picture, entry)
+        return picture
 
-    def _install(self, entry: IndexEntry) -> None:
-        """Put one stored entry into the graph, resolving its components through the caller."""
-        graph = self._graph
-        if graph is None:
-            return
+    def _retire(self, picture: _GraphSnapshot) -> None:
+        """Drop ``picture`` if it is the published one; leave any other picture alone.
+
+        The compare is what keeps one thread's outcome from erasing another's: a warm-path
+        refusal, or a removal, contaminates the picture it happened to, and that is the only
+        picture it may discard.
+        """
+        with self._guard:
+            if self._snapshot is picture:
+                self._snapshot = None
+
+    def _certify(self, picture: _GraphSnapshot, mark: Lsn) -> None:
+        """Republish ``picture`` carrying ``mark``, if it is still the published one.
+
+        Only a caller that verified the picture was current BEFORE the store moved, and then
+        noted its own changes into it, may call this; the compare refuses the certification when
+        the picture was retired or replaced in between.
+        """
+        with self._guard:
+            if self._snapshot is picture:
+                self._snapshot = picture.certified(mark)
+
+    def _install(self, picture: _GraphSnapshot, entry: IndexEntry) -> None:
+        """Put one stored entry into a picture, resolving its components through the resolver.
+
+        A refusal propagates and the picture is left to the caller: dropped when it was a local
+        under construction, retired when it was the published one (``_note``), because a
+        refusal inside ``graph.insert`` can leave the graph half-linked and a half-linked graph
+        is discarded, never repaired.
+        """
         encoded = entry.ref.encode()
-        if encoded in self._node_of_ref:
-            self._entry_of_node[self._node_of_ref[encoded]] = entry
+        node = picture.node_of_ref.get(encoded)
+        if node is not None:
+            picture.entry_of_node[node] = entry
             return
-        try:
-            self._install_fresh(graph, entry, encoded)
-        except BaseException:
-            # EVERY refusal on the way into the graph discards it, not only the late one inside
-            # graph.insert. The cold build in graph() already did this; the WARM path -- _note()
-            # on every commit and redo -- reached the two early refusals below with the graph
-            # intact, and a search then answered out of a graph missing the row (C9 round-2 B4:
-            # five nodes, live_count six, stale False, the exact regime answering six).
-            self.invalidate_graph()
-            raise
+        self._install_fresh(picture, entry, encoded)
 
-    def _install_fresh(self, graph: HnswGraph, entry: IndexEntry, encoded: bytes) -> None:
-        """Resolve, check and insert one entry that the graph does not hold yet."""
+    def _install_fresh(self, picture: _GraphSnapshot, entry: IndexEntry, encoded: int) -> None:
+        """Resolve, check and insert one entry that the picture does not hold yet."""
         try:
             resolved = self._resolve(entry.ref)
         except GrafxError as failure:
@@ -597,81 +772,100 @@ class VectorHnswIndex(ProximityIndex):
                 expected=self._dimension,
                 value=len(components),
             )
-        node = len(self._entry_of_node) + 1
-        while node in self._entry_of_node:
+        entries = picture.entry_of_node
+        node = len(entries) + 1
+        while node in entries:
             node += 1
         # Nothing becomes reachable before every step that can still refuse has succeeded. The
         # insertion scores the new node against its neighbours, so it can refuse on arithmetic
-        # this index cannot rank -- and publishing the three mappings first would leave an entry
-        # with no graph node behind it: invisible to a search, uncountable by the planner, and a
-        # bare KeyError out of walk() and lookup() forever.
+        # this index cannot rank -- and publishing the mappings first would leave an entry with
+        # no graph node behind it: invisible to a search, uncountable by the planner, and a bare
+        # KeyError out of walk() and lookup() forever.
         #
-        # The graph itself can be left half-linked by that refusal, so it is DISCARDED rather
-        # than repaired. It is derived state: throwing it away costs nothing durable and the
-        # rebuild is deterministic, which is a cheaper correctness argument than a partial undo.
         # The entry and the record are registered BEFORE the node becomes reachable. graph.insert
         # links the node into the connectivity chain, and a traversal on another thread can reach
         # it the moment it does; a node it can reach must have an entry to answer with, or the
         # traversal dies with a bare KeyError (C9 round-3 B5). A failure inside insert is handled
-        # by the caller, which discards the whole graph and these maps with it.
-        self._entry_of_node[node] = entry
-        self._record_of_node[node] = record_id
-        graph.insert(node, components)
-        self._node_of_ref[encoded] = node
+        # by the caller, which drops or retires the whole picture.
+        entries[node] = entry
+        picture.record_of_node[node] = record_id
+        picture.graph.insert(node, components)
+        picture.node_of_ref[encoded] = node
 
-    def _note(self, change: IndexChange) -> None:
-        """Bring the graph in line with one change the store has just applied."""
-        if self._graph is None:
-            return
+    def _note(self, picture: _GraphSnapshot, change: IndexChange) -> bool:
+        """Bring one published picture in line with one applied change; say whether it survived.
+
+        Returns False when the change retired the picture -- a RESET, a removal, or a refusal on
+        the way in -- so the caller stops noting into a picture nobody can reach any more and,
+        above all, does not certify it.
+        """
         if change.operation is IndexOperation.RESET:
-            self.invalidate_graph()
-            return
+            self._retire(picture)
+            return False
         encoded = change.ref.encode()
-        node = self._node_of_ref.get(encoded)
+        node = picture.node_of_ref.get(encoded)
         if change.operation is IndexOperation.INSERT:
             if node is None:
-                self._install(
-                    IndexEntry(
-                        key=change.key,
-                        ref=change.ref,
-                        versioned=True,
-                        born_csn=change.csn,
+                try:
+                    self._install(
+                        picture,
+                        IndexEntry(
+                            key=change.key,
+                            ref=change.ref,
+                            versioned=True,
+                            born_csn=change.csn,
+                        ),
                     )
-                )
-            return
+                except BaseException:
+                    # EVERY refusal on the way into the graph discards the picture, not only
+                    # the late one inside graph.insert: the two early refusals used to re-raise
+                    # with the graph intact, and a search then answered out of a graph missing
+                    # the row (C9 round-2 B4: five nodes, live_count six, stale False).
+                    self._retire(picture)
+                    raise
+            return True
         if node is None:
-            return
+            return True
         if change.operation is IndexOperation.TOMBSTONE:
-            self._entry_of_node[node] = self._entry_of_node[node].ended_at(change.csn)
-            return
+            picture.entry_of_node[node] = picture.entry_of_node[node].ended_at(change.csn)
+            return True
         # A removal mutates the graph's neighbour lists and unlinks a node; done in place under
         # a traversal on another thread, that traversal can step onto a node that is no longer
         # there. Derived state is discarded rather than edited, and rebuilt on the next search
         # (a reconcile pass removes many entries in one go and pays one rebuild for all of them).
-        self.invalidate_graph()
+        self._retire(picture)
+        return False
 
     # --- the write path ---------------------------------------------------------------------
 
     def commit(self, txn: StagingTransaction, csn: Csn) -> int:
-        """Apply the transaction's staged changes, then bring the graph in line with them."""
+        """Apply the transaction's staged changes, then bring the published picture in line.
+
+        The picture is captured ONCE, before the store moves; the changes are noted into that
+        picture and it is certified through the position the store now holds.
+        """
         staged = self.pending(txn)
+        picture = self._snapshot
         applied = super().commit(txn, csn)
+        if picture is None:
+            return applied
         for change in staged:
-            self._note(change)
-        if self._graph is not None:
-            self._graph_mark = self.built_through_lsn
+            if not self._note(picture, change):
+                return applied
+        self._certify(picture, self.built_through_lsn)
         return applied
 
     def apply(self, record: WalRecord) -> None:
-        """Redo one log record, then bring the graph in line with it."""
+        """Redo one log record, then bring the published picture in line with it (as commit does)."""
         from okto_grafx.domain.index.records import change_of
 
         change = change_of(record)
+        picture = self._snapshot
         super().apply(record)
-        if change.index == self.name:
-            self._note(change)
-            if self._graph is not None:
-                self._graph_mark = self.built_through_lsn
+        if change.index != self.name or picture is None:
+            return
+        if self._note(picture, change):
+            self._certify(picture, self.built_through_lsn)
 
     def mark_stale(self, reason: str) -> None:
         """Record staleness durably, and drop the graph derived from the entries it doubts."""
@@ -708,15 +902,13 @@ class VectorHnswIndex(ProximityIndex):
         width = self._ef_search if ef is None else ef
         if width < k:
             width = k
-        if self._graph is not None and not self._graph_is_current():
-            self.invalidate_graph()
-        graph = self.graph()
-        # The picture this search answers from is fixed HERE. A commit on another thread may
-        # replace the graph and the maps while the traversal runs; the traversal keeps these
-        # references and finishes on one consistent picture. A node that vanished from the
-        # picture it holds (removed concurrently) is simply not visible.
-        entries = self._entry_of_node
-        records = self._record_of_node
+        # The picture this search answers from is fixed HERE, by one capture. A commit on
+        # another thread may retire or replace the published picture while the traversal runs;
+        # the traversal keeps this one and finishes on one consistent picture. A node that
+        # vanished from it (removed concurrently) is simply not visible.
+        picture = self.snapshot()
+        entries = picture.entry_of_node
+        records = picture.record_of_node
 
         def visible_and_admitted(node: int) -> bool:
             """Return True when this snapshot may see the entry and the filter admits it."""
@@ -728,7 +920,7 @@ class VectorHnswIndex(ProximityIndex):
             record = records.get(node)
             return record is not None and bool(admits(record))
 
-        ranked, stats = graph.search(query, width, visible_and_admitted)
+        ranked, stats = picture.graph.search(query, width, visible_and_admitted)
         scored = [
             ScoredEntry(entry=entries[node], record_id=records[node], score=score)
             for score, node in ranked
@@ -769,6 +961,7 @@ class VectorEngine:
         "_ef_search",
         "_by_space",
         "_maintained_at",
+        "_guard",
     )
 
     def __init__(
@@ -787,8 +980,14 @@ class VectorEngine:
         neighbours: int = DEFAULT_NEIGHBOURS,
         ef_construction: int = DEFAULT_EF_CONSTRUCTION,
         ef_search: int = DEFAULT_EF_SEARCH,
+        guard: GraphGuard | None = None,
     ) -> None:
-        """Build the engine over one catalog, one heap and one index registry."""
+        """Build the engine over one catalog, one heap and one index registry.
+
+        ``guard`` is the lock every index of this engine publishes its derived graph under (see
+        :class:`GraphGuard`). The composition root hands in a ``threading.Condition``; a
+        composition that hands in none gets indexes fit for a single thread.
+        """
         if isinstance(exact_scan_threshold, bool) or not isinstance(exact_scan_threshold, int):
             raise GrafxConfigurationError(
                 f"The exact scan threshold must be an integer; got "
@@ -817,6 +1016,7 @@ class VectorEngine:
         self._ef_search = ef_search
         self._by_space: dict[str, VectorHnswIndex] = {}
         self._maintained_at: dict[str, float] = {}
+        self._guard = guard
 
     # --- spaces -------------------------------------------------------------------------------
 
@@ -902,6 +1102,7 @@ class VectorEngine:
             neighbours=self._neighbours,
             ef_construction=self._ef_construction,
             ef_search=self._ef_search,
+            guard=self._guard,
         )
         registry.register(index)
         self._by_space[space.name] = index
