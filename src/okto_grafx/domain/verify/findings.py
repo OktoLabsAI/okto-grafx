@@ -20,6 +20,7 @@ from okto_grafx.domain.errors import GrafxConfigurationError
 from okto_grafx.domain.ids import NO_LSN, Lsn
 
 __all__ = [
+    "VERIFICATION_FINDING_KINDS",
     "VERIFICATION_SCOPES",
     "SCOPE_ALL",
     "SCOPE_INDEXES",
@@ -45,7 +46,12 @@ SCOPE_INDEXES: str = "indexes"
 SCOPE_ALL: str = "all"
 """Every scope above, in one walk."""
 
-VERIFICATION_SCOPES: tuple[str, ...] = (SCOPE_PAGES, SCOPE_RECORDS, SCOPE_INDEXES, SCOPE_ALL)
+VERIFICATION_SCOPES: tuple[str, ...] = (
+    SCOPE_PAGES,
+    SCOPE_RECORDS,
+    SCOPE_INDEXES,
+    SCOPE_ALL,
+)
 """The closed set CONTRACT.md section 8.6 gives ``Verifier.verify``."""
 
 NOT_APPLICABLE: int = -1
@@ -78,6 +84,34 @@ class FindingKind:
     LOG_DAMAGE: str = "log_damage"
 
 
+VERIFICATION_FINDING_KINDS: frozenset[str] = frozenset(
+    (
+        FindingKind.PAGE_CHECKSUM,
+        FindingKind.PAGE_TYPE,
+        FindingKind.PAGE_TORN,
+        FindingKind.PAGE_UNWRITTEN,
+        FindingKind.PAGE_DESCRIPTOR_MISSING,
+        FindingKind.FILE_HEADER,
+        FindingKind.FILE_UNREADABLE,
+        FindingKind.RECORD_HEADER,
+        FindingKind.RECORD_LENGTH,
+        FindingKind.RECORD_LIFETIME,
+        FindingKind.VERSION_CHAIN,
+        FindingKind.ORPHAN_PAGE,
+        FindingKind.EXTENT_DRIFT,
+        FindingKind.TABLE_UNREADABLE,
+        FindingKind.CATALOG_UNREADABLE,
+        FindingKind.INDEX_UNREADABLE,
+        FindingKind.INDEX_ENTRY_MALFORMED,
+        FindingKind.INDEX_ENTRY_UNRESOLVED,
+        FindingKind.INDEX_KEY_MISMATCH,
+        FindingKind.INDEX_ENTRY_MISSING,
+        FindingKind.LOG_DAMAGE,
+    )
+)
+"""The exact machine-readable finding vocabulary accepted by verification reports."""
+
+
 @dataclass(frozen=True, slots=True)
 class FindingLocation:
     """Where a finding is, with the five coordinates section 8.6 names."""
@@ -97,7 +131,11 @@ class FindingLocation:
                     field=name,
                     value=type(value).__name__,
                 )
-        for name, value in (("page", self.page), ("slot", self.slot), ("lsn", self.lsn)):
+        for name, value in (
+            ("page", self.page),
+            ("slot", self.slot),
+            ("lsn", self.lsn),
+        ):
             if isinstance(value, bool) or not isinstance(value, int):
                 raise GrafxConfigurationError(
                     f"A finding location {name} must be an integer; got {type(value).__name__}.",
@@ -194,9 +232,13 @@ class VerificationReport:
         """
         if self.findings:
             return False
-        return bool(self.pages_checked or self.records_checked or self.index_entries_checked)
+        return bool(
+            self.pages_checked or self.records_checked or self.index_entries_checked
+        )
 
-    def findings_at(self, kind: str, file: str, page: int) -> tuple[VerificationFinding, ...]:
+    def findings_at(
+        self, kind: str, file: str, page: int
+    ) -> tuple[VerificationFinding, ...]:
         """Return every finding of one kind about one page of one file.
 
         A caller checking that a page was reported ONCE needs to ask about that page rather than

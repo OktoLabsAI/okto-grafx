@@ -261,11 +261,21 @@ def test_every_recording_door_contains_every_exception_class(
     contained.increment("counter")
     contained.set_gauge("gauge", 1.0)
     contained.observe("histogram", 1.0)
-    assert contained.snapshot() == {}
     with contained.time("timer"):
         pass
     with ContainedMetricsSink(_TimerFactoryBomb(failure_type)).time("timer"):
         pass
+
+
+@pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt, SystemExit))
+def test_an_explicit_metrics_snapshot_preserves_the_inner_failure(
+    failure_type: type[BaseException],
+) -> None:
+    """An observation cannot silently turn a failed sink into an honest empty snapshot."""
+    contained = ContainedMetricsSink(_EveryRecordingDoorBomb(failure_type))
+
+    with pytest.raises(failure_type):
+        contained.snapshot()
 
 
 def test_publish_stays_typed_and_the_json_selector_writes_its_file(
