@@ -1219,7 +1219,7 @@ def _quarantine_inspect_body(invocation: Invocation, database: Database) -> Repo
     store = _require_quarantine(database)
     entry = store.inspect(invocation.positionals[1])
     manifest = entry.manifest
-    receipts = tuple(store.receipts(entry.name))
+    receipts = database.quarantine_receipts(entry.name)
     payload = {
         **_head(invocation),
         "entry": _quarantine_payload(entry),
@@ -1253,10 +1253,9 @@ def _quarantine_read(invocation: Invocation) -> Report:
 
 def _quarantine_read_body(invocation: Invocation, database: Database) -> Report:
     """Read one quarantine entry and confirm the written file independently of the write."""
-    store = _require_quarantine(database)
     output = _require_output(invocation)
     name = invocation.positionals[1]
-    body = store.read(name)
+    body = database.read_quarantine(name)
     written = _write_evidence(output, body)
     payload = {
         **_head(invocation),

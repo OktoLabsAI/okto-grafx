@@ -33,6 +33,7 @@ from okto_grafx.domain.ledger.entry import (
     LedgerOriginClass,
     LedgerReason,
 )
+from okto_grafx.domain.ledger.payload import LedgerPayload, decode_payload
 from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import ValueType
@@ -452,6 +453,32 @@ class LedgerView:
             entry_id=wanted,
         )
 
+    def provenance(self, entry_id: int) -> LedgerPayload:
+        """Decode the immutable provenance captured with one ledger entry."""
+        return decode_payload(self.inspect(entry_id).payload)
+
+    def export(self, entry_id: int) -> bytes:
+        """Return preserved bytes from the captured, already-verified ledger entry."""
+        entry = self.inspect(entry_id)
+        if entry.reapplicable:
+            raise GrafxLedgerError(
+                f"Ledger entry {entry.entry_id} is reapplicable, so it carries an operation "
+                "rather than preserved bytes; reprocess it instead of exporting it.",
+                field="origin_class",
+                entry_id=entry.entry_id,
+            )
+        provenance = decode_payload(entry.payload)
+        if not provenance.body and provenance.length:
+            raise GrafxLedgerError(
+                f"Ledger entry {entry.entry_id} preserves {provenance.length} bytes that were too "
+                f"large to carry here; read them from quarantine entry "
+                f"{provenance.quarantine!r} instead.",
+                field="quarantine",
+                entry_id=entry.entry_id,
+                quarantine=provenance.quarantine,
+            )
+        return provenance.body
+
 
 @dataclass(frozen=True, slots=True)
 class QuarantineView:
@@ -463,6 +490,10 @@ class QuarantineView:
     def list(self) -> tuple[QuarantineEntry, ...]:
         """Return every quarantine entry captured with this view."""
         return self.captured_entries
+
+    def count(self) -> int:
+        """Return how many quarantine entries were captured with this view."""
+        return len(self.captured_entries)
 
     def inspect(self, name: str) -> QuarantineEntry:
         """Return one captured quarantine entry by name."""

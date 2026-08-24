@@ -112,6 +112,7 @@ from okto_grafx.engine.public_views import (
     _recovery_report_view,
     _storage_view,
     _transactions_view,
+    _tuple_items,
     _vectors_view,
     _wal_view,
 )
@@ -1572,15 +1573,30 @@ class Database:
 
     def read_quarantine(self, name: str) -> bytes:
         """Return and checksum-verify the immutable bytes of one quarantine entry."""
-        self._require_open()
-        wanted = _require_text("quarantine entry", name)
-        quarantine = self._require_component(
-            "quarantine", self._quarantine, "quarantine (C6)"
-        )
-        return _builtin_bytes(
-            quarantine.read(wanted),  # type: ignore[attr-defined]
-            field="quarantine.payload",
-        )
+        with self._public_transition():
+            self._require_open()
+            wanted = _require_text("quarantine entry", name)
+            quarantine = self._require_component(
+                "quarantine", self._quarantine, "quarantine (C6)"
+            )
+            return _builtin_bytes(
+                quarantine.read(wanted),  # type: ignore[attr-defined]
+                field="quarantine.payload",
+            )
+
+    def quarantine_receipts(self, name: str) -> tuple[str, ...]:
+        """Return immutable restore-receipt names without exposing the quarantine store."""
+        with self._public_transition():
+            self._require_open()
+            wanted = _require_text("quarantine entry", name)
+            quarantine = self._require_component(
+                "quarantine", self._quarantine, "quarantine (C6)"
+            )
+            observed = quarantine.receipts(wanted)  # type: ignore[attr-defined]
+            return tuple(
+                _builtin_text(receipt, field="quarantine.receipt", empty=False)
+                for receipt in _tuple_items(observed, field="quarantine.receipts")
+            )
 
     # --- lifecycle ----------------------------------------------------------------------------
 

@@ -39,6 +39,7 @@ from okto_grafx.domain.ledger.entry import (
     LedgerOriginClass,
     LedgerReason,
 )
+from okto_grafx.domain.ledger.payload import LedgerPayload, encode_payload
 from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import ValueType
@@ -173,6 +174,7 @@ _EXACT_DATACLASS_TYPES: frozenset[type[object]] = frozenset(
         IndexDefinition,
         IndexView,
         LedgerEntry,
+        LedgerPayload,
         QuarantineEntry,
         QuarantineManifest,
         RecoveryFinding,
@@ -219,6 +221,7 @@ def _hook_counts() -> dict[str, int]:
         "__int__": 0,
         "__float__": 0,
         "__bytes__": 0,
+        "__iter__": 0,
         "__class__": 0,
         "__call__": 0,
         "comparison": 0,
@@ -315,6 +318,20 @@ class _CapabilityBytes(_CapabilityMixin, bytes):
 
     def __repr__(self) -> str:
         self._explode("__repr__")
+
+
+class _CapabilityTuple(_CapabilityMixin, tuple):
+    """A real tuple whose public iterator is an executable host capability."""
+
+    def __new__(
+        cls, value: tuple[object, ...], counts: dict[str, int]
+    ) -> _CapabilityTuple:
+        instance = tuple.__new__(cls, value)
+        instance._capability_counts = counts
+        return instance
+
+    def __iter__(self) -> Iterator[object]:
+        self._explode("__iter__")
 
 
 class _AttributeCapability:
@@ -1635,6 +1652,69 @@ def test_ledger_view_preserves_store_filtering_pagination_and_case_insensitivity
     assert view.inspect(2) is reapplicable
 
 
+def test_ledger_view_decodes_and_exports_only_its_immutable_captured_entry() -> None:
+    """Forensic compatibility reads need no callback or retained ledger capability."""
+    payload = LedgerPayload(
+        origin="wal/000000000001.wal",
+        offset=512,
+        length=8,
+        expected_lsn=7,
+        record_type=2,
+        failure="checksum_failure",
+        detail="bad checksum",
+        quarantine="evidence",
+        body=b"evidence",
+    )
+    entry = LedgerEntry(
+        entry_id=1,
+        origin_class=LedgerOriginClass.FORENSIC,
+        reason=LedgerReason.CHECKSUM_FAILURE,
+        payload=encode_payload(payload),
+    )
+    view = LedgerView("ledger/unapplied.log", None, (entry,), (("forensic", 1),))
+
+    observed = view.provenance(1)
+
+    assert observed == payload
+    _assert_capability_free(observed, surface="ledger.provenance")
+    assert view.export(1) == b"evidence"
+
+
+def test_ledger_view_export_preserves_store_refusal_taxonomy() -> None:
+    """Operations and quarantine-backed large ranges are never mislabeled as exported bytes."""
+    operation = LedgerEntry(
+        entry_id=1,
+        origin_class=LedgerOriginClass.REAPPLICABLE,
+        reason=LedgerReason.STALE_EPOCH,
+        payload=encode_payload(LedgerPayload(origin="wal/operation.wal")),
+    )
+    redirected = LedgerEntry(
+        entry_id=2,
+        origin_class=LedgerOriginClass.FORENSIC,
+        reason=LedgerReason.TRUNCATED_TAIL,
+        payload=encode_payload(
+            LedgerPayload(
+                origin="wal/large.wal",
+                length=4096,
+                quarantine="large-evidence",
+            )
+        ),
+    )
+    view = LedgerView("ledger/unapplied.log", None, (operation, redirected), ())
+
+    with pytest.raises(GrafxLedgerError) as operation_failure:
+        view.export(1)
+    with pytest.raises(GrafxLedgerError) as redirected_failure:
+        view.export(2)
+
+    assert operation_failure.value.details == {"field": "origin_class", "entry_id": 1}
+    assert redirected_failure.value.details == {
+        "field": "quarantine",
+        "entry_id": 2,
+        "quarantine": "large-evidence",
+    }
+
+
 @pytest.mark.parametrize(
     ("case", "field"),
     (
@@ -1762,6 +1842,88 @@ def test_snapshot_valid_missing_lookups_keep_component_taxonomy() -> None:
         VectorEngineView(0, (), ()).index("missing")
     with pytest.raises(GrafxIndexError):
         IndexRegistryView((), 0).index("missing")
+
+
+def test_quarantine_view_count_is_an_exact_observational_integer() -> None:
+    """The compatibility count never traverses or retains a store capability."""
+    calls: dict[str, int] = {}
+    view = QuarantineView(
+        "quarantine",
+        (_hostile_quarantine_entry(calls),),
+    )
+
+    observed = view.count()
+
+    assert type(observed) is int
+    assert observed == 1
+    assert calls == {}
+
+
+def test_database_quarantine_receipts_cross_as_exact_immutable_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The explicit receipt read strips host subclasses without exposing its store."""
+    calls = _hook_counts()
+    with connect(":memory:") as database:
+        quarantine = database._quarantine
+        original = QuarantineStore.receipts
+
+        def hostile_receipts(candidate: QuarantineStore, name: str) -> tuple[str, ...]:
+            if candidate is quarantine:
+                assert type(name) is str
+                assert name == "evidence"
+                return _CapabilityTuple(
+                    (_CapabilityText("quarantine/evidence/restore-1.json", calls),),
+                    calls,
+                )
+            return original(candidate, name)
+
+        monkeypatch.setattr(QuarantineStore, "receipts", hostile_receipts)
+        observed = database.quarantine_receipts(_CapabilityText("evidence", calls))
+
+    assert type(observed) is tuple
+    assert observed == ("quarantine/evidence/restore-1.json",)
+    assert type(observed[0]) is str
+    assert calls == _hook_counts()
+
+
+@pytest.mark.parametrize("operation", ("read", "receipts"))
+def test_explicit_quarantine_reads_defer_reentrant_close_until_the_result_is_safe(
+    operation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A callback may seal the facade but cannot release the store beneath an active read."""
+    database = connect(":memory:")
+    quarantine = database._quarantine
+    original = getattr(QuarantineStore, operation)
+    callbacks: list[str] = []
+
+    def close_then_return(candidate: QuarantineStore, name: str) -> object:
+        if candidate is quarantine:
+            assert type(name) is str
+            database.close()
+            assert database.closed
+            assert not database.close_complete
+            callbacks.append(operation)
+            if operation == "read":
+                return b"verified evidence"
+            return ("quarantine/evidence/restore-1.json",)
+        return original(candidate, name)
+
+    try:
+        with monkeypatch.context() as boundary:
+            boundary.setattr(QuarantineStore, operation, close_then_return)
+            if operation == "read":
+                observed = database.read_quarantine("evidence")
+                assert observed == b"verified evidence"
+            else:
+                observed = database.quarantine_receipts("evidence")
+                assert observed == ("quarantine/evidence/restore-1.json",)
+    finally:
+        database.close()
+
+    assert callbacks == [operation]
+    assert database.close_complete
 
 
 def test_every_component_property_returns_the_allowlisted_immutable_value_graph() -> (
