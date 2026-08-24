@@ -1234,13 +1234,24 @@ option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`
   byte-identical on both success and refusal. An old `commit.state` cannot hide a retained COMMIT.
 - **CLOSED** — lifecycle cleanup attempts all steps and closers for every `BaseException`, while
   preserving the original exception that caused assembly or context-manager unwind.
-- **OPEN for M0-C** — `Database` still exposes raw collaborators (`transactions`, `storage`,
-  `queries`, pool-reachable paths) whose direct use can bypass the public read-only and recovery
-  gates. Replace them with read-only views/private assembly plumbing or enforce the invariant at
-  the lowest callable door.
-- **OPEN for M0-C** — a directly composed `RecoveryManager` with no coordinator has no
-  cross-process fence. Refuse destructive recovery unless a coordinator/capability proves the
-  caller owns the section; retain only a deliberately named single-process composition.
-- **OPEN for M0-C** — control-record retirement proves damage and later retires by path. Bind the
-  proof to the exact captured bytes/generation so a healthy replacement cannot lose a
-  probe-to-retire race.
+- **CLOSED in M0-C** — `Database` collaborator properties now return detached immutable public
+  views; mutation and lifecycle doors remain private or are mediated by explicit database methods.
+  `tests/api/test_public_collaborator_boundaries.py` recursively rejects every mutable collaborator,
+  capability, callback and transitive container leak, including hostile scalar subclasses.
+- **CLOSED in M0-C** — destructive `RecoveryManager` operations require the shared coordinator
+  fence; directly composed unfenced managers refuse before observation or mutation. The door-by-door
+  proof is `tests/recovery/test_recovery_demands_the_fence.py`.
+- **CLOSED in M0-C** — control-record retirement binds the damage decision to the captured exact
+  generation. A replacement between probe, confirmation and removal is preserved byte-for-byte;
+  see `tests/recovery/test_control_record_retirement_generation.py`.
+
+## M1 — honest configuration and automatic maintenance (2026-08-24)
+
+- **CLOSED** — `checkpoint_interval_records` is no longer inert. A durable write triggers a
+  single-flight checkpoint at the exact published WAL-distance threshold. Ordinary or late
+  maintenance failures stay pending and cannot invalidate the commit; read/no-op commits do
+  nothing. Fifteen regressions in `tests/api/test_auto_checkpoint.py` include WAL recycle/reopen,
+  hostile diagnostics, broken/re-entrant EventSinks and process-control signals.
+- **IN PROGRESS (C13)** — `vector_recall_target` remains non-certifying until the deterministic
+  pure/NumPy recall calibration publishes its gauge and CI enables `--require-recall`. It must not
+  be described as an active runtime guarantee before that gate lands.

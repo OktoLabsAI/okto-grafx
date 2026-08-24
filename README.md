@@ -491,7 +491,7 @@ invalid one is refused with the field name the caller actually wrote.
 | `commit_lock_timeout_seconds` | `30.0` | How long to wait at the commit section |
 | `reader_stall_threshold_seconds` | `15.0` | When a reader stops holding the horizon down |
 | `wal_segment_bytes` | `4 MiB` | Log segment size |
-| `checkpoint_interval_records` | `512` | |
+| `checkpoint_interval_records` | `512` | After a durable write, checkpoint when the published WAL distance reaches this many records; a failed attempt is reported and retried after the next write |
 | `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
 | `metrics_destination` | `None` | Required for `"json"` |
 | `vector_math` | `"auto"` | `"auto"` and `"pure"` both bind the pure oracle; `"numpy"` requires `[accel]` |

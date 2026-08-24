@@ -7,6 +7,21 @@
 **Ambiente principal:** Windows, Python 3.13.1
 **Escopo:** integridade, recuperação, concorrência, estabilidade, performance, API, configuração e novas capacidades.
 
+## Estado de execução — 2026-08-24
+
+- **M0 estabilização: concluído e publicado** em
+  `milestone/m0-stabilization@e2d6a22da8ec2571127fc9d1533995d40330c632`. Os cinco P0
+  reproduzidos, as fronteiras públicas, o primeiro open durável, read-only observacional, fencing
+  de recovery e retirement por geração têm regressões; a suíte global coletou 8.610 testes em 184
+  módulos e terminou com 100%/exit 0. Duas auditorias independentes aceitaram o milestone.
+- **M1 configuração honesta: em execução.** `checkpoint_interval_records` já está ligado ao caminho
+  pós-commit com threshold exato, single-flight, retry após falha tardia e 15 regressões. O C13 de
+  recall vetorial está sendo implementado em branch isolado pelo Claude, com revisão adversarial do
+  Codex antes da integração; `vector_recall_target` continua não certificante até esse gate fechar.
+- **Próximo gate:** concluir C13 e o censo de retornos públicos tipados, integrar serialmente no
+  branch M1, executar a suíte completa e publicar um SHA imutável. M2 inicia identity-range leasing
+  somente depois desse gate.
+
 ## 1. Resumo executivo
 
 O Okto Grafx possui fundamentos muito bons para um banco de dados de grafo embutido e local-first:
@@ -437,11 +452,17 @@ Batching já amortiza muito o custo. Antes de mudar o formato WAL, priorizar:
 
 ## 6. Configuração, API e extensibilidade
 
-### P1.14 — Dois parâmetros públicos não têm efeito
+### P1.14 — Dois parâmetros públicos não têm efeito (checkpoint fechado; recall em execução)
 
-`checkpoint_interval_records` e `vector_recall_target` são aceitos e validados em [`config.py`](src/okto_grafx/runtime/config.py#L141), mas não participam do wiring.
+No estado originalmente analisado, `checkpoint_interval_records` e `vector_recall_target` eram
+aceitos e validados em [`config.py`](src/okto_grafx/runtime/config.py#L141), mas não participavam do
+wiring. M1 já ligou o primeiro ao caminho pós-commit; o segundo só será reclassificado quando a
+calibração C13 publicar recall e o gate obrigatório estiver ativo na CI.
 
-O próprio `Database.checkpoint()` afirma que o WAL cresce até uma chamada manual em [`database.py`](src/okto_grafx/engine/database.py#L972). O `VectorEngine` já aceita `neighbours`, `ef_construction` e `ef_search`, mas eles não chegam à API em [`vector_engine.py`](src/okto_grafx/engine/vector_engine.py#L774).
+Naquele estado, o próprio `Database.checkpoint()` afirmava que o WAL crescia até uma chamada manual;
+essa afirmação foi substituída pelo contrato automático e pela regressão de recycle/reopen. O
+`VectorEngine` já aceitava `neighbours`, `ef_construction` e `ef_search`, mas eles ainda não chegavam
+à API em [`vector_engine.py`](src/okto_grafx/engine/vector_engine.py#L774).
 
 Isso cria garantias aparentes que não existem.
 

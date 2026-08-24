@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Self
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
+    GrafxError,
     GrafxSchemaVersionMismatch,
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
@@ -693,6 +694,9 @@ class Transaction:
                 # privately as lifecycle evidence.
                 if self._database._close_failure is None:
                     self._database._close_failure = settlement_failure
+            else:
+                if public_report.wrote:
+                    self._database._maybe_checkpoint()
             return public_report
 
     def rollback(self) -> None:
@@ -796,6 +800,9 @@ class Database:
         "_path",
         "_metrics_endpoint",
         "_read_only",
+        "_checkpoint_interval_records",
+        "_checkpointing",
+        "_checkpoint_retry_pending",
         "_closers",
         "_closed",
         "_public_contexts",
@@ -829,6 +836,7 @@ class Database:
         identity: DatabaseIdentity,
         path: str,
         label: str,
+        checkpoint_interval_records: int = 512,
         read_only: bool = False,
         metrics_endpoint: str | None = None,
         indexes: object = None,
@@ -868,6 +876,17 @@ class Database:
         self._path: str = _require_text("path", path)
         self._label: str = _require_text("label", label)
         self._read_only: bool = _builtin_bool(read_only)
+        self._checkpoint_interval_records: int = _builtin_int(
+            checkpoint_interval_records, field="checkpoint_interval_records"
+        )
+        if self._checkpoint_interval_records <= 0:
+            raise GrafxConfigurationError(
+                "The checkpoint interval must be a positive number of WAL records.",
+                field="checkpoint_interval_records",
+                value=self._checkpoint_interval_records,
+            )
+        self._checkpointing: bool = False
+        self._checkpoint_retry_pending: bool = False
         self._metrics_endpoint: str | None = _builtin_optional_text(
             metrics_endpoint, field="metrics_endpoint"
         )
@@ -1515,9 +1534,10 @@ class Database:
         reader, and what the platform deferred. A read-only database refuses -- a checkpoint
         publishes a control record and may release log segments, and neither is a reader's to do.
 
-        The log grows until this is called. Every acknowledged commit is durable in the log
-        whether or not a checkpoint ever runs, so skipping it costs space and recovery time,
-        never data; when to run it is a lifecycle decision left to the caller (see CF-11).
+        Every acknowledged commit is durable in the log whether or not a checkpoint runs, so a
+        failed automatic attempt costs space and recovery time, never committed data. Writable
+        databases also call this door after a commit whose published WAL distance reaches the
+        configured ``checkpoint_interval_records``; callers may still invoke it explicitly.
         """
         self._require_open()
         self._require_writable("checkpoint the database")
@@ -1540,6 +1560,83 @@ class Database:
                     )
                 )
         return report
+
+    def _maybe_checkpoint(self) -> None:
+        """Attempt due maintenance without changing an already-durable commit outcome.
+
+        The participant section makes the due check and checkpoint one local single-flight
+        operation. ``_checkpoint_retry_pending`` remains set until the manager checkpoint AND
+        the facade's index-refresh postlude both finish: checkpoint state is published before
+        WAL recycling and before that postlude, so the numeric distance alone cannot detect a
+        late failure on the next commit.
+        """
+        if self._closed or self._read_only:
+            return
+        checkpoint_failure: Exception | None = None
+        published_lsn = 0
+        checkpoint_lsn = 0
+        owns_attempt = False
+        try:
+            try:
+                with self._transactions._participant_section():
+                    if self._closed or self._checkpointing:
+                        return
+                    self._checkpointing = True
+                    owns_attempt = True
+                    state = self._transactions._published_state_in_section()
+                    published_lsn = _builtin_int(
+                        state.last_committed_lsn, field="checkpoint.published_lsn"
+                    )
+                    checkpoint_lsn = _builtin_int(
+                        state.checkpoint_lsn, field="checkpoint.checkpoint_lsn"
+                    )
+                    distance = published_lsn - checkpoint_lsn
+                    if (
+                        not self._checkpoint_retry_pending
+                        and distance < self._checkpoint_interval_records
+                    ):
+                        return
+                    self._checkpoint_retry_pending = True
+                    try:
+                        self.checkpoint()
+                    except Exception as failure:  # noqa: BLE001 - maintenance cannot undo commit
+                        checkpoint_failure = failure
+                    else:
+                        self._checkpoint_retry_pending = False
+            except Exception as failure:  # noqa: BLE001 - includes participant/state adapters
+                self._checkpoint_retry_pending = True
+                checkpoint_failure = failure
+
+            if checkpoint_failure is not None:
+                code = "foreign_error"
+                retryable = False
+                try:
+                    if isinstance(checkpoint_failure, GrafxError):
+                        code = _builtin_text(
+                            checkpoint_failure.code,
+                            field="checkpoint.failure_code",
+                            empty=False,
+                        )
+                        retryable = _builtin_bool(checkpoint_failure.retryable)
+                except Exception:  # noqa: BLE001 - hostile diagnostics are still diagnostics
+                    code = "foreign_error"
+                    retryable = False
+                try:
+                    self._events.emit(
+                        "checkpoint.auto_failed",
+                        {
+                            "code": code,
+                            "retryable": retryable,
+                            "published_lsn": published_lsn,
+                            "checkpoint_lsn": checkpoint_lsn,
+                            "interval_records": self._checkpoint_interval_records,
+                        },
+                    )
+                except Exception:  # noqa: BLE001 - observability never changes commit truth
+                    pass
+        finally:
+            if owns_attempt:
+                self._checkpointing = False
 
     def snapshot_metrics(self) -> Mapping[str, object]:
         """Return the machine-readable current value of every metric this database emitted."""

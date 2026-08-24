@@ -9,6 +9,13 @@ including the on-disk format.
 
 ### Changed
 
+- **`checkpoint_interval_records` now drives automatic WAL maintenance.** After a durable write
+  commit and schema settlement, writable databases checkpoint when
+  `last_committed_lsn - checkpoint_lsn` reaches the configured threshold. The decision is
+  single-flight per handle; a refused or late-failing checkpoint remains pending for the next
+  write, while maintenance and diagnostic failures can never turn the already-durable commit into
+  an apparent transactional failure. Read transactions and empty write transactions do not run
+  maintenance, and explicit `Database.checkpoint()` remains available.
 - **`Database` no longer exposes mutable engine collaborators, and `Transaction.context` was
   removed.** Composition properties now return detached frozen schema, inventory and diagnostic
   snapshots with no `inner`, callback or raw-object backdoor. Vector reads use

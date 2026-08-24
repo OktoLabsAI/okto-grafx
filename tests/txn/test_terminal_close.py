@@ -87,6 +87,7 @@ def _database(stack: Stack, closer: Callable[[], None]) -> Database:
         ),
         path=":memory:",
         label="terminal-close",
+        checkpoint_interval_records=2**63 - 1,
         closers=(closer,),
     )
 
