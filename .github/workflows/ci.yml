@@ -37,6 +37,8 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "0 6 * * 1"  # weekly full-profile recall calibration (C13)
   workflow_dispatch:
 
 permissions:
@@ -262,11 +264,24 @@ jobs:
             --out calibration-${{ matrix.family }}.json \
             --metrics metrics-${{ matrix.family }}.json || true
 
+      - name: Vector recall stage (fail-closed, C13)
+        shell: bash
+        # SPEC-VEC FR-8: no || true here -- a recall failure (dtype check, differential,
+        # worker refusal) fails the job BEFORE the gate step, so the gate can never pass over
+        # a broken vector stage. Appends are ordered: section into the calibration document
+        # first, the gauge into the metrics document LAST (an interrupted run leaves
+        # section-without-gauge, which --require-recall below reads as UNMEASURED).
+        # Pushes run the smoke profile; the weekly schedule runs the full numpy oracle.
+        run: |
+          python -m bench.harness.recall_wiring             --profile ${{ github.event_name == 'schedule' && 'full' || 'smoke' }}             --gt auto             --out calibration-${{ matrix.family }}.json             --metrics metrics-${{ matrix.family }}.json             --workspace .recall-workspace
+
       - name: Apply the D5 ceilings to the PUBLISHED metric
         shell: bash
         # OR-4: the gate reads oktografx_baseline_ceiling_multiple, not a log. A durable-commit
         # multiple above 10x is the 'consult JP' state of FR-15 and stops the pipeline.
-        run: python -m bench.harness.gate --metrics metrics-${{ matrix.family }}.json
+        # C13: --require-recall makes a build that publishes no recall gauge FAIL (the C13
+        # observation closed), and the frozen floor comes from the committed calibration.
+        run: python -m bench.harness.gate --metrics metrics-${{ matrix.family }}.json --require-recall --calibration bench/calibration.json
 
       - name: Upload the calibration artefacts
         if: always()
