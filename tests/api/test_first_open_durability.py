@@ -456,6 +456,33 @@ def test_public_connect_never_follows_bootstrap_redirect_into_a_victim(
         redirected.unlink()
 
 
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name == "nt", reason="A FIFO namespace probe requires POSIX mkfifo.")
+def test_public_connect_refuses_fifo_evidence_without_opening_or_hiding_it(
+    tmp_path: Path,
+) -> None:
+    """A special node is preserved evidence, never an absent file or an empty database."""
+    root = tmp_path / "database"
+    root.mkdir()
+    fifo = root / "operator.evidence"
+    os.mkfifo(fifo)
+    before = os.lstat(fifo)
+    try:
+        with pytest.raises(GrafxUnsupportedOperation) as raised:
+            connect(root)
+        after = os.lstat(fifo)
+        assert raised.value.details["reason"] == "unsupported_entry_type"
+        assert raised.value.details["file"] == "operator.evidence"
+        assert (after.st_mode, after.st_ino, after.st_size) == (
+            before.st_mode,
+            before.st_ino,
+            before.st_size,
+        )
+        assert tuple(entry.name for entry in root.iterdir()) == ("operator.evidence",)
+    finally:
+        fifo.unlink()
+
+
 def test_bootstrap_orphan_beside_published_database_is_never_retired() -> None:
     """A final identity removes the proof that any bootstrap payload is expendable."""
     registry, _bench, inner = bench_registry(1)

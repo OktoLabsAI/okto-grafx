@@ -117,6 +117,41 @@ def test_a_database_root_exchanged_for_a_redirect_is_refused_without_touching_vi
             original.rename(root)
 
 
+@pytest.mark.platform_specific
+@pytest.mark.skipif(IS_WINDOWS, reason="A FIFO namespace probe requires POSIX mkfifo.")
+def test_a_special_namespace_entry_is_refused_without_opening_or_mutating_it(
+    tmp_path: Path,
+) -> None:
+    """FIFO evidence is classified by lstat; no operation may open and block on it."""
+    root = tmp_path / "database"
+    root.mkdir()
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE)
+    fifo = root / "operator.evidence"
+    os.mkfifo(fifo)
+    before = os.lstat(fifo)
+    try:
+        for operation in (
+            device.list_files,
+            lambda: device.exists("operator.evidence"),
+            lambda: device.create("operator.evidence"),
+            lambda: device.remove("operator.evidence"),
+        ):
+            with pytest.raises(GrafxUnsupportedOperation) as raised:
+                operation()
+            assert raised.value.details["reason"] == "unsupported_entry_type"
+            assert raised.value.details["file"] == "operator.evidence"
+        after = os.lstat(fifo)
+        assert (after.st_mode, after.st_ino, after.st_size) == (
+            before.st_mode,
+            before.st_ino,
+            before.st_size,
+        )
+        assert tuple(entry.name for entry in root.iterdir()) == ("operator.evidence",)
+    finally:
+        device.close()
+        fifo.unlink()
+
+
 def _record_barrier(device: LocalStorageDevice, file: str | None) -> tuple[set[int], int]:
     """Run one barrier and return which file inodes and how many directories it flushed.
 

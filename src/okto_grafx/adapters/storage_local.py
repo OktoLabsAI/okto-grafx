@@ -1217,6 +1217,18 @@ class LocalStorageDevice:
                     file=name,
                     component=self._relative(current),
                 )
+            if not (
+                stat.S_ISDIR(information.st_mode)
+                or stat.S_ISREG(information.st_mode)
+            ):
+                raise refuse_operation(
+                    "unsupported_entry_type",
+                    f"Logical file {name!r} crosses a filesystem entry that is neither a "
+                    "regular file nor a directory.",
+                    file=name,
+                    component=self._relative(current),
+                    mode=stat.S_IFMT(information.st_mode),
+                )
             self._require_contained(name, current)
 
     def _require_directory_parents(self, name: str) -> None:
@@ -1319,6 +1331,15 @@ class LocalStorageDevice:
                     include_pending or not _is_pending_delete(entry.name)
                 ):
                     yield name
+                elif not stat.S_ISREG(information.st_mode):
+                    raise refuse_operation(
+                        "unsupported_entry_type",
+                        f"Stored namespace component {name!r} is neither a regular file nor "
+                        "a directory and will not be opened or ignored.",
+                        file=name,
+                        component=name,
+                        mode=stat.S_IFMT(information.st_mode),
+                    )
 
     def _descriptor(self, name: str, intent: str) -> int:
         """Return the cached descriptor of a file, opening and admitting it when it is not cached.
