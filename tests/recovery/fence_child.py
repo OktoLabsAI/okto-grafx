@@ -20,8 +20,11 @@ SAFETY_BUDGET: float = 60.0
 """Last-resort bound so a genuine deadlock is reported rather than waited on for ever."""
 
 
-def hold_commit_section(root: str, ready: str, release: str) -> None:
-    """Take the commit section over ``root``, announce it, and hold until released."""
+def hold_commit_section(
+    root: str, ready: str, release: str, section: str | None = None
+) -> None:
+    """Take a section over ``root`` (the commit section by default), announce it by
+    writing the ready file, and hold it until the release file appears."""
     from okto_grafx.adapters.clock_system import SystemClock
     from okto_grafx.adapters.coordination_local import LocalProcessCoordinator
     from okto_grafx.adapters.storage_local import LocalStorageDevice
@@ -36,7 +39,7 @@ def hold_commit_section(root: str, ready: str, release: str) -> None:
         ttl_seconds=SAFETY_BUDGET,
         owner_stall_threshold=SAFETY_BUDGET,
     )
-    with coordinator.exclusive(COMMIT_SECTION, timeout=10.0):
+    with coordinator.exclusive(section or COMMIT_SECTION, timeout=10.0):
         Path(ready).write_text("held", encoding="ascii")
         deadline = time.monotonic() + SAFETY_BUDGET
         while not Path(release).exists() and time.monotonic() < deadline:
@@ -45,4 +48,9 @@ def hold_commit_section(root: str, ready: str, release: str) -> None:
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-    hold_commit_section(sys.argv[1], sys.argv[2], sys.argv[3])
+    hold_commit_section(
+        sys.argv[1],
+        sys.argv[2],
+        sys.argv[3],
+        sys.argv[4] if len(sys.argv) > 4 else None,
+    )

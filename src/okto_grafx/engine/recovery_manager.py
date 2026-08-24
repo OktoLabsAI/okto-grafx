@@ -184,6 +184,14 @@ _CONTROL_PREFIX: str = "control/"
 _LEASE_RECORD: str = "control/writer.lease"
 """The writer lease, exactly where the coordination adapter keeps it."""
 
+_LEASE_SECTION: str = "writer.lease"
+"""The section every cooperating publisher of the lease serialises on.
+
+This mirrors ``coordination_local.LEASE_SECTION`` -- the engine may not import the adapter
+(G2), so the name is restated here and pinned equal by the retirement battery. Holding it
+around the last look and the removal is what turns the cooperative guarantee for the lease
+from narrative into exclusion."""
+
 _READERS_PREFIX: str = "control/readers/"
 _READER_SUFFIX: str = ".reader"
 """Canonical reader records: ``control/readers/<reader_id>.reader`` and nothing else."""
@@ -775,15 +783,20 @@ class RecoveryManager:
           and SHA-256 recorded in both quarantine and ledger -- re-read and compared under the
           section immediately before the removal. A record that changed in ANY window refuses,
           retryably, naming the evidence already kept; a healthy or different replacement
-          survives byte for byte. The targets are exactly the writer lease and canonical
-          reader records; ``commit.state`` is protected and can never leave through this door.
+          survives byte for byte. The only LIVE target is the writer lease, taken under
+          the lease section nested inside the commit section; canonical reader records are
+          recognised but FAIL-CLOSED until a safe compare-and-remove primitive exists, and
+          ``commit.state`` is protected and can never leave through this door.
 
-        The compare-then-remove is COOPERATIVE, like every advisory protocol over this storage
-        port: the port offers no atomic compare-and-remove, so a NON-cooperating process that
-        rewrites the record between the last look and the removal is outside the guarantee.
-        What the section does exclude is every cooperating participant -- commit, checkpoint,
-        recovery and this door itself -- and the last look narrows the rest of the window to
-        what the platform allows.
+        For the writer lease the exclusion of cooperating participants is BY SECTION:
+        every cooperating publisher of ``writer.lease`` -- renew, acquire, takeover --
+        serialises on the lease section this door holds around the last look and the removal,
+        nested inside the commit section (lock order audited: the adapter only ever takes the
+        lease section alone, so commit-then-lease cannot deadlock). What remains outside every
+        guarantee is a NON-cooperating process, because the storage port offers no atomic
+        compare-and-remove; the last look narrows that residual window to what the platform
+        allows. Reader records have no shared section in this contract, which is exactly why
+        their retirement is FAIL-CLOSED above rather than window-narrowed.
         """
         name = _require_text("file", file)
         if self._probe is None:
@@ -801,19 +814,39 @@ class RecoveryManager:
             )
         if not _is_canonical_retirement_target(name):
             raise GrafxRecoveryRefused(
-                f"{name!r} is not a canonical retirement target: this door retires exactly "
+                f"{name!r} is not a canonical retirement target: this door recognises exactly "
                 f"{_LEASE_RECORD!r} and reader records under {_READERS_PREFIX!r}, and nothing "
                 "else.",
                 field="file",
                 file=name,
             )
+        if name != _LEASE_RECORD:
+            raise GrafxRecoveryRefused(
+                f"Retiring the reader record {name!r} is FAIL-CLOSED in this contract: reader "
+                "registrations are published under no section this door could share, and the "
+                "storage port offers no atomic compare-and-remove, so a retirement here could "
+                "destroy a generation a live reader had just republished. A stale reader "
+                "already leaves the horizon by TTL; this door opens for readers only when a "
+                "safe compare-and-remove primitive exists. Nothing was read or touched.",
+                field="file",
+                file=name,
+            )
         coordinator = self._require_complete_coordinator("retire a control record")
+        # Lock order, audited: COMMIT_SECTION first, LEASE_SECTION nested inside it. The
+        # coordination adapter only ever takes the lease section ALONE (renew, acquire,
+        # takeover, horizon) and never opens the commit section while holding it, so this
+        # nesting cannot deadlock -- and it is what closes the race the integrator's review
+        # named: every cooperating publisher of writer.lease serialises on the lease section,
+        # so none can land between the last look and the removal.
         with coordinator.exclusive(COMMIT_SECTION, timeout=self._commit_lock_timeout):
-            permit = _RecoveryPermit(self, _PERMIT_SEAL)
-            try:
-                return self._retire_fenced(name, permit)
-            finally:
-                permit.revoke()
+            with coordinator.exclusive(
+                _LEASE_SECTION, timeout=self._commit_lock_timeout
+            ):
+                permit = _RecoveryPermit(self, _PERMIT_SEAL)
+                try:
+                    return self._retire_fenced(name, permit)
+                finally:
+                    permit.revoke()
 
     def _read_generation(self, name: str) -> bytes:
         """Read the whole record as it is on the device right now."""

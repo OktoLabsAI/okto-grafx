@@ -1008,7 +1008,7 @@ def test_a_database_with_no_meta_page_yet_is_not_a_version_mismatch(
 
 def _control(
     stack: Stack,
-    name: str = "control/readers/reader-a.reader",
+    name: str = "control/writer.lease",
     body: bytes = b"damaged",
 ) -> str:
     """Put a control record on the device and return its name."""
@@ -1136,7 +1136,7 @@ def test_retiring_a_control_record_that_is_not_there_is_refused(stack: Stack) ->
     probe = RefusingProbe(GrafxCorruptionDetected("Damaged."))
     with pytest.raises(GrafxRecoveryRefused):
         stack.recovery(control_probe=probe).retire_control_record(
-            "control/readers/missing.reader"
+            "control/writer.lease"
         )
 
 

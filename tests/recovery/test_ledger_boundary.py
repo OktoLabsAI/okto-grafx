@@ -49,7 +49,9 @@ def _damage(stack: Stack) -> None:
 
 def _reopened(stack: Stack) -> Stack:
     """Return a second stack over the same device."""
-    return build_stack(stack.storage, clock=stack.clock, metrics=stack.metrics, bootstrap=False)
+    return build_stack(
+        stack.storage, clock=stack.clock, metrics=stack.metrics, bootstrap=False
+    )
 
 
 def test_a_refused_recovery_writes_nothing_to_the_ledger(stack: Stack) -> None:
@@ -91,8 +93,8 @@ def test_a_record_from_a_newer_build_writes_nothing_to_the_ledger(stack: Stack) 
 
 def test_a_refused_retirement_writes_nothing_to_the_ledger(stack: Stack) -> None:
     device = stack.storage
-    device.create("control/readers/reader-a.reader", exclusive=False)  # type: ignore[attr-defined]
-    device.append_log("control/readers/reader-a.reader", b"damaged")  # type: ignore[attr-defined]
+    device.create("control/writer.lease", exclusive=False)  # type: ignore[attr-defined]
+    device.append_log("control/writer.lease", b"damaged")  # type: ignore[attr-defined]
     probe = RefusingProbe(GrafxCorruptionDetected("Unreadable."))
     manager = stack.recovery(control_probe=probe)
     for name in (HEAP_FILE, "wal/000000000001.wal", "control/readers/missing.reader"):
@@ -102,9 +104,13 @@ def test_a_refused_retirement_writes_nothing_to_the_ledger(stack: Stack) -> None
     assert stack.quarantine.list() == ()
 
 
-def test_a_refused_quarantine_capture_writes_nothing_to_the_ledger(stack: Stack) -> None:
+def test_a_refused_quarantine_capture_writes_nothing_to_the_ledger(
+    stack: Stack,
+) -> None:
     with pytest.raises(GrafxQuarantineError):
-        stack.quarantine.capture(origin="wal/absent.wal", offset=0, length=8, reason="a")
+        stack.quarantine.capture(
+            origin="wal/absent.wal", offset=0, length=8, reason="a"
+        )
     assert stack.ledger.list() == ()
 
 
@@ -143,10 +149,10 @@ def test_the_backlog_counts_lost_work_and_not_the_receipts_of_recovery_acts(
     lost = sum(reopened.ledger.depth().values())
 
     device = stack.storage
-    device.create("control/readers/reader-a.reader", exclusive=False)  # type: ignore[attr-defined]
-    device.append_log("control/readers/reader-a.reader", b"damaged")  # type: ignore[attr-defined]
+    device.create("control/writer.lease", exclusive=False)  # type: ignore[attr-defined]
+    device.append_log("control/writer.lease", b"damaged")  # type: ignore[attr-defined]
     probe = RefusingProbe(GrafxCorruptionDetected("Unreadable."))
-    reopened.recovery(control_probe=probe).retire_control_record("control/readers/reader-a.reader")
+    reopened.recovery(control_probe=probe).retire_control_record("control/writer.lease")
 
     assert sum(reopened.ledger.depth().values()) == lost
     kinds = {entry.entry_type for entry in reopened.ledger.list(limit=100)}

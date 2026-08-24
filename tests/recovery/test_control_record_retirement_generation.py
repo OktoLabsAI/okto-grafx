@@ -46,6 +46,7 @@ from okto_grafx.engine.recovery_manager import RecoveryManager
 from .conftest import Stack
 
 LEASE = "control/writer.lease"
+TARGET = LEASE
 READER = "control/readers/reader-a.reader"
 DAMAGED = b"AAAA-damaged"
 REPLACED = b"BBBB-healthy"
@@ -63,6 +64,15 @@ def _replace(stack: Stack, name: str, body: bytes) -> None:
     stack.storage.remove(name)  # type: ignore[attr-defined]
     stack.storage.create(name, exclusive=False)  # type: ignore[attr-defined]
     stack.storage.append_log(name, body)  # type: ignore[attr-defined]
+
+
+def _quarantine_files(stack: Stack) -> list[str]:
+    """Snapshot the quarantine directory, so a refusal can prove it captured nothing."""
+    return sorted(
+        name
+        for name in stack.storage.list_files()  # type: ignore[attr-defined]
+        if name.startswith("quarantine/")
+    )
 
 
 def _bytes_of(stack: Stack, name: str) -> bytes:
@@ -302,32 +312,32 @@ def test_a_record_that_changes_during_inspection_refuses_with_nothing_captured(
     stack: Stack,
 ) -> None:
     """The probe's verdict belongs to the OLD bytes, so nothing is quarantined or retired."""
-    _seed(stack, READER)
-    probe = _SwappingProbe(stack, READER, REPLACED)
+    _seed(stack, TARGET)
+    probe = _SwappingProbe(stack, TARGET, REPLACED)
     with pytest.raises(
         GrafxRecoveryRefused, match="changed while it was being inspected"
     ) as caught:
-        _manager(stack, control_probe=probe).retire_control_record(READER)
+        _manager(stack, control_probe=probe).retire_control_record(TARGET)
     assert caught.value.details.get("retryable") or "retry" in str(caught.value)
-    assert _bytes_of(stack, READER) == REPLACED
+    assert _bytes_of(stack, TARGET) == REPLACED
     assert len(stack.ledger.entries()) == 0
 
 
 def test_a_replacement_after_the_evidence_survives_byte_for_byte(stack: Stack) -> None:
     """A healthy record that lands between the ledger entry and the removal is untouchable:
     the refusal names the evidence kept, and the replacement keeps every byte."""
-    _seed(stack, READER)
+    _seed(stack, TARGET)
     window = _WindowStorage(
         stack.storage,
-        READER,
+        TARGET,
         at_read=3,  # 1: the generation; 2: the confirm; 3: the last look
-        strike=lambda: _replace(stack, READER, REPLACED),
+        strike=lambda: _replace(stack, TARGET, REPLACED),
     )
     with pytest.raises(GrafxRecoveryRefused, match="replacement landed") as caught:
-        _manager(stack, storage=window).retire_control_record(READER)
+        _manager(stack, storage=window).retire_control_record(TARGET)
     details = caught.value.details
     assert details["expected_sha256"] == hashlib.sha256(DAMAGED).hexdigest()
-    assert _bytes_of(stack, READER) == REPLACED
+    assert _bytes_of(stack, TARGET) == REPLACED
     kept = stack.quarantine.read(str(details["quarantine"]))
     assert kept == DAMAGED, (
         "quarantine must hold the inspected generation, byte for byte"
@@ -339,18 +349,18 @@ def test_a_record_that_vanishes_before_the_last_look_is_the_outcome_already(
     stack: Stack,
 ) -> None:
     """Someone else removed the name: the evidence is kept and nothing else is touched."""
-    _seed(stack, READER)
+    _seed(stack, TARGET)
     window = _WindowStorage(
         stack.storage,
-        READER,
+        TARGET,
         at_exists=2,  # 1: the door's entry check; 2: the last look
-        strike=lambda: stack.storage.remove(READER),  # type: ignore[attr-defined]
+        strike=lambda: stack.storage.remove(TARGET),  # type: ignore[attr-defined]
     )
-    report = _manager(stack, storage=window).retire_control_record(READER)
+    report = _manager(stack, storage=window).retire_control_record(TARGET)
     assert report.records_discarded == 1
     retired = report.findings_of(FindingKind.CONTROL_RECORD_RETIRED)
     assert retired and "already gone" in retired[0].detail
-    assert not stack.storage.exists(READER)  # type: ignore[attr-defined]
+    assert not stack.storage.exists(TARGET)  # type: ignore[attr-defined]
     assert stack.quarantine.read(retired[0].quarantine) == DAMAGED
 
 
@@ -383,21 +393,142 @@ def test_a_second_retirement_of_a_retired_name_refuses(stack: Stack) -> None:
 def test_an_interrupted_retirement_resumes_idempotently(stack: Stack) -> None:
     """A platform that held the name leaves evidence behind; the retry retires the SAME
     generation without a second quarantine entry or a second ledger entry."""
-    _seed(stack, READER)
+    _seed(stack, TARGET)
     held = _manager(
         stack, storage=_DeferringStorage(stack.storage)
-    ).retire_control_record(READER)
+    ).retire_control_record(TARGET)
     assert held.records_discarded == 1
     assert held.ledger_entries_created == 1
     lingering = held.findings_of(FindingKind.CONTROL_RECORD_RETIRED)
     assert lingering and "not released its name" in lingering[0].detail
-    assert stack.storage.exists(READER)  # type: ignore[attr-defined]
-    retry = _manager(stack).retire_control_record(READER)
+    assert stack.storage.exists(TARGET)  # type: ignore[attr-defined]
+    retry = _manager(stack).retire_control_record(TARGET)
     assert retry.records_discarded == 1
     assert retry.ledger_entries_created == 0, (
         "the retry recognises the entry it already wrote"
     )
-    assert not stack.storage.exists(READER)  # type: ignore[attr-defined]
+    assert not stack.storage.exists(TARGET)  # type: ignore[attr-defined]
     assert len(stack.ledger.entries()) == 1
     retried = retry.findings_of(FindingKind.CONTROL_RECORD_RETIRED)
     assert retried and stack.quarantine.read(retried[0].quarantine) == DAMAGED
+
+
+def test_the_engine_lease_section_mirrors_the_adapters(stack: Stack) -> None:
+    """G2 forbids the import, so the mirrored constant is pinned equal here instead."""
+    from okto_grafx.adapters.coordination_local import LEASE_SECTION
+    from okto_grafx.engine.recovery_manager import _LEASE_SECTION  # noqa: PLC2701
+
+    assert _LEASE_SECTION == LEASE_SECTION
+
+
+def test_a_canonical_reader_record_is_fail_closed_with_nothing_read(
+    stack: Stack,
+) -> None:
+    """No shared section, no atomic compare-and-remove: reader retirement refuses typed,
+    before the probe runs, and the record keeps every byte."""
+    _seed(stack, READER)
+    probe = _DamageProbe()
+    with pytest.raises(GrafxRecoveryRefused, match="FAIL-CLOSED"):
+        _manager(stack, control_probe=probe).retire_control_record(READER)
+    assert probe.calls == 0
+    assert _bytes_of(stack, READER) == DAMAGED
+    assert len(stack.ledger.entries()) == 0
+
+
+def test_the_last_look_and_removal_happen_inside_the_lease_section(
+    stack: Stack,
+) -> None:
+    """The deterministic pin on the integrator's race: at the exact post-compare window the
+    manager holds commit AND lease sections, nested in that audited order, so a cooperating
+    lease publisher (which serialises on the lease section) cannot land there."""
+    from .conftest import StackCoordinator
+
+    coordinator = StackCoordinator()
+    _seed(stack, LEASE)
+    observed: list[tuple[str, ...]] = []
+
+    def strike() -> None:
+        held = [name for kind, name, _ in coordinator.sections if kind == "enter"]
+        left = [name for kind, name, _ in coordinator.sections if kind == "exit"]
+        for name in left:
+            held.remove(name)
+        observed.append(tuple(held))
+
+    window = _WindowStorage(stack.storage, LEASE, at_read=3, strike=strike)
+    report = _manager(
+        stack, storage=window, coordinator=coordinator
+    ).retire_control_record(LEASE)
+    assert report.records_discarded == 1
+    assert observed == [("commit", "writer.lease")], (
+        "the last look must run holding commit THEN lease, and nothing else"
+    )
+    entered = [name for kind, name, _ in coordinator.sections if kind == "enter"]
+    assert entered == ["commit", "writer.lease"], "lock order is commit before lease"
+
+
+def test_a_live_holder_of_the_lease_section_keeps_retirement_out(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """Cross-process: the REAL lease section held elsewhere refuses the lease retirement
+    typed, with the record intact and no removal; the release lets it complete."""
+    _seed(stack, LEASE)
+    root = tmp_path / "fence"
+    root.mkdir()
+    ready = tmp_path / "ready.marker"
+    release = tmp_path / "release.marker"
+    coordinator = LocalProcessCoordinator(
+        LocalStorageDevice(str(root)),
+        SystemClock(),
+        owner_id="lease-retire-parent",
+        lock_directory=str(root / "control"),
+        poll_interval=0.002,
+    )
+    probe = _DamageProbe()
+    quarantine_before = _quarantine_files(stack)
+    manager = _manager(
+        stack, control_probe=probe, coordinator=coordinator, commit_lock_timeout=0.4
+    )
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).with_name("fence_child.py")),
+            str(root),
+            str(ready),
+            str(release),
+            "writer.lease",
+        ],
+    )
+    try:
+        deadline = time.monotonic() + 30.0
+        while not ready.exists() and time.monotonic() < deadline:
+            assert child.poll() is None, (
+                "the section-holding child died before announcing"
+            )
+            time.sleep(0.005)
+        assert ready.exists(), "the child never announced the held lease section"
+        with pytest.raises(GrafxLeaseTimeout):
+            manager.retire_control_record(LEASE)
+        assert probe.calls == 0, "the lease-section timeout must precede the probe"
+        assert _bytes_of(stack, LEASE) == DAMAGED
+        assert len(stack.ledger.entries()) == 0
+        assert _quarantine_files(stack) == quarantine_before
+    finally:
+        release.write_text("go", encoding="ascii")
+        child.wait(timeout=30.0)
+    report = manager.retire_control_record(LEASE)
+    assert report.records_discarded == 1
+    assert not stack.storage.exists(LEASE)  # type: ignore[attr-defined]
+
+
+def test_no_adapter_path_ever_opens_the_commit_section() -> None:
+    """The audited lock order (commit, then lease) holds because the coordination adapter
+    never opens the commit section at all: it takes the lease section ALONE. Pinned against
+    the adapter's source, so a future lease->commit nesting fails here before it deadlocks."""
+    import inspect
+
+    from okto_grafx.adapters import coordination_local
+
+    source = Path(inspect.getsourcefile(coordination_local)).read_text(encoding="utf-8")  # type: ignore[arg-type]
+    assert "COMMIT_SECTION" not in source
+    assert 'exclusive("commit"' not in source
+    assert "exclusive('commit'" not in source
