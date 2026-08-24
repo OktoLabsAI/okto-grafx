@@ -863,8 +863,8 @@ had never seen. Both answered short with `stale` False, which is the worst shape
 take (L22).
 
 **The rule:** derived state gets ONE publication, of a whole picture, by one assignment, and the
-mark it carries is the reading taken BEFORE the work began -- the only reading the picture can
-honestly claim. A later certification is legitimate only for the thread that (1) verified the
+mark it carries is a reading taken BEFORE a walk that fed it -- the only reading the picture can
+honestly claim -- and a build catches up with what landed while it ran before it publishes. A later certification is legitimate only for the thread that (1) verified the
 picture was current at the moment it started and (2) did the whole of the change it certifies.
 Anyone else retires the picture and lets the next reader rebuild. "Stale by one commit, and the
 next reader will know" is a state a system can be in; "certified current and short" is not.

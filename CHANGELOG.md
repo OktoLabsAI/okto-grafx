@@ -14,7 +14,7 @@ including the on-disk format.
   searches meeting on the first use raced: one answered three of eight rows with `stale` False
   and `achieved_k` reported as if complete, and a build that failed part-way could erase another
   thread's complete build. The graph, its maps and the log position it reflects are now ONE
-  immutable picture, built in locals and published by a single reference assignment under a guard
+  snapshot (graph, maps, mark), built in locals and published atomically by one reference assignment under a guard
   the assembly hands in; a search captures it once; a build in flight is waited for rather than
   raced; a failed build drops its locals and nothing else.
 - **Vector search: a commit could certify a warm graph that another process had left behind.**

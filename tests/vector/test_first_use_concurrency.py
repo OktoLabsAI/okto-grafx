@@ -409,3 +409,67 @@ def test_a_build_that_calls_back_into_its_own_index_does_not_wait_on_itself(
     assert math.inner_seconds < 1.0, (
         f"the re-entrant search took {math.inner_seconds:.2f}s: it waited on its own build"
     )
+
+
+class _SeesEveryLiveVersion:
+    """A structural ``SnapshotLike`` that admits every live version: the predicate is the caller's.
+
+    ``SnapshotLike`` is taken by shape (A19), so a caller may bring any predicate. This one is
+    what the engine's own suite uses (``SnapshotDouble(1000)`` in spirit): everything committed,
+    nothing ended. Under it, the answer must include whatever the store holds when the search
+    answers -- which is what ``main`` gave and ``8c88e9d`` did not.
+    """
+
+    def visible(self, xmin: int, xmax: int) -> bool:
+        return xmin != 0 and xmax == 0
+
+
+def _search_permissive(database: Any) -> tuple[int, str, tuple[int, ...]]:
+    hits = database.vectors.search(
+        space="s", k=ROWS, query=[1.0, 0.0, 0.25, 0.0], snapshot=_SeesEveryLiveVersion()
+    )
+    return (
+        hits.achieved_k,
+        hits.regime,
+        tuple(sorted(hit.record_id for hit in hits.hits)),
+    )
+
+
+def test_a_commit_landing_during_the_build_is_caught_up_before_the_snapshot_is_published(
+    tmp_path: Path,
+) -> None:
+    """The M0A cross-review's blocking regression: a permissive predicate sees the commit.
+
+    Seven rows, the cold build parked, the eighth row committed, the build released. Under a
+    predicate that admits every live version, ``main@12c67c8`` answered eight -- the commit was
+    noted into the partial graph it had already published -- and ``8c88e9d`` answered seven and
+    then eight, because the build published a snapshot with the commit neither noted nor caught
+    up. The build now catches up before publishing: the search that built answers all eight.
+    """
+    math = GatingMath()
+    database, registry = _open(tmp_path / "db", math)
+    outcomes: dict[str, object] = {}
+
+    def search_into(name: str) -> None:
+        try:
+            outcomes[name] = _search_permissive(database)
+        except Exception as failure:  # noqa: BLE001 - the outcome IS what is recorded
+            outcomes[name] = ("ERROR", type(failure).__name__)
+
+    try:
+        _populate(database, ROWS - 1)
+        first = threading.Thread(target=search_into, args=("first",))
+        first.start()
+        assert math.parked.wait(PATIENCE), (
+            "the first search never reached the parked score"
+        )
+        with database.begin("write") as txn:
+            _insert(txn, ROWS)
+        math.release()
+        _finish(first)
+        assert outcomes["first"] == (ROWS, "approximate", ALL_IDS), outcomes
+        assert _search_permissive(database) == (ROWS, "approximate", ALL_IDS)
+    finally:
+        math.release()
+        database.close()
+        release_ports(registry)

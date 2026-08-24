@@ -412,6 +412,14 @@ class _UnguardedBuild:
 _BUILD_WAIT_SECONDS: float = 0.5
 """One slice of waiting behind another thread's build of the same index."""
 
+_BUILD_CATCH_UP_PASSES: int = 3
+"""Passes a cold build spends catching up with commits that landed while it ran.
+
+Each pass walks the store again, takes into the picture what it lacks, and re-reads the header;
+a store that keeps moving is left behind after the last pass, and the mark says so, so the next
+search rebuilds. Bounded, so a commit storm cannot hold a search hostage.
+"""
+
 _BUILD_WAIT_SLICES: int = 120
 """Slices a waiter spends behind another thread's build before it builds for itself.
 
@@ -425,10 +433,11 @@ behind a build that is slow past reason, or behind an unguarded composition's in
 class _GraphSnapshot:
     """One complete, consistent picture of the index: the graph, its maps and the mark.
 
-    ``mark`` is the ``built_through_lsn`` the header held when the build STARTED, which is the
-    only reading a picture can honestly claim: an entry the store received after it was read is
-    either in the walk (then the picture is ahead of its mark, which costs one rebuild) or not
-    (then the mark says so). The maps are mutated in place by the warm path, under the same
+    ``mark`` is a ``built_through_lsn`` reading taken BEFORE a walk that fed the picture -- at
+    the start of the build, or at the start of a catch-up pass -- which is the only reading a
+    picture can honestly claim: an entry the store received after it was read is either in the
+    walk (then the picture is ahead of its mark, which costs one rebuild) or not (then the mark
+    says so). The maps are mutated in place by the warm path, under the same
     discipline as the graph -- an entry is registered before its node becomes reachable -- and a
     search that captured this picture keeps every part of it for as long as it runs.
     """
@@ -664,10 +673,14 @@ class VectorHnswIndex(ProximityIndex):
 
         Freshness is decided against the header's ``built_through_lsn`` read BEFORE the walk
         begins, and the picture carries that reading as its mark. A commit that lands during the
-        build is neither noted into the picture (nothing is published to note into) nor
-        certified by it: its mark stays behind the header and the next search rebuilds. The
-        search that built it answers correctly regardless -- that commit's CSN is above its
-        snapshot, so nothing of it is visible to it.
+        build is not noted into the picture (nothing is published to note into); before the
+        picture is published the build CATCHES UP with it (``_catch_up``): the header is read
+        again and, while it has moved, the store is walked again and what the picture lacks is
+        taken in. A caller with a fixed snapshot could not see that commit anyway; a caller whose
+        predicate admits it -- ``SnapshotLike`` is structural -- gets it too, as the protocol
+        before this one gave it (the M0A cross-review). If the store still moves past the last
+        pass, the mark stays behind the header and the next search rebuilds: never a
+        certification the build did not verify.
 
         One build at a time per index: a thread that finds a build in flight waits on the guard
         for it, in bounded slices, and takes the published picture when it wakes. Past
@@ -714,7 +727,7 @@ class VectorHnswIndex(ProximityIndex):
                 if not finished and waited >= _BUILD_WAIT_SLICES:
                     break
         try:
-            built = self._build(header)
+            built = self._catch_up(self._build(header))
         except BaseException:
             # A build that does not finish leaves NOTHING behind -- and takes nothing away. Its
             # locals go with this frame; the published picture, which may be another thread's
@@ -738,6 +751,32 @@ class VectorHnswIndex(ProximityIndex):
                 self._builder = None
                 self._guard.notify_all()
         return built
+
+    def _catch_up(self, picture: _GraphSnapshot) -> _GraphSnapshot:
+        """Take into a not-yet-published picture what the store received while it was built.
+
+        The walk that fed the build is a moment in the past. A commit that landed after it is in
+        the store and not in the picture, and nothing noted it there, because a picture under
+        construction is not published. A caller whose snapshot is fixed cannot see that commit
+        -- but ``SnapshotLike`` is taken by shape (A19), a predicate that admits it is a
+        supported caller, and the protocol before this one answered it whole (it noted commits
+        into the partial graph it had already published). So: read the header again; while it
+        has moved past the mark, walk the store again and offer every entry to the picture --
+        one already held has its entry refreshed (a tombstone that landed is taken), a new one
+        is installed -- and certify the picture with the reading taken before that walk. An
+        entry the store reconciled away in the meantime stays in the picture as an ended node,
+        invisible by its stamps to every snapshot.
+        """
+        for _pass in range(_BUILD_CATCH_UP_PASSES):
+            header = self.built_through_lsn
+            if header == picture.mark:
+                return picture
+            for entry in sorted(
+                self.walk(), key=lambda item: (item.born_csn, item.ref.encode())
+            ):
+                self._install(picture, entry)
+            picture = picture.certified(header)
+        return picture
 
     def _release_build(self) -> None:
         """Give the build up as its owner: clear the flag and wake whoever waited for it."""
