@@ -112,7 +112,29 @@ def _describe(value: object) -> str:
         # CONSTANT fallback: even type(value).__name__ can execute a hostile
         # metaclass property. The refusal path touches the offender zero more times.
         return "<value whose repr raises>"
-    return text if len(text) <= 80 else text[:77] + "..."
+    return _bounded(text)
+
+
+def _bounded(text: object) -> str:
+    """The length rule, applied only to an EXACT str and under the same guard.
+
+    Round-7 (1): len() and the slice were outside the try, so a str SUBCLASS returned by
+    repr could raise from __len__/__getitem__ after the guard had already been passed.
+    Type-exactness comes first because it removes the object's code from the path
+    entirely; the guard stays anyway, since a diagnostic that can raise is not one.
+    """
+    try:
+        if type(text) is not str:
+            # Round-7 (A): repr() is only CONVENTIONALLY a str -- it may return a
+            # str SUBCLASS whose __len__, __getitem__ or __format__ raises. Guarding
+            # len() alone would not fix that: the object would leave this function
+            # intact and explode later, inside the f-string of whoever formats the
+            # refusal. Type-exact never runs the object's code; anything else becomes
+            # a constant.
+            return "<value whose repr is not a plain str>"
+        return text if len(text) <= 80 else text[:77] + "..."
+    except BaseException:  # noqa: BLE001 -- a diagnostic NEVER decides an outcome
+        return "<value whose repr cannot be measured>"
 
 
 def _emit(line: str) -> None:
@@ -196,7 +218,16 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
         if not _is_a(metrics, list):
             return {}, {}, "the metrics document holds no metric list"
         return _collect_multiples(metrics)
-    except Exception:  # noqa: BLE001 -- never-raise is absolute; KI/SE propagate
+    except BaseException:  # noqa: BLE001 -- inspection only; see the note below
+        # Round-7 (B): this boundary caught Exception, and everything inside it runs the
+        # OBJECT's code -- .get, __iter__, __getitem__, len, set, sorted -- so a payload
+        # fabricating SystemExit walked straight out of a function that promises a
+        # verdict. The scope of this absorption is deliberately narrow: it covers ONLY
+        # the inspection of an already-parsed object, where there is no I/O, no spawn
+        # and no clock, and where an interrupt cannot be told apart from data choosing
+        # its own shape. The parse above, and every place in this stage that does real
+        # work, keep Exception so that genuine KeyboardInterrupt and SystemExit still
+        # propagate as primaries.
         return (
             {},
             {},
@@ -275,7 +306,16 @@ def _recall_measurement(document: str) -> tuple[str, object]:
         # A publication that raises while being inspected is MALFORMED, which is a
         # verdict the gate can act on; a traceback is exit 1, which is a lie.
         return _resolve_measurement(payload)
-    except Exception:  # noqa: BLE001 -- never-raise is absolute; KI/SE propagate
+    except BaseException:  # noqa: BLE001 -- inspection only; see the note below
+        # Round-7 (B): this boundary caught Exception, and everything inside it runs the
+        # OBJECT's code -- .get, __iter__, __getitem__, len, set, sorted -- so a payload
+        # fabricating SystemExit walked straight out of a function that promises a
+        # verdict. The scope of this absorption is deliberately narrow: it covers ONLY
+        # the inspection of an already-parsed object, where there is no I/O, no spawn
+        # and no clock, and where an interrupt cannot be told apart from data choosing
+        # its own shape. The parse above, and every place in this stage that does real
+        # work, keep Exception so that genuine KeyboardInterrupt and SystemExit still
+        # propagate as primaries.
         return ("malformed", "raised while being inspected")
 
 
@@ -449,11 +489,20 @@ def _resolve_recall_target(
                 f"--calibration {calibration!r} was named explicitly but is unreadable "
                 f"({_describe(error)}); refusing to fall back to a floor nobody chose"
             ) from error
-        candidate = (
-            payload.get("vector_recall", {}).get("frozen", {}).get("target")
-            if _is_a(payload, dict)
-            else None
-        )
+        try:
+            # Round-7 (5): three chained .get calls on a parsed object -- all of them the
+            # OBJECT's code. A dict subclass raising SystemExit here escaped main's
+            # Exception clause and ended the process from inside a gate. The read and the
+            # parse above keep their own clause, so a real interrupt of that WORK still
+            # propagates; a payload that cannot be inspected simply carries no target,
+            # which the refusal below turns into UNMEASURED.
+            candidate = (
+                payload.get("vector_recall", {}).get("frozen", {}).get("target")
+                if _is_a(payload, dict)
+                else None
+            )
+        except BaseException:  # noqa: BLE001 -- inspection of parsed data only
+            candidate = None
         frozen = _as_finite_float(candidate)
         if frozen is not None and 0.0 < frozen <= 1.0:
             return frozen, f"frozen in {calibration}"

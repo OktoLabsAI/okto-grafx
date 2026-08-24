@@ -115,11 +115,26 @@ def _strip_stale_gauge(metrics: Path) -> None:
     stage exit would need generation binding between section and gauge; that evolution is
     recorded here rather than half-built.
     """
+    # The read and the parse are WORK: a real KeyboardInterrupt or SystemExit there
+    # still propagates, and the caller's boundary turns ordinary failures into exit 3.
     document = json.loads(metrics.read_text(encoding="utf-8"))
-    entries = document.get("metrics") if _is_a(document, dict) else None
-    if not _is_a(entries, list) or not any(
-        _is_a(entry, dict) and entry.get("name") == RECALL_METRIC for entry in entries
-    ):
+    try:
+        # Round-7 (5): everything from here is the parsed OBJECT's code -- .get, the
+        # iteration, each entry's .get. A subclass raising SystemExit here escaped with
+        # the locks already held. We cannot prove there is no stale gauge, and stripping
+        # is the step that makes every crash window read as gauge-ABSENT, so a document
+        # we cannot inspect is a stage failure rather than a silent skip.
+        entries = document.get("metrics") if _is_a(document, dict) else None
+        carries_gauge = _is_a(entries, list) and any(
+            _is_a(entry, dict) and entry.get("name") == RECALL_METRIC
+            for entry in entries
+        )
+    except BaseException as failure:  # noqa: BLE001 -- inspection of parsed data only
+        raise RecallStageError(
+            "the metrics document could not be inspected for a stale recall gauge "
+            f"({_describe(failure)}); refusing to publish over an unknown state."
+        ) from None
+    if not carries_gauge:
         return
 
     def mutate(document: dict[str, object]) -> None:
@@ -241,9 +256,12 @@ def _acquire_publication_locks(
         # outside every guard -- a __str__ raising SystemExit escaped before a single
         # lock existed. A document that cannot even be named cannot be locked.
         ordered = sorted({str(document) for document in documents})
-    except BaseException as failure:  # noqa: BLE001 -- KI/SE still reach the caller
-        if not _is_a(failure, Exception):
-            raise
+    except BaseException as failure:  # noqa: BLE001 -- naming runs ONLY caller code
+        # Round-7 (C): this used to re-raise anything that was not an ordinary
+        # Exception, which handed the caller a SystemExit the DATA had fabricated --
+        # str() on a caller-supplied object is the caller's code and nothing else. This
+        # region converts every shape into a typed refusal. The real lock operations
+        # below keep the ordinary-vs-KI/SE distinction, because they do actual work.
         return [], (
             "a document could not be named for locking "
             f"({_describe(failure)}); nothing was locked and nothing was run"
@@ -463,13 +481,30 @@ def append_vector_recall(
         if alias_path is None:
             continue
         try:
-            canonical = alias_path.resolve(strict=True)
-            link_count = os.stat(canonical).st_nlink
-        except Exception as failure:  # noqa: BLE001 -- absolute boundary; KI/SE pass
+            # Round-7 (3): resolve() is the ARGUMENT's code, not ours -- a path-like can
+            # choose the shape it raises, so every shape here becomes a typed refusal.
+            # The result is reduced to a builtin string immediately, which is what takes
+            # the object out of every line that follows.
+            canonical_name = os.fspath(alias_path.resolve(strict=True))
+            if type(canonical_name) is not str:
+                raise TypeError("resolve() did not yield a filesystem path")
+        except BaseException as failure:  # noqa: BLE001 -- the ARGUMENT chose the shape
             _emit(
                 f"vector recall stage: REFUSED -- {alias_label} "
                 f"{_describe(alias_path)} could "
                 "not be resolved to a physical document "
+                f"({_describe(failure)}); nothing was run."
+            )
+            return 3
+        canonical = Path(canonical_name)
+        try:
+            # Real I/O, on a builtin string: a genuine KeyboardInterrupt or SystemExit
+            # here is an interrupt of WORK and keeps propagating as the primary.
+            link_count = os.stat(canonical_name).st_nlink
+        except Exception as failure:  # noqa: BLE001 -- KI/SE propagate; this is I/O
+            _emit(
+                f"vector recall stage: REFUSED -- {alias_label} "
+                f"{_describe(alias_path)} could not be inspected on disk "
                 f"({_describe(failure)}); nothing was run."
             )
             return 3
@@ -512,11 +547,20 @@ def append_vector_recall(
                 f"{_describe(document)}, not an object; nothing was run."
             )
             return 3
-        if (
-            label == "--metrics"
-            and "metrics" in document
-            and not _is_a(document["metrics"], list)
-        ):
+        try:
+            # Round-7 (5): `"metrics" in document` runs the OBJECT's __contains__ and
+            # the indexing runs its __getitem__ -- a dict subclass reached this line
+            # before any lock existed and chose its own shape. Inspecting parsed data
+            # can never be what ends the process; a document that cannot answer whether
+            # it carries a usable metrics list is refused as though it did not.
+            metrics_key_unusable = (
+                label == "--metrics"
+                and "metrics" in document
+                and not _is_a(document["metrics"], list)
+            )
+        except BaseException:  # noqa: BLE001 -- inspection of parsed data only
+            metrics_key_unusable = True
+        if metrics_key_unusable:
             _emit(
                 f"vector recall stage: REFUSED -- {label} {_describe(path)} carries a "
                 "'metrics' key that is not a list; a gauge could never land there. "

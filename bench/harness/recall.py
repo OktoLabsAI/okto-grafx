@@ -114,7 +114,29 @@ def _describe(value: object) -> str:
         # CONSTANT fallback: even type(value).__name__ can execute a hostile
         # metaclass property. The refusal path touches the offender zero more times.
         return "<value whose repr raises>"
-    return text if len(text) <= 80 else text[:77] + "..."
+    return _bounded(text)
+
+
+def _bounded(text: object) -> str:
+    """The length rule, applied only to an EXACT str and under the same guard.
+
+    Round-7 (1): len() and the slice were outside the try, so a str SUBCLASS returned by
+    repr could raise from __len__/__getitem__ after the guard had already been passed.
+    Type-exactness comes first because it removes the object's code from the path
+    entirely; the guard stays anyway, since a diagnostic that can raise is not one.
+    """
+    try:
+        if type(text) is not str:
+            # Round-7 (A): repr() is only CONVENTIONALLY a str -- it may return a
+            # str SUBCLASS whose __len__, __getitem__ or __format__ raises. Guarding
+            # len() alone would not fix that: the object would leave this function
+            # intact and explode later, inside the f-string of whoever formats the
+            # refusal. Type-exact never runs the object's code; anything else becomes
+            # a constant.
+            return "<value whose repr is not a plain str>"
+        return text if len(text) <= 80 else text[:77] + "..."
+    except BaseException:  # noqa: BLE001 -- a diagnostic NEVER decides an outcome
+        return "<value whose repr cannot be measured>"
 
 
 def _emit(line: str) -> None:
@@ -200,7 +222,12 @@ def run_recall(
             "the fresh per-run verdict file could not be prepared "
             f"({_describe(failure)}); nothing was spawned."
         ) from failure
-    verdict_path = Path(temp_name)
+    # Round-7 (D): even Path(temp_name) sits inside the region now. It was the last
+    # statement between the descriptor closing and the try, and a Path that refuses to
+    # be built left the file orphaned with no cleanup and no spawn -- the same gap as
+    # round-6 item 7, one statement narrower. Everything the cleanup needs is the
+    # BUILTIN string the mkstemp returned, so no object this function constructs can
+    # make the removal unreachable.
     # Round-6 item 7: the file is OURS from the moment the mkstemp descriptor closed, so
     # the cleanup region starts HERE. It used to start after the environment copy, the
     # command construction and time.monotonic() -- three ordinary calls that can fail
@@ -208,6 +235,7 @@ def run_recall(
     # with no cleanup, no spawn and no diagnosis. Everything that follows the acquisition
     # is now inside the same state machine that removes it.
     try:
+        verdict_path = Path(temp_name)
         environment = dict(os.environ)
         for name in _BLAS_THREAD_VARIABLES:
             environment[name] = "1"
@@ -220,7 +248,7 @@ def run_recall(
             "--gt",
             gt_mode,
             "--out",
-            str(verdict_path),
+            temp_name,
         ]
         started = time.monotonic()
         try:
@@ -268,13 +296,22 @@ def run_recall(
                 f"the recall worker's verdict is not readable JSON "
                 f"(exit {completed.returncode}): {_describe(failure)}"
             ) from failure
-        if not _is_a(verdict, dict):
+        if type(verdict) is not dict:
+            # Round-7 (6): _is_a accepted a dict SUBCLASS, which can answer every read
+            # coherently and then raise from __setitem__ when duration_seconds and
+            # exit_code are written in below -- after the file was already cleaned up.
+            # json.loads produces an exact dict, so requiring one costs nothing real and
+            # removes the object's code from the two writes that follow.
             raise RecallStageError(
-                "the recall worker's verdict is not a JSON object; refusing it."
+                "the recall worker's verdict is not a plain JSON object; refusing it."
             )
     finally:
         try:
-            verdict_path.unlink()
+            # Round-7 (D): os.unlink on the BUILTIN name, never verdict_path.unlink().
+            # The Path object is built inside the region above, so on the failure path
+            # that removal exists it may not exist at all -- and a cleanup that depends
+            # on the object that failed is not a cleanup.
+            os.unlink(temp_name)
         except BaseException:  # noqa: BLE001 -- cleanup NEVER replaces the primary
             # Round-5 blocker 2: this runs inside a finally, so ANY exception raised
             # here replaces what was propagating -- the worker's own typed failure, or
@@ -291,7 +328,7 @@ def run_recall(
         # which escaped run_recall untyped. A check that cannot answer counts as
         # RESIDUE: the conservative side of the only honest doubt here.
         try:
-            residual = verdict_path.exists()
+            residual = os.path.exists(temp_name)
         except BaseException:  # noqa: BLE001 -- a diagnosis NEVER decides an outcome
             # Round-6 item 5: this caught Exception only, so exists() raising SystemExit
             # escaped -- and SystemExit(0) is the worst shape available here, because

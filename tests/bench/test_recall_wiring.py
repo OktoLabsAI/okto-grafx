@@ -883,14 +883,17 @@ def test_run_recall_refuses_success_over_temp_residue(
         return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
 
     monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
-    real_unlink = Path.unlink
+    real_unlink = os.unlink
 
-    def sticky(self: Path, *args: object, **kwargs: object) -> None:
-        if self.name.startswith("recall-tiny-"):
+    def sticky(target: object, *args: object, **kwargs: object) -> None:
+        # Round-7 (4): the cleanup runs on the BUILTIN name now, so this is where the
+        # stickiness has to be injected -- patching Path.unlink would leave the real
+        # mechanism untouched and the probe would pass without proving anything.
+        if "recall-tiny-" in str(target):
             raise OSError("sticky temp")
-        return real_unlink(self, *args, **kwargs)
+        return real_unlink(target, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(Path, "unlink", sticky)
+    monkeypatch.setattr(os, "unlink", sticky)
     with pytest.raises(RecallStageError, match="residue"):
         run_recall("tiny", scratch=scratch)
 
@@ -1510,20 +1513,20 @@ def test_an_existence_check_that_cannot_answer_counts_as_residue(
         return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
 
     monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
-    real_unlink, real_exists = Path.unlink, Path.exists
+    real_unlink, real_exists = os.unlink, os.path.exists
 
-    def sticky(self: Path, *args: object, **kwargs: object) -> None:
-        if self.name.startswith("recall-tiny-"):
+    def sticky(target: object, *args: object, **kwargs: object) -> None:
+        if "recall-tiny-" in str(target):
             raise OSError("sticky temp")
-        return real_unlink(self, *args, **kwargs)
+        return real_unlink(target, *args, **kwargs)  # type: ignore[arg-type]
 
-    def unanswerable(self: Path) -> bool:
-        if self.name.startswith("recall-tiny-"):
+    def unanswerable(target: object) -> bool:
+        if "recall-tiny-" in str(target):
             raise OSError("the existence of this path cannot be determined")
-        return real_exists(self)
+        return real_exists(target)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(Path, "unlink", sticky)
-    monkeypatch.setattr(Path, "exists", unanswerable)
+    monkeypatch.setattr(os, "unlink", sticky)
+    monkeypatch.setattr(os.path, "exists", unanswerable)
     with pytest.raises(RecallStageError, match="residue"):
         run_recall("tiny", scratch=tmp_path / "scratch")
 
@@ -1762,6 +1765,23 @@ def test_a_document_that_cannot_be_named_is_never_locked() -> None:
     assert held == []
     assert refusal is not None and "named for locking" in refusal
 
+    class _ExitingName:
+        """Round-7 (C, code 121): the shape the pre-fix code RE-RAISED. str() on a
+        caller-supplied object is the caller's code and nothing else, so a SystemExit
+        arriving here was fabricated by the data, not by the process asking to exit --
+        and handing it back to the caller ended the run from inside a refusal path. An
+        ordinary Exception cannot tell these two versions apart; only this can."""
+
+        def __str__(self) -> str:
+            raise SystemExit(121)
+
+        def __repr__(self) -> str:
+            raise SystemExit(121)
+
+    held, refusal = wiring._acquire_publication_locks([_ExitingName()])  # type: ignore[list-item]
+    assert held == []
+    assert refusal is not None and "named for locking" in refusal
+
 
 def test_an_exiting_existence_check_cannot_report_success_over_residue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1780,20 +1800,20 @@ def test_an_exiting_existence_check_cannot_report_success_over_residue(
         return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
 
     monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
-    real_unlink, real_exists = Path.unlink, Path.exists
+    real_unlink, real_exists = os.unlink, os.path.exists
 
-    def sticky(self: Path, *args: object, **kwargs: object) -> None:
-        if self.name.startswith("recall-tiny-"):
+    def sticky(target: object, *args: object, **kwargs: object) -> None:
+        if "recall-tiny-" in str(target):
             raise OSError("sticky temp")
-        return real_unlink(self, *args, **kwargs)
+        return real_unlink(target, *args, **kwargs)  # type: ignore[arg-type]
 
-    def exiting_exists(self: Path) -> bool:
-        if self.name.startswith("recall-tiny-"):
+    def exiting_exists(target: object) -> bool:
+        if "recall-tiny-" in str(target):
             raise SystemExit(0)
-        return real_exists(self)
+        return real_exists(target)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(Path, "unlink", sticky)
-    monkeypatch.setattr(Path, "exists", exiting_exists)
+    monkeypatch.setattr(os, "unlink", sticky)
+    monkeypatch.setattr(os.path, "exists", exiting_exists)
     with pytest.raises(RecallStageError, match="residue"):
         run_recall("tiny", scratch=tmp_path / "scratch")
 
@@ -1823,4 +1843,285 @@ def test_a_failure_before_the_spawn_never_orphans_the_verdict_file(
     monkeypatch.undo()
     assert list(scratch.iterdir()) == [], (
         "a failure anywhere after the acquisition still removes the fresh file"
+    )
+
+
+# =====================================================================================
+# Round-7: hostile data may choose the SHAPE it raises; only WORK keeps its interrupts
+# =====================================================================================
+
+
+class _ExitingLen(str):
+    """A str subclass whose length cannot be taken -- what repr() may hand back."""
+
+    def __len__(self) -> int:
+        raise SystemExit(122)
+
+
+class _ExitingFormat(str):
+    """The shape a GUARD cannot save you from.
+
+    It measures and slices like any string, so every check inside the describer passes
+    and the value is RETURNED. The explosion happens afterwards, in the caller's
+    f-string -- which is why the fix has to be type-exactness at the boundary rather
+    than another try/except around the length.
+    """
+
+    def __format__(self, spec: str) -> str:
+        raise SystemExit(91)
+
+    def __str__(self) -> str:
+        raise SystemExit(91)
+
+
+class _ReprReturnsUnmeasurable:
+    def __repr__(self) -> str:
+        return _ExitingLen("x" * 100)
+
+
+class _ReprReturnsUnformattable:
+    def __repr__(self) -> str:
+        return _ExitingFormat("short")
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [_ReprReturnsUnmeasurable, _ReprReturnsUnformattable],
+    ids=["len-raises-122", "format-raises-91"],
+)
+def test_a_repr_returning_a_str_subclass_never_leaves_the_describer(
+    hostile: type,
+) -> None:
+    """Round-7 (1): repr() is only CONVENTIONALLY a str, and the two cases fail
+    differently. The one whose __len__ raises (122) is caught by the guard. The one
+    whose __format__ raises (91) is NOT: it measures fine, so it is returned intact and
+    detonates in the f-string of whoever formats the refusal -- a frame no guard here
+    can reach. Type-exactness at the boundary is what closes both, which is why this
+    probe asserts on the TYPE that leaves and not merely on not-raising."""
+    from bench.harness.gate import _describe as gate_describe
+    from bench.harness.recall import _describe as recall_describe
+
+    for describe in (recall_describe, gate_describe):
+        described = describe(hostile())
+        assert type(described) is str, "an exact str, not a subclass, leaves here"
+        assert f"{described}" == described, "and it survives being formatted"
+
+
+def test_a_path_like_whose_resolve_exits_is_a_typed_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-7 (3, code 103): resolve() is the ARGUMENT's code, so the shape it raises is
+    chosen by the caller's object, not by an interrupt of our work. It becomes a typed
+    refusal; the worker never runs."""
+    called: list[int] = []
+
+    class _ExitingResolve:
+        def resolve(self, strict: bool = False) -> object:
+            raise SystemExit(103)
+
+        def __str__(self) -> str:
+            return "<hostile path>"
+
+        def __repr__(self) -> str:
+            return "<hostile path>"
+
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    code = append_vector_recall(
+        profile="tiny",
+        gt_mode="auto",
+        out=_ExitingResolve(),  # type: ignore[arg-type]
+        metrics=None,
+        workspace=tmp_path,
+    )
+    assert code == 3
+    assert not called, "nothing runs behind a document that cannot be resolved"
+
+
+def test_a_document_whose_containment_exits_is_refused_before_the_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-7 (5, code 102): `"metrics" in document` runs the parsed object's
+    __contains__, and a dict subclass reached that line before any lock existed."""
+
+    class _ExitingContains(dict):
+        def __contains__(self, key: object) -> bool:
+            raise SystemExit(102)
+
+    out, metrics = _seed_documents(tmp_path)
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    real_loads = json.loads
+
+    def hostile_loads(text: str, *args: object, **kwargs: object) -> object:
+        parsed = real_loads(text, *args, **kwargs)
+        return _ExitingContains(parsed) if isinstance(parsed, dict) else parsed
+
+    monkeypatch.setattr(wiring.json, "loads", hostile_loads)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert not called
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")] == []
+
+
+def test_a_stale_gauge_check_that_exits_fails_the_stage_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-7 (5, code 132): _strip_stale_gauge inspects a parsed document with the
+    locks already held, and a subclass raising there escaped. Stripping is what makes
+    every crash window read as gauge-ABSENT, so a document we cannot inspect is a typed
+    stage failure -- never a silent skip that publishes over an unknown state."""
+
+    class _ExitingGet(dict):
+        def get(self, *args: object, **kwargs: object) -> object:
+            raise SystemExit(132)
+
+    out, metrics = _seed_documents(tmp_path)
+    before = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    real_loads = json.loads
+    seen: list[int] = []
+
+    def hostile_loads(text: str, *args: object, **kwargs: object) -> object:
+        parsed = real_loads(text, *args, **kwargs)
+        if not isinstance(parsed, dict):
+            return parsed
+        seen.append(1)
+        # The prevalidation reads both documents first; only the strip, which runs with
+        # the locks held, gets the hostile mapping.
+        return _ExitingGet(parsed) if len(seen) > 2 else parsed
+
+    monkeypatch.setattr(wiring.json, "loads", hostile_loads)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert not called, "the worker never runs behind an uninspectable strip"
+    assert (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8")) == (
+        before
+    )
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")] == []
+
+
+def test_a_verdict_dict_subclass_is_refused_before_anything_is_written_into_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-7 (6, code 131): a dict SUBCLASS can answer every read coherently and then
+    raise from __setitem__, which is where duration_seconds and exit_code are written --
+    after the temp file has already been cleaned up. json.loads yields an exact dict, so
+    requiring one costs nothing and takes the object's code off those two writes."""
+    import subprocess as subprocess_module
+
+    from bench.harness import recall as recall_module
+    from bench.harness.recall import run_recall
+
+    class _ExitingSetItem(dict):
+        def __setitem__(self, key: object, value: object) -> None:
+            raise SystemExit(131)
+
+    def writes_verdict(command: list[str], **kwargs: object):
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.write_text(json.dumps(_verdict_stub()), encoding="utf-8")
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    real_loads = json.loads
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
+    monkeypatch.setattr(
+        recall_module.json,
+        "loads",
+        lambda text, *a, **k: _ExitingSetItem(real_loads(text, *a, **k)),
+    )
+    scratch = tmp_path / "scratch"
+    with pytest.raises(RecallStageError, match="plain JSON object"):
+        run_recall("tiny", scratch=scratch)
+    monkeypatch.undo()
+    assert list(scratch.iterdir()) == [], "and the fresh file is still removed"
+
+
+def test_a_real_interrupt_of_work_still_propagates_with_the_temp_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for every absorption above: a KeyboardInterrupt raised by the
+    SUBPROCESS -- real work, not data choosing a shape -- stays the primary, and the
+    fresh verdict file is still removed. If this ever turns into a typed refusal, the
+    line between work and inspection has been crossed."""
+    from bench.harness.recall import run_recall
+
+    def interrupted(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt("the operator interrupted the worker")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", interrupted)
+    scratch = tmp_path / "scratch"
+    with pytest.raises(KeyboardInterrupt):
+        run_recall("tiny", scratch=scratch, timeout_seconds=30)
+    assert list(scratch.iterdir()) == [], (
+        "work may be interrupted; residue may not stay"
+    )
+
+
+def test_a_real_system_exit_from_os_open_still_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second control: os.open is real I/O, so a SystemExit raised THERE is an
+    interrupt of work and must reach the caller instead of becoming a typed refusal."""
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real_open = os.open
+
+    def exiting_open(path: object, *args: object, **kwargs: object) -> int:
+        if str(path).endswith(".c13.lock"):
+            raise SystemExit(93)
+        return real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", exiting_open)
+    with pytest.raises(SystemExit):
+        append_vector_recall(
+            profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+        )
+    monkeypatch.undo()
+
+
+def test_a_path_that_refuses_to_be_built_still_removes_the_verdict_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-7 (4): Path(temp_name) was the LAST statement between the descriptor
+    closing and the try, and a Path that refuses to be built left the fresh file
+    orphaned with no cleanup and no spawn. This probe targets that statement
+    specifically -- the earlier one breaks the clock, which stays inside the region
+    either way and therefore cannot tell the two versions apart. The cleanup rides on
+    the builtin name precisely so the object that failed cannot make the removal
+    unreachable."""
+    from bench.harness import recall as recall_module
+    from bench.harness.recall import run_recall
+
+    real_path = recall_module.Path
+
+    class _RefusingPath:
+        def __new__(cls, *args: object, **kwargs: object):
+            if args and "recall-tiny-" in str(args[0]):
+                raise RuntimeError("this path object cannot be built")
+            return real_path(*args, **kwargs)  # type: ignore[arg-type]
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("subprocess.run must not be reached")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", forbidden)
+    monkeypatch.setattr(recall_module, "Path", _RefusingPath)
+    scratch = tmp_path / "scratch"
+    with pytest.raises(RuntimeError, match="cannot be built"):
+        run_recall("tiny", scratch=scratch, timeout_seconds=30)
+    monkeypatch.undo()
+    assert list(scratch.iterdir()) == [], (
+        "the file is ours from the moment the descriptor closed, so it goes even when "
+        "the object naming it never existed"
     )

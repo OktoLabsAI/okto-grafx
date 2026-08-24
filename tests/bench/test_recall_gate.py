@@ -720,3 +720,58 @@ def test_a_hostile_instance_check_cannot_escape_either_reader(
     assert reason, "an unreadable document must say so, not raise"
     assert gate_module._recall_measurement("{}")[0] in ("absent", "malformed")
     assert check("{}", require_recall=True).status == STATUS_UNMEASURED
+
+
+class _ExitingGetMapping(dict):
+    """A parsed object whose every .get raises -- the round-7 (B)/(E) shape."""
+
+    def get(self, *args: object, **kwargs: object) -> object:
+        raise SystemExit(92)
+
+
+def test_a_payload_whose_get_exits_is_a_verdict_not_an_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-7 (2, codes 92/93): the post-parse boundaries caught Exception while
+    everything inside them runs the OBJECT's code, so a payload fabricating SystemExit
+    walked out of functions that promise a verdict. Inspection of an already-parsed
+    object absorbs every shape; the parse itself does not."""
+    monkeypatch.setattr(
+        gate_module.json, "loads", lambda *a, **kw: _ExitingGetMapping({"metrics": []})
+    )
+    multiples, gauges, reason = read_multiples("{}")
+    assert (multiples, gauges) == ({}, {})
+    assert reason
+    assert gate_module._recall_measurement("{}") == (
+        "malformed",
+        "raised while being inspected",
+    )
+    assert check("{}", require_recall=True).exit_code == 2
+
+
+def test_a_calibration_payload_whose_get_exits_reads_as_unmeasured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round-7 (5, code 101): three chained .get calls on the parsed calibration payload,
+    all of them the object's code, escaped main's Exception clause and ended the process
+    from inside a gate. A payload that cannot be inspected carries no frozen target,
+    which is UNMEASURED -- never exit 1, which means CEILING EXCEEDED."""
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text("{}", encoding="utf-8")
+    metrics = tmp_path / "metrics.json"
+    metrics.write_text(json.dumps({"metrics": []}), encoding="utf-8")
+
+    class _ExitingChain(dict):
+        def get(self, *args: object, **kwargs: object) -> object:
+            raise SystemExit(101)
+
+    real_loads = json.loads
+
+    def hostile_loads(text: str, *args: object, **kwargs: object) -> object:
+        parsed = real_loads(text, *args, **kwargs)
+        return _ExitingChain(parsed) if isinstance(parsed, dict) else parsed
+
+    monkeypatch.setattr(gate_module.json, "loads", hostile_loads)
+    assert main(["--metrics", str(metrics), "--calibration", str(calibration)]) == 2
+    monkeypatch.undo()
+    assert "UNMEASURED" in capsys.readouterr().out
