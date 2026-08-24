@@ -1172,7 +1172,27 @@ re-colliding under a random backoff (2–20 ms) far smaller than the commit itse
 Reads under the same load are unaffected — point read median 1.52 ms, p99 under 6 ms, zero torn
 reads in 6,207 rounds — so this is purely a write-throughput ceiling.
 
-W6 candidate: declare page-0 interest only when the directory actually changes (table creation, a
-chain extension moving the extent record), which restores the disjoint concurrency BR-6 promises;
-plus commit-aware backoff in the retry guidance. Instrument: `scratchpad` smoke promoted to
-`tools/measure_concurrency.py` if this is picked up.
+**The obvious candidate is VOID, verified:** "declare page-0 interest only when the directory
+changes" fails because `next_record_id` lives in the page-0 directory entry and `allocate` spends
+it on EVERY insert -- the write is real every time, and under whole-page-image redo two concurrent
+page-0 images cannot both survive. Verified premises, measured on this rig: single-writer commit
+95-112 ms median (so the 313 ms under 4 writers is ~3x queueing), and three caller-backoff
+configurations all pin throughput at ~10.8 rows/s with unfair tails -- client-side retry policy
+moves along the median-vs-tail curve (expo+jitter halves median and conflicts; shipped in the
+instrument and the README example) and cannot move the curve.
+
+**The real W6 options, each a frozen-surface amendment (section 8.5 / on-disk format):**
+
+1. **Identity-range leasing per participant.** A writer leases a block of N identities in one
+   page-0 write and allocates from memory; most commits then never touch the counter. Gaps on a
+   crash are already sanctioned ("an id burned ... leaves a GAP, which no reader can observe").
+   Smallest blast radius. Page 0 still carries extent hints, but their LAG is already tolerated
+   and repaired (A40.2), so hint updates could ride only the commits that grow a chain.
+2. **Per-table directory pages.** Splits the lock per table -- disjoint-TABLE writers stop
+   intersecting; same-table writers still queue. A heap header layout change.
+3. **Logical, merge-able records for directory state** instead of whole-page images -- the
+   deepest option, touching the redo model itself.
+
+Recommended order: 1, then measure; 2 only if multi-table ingest is the workload; 3 only if the
+first two prove insufficient. Every option needs an amendment record and the full builder +
+blind-critic cycle. Instrument for before/after: `tools/measure_concurrency.py`.

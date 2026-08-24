@@ -63,10 +63,21 @@ conflicts = 0
 
 
 def committed(build, bucket):
-    """Run one transaction to a successful commit, timing END TO END including retries."""
+    """Run one transaction to a successful commit, timing END TO END including retries.
+
+    The backoff is exponential with full jitter, scaled to the commit cost -- and three
+    configurations MEASURED on this rig say what a caller can and cannot buy with it. Uniform
+    2-20 ms against a ~100 ms commit: median 313 ms, p90 3.45 s, 254 conflicts (writers wake
+    inside each other's commit window and re-collide). Expo capped at 1 s: median 207 ms,
+    conflicts 134 -- and p99 WORSE (7.2 s), because a writer backed off to its ceiling keeps
+    losing to fresh arrivals. Capped at 0.35 s: p90 2.5 s, tails still noisy. Throughput is
+    ~10.8 rows/s in ALL three: the ceiling is the serialized commit (heap page 0 is in every
+    write set -- see PUNCHLIST), and no client-side backoff adds fairness to a convoy. Backoff
+    chooses where on the median-vs-tail curve a caller sits; moving the curve is engine work.
+    """
     global conflicts
     started = time.perf_counter()
-    for _ in range(60):
+    for attempt in range(60):
         try:
             with db.begin("write") as txn:
                 made = build(txn)
@@ -75,7 +86,8 @@ def committed(build, bucket):
         except GrafxError as refused:
             if getattr(refused, "retryable", False):
                 conflicts += 1
-                time.sleep(rnd.uniform(0.002, 0.02))
+                ceiling = min(0.08 * (2 ** min(attempt, 4)), 0.35)
+                time.sleep(rnd.uniform(0.0, ceiling))
                 continue
             raise
         except BaseException as escaped:

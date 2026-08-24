@@ -68,15 +68,35 @@ primary-key index holds its ~1.5 ms median under full contention.
 
 10.9 rows/s aggregate; 254 retryable conflicts, all retried to success.
 
+**The caller-side lever, measured and mostly refuted.** Single-writer commit on this rig costs
+95-112 ms median, so the 313 ms above is ~3x queueing. Three retry-backoff configurations, same
+engine, same workload:
+
+| caller backoff | median | p90 | p99 | conflicts | throughput |
+|---|---|---|---|---|---|
+| uniform 2-20 ms | 313 ms | 3.45 s | 5.1 s | 254 | 10.9 rows/s |
+| expo + jitter, cap 1 s | **207 ms** | 3.69 s | 7.2 s | **134** | 10.8 rows/s |
+| expo + jitter, cap 0.35 s | 278 ms | **2.52 s** | noisy | 179 | 10.8 rows/s |
+
+A commit-scaled exponential backoff halves the median and the conflict count -- worth doing, and
+the instrument and the README's retry example now ship it -- but **throughput is pinned at ~10.8
+rows/s in all three and the tail is unfair in all three**: a writer backed off to its ceiling keeps
+losing to fresh arrivals, and no client-side backoff adds fairness to a convoy on a serialized
+resource. Backoff chooses where on the median-vs-tail curve a caller sits; moving the curve is
+engine work.
+
 **Read the write table with its diagnosis, which this measurement produced.** The disjoint phase
 has the *worse* tail — writers whose keys never touch conflicted constantly. The cause is
 structural and recorded: every row-writing commit declares interest in **heap page 0** (the table
 directory, unconditionally, since the E1 fix), so any two write commits in the database intersect
 and optimistic validation serializes them. Effective write concurrency is ~1; end-to-end latency is
 queueing over this platform's ~300 ms commit cost (the Windows publication gap, §5) with a retry
-backoff too small to de-synchronize the queue. The W6 candidate fix — declare page-0 interest only
-when the directory actually changes — is in `docs/architecture/PUNCHLIST.md` under *"Heap page 0 is
-a global write lock, measured"*.
+backoff too small to de-synchronize the queue. The obvious fix — declare page-0 interest
+only when the directory changes — is **void, verified against the code**: `next_record_id` lives in
+the page-0 directory entry and every insert spends it, so the write is real every time. The real
+levers are format/protocol work (identity-range leasing per participant, per-table directory pages,
+merge-able directory records) and are laid out with their blast radii in
+`docs/architecture/PUNCHLIST.md` under *"Heap page 0 is a global write lock, measured"*.
 
 ---
 

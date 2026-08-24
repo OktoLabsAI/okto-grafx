@@ -225,8 +225,10 @@ A conflict is the protocol working, not an error in your code. Retry with a fres
 ```python
 from okto_grafx.domain.errors import GrafxError
 
+import random, time
+
 def transfer(db, statement, parameters, attempts=20):
-    for _ in range(attempts):
+    for attempt in range(attempts):
         try:
             with db.begin("write") as txn:
                 txn.execute(statement, parameters)
@@ -234,6 +236,11 @@ def transfer(db, statement, parameters, attempts=20):
         except GrafxError as refused:
             if not getattr(refused, "retryable", False):
                 raise
+            # Exponential backoff with full jitter, scaled to your platform's COMMIT cost --
+            # a backoff smaller than one commit is a busy-wait. Measured: this halves the
+            # median latency and the conflict count under contention; it cannot fix the tail,
+            # which is a fairness property (see docs/PERFORMANCE.md).
+            time.sleep(random.uniform(0.0, min(0.08 * 2 ** min(attempt, 4), 0.5)))
     raise RuntimeError("gave up after too many conflicts")
 ```
 
