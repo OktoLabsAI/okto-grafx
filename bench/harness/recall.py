@@ -403,7 +403,15 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
         )
     grid_units = mean * profile.queries * profile.k
     total = round(grid_units)
-    if abs(grid_units - total) > 1e-6:
+    # ULP-derived acceptance band (round-3 preliminary blocker): a flat 1e-6 accepted
+    # fabricated means with deltas down to 1e-8, and naive equality is wrong the other
+    # way -- fsum(m/k)/q can legitimately sit 1 ulp off the rational S/(q*k) at k=10.
+    # The worker's mean passes through three correctly-rounded stages (each m/k, the
+    # fsum, the /q) plus the two multiplications of this very comparison: an honest
+    # budget of a handful of ulps. 16*eps*q*k over-covers that budget while every
+    # fabrication from 1e-12 upward lands orders of magnitude outside it.
+    tolerance = 16.0 * sys.float_info.epsilon * profile.queries * profile.k
+    if abs(grid_units - total) > tolerance:
         return (
             f"observed.mean_recall_at_k {_describe(mean)} is not on the recall@k "
             f"grid for queries={profile.queries}, k={profile.k}"

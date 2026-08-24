@@ -679,6 +679,28 @@ def test_an_unrealizable_summary_is_refused_and_the_possible_one_accepted(
     )
 
 
+def test_the_mean_acceptance_band_is_ulp_scaled_not_a_flat_epsilon() -> None:
+    """Preliminary round-3 blocker: the flat 1e-6 accepted fabricated means down to
+    1e-8 deltas. The band now hugs the honest rounding budget: real 1-ulp neighbours
+    of 31/32 pass in BOTH directions, every fabricated delta from 1e-12 up is refused."""
+    import math as math_module
+
+    from bench.harness.recall import _validate_verdict
+
+    for direction in (0.0, 1.0):
+        neighbour = _verdict_stub()
+        nudged = math_module.nextafter(0.96875, direction)
+        neighbour["observed"]["mean_recall_at_k"] = nudged
+        neighbour["gauge"] = nudged
+        assert _validate_verdict(neighbour, "tiny") is None, direction
+    for delta in (1e-12, 1e-10, 1e-9, 1e-8):
+        fabricated = _verdict_stub()
+        fabricated["observed"]["mean_recall_at_k"] = 0.96875 + delta
+        fabricated["gauge"] = 0.96875 + delta
+        reason = _validate_verdict(fabricated, "tiny")
+        assert reason is not None and "grid" in reason, (delta, reason)
+
+
 def test_a_chameleon_mapping_cannot_split_validation_from_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
