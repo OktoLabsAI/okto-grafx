@@ -353,6 +353,7 @@ def test_a_capture_cannot_be_handed_something_that_is_not_bytes(stack: Stack) ->
 def test_every_main_data_file_is_recognised_as_protected() -> None:
     for name in PROTECTED_FILES:
         assert is_protected(name) is True
+    assert is_protected("bootstrap/first-open.intent") is True
     assert is_protected("index/by_name.idx") is True
     assert is_protected("wal/000000000001.wal") is False
     assert is_protected("control/writer.lease") is False
@@ -361,7 +362,12 @@ def test_every_main_data_file_is_recognised_as_protected() -> None:
 def test_a_restore_never_writes_over_a_main_data_file(stack: Stack) -> None:
     _seed(stack)
     entry = stack.quarantine.capture(origin=ORIGIN, offset=0, length=16, reason="a")
-    for target in ("heap.dat", "catalog.dat", "index/by_name.idx"):
+    for target in (
+        "heap.dat",
+        "catalog.dat",
+        "bootstrap/first-open.intent",
+        "index/by_name.idx",
+    ):
         with pytest.raises(GrafxQuarantineError) as caught:
             stack.quarantine.restore(entry.name, target=target)
         assert caught.value.details["field"] == "target"

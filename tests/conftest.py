@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from okto_grafx.adapters.codec_v1 import PageCodecV1
 from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxUnsupportedOperation
 from okto_grafx.domain.ids import Epoch, Lsn, PageIndex
 from okto_grafx.domain.ports import (
@@ -217,23 +218,24 @@ class FakeCoordinator:
 
 
 class FakePageCodec:
-    """Identity codec: it proves the shape of the port without claiming to be CRC-32C."""
+    """Inspectable codec twin that preserves the real page-format semantics of the port."""
 
     def __init__(self, page_size: int = 8192) -> None:
         self._page_size = page_size
+        self._codec = PageCodecV1(page_size)
 
     @property
     def format_version(self) -> int:
         return 1
 
     def checksum(self, payload: bytes) -> int:
-        return sum(payload) & 0xFFFFFFFF
+        return self._codec.checksum(payload)
 
     def encode_page(self, page: object) -> bytes:
-        return bytes(self._page_size)
+        return self._codec.encode_page(page)  # type: ignore[arg-type]
 
     def decode_page(self, raw: bytes, *, verify: bool = True) -> object:
-        return raw
+        return self._codec.decode_page(raw, verify=verify)
 
 
 class RecordingMetricsSink:

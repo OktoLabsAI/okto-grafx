@@ -30,6 +30,7 @@ from okto_grafx.domain.errors import (
     GrafxDurabilityBarrierFailed,
     GrafxError,
     GrafxStorageError,
+    GrafxUnsupportedOperation,
 )
 
 PAGE_SIZE: int = 512
@@ -39,7 +40,116 @@ SEGMENT: str = "wal/000000000001.wal"
 HEAP: str = "heap.dat"
 
 
+def _directory_symlink_or_skip(link: Path, target: Path) -> None:
+    """Create the platform's directory reparse link, or declare the host cannot exercise it."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except (NotImplementedError, OSError) as failure:
+        pytest.skip(f"directory symlink/reparse creation is unavailable: {failure}")
+
+
 # --- durability ---------------------------------------------------------------------------
+
+
+def test_a_redirected_logical_component_is_never_followed_or_ignored(tmp_path: Path) -> None:
+    root = tmp_path / "database"
+    victim = tmp_path / "victim"
+    root.mkdir()
+    victim.mkdir()
+    protected = victim / "first-open.intent"
+    protected.write_bytes(b"victim bytes")
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE)
+    original = root / "bootstrap-original"
+    redirected = root / "bootstrap"
+    redirected.mkdir()
+    redirected.rename(original)
+    try:
+        _directory_symlink_or_skip(redirected, victim)
+        before = {entry.name: entry.read_bytes() for entry in victim.iterdir()}
+        for operation in (
+            device.list_files,
+            lambda: device.exists("bootstrap/first-open.intent"),
+            lambda: device.create("bootstrap/new.intent"),
+            lambda: device.remove("bootstrap/first-open.intent"),
+        ):
+            with pytest.raises(GrafxUnsupportedOperation) as raised:
+                operation()
+            assert raised.value.details["reason"] == "redirected_path"
+        assert {entry.name: entry.read_bytes() for entry in victim.iterdir()} == before
+    finally:
+        device.close()
+        if redirected.is_symlink():
+            redirected.unlink()
+        if original.exists():
+            original.rename(redirected)
+
+
+def test_a_database_root_exchanged_for_a_redirect_is_refused_without_touching_victim(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "database"
+    original = tmp_path / "database-original"
+    victim = tmp_path / "victim"
+    root.mkdir()
+    victim.mkdir()
+    protected = victim / "protected.bin"
+    protected.write_bytes(b"authoritative victim bytes")
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE)
+    root.rename(original)
+    try:
+        _directory_symlink_or_skip(root, victim)
+        before = {entry.name: entry.read_bytes() for entry in victim.iterdir()}
+        for operation in (
+            device.list_files,
+            lambda: device.exists("protected.bin"),
+            lambda: device.create("new.bin"),
+            lambda: device.remove("protected.bin"),
+        ):
+            with pytest.raises(GrafxUnsupportedOperation) as raised:
+                operation()
+            assert raised.value.details["reason"] == "redirected_root"
+        assert {entry.name: entry.read_bytes() for entry in victim.iterdir()} == before
+    finally:
+        device.close()
+        if root.is_symlink():
+            root.unlink()
+        if original.exists():
+            original.rename(root)
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(IS_WINDOWS, reason="A FIFO namespace probe requires POSIX mkfifo.")
+def test_a_special_namespace_entry_is_refused_without_opening_or_mutating_it(
+    tmp_path: Path,
+) -> None:
+    """FIFO evidence is classified by lstat; no operation may open and block on it."""
+    root = tmp_path / "database"
+    root.mkdir()
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE)
+    fifo = root / "operator.evidence"
+    os.mkfifo(fifo)
+    before = os.lstat(fifo)
+    try:
+        for operation in (
+            device.list_files,
+            lambda: device.exists("operator.evidence"),
+            lambda: device.create("operator.evidence"),
+            lambda: device.remove("operator.evidence"),
+        ):
+            with pytest.raises(GrafxUnsupportedOperation) as raised:
+                operation()
+            assert raised.value.details["reason"] == "unsupported_entry_type"
+            assert raised.value.details["file"] == "operator.evidence"
+        after = os.lstat(fifo)
+        assert (after.st_mode, after.st_ino, after.st_size) == (
+            before.st_mode,
+            before.st_ino,
+            before.st_size,
+        )
+        assert tuple(entry.name for entry in root.iterdir()) == ("operator.evidence",)
+    finally:
+        device.close()
+        fifo.unlink()
 
 
 def _record_barrier(device: LocalStorageDevice, file: str | None) -> tuple[set[int], int]:
@@ -159,6 +269,120 @@ def test_a_barrier_flushes_the_parent_directory_on_posix(local_device: LocalStor
         storage_local.os.fsync = original
     assert True in kinds, "the barrier did not flush any directory"
     assert False in kinds, "the barrier did not flush the file itself"
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(IS_WINDOWS, reason="Only POSIX exposes directory fsync durability.")
+def test_nested_namespace_create_remove_and_rename_leave_directory_barrier_debts(
+    local_device: LocalStorageDevice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A global barrier finds directory mutations even after their file name disappeared."""
+    root = Path(local_device.root)
+    opened_directories: list[Path] = []
+    real_open = os.open
+
+    def _recording_open(path: Any, flags: int, *rest: Any) -> int:
+        candidate = Path(path)
+        if candidate.is_dir():
+            opened_directories.append(candidate)
+        return real_open(path, flags, *rest)
+
+    monkeypatch.setattr(storage_local.os, "open", _recording_open)
+
+    nested = "bootstrap/nested/first-open.intent"
+    local_device.create(nested)
+    local_device.append_log(nested, b"intent")
+    local_device.durable_barrier(None)
+    assert set(opened_directories) >= {
+        root,
+        root / "bootstrap",
+        root / "bootstrap" / "nested",
+    }
+
+    opened_directories.clear()
+    local_device.remove(nested)
+    local_device.durable_barrier(None)
+    assert set(opened_directories) >= {
+        root,
+        root / "bootstrap",
+        root / "bootstrap" / "nested",
+    }, "remove lost the nested parent once the file descriptor/name was gone"
+
+    source = "bootstrap/incoming/intent.staging"
+    target = "published/state/intent"
+    local_device.create(source)
+    local_device.append_log(source, b"complete")
+    local_device.durable_barrier(source)
+    opened_directories.clear()
+    local_device.atomic_replace(source, target)
+    local_device.durable_barrier(None)
+    assert set(opened_directories) >= {
+        root,
+        root / "bootstrap",
+        root / "bootstrap" / "incoming",
+        root / "published",
+        root / "published" / "state",
+    }, "atomic rename did not pin both the source removal and target publication namespaces"
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(IS_WINDOWS, reason="Only POSIX exposes directory fsync durability.")
+def test_first_barrier_publishes_a_new_database_root_through_every_created_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fault model drops a created directory unless its publishing parent was fsynced."""
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    root = existing / "created-parent" / "database"
+    created = (root.parent, root)
+    opened_directories: list[Path] = []
+    real_open = os.open
+
+    def _recording_open(path: Any, flags: int, *rest: Any) -> int:
+        candidate = Path(path)
+        if candidate.is_dir():
+            opened_directories.append(candidate)
+        return real_open(path, flags, *rest)
+
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE)
+    device.create(HEAP)
+    device.allocate(HEAP)
+    monkeypatch.setattr(storage_local.os, "open", _recording_open)
+    device.durable_barrier(None)
+
+    durable_directories = set(opened_directories)
+    # Fault model: after power loss, a newly-created directory remains reachable only when the
+    # parent entry that names it was pinned.  This is the exact hole fsync(root) alone leaves.
+    survivors = tuple(directory for directory in created if directory.parent in durable_directories)
+    assert survivors == created
+    assert {root, root.parent, existing} <= durable_directories
+    assert tmp_path not in durable_directories, "a pre-existing ancestor gained false debt"
+    device.close()
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(IS_WINDOWS, reason="Only POSIX exposes directory fsync durability.")
+def test_a_preexisting_database_root_does_not_gain_parent_namespace_debt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "already-there"
+    root.mkdir()
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE)
+    device.create(HEAP)
+    opened_directories: list[Path] = []
+    real_open = os.open
+
+    def _recording_open(path: Any, flags: int, *rest: Any) -> int:
+        candidate = Path(path)
+        if candidate.is_dir():
+            opened_directories.append(candidate)
+        return real_open(path, flags, *rest)
+
+    monkeypatch.setattr(storage_local.os, "open", _recording_open)
+    device.durable_barrier(None)
+    assert root in opened_directories
+    assert root.parent not in opened_directories
+    device.close()
 
 
 @pytest.mark.platform_specific

@@ -62,6 +62,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import os
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -544,6 +545,43 @@ def _is_queueable(relative: str) -> bool:
     return _is_pending_delete(relative)
 
 
+def _missing_directory_chain(path: str) -> tuple[str, ...]:
+    """Return missing directories from the first absent ancestor through ``path``.
+
+    The snapshot is taken before ``makedirs``.  Only these names can create namespace debt for
+    their parents; a root that already existed when the adapter opened must not make every
+    later barrier fsync a directory the adapter did not publish.
+    """
+    missing: list[str] = []
+    current = path
+    while not os.path.lexists(current):
+        missing.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    missing.reverse()
+    return tuple(missing)
+
+
+def _is_redirected_path(path: str, information: os.stat_result | None = None) -> bool:
+    """Return True for a symlink, junction or any Windows reparse-point component."""
+    try:
+        details = os.lstat(path) if information is None else information
+    except OSError:
+        return False
+    if stat.S_ISLNK(details.st_mode):
+        return True
+    attributes = getattr(details, "st_file_attributes", 0)
+    if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+        return True
+    is_junction = getattr(os.path, "isjunction", None)
+    if callable(is_junction):
+        with contextlib.suppress(OSError):
+            return bool(is_junction(path))
+    return False
+
+
 class LocalStorageDevice:
     """StorageDevice backed by a real directory, with POSIX and Windows treated as equal citizens."""
 
@@ -565,13 +603,37 @@ class LocalStorageDevice:
         self._lock = threading.RLock()
         self._handles: dict[str, int] = {}
         self._dirty: set[str] = set()
+        # File bytes and namespace entries have different durability authorities on POSIX.
+        # ``_dirty`` records descriptors whose bytes still need fsync; this set records the
+        # directories whose entries changed.  Keeping the latter independently is essential
+        # for remove(): once a file is gone there is deliberately no descriptor left for a
+        # later global barrier to discover, but its parent directory still owes an fsync.
+        self._dirty_directories: set[str] = set()
         self._deferred: dict[str, int] = {}
         self._pending_serial = 0
         self._closed = False
+        missing_directories = _missing_directory_chain(self._root)
         try:
             os.makedirs(self._root, exist_ok=True)
         except OSError as failure:
             raise self._device_failure("open_root", self._root, failure) from failure
+        try:
+            root_information = os.lstat(self._root)
+        except OSError as failure:
+            raise self._device_failure("inspect_root", self._root, failure) from failure
+        if _is_redirected_path(self._root, root_information):
+            raise refuse_operation(
+                "redirected_root",
+                "A database root may not itself be a symlink, junction or reparse point.",
+                file=self._root,
+            )
+        self._root_real = os.path.realpath(self._root)
+        self._root_identity = (root_information.st_dev, root_information.st_ino)
+        # Publishing a newly-created root changes its PARENT namespace, not the root itself.
+        # For a multi-level makedirs chain each created directory contributes exactly the parent
+        # that names it.  The first barrier flushes root -> ... -> first pre-existing ancestor.
+        for created in missing_directories:
+            self._dirty_directories.add(os.path.dirname(created))
         self._adopt_pending_deletes()
 
     # --- identity -----------------------------------------------------------------------
@@ -622,6 +684,7 @@ class LocalStorageDevice:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
             except OSError as failure:
                 raise self._device_failure("create", name, failure) from failure
+            self._acknowledge_namespace(path)
             self._forget_deferred(name)
             descriptor = self._retry("create", name, lambda: _open_descriptor(path, create_new=True))
             self._admit(name, descriptor)
@@ -641,6 +704,7 @@ class LocalStorageDevice:
             self._dirty.discard(name)
             path = self._physical_path(name)
             self._retry("remove", name, lambda: _remove_file(path))
+            self._acknowledge_namespace(path)
             self._forget_deferred(name)
             # Draining afterwards keeps this door an independent trigger for the deletion queue
             # without letting a pass take the very file the caller asked about.
@@ -697,6 +761,8 @@ class LocalStorageDevice:
             # families: os.rename fails on Windows the moment the target exists, and os.replace
             # fails there whenever another participant holds the target open (CF-5).
             self._retry("atomic_replace", target_name, lambda: _publish_over(source_path, target_path))
+            self._acknowledge_namespace(source_path)
+            self._acknowledge_namespace(target_path)
             self._dirty.discard(source_name)
             self._acknowledge(target_name)
             # Any deletion still queued for either name refers to a file that is now gone or
@@ -757,6 +823,7 @@ class LocalStorageDevice:
                     # Checked before the attempt cap: a file that is already gone must be
                     # retired from the queue, otherwise an operator reads a phantom forever.
                     del self._deferred[relative]
+                    self._acknowledge_namespace(path)
                     reclaimed += 1
                     continue
                 if attempts >= MAX_PENDING_DELETE_ATTEMPTS and not force:
@@ -765,6 +832,7 @@ class LocalStorageDevice:
                     _remove_file(path)
                 except FileNotFoundError:
                     del self._deferred[relative]
+                    self._acknowledge_namespace(path)
                     reclaimed += 1
                 except OSError:
                     self._deferred[relative] = attempts + 1
@@ -775,6 +843,7 @@ class LocalStorageDevice:
                         self._deferred[relative] = attempts + 1
                     else:
                         del self._deferred[relative]
+                        self._acknowledge_namespace(path)
                         reclaimed += 1
             return reclaimed
 
@@ -925,10 +994,16 @@ class LocalStorageDevice:
         (``reason``, ``errno``, ``winerror``, ``attempts``, ``retryable``).
         """
         names: tuple[str, ...] = ()
+        directories: tuple[str, ...] = ()
         with self._lock:
             try:
                 self._require_open()
                 names = self._barrier_targets(file)
+                # A named barrier still flushes every outstanding namespace mutation.  A
+                # rename can change two different parent directories and a removed file has
+                # no name left from which to rediscover either one.  Flushing this small set is
+                # conservative and mirrors what fsync(parent) already does for sibling names.
+                directories = tuple(self._dirty_directories)
                 for name in names:
                     descriptor = self._descriptor(name, "read")
                     try:
@@ -944,12 +1019,13 @@ class LocalStorageDevice:
                             attempts=1,
                         ) from failure
                 if not IS_WINDOWS:
-                    self._synchronize_directories(names)
+                    self._synchronize_directories(names, extra=directories)
             except GrafxDurabilityBarrierFailed:
                 raise
             except GrafxError as failure:
                 raise barrier_failure_from(failure) from failure
             self._dirty.difference_update(names)
+            self._dirty_directories.difference_update(directories)
 
     # --- lifecycle ----------------------------------------------------------------------
 
@@ -1007,6 +1083,7 @@ class LocalStorageDevice:
             except OSError:
                 pass
             else:
+                self._acknowledge_namespace(path)
                 return True
         pending = self._pending_path(path)
         try:
@@ -1018,12 +1095,16 @@ class LocalStorageDevice:
                 _remove_file(path)
             except OSError:
                 return False
+            self._acknowledge_namespace(path)
             return not self._entry_present(path)
+        self._acknowledge_namespace(path)
+        self._acknowledge_namespace(pending)
         self._forget_deferred(name)
         try:
             _remove_file(pending)
         except OSError:
             return self._defer(pending)
+        self._acknowledge_namespace(pending)
         if self._entry_present(pending):
             return self._defer(pending)
         return True
@@ -1075,10 +1156,84 @@ class LocalStorageDevice:
 
     def _physical_path(self, name: str) -> str:
         """Translate a logical name into the real path it denotes inside the database directory."""
-        return os.path.join(self._root, *name.split("/"))
+        path = os.path.join(self._root, *name.split("/"))
+        self._require_safe_path(name)
+        return path
+
+    def _require_root_identity(self, name: str) -> None:
+        """Refuse a root that was exchanged or redirected after this adapter opened it."""
+        try:
+            information = os.lstat(self._root)
+        except OSError as failure:
+            raise self._device_failure("inspect_root", name, failure) from failure
+        observed = (information.st_dev, information.st_ino)
+        if (
+            observed != self._root_identity
+            or _is_redirected_path(self._root, information)
+            or os.path.normcase(os.path.realpath(self._root))
+            != os.path.normcase(self._root_real)
+        ):
+            raise refuse_operation(
+                "redirected_root",
+                "The database root was replaced or redirected after the storage device opened.",
+                file=name,
+                root=self._root,
+            )
+
+    def _require_contained(self, name: str, path: str) -> None:
+        """Refuse a real path whose resolution leaves the opened database root."""
+        resolved = os.path.realpath(path)
+        try:
+            common = os.path.commonpath((self._root_real, resolved))
+        except ValueError:
+            common = ""
+        if os.path.normcase(common) != os.path.normcase(self._root_real):
+            raise refuse_operation(
+                "path_escape",
+                f"Logical file {name!r} resolves outside the database root.",
+                file=name,
+                component=self._relative(path),
+            )
+
+    def _require_safe_path(self, name: str) -> None:
+        """Refuse every existing redirected component of one logical file path."""
+        self._require_root_identity(name)
+        current = self._root
+        for segment in name.split("/"):
+            current = os.path.join(current, segment)
+            try:
+                information = os.lstat(current)
+            except (FileNotFoundError, NotADirectoryError):
+                # Missing suffixes are safe only while their eventual resolution stays under
+                # root; a preceding symlink was already met and refused above.
+                self._require_contained(name, current)
+                continue
+            except OSError as failure:
+                raise self._device_failure("inspect_path", name, failure) from failure
+            if _is_redirected_path(current, information):
+                raise refuse_operation(
+                    "redirected_path",
+                    f"Logical file {name!r} crosses a symlink, junction or reparse point.",
+                    file=name,
+                    component=self._relative(current),
+                )
+            if not (
+                stat.S_ISDIR(information.st_mode)
+                or stat.S_ISREG(information.st_mode)
+            ):
+                raise refuse_operation(
+                    "unsupported_entry_type",
+                    f"Logical file {name!r} crosses a filesystem entry that is neither a "
+                    "regular file nor a directory.",
+                    file=name,
+                    component=self._relative(current),
+                    mode=stat.S_IFMT(information.st_mode),
+                )
+            self._require_contained(name, current)
 
     def _require_directory_parents(self, name: str) -> None:
         """Refuse a name whose parent segment is itself a stored file, on both families alike."""
+        self._require_safe_path(name)
         current = self._root
         for segment in name.split("/")[:-1]:
             current = os.path.join(current, segment)
@@ -1087,21 +1242,32 @@ class LocalStorageDevice:
 
     def _adopt_pending_deletes(self) -> None:
         """Take over the deferred deletions a previous run left behind, and keep serials unique."""
-        for directory, _, files in os.walk(self._root):
-            relative = os.path.relpath(directory, self._root)
-            prefix = "" if relative == "." else relative.replace(os.sep, "/") + "/"
-            for entry in files:
-                marker = entry.lower().rfind(PENDING_DELETE_MARKER)
-                if marker < 0:
-                    continue
-                name = prefix + entry
-                self._deferred.setdefault(name, 0)
-                tail = entry[marker + len(PENDING_DELETE_MARKER) :]
-                if tail.isdigit():
-                    self._pending_serial = max(self._pending_serial, int(tail))
+        for name in self._walk(include_pending=True):
+            entry = name.rsplit("/", 1)[-1]
+            marker = entry.lower().rfind(PENDING_DELETE_MARKER)
+            if marker < 0:
+                continue
+            self._deferred.setdefault(name, 0)
+            tail = entry[marker + len(PENDING_DELETE_MARKER) :]
+            if tail.isdigit():
+                self._pending_serial = max(self._pending_serial, int(tail))
 
     def _entries(self, directory: str, name: str) -> tuple[str, ...]:
         """Return the real entries of one directory, empty when the directory is not there."""
+        self._require_root_identity(name)
+        self._require_contained(name, directory)
+        if os.path.lexists(directory):
+            try:
+                information = os.lstat(directory)
+            except OSError as failure:
+                raise self._device_failure("inspect_path", name, failure) from failure
+            if _is_redirected_path(directory, information):
+                raise refuse_operation(
+                    "redirected_path",
+                    f"Logical file {name!r} crosses a symlink, junction or reparse point.",
+                    file=name,
+                    component=self._relative(directory),
+                )
         try:
             return tuple(os.listdir(directory))
         except (FileNotFoundError, NotADirectoryError):
@@ -1116,6 +1282,7 @@ class LocalStorageDevice:
         cannot make ``Wal/x.wal`` resolve to ``wal/x.wal`` behind the back of the engine. The
         answer is True only for a regular file: a directory is not part of the namespace.
         """
+        self._require_safe_path(name)
         current = self._root
         for segment in name.split("/"):
             entries = self._entries(current, name)
@@ -1132,15 +1299,47 @@ class LocalStorageDevice:
             current = os.path.join(current, segment)
         return os.path.isfile(current)
 
-    def _walk(self) -> Iterable[str]:
-        """Yield every logical name held by the device, deferred deletions excluded."""
-        for directory, _, files in os.walk(self._root):
-            relative = os.path.relpath(directory, self._root)
-            prefix = "" if relative == "." else relative.replace(os.sep, "/") + "/"
-            for entry in files:
-                if _is_pending_delete(entry):
-                    continue
-                yield prefix + entry
+    def _walk(self, *, include_pending: bool = False) -> Iterable[str]:
+        """Yield regular files without ever following or ignoring a redirected component."""
+        self._require_root_identity(self._root)
+        pending: list[tuple[str, str]] = [(self._root, "")]
+        while pending:
+            directory, prefix = pending.pop()
+            try:
+                with os.scandir(directory) as scan:
+                    entries = tuple(scan)
+            except OSError as failure:
+                raise self._device_failure("list", prefix or self._root, failure) from failure
+            for entry in entries:
+                name = prefix + entry.name
+                try:
+                    information = entry.stat(follow_symlinks=False)
+                except OSError as failure:
+                    raise self._device_failure("inspect_path", name, failure) from failure
+                if _is_redirected_path(entry.path, information):
+                    raise refuse_operation(
+                        "redirected_path",
+                        f"Stored namespace component {name!r} is a symlink, junction or "
+                        "reparse point and will not be followed or ignored.",
+                        file=name,
+                        component=name,
+                    )
+                self._require_contained(name, entry.path)
+                if stat.S_ISDIR(information.st_mode):
+                    pending.append((entry.path, name + "/"))
+                elif stat.S_ISREG(information.st_mode) and (
+                    include_pending or not _is_pending_delete(entry.name)
+                ):
+                    yield name
+                elif not stat.S_ISREG(information.st_mode):
+                    raise refuse_operation(
+                        "unsupported_entry_type",
+                        f"Stored namespace component {name!r} is neither a regular file nor "
+                        "a directory and will not be opened or ignored.",
+                        file=name,
+                        component=name,
+                        mode=stat.S_IFMT(information.st_mode),
+                    )
 
     def _descriptor(self, name: str, intent: str) -> int:
         """Return the cached descriptor of a file, opening and admitting it when it is not cached.
@@ -1194,6 +1393,26 @@ class LocalStorageDevice:
         """
         self._dirty.add(name)
         self._forget_deferred(name)
+
+    def _acknowledge_namespace(self, path: str) -> None:
+        """Remember every owned directory whose namespace may have changed.
+
+        The immediate parent owns the file entry; each ancestor owns the entry for the nested
+        directory below it.  Remembering the complete chain makes creation of a new nested
+        namespace durable in the same child-before-parent barrier as its first file.  Existing
+        ancestors may be recorded again -- an idempotent and deliberately conservative debt.
+        """
+        directory = os.path.dirname(path)
+        while True:
+            self._dirty_directories.add(directory)
+            if os.path.normcase(directory) == os.path.normcase(self._root):
+                return
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                # All callers pass a path below _root.  Keep this guard fail-safe if that
+                # invariant is ever broken rather than walking forever at a volume root.
+                return
+            directory = parent
 
     def _admit(self, name: str, descriptor: int) -> None:
         """Cache one descriptor, evicting the least recently used one when the cache is full."""
@@ -1303,11 +1522,19 @@ class LocalStorageDevice:
         """Return the device relative form of a real path, using the logical separator."""
         return os.path.relpath(path, self._root).replace(os.sep, "/")
 
-    def _synchronize_directories(self, names: tuple[str, ...]) -> None:
-        """Flush every directory that holds one of the named files. POSIX only."""
+    def _synchronize_directories(
+        self, names: tuple[str, ...], *, extra: tuple[str, ...] = ()
+    ) -> None:
+        """Flush file parents plus outstanding namespace directories. POSIX only."""
         directories = {os.path.dirname(self._physical_path(name)) for name in names}
+        directories.update(extra)
         directories.add(self._root)
-        for directory in sorted(directories):
+        # A child entry is fixed before the parent entry that makes that child reachable.
+        for directory in sorted(
+            directories,
+            key=lambda path: (path.count(os.sep), path),
+            reverse=True,
+        ):
             try:
                 descriptor = os.open(directory, os.O_RDONLY)
             except OSError as failure:

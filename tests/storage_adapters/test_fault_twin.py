@@ -688,6 +688,31 @@ def test_a_crash_undoes_a_remove_and_a_recycle_that_were_never_durable() -> None
         assert bench.inner.read_log(SEGMENT, 0, len(RECORD)) == RECORD
 
 
+def test_global_barriers_pin_nested_namespace_publication_and_retirement() -> None:
+    """The power-loss twin agrees that rename and later absence are publication state."""
+    staging = "bootstrap/nested/first-open.intent.staging"
+    canonical = "bootstrap/nested/first-open.intent"
+    bench = _twin(plan=FaultPlan(lying_barrier=True))
+    bench.lie_on_barrier(enabled=False)
+
+    bench.create(staging)
+    bench.append_log(staging, b"complete intent")
+    bench.durable_barrier(None)
+    bench.atomic_replace(staging, canonical)
+    bench.durable_barrier(None)
+    assert bench.inner.exists(staging) is False
+    assert bench.inner.exists(canonical) is True
+
+    bench.remove(canonical)
+    bench.durable_barrier(None)
+    bench.lie_on_barrier()
+    bench.crash_on("list_files")
+    with pytest.raises(SimulatedCrash):
+        bench.list_files()
+    assert bench.inner.exists(staging) is False
+    assert bench.inner.exists(canonical) is False
+
+
 def test_a_rollback_the_device_refuses_is_reported_and_never_stops_the_crash() -> None:
     bench = _twin(plan=FaultPlan(lying_barrier=True))
     bench.create(SEGMENT)

@@ -94,8 +94,13 @@ protocol. Treating it as an arbitrary damaged coordination record lets the gener
 door erase the snapshot/checkpoint fence after a probe/capture TOCTOU.
 """
 
-PROTECTED_PREFIXES: tuple[str, ...] = ("index/",)
-"""Prefixes under the same protection: every secondary index file (G6, BR-1)."""
+PROTECTED_PREFIXES: tuple[str, ...] = ("bootstrap/", "index/")
+"""Protected derived indexes and the authority-bearing first-open protocol namespace.
+
+Bootstrap staging is retired only while holding the first-open cross-process section and only
+after proving that no published/transaction state exists.  A generic quarantine restore has
+neither proof, so it may not manufacture or replace an intent/staging name behind that protocol.
+"""
 
 COPY_ATTEMPTS: int = 3
 """How many times a copy rides out a device condition its details declare retryable (A47)."""
