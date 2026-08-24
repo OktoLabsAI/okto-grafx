@@ -1259,6 +1259,7 @@ option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`
   typed before first-open. Registry composition uses one validated atomic snapshot. The
   process-global checksum selector also runs with custom registries, and checksum providers can no
   longer pass validation with forged equality or a non-`u32` result.
-- **IN PROGRESS (C13)** — `vector_recall_target` remains non-certifying until the deterministic
-  pure/NumPy recall calibration publishes its gauge and CI enables `--require-recall`. It must not
-  be described as an active runtime guarantee before that gate lands.
+- **CLOSED** — the inert runtime `vector_recall_target` field was removed rather than wired to an
+  invented target-to-beam formula. `connect()` retains a typed tombstone that points callers to
+  `bench.harness.gate --recall-target`; vector regression floors now come from that offline owner.
+  `vector_ef_search` remains the separately tested runtime effort control.

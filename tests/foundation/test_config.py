@@ -44,7 +44,9 @@ def test_defaults_match_the_contract() -> None:
     assert config.vector_math == "auto"
     assert config.vector_exact_scan_threshold == 4096
     assert config.vector_ef_search == 320
-    assert config.vector_recall_target == 0.90
+    assert "vector_recall_target" not in {
+        field.name for field in dataclasses.fields(DatabaseConfig)
+    }
     assert config.read_only is False
 
 
@@ -303,31 +305,6 @@ def test_an_invalid_hnsw_search_beam_is_rejected(width: object) -> None:
     with pytest.raises(GrafxConfigurationError) as raised:
         DatabaseConfig(path=":memory:", vector_ef_search=width)  # type: ignore[arg-type]
     assert raised.value.details["field"] == "vector_ef_search"
-
-
-@pytest.mark.parametrize("target", [0.5, 0.9, 1.0])
-def test_a_recall_target_in_the_open_unit_interval_is_accepted(target: float) -> None:
-    config = DatabaseConfig(path=":memory:", vector_recall_target=target)
-    assert config.vector_recall_target == target
-
-
-@pytest.mark.parametrize(
-    "target",
-    [
-        0.0,
-        -0.1,
-        1.0001,
-        2,
-        "0.9",
-        None,
-        float("nan"),
-        pytest.param(10**10_000, id="huge_integer"),
-    ],
-)
-def test_an_invalid_recall_target_is_rejected(target: object) -> None:
-    with pytest.raises(GrafxConfigurationError) as raised:
-        DatabaseConfig(path=":memory:", vector_recall_target=target)  # type: ignore[arg-type]
-    assert raised.value.details["field"] == "vector_recall_target"
 
 
 # --- read only ------------------------------------------------------------------------------
@@ -619,7 +596,6 @@ def test_configuration_canonicalizes_every_real_leaf_before_using_it() -> None:
         lease_timeout_seconds=_HostileInt(2),
         commit_lock_timeout_seconds=_HostileFloat(3.0),
         reader_stall_threshold_seconds=_HostileInt(4),
-        vector_recall_target=_HostileFloat(0.9),
     )
 
     for field in (
@@ -627,7 +603,6 @@ def test_configuration_canonicalizes_every_real_leaf_before_using_it() -> None:
         "lease_timeout_seconds",
         "commit_lock_timeout_seconds",
         "reader_stall_threshold_seconds",
-        "vector_recall_target",
     ):
         assert type(getattr(config, field)) is float
 

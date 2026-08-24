@@ -256,6 +256,18 @@ def test_an_unknown_connection_option_is_refused_by_name() -> None:
     assert raised.value.details["field"] == "options"
 
 
+def test_the_removed_recall_knob_names_the_offline_migration() -> None:
+    with pytest.raises(GrafxConfigurationError) as raised:
+        connect(":memory:", vector_recall_target=0.95)  # type: ignore[call-arg]
+
+    assert raised.value.details == {
+        "field": "vector_recall_target",
+        "replacement": "bench.harness.gate --recall-target",
+    }
+    assert "bench.harness.gate --recall-target" in raised.value.message
+    assert "vector_ef_search" in raised.value.message
+
+
 def test_a_read_only_database_refuses_a_write_transaction(tmp_path: Path) -> None:
     root = tmp_path / "db"
     with connect(root) as db:

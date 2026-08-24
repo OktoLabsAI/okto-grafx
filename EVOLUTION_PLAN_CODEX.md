@@ -16,8 +16,8 @@
   módulos e terminou com 100%/exit 0. Duas auditorias independentes aceitaram o milestone.
 - **M1 configuração honesta: em execução.** `checkpoint_interval_records` já está ligado ao caminho
   pós-commit com threshold exato, single-flight, retry após falha tardia e 15 regressões. O C13 de
-  recall vetorial está sendo implementado em branch isolado pelo Claude, com revisão adversarial do
-  Codex antes da integração; `vector_recall_target` continua não certificante até esse gate fechar.
+  recall vetorial continua como gate offline independente; o knob runtime inerte
+  `vector_recall_target` foi removido e seu keyword legado produz uma recusa migratória explícita.
 - **Próximo gate:** concluir C13 e o censo de retornos públicos tipados, integrar serialmente no
   branch M1, executar a suíte completa e publicar um SHA imutável. M2 inicia identity-range leasing
   somente depois desse gate.
@@ -452,12 +452,13 @@ Batching já amortiza muito o custo. Antes de mudar o formato WAL, priorizar:
 
 ## 6. Configuração, API e extensibilidade
 
-### P1.14 — Dois parâmetros públicos não têm efeito (checkpoint fechado; recall em execução)
+### P1.14 — Dois parâmetros públicos não tinham efeito (fechado em M1)
 
 No estado originalmente analisado, `checkpoint_interval_records` e `vector_recall_target` eram
 aceitos e validados em [`config.py`](src/okto_grafx/runtime/config.py#L141), mas não participavam do
-wiring. M1 já ligou o primeiro ao caminho pós-commit; o segundo só será reclassificado quando a
-calibração C13 publicar recall e o gate obrigatório estiver ativo na CI.
+wiring. M1 ligou o primeiro ao caminho pós-commit. O segundo foi removido de `DatabaseConfig`:
+recall é um SLO do gate offline, não algo que um valor passado a `connect()` consiga impor. O nome
+legado recebe uma recusa tipada apontando para `bench.harness.gate --recall-target`.
 
 Naquele estado, o próprio `Database.checkpoint()` afirmava que o WAL crescia até uma chamada manual;
 essa afirmação foi substituída pelo contrato automático e pela regressão de recycle/reopen. O
@@ -574,7 +575,8 @@ Ao abrir um banco existente, esses valores devem ser descobertos da identidade. 
 | `MetricsOptions` | bind, non-loopback opt-in, intervalo, rotação e timeouts |
 | `ConcurrencyOptions` | `identity_lease_size`, group-commit window e batch máximo |
 
-`vector_recall_target` deve ser um SLO de benchmark, não uma promessa que cada query possa garantir sem um oracle exato.
+O alvo de recall pertence a `bench.harness.gate --recall-target`, não a `DatabaseConfig`: é um SLO
+de benchmark, não uma promessa que cada query possa garantir sem um oracle exato.
 
 ## 8. Novas capacidades recomendadas
 
