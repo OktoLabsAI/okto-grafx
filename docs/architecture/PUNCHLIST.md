@@ -1127,7 +1127,10 @@ skipping the `ended` filter, both directions (investigated as blocking and refut
 only DELETEd refs, edge deletion refuses, and an in-transaction SET keeps the old version visible
 in both regimes — **the day edge deletion lands, those two lines have no witness**).
 
-## C12 — the mutation battery is an open obligation (14.1.5)
+## C12 — the mutation battery is an open obligation (14.1.5) — DISCHARGED, see COMPONENTS
+
+The exit-code battery ran against the archive of 51c469c: six of six mutants killed by tests/cli.
+Scope named there. Originally recorded as:
 
 The sign-off audit found no code defect across every documented command, exit code, and
 concurrency shape — and found that the battery recorded as "20/42 killed" mid-session was never

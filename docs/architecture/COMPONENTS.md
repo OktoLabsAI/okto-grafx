@@ -1429,6 +1429,43 @@ not a kill, L7), and the determinism hash was the sha256 of EMPTY input (L28). B
 re-run against an immutable `git archive` of this commit instead; L26's rule — instruments and
 work must not share a mutable substrate — now includes the author's own background jobs.
 
+### The round-6 verification fleet, completed against the archive of 51c469c
+
+The voided report's three debts, discharged on an immutable `git archive` with a source-integrity
+gate (every guarded file sha-checked against the archive before any mutant, and restored when a
+kill left one mutated -- the gate fired four times).
+
+**Determinism (14.1.3): HELD.** Five consecutive full-suite runs, every one `7950 tests,
+0 failures, 0 errors, 5 skipped`, and the sha256 of the sorted test-id set identical across all
+five (`8d62db0e...`), read from the junit files rather than from a pipe that can silently produce
+nothing.
+
+**Battery, full suite per mutant** (killer-set first -- a kill on a subset is final -- then two
+half-suite runs for every survival claim):
+
+| mutant | verdict |
+|---|---|
+| journal never replayed on rollback/retry | KILLED by `test_retry_settles_the_loser...` |
+| working-copy clone skipped | KILLED by `test_a_refused_statement_poisons_nothing...` |
+| metrics containment re-raises | KILLED by `test_a_post_commit_raise_cannot_make_a_durable...` |
+| M05, M07, M15 (operator-door guards on `_tables_written_by`) | SURVIVED, full scope -- unreachable through `connect()`, recorded |
+| M14/M32 (the staleness rule's narrowness) | SURVIVED, full scope -- the E3 counterfactual is the evidence, recorded |
+| M17 (advance loses its flush) | SURVIVED, full scope -- costs a rebuild, never a wrong answer, recorded |
+| M27/M30 (`_rows_carrying_key` guards) | SURVIVED, full scope -- recorded |
+| N01/N03 (traversal never indexed / fan limit 1) | SURVIVED, full scope -- correctness-neutral by construction, the recorded usage gap |
+
+Every round-6 blocking fix therefore has a mutant that dies in its own regression, and every
+survivor is one already dispositioned in this punch list -- now confirmed against the whole suite
+rather than the 2,402-test subset the round-4 report was limited to.
+
+**C12's battery obligation: DISCHARGED, with its scope named.** Six mutants shifting each
+contracted exit code (FINDINGS, USAGE, REFUSED, DAMAGED, RETRY, INCONCLUSIVE): **six of six
+KILLED** by `tests/cli`. Together with the sign-off audit's ~70-invocation behavioural sweep over
+every documented command and the 389-test suite, C12's sign-off is now earned rather than pending.
+The scope is the exit-code mapping, not the whole CLI surface; the audit's behavioural sweep is
+what covers the rest, and saying so is the difference between this record and the "20/42" note it
+replaces.
+
 ### D5 durable_commit — 'consult JP' DISCHARGED: the ceiling stands, W6 owns the Windows gap
 
 SPEC-M1 `fr_18f8eff7` anticipated this: *"se o multiplo de commit exceder 10x, o pipeline PARA em
