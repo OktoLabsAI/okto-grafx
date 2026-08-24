@@ -777,26 +777,59 @@ def test_a_non_utf8_verdict_is_a_typed_refusal_with_cleanup(
     assert leftovers == [], "cleanup must be outcome-neutral"
 
 
-def test_the_mean_acceptance_band_is_ulp_scaled_not_a_flat_epsilon() -> None:
-    """Preliminary round-3 blocker: the flat 1e-6 accepted fabricated means down to
-    1e-8 deltas. The band now hugs the honest rounding budget: real 1-ulp neighbours
-    of 31/32 pass in BOTH directions, every fabricated delta from 1e-12 up is refused."""
+def test_the_mean_acceptance_set_is_exactly_the_fsum_reachable_one() -> None:
+    """Round-3 final: at k=4 the pipeline is EXACT (dyadic grid), so even the 1-ulp
+    neighbours of 31/32 are fiction and are refused; every fabricated delta dies; and
+    a REAL k=10 histogram computed through the worker's own fsum pipeline is accepted
+    -- the interval collapses to equality for dyadic k and spans real ulps for k=10."""
     import math as math_module
 
-    from bench.harness.recall import _validate_verdict
+    from bench.harness.recall import _expected_hashes, _validate_verdict
+    from bench.harness.recall_worker import PROFILES
 
     for direction in (0.0, 1.0):
         neighbour = _verdict_stub()
         nudged = math_module.nextafter(0.96875, direction)
         neighbour["observed"]["mean_recall_at_k"] = nudged
         neighbour["gauge"] = nudged
-        assert _validate_verdict(neighbour, "tiny") is None, direction
+        reason = _validate_verdict(neighbour, "tiny")
+        assert reason is not None, (direction, "dyadic k=4 admits ONLY exact 31/32")
     for delta in (1e-12, 1e-10, 1e-9, 1e-8):
         fabricated = _verdict_stub()
         fabricated["observed"]["mean_recall_at_k"] = 0.96875 + delta
         fabricated["gauge"] = 0.96875 + delta
         reason = _validate_verdict(fabricated, "tiny")
         assert reason is not None and "grid" in reason, (delta, reason)
+    smoke = PROFILES["smoke"]
+    recalls = [1.0] * (smoke.queries - 1) + [3 / 10]
+    mean = math_module.fsum(recalls) / smoke.queries
+    real_histogram = {
+        "ok": True,
+        "failure": "",
+        "profile": "smoke",
+        "generator": "uniform-int53-v1",
+        "oracle": "pure-fsum",
+        "gt_path_used": "pure",
+        "numpy": "absent",
+        "k": smoke.k,
+        "queries": smoke.queries,
+        "corpus_size": smoke.corpus_size,
+        "dimension": smoke.dimension,
+        "hashes": _expected_hashes(smoke),
+        "gauge": mean,
+        "observed": {
+            "mean_recall_at_k": mean,
+            "min_recall_at_k": 3 / 10,
+            "queries_below_perfect": 1,
+            "dtype_check": {"mean_overlap": 1.0, "min_overlap": 1.0},
+        },
+        "blas_environment": {name: "1" for name in _BLAS_THREAD_VARIABLES},
+        "hnsw": dict(HNSW_FROZEN),
+        "duration_seconds": 1.0,
+        "exit_code": 0,
+    }
+    verdict = _validate_verdict(real_histogram, "smoke")
+    assert verdict is None, verdict
 
 
 def test_a_chameleon_mapping_cannot_split_validation_from_publication(

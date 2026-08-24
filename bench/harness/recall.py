@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from fractions import Fraction
 from pathlib import Path
 
 from bench.recall_corpus import (
@@ -236,6 +237,77 @@ def _expected_hashes(profile) -> dict[str, str]:
     return cached
 
 
+_REACHABLE_MEANS: dict[tuple[int, int, int, int, int], frozenset[float]] = {}
+
+
+def _reachable_means(
+    queries: int, k: int, below: int, m_min: int, total: int
+) -> frozenset[float]:
+    """Every float mean some REAL histogram produces via fsum([m/k]*counts)/q.
+
+    The auditor's exact DP, benchmarked at 0.56s cold for the worst real case
+    (q=256, k=10, below=256, total=1294) and cached per (q, k, below, m_min, total).
+    Each grid value's float error e_m = fl(m/k) - m/k is exact as a Fraction; scaling
+    by the LCM of their denominators makes them TINY integers (the denominators are
+    5*2^t, so |err_int| stays single-digit). One occurrence of m_min is fixed; the
+    below-1 remaining non-perfect picks choose from [m_min, k-1] under the exact
+    units target; perfect queries contribute error zero. A bitset DP over
+    (count, units) -> achievable shifted error sums enumerates every reachable exact
+    dyadic fsum, and float(Fraction(total, k) + error) / q reproduces math.fsum's
+    correctly rounded sum followed by the one division -- the worker's own pipeline.
+    For dyadic k every error is zero and the set collapses to the single exact mean.
+    """
+    key = (queries, k, below, m_min, total)
+    cached = _REACHABLE_MEANS.get(key)
+    if cached is not None:
+        return cached
+    base = Fraction(total, k)
+    if below == 0:
+        result = frozenset({float(base) / queries})
+        _REACHABLE_MEANS[key] = result
+        return result
+    errors = [Fraction(m / k) - Fraction(m, k) for m in range(k + 1)]
+    scale = math.lcm(*[fraction.denominator for fraction in errors])
+    err_int = [int(fraction * scale) for fraction in errors]
+    choices = list(range(m_min, k))
+    free = below - 1
+    units_free = (total - (queries - below) * k) - m_min - free * m_min
+    span = k - 1 - m_min
+    reachable_error_ints: set[int] = set()
+    if free == 0:
+        if units_free == 0:
+            reachable_error_ints.add(err_int[m_min])
+    elif 0 <= units_free <= free * span:
+        shift_by_value = {m: err_int[m] - min(err_int[m_min:k]) for m in choices}
+        smallest = min(err_int[m_min:k])
+        # dp[count][units] = bitset of achievable shifted error sums
+        dp = [[0] * (units_free + 1) for _ in range(free + 1)]
+        dp[0][0] = 1
+        for m in choices:
+            value_units = m - m_min
+            value_shift = shift_by_value[m]
+            for count in range(1, free + 1):
+                row = dp[count]
+                previous = dp[count - 1]
+                for units in range(value_units, units_free + 1):
+                    source = previous[units - value_units]
+                    if source:
+                        row[units] |= source << value_shift
+        bits = dp[free][units_free]
+        offset = err_int[m_min] + free * smallest
+        position = 0
+        while bits:
+            if bits & 1:
+                reachable_error_ints.add(offset + position)
+            bits >>= 1
+            position += 1
+    result = frozenset(
+        float(base + Fraction(error, scale)) / queries for error in reachable_error_ints
+    )
+    _REACHABLE_MEANS[key] = result
+    return result
+
+
 class _NotCanonical(Exception):
     """A node that is not exact builtin data; the rebuild refuses it."""
 
@@ -408,15 +480,11 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
         )
     grid_units = mean * profile.queries * profile.k
     total = round(grid_units)
-    # ULP-derived acceptance band (round-3 preliminary blocker): a flat 1e-6 accepted
-    # fabricated means with deltas down to 1e-8, and naive equality is wrong the other
-    # way -- fsum(m/k)/q can legitimately sit 1 ulp off the rational S/(q*k) at k=10.
-    # The worker's mean passes through three correctly-rounded stages (each m/k, the
-    # fsum, the /q) plus the two multiplications of this very comparison: an honest
-    # budget of a handful of ulps. 16*eps*q*k over-covers that budget while every
-    # fabrication from 1e-12 upward lands orders of magnitude outside it.
-    tolerance = 16.0 * sys.float_info.epsilon * profile.queries * profile.k
-    if abs(grid_units - total) > tolerance:
+    # This rounding only PINS the candidate integer total; the decisive test is the
+    # exact fsum-reachable interval below, which collapses to EQUALITY for dyadic k
+    # and spans the single ulps a real histogram can reach otherwise. Half a grid
+    # unit of slack here cannot admit fiction past that exact check.
+    if abs(grid_units - total) > 0.75:
         return (
             f"observed.mean_recall_at_k {_describe(mean)} is not on the recall@k "
             f"grid for queries={profile.queries}, k={profile.k}"
@@ -434,6 +502,17 @@ def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | No
         return (
             "observed mean/min/queries_below_perfect are not jointly realizable for "
             f"queries={profile.queries}, k={profile.k} (grid total {total})"
+        )
+    # Round-3 final refinement: a NEIGHBOURHOOD band still crystallized fiction -- at
+    # k=4 the whole pipeline is EXACT, so even nextafter(31/32) is impossible, and at
+    # k=10 only the means some REAL histogram produces are legitimate. The decisive
+    # test is therefore the exact reachable SET (the auditor's benchmarked bitset DP),
+    # not any interval around it.
+    if mean not in _reachable_means(profile.queries, profile.k, below, m_min, total):
+        return (
+            f"observed.mean_recall_at_k {_describe(mean)} is outside the exact "
+            f"fsum-reachable set on the recall@k grid for total {total} at "
+            f"queries={profile.queries}, k={profile.k}"
         )
     dtype = observed["dtype_check"]
     if not isinstance(dtype, dict) or set(dtype) != {"mean_overlap", "min_overlap"}:
