@@ -33,6 +33,7 @@ from okto_grafx.engine.wal_manager import WalManager
 _SCALAR_DATABASE_PROPERTIES: frozenset[str] = frozenset(
     {
         "attached_indexes",
+        "close_complete",
         "closed",
         "identity",
         "label",

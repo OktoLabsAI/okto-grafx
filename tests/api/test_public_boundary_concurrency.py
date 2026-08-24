@@ -15,8 +15,10 @@ from okto_grafx.adapters.storage_fault import FaultInjectingStorageDevice
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxTransactionStateError,
+    GrafxUnsupportedOperation,
     GrafxWriteConflict,
 )
+from okto_grafx.domain.txn import WalRecordType
 from okto_grafx.domain.txn.context import TransactionContext
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.engine.database import Database, Transaction
@@ -478,6 +480,96 @@ def test_retry_settlement_failure_retires_the_unpublished_successor_and_keeps_ca
         database.close()
 
 
+def test_invalid_retry_keeps_speculative_ddl_intact_until_real_rollback() -> None:
+    """Manager validation refuses before public retry can unwind a live schema journal."""
+    database, registry, storage, _metrics = _instrumented_database()
+    transaction = database.begin("write")
+    transaction.execute("CREATE NODE TABLE Pending(id INT64, PRIMARY KEY(id))")
+
+    try:
+        with pytest.raises(GrafxTransactionStateError) as raised:
+            database.retry(transaction)
+
+        assert raised.value.details["conflicts"] == 0
+        assert transaction.active
+        assert transaction.txn_id in database._public_contexts
+        assert transaction.txn_id in database._queries._working
+        assert transaction.txn_id in database._queries._txn_effects
+        assert "pk_pending" in database._indexes._indexes
+        assert storage.exists("index/pk_Pending.idx")
+
+        transaction.rollback()
+        assert not transaction.active
+        assert transaction.txn_id not in database._public_contexts
+        assert transaction.txn_id not in database._queries._working
+        assert transaction.txn_id not in database._queries._txn_effects
+        assert "pk_pending" not in database._indexes._indexes
+        assert not storage.exists("index/pk_Pending.idx")
+    finally:
+        database.close()
+        release_ports(registry)
+
+
+def test_retry_cleanup_preenter_failure_seals_and_retires_unpublished_successor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable ACTIVE successor forces terminal close without masking settlement."""
+    database, registry, _storage, _metrics = _instrumented_database()
+    loser = _conflicted_writer(database)
+    settlement_failure = RuntimeError("predecessor schema settlement sentinel")
+    cleanup_failure = SystemExit("successor rollback pre-enter sentinel")
+    original_settle = Database._settle_schema
+    original_section = TransactionManager._participant_section
+    original_begin = TransactionManager._begin_in_section
+    created: list[TransactionContext] = []
+    cleanup_armed = [False]
+
+    def capture_successor(self: TransactionManager, mode: object):  # noqa: ANN202
+        answer = original_begin(self, mode)  # type: ignore[arg-type]
+        if self is database._transactions:
+            created.append(answer[0])
+            cleanup_armed[0] = True
+        return answer
+
+    def refuse_predecessor(
+        self: Database, context: TransactionContext, *, committed: bool
+    ) -> None:
+        if self is database and context is loser._context:
+            raise settlement_failure
+        original_settle(self, context, committed=committed)
+
+    def fail_successor_rollback_preenter(self: TransactionManager):  # noqa: ANN202
+        if self is database._transactions and cleanup_armed[0]:
+            cleanup_armed[0] = False
+
+            @contextmanager
+            def refused() -> Iterator[None]:
+                raise cleanup_failure
+                yield  # pragma: no cover - context entry always raises
+
+            return refused()
+        return original_section(self)
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(TransactionManager, "_begin_in_section", capture_successor)
+        boundary.setattr(TransactionManager, "_participant_section", fail_successor_rollback_preenter)
+        boundary.setattr(Database, "_settle_schema", refuse_predecessor)
+        with pytest.raises(RuntimeError) as raised:
+            database.retry(loser)
+
+    assert raised.value is settlement_failure
+    assert len(created) == 1 and created[0].state.value == "aborted"
+    assert any(
+        "SystemExit" in note and "successor rollback pre-enter sentinel" in note
+        for note in getattr(settlement_failure, "__notes__", ())
+    )
+    assert database.closed and database.close_complete
+    assert database._transactions.open_transactions == 0
+    assert database._coordinator.reader_horizon() is None
+    assert database._public_contexts == {}
+    release_ports(registry)
+
+
 def test_public_retry_and_a_checked_commit_have_one_atomic_winner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -532,6 +624,135 @@ def test_public_retry_and_a_checked_commit_have_one_atomic_winner(
     finally:
         database.close()
         release_ports(registry)
+
+
+def test_committed_schema_settlement_failure_is_diagnostic_and_close_retries_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cleanup bomb after manager success cannot turn a durable commit into a retry signal."""
+    database = connect(tmp_path / "settlement-retry")
+    transaction = database.begin("write")
+    transaction.execute("CREATE NODE TABLE Durable(id INT64, PRIMARY KEY(id))")
+    settlement_failure = RuntimeError("committed settlement sentinel")
+    original_settle = QueryEngine.settle_schema
+    armed = [True]
+
+    def fail_once(self: QueryEngine, txn_id: int, *, committed: bool) -> None:
+        if self is database._queries and txn_id == transaction.txn_id and armed[0]:
+            armed[0] = False
+            assert committed is True
+            raise settlement_failure
+        original_settle(self, txn_id, committed=committed)
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(QueryEngine, "settle_schema", fail_once)
+        report = transaction.commit()
+
+    assert report.durable and report.wrote
+    assert transaction.report is report
+    assert not transaction.active
+    assert database._close_failure is settlement_failure
+    assert database._public_contexts == {transaction.txn_id: transaction._context}
+
+    database.close()
+
+    assert database.close_complete
+    assert database._public_contexts == {}
+    with connect(tmp_path / "settlement-retry") as reopened:
+        assert reopened.catalog.catalog.has_table("Durable")
+        assert tuple(index.name for index in reopened.indexes.indexes()) == ("pk_Durable",)
+
+
+def test_public_wrapper_reports_durable_outcome_when_foreign_apply_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-barrier typed failure leaves the public wrapper terminal with an honest report."""
+    database, registry, _storage, _metrics = _instrumented_database()
+    with database.begin("write") as schema:
+        schema.execute("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")
+    writer = database.begin("write")
+    writer.execute("CREATE (:P {id: 1})")
+    apply_failure = RuntimeError("foreign public apply sentinel")
+    commits_before = tuple(
+        record
+        for record in database._wal.read_from(1)
+        if record.record_type == int(WalRecordType.COMMIT)
+    )
+    original_apply = TransactionManager._apply_images
+
+    def fail_apply(
+        self: TransactionManager,
+        images: object,
+    ) -> None:
+        if self is database._transactions:
+            raise apply_failure
+        original_apply(self, images)  # type: ignore[arg-type]
+
+    try:
+        with monkeypatch.context() as boundary:
+            boundary.setattr(TransactionManager, "_apply_images", fail_apply)
+            with pytest.raises(GrafxTransactionStateError) as raised:
+                writer.commit()
+
+        assert raised.value.__cause__ is apply_failure
+        assert raised.value.details["committed"] is True
+        assert raised.value.details["durable"] is True
+        assert raised.value.details["recovery_required"] is True
+        assert raised.value.retryable is False
+        assert not writer.active
+        assert writer.report is not None
+        assert writer.report.durable and writer.report.wrote
+        assert writer.report.csn == writer._context.commit_csn
+        assert writer.txn_id not in database._public_contexts
+        commits_after = tuple(
+            record
+            for record in database._wal.read_from(1)
+            if record.record_type == int(WalRecordType.COMMIT)
+        )
+        assert len(commits_after) == len(commits_before) + 1
+        assert commits_after[-1].txn_id == writer.txn_id
+        assert commits_after[-1].lsn == writer.report.csn
+    finally:
+        database.close()
+        release_ports(registry)
+
+
+def test_autocommit_execute_preserves_primary_when_rollback_cleanup_escapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The convenience read door annotates cleanup and never masks its statement failure."""
+    database = connect(":memory:")
+    statement_failure = ValueError("autocommit statement sentinel")
+    rollback_failure = SystemExit("autocommit rollback sentinel")
+
+    def fail_statement(
+        _transaction: Transaction,
+        _text: str,
+        _parameters: object = None,
+    ) -> object:
+        raise statement_failure
+
+    def fail_rollback(
+        _manager: TransactionManager,
+        _context: TransactionContext,
+    ) -> None:
+        raise rollback_failure
+
+    try:
+        with monkeypatch.context() as boundary:
+            boundary.setattr(Transaction, "execute", fail_statement)
+            boundary.setattr(TransactionManager, "rollback", fail_rollback)
+            with pytest.raises(ValueError) as raised:
+                database.execute("RETURN 1")
+
+        assert raised.value is statement_failure
+        assert any(
+            "SystemExit" in note and "autocommit rollback sentinel" in note
+            for note in getattr(statement_failure, "__notes__", ())
+        )
+        assert database._transactions.open_transactions == 1
+    finally:
+        database.close()
 
 
 def test_failed_retry_metric_reenters_database_only_after_participant_release(
@@ -598,6 +819,192 @@ def test_failed_retry_metric_reenters_database_only_after_participant_release(
         release_ports(registry)
 
 
+def test_rollback_cleanup_failure_after_abort_still_unwinds_schema_and_finishes_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ABORTED manager outcome owns schema unwind even when cleanup reports a sentinel."""
+    database, registry, storage, _metrics = _instrumented_database()
+    transaction = database.begin("write")
+    transaction.execute("CREATE NODE TABLE Ghost(id INT64, PRIMARY KEY(id))")
+    cleanup_failure = RuntimeError("manager cleanup after abort sentinel")
+    original_rollback = TransactionManager.rollback
+
+    def abort_then_fail(
+        self: TransactionManager, context: TransactionContext
+    ) -> None:
+        original_rollback(self, context)
+        if self is database._transactions and context is transaction._context:
+            raise cleanup_failure
+
+    try:
+        with monkeypatch.context() as boundary:
+            boundary.setattr(TransactionManager, "rollback", abort_then_fail)
+            with pytest.raises(RuntimeError) as raised:
+                transaction.rollback()
+
+        assert raised.value is cleanup_failure
+        assert not transaction.active
+        assert transaction._context.state.value == "aborted"
+        assert database._transactions.open_transactions == 0
+        assert transaction.txn_id not in database._public_contexts
+        assert transaction.txn_id not in database._queries._working
+        assert transaction.txn_id not in database._queries._txn_effects
+        assert "pk_ghost" not in database._indexes._indexes
+        assert not storage.exists("index/pk_Ghost.idx")
+    finally:
+        database.close()
+        release_ports(registry)
+
+
+def test_close_drains_an_active_ddl_before_releasing_storage_and_late_rollback_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal close removes every speculative registration/file/journal before lower release."""
+    database, registry, storage, _metrics = _instrumented_database()
+    transaction = database.begin("write")
+    transaction.execute("CREATE NODE TABLE Ghost(id INT64, PRIMARY KEY(id))")
+    txn_id = transaction.txn_id
+
+    try:
+        assert txn_id in database._public_contexts
+        assert txn_id in database._queries._working
+        assert txn_id in database._queries._txn_effects
+        assert "pk_ghost" in database._indexes._indexes
+        assert storage.exists("index/pk_Ghost.idx")
+
+        database.close()
+
+        assert database.close_complete
+        assert transaction._context.state.value == "aborted"
+        assert database._transactions.open_transactions == 0
+        assert database._public_contexts == {}
+        assert txn_id not in database._queries._working
+        assert txn_id not in database._queries._txn_effects
+        assert "pk_ghost" not in database._indexes._indexes
+        assert not storage.exists("index/pk_Ghost.idx")
+
+        # Close already owns and removed this journal. A tardy wrapper observes ABORTED and its
+        # absent-id settlement must not touch QueryEngine or storage after lower release.
+        storage.clear_trail()
+
+        def forbidden_settle(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("late rollback reached an already-drained schema journal")
+
+        with monkeypatch.context() as boundary:
+            boundary.setattr(QueryEngine, "settle_schema", forbidden_settle)
+            transaction.rollback()
+        assert storage.trail() == ()
+        assert not transaction.active
+    finally:
+        database.close()
+        release_ports(registry)
+
+
+def test_close_drain_failure_safe_leaks_lower_storage_and_retry_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed schema unwind leaves dependencies owned until a later close drains it."""
+    storage_closed = threading.Event()
+    target_storage: list[LocalStorageDevice | None] = [None]
+    original_storage_close = LocalStorageDevice.close
+    original_settle = QueryEngine.settle_schema
+    settlement_failure = RuntimeError("close schema drain sentinel")
+    armed = [True]
+
+    def observe_storage_close(self: LocalStorageDevice) -> None:
+        if self is target_storage[0]:
+            storage_closed.set()
+        original_storage_close(self)
+
+    def fail_once(self: QueryEngine, txn_id: int, *, committed: bool) -> None:
+        if self is database._queries and txn_id == transaction.txn_id and armed[0]:
+            armed[0] = False
+            assert committed is False
+            raise settlement_failure
+        original_settle(self, txn_id, committed=committed)
+
+    monkeypatch.setattr(LocalStorageDevice, "close", observe_storage_close)
+    database = connect(tmp_path / "failed-close-drain")
+    target_storage[0] = database._storage  # type: ignore[assignment]
+    transaction = database.begin("write")
+    transaction.execute("CREATE NODE TABLE Pending(id INT64, PRIMARY KEY(id))")
+    monkeypatch.setattr(QueryEngine, "settle_schema", fail_once)
+
+    with pytest.raises(RuntimeError) as raised:
+        database.close()
+
+    assert raised.value is settlement_failure
+    assert database.closed and not database.close_complete
+    assert database._transactions.close_complete
+    assert transaction.txn_id in database._public_contexts
+    assert not storage_closed.is_set()
+
+    database.close()
+
+    assert database.close_complete
+    assert database._public_contexts == {}
+    assert transaction.txn_id not in database._queries._working
+    assert transaction.txn_id not in database._queries._txn_effects
+    assert "pk_pending" not in database._indexes._indexes
+    assert storage_closed.is_set()
+
+
+def test_close_between_precheck_and_transition_refuses_late_begin_without_new_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The terminal seal closes the false-active-check to late facade-transition race."""
+    database, registry, storage, _metrics = _instrumented_database()
+    before_transition = threading.Event()
+    release_begin = threading.Event()
+    failures: list[BaseException] = []
+    original_transition = Database._public_transition
+
+    def pause_before_transition(self: Database):  # noqa: ANN202
+        inner = original_transition(self)
+
+        @contextmanager
+        def paused() -> Iterator[None]:
+            if self is database and threading.current_thread().name == "late-public-begin":
+                before_transition.set()
+                assert release_begin.wait(_WAIT_SECONDS), "close did not seal the late begin"
+            with inner:
+                yield
+
+        return paused()
+
+    monkeypatch.setattr(Database, "_public_transition", pause_before_transition)
+
+    def begin_late() -> None:
+        try:
+            database.begin("read")
+        except BaseException as failure:  # noqa: BLE001 - asserted as exact lifecycle evidence
+            failures.append(failure)
+
+    worker = threading.Thread(target=begin_late, name="late-public-begin")
+    try:
+        worker.start()
+        assert before_transition.wait(_WAIT_SECONDS), "begin never crossed its open precheck"
+        database.close()
+        assert database.close_complete
+        storage.clear_trail()
+    finally:
+        release_begin.set()
+        worker.join(_WAIT_SECONDS)
+
+    try:
+        assert not worker.is_alive()
+        assert len(failures) == 1
+        assert isinstance(failures[0], GrafxUnsupportedOperation)
+        assert failures[0].details["path"] == ":memory:"
+        assert database._transactions.open_transactions == 0
+        assert database._public_contexts == {}
+        assert storage.trail() == ()
+    finally:
+        database.close()
+        release_ports(registry)
+
+
 def test_close_drains_committed_schema_with_its_outcome_before_late_wrapper_returns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -654,23 +1061,18 @@ def test_close_drains_committed_schema_with_its_outcome_before_late_wrapper_retu
     assert close_failures == []
     assert settle_outcomes == [True]
     assert database._public_contexts == {}
+    assert not database.close_complete
 
-    # The wrapper returns after every owned closer. Its absent-id fast path must not attempt to
-    # enter coordination (or touch the already-closed storage) a second time.
-    with monkeypatch.context() as late:
-        late.setattr(
-            type(database._coordinator),
-            "exclusive",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                AssertionError("late commit settlement entered coordination after close")
-            ),
-        )
-        release_wrapper.set()
-        commit_worker.join(_WAIT_SECONDS)
+    # The wrapper's absent-id settlement is a QueryEngine no-op; leaving its facade transition
+    # then resumes the pending close and releases lower dependencies.
+    release_wrapper.set()
+    commit_worker.join(_WAIT_SECONDS)
 
     assert not commit_worker.is_alive()
     assert commit_failures == []
     assert len(commit_results) == 1 and commit_results[0].durable is True
+    assert settle_outcomes == [True]
+    assert database.close_complete
 
     with connect(tmp_path / "committed-schema") as reopened:
         assert reopened.catalog.catalog.has_table("Durable")
@@ -754,21 +1156,14 @@ def test_close_owns_rollback_schema_unwind_in_the_manager_to_wrapper_gap(
         close_worker.join(_WAIT_SECONDS)
         assert not close_worker.is_alive()
         assert close_failures == []
-        assert storage_closed.is_set()
+        assert not storage_closed.is_set()
+        assert not database.close_complete
         assert database._public_contexts == {}
 
-        # Only after storage is gone does the original wrapper return from manager.rollback. Its
-        # settlement must be an absent-id no-op that does not re-enter coordinator or QueryEngine.
-        with monkeypatch.context() as late:
-            late.setattr(
-                type(database._coordinator),
-                "exclusive",
-                lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                    AssertionError("late rollback entered coordination after close")
-                ),
-            )
-            release_wrapper.set()
-            rollback_worker.join(_WAIT_SECONDS)
+        # The original wrapper now returns from manager.rollback. Its settlement is absent-id
+        # and cannot reach QueryEngine again; transition exit resumes the safe pending close.
+        release_wrapper.set()
+        rollback_worker.join(_WAIT_SECONDS)
     finally:
         release_close_drain.set()
         release_wrapper.set()
@@ -778,6 +1173,8 @@ def test_close_owns_rollback_schema_unwind_in_the_manager_to_wrapper_gap(
     assert not rollback_worker.is_alive()
     assert rollback_failures == []
     assert settle_outcomes == [False]
+    assert storage_closed.is_set()
+    assert database.close_complete
 
     with connect(tmp_path / "rolled-back-schema") as reopened:
         assert not reopened.catalog.catalog.has_table("Ghost")

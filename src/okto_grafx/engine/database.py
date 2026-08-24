@@ -33,14 +33,13 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
-    GrafxError,
     GrafxSchemaVersionMismatch,
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
@@ -531,20 +530,76 @@ class Transaction:
         transaction that lost is still active and still free of side effects, so a caller may
         call :meth:`retry` on the database and try again.
         """
-        self._require_active()
-        report = self._database._transactions.commit(self._context)
-        self._report = report
-        self._finished = True
-        self._database._settle_schema(self._context, committed=True)
-        return report
+        with self._database._public_transition():
+            self._require_active()
+            try:
+                report = self._database._transactions.commit(self._context)
+            except BaseException as failure:
+                # A post-barrier apply/publication failure is reported only after the manager
+                # has made the durable outcome irrevocable and retired this context.  Publish
+                # the same outcome on the wrapper and settle its schema journal before the
+                # failure escapes; otherwise callers see an apparently reusable transaction
+                # and close has to guess whether its DDL committed.
+                if self._context.state is TransactionState.COMMITTED:
+                    self._report = CommitReport(
+                        csn=self._context.commit_csn,
+                        durable=True,
+                        wrote=self._context.wrote,
+                    )
+                    self._finished = True
+                    try:
+                        self._database._settle_schema(self._context, committed=True)
+                    except BaseException as settlement_failure:
+                        _note_cleanup_failure(failure, settlement_failure)
+                elif self._context.state is TransactionState.ABORTED:
+                    # Terminal close can win through a re-entrant host callback.  The wrapper
+                    # must agree with that outcome, and any tracked schema work is rollback work.
+                    self._finished = True
+                    try:
+                        self._database._settle_schema(self._context, committed=False)
+                    except BaseException as settlement_failure:
+                        _note_cleanup_failure(failure, settlement_failure)
+                else:
+                    # Validation and every other pre-barrier refusal leave the transaction
+                    # ACTIVE and retryable through its documented lifecycle doors.
+                    self._finished = False
+                raise
+            self._report = report
+            self._finished = True
+            try:
+                self._database._settle_schema(self._context, committed=True)
+            except BaseException as settlement_failure:
+                # The manager has returned a durable report. QueryEngine settlement only drops
+                # facade bookkeeping; letting a hostile cleanup escape here would turn success
+                # into an apparent retry invitation. Keep the context tracked so close retries
+                # the journal drain before lower resources are released, and retain the failure
+                # privately as lifecycle evidence.
+                if self._database._close_failure is None:
+                    self._database._close_failure = settlement_failure
+            return report
 
     def rollback(self) -> None:
         """Abandon this transaction. Rolling back twice is a no-op, never an error."""
-        if self._finished:
-            return
-        self._finished = True
-        self._database._transactions.rollback(self._context)
-        self._database._settle_schema(self._context, committed=False)
+        with self._database._public_transition():
+            if self._finished:
+                return
+            try:
+                self._database._transactions.rollback(self._context)
+            except BaseException as failure:
+                # A participant-section pre-enter failure has changed no outcome: keep the
+                # wrapper live so the caller (or a later close) can withdraw its reader pin.
+                # Conversely, reader/index cleanup can fail after the manager has already made
+                # ABORTED final. In that case finish the wrapper and its schema unwind while
+                # retaining the manager failure as the primary evidence.
+                self._finished = not self._context.active
+                if self._context.state is TransactionState.ABORTED:
+                    try:
+                        self._database._settle_schema(self._context, committed=False)
+                    except BaseException as settlement_failure:
+                        _note_cleanup_failure(failure, settlement_failure)
+                raise
+            self._finished = True
+            self._database._settle_schema(self._context, committed=False)
 
     def __enter__(self) -> Self:
         """Return this transaction so a ``with`` block can use it."""
@@ -563,7 +618,9 @@ class Transaction:
             return
         try:
             self.rollback()
-        except GrafxError:
+        except BaseException as cleanup_failure:
+            if exc is not None:
+                _note_cleanup_failure(exc, cleanup_failure)
             return
 
     def _require_active(self) -> None:
@@ -625,6 +682,9 @@ class Database:
         "_closers",
         "_closed",
         "_public_contexts",
+        "_close_releasing",
+        "_close_released",
+        "_close_failure",
         "_recovery_report",
         "_attached_indexes",
         "_stale_indexes",
@@ -700,6 +760,9 @@ class Database:
         # settlement, so Database.close can finish it before storage and the pool disappear. A
         # transaction that never executed a statement needs no entry and no post-close unwind.
         self._public_contexts: dict[int, TransactionContext] = {}
+        self._close_releasing: bool = False
+        self._close_released: bool = False
+        self._close_failure: BaseException | None = None
         self._recovery_report: object = recovery_report
         self._attached_indexes: tuple[str, ...] = tuple(attached_indexes)
         self._stale_indexes: tuple[str, ...] = tuple(stale_indexes)
@@ -735,6 +798,16 @@ class Database:
     def closed(self) -> bool:
         """Return True once :meth:`close` has run; a closed database refuses every door."""
         return self._closed
+
+    @property
+    def close_complete(self) -> bool:
+        """Return True once the elected caller finished lower-layer release.
+
+        A concurrent or reentrant ``close`` that observes a release already in progress returns
+        without waiting on host-owned closer code. Terminal refusal is already effective, while
+        this property remains False until that elected caller exhausts every release step.
+        """
+        return self._close_released
 
     @property
     def metrics_endpoint(self) -> str | None:
@@ -970,8 +1043,12 @@ class Database:
         parsed = TransactionMode.parse(mode)
         if parsed is TransactionMode.WRITE:
             self._require_writable("begin a write transaction")
-        context = self._transactions.begin(parsed.value)
-        return self._public_transaction(context)
+        with self._public_transition():
+            # Seal the check/transition race: close may publish after the preliminary guard but
+            # before this process-wide facade boundary increments its settlement count.
+            self._require_open()
+            context = self._transactions.begin(parsed.value)
+            return self._public_transaction(context)
 
     def retry(self, transaction: Transaction) -> Transaction:
         """Open the successor of a transaction optimistic validation refused (BR-6).
@@ -994,42 +1071,50 @@ class Database:
                 field="transaction_owner",
                 path=self._path,
             )
-        transaction._require_active()
-        context = transaction._context
-        # TransactionManager.retry revalidates the CURRENT owned ACTIVE context, aborts it and
-        # registers its successor in one participant section.  Keeping a second outer section
-        # here would put the manager's failure telemetry under a facade lock and would still not
-        # be the authority for state. Only after that atomic operation succeeds may the public
-        # wrapper be retired and its query-schema journal unwound.
-        try:
-            successor = self._transactions.retry(context)
-        except BaseException as retry_failure:
-            # Manager retry can fail after it has fail-completely aborted the predecessor (for
-            # example, if opening the successor or publishing the decremented gauge fails). In
-            # that case its query journal belongs to the same unwind as a successful retry. A
-            # validation refusal leaves the context ACTIVE and therefore leaves the wrapper and
-            # journal untouched.
-            if context.state is TransactionState.ABORTED:
-                transaction._finished = True
-                try:
-                    self._settle_schema(context, committed=False)
-                except BaseException as settlement_failure:
-                    _note_cleanup_failure(retry_failure, settlement_failure)
-            raise
-        transaction._finished = True
-        try:
-            self._settle_schema(context, committed=False)
-        except BaseException as settlement_failure:
-            # The successor has not escaped yet. Retire it immediately so a failure in the
-            # predecessor's schema unwind cannot leak a reader pin or an active transaction. A
-            # fail-complete manager may itself report cleanup trouble after retiring the pin;
-            # that evidence is attached without replacing the original settlement failure.
+        with self._public_transition():
+            # As with begin, close can win between the public preliminary check and transition
+            # entry. Refuse before manager/schema work; manager retry revalidates terminal state
+            # again in its own participant section.
+            self._require_open()
+            transaction._require_active()
+            context = transaction._context
+            # TransactionManager.retry revalidates the CURRENT owned ACTIVE context, aborts it
+            # and registers its successor in one participant section. Keeping a second outer
+            # participant section here would put manager failure telemetry under a facade lock;
+            # the injected public transition tracks only wrapper/schema outcome publication.
             try:
-                self._transactions.rollback(successor)
-            except BaseException as cleanup_failure:
-                _note_cleanup_failure(settlement_failure, cleanup_failure)
-            raise
-        return self._public_transaction(successor)
+                successor = self._transactions.retry(context)
+            except BaseException as retry_failure:
+                # Manager retry can fail after it has fail-completely aborted the predecessor
+                # (for example if successor open fails). Its query journal then belongs to the
+                # same unwind as a successful retry. A validation refusal leaves it ACTIVE.
+                if context.state is TransactionState.ABORTED:
+                    transaction._finished = True
+                    try:
+                        self._settle_schema(context, committed=False)
+                    except BaseException as settlement_failure:
+                        _note_cleanup_failure(retry_failure, settlement_failure)
+                raise
+            transaction._finished = True
+            try:
+                self._settle_schema(context, committed=False)
+            except BaseException as settlement_failure:
+                # The successor has not escaped yet. Retire it immediately so a predecessor
+                # unwind failure cannot leak a reader pin. Cleanup evidence never replaces it.
+                try:
+                    self._transactions.rollback(successor)
+                except BaseException as cleanup_failure:
+                    _note_cleanup_failure(settlement_failure, cleanup_failure)
+                    if successor.active:
+                        # The successor has no public wrapper and a participant pre-enter bomb
+                        # means ordinary rollback changed nothing. Seal this facade immediately;
+                        # leaving the current public transition then resumes close and retires
+                        # the otherwise unreachable reader pin. The predecessor settlement
+                        # failure remains the primary outcome throughout.
+                        self._closed = True
+                        self._transactions.request_close()
+                raise
+            return self._public_transaction(successor)
 
     @contextmanager
     def transaction(self, mode: str = "write") -> Iterator[Transaction]:
@@ -1051,8 +1136,11 @@ class Database:
         txn = self.begin("read")
         try:
             result = txn.execute(text, parameters)
-        except BaseException:
-            txn.rollback()
+        except BaseException as failure:
+            try:
+                txn.rollback()
+            except BaseException as cleanup_failure:
+                _note_cleanup_failure(failure, cleanup_failure)
             raise
         txn.commit()
         return result
@@ -1292,17 +1380,17 @@ class Database:
     def close(self) -> None:
         """Release everything this database opened, and never corrupt anything doing it (FR-1).
 
-        The order is the reverse of the order things were acquired, and every step runs even when
-        an earlier one failed: an open transaction is aborted, its reader registration withdrawn,
-        the dirty pages written back, and whatever the composition root opened is released. A
-        database that fails to release something is still CLOSED afterwards -- refusing to record
-        that would leave a caller with an object it can neither use nor retire -- and the first
-        failure is raised once every step has been attempted.
+        Transaction close and every tracked QueryEngine schema journal must first prove complete.
+        If either cannot, lower dependencies stay open and a later call retries that safe leak.
+        Once quiescent, every release step runs even when an earlier one failed, and exactly one
+        caller owns those steps even when close calls race or host callbacks re-enter.
 
         Closing twice is a no-op. Closing with a transaction open aborts it: nothing of an open
-        transaction has reached the device, so abandoning it is the whole of that promise.
+        transaction has reached the device, so abandoning it is the whole of that promise. A
+        concurrent/reentrant caller may return terminal but incomplete; :attr:`close_complete`
+        distinguishes that safe intermediate state from completed lower-layer release.
         """
-        if self._closed:
+        if self._close_released:
             return
         # Marked closed BEFORE anything is released. A release path calls host-supplied code --
         # an event sink, a metrics publisher, a storage device -- and any of it may re-enter this
@@ -1310,18 +1398,72 @@ class Database:
         # time (A91). There is no lock here to make re-entry safe by exclusion, deliberately:
         # a lock held across foreign code is the defect A91 names.
         self._closed = True
-        failures: list[BaseException] = []
-        for step in (
-            self._close_transactions,
-            self._flush_pages,
-            self._publish_metrics,
-            self._release_closers,
+        self._transactions.request_close()
+        if (
+            self._facade_transition_reentrant()
+            or self._transactions.transition_active
+            or self._close_releasing
         ):
+            # A callback arrived inside begin/commit/rollback/retry, a manager transition, or
+            # this close's host release phase. The terminal request is enough here; the public
+            # transition finally (or a later explicit close) resumes after wrapper settlement.
+            return
+
+        failures: list[BaseException] = []
+        try:
+            self._close_transactions()
+        except BaseException as failure:
+            failures.append(failure)
+
+        journals_pending = bool(self._public_contexts)
+        if not self._transactions.close_complete or journals_pending:
+            # A participant-section pre-enter failure, schema-unwind failure, or same-context
+            # transition means a winner may still touch pool/storage. Never release under it.
+            if failures:
+                if self._close_failure is None:
+                    self._close_failure = failures[0]
+                raise failures[0]
+            return
+        if self._facade_transition_active():
+            # Another wrapper may still be publishing its outcome after manager quiescence. It
+            # cannot start new work after the terminal seal; its transition-finally retries close
+            # once the process-wide facade counter reaches zero.
+            if failures:
+                if self._close_failure is None:
+                    self._close_failure = failures[0]
+                raise failures[0]
+            return
+
+        # Elect exactly one lower-layer releaser under the manager's quiescent participant
+        # section, then leave that section before any host-owned flush/publish/closer callback.
+        if self._close_released or self._close_releasing:
+            return
+        try:
+            with self._transactions.database_release_section():
+                if self._close_released or self._close_releasing:
+                    return
+                # Recheck journals beside the release claim. A late rollback already drained by
+                # close is absent-id and cannot re-register; a statement that crossed the seal
+                # would have had to own this same participant section before manager close.
+                if self._public_contexts:
+                    return
+                self._close_releasing = True
+        except BaseException as failure:
+            failures.append(failure)
+            if self._close_failure is None:
+                self._close_failure = failures[0]
+            raise failures[0]
+
+        for step in (self._flush_pages, self._publish_metrics, self._release_closers):
             try:
                 step()
             except BaseException as failure:
                 failures.append(failure)
+        self._close_released = True
+        self._close_releasing = False
         if failures:
+            if self._close_failure is None:
+                self._close_failure = failures[0]
             raise failures[0]
 
     def __enter__(self) -> Self:
@@ -1358,28 +1500,29 @@ class Database:
         except BaseException as close_failure:
             failure = close_failure
 
-        # No statement registration can pass manager quiescence. Drain under the same section
-        # used by wrapper settlement, preserving the manager's final outcome: a commit that won
-        # before close is settled as committed, never mistaken for rollback work.
-        try:
-            with self._transactions._participant_section():
-                contexts = tuple(self._public_contexts.values())
-                for context in contexts:
-                    try:
-                        self._settle_schema_in_section(
-                            context,
-                            committed=context.state is TransactionState.COMMITTED,
-                        )
-                    except BaseException as settlement_failure:
-                        if failure is None:
-                            failure = settlement_failure
-                        else:
-                            _note_cleanup_failure(failure, settlement_failure)
-        except BaseException as snapshot_failure:
-            if failure is None:
-                failure = snapshot_failure
-            else:
-                _note_cleanup_failure(failure, snapshot_failure)
+        # A failed pre-enter means manager close has not proved quiescence. Touching QueryEngine
+        # journals (which can remove index files) would race the still-active winner just as
+        # surely as flushing the pool, so leave every journal tracked for the retrying close.
+        if self._transactions.close_complete and self._public_contexts:
+            try:
+                with self._transactions._participant_section():
+                    contexts = tuple(self._public_contexts.values())
+                    for context in contexts:
+                        try:
+                            self._settle_schema_in_section(
+                                context,
+                                committed=context.state is TransactionState.COMMITTED,
+                            )
+                        except BaseException as settlement_failure:
+                            if failure is None:
+                                failure = settlement_failure
+                            else:
+                                _note_cleanup_failure(failure, settlement_failure)
+            except BaseException as snapshot_failure:
+                if failure is None:
+                    failure = snapshot_failure
+                else:
+                    _note_cleanup_failure(failure, snapshot_failure)
         if failure is not None:
             raise failure
 
@@ -1471,6 +1614,45 @@ class Database:
             raise failures[0]
 
     # --- internals ----------------------------------------------------------------------------
+
+    @contextmanager
+    def _public_transition(self) -> Iterator[None]:
+        """Defer dependency release until one wrapper outcome and schema settlement finish.
+
+        The contained metrics adapter owns the process-local transition mechanism required by
+        G2; the pure facade only consumes its injected context. A clock or telemetry callback can
+        publish terminal state immediately, while lower dependency release waits for its wrapper
+        transition to leave. The null context supports direct internal construction without
+        claiming callback-reentrancy guarantees that only the standard composition supplies.
+        """
+        transition = getattr(self._metrics, "transition", None)
+        boundary = transition() if callable(transition) else nullcontext()
+        try:
+            with boundary:
+                yield
+        finally:
+            if self._closed and not self._close_released:
+                try:
+                    self.close()
+                except BaseException as failure:
+                    # A close requested by host telemetry/clock resumes only after transaction
+                    # and schema outcome settlement. It cannot replace a durable commit result.
+                    if self._close_failure is None:
+                        self._close_failure = failure
+
+    def _facade_transition_active(self) -> bool:
+        """Read the contained adapter's host-free cross-thread settlement capability."""
+        try:
+            return bool(getattr(self._metrics, "facade_transition_active", False))
+        except BaseException:  # noqa: BLE001 - telemetry cannot control dependency release
+            return False
+
+    def _facade_transition_reentrant(self) -> bool:
+        """Read whether this execution context re-entered its own facade transition."""
+        try:
+            return bool(getattr(self._metrics, "transition_active", False))
+        except BaseException:  # noqa: BLE001 - telemetry cannot control dependency release
+            return False
 
     def _public_transaction(self, context: TransactionContext) -> Transaction:
         """Wrap a manager context only if it still belongs to an open public facade.

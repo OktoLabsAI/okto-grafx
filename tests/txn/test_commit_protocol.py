@@ -763,6 +763,70 @@ def test_a_failure_after_the_barrier_is_reported_as_already_committed(
     assert blocked.value.details["field"] == "recovery_required"
 
 
+@pytest.mark.parametrize(
+    "failure",
+    (
+        RuntimeError("foreign post-barrier apply failure"),
+        KeyboardInterrupt("interrupted post-barrier apply"),
+        SystemExit("terminated post-barrier apply"),
+    ),
+    ids=("runtime-error", "keyboard-interrupt", "system-exit"),
+)
+def test_foreign_post_barrier_apply_escape_cannot_hide_the_one_durable_commit(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    """RuntimeError is typed; KI/SystemExit keep identity, all forbid retry after one COMMIT."""
+    txn = _stage(stack, page_index=4, payload=b"durable-before-foreign-apply")
+
+    def fail_apply(
+        manager: TransactionManager,
+        _images: object,
+    ) -> None:
+        assert manager is stack.manager
+        assert stack.wal.barriers == 1
+        raise failure
+
+    monkeypatch.setattr(TransactionManager, "_apply_images", fail_apply)
+
+    if isinstance(failure, Exception):
+        with pytest.raises(GrafxTransactionStateError) as escaped:
+            stack.manager.commit(txn)
+        assert escaped.value.__cause__ is failure
+        assert escaped.value.retryable is False
+        assert escaped.value.details == {
+            "operation": "commit",
+            "committed": True,
+            "csn": txn.commit_csn,
+            "durable": True,
+            "recovery_required": True,
+            "original_type": "RuntimeError",
+            "retryable": False,
+        }
+    else:
+        with pytest.raises(type(failure)) as escaped:
+            stack.manager.commit(txn)
+        assert escaped.value is failure
+        note = "\n".join(getattr(failure, "__notes__", ()))
+        assert f"commit {txn.commit_csn} is already durable" in note
+        assert "durable=True" in note
+        assert "recovery_required=True" in note
+        assert "do not retry" in note
+
+    commits = tuple(
+        record
+        for record in stack.wal.records()
+        if record.record_type == WalRecordType.COMMIT
+    )
+    assert len(commits) == 1
+    assert commits[0].txn_id == txn.txn_id
+    assert commits[0].lsn == txn.commit_csn
+    assert txn.state is TransactionState.COMMITTED
+    assert stack.manager.open_transactions == 0
+    assert stack.manager.recovery_required is True
+
+
 # --- metrics ---------------------------------------------------------------------------------------
 
 

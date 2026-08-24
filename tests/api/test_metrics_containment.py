@@ -20,6 +20,8 @@ import okto_grafx
 import pytest
 from okto_grafx import DatabaseConfig
 from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
+from okto_grafx.domain.errors import GrafxUnsupportedOperation
+from okto_grafx.domain.txn import TransactionState
 from okto_grafx.runtime.bootstrap import build_default_registry
 
 
@@ -150,11 +152,65 @@ class _TimerFactoryBomb(_EveryRecordingDoorBomb):
         self._explode("time")
 
 
+class _CloseOnDeferredFsync:
+    """Request Database.close when a locally measured WAL timer drains as an observation."""
+
+    def __init__(self) -> None:
+        self.database = None
+        self.armed = False
+        self.fired = False
+
+    @property
+    def enabled(self) -> bool:
+        return True
+
+    def register(self, descriptor) -> None:
+        return None
+
+    def increment(self, name, value=1.0, labels=None) -> None:
+        return None
+
+    def set_gauge(self, name, value, labels=None) -> None:
+        return None
+
+    def observe(self, name, value, labels=None) -> None:
+        if self.armed and name == "oktografx_fsync_duration_seconds" and not self.fired:
+            self.fired = True
+            assert self.database is not None
+            self.database.close()
+
+    def time(self, name, labels=None):
+        if self.armed:
+            raise AssertionError(
+                "a critical WAL timer reached host code before section exit"
+            )
+        from contextlib import nullcontext
+
+        return nullcontext()
+
+    def snapshot(self):
+        return {}
+
+
 def _database_with(tmp_path: Path, sink):
     root = str(tmp_path / "db")
     registry = build_default_registry(DatabaseConfig(path=root))
     registry.bind("metrics", sink)
     return okto_grafx.connect(root, registry=registry)
+
+
+def test_custom_registry_shares_one_containment_boundary_with_the_manager(
+    tmp_path: Path,
+) -> None:
+    """Supported custom composition never gives facade and manager different lifecycle guards."""
+    sink = _PostCommitBomb()
+    database = _database_with(tmp_path, sink)
+    try:
+        assert isinstance(database._metrics, ContainedMetricsSink)
+        assert database._metrics.inner is sink
+        assert database._transactions._metrics is database._metrics
+    finally:
+        database.close()
 
 
 def test_a_sink_that_always_raises_breaks_nothing(tmp_path: Path) -> None:
@@ -170,9 +226,7 @@ def test_a_sink_that_always_raises_breaks_nothing(tmp_path: Path) -> None:
         db.close()
 
 
-@pytest.mark.parametrize(
-    "failure_type", (RuntimeError, KeyboardInterrupt, SystemExit)
-)
+@pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt, SystemExit))
 def test_a_post_commit_raise_cannot_make_a_durable_commit_report_failure(
     tmp_path: Path, failure_type: type[BaseException]
 ) -> None:
@@ -188,16 +242,14 @@ def test_a_post_commit_raise_cannot_make_a_durable_commit_report_failure(
             txn.execute("CREATE NODE TABLE T(id INT64, n STRING, PRIMARY KEY(id))")
         writer = db.begin("write")
         writer.execute("CREATE (:T {id: 1, n: 'once'})")
-        report = writer.commit()          # must NOT raise, and must tell the truth
+        report = writer.commit()  # must NOT raise, and must tell the truth
         assert report.durable
         assert db.execute("MATCH (t:T) RETURN count(*)").rows == ((1,),)
     finally:
         db.close()
 
 
-@pytest.mark.parametrize(
-    "failure_type", (RuntimeError, KeyboardInterrupt, SystemExit)
-)
+@pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt, SystemExit))
 def test_every_recording_door_contains_every_exception_class(
     failure_type: type[BaseException],
 ) -> None:
@@ -216,7 +268,9 @@ def test_every_recording_door_contains_every_exception_class(
         pass
 
 
-def test_publish_stays_typed_and_the_json_selector_writes_its_file(tmp_path: Path) -> None:
+def test_publish_stays_typed_and_the_json_selector_writes_its_file(
+    tmp_path: Path,
+) -> None:
     """The one metrics door a caller ACTS on keeps its contract, and close() now walks it.
 
     `metrics="json"` documents that the sink writes to the destination the configuration names,
@@ -232,3 +286,31 @@ def test_publish_stays_typed_and_the_json_selector_writes_its_file(tmp_path: Pat
     db.close()
     assert destination.exists(), "close() did not publish the metrics document"
     assert json.loads(destination.read_text(encoding="utf-8"))
+
+
+def test_wal_timer_reentrant_close_waits_for_commit_outcome_then_releases_storage(
+    tmp_path: Path,
+) -> None:
+    """A timer callback closes only after COMMIT/forget and cannot turn durability into failure."""
+    database = okto_grafx.connect(tmp_path / "timer-close", page_size=512)
+    contained = database._metrics
+    assert isinstance(contained, ContainedMetricsSink)
+    hostile = _CloseOnDeferredFsync()
+    hostile.database = database
+    contained._inner = hostile
+    contained._enabled_hint = True
+    with database.begin("write") as schema:
+        schema.execute("CREATE NODE TABLE T(id INT64, n STRING, PRIMARY KEY(id))")
+    writer = database.begin("write")
+    writer.execute("CREATE (:T {id: 1, n: 'durable'})")
+    hostile.armed = True
+
+    report = writer.commit()
+
+    assert report.durable and report.wrote
+    assert writer._context.state is TransactionState.COMMITTED
+    assert hostile.fired
+    assert database.closed and database.close_complete
+    assert database._transactions.close_complete
+    with pytest.raises(GrafxUnsupportedOperation):
+        database.storage.exists("grafx.meta")
