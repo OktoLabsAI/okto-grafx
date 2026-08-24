@@ -421,14 +421,17 @@ class Verifier:
         if self._heap is None:
             return 0, findings
         heap_file = _store_file(self._heap)
-        owners, physical_maxima = self._physical_heap_inventory(
-            heap_file, findings, reported
-        )
+        inventory = self._physical_heap_inventory(heap_file, findings, reported)
+        if inventory is None:
+            owners: dict[int, set[PageIndex]] | None = None
+            physical_maxima: dict[int, int] | None = None
+        else:
+            owners, physical_maxima = inventory
         counter_findings, extent_slots = self._verify_record_id_counters(
             heap_file, physical_maxima, findings, reported
         )
         findings.extend(counter_findings)
-        if extent_slots is not None:
+        if extent_slots is not None and owners is not None:
             findings.extend(
                 self._verify_unowned_heap_pages(
                     heap_file, owners, frozenset(extent_slots), reported
@@ -470,7 +473,7 @@ class Verifier:
         heap_file: str,
         findings: list[VerificationFinding],
         reported: set[tuple[str, PageIndex]],
-    ) -> tuple[dict[int, set[PageIndex]], dict[int, int]]:
+    ) -> tuple[dict[int, set[PageIndex]], dict[int, int]] | None:
         """Return physical page owners and the greatest decodable record id of each table.
 
         This is the independent half of the structural check. It follows no ``next_page`` link and
@@ -486,13 +489,25 @@ class Verifier:
         header happened to be visible. Pages and slots are read from the device, never through the
         heap or its cache. A page without an exact readable descriptor is located and excluded:
         assigning its headers to any table would fabricate the association the damaged bytes lost.
+        ``None`` means the file could not be enumerated at all; it is deliberately distinct from
+        two complete empty maps, because an unavailable oracle cannot certify an empty heap.
         """
         owners: dict[int, set[PageIndex]] = {}
         maxima: dict[int, int] = {}
         try:
             total = self._pool.storage.page_count(heap_file)
-        except GrafxError:
-            return owners, maxima
+        except GrafxError as failure:
+            findings.append(
+                VerificationFinding(
+                    kind=FindingKind.FILE_UNREADABLE,
+                    location=FindingLocation(file=heap_file),
+                    detail=(
+                        "The physical heap inventory could not read the file's page count: "
+                        f"{failure}. Record ownership and identity high-water were not certified."
+                    ),
+                )
+            )
+            return None
         for index in range(total):
             if index == HEADER_PAGE_INDEX:
                 continue
@@ -556,7 +571,7 @@ class Verifier:
     def _verify_record_id_counters(
         self,
         heap_file: str,
-        physical_maxima: Mapping[int, int],
+        physical_maxima: Mapping[int, int] | None,
         findings: list[VerificationFinding],
         reported: set[tuple[str, PageIndex]],
     ) -> tuple[list[VerificationFinding], dict[int, tuple[int, ...]] | None]:
@@ -651,6 +666,8 @@ class Verifier:
                     )
                 continue
             slot, extent = entries[0]
+            if physical_maxima is None:
+                continue
             highest = physical_maxima.get(table_id)
             if highest is None or extent.next_record_id > highest:
                 continue
@@ -703,7 +720,7 @@ class Verifier:
     def _verify_catalog_ownership(
         self,
         heap_file: str,
-        owners: Mapping[int, set[PageIndex]],
+        owners: Mapping[int, set[PageIndex]] | None,
         extent_slots: Mapping[int, tuple[int, ...]],
         catalog_table_ids: frozenset[int],
         reported: set[tuple[str, PageIndex]],
@@ -733,7 +750,7 @@ class Verifier:
                         ),
                     )
                 )
-            for page_index in sorted(owners.get(table_id, ())):
+            for page_index in sorted(owners.get(table_id, ()) if owners is not None else ()):
                 self._report_page(
                     found,
                     reported,
@@ -749,7 +766,7 @@ class Verifier:
         self,
         table: TableDef,
         heap_file: str,
-        owners: Mapping[int, set[PageIndex]],
+        owners: Mapping[int, set[PageIndex]] | None,
         reported: set[tuple[str, PageIndex]],
     ) -> tuple[int, list[VerificationFinding]]:
         """Verify one table: its chain against the file, its records, and its version chains."""
@@ -788,18 +805,19 @@ class Verifier:
                     ),
                 )
             ]
-        claimed = set(owners.get(table.table_id, ()))
-        for orphan in sorted(claimed - set(chain)):
-            self._report_page(
-                findings,
-                reported,
-                heap_file,
-                orphan,
-                FindingKind.ORPHAN_PAGE,
-                f"This page carries the descriptor of table {table.name!r} and is not "
-                "reachable from the chain that table's directory entry starts, so every "
-                "record on it is invisible to a scan.",
-            )
+        if owners is not None:
+            claimed = set(owners.get(table.table_id, ()))
+            for orphan in sorted(claimed - set(chain)):
+                self._report_page(
+                    findings,
+                    reported,
+                    heap_file,
+                    orphan,
+                    FindingKind.ORPHAN_PAGE,
+                    f"This page carries the descriptor of table {table.name!r} and is not "
+                    "reachable from the chain that table's directory entry starts, so every "
+                    "record on it is invisible to a scan.",
+                )
         findings.extend(self._verify_extent(table, heap_file, chain))
         checked, found = self._verify_versions(table, heap_file, chain, reported)
         findings.extend(found)

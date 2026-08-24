@@ -12,7 +12,11 @@ from dataclasses import replace
 
 import pytest
 
-from okto_grafx.domain.errors import GrafxConfigurationError, GrafxCorruptionDetected
+from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
+    GrafxCorruptionDetected,
+    GrafxStorageError,
+)
 from okto_grafx.domain.ids import NO_CSN, NO_PAGE, PROVISIONAL_CSN, RecordRef
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
@@ -321,6 +325,44 @@ def test_the_counter_oracle_reads_page_zero_from_the_device_not_the_cache(
     found = report.findings_of(FindingKind.RECORD_ID_COUNTER)
     assert len(found) == 1
     assert "next_record_id 2" in found[0].detail and "id 3" in found[0].detail
+
+
+def test_a_refused_physical_inventory_cannot_certify_an_empty_high_water(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One failed enumeration is UNKNOWN, even when every later page-count call succeeds."""
+    table = _populate(stack)
+    assert stack.heap.next_record_id(table) == 4, "prime the resident good page-zero image"
+    _rewrite_device_counter(stack, table, 2, invalidate=False)
+    assert stack.heap.next_record_id(table) == 4, "the lower device image remains hidden in cache"
+
+    device = stack.storage
+    device_type = type(device)
+    original_page_count = device_type.page_count
+    heap_counts = 0
+
+    def refuse_first_heap_count(instance: object, file: str) -> int:
+        nonlocal heap_counts
+        if instance is device and file == HEAP_FILE:
+            heap_counts += 1
+            if heap_counts == 1:
+                raise GrafxStorageError(
+                    "The first physical inventory count was refused.", file=file
+                )
+        return original_page_count(instance, file)
+
+    monkeypatch.setattr(device_type, "page_count", refuse_first_heap_count)
+
+    report = stack.verifier().verify(SCOPE_RECORDS)
+
+    unreadable = report.findings_of(FindingKind.FILE_UNREADABLE)
+    assert len(unreadable) == 1
+    assert unreadable[0].location == FindingLocation(file=HEAP_FILE)
+    assert "high-water were not certified" in unreadable[0].detail
+    assert report.findings_of(FindingKind.RECORD_ID_COUNTER) == ()
+    assert report.records_checked == 3, "later chain page-count calls still succeeded"
+    assert heap_counts > 1
+    assert report.clean is False
 
 
 def test_the_same_lower_durable_counter_is_found_after_the_pool_is_invalidated(
