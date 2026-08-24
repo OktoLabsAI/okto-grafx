@@ -1821,6 +1821,20 @@ def _query_plan_dataclass_snapshot(
                     else None
                 ),
             )
+        if expected is ProduceResults:
+            columns = arguments["columns"]
+            if type(columns) is not tuple:  # pragma: no cover - grammar proves this above
+                raise AssertionError("ProduceResults.columns did not clone to a tuple")
+            seen_columns: set[str] = set()
+            for column in columns:
+                if column in seen_columns:
+                    raise GrafxPlanError(
+                        f"A public query plan cannot publish duplicate column {column!r}.",
+                        field="plan.ProduceResults.columns",
+                        value=column,
+                        reason="duplicate",
+                    )
+                seen_columns.add(column)
         return expected(**arguments)
     finally:
         active.remove(marker)

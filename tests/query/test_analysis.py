@@ -192,7 +192,14 @@ def test_an_order_by_key_over_a_bound_variable_is_allowed_without_aggregation() 
 def test_two_items_may_not_be_given_the_same_name() -> None:
     with pytest.raises(GrafxPlanError) as failure:
         analysis_of("MATCH (p:Person) RETURN p.age AS x, p.name AS x")
-    assert failure.value.details["value"] == "x"
+    assert failure.value.details == {"field": "alias", "value": "x"}
+
+
+@pytest.mark.parametrize("text", ["RETURN 1, 1", "RETURN 1, 2 AS `1`"])
+def test_two_items_may_not_share_a_derived_or_explicit_output_name(text: str) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of(text)
+    assert failure.value.details == {"field": "column", "value": "1"}
 
 
 @pytest.mark.parametrize("keyword", ["SKIP", "LIMIT"])

@@ -454,6 +454,51 @@ def test_query_result_plan_callback_failures_have_stable_taxonomy(
         assert caught.value.__cause__ is failure
 
 
+@pytest.mark.parametrize("text", ["RETURN 1, 1", "RETURN 1, 2 AS `1`"])
+def test_duplicate_output_columns_are_refused_before_execution_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+) -> None:
+    reached = False
+
+    def should_not_run(*_args: object, **_kwargs: object) -> QueryResult:
+        nonlocal reached
+        reached = True
+        raise AssertionError("a duplicate result shape reached execution dispatch")
+
+    monkeypatch.setattr(QueryEngine, "_run", should_not_run)
+    with connect(":memory:") as database:
+        with pytest.raises(GrafxPlanError):
+            database.explain(text)
+        reader = database.begin("read")
+        with pytest.raises(GrafxPlanError):
+            reader.execute(text)
+        assert reader.active
+        reader.rollback()
+
+    assert reached is False
+
+
+@pytest.mark.parametrize("finalizer", ["commit", "rollback"])
+def test_duplicate_write_columns_leave_zero_mutation_and_a_usable_transaction(
+    finalizer: str,
+) -> None:
+    with connect(":memory:") as database:
+        schema = database.begin("write")
+        schema.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
+        schema.commit()
+
+        writer = database.begin("write")
+        with pytest.raises(GrafxPlanError):
+            writer.execute("CREATE (p:Person {id: 1}) RETURN p.id, p.id")
+        assert writer.active
+        assert writer.execute("MATCH (p:Person) RETURN p.id").rows == ()
+        getattr(writer, finalizer)()
+        assert not writer.active
+
+        assert database.execute("MATCH (p:Person) RETURN p.id").rows == ()
+
+
 def test_malformed_collaborator_result_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -670,6 +715,17 @@ def test_hostile_oversized_plan_column_is_refused_without_dispatch(
             database.explain("RETURN 1")
 
     assert events == []
+
+
+def test_collaborator_plan_with_duplicate_columns_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = ProduceResults(child=SingleRow(), columns=("x", "x"))
+    monkeypatch.setattr(QueryEngine, "explain", lambda *_args: raw)
+
+    with connect(":memory:") as database:
+        with pytest.raises(GrafxPlanError):
+            database.explain("RETURN 1 AS x")
 
 
 def test_literal_value_graph_in_an_exact_plan_is_deeply_owned(
