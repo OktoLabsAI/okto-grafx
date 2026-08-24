@@ -602,9 +602,12 @@ def _broken(mutation) -> dict[str, object]:
         lambda v: v.__setitem__("exit_code", 1),
         lambda v: v.__setitem__("duration_seconds", -1.0),
         lambda v: v["blas_environment"].__setitem__("EXTRA_THREADS", "1"),
+        # gauge follows the adulterated mean so the GAUGE rule stays satisfied and the
+        # MEAN/BELOW coherence guard is what refuses -- the exact impossible verdict:
+        # a perfect mean beside min 0.9 and one below-perfect query.
         lambda v: (
             v["observed"].__setitem__("mean_recall_at_k", 1.0),
-            v["observed"].__setitem__("min_recall_at_k", 1.0),
+            v.__setitem__("gauge", 1.0),
         ),
     ],
     ids=[

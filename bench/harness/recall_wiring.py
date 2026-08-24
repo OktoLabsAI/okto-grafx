@@ -137,7 +137,7 @@ def append_vector_recall(
             continue
         try:
             document = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, RecursionError) as failure:
+        except Exception as failure:  # noqa: BLE001 -- absolute boundary; KI/SE propagate
             print(
                 f"vector recall stage: REFUSED -- {label} {path} is not a readable JSON "
                 f"document ({failure}); nothing was run and nothing was written."
