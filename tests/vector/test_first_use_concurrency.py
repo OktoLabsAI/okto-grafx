@@ -473,3 +473,61 @@ def test_a_commit_landing_during_the_build_is_caught_up_before_the_snapshot_is_p
         math.release()
         database.close()
         release_ports(registry)
+
+
+def test_a_commit_landing_during_the_catch_up_pass_is_caught_up_too(
+    tmp_path: Path,
+) -> None:
+    """The catch-up pass has the same window the build had, and closes it the same way.
+
+    Seven rows; the build is parked; the eighth is committed; the build is released and its
+    catch-up pass begins -- and is parked again, INSIDE that pass, on the resolve of the eighth
+    row (the first entry the pass installs, after the pass read the header). The ninth row is
+    committed there. The pass must certify with the header it read BEFORE its walk, find the
+    header moved, and run again: a pass that certified with a header read after its walk would
+    publish a snapshot missing the ninth row as current, and the next search would answer eight.
+    """
+    math = GatingMath()
+    database, registry = _open(tmp_path / "db", math)
+    outcomes: dict[str, object] = {}
+    parked_in_catch_up = threading.Event()
+    release_catch_up = threading.Event()
+    try:
+        _populate(database, ROWS - 1)
+        index = database.vectors.index("s")
+        resolved = index._resolve  # noqa: SLF001 - the resolve of the eighth row is the hook
+        resolves = Counter()
+
+        def parking_resolve(ref: object) -> object:
+            me = threading.get_ident()
+            resolves[me] += 1
+            if me == math.builder_ident and resolves[me] == ROWS:
+                parked_in_catch_up.set()
+                release_catch_up.wait(PATIENCE)
+            return resolved(ref)
+
+        index._resolve = parking_resolve  # type: ignore[assignment]  # noqa: SLF001
+        first = threading.Thread(
+            target=_search_into, args=(database, outcomes, "first")
+        )
+        first.start()
+        assert math.parked.wait(PATIENCE), (
+            "the first search never reached the parked score"
+        )
+        with database.begin("write") as txn:
+            _insert(txn, ROWS)
+        math.release()
+        assert parked_in_catch_up.wait(PATIENCE), (
+            "the catch-up pass never resolved row 8"
+        )
+        with database.begin("write") as txn:
+            _insert(txn, ROWS + 1)
+        release_catch_up.set()
+        _finish(first)
+        expected = tuple(range(1, ROWS + 2))
+        assert _search(database, k=ROWS + 1) == (ROWS + 1, "approximate", expected)
+    finally:
+        math.release()
+        release_catch_up.set()
+        database.close()
+        release_ports(registry)
