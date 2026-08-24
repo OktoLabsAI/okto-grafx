@@ -1,0 +1,174 @@
+"""The C13 corpus/ground-truth mathematics is deterministic, generous and non-tautological.
+
+What these tests pin, per c13_design_v4 (art_285e6c90):
+
+* the ``uniform-int53-v1`` generator reproduces EXACT bytes — a frozen reference SHA-256 for
+  both the float64 corpus and its float32 quantization, so any drift of the recipe (or any
+  platform that disagrees at the bit level) fails loudly here rather than moving a frozen
+  calibration silently;
+* the quantization is REAL (components change), so the TR-4 dtype check can never pass
+  tautologically;
+* the canonical ``math.fsum`` ground truth matches hand-computed answers, orders totally, and
+  the generous tie rule keeps recall@k immune to ties at the cut;
+* recall@k behaves at the edges (k larger than the corpus, empty intersections, k <= 0);
+* the dtype check aggregates per-query overlaps and fails closed against frozen thresholds;
+* the accelerated-oracle differential agrees on itself and refuses a perturbed distance with
+  the eps named in the verdict.
+"""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+
+from bench.recall_corpus import (
+    GENERATOR_NAME,
+    cosine_distance,
+    differential,
+    dtype_check,
+    generate_vectors,
+    ground_truth,
+    quantize_f32,
+    recall_at_k,
+    sha256_hex,
+    vector_bytes_f32,
+    vector_bytes_f64,
+)
+
+REFERENCE_SEED = 1337
+REFERENCE_F64 = "ac1fba32ae960a83c8f8ccfffeff761f8ff3bd1ef6046a96ae9aeba66309f563"
+REFERENCE_F32 = "9d7bf3f99ae1223e320fce5bb6508c7eefc341853a2c78215649b79de53321a4"
+
+
+def test_the_generator_reproduces_frozen_bytes_on_every_platform() -> None:
+    """Same seed, same bytes: the cross-platform bit-identity claim, pinned by value."""
+    vectors = generate_vectors(REFERENCE_SEED, 4, 8)
+    assert GENERATOR_NAME == "uniform-int53-v1"
+    assert sha256_hex(vector_bytes_f64(vectors)) == REFERENCE_F64
+    assert sha256_hex(vector_bytes_f32(vectors)) == REFERENCE_F32
+    assert vectors[0][0] == 0.851070993187762
+    assert generate_vectors(REFERENCE_SEED, 4, 8) == vectors
+    assert generate_vectors(REFERENCE_SEED + 1, 4, 8) != vectors
+
+
+def test_every_component_lands_inside_the_unit_interval() -> None:
+    """The recipe promises [-1.0, 1.0) exactly."""
+    for vector in generate_vectors(7, 16, 32):
+        for component in vector:
+            assert -1.0 <= component < 1.0
+
+
+def test_the_float32_quantization_is_genuine_not_tautological() -> None:
+    """An int53 component does not generally fit float32 — TR-4 measures a REAL cast."""
+    vectors = generate_vectors(REFERENCE_SEED, 4, 8)
+    quantized = quantize_f32(vectors)
+    changed = sum(
+        1
+        for original, cast in zip(
+            [c for v in vectors for c in v],
+            [c for v in quantized for c in v],
+            strict=True,
+        )
+        if original != cast
+    )
+    assert changed == 32, (
+        "quantization changed nothing; the dtype check would be a tautology"
+    )
+    assert quantize_f32(quantized) == quantized, "a second cast must be the identity"
+
+
+def test_the_canonical_ground_truth_matches_a_hand_computed_case() -> None:
+    """Three vectors, one axis query: distances, order and membership by hand."""
+    corpus = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+    truth = ground_truth(corpus, [1.0, 0.0], 1)
+    assert truth.ordered[0] == (0.0, 0)
+    assert truth.ordered[1][1] == 2  # 1 - 1/sqrt(2)
+    assert math.isclose(truth.ordered[1][0], 1.0 - 1.0 / math.sqrt(2.0))
+    assert truth.ordered[2] == (1.0, 1)
+    assert truth.members == {0}
+    assert truth.cut_distance == 0.0
+
+
+def test_zero_norm_vectors_never_displace_a_genuine_neighbour() -> None:
+    """A vector with no direction gets the maximum distance by definition."""
+    assert cosine_distance([0.0, 0.0], [1.0, 0.0]) == 2.0
+    truth = ground_truth([[0.0, 0.0], [1.0, 0.0]], [1.0, 0.0], 1)
+    assert truth.members == {1}
+
+
+def test_the_generous_tie_rule_admits_every_record_at_the_cut() -> None:
+    """Two identical vectors: either answer at k=1 scores full recall."""
+    corpus = [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+    truth = ground_truth(corpus, [1.0, 0.0], 1)
+    assert truth.members == {0, 1}
+    assert recall_at_k([0], truth, 1) == 1.0
+    assert recall_at_k([1], truth, 1) == 1.0
+    assert recall_at_k([2], truth, 1) == 0.0
+
+
+def test_recall_at_the_edges() -> None:
+    """k past the corpus keeps everything; empty intersections score zero; k<=0 refuses."""
+    corpus = [[1.0, 0.0], [0.0, 1.0]]
+    truth = ground_truth(corpus, [1.0, 0.0], 10)
+    assert truth.members == {0, 1}
+    assert recall_at_k([0, 1], truth, 10) == pytest.approx(0.2)
+    assert recall_at_k([], truth, 10) == 0.0
+    with pytest.raises(ValueError):
+        ground_truth(corpus, [1.0, 0.0], 0)
+    with pytest.raises(ValueError):
+        recall_at_k([0], truth, 0)
+
+
+def test_the_dtype_check_aggregates_and_fails_closed_against_frozen_thresholds() -> (
+    None
+):
+    """Mean and min overlaps come from per-query truth; thresholds decide, nothing else."""
+    vectors = generate_vectors(REFERENCE_SEED, 64, 16)
+    quantized = quantize_f32(vectors)
+    queries = generate_vectors(4242, 8, 16)
+    verdict = dtype_check(vectors, quantized, queries, 4)
+    assert len(verdict.per_query) == 8
+    assert 0.0 <= verdict.min_overlap <= verdict.mean_overlap <= 1.0
+    assert verdict.passes(mean_overlap_min=0.99, per_query_overlap_min=0.90) == (
+        verdict.mean_overlap >= 0.99 and verdict.min_overlap >= 0.90
+    )
+    assert not verdict.passes(mean_overlap_min=1.1, per_query_overlap_min=1.1)
+    with pytest.raises(ValueError):
+        dtype_check(vectors, quantized, [], 4)
+
+
+def test_the_differential_accepts_the_canonical_oracle_against_itself() -> None:
+    """An accelerated path that IS the canonical one must agree on every query."""
+    corpus = generate_vectors(REFERENCE_SEED, 32, 8)
+    queries = generate_vectors(4242, 4, 8)
+    verdict = differential(corpus, queries, 3, cosine_distance, eps_rel=1e-9)
+    assert verdict.agreed
+    assert verdict.queries_checked == 4
+    assert verdict.first_disagreement == ""
+
+
+def test_the_differential_refuses_a_perturbed_distance_and_names_the_eps() -> None:
+    """A distance off by more than eps_rel is a disagreement, reported with its delta."""
+    corpus = generate_vectors(REFERENCE_SEED, 32, 8)
+    queries = generate_vectors(4242, 4, 8)
+
+    def drifted(left: list[float], right: list[float]) -> float:
+        return cosine_distance(left, right) * (1.0 + 5e-9)
+
+    verdict = differential(corpus, queries, 3, drifted, eps_rel=1e-12)
+    assert not verdict.agreed
+    assert verdict.first_disagreement != ""
+
+
+def test_the_differential_refuses_a_membership_swap() -> None:
+    """An oracle that reorders the cut is refused on membership, before any eps math."""
+    corpus = [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]
+    queries = [[1.0, 0.0]]
+
+    def inverted(left: list[float], right: list[float]) -> float:
+        return -cosine_distance(left, right)
+
+    verdict = differential(corpus, queries, 1, inverted, eps_rel=1e-9)
+    assert not verdict.agreed
+    assert "member sets differ" in verdict.first_disagreement
