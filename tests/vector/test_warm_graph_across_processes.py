@@ -45,11 +45,11 @@ def _insert(txn: Any, record_id: int) -> None:
 def _search(database: Any, k: int) -> tuple[int, str]:
     reader = database.begin("read")
     try:
-        hits = database.vectors.search(
+        hits = database.search_vectors(
+            reader,
             space="s",
             k=k,
             query=[1.0, 0.0, 0.25, 0.0],
-            snapshot=reader.context.snapshot,
         )
         return (hits.achieved_k, hits.regime)
     finally:

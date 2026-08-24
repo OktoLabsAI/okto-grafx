@@ -104,7 +104,10 @@ def test_open_database_with_a_complete_registry_assembles_on_the_caller_ports(
     )
     try:
         for slot in PortRegistry.REQUIRED:
-            held = getattr(database, slot)
+            # This is a composition-root identity test. Public properties intentionally return
+            # immutable observations now; the private slot is where assembly must retain the
+            # exact caller-owned collaborator.
+            held = getattr(database, f"_{slot}")
             if slot == "metrics":
                 # The one slot that is deliberately NOT the caller's object: a host-supplied
                 # sink may do anything at all, and a raise on the post-commit gauge made a
@@ -145,7 +148,8 @@ def test_the_bootstrap_keeps_the_caller_registry(complete_registry: PortRegistry
     )
     try:
         assert complete_registry.get("storage") is storage
-        assert database.storage is storage
+        assert database._storage is storage
+        assert database.storage is not storage
     finally:
         database.close()
 

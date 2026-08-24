@@ -71,6 +71,40 @@ from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.metrics_catalog import metric
+from okto_grafx.engine.public_views import (
+    BufferPoolView,
+    CatalogStoreView,
+    ClockView,
+    CodecView,
+    ComponentView,
+    CoordinatorView,
+    HeapStoreView,
+    IndexRegistryView,
+    LedgerView,
+    MetricsView,
+    QuarantineView,
+    QueryEngineView,
+    StorageView,
+    TransactionManagerView,
+    VectorEngineView,
+    VectorMathView,
+    WalView,
+    _catalog_view,
+    _clock_view,
+    _codec_view,
+    _component_view,
+    _coordinator_view,
+    _heap_view,
+    _indexes_view,
+    _ledger_view,
+    _pool_view,
+    _quarantine_view,
+    _queries_view,
+    _storage_view,
+    _transactions_view,
+    _vectors_view,
+    _wal_view,
+)
 from okto_grafx.engine.txn_manager import TransactionManager
 from okto_grafx.engine.verifier import VERIFICATION_SCOPES
 
@@ -441,11 +475,6 @@ class Transaction:
         self._finished: bool = False
 
     @property
-    def context(self) -> TransactionContext:
-        """Return the engine level transaction this object wraps."""
-        return self._context
-
-    @property
     def mode(self) -> str:
         """Return ``"read"`` or ``"write"``, the mode this transaction was opened in."""
         return self._context.mode.value
@@ -479,7 +508,7 @@ class Transaction:
         one refuses here with GrafxUnsupportedOperation rather than pretending to run anything.
         """
         self._require_active()
-        return self._database.run_statement(self._context, text, parameters)
+        return self._database._run_statement(self._context, text, parameters)
 
     def commit(self) -> CommitReport:
         """Commit this transaction and return the report of CONTRACT.md section 8.5.
@@ -489,7 +518,7 @@ class Transaction:
         call :meth:`retry` on the database and try again.
         """
         self._require_active()
-        report = self._database.transactions.commit(self._context)
+        report = self._database._transactions.commit(self._context)
         self._report = report
         self._finished = True
         self._database._settle_schema(self._context, committed=True)
@@ -500,7 +529,7 @@ class Transaction:
         if self._finished:
             return
         self._finished = True
-        self._database.transactions.rollback(self._context)
+        self._database._transactions.rollback(self._context)
         self._database._settle_schema(self._context, committed=False)
 
     def __enter__(self) -> Self:
@@ -740,104 +769,140 @@ class Database:
     # --- the composition ---------------------------------------------------------------------
 
     @property
-    def storage(self) -> StorageDevice:
-        """Return the storage device this database persists through."""
-        return self._storage
+    def storage(self) -> StorageView:
+        """Return immutable storage identity and file-size metadata.
+
+        The device itself is deliberately not public: its allocation, append, truncate and page
+        write doors bypass the WAL and recovery protocols.  This snapshot keeps useful inventory
+        reads while carrying no reference or callback back to that device.
+        """
+        self._require_open()
+        return _storage_view(self._storage)
 
     @property
-    def clock(self) -> Clock:
-        """Return the clock this database measures liveness and stamps wall times with."""
-        return self._clock
+    def clock(self) -> ClockView:
+        """Return clock implementation identity without advancing either clock source."""
+        self._require_open()
+        return _clock_view(self._clock)
 
     @property
-    def codec(self) -> PageCodec:
-        """Return the page codec this database encodes and verifies pages with."""
-        return self._codec
+    def codec(self) -> CodecView:
+        """Return immutable format metadata without exposing page encode/decode doors."""
+        self._require_open()
+        return _codec_view(self._codec, self._identity.page_size)
 
     @property
-    def metrics(self) -> MetricsSink:
-        """Return the metrics sink every component of this database emits through (FR-14)."""
-        return self._metrics
+    def metrics(self) -> MetricsView:
+        """Return whether metrics collection is enabled, without exposing the mutable sink."""
+        self._require_open()
+        return MetricsView(bool(self._metrics.enabled))
 
     @property
-    def events(self) -> EventSink:
-        """Return the event sink this database narrates through."""
-        return self._events
+    def events(self) -> ComponentView:
+        """Return identity-only metadata for the configured event destination."""
+        self._require_open()
+        return _component_view("events", self._events)
 
     @property
-    def vector_math(self) -> VectorMath:
-        """Return the vector math adapter this database scores with (SPEC-VEC FR-7)."""
-        return self._vector_math
+    def vector_math(self) -> VectorMathView:
+        """Return the selected vector arithmetic implementation's immutable name."""
+        self._require_open()
+        # Adapter identity is observable without executing a host-supplied descriptor.  Calling
+        # ``name`` here would turn a harmless property read into another callback into the host.
+        return VectorMathView(type(self._vector_math).__name__)
 
     @property
-    def coordinator(self) -> ProcessCoordinator:
-        """Return the coordinator that fences this database against other processes (FR-7)."""
-        return self._coordinator
+    def coordinator(self) -> CoordinatorView:
+        """Return participant identity without touching lease, horizon or fencing state."""
+        self._require_open()
+        return _coordinator_view(self._coordinator)
 
     @property
-    def pool(self) -> BufferPool:
-        """Return the page cache of this database, bounded by its own budget (FR-13)."""
-        return self._pool
+    def pool(self) -> BufferPoolView:
+        """Return immutable page-cache capacity and residency counters (FR-13)."""
+        self._require_open()
+        return _pool_view(self._pool)
 
     @property
-    def catalog(self) -> CatalogStore:
-        """Return the catalog store that holds the schema of this database."""
-        return self._catalog
+    def catalog(self) -> CatalogStoreView:
+        """Return an immutable schema and catalog-layout snapshot."""
+        self._require_open()
+        return _catalog_view(self._catalog)
 
     @property
-    def heap(self) -> HeapStore:
-        """Return the heap store that holds the rows of this database."""
-        return self._heap
+    def heap(self) -> HeapStoreView:
+        """Return immutable heap layout metadata without row or page mutation doors."""
+        self._require_open()
+        return _heap_view(self._heap)
 
     @property
-    def wal(self) -> WalManager:
-        """Return the write ahead log of this database (FR-5)."""
-        return self._wal
+    def wal(self) -> WalView:
+        """Return an immutable write-ahead-log state and segment inventory (FR-5)."""
+        self._require_open()
+        return _wal_view(self._wal)
 
     @property
-    def transactions(self) -> TransactionManager:
-        """Return the transaction manager that runs the frozen commit protocol (FR-2, FR-3)."""
-        return self._transactions
+    def transactions(self) -> TransactionManagerView:
+        """Return immutable transaction configuration, counts and publication state."""
+        self._require_open()
+        return _transactions_view(self._transactions)
 
     @property
-    def indexes(self) -> object:
-        """Return the secondary index registry of this database (FR-12).
+    def indexes(self) -> IndexRegistryView:
+        """Return an immutable secondary-index inventory (FR-12).
 
         Refuses with GrafxUnsupportedOperation when the composition has no index manager.
         """
-        return self._require_component("indexes", self._indexes, "the index framework (C7)")
+        self._require_open()
+        indexes = self._require_component("indexes", self._indexes, "the index framework (C7)")
+        # Built/reconciled positions live in index header pages.  Treat this observation like
+        # every other public page read so it cannot straddle a recovery-required latch.
+        with self._transactions.page_access_section():
+            return _indexes_view(indexes)
 
     @property
-    def ledger(self) -> object:
-        """Return the ledger of unapplied work (SPEC-M1 FR-9, CONTRACT.md section 10).
+    def ledger(self) -> LedgerView:
+        """Return an immutable ledger inventory (SPEC-M1 FR-9, section 10).
 
         Refuses with GrafxUnsupportedOperation when the composition has no ledger store.
         """
-        return self._require_component("ledger", self._ledger, "the ledger store (C6)")
+        self._require_open()
+        ledger = self._require_component("ledger", self._ledger, "the ledger store (C6)")
+        return _ledger_view(ledger)
 
     @property
-    def quarantine(self) -> object:
-        """Return the quarantine store of this database (FR-10).
+    def quarantine(self) -> QuarantineView:
+        """Return an immutable quarantine evidence inventory (FR-10).
 
         Refuses with GrafxUnsupportedOperation when the composition has no quarantine store.
         """
-        return self._require_component("quarantine", self._quarantine, "quarantine (C6)")
+        self._require_open()
+        quarantine = self._require_component(
+            "quarantine", self._quarantine, "quarantine (C6)"
+        )
+        return _quarantine_view(quarantine)
 
     @property
-    def vectors(self) -> object:
-        """Return the vector engine of this database (SPEC-VEC).
+    def vectors(self) -> VectorEngineView:
+        """Return immutable vector-space and index configuration (SPEC-VEC).
 
         Refuses with GrafxUnsupportedOperation when the composition has no vector engine.
         """
-        return self._require_component("vectors", self._vectors, "the vector engine (C9)")
+        self._require_open()
+        vectors = self._require_component("vectors", self._vectors, "the vector engine (C9)")
+        # Vector inventory includes the index header's built-through position.
+        with self._transactions.page_access_section():
+            return _vectors_view(vectors)
 
     @property
-    def queries(self) -> object:
-        """Return the query engine of this database.
+    def queries(self) -> QueryEngineView:
+        """Return immutable diagnostics for the composed query engine.
 
         Refuses with GrafxUnsupportedOperation when the composition has no query engine.
         """
-        return self._require_component("queries", self._queries, "the query engine (C10)")
+        self._require_open()
+        queries = self._require_component("queries", self._queries, "the query engine (C10)")
+        return _queries_view(queries)
 
     # --- transactions -------------------------------------------------------------------------
 
@@ -869,13 +934,28 @@ class Database:
                 field="transaction",
                 value=type(transaction).__name__,
             )
-        # The loser's schema bookkeeping is settled BEFORE the successor opens: its working
-        # catalog is dropped and its registered indexes pruned, so the successor's re-executed
-        # DDL registers cleanly instead of being refused by its own predecessor's leftovers --
-        # which made the documented BR-6 retry loop unable to ever succeed for a schema change,
-        # and let the successor's later rows commit against a phantom table.
-        self._settle_schema(transaction.context, committed=False)
-        return Transaction(self, self._transactions.retry(transaction.context))
+        if transaction._database is not self:
+            raise GrafxTransactionStateError(
+                "A transaction can only be retried by the database that opened it.",
+                txn_id=transaction.txn_id,
+                field="transaction_owner",
+                path=self._path,
+            )
+        # Hold the participant section across the wrapper-state check and manager retry. Without
+        # it a concurrent rollback could finish after this check but before TransactionManager
+        # inspects the context; its retry door intentionally accepts an already-aborted context
+        # when called internally, which is not the public contract here.
+        with self._transactions._participant_section():
+            transaction._require_active()
+            context = transaction._context
+            # TransactionManager.retry performs the conflict check, ownership check, rollback
+            # and successor open as one engine operation. Only AFTER all validation has succeeded
+            # do we settle query-schema bookkeeping. The old order settled the wrong database's
+            # working schema before the manager could reject a foreign or finished transaction.
+            successor = self._transactions.retry(context)
+            transaction._finished = True
+            self._settle_schema(context, committed=False)
+        return Transaction(self, successor)
 
     @contextmanager
     def transaction(self, mode: str = "write") -> Iterator[Transaction]:
@@ -896,30 +976,77 @@ class Database:
         self._require_open()
         txn = self.begin("read")
         try:
-            result = self.run_statement(txn.context, text, parameters)
+            result = txn.execute(text, parameters)
         except BaseException:
             txn.rollback()
             raise
         txn.commit()
         return result
 
-    def run_statement(
+    def explain(self, text: str) -> object:
+        """Plan one statement without exposing the mutable query engine."""
+        self._require_open()
+        _require_text("statement", text)
+        engine = self._require_component("queries", self._queries, "the query engine (C10)")
+        with self._transactions.page_access_section():
+            return engine.explain(text)  # type: ignore[attr-defined]
+
+    def _run_statement(
         self,
         context: TransactionContext,
         text: str,
         parameters: Mapping[str, object] | None = None,
     ) -> object:
-        """Run one statement through the query engine on behalf of a transaction.
-
-        Public because :class:`Transaction` reaches it, and documented as the single door every
-        statement of this database passes through -- there is deliberately no second path that
-        could diverge from it.
-        """
+        """Run one statement for a context already validated by the public Transaction."""
         self._require_open()
         _require_text("statement", text)
         engine = self._require_component("queries", self._queries, "the query engine (C10)")
         with self._transactions.page_access_section():
             return engine.execute(text, context, parameters)  # type: ignore[attr-defined]
+
+    def search_vectors(
+        self,
+        transaction: Transaction,
+        *,
+        space: str,
+        query: Sequence[float],
+        k: int,
+        candidate_filter: object = None,
+    ) -> object:
+        """Search vectors under the fixed snapshot of one active transaction.
+
+        This is the safe replacement for reaching through ``database.vectors.search`` and
+        supplying a raw ``TransactionContext`` or snapshot.  Ownership and liveness are checked
+        before the vector engine is reached, and the page-access section keeps the recovery latch
+        stable for the whole search.  The vector collaborator itself never leaves the database.
+        """
+        self._require_open()
+        if not isinstance(transaction, Transaction):
+            raise GrafxConfigurationError(
+                f"A vector search takes a Transaction; got {type(transaction).__name__}.",
+                field="transaction",
+                value=type(transaction).__name__,
+            )
+        if transaction._database is not self:
+            raise GrafxTransactionStateError(
+                "A vector search can only use a transaction opened by this database.",
+                txn_id=transaction.txn_id,
+                field="transaction_owner",
+                path=self._path,
+            )
+        vectors = self._require_component("vectors", self._vectors, "the vector engine (C9)")
+        with self._transactions.page_access_section():
+            # Liveness is checked under the same participant section that commit/rollback use.
+            # Checking before it would let a racing rollback withdraw this snapshot's reader pin
+            # in the gap and leave the search reading below a recyclable horizon.
+            transaction._require_active()
+            return vectors.search(  # type: ignore[attr-defined]
+                space=space,
+                query=query,
+                k=k,
+                snapshot=transaction._context.snapshot,
+                candidate_filter=candidate_filter,
+            )
 
     # --- operator surface ---------------------------------------------------------------------
 
@@ -1030,6 +1157,38 @@ class Database:
         """Return the machine-readable current value of every metric this database emitted."""
         self._require_open()
         return self._metrics.snapshot()
+
+    def publish_metrics(self) -> None:
+        """Publish a configured metrics document without exposing its mutable sink.
+
+        Sinks without an explicit publication door have nothing to do.  A JSON sink writes the
+        configured destination; the same action runs automatically during :meth:`close`.
+        """
+        self._require_open()
+        self._publish_metrics()
+
+    def inspect_index(self, name: str) -> tuple[object, ...]:
+        """Return immutable entry DTOs from one secondary index.
+
+        This is an explicit potentially expensive read.  The index store itself stays private,
+        so callers cannot mark it stale, advance its header or stage changes outside a
+        transaction.
+        """
+        self._require_open()
+        _require_text("index", name)
+        indexes = self._require_component("indexes", self._indexes, "the index framework (C7)")
+        with self._transactions.page_access_section():
+            index = indexes.index(name)  # type: ignore[attr-defined]
+            return tuple(index.walk())
+
+    def read_quarantine(self, name: str) -> bytes:
+        """Return and checksum-verify the immutable bytes of one quarantine entry."""
+        self._require_open()
+        _require_text("quarantine entry", name)
+        quarantine = self._require_component(
+            "quarantine", self._quarantine, "quarantine (C6)"
+        )
+        return bytes(quarantine.read(name))  # type: ignore[attr-defined]
 
     # --- lifecycle ----------------------------------------------------------------------------
 

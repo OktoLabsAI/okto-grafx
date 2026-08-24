@@ -276,32 +276,34 @@ def test_releasing_a_registry_twice_is_harmless(tmp_path: Path) -> None:
     assert _closed(registry.get("storage")) is True
 
 
-def test_the_composition_hands_the_caller_its_own_adapter_instances_through(
+def test_the_composition_uses_caller_adapters_without_publishing_them_back(
     tmp_path: Path,
 ) -> None:
     """Identity, not type: a root that rebuilt an equivalent adapter would pass a type check.
 
-    A caller composes its own registry when it needs THOSE objects -- a device it will inspect, a
-    sink it is already scraping, a coordinator it shares with something else. Handing back an
-    equivalent instance satisfies every ``isinstance`` and is still the wrong object.
+    A caller that composes a registry already owns the objects through that registry. The engine
+    must use THOSE instances while its Database surface returns detached immutable observations,
+    not a second route to their mutation doors.
     """
     registry = build_default_registry(_config(tmp_path / "db"))
     bound = {slot: registry.get(slot) for slot in PortRegistry.REQUIRED}
     try:
         database = connect(tmp_path / "db", registry=registry)
         try:
-            assert database.storage is bound["storage"]
-            assert database.clock is bound["clock"]
-            assert database.codec is bound["codec"]
+            assert database._storage is bound["storage"]
+            assert database._clock is bound["clock"]
+            assert database._codec is bound["codec"]
             # The metrics slot is the one deliberate exception: the engine sees a containment
             # shell (a raise on the post-commit gauge made a durable commit report failure),
             # and the caller's sink -- identity preserved -- is what the shell contains.
-            assert database.metrics.inner is bound["metrics"]
-            assert database.events is bound["events"]
-            assert database.vector_math is bound["vector_math"]
-            assert database.coordinator is bound["coordinator"]
+            assert database._metrics.inner is bound["metrics"]
+            assert database._events is bound["events"]
+            assert database._vector_math is bound["vector_math"]
+            assert database._coordinator is bound["coordinator"]
             # The engines built on top must reach the same objects, not copies of them.
-            assert database.pool.storage is bound["storage"]
+            assert database._pool.storage is bound["storage"]
+            assert database.storage is not bound["storage"]
+            assert not hasattr(database.metrics, "inner")
         finally:
             database.close()
     finally:

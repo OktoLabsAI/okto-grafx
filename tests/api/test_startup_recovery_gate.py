@@ -128,7 +128,7 @@ def test_recovery_replays_catalog_pages_before_deserializing_the_catalog(tmp_pat
             transaction.execute(
                 "CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))"
             )
-        catalog_root = database.catalog.chain_pages()[0]
+        catalog_root = database._catalog.chain_pages()[0]
         committed_lsn = database.transactions.published_lsn()
 
     device = LocalStorageDevice(str(root), page_size=PAGE_SIZE)

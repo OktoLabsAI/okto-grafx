@@ -40,7 +40,7 @@ def _image(db: Database, payloads: list[bytes], page_index: int) -> bytes:
     )
     for payload in payloads:
         page.insert_slot(payload)
-    return db.codec.encode_page(page)
+    return db._codec.encode_page(page)
 
 
 def _grow_to(db: Database, page_index: int) -> None:
@@ -49,12 +49,12 @@ def _grow_to(db: Database, page_index: int) -> None:
     Bounded by a count and gated on the device's own page count, never on anything the code under
     test computes (A92): a walk that regresses must fail this test, not hang it.
     """
-    db.heap.bootstrap()
+    db._heap.bootstrap()
     for _ in range(page_index + 2):
-        if db.storage.page_count(HEAP) > page_index:
+        if db._storage.page_count(HEAP) > page_index:
             return
-        page = db.pool.allocate(HEAP, int(PageType.HEAP))
-        db.pool.unpin(HEAP, page.page_index, dirty=True)
+        page = db._pool.allocate(HEAP, int(PageType.HEAP))
+        db._pool.unpin(HEAP, page.page_index, dirty=True)
     raise AssertionError(f"The heap did not reach page {page_index}.")
 
 
@@ -62,14 +62,16 @@ def _write_one_row(db: Database, page_index: int, payload: bytes) -> object:
     """Stage one page through a public write transaction and commit it."""
     _grow_to(db, page_index)
     txn = db.begin("write")
-    txn.context.owner._stage_page_image(txn.context, HEAP, page_index, _image(db, [payload], page_index))
-    txn.context.note_write(db.transactions.partition_of(1, payload))
+    txn._context.owner._stage_page_image(
+        txn._context, HEAP, page_index, _image(db, [payload], page_index)
+    )
+    txn._context.note_write(db.transactions.partition_of(1, payload))
     return txn.commit()
 
 
 def _payloads(db: Database, page_index: int) -> tuple[bytes, ...]:
     """Return what the heap page holds right now, read back through the pool."""
-    with db.pool.pinned(HEAP, page_index) as page:
+    with db._pool.pinned(HEAP, page_index) as page:
         return tuple(bytes(payload) for _, payload in page.iter_slots())
 
 
@@ -100,8 +102,10 @@ def test_a_rolled_back_transaction_leaves_nothing_on_the_device(tmp_path: Path) 
         _grow_to(db, 2)
         before = db.wal.last_lsn
         txn = db.begin("write")
-        txn.context.owner._stage_page_image(txn.context, HEAP, 2, _image(db, [b"never"], 2))
-        txn.context.note_write(db.transactions.partition_of(1, b"never"))
+        txn._context.owner._stage_page_image(
+            txn._context, HEAP, 2, _image(db, [b"never"], 2)
+        )
+        txn._context.note_write(db.transactions.partition_of(1, b"never"))
         txn.rollback()
         assert db.wal.last_lsn == before
         assert _payloads(db, 2) == ()
@@ -115,8 +119,10 @@ def test_closing_a_database_with_an_uncommitted_transaction_loses_only_that_tran
     with connect(root, page_size=512, partitions_per_table=8) as db:
         _write_one_row(db, 3, ROW)
         abandoned = db.begin("write")
-        abandoned.context.owner._stage_page_image(abandoned.context, HEAP, 3, _image(db, [b"abandoned"], 3))
-        abandoned.context.note_write(db.transactions.partition_of(1, b"abandoned"))
+        abandoned._context.owner._stage_page_image(
+            abandoned._context, HEAP, 3, _image(db, [b"abandoned"], 3)
+        )
+        abandoned._context.note_write(db.transactions.partition_of(1, b"abandoned"))
 
     with connect(root, page_size=512, partitions_per_table=8) as reopened:
         assert _payloads(reopened, 3) == (ROW,)
@@ -129,10 +135,14 @@ def test_two_transactions_on_disjoint_partitions_both_commit(tmp_path: Path) -> 
         _grow_to(db, 4)
         first = db.begin("write")
         second = db.begin("write")
-        first.context.owner._stage_page_image(first.context, HEAP, 3, _image(db, [b"first"], 3))
-        first.context.note_write(db.transactions.partition_of(1, b"first"))
-        second.context.owner._stage_page_image(second.context, HEAP, 4, _image(db, [b"second"], 4))
-        second.context.note_write(db.transactions.partition_of(2, b"second"))
+        first._context.owner._stage_page_image(
+            first._context, HEAP, 3, _image(db, [b"first"], 3)
+        )
+        first._context.note_write(db.transactions.partition_of(1, b"first"))
+        second._context.owner._stage_page_image(
+            second._context, HEAP, 4, _image(db, [b"second"], 4)
+        )
+        second._context.note_write(db.transactions.partition_of(2, b"second"))
         assert first.commit().wrote is True
         assert second.commit().wrote is True
         assert _payloads(db, 3) == (b"first",)
@@ -249,8 +259,8 @@ def test_verification_walks_the_indexes_a_caller_registered_after_the_open(
             positions=(0,),
             visibility=IndexVisibility.EXACT,
         )
-        index = db.indexes.register(HashIndex(definition, db.pool, db.metrics))
-        assert db.indexes.indexes() == (index,)
+        index = db._indexes.register(HashIndex(definition, db._pool, db._metrics))
+        assert [item.name for item in db.indexes.indexes()] == [index.name]
         after = db.verify("all")
         # The index file is walked because the verifier was given the index. A verifier built
         # over an empty set reports exactly the reading above and never looks at these pages.
@@ -271,8 +281,8 @@ def _vector_schema(db: Database, space_name: str = "minilm_v2") -> object:
     from okto_grafx.domain.model.value import ValueType
     from okto_grafx.domain.ports.vectormath import DistanceMetric
 
-    catalog = db.catalog.catalog
-    db.vectors.create_space(
+    catalog = db._catalog.catalog
+    db._vectors.create_space(
         EmbeddingSpaceDef(
             space_id=catalog.next_space_id(),
             name=space_name,
@@ -281,7 +291,7 @@ def _vector_schema(db: Database, space_name: str = "minilm_v2") -> object:
             normalized=True,
             storage_dtype="float32",
             state="active",
-            created_at_wall=db.clock.wall(),
+            created_at_wall=db._clock.wall(),
         )
     )
     table = TableDef(
@@ -297,7 +307,7 @@ def _vector_schema(db: Database, space_name: str = "minilm_v2") -> object:
         to_table=None,
     )
     catalog.add_table(table)
-    db.catalog.save()
+    db._catalog.save()
     return table
 
 
@@ -311,9 +321,9 @@ def test_a_vector_index_attaches_onto_the_paged_index_registry(tmp_path: Path) -
     """
     with connect(tmp_path / "db", page_size=512) as db:
         table = _vector_schema(db)
-        index = db.vectors.attach(table, "minilm_v2")
+        index = db._vectors.attach(table, "minilm_v2")
         # Registered with the SAME registry the rest of the database uses, by identity.
-        assert db.indexes.index(index.name) is index
+        assert db._indexes.index(index.name) is index
         assert index.name in [registered.name for registered in db.indexes.indexes()]
         db.flush()
         report = db.verify("all")
@@ -329,7 +339,7 @@ def test_the_vector_engine_reaches_the_same_pool_and_registry_as_the_database(
     # database does not account for, and FR-13 says a budget belongs to one database.
     with connect(tmp_path / "db", page_size=512) as db:
         table = _vector_schema(db)
-        db.vectors.attach(table, "minilm_v2")
+        db._vectors.attach(table, "minilm_v2")
         assert db.indexes.indexes()[0].name.startswith("vector_")
         before = db.pool.used_bytes()
         assert before > 0
@@ -381,7 +391,7 @@ def test_the_vector_engine_of_a_composed_database_can_attach(tmp_path: Path) -> 
                 "id INT64, embedding VECTOR(minilm_v2), PRIMARY KEY(id))"
             )
         index = db.indexes.indexes()[0]
-        assert db.indexes.index(index.name) is index
+        assert db.indexes.index(index.name) == index
         db.flush()
         report = db.verify("all")
         assert any(index.name in name for name in report.files_checked), report.files_checked
@@ -452,7 +462,7 @@ def test_a_reopened_database_says_which_indexes_opened_behind(tmp_path: Path) ->
         # still fails today for a composition that reported an empty set it never computed.
         recomputed = {
             index.name
-            for index in reopened.indexes.open(reopened.transactions.published_lsn())
+            for index in reopened._indexes.open(reopened._transactions.published_lsn())
         }
         assert set(reopened.stale_indexes) == recomputed
 

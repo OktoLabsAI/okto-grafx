@@ -191,11 +191,15 @@ def _search(database: Any, k: int = ROWS) -> tuple[int, str, tuple[int, ...]]:
     """Search under a fresh read snapshot; return (achieved_k, regime, sorted record ids)."""
     reader = database.begin("read")
     try:
-        hits = database.vectors.search(
+        # This suite instruments interleavings *inside* VectorEngine. The public facade holds the
+        # recovery-safe participant section around a search, intentionally excluding a same-
+        # participant commit; use the owned engine here so the unit-level HNSW windows remain
+        # reachable without publishing it to library callers.
+        hits = database._vectors.search(
             space="s",
             k=k,
             query=[1.0, 0.0, 0.25, 0.0],
-            snapshot=reader.context.snapshot,
+            snapshot=reader.snapshot,
         )
         return (
             hits.achieved_k,
@@ -252,7 +256,7 @@ def test_a_search_arriving_mid_build_waits_and_answers_from_a_complete_snapshot(
     idents: dict[str, int] = {}
     try:
         _populate(database, ROWS)
-        resolves = _count_resolves(database.vectors.index("s"))
+        resolves = _count_resolves(database._vectors.index("s"))
 
         def search_as(name: str) -> None:
             idents[name] = threading.get_ident()
@@ -302,7 +306,7 @@ def test_a_builder_failing_after_another_published_does_not_erase_the_success(
     outcomes: dict[str, object] = {}
     try:
         _populate(database, ROWS)
-        index = database.vectors.index("s")
+        index = database._vectors.index("s")
         resolved = index._resolve  # noqa: SLF001 - the refusal is injected where it arises
 
         def refuse_the_parked_builder_after_release(ref: object) -> object:
@@ -427,7 +431,7 @@ class _SeesEveryLiveVersion:
 
 
 def _search_permissive(database: Any) -> tuple[int, str, tuple[int, ...]]:
-    hits = database.vectors.search(
+    hits = database._vectors.search(
         space="s",
         k=2 * ROWS,
         query=[1.0, 0.0, 0.25, 0.0],
@@ -501,7 +505,7 @@ def test_a_commit_landing_during_the_catch_up_pass_is_caught_up_too(
     release_catch_up = threading.Event()
     try:
         _populate(database, ROWS - 1)
-        index = database.vectors.index("s")
+        index = database._vectors.index("s")
         resolved = index._resolve  # noqa: SLF001 - the resolve of the eighth row is the hook
         resolves = Counter()
 
@@ -553,7 +557,7 @@ def _delete_and_reconcile(database: Any, record_id: int) -> None:
     horizon = database.transactions.published_state().last_csn
     with database.begin("write") as txn:
         _insert(txn, EXTRA_ID)
-        database.vectors.reconcile("s", horizon, txn.context)
+        database._vectors.reconcile("s", horizon, txn._context)
 
 
 def _search_permissive_into(
@@ -593,7 +597,7 @@ def test_an_entry_reconciled_away_during_the_build_is_not_in_the_published_snaps
             "the first search never reached the parked score"
         )
         _delete_and_reconcile(database, 2)
-        assert len(database.vectors.index("s").walk()) == ROWS  # A72: 2 gone, 100 there
+        assert len(database._vectors.index("s").walk()) == ROWS  # A72: 2 gone, 100 there
         math.release()
         _finish(first)
         assert outcomes["first"] == (ROWS, "approximate", expected), outcomes
@@ -625,7 +629,7 @@ def test_an_entry_reconciled_away_during_the_catch_up_pass_is_not_in_the_publish
     expected = tuple(sorted((set(range(1, ROWS + 1)) - {2}) | {ROWS + 1}))  # record id
     try:
         _populate(database, ROWS - 1)
-        index = database.vectors.index("s")
+        index = database._vectors.index("s")
         resolved = index._resolve  # noqa: SLF001 - the builder's eighth resolve is the hook
         resolves = Counter()
 
@@ -697,7 +701,7 @@ def test_a_commit_storm_through_every_pass_leaves_the_mark_behind_and_the_next_s
 
     try:
         _populate(database, ROWS - 1)
-        index = database.vectors.index("s")
+        index = database._vectors.index("s")
         resolved = index._resolve  # noqa: SLF001 - the first resolve of each walk is the hook
         resolves = Counter()
 

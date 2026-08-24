@@ -47,7 +47,7 @@ def _plan_operators(handle, statement: str, parameters=None) -> set[str]:
     the plan the query would actually run.
     """
     seen: set[str] = set()
-    stack = [handle.queries.explain(statement)]
+    stack = [handle.explain(statement)]
     while stack:
         node = stack.pop()
         seen.add(type(node).__name__)
@@ -289,7 +289,7 @@ def test_a_stale_index_is_never_planned_and_the_answer_stays_right(database) -> 
         database, "MATCH (p:Person) WHERE p.id = $k RETURN p.name", {"k": 3}
     )
 
-    index = database.indexes.index("pk_Person")
+    index = database._indexes.index("pk_Person")
     index.mark_stale("forced by a test")
     # The index's own flag, not `Database.stale_indexes`: that attribute is the verdict taken at
     # open and does not move afterwards, so asserting it here would assert nothing about now.
@@ -321,7 +321,7 @@ def test_a_stale_index_does_not_let_a_duplicate_key_through(database) -> None:
     with database.begin("write") as txn:
         txn.execute("CREATE (:Person {id: 1, name: 'ada'})")
 
-    database.indexes.index("pk_Person").mark_stale("forced by a test")
+    database._indexes.index("pk_Person").mark_stale("forced by a test")
 
     with pytest.raises(GrafxQueryError) as refused:
         with database.begin("write") as txn:

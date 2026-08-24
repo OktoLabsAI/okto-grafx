@@ -139,7 +139,7 @@ def test_a_committed_schema_change_logs_the_catalog_header_page(tmp_path: Path) 
 
         logged = {
             decode_page_write(record.payload).page_index
-            for record in db.wal.read_from(before + 1)
+            for record in db._wal.read_from(before + 1)
             if record.record_type == WalRecordType.WRITE_PAGE
             and decode_page_write(record.payload).file == catalog_file
         }

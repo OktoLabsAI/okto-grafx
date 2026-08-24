@@ -58,8 +58,8 @@ def test_the_commit_populates_both_endpoint_indexes(database) -> None:
     scan could not make an EMPTY index look populated (the E3 shape, one component over).
     """
     _small_graph(database)
-    assert len(database.indexes.index(edge_from_index_name("E")).walk()) == 6
-    assert len(database.indexes.index(edge_to_index_name("E")).walk()) == 6
+    assert len(database.inspect_index(edge_from_index_name("E"))) == 6
+    assert len(database.inspect_index(edge_to_index_name("E"))) == 6
 
 
 def test_traversal_answers_the_same_rows_by_index_and_by_scan(database) -> None:
@@ -72,8 +72,8 @@ def test_traversal_answers_the_same_rows_by_index_and_by_scan(database) -> None:
         ("MATCH (b:B {id: 1})<-[:E]-(a:A) RETURN a.id", None),
     ]
     indexed = [sorted(database.execute(text).rows) for text, _p in shapes]
-    database.indexes.index(edge_from_index_name("E")).mark_stale("forced by this test")
-    database.indexes.index(edge_to_index_name("E")).mark_stale("forced by this test")
+    database._indexes.index(edge_from_index_name("E")).mark_stale("forced by this test")
+    database._indexes.index(edge_to_index_name("E")).mark_stale("forced by this test")
     scanned = [sorted(database.execute(text).rows) for text, _p in shapes]
     assert indexed == scanned
     assert indexed[0] == [(1,), (2,)]

@@ -7,6 +7,15 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### Changed
+
+- **`Database` no longer exposes mutable engine collaborators, and `Transaction.context` was
+  removed.** Composition properties now return detached frozen schema, inventory and diagnostic
+  snapshots with no `inner`, callback or raw-object backdoor. Vector reads use
+  `Database.search_vectors(transaction, ...)`; planning, index inspection, quarantine reads and
+  metrics publication have explicit database methods. Invalid `Database.retry()` calls now prove
+  type, ownership, active state and retry eligibility before schema bookkeeping can move.
+
 ### Fixed
 
 - **Vector search: a search arriving while the HNSW graph was being built could answer from a

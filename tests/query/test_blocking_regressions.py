@@ -49,7 +49,7 @@ def reopened(directory: object, table: str) -> list[tuple[object, ...]]:
     handle = okto_grafx.connect(str(directory))
     try:
         definition = handle.catalog.catalog.table(table)
-        return [version.values for _ref, version in handle.heap.scan_all(definition)]
+        return [version.values for _ref, version in handle._heap.scan_all(definition)]
     finally:
         handle.close()
 
@@ -244,14 +244,14 @@ def test_a_window_still_truncates_what_the_caller_receives(tmp_path: object) -> 
 def test_the_barrier_is_an_operator_rather_than_a_habit_of_the_executor(
     database: object,
 ) -> None:
-    plan = database.queries.explain("MATCH (p:Person) CREATE (:Copy {id: p.id}) RETURN p.id")
+    plan = database.explain("MATCH (p:Person) CREATE (:Copy {id: p.id}) RETURN p.id")
     labels = [node.label for node in plan.walk()]
     assert "EagerRows" in labels
     assert labels.index("EagerRows") < labels.index("CreateRelationships")
 
 
 def test_a_query_that_only_reads_carries_no_barrier(database: object) -> None:
-    plan = database.queries.explain("MATCH (p:Person) RETURN p.id LIMIT 1")
+    plan = database.explain("MATCH (p:Person) RETURN p.id LIMIT 1")
     assert "EagerRows" not in [node.label for node in plan.walk()]
 
 

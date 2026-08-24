@@ -37,9 +37,7 @@ def _schema(database: object) -> None:
 def _search(database: object, query: list[float], k: int) -> list[int]:
     reader = database.begin("read")
     try:
-        result = database.vectors.search(
-            space="s", k=k, query=query, snapshot=reader.context.snapshot
-        )
+        result = database.search_vectors(reader, space="s", k=k, query=query)
     finally:
         reader.rollback()
     return [hit.record_id for hit in result.hits]

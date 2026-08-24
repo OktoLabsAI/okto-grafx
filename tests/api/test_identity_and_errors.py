@@ -137,7 +137,7 @@ def test_an_identity_page_with_no_identity_record_is_damage(tmp_path: Path) -> N
     registry = build_default_registry(DatabaseConfig(path=str(tmp_path / "db")))
     try:
         db = connect(tmp_path / "db", registry=registry)
-        pool = db.pool
+        pool = db._pool
         db.close()
         with pool.pinned(META_FILE, 0) as page:
             page.free_slot(IDENTITY_SLOT)
@@ -362,8 +362,10 @@ def test_a_barrier_failure_reaches_a_committing_caller_with_its_detail_intact(
     try:
         db = connect(tmp_path / "db", registry=registry)
         txn = db.begin("write")
-        txn.context.owner._stage_page_image(txn.context, "heap.dat", 0, db.codec.encode_page(_heap_page(db)))
-        txn.context.note_write(db.transactions.partition_of(1, b"k"))
+        txn._context.owner._stage_page_image(
+            txn._context, "heap.dat", 0, db._codec.encode_page(_heap_page(db))
+        )
+        txn._context.note_write(db.transactions.partition_of(1, b"k"))
         device_type.durable_barrier = refuse  # type: ignore[method-assign]
         try:
             with pytest.raises(GrafxError) as raised:
@@ -544,7 +546,7 @@ def test_the_identity_store_refuses_a_page_size_the_database_was_not_created_wit
     registry = build_default_registry(DatabaseConfig(path=str(tmp_path / "db"), page_size=512))
     try:
         db = connect(tmp_path / "db", page_size=512, registry=registry)
-        pool = db.pool
+        pool = db._pool
         db.close()
         store = MetaStore(pool)
         wrong = DatabaseIdentity(
@@ -625,7 +627,7 @@ def test_a_device_failure_under_a_read_reaches_the_caller_as_the_class_it_starte
     try:
         with database.begin("write") as txn:
             txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
-        database.pool.invalidate()
+        database._pool.invalidate()
 
         def refuse(self: object, file: str, page_index: int) -> bytes:
             # A44: only the device this test built refuses, and only for the heap.
@@ -665,7 +667,7 @@ def test_a_retryable_device_failure_under_a_read_keeps_its_retryable_flag(
     try:
         with database.begin("write") as txn:
             txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
-        database.pool.invalidate()
+        database._pool.invalidate()
 
         def refuse(self: object, file: str, page_index: int) -> bytes:
             if self is device and file == "heap.dat":

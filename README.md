@@ -109,9 +109,11 @@ other transaction when it commits — schema changes are transactions like any o
 - `CREATE VECTOR SPACE` declares a dimension, a metric (`cosine`, `l2`, `dot`) and a storage dtype.
 - A node table declares a `VECTOR(space)` column, and the index that makes it searchable is created
   with the table.
-- `db.vectors.search(space=…, k=…, query=…, snapshot=…)` returns the nearest rows visible to a
-  snapshot, reporting the **regime** it answered in (`exact` or `approximate`) and the `achieved_k`,
-  so a caller can tell an exhaustive answer from an approximate one.
+- `db.search_vectors(reader, space=…, k=…, query=…)` returns the nearest rows visible to an active
+  read transaction, reporting the **regime** it answered in (`exact` or `approximate`) and the
+  `achieved_k`, so a caller can tell an exhaustive answer from an approximate one. The database
+  validates that the transaction is active and belongs to it; no raw transaction context or
+  mutable vector engine is exposed.
 
 ### Observability
 
@@ -276,12 +278,20 @@ with db.begin("write") as txn:
 
 reader = db.begin("read")
 try:
-    hits = db.vectors.search(space="minilm", k=10, query=[0.1] * 384,
-                             snapshot=reader.context.snapshot)
+    hits = db.search_vectors(reader, space="minilm", k=10, query=[0.1] * 384)
     print(hits.regime, hits.achieved_k)   # 'exact' or 'approximate', and how many it reached
 finally:
     reader.rollback()
 ```
+
+### Safe observations
+
+Properties such as `db.catalog`, `db.indexes`, `db.wal`, `db.storage` and `db.metrics` are frozen
+snapshots for schema, inventory and diagnostics. They never retain the storage device, page pool,
+WAL, transaction manager or adapter callbacks. Writes go through transactions or explicit gated
+database methods (`checkpoint`, `recover`, `flush`, `publish_metrics`); there is no `unsafe=True`
+escape. `Transaction` exposes `snapshot`, `mode`, `txn_id`, `active` and `report`, but never its
+mutable engine context.
 
 ### In memory
 
