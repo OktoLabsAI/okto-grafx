@@ -565,6 +565,12 @@ class LocalStorageDevice:
         self._lock = threading.RLock()
         self._handles: dict[str, int] = {}
         self._dirty: set[str] = set()
+        # File bytes and namespace entries have different durability authorities on POSIX.
+        # ``_dirty`` records descriptors whose bytes still need fsync; this set records the
+        # directories whose entries changed.  Keeping the latter independently is essential
+        # for remove(): once a file is gone there is deliberately no descriptor left for a
+        # later global barrier to discover, but its parent directory still owes an fsync.
+        self._dirty_directories: set[str] = set()
         self._deferred: dict[str, int] = {}
         self._pending_serial = 0
         self._closed = False
@@ -622,6 +628,7 @@ class LocalStorageDevice:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
             except OSError as failure:
                 raise self._device_failure("create", name, failure) from failure
+            self._acknowledge_namespace(path)
             self._forget_deferred(name)
             descriptor = self._retry("create", name, lambda: _open_descriptor(path, create_new=True))
             self._admit(name, descriptor)
@@ -641,6 +648,7 @@ class LocalStorageDevice:
             self._dirty.discard(name)
             path = self._physical_path(name)
             self._retry("remove", name, lambda: _remove_file(path))
+            self._acknowledge_namespace(path)
             self._forget_deferred(name)
             # Draining afterwards keeps this door an independent trigger for the deletion queue
             # without letting a pass take the very file the caller asked about.
@@ -697,6 +705,8 @@ class LocalStorageDevice:
             # families: os.rename fails on Windows the moment the target exists, and os.replace
             # fails there whenever another participant holds the target open (CF-5).
             self._retry("atomic_replace", target_name, lambda: _publish_over(source_path, target_path))
+            self._acknowledge_namespace(source_path)
+            self._acknowledge_namespace(target_path)
             self._dirty.discard(source_name)
             self._acknowledge(target_name)
             # Any deletion still queued for either name refers to a file that is now gone or
@@ -757,6 +767,7 @@ class LocalStorageDevice:
                     # Checked before the attempt cap: a file that is already gone must be
                     # retired from the queue, otherwise an operator reads a phantom forever.
                     del self._deferred[relative]
+                    self._acknowledge_namespace(path)
                     reclaimed += 1
                     continue
                 if attempts >= MAX_PENDING_DELETE_ATTEMPTS and not force:
@@ -765,6 +776,7 @@ class LocalStorageDevice:
                     _remove_file(path)
                 except FileNotFoundError:
                     del self._deferred[relative]
+                    self._acknowledge_namespace(path)
                     reclaimed += 1
                 except OSError:
                     self._deferred[relative] = attempts + 1
@@ -775,6 +787,7 @@ class LocalStorageDevice:
                         self._deferred[relative] = attempts + 1
                     else:
                         del self._deferred[relative]
+                        self._acknowledge_namespace(path)
                         reclaimed += 1
             return reclaimed
 
@@ -925,10 +938,16 @@ class LocalStorageDevice:
         (``reason``, ``errno``, ``winerror``, ``attempts``, ``retryable``).
         """
         names: tuple[str, ...] = ()
+        directories: tuple[str, ...] = ()
         with self._lock:
             try:
                 self._require_open()
                 names = self._barrier_targets(file)
+                # A named barrier still flushes every outstanding namespace mutation.  A
+                # rename can change two different parent directories and a removed file has
+                # no name left from which to rediscover either one.  Flushing this small set is
+                # conservative and mirrors what fsync(parent) already does for sibling names.
+                directories = tuple(self._dirty_directories)
                 for name in names:
                     descriptor = self._descriptor(name, "read")
                     try:
@@ -944,12 +963,13 @@ class LocalStorageDevice:
                             attempts=1,
                         ) from failure
                 if not IS_WINDOWS:
-                    self._synchronize_directories(names)
+                    self._synchronize_directories(names, extra=directories)
             except GrafxDurabilityBarrierFailed:
                 raise
             except GrafxError as failure:
                 raise barrier_failure_from(failure) from failure
             self._dirty.difference_update(names)
+            self._dirty_directories.difference_update(directories)
 
     # --- lifecycle ----------------------------------------------------------------------
 
@@ -1007,6 +1027,7 @@ class LocalStorageDevice:
             except OSError:
                 pass
             else:
+                self._acknowledge_namespace(path)
                 return True
         pending = self._pending_path(path)
         try:
@@ -1018,12 +1039,16 @@ class LocalStorageDevice:
                 _remove_file(path)
             except OSError:
                 return False
+            self._acknowledge_namespace(path)
             return not self._entry_present(path)
+        self._acknowledge_namespace(path)
+        self._acknowledge_namespace(pending)
         self._forget_deferred(name)
         try:
             _remove_file(pending)
         except OSError:
             return self._defer(pending)
+        self._acknowledge_namespace(pending)
         if self._entry_present(pending):
             return self._defer(pending)
         return True
@@ -1195,6 +1220,26 @@ class LocalStorageDevice:
         self._dirty.add(name)
         self._forget_deferred(name)
 
+    def _acknowledge_namespace(self, path: str) -> None:
+        """Remember every owned directory whose namespace may have changed.
+
+        The immediate parent owns the file entry; each ancestor owns the entry for the nested
+        directory below it.  Remembering the complete chain makes creation of a new nested
+        namespace durable in the same child-before-parent barrier as its first file.  Existing
+        ancestors may be recorded again -- an idempotent and deliberately conservative debt.
+        """
+        directory = os.path.dirname(path)
+        while True:
+            self._dirty_directories.add(directory)
+            if os.path.normcase(directory) == os.path.normcase(self._root):
+                return
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                # All callers pass a path below _root.  Keep this guard fail-safe if that
+                # invariant is ever broken rather than walking forever at a volume root.
+                return
+            directory = parent
+
     def _admit(self, name: str, descriptor: int) -> None:
         """Cache one descriptor, evicting the least recently used one when the cache is full."""
         self._handles[name] = descriptor
@@ -1303,11 +1348,19 @@ class LocalStorageDevice:
         """Return the device relative form of a real path, using the logical separator."""
         return os.path.relpath(path, self._root).replace(os.sep, "/")
 
-    def _synchronize_directories(self, names: tuple[str, ...]) -> None:
-        """Flush every directory that holds one of the named files. POSIX only."""
+    def _synchronize_directories(
+        self, names: tuple[str, ...], *, extra: tuple[str, ...] = ()
+    ) -> None:
+        """Flush file parents plus outstanding namespace directories. POSIX only."""
         directories = {os.path.dirname(self._physical_path(name)) for name in names}
+        directories.update(extra)
         directories.add(self._root)
-        for directory in sorted(directories):
+        # A child entry is fixed before the parent entry that makes that child reachable.
+        for directory in sorted(
+            directories,
+            key=lambda path: (path.count(os.sep), path),
+            reverse=True,
+        ):
             try:
                 descriptor = os.open(directory, os.O_RDONLY)
             except OSError as failure:

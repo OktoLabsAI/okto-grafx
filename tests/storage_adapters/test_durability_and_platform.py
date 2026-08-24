@@ -162,6 +162,60 @@ def test_a_barrier_flushes_the_parent_directory_on_posix(local_device: LocalStor
 
 
 @pytest.mark.platform_specific
+@pytest.mark.skipif(IS_WINDOWS, reason="Only POSIX exposes directory fsync durability.")
+def test_nested_namespace_create_remove_and_rename_leave_directory_barrier_debts(
+    local_device: LocalStorageDevice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A global barrier finds directory mutations even after their file name disappeared."""
+    root = Path(local_device.root)
+    opened_directories: list[Path] = []
+    real_open = os.open
+
+    def _recording_open(path: Any, flags: int, *rest: Any) -> int:
+        candidate = Path(path)
+        if candidate.is_dir():
+            opened_directories.append(candidate)
+        return real_open(path, flags, *rest)
+
+    monkeypatch.setattr(storage_local.os, "open", _recording_open)
+
+    nested = "bootstrap/nested/first-open.intent"
+    local_device.create(nested)
+    local_device.append_log(nested, b"intent")
+    local_device.durable_barrier(None)
+    assert set(opened_directories) >= {
+        root,
+        root / "bootstrap",
+        root / "bootstrap" / "nested",
+    }
+
+    opened_directories.clear()
+    local_device.remove(nested)
+    local_device.durable_barrier(None)
+    assert set(opened_directories) >= {
+        root,
+        root / "bootstrap",
+        root / "bootstrap" / "nested",
+    }, "remove lost the nested parent once the file descriptor/name was gone"
+
+    source = "bootstrap/incoming/intent.staging"
+    target = "published/state/intent"
+    local_device.create(source)
+    local_device.append_log(source, b"complete")
+    local_device.durable_barrier(source)
+    opened_directories.clear()
+    local_device.atomic_replace(source, target)
+    local_device.durable_barrier(None)
+    assert set(opened_directories) >= {
+        root,
+        root / "bootstrap",
+        root / "bootstrap" / "incoming",
+        root / "published",
+        root / "published" / "state",
+    }, "atomic rename did not pin both the source removal and target publication namespaces"
+
+
+@pytest.mark.platform_specific
 @pytest.mark.skipif(not IS_WINDOWS, reason="Windows has no directory handle to flush.")
 def test_a_barrier_flushes_no_directory_on_windows(local_device: LocalStorageDevice) -> None:
     # Counterpart: test_a_barrier_flushes_the_parent_directory_on_posix.
