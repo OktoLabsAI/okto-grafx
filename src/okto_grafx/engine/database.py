@@ -90,17 +90,26 @@ from okto_grafx.engine.public_views import (
     VectorEngineView,
     VectorMathView,
     WalView,
+    _builtin_bool,
+    _builtin_bytes,
+    _builtin_float,
+    _builtin_int,
+    _builtin_optional_text,
+    _builtin_text,
+    _builtin_type_name,
     _catalog_view_from,
     _clock_view,
     _codec_view,
     _component_view,
     _coordinator_view,
+    _domain_field,
     _heap_view,
     _indexes_view,
     _ledger_view,
     _pool_view,
     _quarantine_view,
     _queries_view,
+    _recovery_report_view,
     _storage_view,
     _transactions_view,
     _vectors_view,
@@ -182,21 +191,19 @@ _UUID_BYTES: int = 16
 
 def _require_text(field: str, value: object) -> str:
     """Return the value as a non-empty string, or refuse with the field named."""
-    if not isinstance(value, str) or not value:
-        raise GrafxConfigurationError(
-            f"The {field} must be a non-empty string; got {value!r}.",
-            field=field,
-            value=repr(value),
-        )
-    return value
+    return _builtin_text(value, field=field, empty=False)
 
 
 def _note_cleanup_failure(primary: BaseException, cleanup: BaseException) -> None:
     """Attach cleanup evidence without changing the exception that caused the unwind."""
     try:
-        primary.add_note(
-            f"Additional cleanup failure: {type(cleanup).__name__}: {cleanup}"
-        )
+        note = f"Additional cleanup failure: {_builtin_type_name(cleanup)}"
+        arguments = BaseException.__dict__["args"].__get__(cleanup, type(cleanup))
+        if type(arguments) is tuple and arguments:
+            first = next(tuple.__iter__(arguments))
+            if issubclass(type(first), str):
+                note += f": {str.__str__(first)}"
+        primary.add_note(note + ".")
     except BaseException:
         # Exception note support is diagnostic only; an exotic exception implementation must
         # not replace either the primary failure or the cleanup result it was meant to report.
@@ -221,39 +228,65 @@ class DatabaseIdentity:
 
     def __post_init__(self) -> None:
         """Reject an identity that could not be encoded or could not be true."""
-        if not isinstance(self.database_uuid, bytes) or len(self.database_uuid) != _UUID_BYTES:
+        database_uuid = self.database_uuid
+        if not issubclass(type(database_uuid), bytes):
             raise GrafxConfigurationError(
                 f"A database identity is exactly {_UUID_BYTES} bytes; got "
-                f"{len(self.database_uuid) if isinstance(self.database_uuid, bytes) else '?'}.",
+                f"{_builtin_type_name(database_uuid)}.",
                 field="database_uuid",
-                value=repr(self.database_uuid),
+                value=_builtin_type_name(database_uuid),
+            )
+        database_uuid = _builtin_bytes(database_uuid)
+        object.__setattr__(self, "database_uuid", database_uuid)
+        if len(database_uuid) != _UUID_BYTES:
+            raise GrafxConfigurationError(
+                f"A database identity is exactly {_UUID_BYTES} bytes; got "
+                f"{len(database_uuid)}.",
+                field="database_uuid",
+                value=len(database_uuid),
             )
         for field, value, ceiling in (
             ("format_version", self.format_version, 0xFFFF),
             ("page_size", self.page_size, 0xFFFFFFFF),
             ("partitions_per_table", self.partitions_per_table, 0xFFFF),
         ):
-            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= ceiling:
+            if type(value) is bool or not issubclass(type(value), int):
+                observed = _builtin_type_name(value)
                 raise GrafxConfigurationError(
-                    f"The identity field {field!r} is outside its width: {value!r}.",
+                    f"The identity field {field!r} must be an integer; got {observed}.",
                     field=field,
-                    value=repr(value),
+                    value=observed,
                 )
-        if not isinstance(self.created_at_wall, (int, float)) or isinstance(
-            self.created_at_wall, bool
+            plain = int.__int__(value)
+            object.__setattr__(self, field, plain)
+            if not 0 <= plain <= ceiling:
+                raise GrafxConfigurationError(
+                    f"The identity field {field!r} is outside its width: {plain}.",
+                    field=field,
+                    value=plain,
+                )
+        created_at_wall = self.created_at_wall
+        if (
+            not issubclass(type(created_at_wall), (int, float))
+            or type(created_at_wall) is bool
         ):
+            observed = _builtin_type_name(created_at_wall)
             raise GrafxConfigurationError(
-                f"The creation stamp must be a number; got {self.created_at_wall!r}.",
+                f"The creation stamp must be a number; got {observed}.",
                 field="created_at_wall",
-                value=repr(self.created_at_wall),
+                value=observed,
             )
+        object.__setattr__(self, "created_at_wall", _builtin_float(created_at_wall))
         descriptor = self.granularity_descriptor
-        if not isinstance(descriptor, str):
+        if not issubclass(type(descriptor), str):
+            observed = _builtin_type_name(descriptor)
             raise GrafxConfigurationError(
-                f"The granularity descriptor must be a string; got {descriptor!r}.",
+                f"The granularity descriptor must be a string; got {observed}.",
                 field="granularity_descriptor",
-                value=repr(descriptor),
+                value=observed,
             )
+        descriptor = str.__str__(descriptor)
+        object.__setattr__(self, "granularity_descriptor", descriptor)
         if len(descriptor.encode("utf-8")) > MAX_DESCRIPTOR_BYTES:
             raise GrafxConfigurationError(
                 f"The granularity descriptor is longer than {MAX_DESCRIPTOR_BYTES} bytes.",
@@ -280,14 +313,15 @@ class DatabaseIdentity:
     def decode(cls, raw: bytes) -> DatabaseIdentity:
         """Return the identity a record holds, refusing damaged bytes as corruption."""
         minimum = _IDENTITY_HEAD.size + _IDENTITY_TAIL.size
-        if not isinstance(raw, (bytes, bytearray)) or len(raw) < minimum:
+        raw_is_bytes = issubclass(type(raw), (bytes, bytearray))
+        payload = _builtin_bytes(raw) if raw_is_bytes else b""
+        if not raw_is_bytes or len(payload) < minimum:
             raise GrafxCorruptionDetected(
                 f"An identity record is at least {minimum} bytes; this one holds "
-                f"{len(raw) if isinstance(raw, (bytes, bytearray)) else 0}.",
+                f"{len(payload)}.",
                 field="identity_length",
-                value=len(raw) if isinstance(raw, (bytes, bytearray)) else 0,
+                value=len(payload),
             )
-        payload = bytes(raw)
         (
             magic,
             format_version,
@@ -342,6 +376,41 @@ class DatabaseIdentity:
             granularity_descriptor=descriptor,
             format_version=format_version,
         )
+
+
+def _public_identity(value: DatabaseIdentity) -> DatabaseIdentity:
+    """Rebuild the identity with exact scalar leaves for the public facade.
+
+    The private identity remains the engine's original value.  This copy has the same encoded
+    record and equality semantics, while stripping any host-defined subclass accepted by the
+    domain constructor's intentionally structural validation.
+    """
+    if not issubclass(type(value), DatabaseIdentity):
+        raise GrafxConfigurationError(
+            f"A public database identity must be a DatabaseIdentity; got "
+            f"{_builtin_type_name(value)}.",
+            field="identity",
+            value=_builtin_type_name(value),
+        )
+    return DatabaseIdentity(
+        database_uuid=_builtin_bytes(
+            _domain_field(value, DatabaseIdentity, "database_uuid")
+        ),
+        page_size=_builtin_int(_domain_field(value, DatabaseIdentity, "page_size")),
+        partitions_per_table=_builtin_int(
+            _domain_field(value, DatabaseIdentity, "partitions_per_table")
+        ),
+        created_at_wall=_builtin_float(
+            _domain_field(value, DatabaseIdentity, "created_at_wall")
+        ),
+        granularity_descriptor=_builtin_text(
+            _domain_field(value, DatabaseIdentity, "granularity_descriptor"),
+            field="identity.granularity_descriptor",
+        ),
+        format_version=_builtin_int(
+            _domain_field(value, DatabaseIdentity, "format_version")
+        ),
+    )
 
 
 class MetaStore:
@@ -465,6 +534,38 @@ class MetaStore:
         return f"MetaStore(file={self._file!r})"
 
 
+def _public_commit_report(value: CommitReport | None) -> CommitReport | None:
+    """Copy a commit outcome into the exact public report type and exact scalar leaves."""
+    if value is None:
+        return None
+    if not issubclass(type(value), CommitReport):
+        raise GrafxConfigurationError(
+            f"A public commit report must be a CommitReport; got "
+            f"{_builtin_type_name(value)}.",
+            field="report",
+            value=_builtin_type_name(value),
+        )
+    observed_csn = _domain_field(value, CommitReport, "_csn")
+    observed_durable = _domain_field(value, CommitReport, "_durable")
+    observed_wrote = _domain_field(value, CommitReport, "_wrote")
+    csn = _builtin_int(observed_csn)
+    durable = _builtin_bool(observed_durable)
+    wrote = _builtin_bool(observed_wrote)
+    return CommitReport(csn=csn, durable=durable, wrote=wrote)
+
+
+def _public_snapshot(value: Snapshot) -> Snapshot:
+    """Copy a transaction snapshot into its exact domain type and integer leaf."""
+    if not issubclass(type(value), Snapshot):
+        raise GrafxConfigurationError(
+            f"A public transaction snapshot must be a Snapshot; got "
+            f"{_builtin_type_name(value)}.",
+            field="snapshot",
+            value=_builtin_type_name(value),
+        )
+    return Snapshot(_builtin_int(_domain_field(value, Snapshot, "read_lsn")))
+
+
 class Transaction:
     """One open transaction, as CONTRACT.md section 10 hands it to a caller.
 
@@ -490,27 +591,29 @@ class Transaction:
     @property
     def mode(self) -> str:
         """Return ``"read"`` or ``"write"``, the mode this transaction was opened in."""
-        return self._context.mode.value
+        return _builtin_text(
+            self._context.mode.value, field="transaction.mode", empty=False
+        )
 
     @property
     def snapshot(self) -> Snapshot:
         """Return the fixed view every read of this transaction sees (SPEC-M1 FR-2)."""
-        return self._context.snapshot
+        return _public_snapshot(self._context.snapshot)
 
     @property
     def txn_id(self) -> int:
         """Return the process-local number of this transaction."""
-        return self._context.txn_id
+        return _builtin_int(self._context.txn_id)
 
     @property
     def active(self) -> bool:
         """Return True while this transaction can still commit or roll back."""
-        return not self._finished and self._context.active
+        return _builtin_bool(not self._finished and self._context.active)
 
     @property
     def report(self) -> CommitReport | None:
         """Return what the commit reported, or None while the transaction is still open."""
-        return self._report
+        return _public_commit_report(self._report)
 
     def execute(
         self, text: str, parameters: Mapping[str, object] | None = None
@@ -542,9 +645,9 @@ class Transaction:
                 # and close has to guess whether its DDL committed.
                 if self._context.state is TransactionState.COMMITTED:
                     self._report = CommitReport(
-                        csn=self._context.commit_csn,
+                        csn=_builtin_int(self._context.commit_csn),
                         durable=True,
-                        wrote=self._context.wrote,
+                        wrote=_builtin_bool(self._context.wrote),
                     )
                     self._finished = True
                     try:
@@ -564,7 +667,20 @@ class Transaction:
                     # ACTIVE and retryable through its documented lifecycle doors.
                     self._finished = False
                 raise
-            self._report = report
+            public_report = _public_commit_report(report)
+            if (
+                public_report is None
+            ):  # pragma: no cover - manager success always has a report
+                raise GrafxTransactionStateError(
+                    "A successful commit did not produce its report.",
+                    operation="commit",
+                )
+            private_report = _public_commit_report(public_report)
+            if (
+                private_report is None
+            ):  # pragma: no cover - public_report is non-optional above
+                raise AssertionError("a public commit report copy disappeared")
+            self._report = private_report
             self._finished = True
             try:
                 self._database._settle_schema(self._context, committed=True)
@@ -576,7 +692,7 @@ class Transaction:
                 # privately as lifecycle evidence.
                 if self._database._close_failure is None:
                     self._database._close_failure = settlement_failure
-            return report
+            return public_report
 
     def rollback(self) -> None:
         """Abandon this transaction. Rolling back twice is a no-op, never an error."""
@@ -750,8 +866,10 @@ class Database:
         self._identity: DatabaseIdentity = identity
         self._path: str = _require_text("path", path)
         self._label: str = _require_text("label", label)
-        self._read_only: bool = bool(read_only)
-        self._metrics_endpoint: str | None = metrics_endpoint
+        self._read_only: bool = _builtin_bool(read_only)
+        self._metrics_endpoint: str | None = _builtin_optional_text(
+            metrics_endpoint, field="metrics_endpoint"
+        )
         self._closers: tuple[Callable[[], None], ...] = tuple(closers)
         self._closed: bool = False
         # Contexts never cross the public boundary, but the facade must remember every context
@@ -763,10 +881,19 @@ class Database:
         self._close_releasing: bool = False
         self._close_released: bool = False
         self._close_failure: BaseException | None = None
-        self._recovery_report: object = recovery_report
-        self._attached_indexes: tuple[str, ...] = tuple(attached_indexes)
-        self._stale_indexes: tuple[str, ...] = tuple(stale_indexes)
-        self._unindexed_tables: tuple[str, ...] = tuple(unindexed_tables)
+        self._recovery_report: object = _recovery_report_view(recovery_report)
+        self._attached_indexes: tuple[str, ...] = tuple(
+            _builtin_text(name, field="attached_index", empty=False)
+            for name in attached_indexes
+        )
+        self._stale_indexes: tuple[str, ...] = tuple(
+            _builtin_text(name, field="stale_index", empty=False)
+            for name in stale_indexes
+        )
+        self._unindexed_tables: tuple[str, ...] = tuple(
+            _builtin_text(name, field="unindexed_table", empty=False)
+            for name in unindexed_tables
+        )
         if metrics.enabled:
             for declared in DATABASE_METRICS:
                 metrics.register(declared)
@@ -787,7 +914,7 @@ class Database:
     @property
     def identity(self) -> DatabaseIdentity:
         """Return the identity record of section 6.2 that this database carries (FR-1)."""
-        return self._identity
+        return _public_identity(self._identity)
 
     @property
     def read_only(self) -> bool:
@@ -886,14 +1013,17 @@ class Database:
         """Return immutable format metadata without exposing page encode/decode doors."""
         with self._public_transition():
             self._require_open()
-            return _codec_view(self._codec, self._identity.page_size)
+            return _codec_view(
+                self._codec,
+                _domain_field(self._identity, DatabaseIdentity, "page_size"),
+            )
 
     @property
     def metrics(self) -> MetricsView:
         """Return whether metrics collection is enabled, without exposing the mutable sink."""
         with self._public_transition():
             self._require_open()
-            return MetricsView(bool(self._metrics.enabled))
+            return MetricsView(_builtin_bool(self._metrics.enabled))
 
     @property
     def events(self) -> ComponentView:
@@ -910,7 +1040,13 @@ class Database:
             # Adapter identity is observable without executing a host-supplied descriptor.
             # Calling ``name`` here would turn a harmless property read into another callback
             # into the host.
-            return VectorMathView(type(self._vector_math).__name__)
+            return VectorMathView(
+                _builtin_text(
+                    _builtin_type_name(self._vector_math),
+                    field="vector_math.name",
+                    empty=False,
+                )
+            )
 
     @property
     def coordinator(self) -> CoordinatorView:
@@ -969,7 +1105,7 @@ class Database:
             # storage read is in flight; the facade transition defers release and this private
             # in-section path lets that already-started observation finish honestly.
             with self._transactions._participant_section():
-                recovery_required = bool(self._transactions.recovery_required)
+                recovery_required = _builtin_bool(self._transactions.recovery_required)
                 state = (
                     None
                     if recovery_required
@@ -1001,7 +1137,10 @@ class Database:
                     table.table_id for table in catalog.catalog.table_definitions
                 )
                 with self._transactions._participant_section():
-                    if self._catalog._view_epoch() != epoch:
+                    if (
+                        _builtin_int(self._catalog._view_epoch(), field="catalog.epoch")
+                        != epoch
+                    ):
                         continue
                     return _indexes_view(indexes, table_ids)
 
@@ -1053,7 +1192,10 @@ class Database:
                 )
                 spaces = catalog.catalog.space_definitions
                 with self._transactions._participant_section():
-                    if self._catalog._view_epoch() != epoch:
+                    if (
+                        _builtin_int(self._catalog._view_epoch(), field="catalog.epoch")
+                        != epoch
+                    ):
                         continue
                     return _vectors_view(vectors, spaces, tables)
 
@@ -1099,11 +1241,12 @@ class Database:
         ``oktografx_commit_retries_total``.
         """
         self._require_open()
-        if not isinstance(transaction, Transaction):
+        if type(transaction) is not Transaction:
+            observed = _builtin_type_name(transaction)
             raise GrafxConfigurationError(
-                f"A retry takes a Transaction; got {type(transaction).__name__}.",
+                f"A retry takes a Transaction; got {observed}.",
                 field="transaction",
-                value=type(transaction).__name__,
+                value=observed,
             )
         if transaction._database is not self:
             raise GrafxTransactionStateError(
@@ -1190,7 +1333,9 @@ class Database:
         """Plan one statement without exposing the mutable query engine."""
         self._require_open()
         _require_text("statement", text)
-        engine = self._require_component("queries", self._queries, "the query engine (C10)")
+        engine = self._require_component(
+            "queries", self._queries, "the query engine (C10)"
+        )
         with self._transactions.page_access_section():
             return engine.explain(text)  # type: ignore[attr-defined]
 
@@ -1203,7 +1348,9 @@ class Database:
         """Run one statement for a context already validated by the public Transaction."""
         self._require_open()
         _require_text("statement", text)
-        engine = self._require_component("queries", self._queries, "the query engine (C10)")
+        engine = self._require_component(
+            "queries", self._queries, "the query engine (C10)"
+        )
         with self._transactions.page_access_section():
             if not context.active:
                 raise GrafxTransactionStateError(
@@ -1238,11 +1385,12 @@ class Database:
         vector collaborator itself never leaves the database.
         """
         self._require_open()
-        if not isinstance(transaction, Transaction):
+        if type(transaction) is not Transaction:
+            observed = _builtin_type_name(transaction)
             raise GrafxConfigurationError(
-                f"A vector search takes a Transaction; got {type(transaction).__name__}.",
+                f"A vector search takes a Transaction; got {observed}.",
                 field="transaction",
-                value=type(transaction).__name__,
+                value=observed,
             )
         if transaction._database is not self:
             raise GrafxTransactionStateError(
@@ -1253,14 +1401,20 @@ class Database:
             )
         # Exact type, not isinstance: a subclass can add a callback or mutable backdoor to the
         # otherwise frozen DTO.  Refuse it before resolving or entering the vector engine.
-        if candidate_filter is not None and type(candidate_filter) is not RecordIdFilter:
+        if (
+            candidate_filter is not None
+            and type(candidate_filter) is not RecordIdFilter
+        ):
+            observed = _builtin_type_name(candidate_filter)
             raise GrafxConfigurationError(
                 "A public vector candidate filter must be an immutable RecordIdFilter or None; "
-                f"got {type(candidate_filter).__name__}.",
+                f"got {observed}.",
                 field="candidate_filter",
-                value=type(candidate_filter).__name__,
+                value=observed,
             )
-        vectors = self._require_component("vectors", self._vectors, "the vector engine (C9)")
+        vectors = self._require_component(
+            "vectors", self._vectors, "the vector engine (C9)"
+        )
         with self._transactions.page_access_section():
             # Liveness is checked under the same participant section that commit/rollback use.
             # Checking before it would let a racing rollback withdraw this snapshot's reader pin
@@ -1319,7 +1473,8 @@ class Database:
             self._transactions.require_recovery()
             report = manager.run()  # type: ignore[attr-defined]
             self._transactions.recovery_completed()
-        self._recovery_report = report
+        public_report = _recovery_report_view(report)
+        self._recovery_report = public_report
         indexes = self._indexes
         if indexes is not None:
             # Reacquire after recovery_section released. A concurrent post-barrier failure may
@@ -1327,14 +1482,17 @@ class Database:
             # either finish before that latch or refuse after it, never straddle it.
             with self._transactions.page_access_section():
                 registered = indexes.indexes()  # type: ignore[attr-defined]
-                self._attached_indexes = tuple(index.name for index in registered)
+                self._attached_indexes = tuple(
+                    _builtin_text(index.name, field="attached_index", empty=False)
+                    for index in registered
+                )
                 self._stale_indexes = tuple(
-                    index.name
+                    _builtin_text(index.name, field="stale_index", empty=False)
                     for index in indexes.open(  # type: ignore[attr-defined]
                         self._transactions.published_lsn()
                     )
                 )
-        return report
+        return public_report
 
     def flush(self) -> int:
         """Write every dirty page of this database back to the device and return the count.
@@ -1347,7 +1505,7 @@ class Database:
         self._require_open()
         self._require_writable("flush pages")
         with self._transactions.page_access_section():
-            return self._pool.flush()
+            return _builtin_int(self._pool.flush(), field="flush.count")
 
     def checkpoint(self) -> object:
         """Put the committed state on the platter, publish the checkpoint, and reclaim the log (BR-10).
@@ -1370,9 +1528,12 @@ class Database:
             # registry that now serves queries, just as operator recovery does.
             with self._transactions.page_access_section():
                 registered = indexes.indexes()  # type: ignore[attr-defined]
-                self._attached_indexes = tuple(index.name for index in registered)
+                self._attached_indexes = tuple(
+                    _builtin_text(index.name, field="attached_index", empty=False)
+                    for index in registered
+                )
                 self._stale_indexes = tuple(
-                    index.name
+                    _builtin_text(index.name, field="stale_index", empty=False)
                     for index in indexes.open(  # type: ignore[attr-defined]
                         self._transactions.published_lsn()
                     )
@@ -1401,20 +1562,25 @@ class Database:
         transaction.
         """
         self._require_open()
-        _require_text("index", name)
-        indexes = self._require_component("indexes", self._indexes, "the index framework (C7)")
+        wanted = _require_text("index", name)
+        indexes = self._require_component(
+            "indexes", self._indexes, "the index framework (C7)"
+        )
         with self._transactions.page_access_section():
-            index = indexes.index(name)  # type: ignore[attr-defined]
+            index = indexes.index(wanted)  # type: ignore[attr-defined]
             return tuple(index.walk())
 
     def read_quarantine(self, name: str) -> bytes:
         """Return and checksum-verify the immutable bytes of one quarantine entry."""
         self._require_open()
-        _require_text("quarantine entry", name)
+        wanted = _require_text("quarantine entry", name)
         quarantine = self._require_component(
             "quarantine", self._quarantine, "quarantine (C6)"
         )
-        return bytes(quarantine.read(name))  # type: ignore[attr-defined]
+        return _builtin_bytes(
+            quarantine.read(wanted),  # type: ignore[attr-defined]
+            field="quarantine.payload",
+        )
 
     # --- lifecycle ----------------------------------------------------------------------------
 
@@ -1725,28 +1891,38 @@ class Database:
         """
         store = self._catalog
         while True:
-            before = int(store._view_epoch())
+            before = _builtin_int(store._view_epoch(), field="catalog.epoch")
             observed: object | None = None
             snapshot: CatalogStoreView | None = None
             failure: BaseException | None = None
             try:
-                if int(store._loaded_epoch) == before:
+                if (
+                    _builtin_int(store._loaded_epoch, field="catalog.loaded_epoch")
+                    == before
+                ):
                     observed = store._catalog
                 else:
                     observed = store.read_from_pages()
                 snapshot = _catalog_view_from(store, observed)
             except BaseException as caught:  # noqa: BLE001 - preserve the original taxonomy
                 failure = caught
-            after = int(store._view_epoch())
+            after = _builtin_int(store._view_epoch(), field="catalog.epoch")
             with self._transactions._participant_section():
-                current = int(store._view_epoch())
+                current = _builtin_int(store._view_epoch(), field="catalog.epoch")
                 if before != after or after != current:
                     continue
                 if failure is not None:
                     raise failure
-                if snapshot is None or observed is None:  # pragma: no cover - total above
-                    raise AssertionError("a successful catalog observation produced no value")
-                if int(store._loaded_epoch) != current:
+                if (
+                    snapshot is None or observed is None
+                ):  # pragma: no cover - total above
+                    raise AssertionError(
+                        "a successful catalog observation produced no value"
+                    )
+                if (
+                    _builtin_int(store._loaded_epoch, field="catalog.loaded_epoch")
+                    != current
+                ):
                     # Pure in-memory publication after the epoch proof.  It prevents every later
                     # view/query from paying for the same refresh and runs no adapter callback.
                     store.adopt(observed)

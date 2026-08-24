@@ -56,9 +56,7 @@ class _RecordingMetrics:
     def register(self, descriptor: object) -> None:
         self._record("register", str(getattr(descriptor, "name", "")))
 
-    def increment(
-        self, name: str, value: float = 1.0, labels: object = None
-    ) -> None:
+    def increment(self, name: str, value: float = 1.0, labels: object = None) -> None:
         del value, labels
         self._record("increment", name)
 
@@ -80,7 +78,9 @@ class _RecordingMetrics:
         return {}
 
 
-def _instrumented_database() -> tuple[Any, Any, FaultInjectingStorageDevice, _RecordingMetrics]:
+def _instrumented_database() -> tuple[
+    Any, Any, FaultInjectingStorageDevice, _RecordingMetrics
+]:
     """Compose one database over a recording storage and metrics sink."""
     registry = build_default_registry(DatabaseConfig(path=":memory:"))
     storage = FaultInjectingStorageDevice(registry.get("storage"), seed=17)
@@ -138,7 +138,9 @@ def test_wal_observation_waits_for_commit_and_cannot_erase_its_pending_barrier(
         if manager is database._wal and armed.is_set():
             append_registered.set()
             if not release_commit.wait(_WAIT_SECONDS):
-                raise AssertionError("the WAL-view probe did not release the paused commit")
+                raise AssertionError(
+                    "the WAL-view probe did not release the paused commit"
+                )
         return result
 
     def destructive_refresh(manager: WalManager) -> None:
@@ -180,13 +182,17 @@ def test_wal_observation_waits_for_commit_and_cannot_erase_its_pending_barrier(
 
         commit_thread = threading.Thread(target=commit, name="wal-commit")
         commit_thread.start()
-        assert append_registered.wait(_WAIT_SECONDS), "commit never registered its WAL append"
+        assert append_registered.wait(_WAIT_SECONDS), (
+            "commit never registered its WAL append"
+        )
         assert database._wal._unflushed, "the append did not leave a segment pending"
 
         view_thread = threading.Thread(target=observe, name="wal-view")
         view_thread.start()
         assert view_started.wait(_WAIT_SECONDS)
-        assert not view_finished.wait(0.2), "WAL observation crossed an in-flight commit"
+        assert not view_finished.wait(0.2), (
+            "WAL observation crossed an in-flight commit"
+        )
     finally:
         release_commit.set()
         for thread in (commit_thread, view_thread):
@@ -291,7 +297,9 @@ def test_catalog_view_waits_out_a_multi_page_ddl_and_never_returns_a_partial_sch
             if applied == 1:
                 first_chain_applied.set()
                 if not release_commit.wait(_WAIT_SECONDS):
-                    raise AssertionError("the catalog-view probe did not release the DDL commit")
+                    raise AssertionError(
+                        "the catalog-view probe did not release the DDL commit"
+                    )
         return result
 
     monkeypatch.setattr(txn_module, "apply_page_image", pause_between_catalog_images)
@@ -315,10 +323,14 @@ def test_catalog_view_waits_out_a_multi_page_ddl_and_never_returns_a_partial_sch
     view_thread = threading.Thread(target=observe, name="catalog-view")
     try:
         commit_thread.start()
-        assert first_chain_applied.wait(_WAIT_SECONDS), "DDL never applied its first chain page"
+        assert first_chain_applied.wait(_WAIT_SECONDS), (
+            "DDL never applied its first chain page"
+        )
         view_thread.start()
         assert view_started.wait(_WAIT_SECONDS)
-        assert not view_finished.wait(0.2), "catalog view escaped between DDL page images"
+        assert not view_finished.wait(0.2), (
+            "catalog view escaped between DDL page images"
+        )
     finally:
         release_commit.set()
         commit_thread.join(_WAIT_SECONDS)
@@ -352,9 +364,13 @@ def test_schema_and_index_views_publish_only_committed_ddl() -> None:
         assert database.vectors.indexes() == ()
 
         speculative.commit()
-        committed_index_names = frozenset(index.name for index in database.indexes.indexes())
+        committed_index_names = frozenset(
+            index.name for index in database.indexes.indexes()
+        )
         committed_vector_indexes = tuple(database.vectors.indexes())
-        assert tuple(table.name for table in database.catalog.catalog.tables()) == ("P",)
+        assert tuple(table.name for table in database.catalog.catalog.tables()) == (
+            "P",
+        )
         assert tuple(space.name for space in database.vectors.spaces()) == ("s",)
         assert "pk_P" in committed_index_names
         assert len(committed_vector_indexes) == 1
@@ -383,7 +399,9 @@ def test_schema_and_index_views_publish_only_committed_ddl() -> None:
         assert tuple(space.name for space in database.vectors.spaces()) == ("s",)
 
 
-def test_public_vector_filter_is_exact_immutable_data_and_never_a_reentrant_predicate() -> None:
+def test_public_vector_filter_is_exact_immutable_data_and_never_a_reentrant_predicate() -> (
+    None
+):
     """A predicate that would roll back its reader is rejected before the vector engine."""
     with connect(":memory:") as database:
         with database.begin("write") as schema:
@@ -552,7 +570,9 @@ def test_retry_cleanup_preenter_failure_seals_and_retires_unpublished_successor(
 
     with monkeypatch.context() as boundary:
         boundary.setattr(TransactionManager, "_begin_in_section", capture_successor)
-        boundary.setattr(TransactionManager, "_participant_section", fail_successor_rollback_preenter)
+        boundary.setattr(
+            TransactionManager, "_participant_section", fail_successor_rollback_preenter
+        )
         boundary.setattr(Database, "_settle_schema", refuse_predecessor)
         with pytest.raises(RuntimeError) as raised:
             database.retry(loser)
@@ -600,7 +620,9 @@ def test_public_retry_and_a_checked_commit_have_one_atomic_winner(
     worker = threading.Thread(target=commit_old, name="checked-old-commit")
     try:
         worker.start()
-        assert commit_checked.wait(_WAIT_SECONDS), "old commit never crossed its wrapper check"
+        assert commit_checked.wait(_WAIT_SECONDS), (
+            "old commit never crossed its wrapper check"
+        )
         metrics.calls.clear()
 
         successor = database.retry(loser)
@@ -649,7 +671,8 @@ def test_committed_schema_settlement_failure_is_diagnostic_and_close_retries_it(
         report = transaction.commit()
 
     assert report.durable and report.wrote
-    assert transaction.report is report
+    assert transaction.report == report
+    assert transaction.report is not report
     assert not transaction.active
     assert database._close_failure is settlement_failure
     assert database._public_contexts == {transaction.txn_id: transaction._context}
@@ -660,7 +683,9 @@ def test_committed_schema_settlement_failure_is_diagnostic_and_close_retries_it(
     assert database._public_contexts == {}
     with connect(tmp_path / "settlement-retry") as reopened:
         assert reopened.catalog.catalog.has_table("Durable")
-        assert tuple(index.name for index in reopened.indexes.indexes()) == ("pk_Durable",)
+        assert tuple(index.name for index in reopened.indexes.indexes()) == (
+            "pk_Durable",
+        )
 
 
 def test_public_wrapper_reports_durable_outcome_when_foreign_apply_fails(
@@ -801,7 +826,9 @@ def test_failed_retry_metric_reenters_database_only_after_participant_release(
 
     try:
         with monkeypatch.context() as boundary:
-            boundary.setattr(TransactionManager, "_participant_section", tracked_section)
+            boundary.setattr(
+                TransactionManager, "_participant_section", tracked_section
+            )
             boundary.setattr(TransactionManager, "_begin_in_section", refuse_successor)
             metrics.calls.clear()
             metrics.callback = reenter_once
@@ -829,9 +856,7 @@ def test_rollback_cleanup_failure_after_abort_still_unwinds_schema_and_finishes_
     cleanup_failure = RuntimeError("manager cleanup after abort sentinel")
     original_rollback = TransactionManager.rollback
 
-    def abort_then_fail(
-        self: TransactionManager, context: TransactionContext
-    ) -> None:
+    def abort_then_fail(self: TransactionManager, context: TransactionContext) -> None:
         original_rollback(self, context)
         if self is database._transactions and context is transaction._context:
             raise cleanup_failure
@@ -888,7 +913,9 @@ def test_close_drains_an_active_ddl_before_releasing_storage_and_late_rollback_i
         storage.clear_trail()
 
         def forbidden_settle(*_args: object, **_kwargs: object) -> None:
-            raise AssertionError("late rollback reached an already-drained schema journal")
+            raise AssertionError(
+                "late rollback reached an already-drained schema journal"
+            )
 
         with monkeypatch.context() as boundary:
             boundary.setattr(QueryEngine, "settle_schema", forbidden_settle)
@@ -965,9 +992,14 @@ def test_close_between_precheck_and_transition_refuses_late_begin_without_new_wo
 
         @contextmanager
         def paused() -> Iterator[None]:
-            if self is database and threading.current_thread().name == "late-public-begin":
+            if (
+                self is database
+                and threading.current_thread().name == "late-public-begin"
+            ):
                 before_transition.set()
-                assert release_begin.wait(_WAIT_SECONDS), "close did not seal the late begin"
+                assert release_begin.wait(_WAIT_SECONDS), (
+                    "close did not seal the late begin"
+                )
             with inner:
                 yield
 
@@ -984,7 +1016,9 @@ def test_close_between_precheck_and_transition_refuses_late_begin_without_new_wo
     worker = threading.Thread(target=begin_late, name="late-public-begin")
     try:
         worker.start()
-        assert before_transition.wait(_WAIT_SECONDS), "begin never crossed its open precheck"
+        assert before_transition.wait(_WAIT_SECONDS), (
+            "begin never crossed its open precheck"
+        )
         database.close()
         assert database.close_complete
         storage.clear_trail()
@@ -1054,10 +1088,14 @@ def test_close_drains_committed_schema_with_its_outcome_before_late_wrapper_retu
     commit_worker = threading.Thread(target=commit, name="manager-committed-wrapper")
     close_worker = threading.Thread(target=close, name="close-committed-schema")
     commit_worker.start()
-    assert manager_committed.wait(_WAIT_SECONDS), "DDL never committed inside its manager"
+    assert manager_committed.wait(_WAIT_SECONDS), (
+        "DDL never committed inside its manager"
+    )
     close_worker.start()
     close_worker.join(_WAIT_SECONDS)
-    assert not close_worker.is_alive(), "close waited for a wrapper after manager quiescence"
+    assert not close_worker.is_alive(), (
+        "close waited for a wrapper after manager quiescence"
+    )
     assert close_failures == []
     assert settle_outcomes == [True]
     assert database._public_contexts == {}
@@ -1076,7 +1114,9 @@ def test_close_drains_committed_schema_with_its_outcome_before_late_wrapper_retu
 
     with connect(tmp_path / "committed-schema") as reopened:
         assert reopened.catalog.catalog.has_table("Durable")
-        assert tuple(index.name for index in reopened.indexes.indexes()) == ("pk_Durable",)
+        assert tuple(index.name for index in reopened.indexes.indexes()) == (
+            "pk_Durable",
+        )
         assert reopened.verify("all").findings == ()
 
 
@@ -1141,14 +1181,22 @@ def test_close_owns_rollback_schema_unwind_in_the_manager_to_wrapper_gap(
         except BaseException as failure:  # noqa: BLE001 - asserted below
             close_failures.append(failure)
 
-    rollback_worker = threading.Thread(target=rollback, name="manager-rolled-back-wrapper")
+    rollback_worker = threading.Thread(
+        target=rollback, name="manager-rolled-back-wrapper"
+    )
     close_worker = threading.Thread(target=close, name="close-rolled-back-schema")
     try:
         rollback_worker.start()
-        assert manager_rolled_back.wait(_WAIT_SECONDS), "manager rollback never released its pin"
+        assert manager_rolled_back.wait(_WAIT_SECONDS), (
+            "manager rollback never released its pin"
+        )
         close_worker.start()
-        assert close_drain_started.wait(_WAIT_SECONDS), "close did not adopt schema unwind"
-        assert not storage_closed.is_set(), "storage closed while speculative files were live"
+        assert close_drain_started.wait(_WAIT_SECONDS), (
+            "close did not adopt schema unwind"
+        )
+        assert not storage_closed.is_set(), (
+            "storage closed while speculative files were live"
+        )
         assert settle_outcomes == [False]
         assert close_worker.is_alive()
 

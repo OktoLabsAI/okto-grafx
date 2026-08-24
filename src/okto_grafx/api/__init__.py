@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 from dataclasses import fields
 
-from okto_grafx.api.assembly import assemble_database, database_label
+from okto_grafx.api.assembly import assemble_database
 from okto_grafx.domain.errors import GrafxConfigurationError
 from okto_grafx.engine.database import Database, DatabaseIdentity, Transaction
 from okto_grafx.engine.query_engine import QueryResult
@@ -73,7 +73,9 @@ def connect(
     return open_database(config, registry=registry)
 
 
-def _configure(path: str | os.PathLike[str], options: dict[str, object]) -> DatabaseConfig:
+def _configure(
+    path: str | os.PathLike[str], options: dict[str, object]
+) -> DatabaseConfig:
     """Build the configuration for a connect call, refusing an option that does not exist.
 
     ``DatabaseConfig`` is a slotted frozen dataclass, so an unknown keyword would raise a bare
@@ -93,16 +95,33 @@ def _as_path_string(path: str | os.PathLike[str]) -> str:
     ``os.fspath`` raises a bare ``TypeError`` for an object that is neither, and a bare TypeError
     out of the front door of the package is exactly what section 2 and DoD item 5 forbid.
     """
-    if isinstance(path, str):
-        return path
+    if issubclass(type(path), str):
+        return str.__str__(path)
     try:
-        return os.fspath(path)
+        resolved = os.fspath(path)
     except TypeError as failure:
+        path_type = _builtin_type_name(path)
         raise GrafxConfigurationError(
-            f"A database path is a string or an os.PathLike; got {type(path).__name__}.",
+            f"A database path is a string or an os.PathLike; got {path_type}.",
             field="path",
-            value=type(path).__name__,
+            value=path_type,
         ) from failure
+    if not issubclass(type(resolved), str):
+        path_type = _builtin_type_name(path)
+        resolved_type = _builtin_type_name(resolved)
+        raise GrafxConfigurationError(
+            f"A database path is text; this {path_type} returned {resolved_type}.",
+            field="path",
+            value=resolved_type,
+        )
+    return str.__str__(resolved)
+
+
+def _builtin_type_name(value: object) -> str:
+    """Name a class without executing a descriptor supplied by its metaclass."""
+    value_type = type(value)
+    declared = type.__dict__["__name__"].__get__(value_type, type(value_type))
+    return str.__str__(declared)
 
 
 def _unknown_options(unknown: list[str]) -> GrafxConfigurationError:
@@ -122,7 +141,9 @@ def _config_fields() -> frozenset[str]:
     second definition of one thing, and it stops agreeing the first time C0 adds a field (A24).
     ``path`` is excluded because :func:`connect` takes it positionally.
     """
-    return frozenset(field.name for field in fields(DatabaseConfig) if field.name != "path")
+    return frozenset(
+        field.name for field in fields(DatabaseConfig) if field.name != "path"
+    )
 
 
 _CONFIG_FIELDS: frozenset[str] = _config_fields()
