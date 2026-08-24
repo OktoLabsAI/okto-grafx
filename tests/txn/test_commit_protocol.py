@@ -16,6 +16,7 @@ from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxDeviceFull,
+    GrafxIndexError,
     GrafxRecoveryRefused,
     GrafxStaleEpoch,
     GrafxStorageError,
@@ -37,6 +38,8 @@ from okto_grafx.engine.txn_manager import (
     TRANSACTION_MANAGER_METRICS,
     TransactionManager,
 )
+from okto_grafx.engine.vector_engine import VectorHnswIndex
+from tests.vector.conftest import SnapshotDouble, VectorFixture
 from shared_device import SharedDirectoryDevice
 from txn_support import (
     DEFAULT_PAGE_SIZE,
@@ -58,6 +61,17 @@ def _stage(stack: Stack, page_index: int = 3, payload: bytes = b"row") -> object
     txn.owner._stage_page_image(txn, HEAP, page_index, make_page_image(stack.codec, [payload], page_index=page_index))
     txn.note_write(stack.manager.partition_of(1, payload))
     return txn
+
+
+def _poisonable_vector(stack: Stack) -> tuple[VectorFixture, VectorHnswIndex]:
+    """Return a real vector registry with a published graph over its own device."""
+    database = VectorFixture(metrics=stack.metrics, clock=stack.clock)
+    space = database.create_space("poison", 4)
+    table = database.create_table("Chunk", space.name)
+    database.insert_row(table, 1, 0, space, (1.0, 0.0, 0.0, 0.0), csn=1)
+    index = database.engine.index(space.name)
+    index.snapshot()
+    return database, index
 
 
 def _fault_stack(root: Path, **overrides: object) -> tuple[Stack, FaultInjectingStorageDevice]:
@@ -491,6 +505,8 @@ def test_any_escape_after_partial_committed_redo_latches_the_handle(
     failure: BaseException,
 ) -> None:
     """A non-Grafx exception class cannot make an applied prefix safe to publish over."""
+    vectors, index = _poisonable_vector(stack)
+    stack.manager._index_manager = vectors.registry  # noqa: SLF001 - explicit composition seam
     image = make_page_image(
         stack.codec,
         [b"applied-prefix"],
@@ -521,6 +537,11 @@ def test_any_escape_after_partial_committed_redo_latches_the_handle(
             b"applied-prefix",
         )
     assert stack.manager.recovery_required is True
+    assert index.stale
+    assert index._snapshot is None  # noqa: SLF001 - proves the derived graph was retired
+    with pytest.raises(GrafxIndexError) as refused:
+        index.search((1.0, 0.0, 0.0, 0.0), 1, SnapshotDouble(10))
+    assert refused.value.details["field"] == "stale"
     with pytest.raises(GrafxRecoveryRefused) as blocked:
         stack.manager.published_lsn()
     assert blocked.value.details["field"] == "recovery_required"
