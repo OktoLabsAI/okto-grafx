@@ -63,8 +63,9 @@ re-run converge.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Sequence
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -179,6 +180,55 @@ _ORIGIN_LABELS: dict[LedgerOriginClass, dict[str, str]] = {
 }
 
 _CONTROL_PREFIX: str = "control/"
+
+_LEASE_RECORD: str = "control/writer.lease"
+"""The writer lease, exactly where the coordination adapter keeps it."""
+
+_READERS_PREFIX: str = "control/readers/"
+_READER_SUFFIX: str = ".reader"
+"""Canonical reader records: ``control/readers/<reader_id>.reader`` and nothing else."""
+
+
+def _is_canonical_retirement_target(name: str) -> bool:
+    """True only for the writer lease and canonical reader records (M0C).
+
+    The retirement door destroys a name, so the names it accepts are enumerated rather than
+    pattern-matched broadly: the lease, and readers under their canonical directory with a
+    non-empty id. ``commit.state`` is already protected upstream and can never reach this.
+    """
+    if name == _LEASE_RECORD:
+        return True
+    return (
+        name.startswith(_READERS_PREFIX)
+        and name.endswith(_READER_SUFFIX)
+        and len(name) > len(_READERS_PREFIX) + len(_READER_SUFFIX)
+    )
+
+
+def _generation_detail(damage: str, digest: str) -> str:
+    """One line naming the damage and the exact generation it was seen on."""
+    return f"{damage} [generation sha256={digest}]"
+
+
+class _CommitSection(Protocol):
+    """What ``exclusive`` returns: a context manager holding the section for its body."""
+
+    def __enter__(self) -> object:
+        """Enter the section."""
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> object:
+        """Leave the section."""
+
+
+class _FencingCoordinator(Protocol):
+    """The complete coordinator surface every fenced door demands (M0C)."""
+
+    def exclusive(self, name: str, *, timeout: float) -> _CommitSection:
+        """Grant the named cross-process section for the body of a ``with``."""
+
+    def reader_horizon(self) -> object:
+        """Answer the lowest LSN a live reader still needs, or None for no reader."""
+
 
 _COORDINATOR_METHODS: tuple[str, ...] = ("exclusive", "reader_horizon")
 """What a COMPLETE coordinator must answer: the fence itself, and the reader horizon
@@ -399,7 +449,7 @@ class RecoveryManager:
 
     # --- the pass ----------------------------------------------------------------------------
 
-    def _require_complete_coordinator(self, purpose: str) -> object:
+    def _require_complete_coordinator(self, purpose: str) -> _FencingCoordinator:
         """Return the coordinator the fence needs, or refuse typed BEFORE any scan or mutation.
 
         M0C removed the unfenced fallback. Without the cross-process commit section there is no
@@ -428,7 +478,7 @@ class RecoveryManager:
                 "re-derive the reader horizon. Nothing was scanned or changed.",
                 missing=absent,
             )
-        return coordinator
+        return cast("_FencingCoordinator", coordinator)
 
     def _require_permit(self, permit: object) -> None:
         """Refuse unless the permit is this manager's own live, section-scoped capability."""
@@ -681,9 +731,29 @@ class RecoveryManager:
           ``test_a_probe_that_fails_with_a_foreign_exception_retires_nothing`` and
           ``test_only_corruption_detected_is_evidence_a_control_record_is_damaged``.
 
-        C4 asks for the reader horizon to be re-derived after any retirement, because it caches
-        none across a pass. When a coordinator is configured that happens here and the result is
-        reported; when one is not, the report says the caller owes the re-derivation.
+        C4 asks for the reader horizon to be re-derived after any retirement, because it
+        caches none across a pass; that happens here, through the coordinator every fenced door
+        now demands, and the result is reported.
+
+        M0C adds two more locks on this door:
+
+        * It is FENCED: probe, capture, ledger entry, last look and removal all happen inside
+          the commit section writers share, holding the same permit every other fenced step
+          demands -- and it refuses typed, before reading anything, when no complete
+          coordinator can grant that section.
+        * It retires ONE GENERATION, not a name: the exact bytes found first -- their length
+          and SHA-256 recorded in both quarantine and ledger -- re-read and compared under the
+          section immediately before the removal. A record that changed in ANY window refuses,
+          retryably, naming the evidence already kept; a healthy or different replacement
+          survives byte for byte. The targets are exactly the writer lease and canonical
+          reader records; ``commit.state`` is protected and can never leave through this door.
+
+        The compare-then-remove is COOPERATIVE, like every advisory protocol over this storage
+        port: the port offers no atomic compare-and-remove, so a NON-cooperating process that
+        rewrites the record between the last look and the removal is outside the guarantee.
+        What the section does exclude is every cooperating participant -- commit, checkpoint,
+        recovery and this door itself -- and the last look narrows the rest of the window to
+        what the platform allows.
         """
         name = _require_text("file", file)
         if self._probe is None:
@@ -699,12 +769,41 @@ class RecoveryManager:
                 field="file",
                 file=name,
             )
+        if not _is_canonical_retirement_target(name):
+            raise GrafxRecoveryRefused(
+                f"{name!r} is not a canonical retirement target: this door retires exactly "
+                f"{_LEASE_RECORD!r} and reader records under {_READERS_PREFIX!r}, and nothing "
+                "else.",
+                field="file",
+                file=name,
+            )
+        coordinator = self._require_complete_coordinator("retire a control record")
+        with coordinator.exclusive(COMMIT_SECTION, timeout=self._commit_lock_timeout):
+            permit = _RecoveryPermit(self, _PERMIT_SEAL)
+            try:
+                return self._retire_fenced(name, permit)
+            finally:
+                permit.revoke()
+
+    def _read_generation(self, name: str) -> bytes:
+        """Read the whole record as it is on the device right now."""
+        return self._storage.read_log(name, 0, self._storage.log_size(name))
+
+    def _retire_fenced(self, name: str, permit: _RecoveryPermit) -> RecoveryReport:
+        """Retire one damaged, canonical control record as a single inspected generation."""
+        self._require_permit(permit)
         if not self._storage.exists(name):
             raise GrafxRecoveryRefused(
                 f"There is no control record {name!r} to retire.",
                 field="file",
                 file=name,
             )
+        # ONE generation: the exact bytes, their length and their SHA-256, read once. Every
+        # decision below is about THESE bytes, and the door refuses rather than act on any
+        # other generation it happens to find later.
+        size = self._storage.log_size(name)
+        body = self._storage.read_log(name, 0, size)
+        digest = hashlib.sha256(body).hexdigest()
         damage = self._probe_damage(name)
         if damage is None:
             raise GrafxRecoveryRefused(
@@ -713,15 +812,37 @@ class RecoveryManager:
                 field="file",
                 file=name,
             )
+        if self._read_generation(name) != body:
+            raise GrafxRecoveryRefused(
+                f"The control record {name!r} changed while it was being inspected, so the "
+                "probe's verdict belongs to another generation. Nothing was quarantined or "
+                "retired; retry against the record that is there now.",
+                retryable=True,
+                field="generation",
+                file=name,
+                expected_sha256=digest,
+            )
         findings: list[RecoveryFinding] = []
-        size = self._storage.log_size(name)
         entry = self._quarantine.capture(
             origin=name,
             offset=0,
             length=size,
             reason=LedgerReason.QUARANTINED_SEGMENT.name.lower(),
-            detail=damage,
+            detail=_generation_detail(damage, digest),
+            payload=body,
         )
+        kept = self._quarantine.read(entry.name)
+        if kept != body:
+            raise GrafxRecoveryRefused(
+                f"Quarantine entry {entry.name!r} does not hold the inspected generation of "
+                f"{name!r}: an earlier capture of the same range kept different bytes, and "
+                "overwriting evidence is not what this door does. The earlier copy is "
+                "preserved; nothing was retired.",
+                field="quarantine",
+                file=name,
+                quarantine=entry.name,
+                expected_sha256=digest,
+            )
         findings.append(
             RecoveryFinding(
                 kind=FindingKind.QUARANTINED_RANGE,
@@ -743,34 +864,60 @@ class RecoveryManager:
                 offset=0,
                 length=size,
                 failure=LedgerReason.QUARANTINED_SEGMENT.name.lower(),
-                detail=damage,
+                detail=_generation_detail(damage, digest),
                 quarantine=entry.name,
-                body=self._quarantine.read(entry.name),
+                body=kept,
             )
         )
         entries_created = len(self._ledger.entries()) - entries_before
+        # The last look, under the same section: the name may go only while it still holds THE
+        # INSPECTED GENERATION. A name that vanished on its own is already the outcome this door
+        # was asked for -- the evidence is kept, nothing else is touched. A name that holds
+        # DIFFERENT bytes is a replacement, and a replacement survives byte for byte.
+        vanished = not self._storage.exists(name)
+        if not vanished and self._read_generation(name) != body:
+            raise GrafxRecoveryRefused(
+                f"A replacement landed in {name!r} between the evidence and the removal. The "
+                f"damaged generation is preserved byte-for-byte in quarantine {entry.name!r} "
+                f"and ledger entry {entry_id}, and the replacement survives untouched. Retire "
+                "again only if the record that is there now is itself damaged.",
+                retryable=True,
+                field="generation",
+                file=name,
+                quarantine=entry.name,
+                ledger_entry=entry_id,
+                expected_sha256=digest,
+            )
         # The name goes last, and only after the copy and the entry are durable. A platform that
         # defers the release is reported rather than retried into a loop: the evidence is already
         # kept, so a name that lingers is bounded and visible, which is the honest outcome C4 asks
         # for when it says an unknown horizon is not a horizon.
-        released = self._storage.recycle(name)
         lingering = ""
-        if not released and self._storage.exists(name):
-            try:
-                self._storage.remove(name)
-            except GrafxError as failure:
-                lingering = str(failure)
+        if not vanished:
+            released = self._storage.recycle(name)
+            if not released and self._storage.exists(name):
+                try:
+                    self._storage.remove(name)
+                except GrafxError as failure:
+                    lingering = str(failure)
         if self._storage.exists(name):
             detail = (
                 f"The damaged control record {name!r} was quarantined as {entry.name!r} and "
                 f"recorded in ledger entry {entry_id}, and the platform has not released its "
                 f"name yet. {lingering} Retry the retirement; nothing was lost."
             )
+        elif vanished:
+            detail = (
+                f"The damaged control record {name!r} was already gone at the last look, after "
+                f"its generation was quarantined as {entry.name!r} and recorded in ledger "
+                f"entry {entry_id}; the evidence is kept and nothing else was touched. The "
+                "reader horizon must be re-derived before the log is recycled again."
+            )
         else:
             detail = (
-                f"The damaged control record {name!r} was retired after being quarantined "
-                f"as {entry.name!r} and recorded in ledger entry {entry_id}. The reader "
-                "horizon must be re-derived before the log is recycled again."
+                f"The damaged control record {name!r} was retired as the exact generation "
+                f"quarantined in {entry.name!r} and recorded in ledger entry {entry_id}. The "
+                "reader horizon must be re-derived before the log is recycled again."
             )
         findings.append(
             RecoveryFinding(
