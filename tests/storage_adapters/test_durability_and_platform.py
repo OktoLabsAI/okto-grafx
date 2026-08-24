@@ -30,6 +30,7 @@ from okto_grafx.domain.errors import (
     GrafxDurabilityBarrierFailed,
     GrafxError,
     GrafxStorageError,
+    GrafxUnsupportedOperation,
 )
 
 PAGE_SIZE: int = 512
@@ -39,7 +40,81 @@ SEGMENT: str = "wal/000000000001.wal"
 HEAP: str = "heap.dat"
 
 
+def _directory_symlink_or_skip(link: Path, target: Path) -> None:
+    """Create the platform's directory reparse link, or declare the host cannot exercise it."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except (NotImplementedError, OSError) as failure:
+        pytest.skip(f"directory symlink/reparse creation is unavailable: {failure}")
+
+
 # --- durability ---------------------------------------------------------------------------
+
+
+def test_a_redirected_logical_component_is_never_followed_or_ignored(tmp_path: Path) -> None:
+    root = tmp_path / "database"
+    victim = tmp_path / "victim"
+    root.mkdir()
+    victim.mkdir()
+    protected = victim / "first-open.intent"
+    protected.write_bytes(b"victim bytes")
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE)
+    original = root / "bootstrap-original"
+    redirected = root / "bootstrap"
+    redirected.mkdir()
+    redirected.rename(original)
+    try:
+        _directory_symlink_or_skip(redirected, victim)
+        before = {entry.name: entry.read_bytes() for entry in victim.iterdir()}
+        for operation in (
+            device.list_files,
+            lambda: device.exists("bootstrap/first-open.intent"),
+            lambda: device.create("bootstrap/new.intent"),
+            lambda: device.remove("bootstrap/first-open.intent"),
+        ):
+            with pytest.raises(GrafxUnsupportedOperation) as raised:
+                operation()
+            assert raised.value.details["reason"] == "redirected_path"
+        assert {entry.name: entry.read_bytes() for entry in victim.iterdir()} == before
+    finally:
+        device.close()
+        if redirected.is_symlink():
+            redirected.unlink()
+        if original.exists():
+            original.rename(redirected)
+
+
+def test_a_database_root_exchanged_for_a_redirect_is_refused_without_touching_victim(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "database"
+    original = tmp_path / "database-original"
+    victim = tmp_path / "victim"
+    root.mkdir()
+    victim.mkdir()
+    protected = victim / "protected.bin"
+    protected.write_bytes(b"authoritative victim bytes")
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE)
+    root.rename(original)
+    try:
+        _directory_symlink_or_skip(root, victim)
+        before = {entry.name: entry.read_bytes() for entry in victim.iterdir()}
+        for operation in (
+            device.list_files,
+            lambda: device.exists("protected.bin"),
+            lambda: device.create("new.bin"),
+            lambda: device.remove("protected.bin"),
+        ):
+            with pytest.raises(GrafxUnsupportedOperation) as raised:
+                operation()
+            assert raised.value.details["reason"] == "redirected_root"
+        assert {entry.name: entry.read_bytes() for entry in victim.iterdir()} == before
+    finally:
+        device.close()
+        if root.is_symlink():
+            root.unlink()
+        if original.exists():
+            original.rename(root)
 
 
 def _record_barrier(device: LocalStorageDevice, file: str | None) -> tuple[set[int], int]:
@@ -213,6 +288,66 @@ def test_nested_namespace_create_remove_and_rename_leave_directory_barrier_debts
         root / "published",
         root / "published" / "state",
     }, "atomic rename did not pin both the source removal and target publication namespaces"
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(IS_WINDOWS, reason="Only POSIX exposes directory fsync durability.")
+def test_first_barrier_publishes_a_new_database_root_through_every_created_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fault model drops a created directory unless its publishing parent was fsynced."""
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    root = existing / "created-parent" / "database"
+    created = (root.parent, root)
+    opened_directories: list[Path] = []
+    real_open = os.open
+
+    def _recording_open(path: Any, flags: int, *rest: Any) -> int:
+        candidate = Path(path)
+        if candidate.is_dir():
+            opened_directories.append(candidate)
+        return real_open(path, flags, *rest)
+
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE)
+    device.create(HEAP)
+    device.allocate(HEAP)
+    monkeypatch.setattr(storage_local.os, "open", _recording_open)
+    device.durable_barrier(None)
+
+    durable_directories = set(opened_directories)
+    # Fault model: after power loss, a newly-created directory remains reachable only when the
+    # parent entry that names it was pinned.  This is the exact hole fsync(root) alone leaves.
+    survivors = tuple(directory for directory in created if directory.parent in durable_directories)
+    assert survivors == created
+    assert {root, root.parent, existing} <= durable_directories
+    assert tmp_path not in durable_directories, "a pre-existing ancestor gained false debt"
+    device.close()
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(IS_WINDOWS, reason="Only POSIX exposes directory fsync durability.")
+def test_a_preexisting_database_root_does_not_gain_parent_namespace_debt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "already-there"
+    root.mkdir()
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE)
+    device.create(HEAP)
+    opened_directories: list[Path] = []
+    real_open = os.open
+
+    def _recording_open(path: Any, flags: int, *rest: Any) -> int:
+        candidate = Path(path)
+        if candidate.is_dir():
+            opened_directories.append(candidate)
+        return real_open(path, flags, *rest)
+
+    monkeypatch.setattr(storage_local.os, "open", _recording_open)
+    device.durable_barrier(None)
+    assert root in opened_directories
+    assert root.parent not in opened_directories
+    device.close()
 
 
 @pytest.mark.platform_specific
