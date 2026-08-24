@@ -1563,8 +1563,9 @@ published would `invalidate_graph()` the success. Delivered instead:
   third regression. Cross-review addendum: `SnapshotLike` is structural (A19 takes it by shape), so
   a permissive predicate is a supported caller, and under one `main` answered that commit while
   `8c88e9d` did not. The build therefore CATCHES UP before publishing (`_catch_up`): it re-reads
-  the header and, while it moved, walks the store again and takes in what the picture lacks,
-  bounded to `_BUILD_CATCH_UP_PASSES`; pinned by the permissive-snapshot regression.
+  the header and, while it moved, REBUILDS the snapshot from a walk taken after that reading
+  (patching the old picture kept a live copy of an entry reconciled away meanwhile -- the
+  verification's finding), bounded to `_BUILD_CATCH_UP_PASSES`; pinned by the permissive-snapshot regression.
 - Single-flight: a search meeting a build in flight waits on the guard in 0.5 s slices and takes
   the published picture when it wakes; after 120 slices it builds for itself (wasted work, never a
   wrong answer: both pictures are complete and publication keeps the fresher mark).

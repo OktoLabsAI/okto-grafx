@@ -675,8 +675,8 @@ class VectorHnswIndex(ProximityIndex):
         begins, and the picture carries that reading as its mark. A commit that lands during the
         build is not noted into the picture (nothing is published to note into); before the
         picture is published the build CATCHES UP with it (``_catch_up``): the header is read
-        again and, while it has moved, the store is walked again and what the picture lacks is
-        taken in. A caller with a fixed snapshot could not see that commit anyway; a caller whose
+        again and, while it has moved, the picture is built again from a walk taken after that
+        reading. A caller with a fixed snapshot could not see that commit anyway; a caller whose
         predicate admits it -- ``SnapshotLike`` is structural -- gets it too, as the protocol
         before this one gave it (the M0A cross-review). If the store still moves past the last
         pass, the mark stays behind the header and the next search rebuilds: never a
@@ -753,29 +753,29 @@ class VectorHnswIndex(ProximityIndex):
         return built
 
     def _catch_up(self, picture: _GraphSnapshot) -> _GraphSnapshot:
-        """Take into a not-yet-published picture what the store received while it was built.
+        """Replace a not-yet-published picture that the store moved under with a fresh build.
 
         The walk that fed the build is a moment in the past. A commit that landed after it is in
         the store and not in the picture, and nothing noted it there, because a picture under
         construction is not published. A caller whose snapshot is fixed cannot see that commit
         -- but ``SnapshotLike`` is taken by shape (A19), a predicate that admits it is a
         supported caller, and the protocol before this one answered it whole (it noted commits
-        into the partial graph it had already published). So: read the header again; while it
-        has moved past the mark, walk the store again and offer every entry to the picture --
-        one already held has its entry refreshed (a tombstone that landed is taken), a new one
-        is installed -- and certify the picture with the reading taken before that walk. An
-        entry the store reconciled away in the meantime stays in the picture as an ended node,
-        invisible by its stamps to every snapshot.
+        into the partial graph it had already published). So: read the header again and, while
+        it has moved past the mark, build the picture AGAIN from a walk taken after that reading.
+
+        Rebuilt, not patched. A pass that only offered the new walk to the old picture took in
+        what landed -- and kept what LEFT: an entry tombstoned and then reconciled away while
+        the build was parked is absent from the walk, so the old picture's copy of it stayed
+        live, with no ending stamp, and the published snapshot answered a deleted row as current
+        (M0A verification, Codex). A build over the new walk holds exactly what the store holds.
+        Bounded: past the last pass the mark stays behind the header and the next search
+        rebuilds; never a certification the build did not verify.
         """
         for _pass in range(_BUILD_CATCH_UP_PASSES):
             header = self.built_through_lsn
             if header == picture.mark:
                 return picture
-            for entry in sorted(
-                self.walk(), key=lambda item: (item.born_csn, item.ref.encode())
-            ):
-                self._install(picture, entry)
-            picture = picture.certified(header)
+            picture = self._build(header)
         return picture
 
     def _release_build(self) -> None:
@@ -1015,11 +1015,14 @@ class VectorHnswIndex(ProximityIndex):
         A stale index refuses here rather than answering: an omission looks exactly like an empty
         neighbourhood, and this is the door where that would be invisible.
 
-        PRECONDITION: ``snapshot`` is a FIXED view -- a transaction's, taken at ``begin()``
-        (amendment A19: the predicate belongs to the transaction manager). The picture this
-        search answers from is complete as of the moment its build started, and a commit that
-        lands after that is above any such snapshot. A predicate that admits versions committed
-        AFTER the search began is outside this contract and may see fewer of them than exist.
+        THE CONTRACT ON ``snapshot``. A transaction's fixed view (amendment A19: the predicate
+        belongs to the transaction manager) sees exactly what it is entitled to: the picture is
+        complete for every position the build verified, and a commit above the view's position
+        is invisible to it anyway. ``SnapshotLike`` is taken by shape, so any predicate is a
+        caller; what one that admits later commits is promised is linearization, not
+        "everything at return": the picture answered from was certified for a header position
+        the build verified (commits landing during the build are caught up, in bounded passes),
+        a commit past the last pass leaves the mark behind, and the NEXT search takes it.
         """
         predicate = _require_snapshot(snapshot)
         self.require_readable()

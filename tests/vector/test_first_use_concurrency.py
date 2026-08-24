@@ -414,10 +414,12 @@ def test_a_build_that_calls_back_into_its_own_index_does_not_wait_on_itself(
 class _SeesEveryLiveVersion:
     """A structural ``SnapshotLike`` that admits every live version: the predicate is the caller's.
 
-    ``SnapshotLike`` is taken by shape (A19), so a caller may bring any predicate. This one is
-    what the engine's own suite uses (``SnapshotDouble(1000)`` in spirit): everything committed,
-    nothing ended. Under it, the answer must include whatever the store holds when the search
-    answers -- which is what ``main`` gave and ``8c88e9d`` did not.
+    ``SnapshotLike`` is taken by shape (A19), so a caller may bring any predicate. What such a
+    caller is promised is LINEARIZATION, not "everything at return": the snapshot a search
+    answers from was certified for a header position the build verified, so it holds every
+    commit at or below that position; a commit that lands after the build's last catch-up pass
+    is not promised at return -- the mark stays behind the header, and the NEXT search takes it
+    (see the commit-storm test). A transaction's fixed snapshot cannot tell the difference.
     """
 
     def visible(self, xmin: int, xmax: int) -> bool:
@@ -426,7 +428,10 @@ class _SeesEveryLiveVersion:
 
 def _search_permissive(database: Any) -> tuple[int, str, tuple[int, ...]]:
     hits = database.vectors.search(
-        space="s", k=ROWS, query=[1.0, 0.0, 0.25, 0.0], snapshot=_SeesEveryLiveVersion()
+        space="s",
+        k=2 * ROWS,
+        query=[1.0, 0.0, 0.25, 0.0],
+        snapshot=_SeesEveryLiveVersion(),
     )
     return (
         hits.achieved_k,
@@ -438,13 +443,15 @@ def _search_permissive(database: Any) -> tuple[int, str, tuple[int, ...]]:
 def test_a_commit_landing_during_the_build_is_caught_up_before_the_snapshot_is_published(
     tmp_path: Path,
 ) -> None:
-    """The M0A cross-review's blocking regression: a permissive predicate sees the commit.
+    """The M0A cross-review's blocking regression: a commit during the build is taken in.
 
     Seven rows, the cold build parked, the eighth row committed, the build released. Under a
     predicate that admits every live version, ``main@12c67c8`` answered eight -- the commit was
     noted into the partial graph it had already published -- and ``8c88e9d`` answered seven and
     then eight, because the build published a snapshot with the commit neither noted nor caught
-    up. The build now catches up before publishing: the search that built answers all eight.
+    up. The build now catches up before publishing: the commit landed before the last pass, so
+    the search that built answers all eight (and would answer them under a fixed snapshot taken
+    after the commit, too).
     """
     math = GatingMath()
     database, registry = _open(tmp_path / "db", math)
@@ -481,8 +488,8 @@ def test_a_commit_landing_during_the_catch_up_pass_is_caught_up_too(
     """The catch-up pass has the same window the build had, and closes it the same way.
 
     Seven rows; the build is parked; the eighth is committed; the build is released and its
-    catch-up pass begins -- and is parked again, INSIDE that pass, on the resolve of the eighth
-    row (the first entry the pass installs, after the pass read the header). The ninth row is
+    catch-up pass begins -- and is parked again, INSIDE that pass, on the builder's eighth resolve
+    (the first entry the pass's rebuild resolves, after the pass read the header). The ninth row is
     committed there. The pass must certify with the header it read BEFORE its walk, find the
     header moved, and run again: a pass that certified with a header read after its walk would
     publish a snapshot missing the ninth row as current, and the next search would answer eight.
@@ -529,5 +536,206 @@ def test_a_commit_landing_during_the_catch_up_pass_is_caught_up_too(
     finally:
         math.release()
         release_catch_up.set()
+        database.close()
+        release_ports(registry)
+
+
+EXTRA_ID: int = 100
+"""The Cypher id of the row the reconcile transaction also writes (its RECORD id is the next one
+the heap hands out): a reconcile alone declares no partition, and a transaction that could never
+be refused by optimistic validation is refused outright."""
+
+
+def _delete_and_reconcile(database: Any, record_id: int) -> None:
+    """Tombstone one row, then reconcile its entry away (beside one row write), through the door."""
+    with database.begin("write") as txn:
+        txn.execute("MATCH (v:V {id: $i}) DELETE v", {"i": record_id})
+    horizon = database.transactions.published_state().last_csn
+    with database.begin("write") as txn:
+        _insert(txn, EXTRA_ID)
+        database.vectors.reconcile("s", horizon, txn.context)
+
+
+def _search_permissive_into(
+    database: Any, outcomes: dict[str, object], name: str
+) -> None:
+    try:
+        outcomes[name] = _search_permissive(database)
+    except Exception as failure:  # noqa: BLE001 - the outcome IS what is recorded
+        outcomes[name] = ("ERROR", type(failure).__name__)
+
+
+def test_an_entry_reconciled_away_during_the_build_is_not_in_the_published_snapshot(
+    tmp_path: Path,
+) -> None:
+    """The M0A verification's finding (Codex): a deleted row survived the catch-up as live.
+
+    Eight rows; the cold build is parked; the second row is tombstoned AND reconciled away, so
+    the walk no longer holds it (a ninth row, id 100, rides the reconcile transaction); the
+    build is released. A catch-up that only offered the new walk to the old picture kept the
+    old copy of row 2 -- live, with no ending stamp -- and published it as current: searches
+    answered ids 1..8. A rebuilt picture holds exactly what the store holds: every search
+    excludes 2, includes the ninth record, and the next one does not reuse a wrong cache either.
+    """
+    math = GatingMath()
+    database, registry = _open(tmp_path / "db", math)
+    outcomes: dict[str, object] = {}
+    expected = tuple(
+        sorted((set(ALL_IDS) - {2}) | {ROWS + 1})
+    )  # record id, not the Cypher id
+    try:
+        _populate(database, ROWS)
+        first = threading.Thread(
+            target=_search_permissive_into, args=(database, outcomes, "first")
+        )
+        first.start()
+        assert math.parked.wait(PATIENCE), (
+            "the first search never reached the parked score"
+        )
+        _delete_and_reconcile(database, 2)
+        assert len(database.vectors.index("s").walk()) == ROWS  # A72: 2 gone, 100 there
+        math.release()
+        _finish(first)
+        assert outcomes["first"] == (ROWS, "approximate", expected), outcomes
+        assert _search_permissive(database) == (ROWS, "approximate", expected)
+        assert _search(database) == (ROWS, "approximate", expected)
+    finally:
+        math.release()
+        database.close()
+        release_ports(registry)
+
+
+def test_an_entry_reconciled_away_during_the_catch_up_pass_is_not_in_the_published_snapshot(
+    tmp_path: Path,
+) -> None:
+    """The same finding, one window later: the removal lands inside the catch-up pass.
+
+    Seven rows; the build is parked; the eighth row is committed (so a catch-up pass will run);
+    the build is released and its pass is parked on the builder's eighth resolve -- inside the
+    pass, after it read the header and took its walk. Row 2 is tombstoned and reconciled away
+    there (row 100 rides the reconcile transaction). The pass certifies with the reading it
+    took before its walk, finds the header moved, and rebuilds again: the published snapshot
+    excludes 2 and holds records 1, 3..8 and the ninth.
+    """
+    math = GatingMath()
+    database, registry = _open(tmp_path / "db", math)
+    outcomes: dict[str, object] = {}
+    parked_in_catch_up = threading.Event()
+    release_catch_up = threading.Event()
+    expected = tuple(sorted((set(range(1, ROWS + 1)) - {2}) | {ROWS + 1}))  # record id
+    try:
+        _populate(database, ROWS - 1)
+        index = database.vectors.index("s")
+        resolved = index._resolve  # noqa: SLF001 - the builder's eighth resolve is the hook
+        resolves = Counter()
+
+        def parking_resolve(ref: object) -> object:
+            me = threading.get_ident()
+            resolves[me] += 1
+            if me == math.builder_ident and resolves[me] == ROWS:
+                parked_in_catch_up.set()
+                release_catch_up.wait(PATIENCE)
+            return resolved(ref)
+
+        index._resolve = parking_resolve  # type: ignore[assignment]  # noqa: SLF001
+        first = threading.Thread(
+            target=_search_permissive_into, args=(database, outcomes, "first")
+        )
+        first.start()
+        assert math.parked.wait(PATIENCE), (
+            "the first search never reached the parked score"
+        )
+        with database.begin("write") as txn:
+            _insert(txn, ROWS)
+        math.release()
+        assert parked_in_catch_up.wait(PATIENCE), (
+            "the catch-up pass never began resolving"
+        )
+        _delete_and_reconcile(database, 2)
+        assert (
+            len(index.walk()) == ROWS
+        )  # A72: eight rows, minus the reconciled, plus 100
+        release_catch_up.set()
+        _finish(first)
+        assert outcomes["first"] == (ROWS, "approximate", expected), outcomes
+        assert _search_permissive(database) == (ROWS, "approximate", expected)
+        assert _search(database) == (ROWS, "approximate", expected)
+    finally:
+        math.release()
+        release_catch_up.set()
+        database.close()
+        release_ports(registry)
+
+
+def test_a_commit_storm_through_every_pass_leaves_the_mark_behind_and_the_next_search_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Liveness and honesty under a commit storm: the cap holds and nothing is over-promised.
+
+    A commit lands after the walk of the build and after the walk of each of the three catch-up
+    passes (the builder is parked on the first resolve of each: cumulative resolves 1, 8, 16
+    and 25 over seven, eight, nine and ten entries). The build cannot chase the store for ever,
+    so it publishes after the last pass with the mark honestly BEHIND the header: the search that
+    built answers the ten rows its last walk saw, not the eleventh; the next search finds the
+    mark behind, rebuilds, and answers all eleven. The third outcome is the one never allowed:
+    a snapshot certified for a position it did not verify.
+    """
+    from okto_grafx.engine import vector_engine as engine_module
+
+    monkeypatch.setattr(engine_module, "_BUILD_CATCH_UP_PASSES", 3, raising=False)
+    math = GatingMath(park_at=10**9)  # the gate is not the lever here; the resolver is
+    database, registry = _open(tmp_path / "db", math)
+    outcomes: dict[str, object] = {}
+    park_points = {1, 8, 16, 25}
+    parked = threading.Event()
+    released = threading.Event()
+    builder: dict[str, int] = {}
+
+    def search_into(name: str) -> None:
+        builder["ident"] = threading.get_ident()
+        _search_permissive_into(database, outcomes, name)
+
+    try:
+        _populate(database, ROWS - 1)
+        index = database.vectors.index("s")
+        resolved = index._resolve  # noqa: SLF001 - the first resolve of each walk is the hook
+        resolves = Counter()
+
+        def parking_resolve(ref: object) -> object:
+            me = threading.get_ident()
+            resolves[me] += 1
+            if me == builder.get("ident") and resolves[me] in park_points:
+                released.clear()
+                parked.set()
+                released.wait(PATIENCE)
+            return resolved(ref)
+
+        index._resolve = parking_resolve  # type: ignore[assignment]  # noqa: SLF001
+        first = threading.Thread(target=search_into, args=("first",))
+        first.start()
+        for record_id in range(
+            ROWS, ROWS + 4
+        ):  # rows 8, 9, 10, 11: one per parked walk
+            assert parked.wait(PATIENCE), (
+                f"the builder never parked before row {record_id}"
+            )
+            parked.clear()
+            with database.begin("write") as txn:
+                _insert(txn, record_id)
+            released.set()
+        _finish(first)
+        ten = tuple(range(1, ROWS + 3))
+        eleven = tuple(range(1, ROWS + 4))
+        # The last pass walked ten rows; the eleventh landed after that walk.
+        assert outcomes["first"] == (ROWS + 2, "approximate", ten), outcomes
+        published = index._snapshot  # noqa: SLF001 - the honesty of the mark is the property
+        assert published is not None
+        assert published.mark != index.built_through_lsn, "certified past its walk"
+        # The next search sees the mark behind, rebuilds, and answers everything.
+        assert _search_permissive(database) == (ROWS + 3, "approximate", eleven)
+        assert _search(database, k=ROWS + 3) == (ROWS + 3, "approximate", eleven)
+    finally:
+        released.set()
+        math.release()
         database.close()
         release_ports(registry)
