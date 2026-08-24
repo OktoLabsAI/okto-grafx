@@ -17,8 +17,6 @@ from collections.abc import Iterator
 import pytest
 
 import okto_grafx
-from okto_grafx.domain.errors import GrafxUnsupportedOperation
-
 SCHEMA: tuple[str, ...] = (
     "CREATE NODE TABLE Person(id INT64, name STRING, age INT64, PRIMARY KEY(id))",
     "CREATE REL TABLE Knows(FROM Person TO Person, since INT64)",
@@ -95,7 +93,7 @@ def test_an_edge_between_committed_rows_stores_both_endpoints(database: object) 
             "CREATE (a)-[:Knows {since: 1994}]->(b)"
         )
     table = database.catalog.catalog.table("Knows")
-    stored = [version.values for _ref, version in database.heap.scan_all(table)]
+    stored = [version.values for _ref, version in database._heap.scan_all(table)]
     # Source and target lead the tuple, ahead of the user's property, per the layout C1 fixed.
     assert stored == [(1, 2, 1994)]
 
@@ -139,7 +137,7 @@ def test_an_aggregate_reads_what_the_writes_left(database: object) -> None:
 
 
 def test_explain_describes_the_tree_the_write_actually_walked(database: object) -> None:
-    plan = database.queries.explain("CREATE (:Person {id: 1, name: 'Ada'})")
+    plan = database.explain("CREATE (:Person {id: 1, name: 'Ada'})")
     labels = [node.label for node in plan.walk()]
     # The eager barrier sits between the write and everything that shapes the result, so a
     # window above can never decide how many rows were written.
@@ -245,7 +243,7 @@ def test_a_schema_statement_declares_the_interest_its_pages_represent(
     txn = database.begin("write")
     try:
         txn.execute("CREATE NODE TABLE Later(id INT64, PRIMARY KEY(id))")
-        assert txn.context.write_partitions != set()
+        assert txn._context.write_partitions != set()
     finally:
         txn.rollback()
 
@@ -263,7 +261,7 @@ def test_two_schema_commits_at_one_snapshot_do_not_both_succeed(database: object
     second = database.begin("write")
     first.execute("CREATE NODE TABLE Alpha(id INT64, PRIMARY KEY(id))")
     second.execute("CREATE NODE TABLE Beta(id INT64, PRIMARY KEY(id))")
-    assert first.context.write_partitions & second.context.write_partitions
+    assert first._context.write_partitions & second._context.write_partitions
     first.commit()
     with pytest.raises(GrafxWriteConflict) as refusal:
         second.commit()
@@ -294,7 +292,7 @@ def test_a_commit_puts_every_written_row_into_every_index_that_covers_it() -> No
         with handle.begin("write") as txn:
             txn.execute("CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))")
         table = handle.catalog.catalog.table("P")
-        index = handle.indexes.register(
+        index = handle._indexes.register(
             HashIndex(
                 IndexDefinition(
                     name="hash_P_id",
@@ -303,8 +301,8 @@ def test_a_commit_puts_every_written_row_into_every_index_that_covers_it() -> No
                     positions=(0,),
                     visibility=IndexVisibility.EXACT,
                 ),
-                handle.pool,
-                handle.metrics,
+                handle._pool,
+                handle._metrics,
             )
         )
         def live() -> int:
@@ -359,11 +357,11 @@ def test_a_similarity_search_finds_the_rows_a_match_can_see() -> None:
 
         reader = handle.begin("read")
         try:
-            result = handle.vectors.search(
+            result = handle.search_vectors(
+                reader,
                 space="minilm_v2",
                 k=3,
                 query=[1.0, 0.0, 0.0, 0.0],
-                snapshot=reader.context.snapshot,
             )
         finally:
             reader.rollback()
@@ -393,7 +391,7 @@ def test_verify_keys_a_row_the_way_the_index_it_checks_keys_it() -> None:
         # The VECTOR index by name, not by position: the table also carries the index of its
         # primary key now, and that one keys on column bytes -- so "the first index" would have
         # made this assertion pass for the wrong index and prove nothing about the vector one.
-        index = handle.indexes.index("vector_C_s")
+        index = handle._indexes.index("vector_C_s")
         assert index.definition.key_derivation != "columns"
         assert len(index.walk()) == 1
         assert handle.verify("all").findings == ()

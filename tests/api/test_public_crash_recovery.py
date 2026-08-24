@@ -137,7 +137,7 @@ def _published(storage: MemoryStorageDevice) -> CommitState:
 def _operators(database: Database, statement: str) -> set[str]:
     """Return the public explain-plan operator names for ``statement``."""
     found: set[str] = set()
-    pending = [database.queries.explain(statement)]
+    pending = [database.explain(statement)]
     while pending:
         node = pending.pop()
         found.add(type(node).__name__)
@@ -215,7 +215,7 @@ def _durable_row_crash() -> tuple[
     )
 
     durable_types = {
-        record.record_type for record in crashed.wal.read_from(published_before + 1)
+        record.record_type for record in crashed._wal.read_from(published_before + 1)
     }
     assert int(WalRecordType.WRITE_PAGE) in durable_types
     assert int(WalRecordType.INDEX_WRITE) in durable_types
@@ -239,8 +239,7 @@ def test_reopen_completes_a_durable_commit_into_heap_index_and_publication() -> 
         assert "IndexSeek" in _operators(recovered, KEYED_READ)
         assert _rows(recovered) == (("durable",),)
 
-        index = recovered.indexes.index(INDEX)
-        entries_after_first_recovery = index.walk()
+        entries_after_first_recovery = recovered.inspect_index(INDEX)
         assert len(entries_after_first_recovery) == 1
         assert recovered.verify("all").findings == ()
 
@@ -249,7 +248,7 @@ def test_reopen_completes_a_durable_commit_into_heap_index_and_publication() -> 
         state_after_first_recovery = _published(memory)
         assert recovered.recover().outcome == "clean"
         assert _published(memory) == state_after_first_recovery
-        assert index.walk() == entries_after_first_recovery
+        assert recovered.inspect_index(INDEX) == entries_after_first_recovery
         assert _rows(recovered) == (("durable",),)
         assert recovered.verify("all").findings == ()
     finally:
@@ -260,7 +259,7 @@ def test_reopen_completes_a_durable_commit_into_heap_index_and_publication() -> 
     with _connect(fault, namespace=memory) as reopened:
         assert _published(memory).last_committed_lsn == committed
         assert reopened.transactions.published_lsn() == committed
-        assert reopened.indexes.index(INDEX).walk() == entries_after_first_recovery
+        assert reopened.inspect_index(INDEX) == entries_after_first_recovery
         assert "IndexSeek" in _operators(reopened, KEYED_READ)
         assert _rows(reopened) == (("durable",),)
         assert reopened.verify("all").findings == ()
@@ -300,34 +299,34 @@ def test_a_late_invalid_effect_preflights_before_stale_or_control_bytes_move() -
     try:
         state = _published(memory)
         assert state.checkpoint_lsn > 0
-        index = database.indexes.index(INDEX)
+        index = database._indexes.index(INDEX)
         header = index.header
         assert header.built_through_lsn >= state.checkpoint_lsn
         # Make the replay-floor verdict actionable: on the old ordering the first non-pure step
         # persisted INDEX_FLAG_STALE here before the later corrupt page image was decoded.
-        with database.pool.pinned(index.file, 0) as page:
+        with database._pool.pinned(index.file, 0) as page:
             page.update_slot(
                 INDEX_HEADER_SLOT,
                 replace(header, built_through_lsn=0).encode(),
             )
-        database.pool.flush(index.file)
+        database._pool.flush(index.file)
 
         page_index = memory.page_count("heap.dat")
         valid_page = Page(
             int(PageType.HEAP),
             page_size=PAGE_SIZE,
             page_index=page_index,
-            page_lsn=database.wal.last_lsn + 1,
+            page_lsn=database._wal.last_lsn + 1,
             seq=2,
         )
         valid_page.insert_slot(b"would-be-prefix")
-        valid_image = database.codec.encode_page(valid_page)
+        valid_image = database._codec.encode_page(valid_page)
         epoch = max(
-            (record.epoch for record in database.wal.read_from(1)),
-            default=database.coordinator.current_epoch(),
+            (record.epoch for record in database._wal.read_from(1)),
+            default=database._coordinator.current_epoch(),
         )
         txn_id = 903
-        database.wal.append_many(
+        database._wal.append_many(
             (
                 WalRecord(
                     record_type=int(WalRecordType.WRITE_PAGE),
@@ -355,7 +354,7 @@ def test_a_late_invalid_effect_preflights_before_stale_or_control_bytes_move() -
                 ),
             )
         )
-        database.wal.barrier()
+        database._wal.barrier()
         before = _recovery_artifacts(memory)
 
         with pytest.raises(GrafxCorruptionDetected) as refused:
@@ -579,7 +578,7 @@ def test_flush_cannot_race_a_post_barrier_recovery_latch(
 
         def paused_flush(pool: BufferPool, file: str | None = None) -> int:
             flush_calls.append((threading.current_thread().name, file))
-            if pool is database.pool and threading.current_thread().name == "public-flush":
+            if pool is database._pool and threading.current_thread().name == "public-flush":
                 flush_entered.set()
                 if not release_flush.wait(timeout=5.0):
                     raise AssertionError("the test did not release the public flush")
@@ -602,7 +601,6 @@ def test_flush_cannot_race_a_post_barrier_recovery_latch(
                 commit_done.set()
 
         monkeypatch.setattr(BufferPool, "flush", paused_flush)
-        before_commit = database.wal.last_lsn
         flush_thread = threading.Thread(target=run_flush, name="public-flush")
         flush_thread.start()
         assert flush_entered.wait(timeout=5.0)
@@ -614,8 +612,9 @@ def test_flush_cannot_race_a_post_barrier_recovery_latch(
         # The flush owns the participant section. The commit cannot append/barrier or set the
         # latch until that earlier page operation has completely left the pool.
         assert not commit_done.wait(timeout=0.2)
-        assert database.wal.last_lsn == before_commit
-        assert database.transactions.recovery_required is False
+        # WAL and transaction publication observations join the participant section as well, so
+        # they intentionally wait behind this paused flush instead of reading straddled state;
+        # commit_done is the non-blocking evidence.
 
         release_flush.set()
         flush_thread.join(timeout=5.0)
@@ -727,7 +726,7 @@ def test_public_recovery_refuses_effects_whose_commit_outcome_was_lost(
 
     commit_item = next(
         item
-        for item in failed.wal.scan_all()
+        for item in failed._wal.scan_all()
         if item.record is not None
         and item.record.lsn == failed.wal.last_lsn
         and item.record.record_type == int(WalRecordType.COMMIT)
@@ -735,7 +734,7 @@ def test_public_recovery_refuses_effects_whose_commit_outcome_was_lost(
     if lost_commit == "checksum_first_effect":
         effect_item = next(
             item
-            for item in failed.wal.scan_all()
+            for item in failed._wal.scan_all()
             if item.record is not None
             and item.record.lsn > state_before.last_committed_lsn
             and item.record.record_type == int(WalRecordType.WRITE_PAGE)
@@ -804,7 +803,7 @@ def test_read_only_open_refuses_an_applied_ddl_effect_with_no_outcome() -> None:
 
     commit_item = next(
         item
-        for item in failed.wal.scan_all()
+        for item in failed._wal.scan_all()
         if item.record is not None
         and item.record.lsn == failed.wal.last_lsn
         and item.record.record_type == int(WalRecordType.COMMIT)
@@ -841,4 +840,4 @@ def test_public_connect_quarantines_a_torn_ledger_tail_and_opens() -> None:
         assert memory.log_size(LEDGER_FILE) == 0
         assert len(entries) == 1
         assert entries[0].manifest.origin == LEDGER_FILE
-        assert reopened.quarantine.read(entries[0].name) == torn
+        assert reopened.read_quarantine(entries[0].name) == torn

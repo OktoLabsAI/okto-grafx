@@ -40,7 +40,6 @@ from typing import TYPE_CHECKING, Self
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
-    GrafxError,
     GrafxSchemaVersionMismatch,
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
@@ -65,12 +64,57 @@ from okto_grafx.domain.txn.context import (
     CommitReport,
     TransactionContext,
     TransactionMode,
+    TransactionState,
 )
 from okto_grafx.domain.txn.snapshot import Snapshot
+from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.metrics_catalog import metric
+from okto_grafx.engine.public_views import (
+    BufferPoolView,
+    CatalogStoreView,
+    ClockView,
+    CodecView,
+    ComponentView,
+    CoordinatorView,
+    HeapStoreView,
+    IndexRegistryView,
+    LedgerView,
+    MetricsView,
+    QuarantineView,
+    QueryEngineView,
+    StorageView,
+    TransactionManagerView,
+    VectorEngineView,
+    VectorMathView,
+    WalView,
+    _builtin_bool,
+    _builtin_bytes,
+    _builtin_float,
+    _builtin_int,
+    _builtin_optional_text,
+    _builtin_text,
+    _builtin_type_name,
+    _catalog_view_from,
+    _clock_view,
+    _codec_view,
+    _component_view,
+    _coordinator_view,
+    _domain_field,
+    _heap_view,
+    _indexes_view,
+    _ledger_view,
+    _pool_view,
+    _quarantine_view,
+    _queries_view,
+    _recovery_report_view,
+    _storage_view,
+    _transactions_view,
+    _vectors_view,
+    _wal_view,
+)
 from okto_grafx.engine.txn_manager import TransactionManager
 from okto_grafx.engine.verifier import VERIFICATION_SCOPES
 
@@ -147,13 +191,23 @@ _UUID_BYTES: int = 16
 
 def _require_text(field: str, value: object) -> str:
     """Return the value as a non-empty string, or refuse with the field named."""
-    if not isinstance(value, str) or not value:
-        raise GrafxConfigurationError(
-            f"The {field} must be a non-empty string; got {value!r}.",
-            field=field,
-            value=repr(value),
-        )
-    return value
+    return _builtin_text(value, field=field, empty=False)
+
+
+def _note_cleanup_failure(primary: BaseException, cleanup: BaseException) -> None:
+    """Attach cleanup evidence without changing the exception that caused the unwind."""
+    try:
+        note = f"Additional cleanup failure: {_builtin_type_name(cleanup)}"
+        arguments = BaseException.__dict__["args"].__get__(cleanup, type(cleanup))
+        if type(arguments) is tuple and arguments:
+            first = next(tuple.__iter__(arguments))
+            if issubclass(type(first), str):
+                note += f": {str.__str__(first)}"
+        primary.add_note(note + ".")
+    except BaseException:
+        # Exception note support is diagnostic only; an exotic exception implementation must
+        # not replace either the primary failure or the cleanup result it was meant to report.
+        return
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,46 +228,65 @@ class DatabaseIdentity:
 
     def __post_init__(self) -> None:
         """Reject an identity that could not be encoded or could not be true."""
-        if (
-            not isinstance(self.database_uuid, bytes)
-            or len(self.database_uuid) != _UUID_BYTES
-        ):
+        database_uuid = self.database_uuid
+        if not issubclass(type(database_uuid), bytes):
             raise GrafxConfigurationError(
                 f"A database identity is exactly {_UUID_BYTES} bytes; got "
-                f"{len(self.database_uuid) if isinstance(self.database_uuid, bytes) else '?'}.",
+                f"{_builtin_type_name(database_uuid)}.",
                 field="database_uuid",
-                value=repr(self.database_uuid),
+                value=_builtin_type_name(database_uuid),
+            )
+        database_uuid = _builtin_bytes(database_uuid)
+        object.__setattr__(self, "database_uuid", database_uuid)
+        if len(database_uuid) != _UUID_BYTES:
+            raise GrafxConfigurationError(
+                f"A database identity is exactly {_UUID_BYTES} bytes; got "
+                f"{len(database_uuid)}.",
+                field="database_uuid",
+                value=len(database_uuid),
             )
         for field, value, ceiling in (
             ("format_version", self.format_version, 0xFFFF),
             ("page_size", self.page_size, 0xFFFFFFFF),
             ("partitions_per_table", self.partitions_per_table, 0xFFFF),
         ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or not 0 <= value <= ceiling
-            ):
+            if type(value) is bool or not issubclass(type(value), int):
+                observed = _builtin_type_name(value)
                 raise GrafxConfigurationError(
-                    f"The identity field {field!r} is outside its width: {value!r}.",
+                    f"The identity field {field!r} must be an integer; got {observed}.",
                     field=field,
-                    value=repr(value),
+                    value=observed,
                 )
-        if not isinstance(self.created_at_wall, (int, float)) or isinstance(
-            self.created_at_wall, bool
+            plain = int.__int__(value)
+            object.__setattr__(self, field, plain)
+            if not 0 <= plain <= ceiling:
+                raise GrafxConfigurationError(
+                    f"The identity field {field!r} is outside its width: {plain}.",
+                    field=field,
+                    value=plain,
+                )
+        created_at_wall = self.created_at_wall
+        if (
+            not issubclass(type(created_at_wall), (int, float))
+            or type(created_at_wall) is bool
         ):
+            observed = _builtin_type_name(created_at_wall)
             raise GrafxConfigurationError(
-                f"The creation stamp must be a number; got {self.created_at_wall!r}.",
+                f"The creation stamp must be a number; got {observed}.",
                 field="created_at_wall",
-                value=repr(self.created_at_wall),
+                value=observed,
             )
+        object.__setattr__(self, "created_at_wall", _builtin_float(created_at_wall))
         descriptor = self.granularity_descriptor
-        if not isinstance(descriptor, str):
+        if not issubclass(type(descriptor), str):
+            observed = _builtin_type_name(descriptor)
             raise GrafxConfigurationError(
-                f"The granularity descriptor must be a string; got {descriptor!r}.",
+                f"The granularity descriptor must be a string; got {observed}.",
                 field="granularity_descriptor",
-                value=repr(descriptor),
+                value=observed,
             )
+        descriptor = str.__str__(descriptor)
+        object.__setattr__(self, "granularity_descriptor", descriptor)
         if len(descriptor.encode("utf-8")) > MAX_DESCRIPTOR_BYTES:
             raise GrafxConfigurationError(
                 f"The granularity descriptor is longer than {MAX_DESCRIPTOR_BYTES} bytes.",
@@ -240,14 +313,15 @@ class DatabaseIdentity:
     def decode(cls, raw: bytes) -> DatabaseIdentity:
         """Return the identity a record holds, refusing damaged bytes as corruption."""
         minimum = _IDENTITY_HEAD.size + _IDENTITY_TAIL.size
-        if not isinstance(raw, (bytes, bytearray)) or len(raw) < minimum:
+        raw_is_bytes = issubclass(type(raw), (bytes, bytearray))
+        payload = _builtin_bytes(raw) if raw_is_bytes else b""
+        if not raw_is_bytes or len(payload) < minimum:
             raise GrafxCorruptionDetected(
                 f"An identity record is at least {minimum} bytes; this one holds "
-                f"{len(raw) if isinstance(raw, (bytes, bytearray)) else 0}.",
+                f"{len(payload)}.",
                 field="identity_length",
-                value=len(raw) if isinstance(raw, (bytes, bytearray)) else 0,
+                value=len(payload),
             )
-        payload = bytes(raw)
         (
             magic,
             format_version,
@@ -302,6 +376,41 @@ class DatabaseIdentity:
             granularity_descriptor=descriptor,
             format_version=format_version,
         )
+
+
+def _public_identity(value: DatabaseIdentity) -> DatabaseIdentity:
+    """Rebuild the identity with exact scalar leaves for the public facade.
+
+    The private identity remains the engine's original value.  This copy has the same encoded
+    record and equality semantics, while stripping any host-defined subclass accepted by the
+    domain constructor's intentionally structural validation.
+    """
+    if not issubclass(type(value), DatabaseIdentity):
+        raise GrafxConfigurationError(
+            f"A public database identity must be a DatabaseIdentity; got "
+            f"{_builtin_type_name(value)}.",
+            field="identity",
+            value=_builtin_type_name(value),
+        )
+    return DatabaseIdentity(
+        database_uuid=_builtin_bytes(
+            _domain_field(value, DatabaseIdentity, "database_uuid")
+        ),
+        page_size=_builtin_int(_domain_field(value, DatabaseIdentity, "page_size")),
+        partitions_per_table=_builtin_int(
+            _domain_field(value, DatabaseIdentity, "partitions_per_table")
+        ),
+        created_at_wall=_builtin_float(
+            _domain_field(value, DatabaseIdentity, "created_at_wall")
+        ),
+        granularity_descriptor=_builtin_text(
+            _domain_field(value, DatabaseIdentity, "granularity_descriptor"),
+            field="identity.granularity_descriptor",
+        ),
+        format_version=_builtin_int(
+            _domain_field(value, DatabaseIdentity, "format_version")
+        ),
+    )
 
 
 class MetaStore:
@@ -425,6 +534,38 @@ class MetaStore:
         return f"MetaStore(file={self._file!r})"
 
 
+def _public_commit_report(value: CommitReport | None) -> CommitReport | None:
+    """Copy a commit outcome into the exact public report type and exact scalar leaves."""
+    if value is None:
+        return None
+    if not issubclass(type(value), CommitReport):
+        raise GrafxConfigurationError(
+            f"A public commit report must be a CommitReport; got "
+            f"{_builtin_type_name(value)}.",
+            field="report",
+            value=_builtin_type_name(value),
+        )
+    observed_csn = _domain_field(value, CommitReport, "_csn")
+    observed_durable = _domain_field(value, CommitReport, "_durable")
+    observed_wrote = _domain_field(value, CommitReport, "_wrote")
+    csn = _builtin_int(observed_csn)
+    durable = _builtin_bool(observed_durable)
+    wrote = _builtin_bool(observed_wrote)
+    return CommitReport(csn=csn, durable=durable, wrote=wrote)
+
+
+def _public_snapshot(value: Snapshot) -> Snapshot:
+    """Copy a transaction snapshot into its exact domain type and integer leaf."""
+    if not issubclass(type(value), Snapshot):
+        raise GrafxConfigurationError(
+            f"A public transaction snapshot must be a Snapshot; got "
+            f"{_builtin_type_name(value)}.",
+            field="snapshot",
+            value=_builtin_type_name(value),
+        )
+    return Snapshot(_builtin_int(_domain_field(value, Snapshot, "read_lsn")))
+
+
 class Transaction:
     """One open transaction, as CONTRACT.md section 10 hands it to a caller.
 
@@ -448,34 +589,31 @@ class Transaction:
         self._finished: bool = False
 
     @property
-    def context(self) -> TransactionContext:
-        """Return the engine level transaction this object wraps."""
-        return self._context
-
-    @property
     def mode(self) -> str:
         """Return ``"read"`` or ``"write"``, the mode this transaction was opened in."""
-        return self._context.mode.value
+        return _builtin_text(
+            self._context.mode.value, field="transaction.mode", empty=False
+        )
 
     @property
     def snapshot(self) -> Snapshot:
         """Return the fixed view every read of this transaction sees (SPEC-M1 FR-2)."""
-        return self._context.snapshot
+        return _public_snapshot(self._context.snapshot)
 
     @property
     def txn_id(self) -> int:
         """Return the process-local number of this transaction."""
-        return self._context.txn_id
+        return _builtin_int(self._context.txn_id)
 
     @property
     def active(self) -> bool:
         """Return True while this transaction can still commit or roll back."""
-        return not self._finished and self._context.active
+        return _builtin_bool(not self._finished and self._context.active)
 
     @property
     def report(self) -> CommitReport | None:
         """Return what the commit reported, or None while the transaction is still open."""
-        return self._report
+        return _public_commit_report(self._report)
 
     def execute(
         self, text: str, parameters: Mapping[str, object] | None = None
@@ -486,7 +624,7 @@ class Transaction:
         one refuses here with GrafxUnsupportedOperation rather than pretending to run anything.
         """
         self._require_active()
-        return self._database.run_statement(self._context, text, parameters)
+        return self._database._run_statement(self._context, text, parameters)
 
     def commit(self) -> CommitReport:
         """Commit this transaction and return the report of CONTRACT.md section 8.5.
@@ -497,19 +635,86 @@ class Transaction:
         """
         with self._database._public_transition():
             self._require_active()
-            report = self._database.transactions.commit(self._context)
-            self._report = report
+            try:
+                report = self._database._transactions.commit(self._context)
+            except BaseException as failure:
+                # A post-barrier apply/publication failure is reported only after the manager
+                # has made the durable outcome irrevocable and retired this context.  Publish
+                # the same outcome on the wrapper and settle its schema journal before the
+                # failure escapes; otherwise callers see an apparently reusable transaction
+                # and close has to guess whether its DDL committed.
+                if self._context.state is TransactionState.COMMITTED:
+                    self._report = CommitReport(
+                        csn=_builtin_int(self._context.commit_csn),
+                        durable=True,
+                        wrote=_builtin_bool(self._context.wrote),
+                    )
+                    self._finished = True
+                    try:
+                        self._database._settle_schema(self._context, committed=True)
+                    except BaseException as settlement_failure:
+                        _note_cleanup_failure(failure, settlement_failure)
+                elif self._context.state is TransactionState.ABORTED:
+                    # Terminal close can win through a re-entrant host callback.  The wrapper
+                    # must agree with that outcome, and any tracked schema work is rollback work.
+                    self._finished = True
+                    try:
+                        self._database._settle_schema(self._context, committed=False)
+                    except BaseException as settlement_failure:
+                        _note_cleanup_failure(failure, settlement_failure)
+                else:
+                    # Validation and every other pre-barrier refusal leave the transaction
+                    # ACTIVE and retryable through its documented lifecycle doors.
+                    self._finished = False
+                raise
+            public_report = _public_commit_report(report)
+            if (
+                public_report is None
+            ):  # pragma: no cover - manager success always has a report
+                raise GrafxTransactionStateError(
+                    "A successful commit did not produce its report.",
+                    operation="commit",
+                )
+            private_report = _public_commit_report(public_report)
+            if (
+                private_report is None
+            ):  # pragma: no cover - public_report is non-optional above
+                raise AssertionError("a public commit report copy disappeared")
+            self._report = private_report
             self._finished = True
-            self._database._settle_schema(self._context, committed=True)
-            return report
+            try:
+                self._database._settle_schema(self._context, committed=True)
+            except BaseException as settlement_failure:
+                # The manager has returned a durable report. QueryEngine settlement only drops
+                # facade bookkeeping; letting a hostile cleanup escape here would turn success
+                # into an apparent retry invitation. Keep the context tracked so close retries
+                # the journal drain before lower resources are released, and retain the failure
+                # privately as lifecycle evidence.
+                if self._database._close_failure is None:
+                    self._database._close_failure = settlement_failure
+            return public_report
 
     def rollback(self) -> None:
         """Abandon this transaction. Rolling back twice is a no-op, never an error."""
         with self._database._public_transition():
             if self._finished:
                 return
+            try:
+                self._database._transactions.rollback(self._context)
+            except BaseException as failure:
+                # A participant-section pre-enter failure has changed no outcome: keep the
+                # wrapper live so the caller (or a later close) can withdraw its reader pin.
+                # Conversely, reader/index cleanup can fail after the manager has already made
+                # ABORTED final. In that case finish the wrapper and its schema unwind while
+                # retaining the manager failure as the primary evidence.
+                self._finished = not self._context.active
+                if self._context.state is TransactionState.ABORTED:
+                    try:
+                        self._database._settle_schema(self._context, committed=False)
+                    except BaseException as settlement_failure:
+                        _note_cleanup_failure(failure, settlement_failure)
+                raise
             self._finished = True
-            self._database.transactions.rollback(self._context)
             self._database._settle_schema(self._context, committed=False)
 
     def __enter__(self) -> Self:
@@ -529,7 +734,9 @@ class Transaction:
             return
         try:
             self.rollback()
-        except GrafxError:
+        except BaseException as cleanup_failure:
+            if exc is not None:
+                _note_cleanup_failure(exc, cleanup_failure)
             return
 
     def _require_active(self) -> None:
@@ -590,6 +797,7 @@ class Database:
         "_read_only",
         "_closers",
         "_closed",
+        "_public_contexts",
         "_close_releasing",
         "_close_released",
         "_close_failure",
@@ -658,17 +866,34 @@ class Database:
         self._identity: DatabaseIdentity = identity
         self._path: str = _require_text("path", path)
         self._label: str = _require_text("label", label)
-        self._read_only: bool = bool(read_only)
-        self._metrics_endpoint: str | None = metrics_endpoint
+        self._read_only: bool = _builtin_bool(read_only)
+        self._metrics_endpoint: str | None = _builtin_optional_text(
+            metrics_endpoint, field="metrics_endpoint"
+        )
         self._closers: tuple[Callable[[], None], ...] = tuple(closers)
         self._closed: bool = False
+        # Contexts never cross the public boundary, but the facade must remember every context
+        # that entered QueryEngine until its schema journal is retired. TransactionManager owns
+        # pins and transaction state; this map owns only the second half of public lifecycle
+        # settlement, so Database.close can finish it before storage and the pool disappear. A
+        # transaction that never executed a statement needs no entry and no post-close unwind.
+        self._public_contexts: dict[int, TransactionContext] = {}
         self._close_releasing: bool = False
         self._close_released: bool = False
         self._close_failure: BaseException | None = None
-        self._recovery_report: object = recovery_report
-        self._attached_indexes: tuple[str, ...] = tuple(attached_indexes)
-        self._stale_indexes: tuple[str, ...] = tuple(stale_indexes)
-        self._unindexed_tables: tuple[str, ...] = tuple(unindexed_tables)
+        self._recovery_report: object = _recovery_report_view(recovery_report)
+        self._attached_indexes: tuple[str, ...] = tuple(
+            _builtin_text(name, field="attached_index", empty=False)
+            for name in attached_indexes
+        )
+        self._stale_indexes: tuple[str, ...] = tuple(
+            _builtin_text(name, field="stale_index", empty=False)
+            for name in stale_indexes
+        )
+        self._unindexed_tables: tuple[str, ...] = tuple(
+            _builtin_text(name, field="unindexed_table", empty=False)
+            for name in unindexed_tables
+        )
         if metrics.enabled:
             for declared in DATABASE_METRICS:
                 metrics.register(declared)
@@ -689,7 +914,7 @@ class Database:
     @property
     def identity(self) -> DatabaseIdentity:
         """Return the identity record of section 6.2 that this database carries (FR-1)."""
-        return self._identity
+        return _public_identity(self._identity)
 
     @property
     def read_only(self) -> bool:
@@ -710,11 +935,6 @@ class Database:
         this property remains False until that elected caller exhausts every release step.
         """
         return self._close_released
-
-    @property
-    def close_failure(self) -> BaseException | None:
-        """Return a deferred close failure that could not replace a transaction outcome."""
-        return self._close_failure
 
     @property
     def metrics_endpoint(self) -> str | None:
@@ -770,112 +990,227 @@ class Database:
     # --- the composition ---------------------------------------------------------------------
 
     @property
-    def storage(self) -> StorageDevice:
-        """Return the storage device this database persists through."""
-        return self._storage
+    def storage(self) -> StorageView:
+        """Return immutable storage identity and file-size metadata.
+
+        The device itself is deliberately not public: its allocation, append, truncate and page
+        write doors bypass the WAL and recovery protocols.  This snapshot keeps useful inventory
+        reads while carrying no reference or callback back to that device.
+        """
+        with self._public_transition():
+            self._require_open()
+            return _storage_view(self._storage)
 
     @property
-    def clock(self) -> Clock:
-        """Return the clock this database measures liveness and stamps wall times with."""
-        return self._clock
+    def clock(self) -> ClockView:
+        """Return clock implementation identity without advancing either clock source."""
+        with self._public_transition():
+            self._require_open()
+            return _clock_view(self._clock)
 
     @property
-    def codec(self) -> PageCodec:
-        """Return the page codec this database encodes and verifies pages with."""
-        return self._codec
+    def codec(self) -> CodecView:
+        """Return immutable format metadata without exposing page encode/decode doors."""
+        with self._public_transition():
+            self._require_open()
+            return _codec_view(
+                self._codec,
+                _domain_field(self._identity, DatabaseIdentity, "page_size"),
+            )
 
     @property
-    def metrics(self) -> MetricsSink:
-        """Return the metrics sink every component of this database emits through (FR-14)."""
-        return self._metrics
+    def metrics(self) -> MetricsView:
+        """Return whether metrics collection is enabled, without exposing the mutable sink."""
+        with self._public_transition():
+            self._require_open()
+            return MetricsView(_builtin_bool(self._metrics.enabled))
 
     @property
-    def events(self) -> EventSink:
-        """Return the event sink this database narrates through."""
-        return self._events
+    def events(self) -> ComponentView:
+        """Return identity-only metadata for the configured event destination."""
+        with self._public_transition():
+            self._require_open()
+            return _component_view("events", self._events)
 
     @property
-    def vector_math(self) -> VectorMath:
-        """Return the vector math adapter this database scores with (SPEC-VEC FR-7)."""
-        return self._vector_math
+    def vector_math(self) -> VectorMathView:
+        """Return the selected vector arithmetic implementation's immutable name."""
+        with self._public_transition():
+            self._require_open()
+            # Adapter identity is observable without executing a host-supplied descriptor.
+            # Calling ``name`` here would turn a harmless property read into another callback
+            # into the host.
+            return VectorMathView(
+                _builtin_text(
+                    _builtin_type_name(self._vector_math),
+                    field="vector_math.name",
+                    empty=False,
+                )
+            )
 
     @property
-    def coordinator(self) -> ProcessCoordinator:
-        """Return the coordinator that fences this database against other processes (FR-7)."""
-        return self._coordinator
+    def coordinator(self) -> CoordinatorView:
+        """Return participant identity without touching lease, horizon or fencing state."""
+        with self._public_transition():
+            self._require_open()
+            return _coordinator_view(self._coordinator)
 
     @property
-    def pool(self) -> BufferPool:
-        """Return the page cache of this database, bounded by its own budget (FR-13)."""
-        return self._pool
+    def pool(self) -> BufferPoolView:
+        """Return immutable page-cache capacity and residency counters (FR-13)."""
+        with self._public_transition():
+            self._require_open()
+            # Every public page operation enters this same section.  The snapshot therefore
+            # cannot straddle an eviction, while its builder only reads in-memory counters and
+            # never calls a storage or telemetry port with the section held.
+            with self._transactions._participant_section():
+                return _pool_view(self._pool)
 
     @property
-    def catalog(self) -> CatalogStore:
-        """Return the catalog store that holds the schema of this database."""
-        return self._catalog
+    def catalog(self) -> CatalogStoreView:
+        """Return a complete, linearized schema and catalog-layout snapshot."""
+        with self._public_transition():
+            self._require_open()
+            snapshot, _epoch = self._catalog_snapshot()
+            return snapshot
 
     @property
-    def heap(self) -> HeapStore:
-        """Return the heap store that holds the rows of this database."""
-        return self._heap
+    def heap(self) -> HeapStoreView:
+        """Return immutable heap layout metadata without row or page mutation doors."""
+        with self._public_transition():
+            self._require_open()
+            return _heap_view(self._heap)
 
     @property
-    def wal(self) -> WalManager:
-        """Return the write ahead log of this database (FR-5)."""
-        return self._wal
+    def wal(self) -> WalView:
+        """Return the WAL state last observed by this handle and its segment inventory (FR-5).
+
+        This observation is deliberately cache-only.  Refreshing the directory here would both
+        turn a property read into storage I/O and race ``WalManager._unflushed`` with a commit's
+        durability barrier.  The participant section makes the cached fields one coherent cut
+        without running storage or metrics callbacks while it is held.
+        """
+        with self._public_transition():
+            self._require_open()
+            with self._transactions._participant_section():
+                return _wal_view(self._wal)
 
     @property
-    def transactions(self) -> TransactionManager:
-        """Return the transaction manager that runs the frozen commit protocol (FR-2, FR-3)."""
-        return self._transactions
+    def transactions(self) -> TransactionManagerView:
+        """Return immutable transaction configuration, counts and publication state."""
+        with self._public_transition():
+            self._require_open()
+            # Capture recovery and publication under the same section without re-entering the
+            # manager's public `published_state` door. A callback may seal the manager while its
+            # storage read is in flight; the facade transition defers release and this private
+            # in-section path lets that already-started observation finish honestly.
+            with self._transactions._participant_section():
+                recovery_required = _builtin_bool(self._transactions.recovery_required)
+                state = (
+                    None
+                    if recovery_required
+                    else self._transactions._published_state_in_section()
+                )
+                return _transactions_view(
+                    self._transactions,
+                    recovery_required=recovery_required,
+                    state=state,
+                )
 
     @property
-    def indexes(self) -> object:
-        """Return the secondary index registry of this database (FR-12).
+    def indexes(self) -> IndexRegistryView:
+        """Return an immutable secondary-index inventory (FR-12).
 
         Refuses with GrafxUnsupportedOperation when the composition has no index manager.
         """
-        return self._require_component(
-            "indexes", self._indexes, "the index framework (C7)"
-        )
+        with self._public_transition():
+            self._require_open()
+            indexes = self._require_component(
+                "indexes", self._indexes, "the index framework (C7)"
+            )
+            # Query DDL registers accelerators before commit and journals them for rollback.
+            # Filter that speculative registry against the same linearized committed catalog
+            # the caller sees, and revalidate its epoch beside the registry snapshot.
+            while True:
+                catalog, epoch = self._catalog_snapshot()
+                table_ids = frozenset(
+                    table.table_id for table in catalog.catalog.table_definitions
+                )
+                with self._transactions._participant_section():
+                    if (
+                        _builtin_int(self._catalog._view_epoch(), field="catalog.epoch")
+                        != epoch
+                    ):
+                        continue
+                    return _indexes_view(indexes, table_ids)
 
     @property
-    def ledger(self) -> object:
-        """Return the ledger of unapplied work (SPEC-M1 FR-9, CONTRACT.md section 10).
+    def ledger(self) -> LedgerView:
+        """Return an immutable ledger inventory (SPEC-M1 FR-9, section 10).
 
         Refuses with GrafxUnsupportedOperation when the composition has no ledger store.
         """
-        return self._require_component("ledger", self._ledger, "the ledger store (C6)")
+        with self._public_transition():
+            self._require_open()
+            ledger = self._require_component(
+                "ledger", self._ledger, "the ledger store (C6)"
+            )
+            return _ledger_view(ledger)
 
     @property
-    def quarantine(self) -> object:
-        """Return the quarantine store of this database (FR-10).
+    def quarantine(self) -> QuarantineView:
+        """Return an immutable quarantine evidence inventory (FR-10).
 
         Refuses with GrafxUnsupportedOperation when the composition has no quarantine store.
         """
-        return self._require_component(
-            "quarantine", self._quarantine, "quarantine (C6)"
-        )
+        with self._public_transition():
+            self._require_open()
+            quarantine = self._require_component(
+                "quarantine", self._quarantine, "quarantine (C6)"
+            )
+            return _quarantine_view(quarantine)
 
     @property
-    def vectors(self) -> object:
-        """Return the vector engine of this database (SPEC-VEC).
+    def vectors(self) -> VectorEngineView:
+        """Return immutable vector-space and index configuration (SPEC-VEC).
 
         Refuses with GrafxUnsupportedOperation when the composition has no vector engine.
         """
-        return self._require_component(
-            "vectors", self._vectors, "the vector engine (C9)"
-        )
+        with self._public_transition():
+            self._require_open()
+            vectors = self._require_component(
+                "vectors", self._vectors, "the vector engine (C9)"
+            )
+            # A catalog refresh can read/evict pages and publish telemetry, so it happens before
+            # the participant section. _catalog_snapshot validates the page epoch under that
+            # section; validate it once more beside the vector registry so a DDL commit cannot
+            # land in the small gap and produce spaces from one side with indexes from the other.
+            while True:
+                catalog, epoch = self._catalog_snapshot()
+                tables = frozenset(
+                    table.table_id for table in catalog.catalog.table_definitions
+                )
+                spaces = catalog.catalog.space_definitions
+                with self._transactions._participant_section():
+                    if (
+                        _builtin_int(self._catalog._view_epoch(), field="catalog.epoch")
+                        != epoch
+                    ):
+                        continue
+                    return _vectors_view(vectors, spaces, tables)
 
     @property
-    def queries(self) -> object:
-        """Return the query engine of this database.
+    def queries(self) -> QueryEngineView:
+        """Return immutable diagnostics for the composed query engine.
 
         Refuses with GrafxUnsupportedOperation when the composition has no query engine.
         """
-        return self._require_component(
-            "queries", self._queries, "the query engine (C10)"
-        )
+        with self._public_transition():
+            self._require_open()
+            queries = self._require_component(
+                "queries", self._queries, "the query engine (C10)"
+            )
+            return _queries_view(queries)
 
     # --- transactions -------------------------------------------------------------------------
 
@@ -892,18 +1227,11 @@ class Database:
         if parsed is TransactionMode.WRITE:
             self._require_writable("begin a write transaction")
         with self._public_transition():
+            # Seal the check/transition race: close may publish after the preliminary guard but
+            # before this process-wide facade boundary increments its settlement count.
+            self._require_open()
             context = self._transactions.begin(parsed.value)
-            if self._closed or not context.active:
-                # A clock/telemetry callback may request close and return normally. The manager
-                # performs the same revalidation, but the facade owns the final publication of
-                # the wrapper and therefore seals this boundary too.
-                self._transactions.close()
-                raise GrafxUnsupportedOperation(
-                    f"This database at {self._path!r} closed while beginning a transaction.",
-                    path=self._path,
-                    operation="begin a transaction",
-                )
-            return Transaction(self, context)
+            return self._public_transaction(context)
 
     def retry(self, transaction: Transaction) -> Transaction:
         """Open the successor of a transaction optimistic validation refused (BR-6).
@@ -913,28 +1241,64 @@ class Database:
         ``oktografx_commit_retries_total``.
         """
         self._require_open()
-        if not isinstance(transaction, Transaction):
+        if type(transaction) is not Transaction:
+            observed = _builtin_type_name(transaction)
             raise GrafxConfigurationError(
-                f"A retry takes a Transaction; got {type(transaction).__name__}.",
+                f"A retry takes a Transaction; got {observed}.",
                 field="transaction",
-                value=type(transaction).__name__,
+                value=observed,
             )
-        # The loser's schema bookkeeping is settled BEFORE the successor opens: its working
-        # catalog is dropped and its registered indexes pruned, so the successor's re-executed
-        # DDL registers cleanly instead of being refused by its own predecessor's leftovers --
-        # which made the documented BR-6 retry loop unable to ever succeed for a schema change,
-        # and let the successor's later rows commit against a phantom table.
+        if transaction._database is not self:
+            raise GrafxTransactionStateError(
+                "A transaction can only be retried by the database that opened it.",
+                txn_id=transaction.txn_id,
+                field="transaction_owner",
+                path=self._path,
+            )
         with self._public_transition():
-            self._settle_schema(transaction.context, committed=False)
-            context = self._transactions.retry(transaction.context)
-            if self._closed or not context.active:
-                self._transactions.close()
-                raise GrafxUnsupportedOperation(
-                    f"This database at {self._path!r} closed while retrying a transaction.",
-                    path=self._path,
-                    operation="retry a transaction",
-                )
-            return Transaction(self, context)
+            # As with begin, close can win between the public preliminary check and transition
+            # entry. Refuse before manager/schema work; manager retry revalidates terminal state
+            # again in its own participant section.
+            self._require_open()
+            transaction._require_active()
+            context = transaction._context
+            # TransactionManager.retry revalidates the CURRENT owned ACTIVE context, aborts it
+            # and registers its successor in one participant section. Keeping a second outer
+            # participant section here would put manager failure telemetry under a facade lock;
+            # the injected public transition tracks only wrapper/schema outcome publication.
+            try:
+                successor = self._transactions.retry(context)
+            except BaseException as retry_failure:
+                # Manager retry can fail after it has fail-completely aborted the predecessor
+                # (for example if successor open fails). Its query journal then belongs to the
+                # same unwind as a successful retry. A validation refusal leaves it ACTIVE.
+                if context.state is TransactionState.ABORTED:
+                    transaction._finished = True
+                    try:
+                        self._settle_schema(context, committed=False)
+                    except BaseException as settlement_failure:
+                        _note_cleanup_failure(retry_failure, settlement_failure)
+                raise
+            transaction._finished = True
+            try:
+                self._settle_schema(context, committed=False)
+            except BaseException as settlement_failure:
+                # The successor has not escaped yet. Retire it immediately so a predecessor
+                # unwind failure cannot leak a reader pin. Cleanup evidence never replaces it.
+                try:
+                    self._transactions.rollback(successor)
+                except BaseException as cleanup_failure:
+                    _note_cleanup_failure(settlement_failure, cleanup_failure)
+                    if successor.active:
+                        # The successor has no public wrapper and a participant pre-enter bomb
+                        # means ordinary rollback changed nothing. Seal this facade immediately;
+                        # leaving the current public transition then resumes close and retires
+                        # the otherwise unreachable reader pin. The predecessor settlement
+                        # failure remains the primary outcome throughout.
+                        self._closed = True
+                        self._transactions.request_close()
+                raise
+            return self._public_transaction(successor)
 
     @contextmanager
     def transaction(self, mode: str = "write") -> Iterator[Transaction]:
@@ -955,32 +1319,114 @@ class Database:
         self._require_open()
         txn = self.begin("read")
         try:
-            result = self.run_statement(txn.context, text, parameters)
-        except BaseException:
-            txn.rollback()
+            result = txn.execute(text, parameters)
+        except BaseException as failure:
+            try:
+                txn.rollback()
+            except BaseException as cleanup_failure:
+                _note_cleanup_failure(failure, cleanup_failure)
             raise
         txn.commit()
         return result
 
-    def run_statement(
-        self,
-        context: TransactionContext,
-        text: str,
-        parameters: Mapping[str, object] | None = None,
-    ) -> object:
-        """Run one statement through the query engine on behalf of a transaction.
-
-        Public because :class:`Transaction` reaches it, and documented as the single door every
-        statement of this database passes through -- there is deliberately no second path that
-        could diverge from it.
-        """
+    def explain(self, text: str) -> object:
+        """Plan one statement without exposing the mutable query engine."""
         self._require_open()
         _require_text("statement", text)
         engine = self._require_component(
             "queries", self._queries, "the query engine (C10)"
         )
         with self._transactions.page_access_section():
+            return engine.explain(text)  # type: ignore[attr-defined]
+
+    def _run_statement(
+        self,
+        context: TransactionContext,
+        text: str,
+        parameters: Mapping[str, object] | None = None,
+    ) -> object:
+        """Run one statement for a context already validated by the public Transaction."""
+        self._require_open()
+        _require_text("statement", text)
+        engine = self._require_component(
+            "queries", self._queries, "the query engine (C10)"
+        )
+        with self._transactions.page_access_section():
+            if not context.active:
+                raise GrafxTransactionStateError(
+                    f"Transaction {context.txn_id} is {context.state.value} and cannot execute "
+                    "another statement.",
+                    txn_id=context.txn_id,
+                    state=context.state.value,
+                )
+            # Registration and statement execution share the participant section. Close can
+            # therefore neither miss a context that may have acquired a schema journal nor
+            # release storage while the statement is installing one.
+            self._public_contexts.setdefault(context.txn_id, context)
             return engine.execute(text, context, parameters)  # type: ignore[attr-defined]
+
+    def search_vectors(
+        self,
+        transaction: Transaction,
+        *,
+        space: str,
+        query: Sequence[float],
+        k: int,
+        candidate_filter: RecordIdFilter | None = None,
+    ) -> object:
+        """Search vectors under the fixed snapshot of one active transaction.
+
+        This is the safe replacement for reaching through ``database.vectors.search`` and
+        supplying a raw ``TransactionContext`` or snapshot.  Ownership and liveness are checked
+        before the vector engine is reached, and the page-access section keeps the recovery latch
+        stable for the whole search.  The public filter is the immutable exact
+        :class:`RecordIdFilter`; accepting an arbitrary predicate would let caller code roll back
+        this transaction from inside the engine and withdraw its reader pin mid-search.  The
+        vector collaborator itself never leaves the database.
+        """
+        self._require_open()
+        if type(transaction) is not Transaction:
+            observed = _builtin_type_name(transaction)
+            raise GrafxConfigurationError(
+                f"A vector search takes a Transaction; got {observed}.",
+                field="transaction",
+                value=observed,
+            )
+        if transaction._database is not self:
+            raise GrafxTransactionStateError(
+                "A vector search can only use a transaction opened by this database.",
+                txn_id=transaction.txn_id,
+                field="transaction_owner",
+                path=self._path,
+            )
+        # Exact type, not isinstance: a subclass can add a callback or mutable backdoor to the
+        # otherwise frozen DTO.  Refuse it before resolving or entering the vector engine.
+        if (
+            candidate_filter is not None
+            and type(candidate_filter) is not RecordIdFilter
+        ):
+            observed = _builtin_type_name(candidate_filter)
+            raise GrafxConfigurationError(
+                "A public vector candidate filter must be an immutable RecordIdFilter or None; "
+                f"got {observed}.",
+                field="candidate_filter",
+                value=observed,
+            )
+        vectors = self._require_component(
+            "vectors", self._vectors, "the vector engine (C9)"
+        )
+        with self._transactions.page_access_section():
+            # Liveness is checked under the same participant section that commit/rollback use.
+            # Checking before it would let a racing rollback withdraw this snapshot's reader pin
+            # in the gap and leave the search reading below a recyclable horizon.
+            transaction._require_active()
+            return vectors.search(  # type: ignore[attr-defined]
+                space=space,
+                query=query,
+                k=k,
+                snapshot=transaction._context.snapshot,
+                candidate_filter=candidate_filter,
+            )
 
     # --- operator surface ---------------------------------------------------------------------
 
@@ -1027,7 +1473,8 @@ class Database:
             self._transactions.require_recovery()
             report = manager.run()  # type: ignore[attr-defined]
             self._transactions.recovery_completed()
-        self._recovery_report = report
+        public_report = _recovery_report_view(report)
+        self._recovery_report = public_report
         indexes = self._indexes
         if indexes is not None:
             # Reacquire after recovery_section released. A concurrent post-barrier failure may
@@ -1035,14 +1482,17 @@ class Database:
             # either finish before that latch or refuse after it, never straddle it.
             with self._transactions.page_access_section():
                 registered = indexes.indexes()  # type: ignore[attr-defined]
-                self._attached_indexes = tuple(index.name for index in registered)
+                self._attached_indexes = tuple(
+                    _builtin_text(index.name, field="attached_index", empty=False)
+                    for index in registered
+                )
                 self._stale_indexes = tuple(
-                    index.name
+                    _builtin_text(index.name, field="stale_index", empty=False)
                     for index in indexes.open(  # type: ignore[attr-defined]
                         self._transactions.published_lsn()
                     )
                 )
-        return report
+        return public_report
 
     def flush(self) -> int:
         """Write every dirty page of this database back to the device and return the count.
@@ -1055,7 +1505,7 @@ class Database:
         self._require_open()
         self._require_writable("flush pages")
         with self._transactions.page_access_section():
-            return self._pool.flush()
+            return _builtin_int(self._pool.flush(), field="flush.count")
 
     def checkpoint(self) -> object:
         """Put the committed state on the platter, publish the checkpoint, and reclaim the log (BR-10).
@@ -1078,9 +1528,12 @@ class Database:
             # registry that now serves queries, just as operator recovery does.
             with self._transactions.page_access_section():
                 registered = indexes.indexes()  # type: ignore[attr-defined]
-                self._attached_indexes = tuple(index.name for index in registered)
+                self._attached_indexes = tuple(
+                    _builtin_text(index.name, field="attached_index", empty=False)
+                    for index in registered
+                )
                 self._stale_indexes = tuple(
-                    index.name
+                    _builtin_text(index.name, field="stale_index", empty=False)
                     for index in indexes.open(  # type: ignore[attr-defined]
                         self._transactions.published_lsn()
                     )
@@ -1092,23 +1545,57 @@ class Database:
         self._require_open()
         return self._metrics.snapshot()
 
+    def publish_metrics(self) -> None:
+        """Publish a configured metrics document without exposing its mutable sink.
+
+        Sinks without an explicit publication door have nothing to do.  A JSON sink writes the
+        configured destination; the same action runs automatically during :meth:`close`.
+        """
+        self._require_open()
+        self._publish_metrics()
+
+    def inspect_index(self, name: str) -> tuple[object, ...]:
+        """Return immutable entry DTOs from one secondary index.
+
+        This is an explicit potentially expensive read.  The index store itself stays private,
+        so callers cannot mark it stale, advance its header or stage changes outside a
+        transaction.
+        """
+        self._require_open()
+        wanted = _require_text("index", name)
+        indexes = self._require_component(
+            "indexes", self._indexes, "the index framework (C7)"
+        )
+        with self._transactions.page_access_section():
+            index = indexes.index(wanted)  # type: ignore[attr-defined]
+            return tuple(index.walk())
+
+    def read_quarantine(self, name: str) -> bytes:
+        """Return and checksum-verify the immutable bytes of one quarantine entry."""
+        self._require_open()
+        wanted = _require_text("quarantine entry", name)
+        quarantine = self._require_component(
+            "quarantine", self._quarantine, "quarantine (C6)"
+        )
+        return _builtin_bytes(
+            quarantine.read(wanted),  # type: ignore[attr-defined]
+            field="quarantine.payload",
+        )
+
     # --- lifecycle ----------------------------------------------------------------------------
 
     def close(self) -> None:
         """Release everything this database opened, and never corrupt anything doing it (FR-1).
 
-        The order is the reverse of the order things were acquired. Transaction close must first
-        prove quiescence; if acquiring that proof fails, lower dependencies stay open and a later
-        call retries the safe leak. Once quiescent, every release step runs even when an earlier
-        one failed. A database that fails to release something is still CLOSED afterwards --
-        refusing to record that would leave a caller with an object it can neither use nor retire
-        -- and the first failure is raised once every safe step has been attempted.
+        Transaction close and every tracked QueryEngine schema journal must first prove complete.
+        If either cannot, lower dependencies stay open and a later call retries that safe leak.
+        Once quiescent, every release step runs even when an earlier one failed, and exactly one
+        caller owns those steps even when close calls race or host callbacks re-enter.
 
         Closing twice is a no-op. Closing with a transaction open aborts it: nothing of an open
         transaction has reached the device, so abandoning it is the whole of that promise. A
-        concurrent or reentrant caller does not join an already elected releaser across foreign
-        hooks; it returns terminal but incomplete, observable through :attr:`close_complete`,
-        and the elected caller finishes the release exactly once.
+        concurrent/reentrant caller may return terminal but incomplete; :attr:`close_complete`
+        distinguishes that safe intermediate state from completed lower-layer release.
         """
         if self._close_released:
             return
@@ -1124,44 +1611,48 @@ class Database:
             or self._transactions.transition_active
             or self._close_releasing
         ):
-            # A callback arrived inside begin/commit/rollback/retry or inside this close's own
-            # host release phase. Terminal state is visible now, but cleanup is deliberately a
-            # safe leak until a later explicit close can prove quiescence.
+            # A callback arrived inside begin/commit/rollback/retry, a manager transition, or
+            # this close's host release phase. The terminal request is enough here; the public
+            # transition finally (or a later explicit close) resumes after wrapper settlement.
             return
+
         failures: list[BaseException] = []
         try:
             self._close_transactions()
         except BaseException as failure:
             failures.append(failure)
-        if not self._transactions.close_complete:
-            # A participant-section pre-enter failure or a same-context transition means a
-            # transaction winner may still touch WAL/pool/storage. Never flush or release a
-            # dependency under it; unlike a completed release, this state is retryable by close.
+
+        journals_pending = bool(self._public_contexts)
+        if not self._transactions.close_complete or journals_pending:
+            # A participant-section pre-enter failure, schema-unwind failure, or same-context
+            # transition means a winner may still touch pool/storage. Never release under it.
             if failures:
                 if self._close_failure is None:
                     self._close_failure = failures[0]
                 raise failures[0]
             return
         if self._facade_transition_active():
-            # Manager settlement may finish while another thread is still publishing the
-            # wrapper outcome or settling QueryEngine schema state. Terminal refusal is already
-            # visible, but pool/storage release waits for that thread's transition-finally to
-            # retry close after the adapter's global count reaches zero.
+            # Another wrapper may still be publishing its outcome after manager quiescence. It
+            # cannot start new work after the terminal seal; its transition-finally retries close
+            # once the process-wide facade counter reaches zero.
             if failures:
                 if self._close_failure is None:
                     self._close_failure = failures[0]
                 raise failures[0]
             return
-        # Two callers can both return from manager.close after it becomes complete. Elect exactly
-        # one lower-layer releaser while holding the same participant exclusion that established
-        # quiescence, then drop that exclusion before invoking any host-owned release hook. A
-        # failed claim changes no release flag: dependencies remain safely open and close can be
-        # retried.
+
+        # Elect exactly one lower-layer releaser under the manager's quiescent participant
+        # section, then leave that section before any host-owned flush/publish/closer callback.
         if self._close_released or self._close_releasing:
             return
         try:
             with self._transactions.database_release_section():
                 if self._close_released or self._close_releasing:
+                    return
+                # Recheck journals beside the release claim. A late rollback already drained by
+                # close is absent-id and cannot re-register; a statement that crossed the seal
+                # would have had to own this same participant section before manager close.
+                if self._public_contexts:
                     return
                 self._close_releasing = True
         except BaseException as failure:
@@ -1169,11 +1660,8 @@ class Database:
             if self._close_failure is None:
                 self._close_failure = failures[0]
             raise failures[0]
-        for step in (
-            self._flush_pages,
-            self._publish_metrics,
-            self._release_closers,
-        ):
+
+        for step in (self._flush_pages, self._publish_metrics, self._release_closers):
             try:
                 step()
             except BaseException as failure:
@@ -1205,20 +1693,78 @@ class Database:
             return
 
     def _close_transactions(self) -> None:
-        """Abort every open transaction and withdraw every reader registration."""
-        self._transactions.close()
+        """Abort contexts, withdraw pins and finish every public schema journal.
+
+        TransactionManager owns the terminal latch and reaches quiescence first. Schema unwind
+        is a distinct QueryEngine responsibility, however: rollback can already have released
+        its reader pin when it starts removing speculative index files. Keeping every adopted
+        context until that second phase succeeds lets close wait for an in-flight unwind or do
+        the unwind itself, before the pool and storage closers run.
+        """
+        failure: BaseException | None = None
+        try:
+            self._transactions.close()
+        except BaseException as close_failure:
+            failure = close_failure
+
+        # A failed pre-enter means manager close has not proved quiescence. Touching QueryEngine
+        # journals (which can remove index files) would race the still-active winner just as
+        # surely as flushing the pool, so leave every journal tracked for the retrying close.
+        if self._transactions.close_complete and self._public_contexts:
+            try:
+                with self._transactions._participant_section():
+                    contexts = tuple(self._public_contexts.values())
+                    for context in contexts:
+                        try:
+                            self._settle_schema_in_section(
+                                context,
+                                committed=context.state is TransactionState.COMMITTED,
+                            )
+                        except BaseException as settlement_failure:
+                            if failure is None:
+                                failure = settlement_failure
+                            else:
+                                _note_cleanup_failure(failure, settlement_failure)
+            except BaseException as snapshot_failure:
+                if failure is None:
+                    failure = snapshot_failure
+                else:
+                    _note_cleanup_failure(failure, snapshot_failure)
+        if failure is not None:
+            raise failure
 
     def _settle_schema(self, context: TransactionContext, *, committed: bool) -> None:
         """Tell the query engine one transaction's schema bookkeeping is over.
 
         On a rollback this is what takes back the two side effects a DDL statement makes outside
         the transaction -- the indexes it registered and the vector engine's space map -- and
-        drops the working catalog copy. Never raises: it runs on the rollback path.
+        drops the working catalog copy. It shares the participant section with close so storage
+        cannot be released between manager rollback and removal of speculative index files. The
+        context remains tracked if a foreign failure interrupts settlement, allowing close to
+        retry the cleanup instead of losing it.
         """
+        # A wrapper can return from manager commit/rollback after a racing close has already
+        # drained this exact context and released its resources. The absent-id fast path is what
+        # makes that late settlement a true no-op without even touching the coordinator.
+        if self._public_contexts.get(context.txn_id) is not context or self._closed:
+            return
+        with self._transactions._participant_section():
+            if self._closed:
+                # Close owns the drain once its terminal flag is visible.
+                return
+            self._settle_schema_in_section(context, committed=committed)
+
+    def _settle_schema_in_section(
+        self, context: TransactionContext, *, committed: bool
+    ) -> None:
+        """Settle one still-tracked query context while the participant section is held."""
+        if self._public_contexts.get(context.txn_id) is not context:
+            return
         queries = self._queries
         settle = getattr(queries, "settle_schema", None)
         if callable(settle):
             settle(context.txn_id, committed=committed)
+        self._public_contexts.pop(context.txn_id, None)
 
     def _flush_pages(self) -> None:
         """Write dirty pages back, unless the database was opened read-only.
@@ -1283,9 +1829,8 @@ class Database:
         The contained metrics adapter owns the process-local transition mechanism required by
         G2; the pure facade only consumes its injected context. A clock or telemetry callback can
         publish terminal state immediately, while lower dependency release waits for its wrapper
-        transition to leave. Another thread still contends through the participant section. The
-        supported ``connect`` assembly always supplies this capability; the null context is only
-        a compatibility fallback for direct internal construction and offers no reentrancy seam.
+        transition to leave. The null context supports direct internal construction without
+        claiming callback-reentrancy guarantees that only the standard composition supplies.
         """
         transition = getattr(self._metrics, "transition", None)
         boundary = transition() if callable(transition) else nullcontext()
@@ -1297,9 +1842,8 @@ class Database:
                 try:
                     self.close()
                 except BaseException as failure:
-                    # A close requested by host telemetry/clock is resumed only after the
-                    # transaction and schema outcome settle. Its failure is diagnostics, not a
-                    # reason to turn a durable commit into an apparent failure and invite retry.
+                    # A close requested by host telemetry/clock resumes only after transaction
+                    # and schema outcome settlement. It cannot replace a durable commit result.
                     if self._close_failure is None:
                         self._close_failure = failure
 
@@ -1316,6 +1860,73 @@ class Database:
             return bool(getattr(self._metrics, "transition_active", False))
         except BaseException:  # noqa: BLE001 - telemetry cannot control dependency release
             return False
+
+    def _public_transaction(self, context: TransactionContext) -> Transaction:
+        """Wrap a manager context only if it still belongs to an open public facade.
+
+        Manager begin/retry may finish just as Database.close publishes its terminal flag. A
+        context that won before that flag is a valid pre-close result; one observed after close
+        is refused without entering coordination again, and manager.close owns its retirement.
+        """
+        self._require_open()
+        if not context.active:
+            raise GrafxTransactionStateError(
+                f"Transaction {context.txn_id} is {context.state.value} and cannot be handed "
+                "to a caller.",
+                txn_id=context.txn_id,
+                state=context.state.value,
+            )
+        return Transaction(self, context)
+
+    def _catalog_snapshot(self) -> tuple[CatalogStoreView, int]:
+        """Read one whole catalog generation without executing host code under a section.
+
+        A DDL commit applies several catalog pages while holding the participant section.  Page
+        reads and their storage/codec/metrics ports cannot safely run under that section, so the
+        observation is optimistic: copy the already-current in-memory catalog or read a fresh
+        value outside, then accept it only when the derived epoch stayed unchanged and still
+        matches after acquiring the participant section.  A read failure is validated the same
+        way: if pages moved while it was raised, retry instead of publishing transient partial
+        DDL as corruption.
+        """
+        store = self._catalog
+        while True:
+            before = _builtin_int(store._view_epoch(), field="catalog.epoch")
+            observed: object | None = None
+            snapshot: CatalogStoreView | None = None
+            failure: BaseException | None = None
+            try:
+                if (
+                    _builtin_int(store._loaded_epoch, field="catalog.loaded_epoch")
+                    == before
+                ):
+                    observed = store._catalog
+                else:
+                    observed = store.read_from_pages()
+                snapshot = _catalog_view_from(store, observed)
+            except BaseException as caught:  # noqa: BLE001 - preserve the original taxonomy
+                failure = caught
+            after = _builtin_int(store._view_epoch(), field="catalog.epoch")
+            with self._transactions._participant_section():
+                current = _builtin_int(store._view_epoch(), field="catalog.epoch")
+                if before != after or after != current:
+                    continue
+                if failure is not None:
+                    raise failure
+                if (
+                    snapshot is None or observed is None
+                ):  # pragma: no cover - total above
+                    raise AssertionError(
+                        "a successful catalog observation produced no value"
+                    )
+                if (
+                    _builtin_int(store._loaded_epoch, field="catalog.loaded_epoch")
+                    != current
+                ):
+                    # Pure in-memory publication after the epoch proof.  It prevents every later
+                    # view/query from paying for the same refresh and runs no adapter callback.
+                    store.adopt(observed)
+                return snapshot, current
 
     def _require_writable(self, operation: str) -> None:
         """Refuse an operation that would write, on a database opened read-only.

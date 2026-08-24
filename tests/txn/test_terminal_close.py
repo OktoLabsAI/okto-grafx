@@ -414,6 +414,90 @@ class _PreEnterFailure(AbstractContextManager[None]):
         return None
 
 
+@pytest.mark.parametrize(
+    "failure_type",
+    (GrafxLeaseTimeout, RuntimeError, KeyboardInterrupt, SystemExit),
+)
+def test_public_rollback_preenter_failure_keeps_wrapper_and_pin_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    """A rollback that never entered changes no wrapper, context, count or reader horizon."""
+    stack, _storage = _stack()
+    database = _database(stack, lambda: None)
+    context = stack.manager.begin("read")
+    transaction = Transaction(database, context)
+    bomb = failure_type("rollback participant pre-enter bomb")
+    original_section = TransactionManager._participant_section
+    armed = True
+
+    def fail_once(self: TransactionManager):  # noqa: ANN202
+        nonlocal armed
+        if self is stack.manager and armed:
+            armed = False
+            return _PreEnterFailure(bomb)
+        return original_section(self)
+
+    monkeypatch.setattr(TransactionManager, "_participant_section", fail_once)
+
+    with pytest.raises(failure_type) as raised:
+        transaction.rollback()
+
+    assert raised.value is bomb
+    assert transaction.active
+    assert context.state is TransactionState.ACTIVE
+    assert stack.manager.open_transactions == 1
+    assert stack.coordinator.reader_horizon() == context.snapshot.read_lsn
+
+    transaction.rollback()
+
+    assert not transaction.active
+    assert context.state is TransactionState.ABORTED
+    assert stack.manager.open_transactions == 0
+    assert stack.coordinator.reader_horizon() is None
+    database.close()
+
+
+@pytest.mark.parametrize("cleanup_type", (RuntimeError, KeyboardInterrupt, SystemExit))
+def test_transaction_exit_preserves_primary_when_rollback_never_enters(
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_type: type[BaseException],
+) -> None:
+    """Unwind retains the block exception identity and records every rollback BaseException."""
+    stack, _storage = _stack()
+    database = _database(stack, lambda: None)
+    context = stack.manager.begin("read")
+    transaction = Transaction(database, context)
+    primary = ValueError("primary block failure")
+    cleanup = cleanup_type("rollback cleanup failure")
+    original_section = TransactionManager._participant_section
+    armed = True
+
+    def fail_once(self: TransactionManager):  # noqa: ANN202
+        nonlocal armed
+        if self is stack.manager and armed:
+            armed = False
+            return _PreEnterFailure(cleanup)
+        return original_section(self)
+
+    monkeypatch.setattr(TransactionManager, "_participant_section", fail_once)
+
+    with pytest.raises(ValueError) as raised:
+        with transaction:
+            raise primary
+
+    assert raised.value is primary
+    assert transaction.active
+    assert any(
+        type(cleanup).__name__ in note and str(cleanup) in note
+        for note in getattr(primary, "__notes__", ())
+    )
+
+    transaction.rollback()
+    assert stack.manager.open_transactions == 0
+    database.close()
+
+
 @pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt, SystemExit))
 def test_database_close_preenter_failure_leaks_safely_then_retry_releases(
     monkeypatch: pytest.MonkeyPatch,
@@ -489,7 +573,7 @@ def test_database_close_preenter_failure_leaks_safely_then_retry_releases(
     # the earlier pre-enter failure remains diagnostic and cannot replace the durable report.
     assert stack.manager.close_quiesced and stack.manager.close_complete
     assert database.close_complete
-    assert database.close_failure is bomb
+    assert database._close_failure is bomb
     assert released == ["closed"]
     database.close()
     assert released == ["closed"]

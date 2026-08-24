@@ -1549,7 +1549,30 @@ class TransactionManager:
             if cleanup_failure is not None:
                 _note_cleanup_failure(post_barrier_failure, cleanup_failure)
             if isinstance(post_barrier_failure, GrafxError):
-                raise _already_committed(post_barrier_failure, committed)
+                raise _already_committed(
+                    post_barrier_failure,
+                    committed,
+                    recovery_required=self._recovery_required,
+                )
+            if isinstance(post_barrier_failure, Exception):
+                # Adapter code is required to translate platform exceptions, but a hostile or
+                # incomplete custom port may still let one through.  After the barrier it must
+                # never look like an ordinary RuntimeError that application retry code can
+                # repeat.  Preserve it as the cause of one typed, machine-readable terminal
+                # outcome instead.
+                raise _foreign_already_committed(
+                    post_barrier_failure,
+                    committed,
+                    recovery_required=self._recovery_required,
+                ) from post_barrier_failure
+            # Process-control signals retain their exact identity and semantics.  Their note is
+            # deliberately explicit because a caller that catches one during shutdown still
+            # needs to know that repeating this transaction would duplicate durable work.
+            _note_durable_commit(
+                post_barrier_failure,
+                committed,
+                recovery_required=self._recovery_required,
+            )
             raise post_barrier_failure
         # Lease/reader cleanup happens only after a durable outcome and is best-effort. A raw
         # RuntimeError or KeyboardInterrupt here would make a confirmed COMMIT look retryable;
@@ -2891,7 +2914,12 @@ def _wal_is_damaged(wal: object) -> bool:
     return damage is not None or uncertain
 
 
-def _already_committed(failure: GrafxError, csn: Csn) -> GrafxError:
+def _already_committed(
+    failure: GrafxError,
+    csn: Csn,
+    *,
+    recovery_required: bool = True,
+) -> GrafxError:
     """Return the failure marked as one that happened AFTER the commit became durable.
 
     The barrier of step 3.5 has returned by the time this is reached, so the transaction is
@@ -2904,5 +2932,45 @@ def _already_committed(failure: GrafxError, csn: Csn) -> GrafxError:
     failure.retryable = False
     failure.details["committed"] = True
     failure.details["csn"] = csn
+    failure.details["durable"] = True
+    failure.details["recovery_required"] = recovery_required
     failure.details["retryable"] = False
     return failure
+
+
+def _foreign_already_committed(
+    failure: Exception,
+    csn: Csn,
+    *,
+    recovery_required: bool,
+) -> GrafxTransactionStateError:
+    """Translate a foreign post-barrier escape into a non-retryable durable outcome."""
+    translated = GrafxTransactionStateError(
+        f"Commit {csn} is already durable; {type(failure).__name__} escaped while applying "
+        "or publishing its post-barrier effects. Do not retry this transaction; recover the "
+        "database handle before further work.",
+        operation="commit",
+        committed=True,
+        csn=csn,
+        durable=True,
+        recovery_required=recovery_required,
+        original_type=type(failure).__name__,
+    )
+    translated.details["retryable"] = False
+    return translated
+
+
+def _note_durable_commit(
+    failure: BaseException,
+    csn: Csn,
+    *,
+    recovery_required: bool,
+) -> None:
+    """Annotate a process-control signal without changing its identity or propagation."""
+    try:
+        failure.add_note(
+            f"Okto Grafx commit {csn} is already durable (committed=True, durable=True, "
+            f"recovery_required={recovery_required}); do not retry this transaction."
+        )
+    except BaseException:  # noqa: BLE001 - diagnostics cannot replace a process-control signal
+        return

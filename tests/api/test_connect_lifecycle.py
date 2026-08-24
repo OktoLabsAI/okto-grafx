@@ -14,7 +14,7 @@ import pytest
 
 from okto_grafx import Database, Transaction, connect
 from okto_grafx.adapters.storage_local import LocalStorageDevice
-from okto_grafx.adapters.storage_memory import MemoryStorageDevice
+from okto_grafx.engine.public_views import StorageView
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxError,
@@ -40,7 +40,8 @@ def test_connect_opens_an_in_memory_database_and_closes_it() -> None:
     assert isinstance(db, Database)
     assert db.path == ":memory:"
     assert db.closed is False
-    assert isinstance(db.storage, MemoryStorageDevice)
+    assert isinstance(db.storage, StorageView)
+    assert db.storage.name == "memory"
     db.close()
     assert db.closed is True
 
@@ -85,7 +86,9 @@ def test_closing_twice_is_a_no_op(tmp_path: Path) -> None:
 
 def test_close_releases_the_device_the_composition_opened(tmp_path: Path) -> None:
     db = connect(tmp_path / "db")
-    device = db.storage
+    # Lifecycle wiring is an internal composition assertion; the public property is now a
+    # detached immutable snapshot and intentionally cannot expose a live close state.
+    device = db._storage
     assert _closed(device) is False
     db.close()
     assert _closed(device) is True
@@ -143,7 +146,7 @@ def test_closing_with_an_open_transaction_withdraws_its_reader_registration(
     registry = build_default_registry(DatabaseConfig(path=str(tmp_path / "db")))
     try:
         db = connect(tmp_path / "db", registry=registry)
-        coordinator = db.coordinator
+        coordinator = registry.get("coordinator")
         db.begin("read")
         assert coordinator.reader_horizon() is not None
         db.close()
@@ -188,8 +191,8 @@ def test_a_finished_transaction_refuses_to_be_used_again(tmp_path: Path) -> None
 def test_two_databases_in_one_process_do_not_share_anything(tmp_path: Path) -> None:
     # FR-13 and BR-8: a budget, a page cache and a metric label belong to ONE database.
     with connect(tmp_path / "a") as first, connect(tmp_path / "b") as second:
-        assert first.pool is not second.pool
-        assert first.storage is not second.storage
+        assert first._pool is not second._pool
+        assert first._storage is not second._storage
         assert first.label != second.label
         assert first.identity.database_uuid != second.identity.database_uuid
 
@@ -327,7 +330,7 @@ def test_an_event_sink_that_re_enters_close_does_not_deadlock(tmp_path: Path) ->
     db = connect(tmp_path / "db", registry=registry)
     sink.database = db
     try:
-        db.events.emit("closing", {})
+        sink.emit("closing", {})
         assert db.closed is True
         assert reentries == [1]
     finally:
@@ -374,7 +377,7 @@ def test_close_finishes_every_step_and_reraises_the_first_base_exception(
     def close_transactions(_database: Database) -> None:
         # Failure is AFTER transaction quiescence. A pre-enter failure has a different safety
         # contract: lower dependencies must remain open for retry (terminal-close regression).
-        _database.transactions.close()
+        _database._transactions.close()
         ran.append("transactions")
         raise first
 

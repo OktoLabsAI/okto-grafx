@@ -229,7 +229,7 @@ def test_an_autocommit_read_leaves_no_transaction_open(tmp_path: Path) -> None:
         for _ in range(5):
             db.execute("MATCH (p:Person) RETURN p.name")
         assert db.transactions.open_transactions == 0
-        assert db.coordinator.reader_horizon() is None
+        assert db._coordinator.reader_horizon() is None
 
 
 def test_an_autocommit_read_that_fails_leaves_no_transaction_open(tmp_path: Path) -> None:
@@ -240,7 +240,7 @@ def test_an_autocommit_read_that_fails_leaves_no_transaction_open(tmp_path: Path
             with pytest.raises(GrafxError):
                 db.execute("THIS IS NOT A STATEMENT")
         assert db.transactions.open_transactions == 0
-        assert db.coordinator.reader_horizon() is None
+        assert db._coordinator.reader_horizon() is None
 
 
 def test_an_interrupt_during_the_open_still_releases_the_device(tmp_path: Path) -> None:
@@ -336,7 +336,7 @@ def test_the_json_sink_also_survives_a_write_commit(tmp_path: Path) -> None:
         with db.begin("write") as txn:
             txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
         assert txn.report is not None and txn.report.durable is True
-        db.metrics.publish()
+        db.publish_metrics()
     assert destination.exists()
     assert os.path.getsize(destination) > 0
 

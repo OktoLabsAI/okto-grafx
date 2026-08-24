@@ -206,9 +206,9 @@ def test_custom_registry_shares_one_containment_boundary_with_the_manager(
     sink = _PostCommitBomb()
     database = _database_with(tmp_path, sink)
     try:
-        assert isinstance(database.metrics, ContainedMetricsSink)
-        assert database.metrics.inner is sink
-        assert database.transactions._metrics is database.metrics
+        assert isinstance(database._metrics, ContainedMetricsSink)
+        assert database._metrics.inner is sink
+        assert database._transactions._metrics is database._metrics
     finally:
         database.close()
 
@@ -293,7 +293,7 @@ def test_wal_timer_reentrant_close_waits_for_commit_outcome_then_releases_storag
 ) -> None:
     """A timer callback closes only after COMMIT/forget and cannot turn durability into failure."""
     database = okto_grafx.connect(tmp_path / "timer-close", page_size=512)
-    contained = database.metrics
+    contained = database._metrics
     assert isinstance(contained, ContainedMetricsSink)
     hostile = _CloseOnDeferredFsync()
     hostile.database = database
@@ -308,9 +308,9 @@ def test_wal_timer_reentrant_close_waits_for_commit_outcome_then_releases_storag
     report = writer.commit()
 
     assert report.durable and report.wrote
-    assert writer.context.state is TransactionState.COMMITTED
+    assert writer._context.state is TransactionState.COMMITTED
     assert hostile.fired
     assert database.closed and database.close_complete
-    assert database.transactions.close_complete
+    assert database._transactions.close_complete
     with pytest.raises(GrafxUnsupportedOperation):
         database.storage.exists("grafx.meta")

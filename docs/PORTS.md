@@ -322,18 +322,28 @@ except GrafxPortNotConfigured as refused:
 Every missing slot is named in **one** error, so the composition is fixed once rather than one
 `connect()` at a time.
 
-### Inspecting what is bound
+### Inspecting a composition safely
 
-A `Database` exposes every adapter it was composed with, which is how a test asserts the composition
-rather than assuming it:
+A caller that supplies a `PortRegistry` already owns and can inspect its adapters through that
+registry. `Database` deliberately does not publish those live objects back: a storage device or
+coordinator would expose write, truncate, lease and takeover doors outside the WAL and fencing
+protocols. Its properties are detached immutable observations instead:
 
 ```python
 db = connect("./mydb")
-db.storage        # the StorageDevice in effect
-db.clock          # the Clock
-db.codec          # the PageCodec
-db.metrics        # the MetricsSink
-db.events         # the EventSink
-db.vector_math    # the VectorMath
-db.coordinator    # the ProcessCoordinator
+db.storage        # name, page size and a captured file inventory
+db.clock          # clock implementation identity; property access advances no clock
+db.codec          # format and page-size metadata
+db.metrics        # whether collection is enabled
+db.events         # event destination identity
+db.vector_math    # implementation name
+db.coordinator    # participant identity; no lease, epoch or reader-retirement reads
+
+# The caller-owned live adapter remains where the caller put it:
+storage = registry.get("storage")
 ```
+
+The same rule covers engine collaborators: `db.catalog`, `db.indexes`, `db.wal`, `db.ledger`,
+`db.quarantine`, `db.vectors` and `db.queries` provide immutable inventories or diagnostics. Safe
+operations that need live state are explicit methods on `Database`, including `explain`,
+`search_vectors`, `inspect_index`, `read_quarantine`, `snapshot_metrics` and `publish_metrics`.
