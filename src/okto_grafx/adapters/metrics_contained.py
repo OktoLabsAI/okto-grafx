@@ -11,9 +11,9 @@ of the database.
 
 Telemetry is never load-bearing (G7 makes the CATALOGUE a contract, not the delivery), so a
 recording failure is absorbed: the alternative on the post-commit path is reporting a lie about
-durability. ``publish`` is the one door whose failures a caller acts on -- it is an explicit
-request to write a document -- so a Grafx refusal passes through it and anything else becomes a
-typed refusal rather than an escape.
+durability. ``snapshot`` and ``publish`` are explicit operator requests rather than recording
+callbacks. Their failures therefore remain observable so the public facade can preserve an
+existing Grafx refusal or process signal and translate an ordinary host exception.
 """
 
 from __future__ import annotations
@@ -221,11 +221,14 @@ class ContainedMetricsSink:
             return nullcontext()
 
     def snapshot(self) -> object:
-        """Return the inner snapshot, or an empty one when asking raises."""
-        try:
-            return self._inner.snapshot()
-        except BaseException:  # noqa: BLE001 - telemetry never controls engine outcome
-            return {}
+        """Return the inner snapshot for the facade to validate and detach.
+
+        Unlike a recording callback, this is an explicit read whose caller acts on the answer.
+        Returning an empty mapping after a sink failure would make "no metrics" indistinguishable
+        from "the metrics could not be observed", so failures cross this adapter unchanged and
+        are classified at :meth:`Database.snapshot_metrics`.
+        """
+        return self._inner.snapshot()
 
     def publish(self) -> object:
         """Publish through the inner sink; a Grafx refusal passes, anything else is typed.

@@ -40,10 +40,12 @@ from typing import TYPE_CHECKING, Self
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
+    GrafxError,
     GrafxSchemaVersionMismatch,
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
 )
+from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.page.file_header import (
     HEADER_PAGE_INDEX,
@@ -68,6 +70,8 @@ from okto_grafx.domain.txn.context import (
 )
 from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.domain.vector.filter import RecordIdFilter
+from okto_grafx.domain.verify.findings import VerificationReport
+from okto_grafx.domain.wal.replay import RecycleReport
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore
@@ -104,19 +108,26 @@ from okto_grafx.engine.public_views import (
     _coordinator_view,
     _domain_field,
     _heap_view,
+    _index_entry_view,
     _indexes_view,
     _ledger_view,
+    _metrics_snapshot_view,
     _pool_view,
     _quarantine_view,
+    _recycle_report_view,
     _queries_view,
     _recovery_report_view,
+    _require_positive_integer,
     _storage_view,
     _transactions_view,
     _tuple_items,
+    _verification_report_view,
+    _vector_search_result_view,
     _vectors_view,
     _wal_view,
 )
 from okto_grafx.engine.txn_manager import TransactionManager
+from okto_grafx.engine.vector_engine import VectorSearchResult
 from okto_grafx.engine.verifier import VERIFICATION_SCOPES
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -209,6 +220,18 @@ def _note_cleanup_failure(primary: BaseException, cleanup: BaseException) -> Non
         # Exception note support is diagnostic only; an exotic exception implementation must
         # not replace either the primary failure or the cleanup result it was meant to report.
         return
+
+
+def _public_operation_failure(
+    operation: str, failure: Exception
+) -> GrafxConfigurationError:
+    """Translate a collaborator's ordinary exception without executing its diagnostics."""
+    observed = _builtin_type_name(failure)
+    return GrafxConfigurationError(
+        f"The public {operation} operation failed because a collaborator raised {observed}.",
+        field=operation,
+        cause=observed,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1374,7 +1397,7 @@ class Database:
         query: Sequence[float],
         k: int,
         candidate_filter: RecordIdFilter | None = None,
-    ) -> object:
+    ) -> VectorSearchResult:
         """Search vectors under the fixed snapshot of one active transaction.
 
         This is the safe replacement for reaching through ``database.vectors.search`` and
@@ -1385,69 +1408,79 @@ class Database:
         this transaction from inside the engine and withdraw its reader pin mid-search.  The
         vector collaborator itself never leaves the database.
         """
-        self._require_open()
-        if type(transaction) is not Transaction:
-            observed = _builtin_type_name(transaction)
-            raise GrafxConfigurationError(
-                f"A vector search takes a Transaction; got {observed}.",
-                field="transaction",
-                value=observed,
+        with self._public_operation("search_vectors"):
+            self._require_open()
+            if type(transaction) is not Transaction:
+                observed = _builtin_type_name(transaction)
+                raise GrafxConfigurationError(
+                    f"A vector search takes a Transaction; got {observed}.",
+                    field="transaction",
+                    value=observed,
+                )
+            if transaction._database is not self:
+                raise GrafxTransactionStateError(
+                    "A vector search can only use a transaction opened by this database.",
+                    txn_id=transaction.txn_id,
+                    field="transaction_owner",
+                    path=self._path,
+                )
+            # Exact type, not isinstance: a subclass can add a callback or mutable backdoor to
+            # the otherwise frozen DTO.  Refuse it before resolving or entering the engine.
+            if (
+                candidate_filter is not None
+                and type(candidate_filter) is not RecordIdFilter
+            ):
+                observed = _builtin_type_name(candidate_filter)
+                raise GrafxConfigurationError(
+                    "A public vector candidate filter must be an immutable RecordIdFilter or "
+                    f"None; got {observed}.",
+                    field="candidate_filter",
+                    value=observed,
+                )
+            vectors = self._require_component(
+                "vectors", self._vectors, "the vector engine (C9)"
             )
-        if transaction._database is not self:
-            raise GrafxTransactionStateError(
-                "A vector search can only use a transaction opened by this database.",
-                txn_id=transaction.txn_id,
-                field="transaction_owner",
-                path=self._path,
-            )
-        # Exact type, not isinstance: a subclass can add a callback or mutable backdoor to the
-        # otherwise frozen DTO.  Refuse it before resolving or entering the vector engine.
-        if (
-            candidate_filter is not None
-            and type(candidate_filter) is not RecordIdFilter
-        ):
-            observed = _builtin_type_name(candidate_filter)
-            raise GrafxConfigurationError(
-                "A public vector candidate filter must be an immutable RecordIdFilter or None; "
-                f"got {observed}.",
-                field="candidate_filter",
-                value=observed,
-            )
-        vectors = self._require_component(
-            "vectors", self._vectors, "the vector engine (C9)"
-        )
-        with self._transactions.page_access_section():
-            # Liveness is checked under the same participant section that commit/rollback use.
-            # Checking before it would let a racing rollback withdraw this snapshot's reader pin
-            # in the gap and leave the search reading below a recyclable horizon.
-            transaction._require_active()
-            return vectors.search(  # type: ignore[attr-defined]
-                space=space,
-                query=query,
-                k=k,
-                snapshot=transaction._context.snapshot,
-                candidate_filter=candidate_filter,
-            )
+            with self._transactions.page_access_section():
+                # Liveness is checked under the same participant section that commit/rollback
+                # use. Checking before it would let a racing rollback withdraw this snapshot's
+                # reader pin in the gap and leave the search below a recyclable horizon.
+                transaction._require_active()
+                wanted_space = _require_text("space", space)
+                wanted_k = _require_positive_integer("k", k)
+                result = vectors.search(  # type: ignore[attr-defined]
+                    space=wanted_space,
+                    query=query,
+                    k=wanted_k,
+                    snapshot=transaction._context.snapshot,
+                    candidate_filter=candidate_filter,
+                )
+                return _vector_search_result_view(
+                    result,
+                    requested_k=wanted_k,
+                    requested_space=wanted_space,
+                )
 
     # --- operator surface ---------------------------------------------------------------------
 
-    def verify(self, scope: str = "all") -> object:
+    def verify(self, scope: str = "all") -> VerificationReport:
         """Walk the database and report every finding, precisely located (SPEC-M1 FR-11).
 
         ``scope`` is one of ``"pages"``, ``"records"``, ``"indexes"`` or ``"all"``. A clean
         database produces a report with no findings.
         """
-        self._require_open()
-        factory = self._require_component(
-            "verifier", self._verifier_factory, "the verifier (C6)"
-        )
-        # Built per call, not held: a verifier is given the index set it must walk, and a
-        # database registers indexes for as long as it is open. A verifier captured at open would
-        # quietly report a clean "indexes" scope for every index registered after it -- a wrong
-        # answer, which is worse than no answer.
-        with self._transactions.page_access_section():
-            verifier = factory()  # type: ignore[operator]
-            return verifier.verify(scope)  # type: ignore[attr-defined]
+        with self._public_operation("verify"):
+            self._require_open()
+            wanted_scope = _require_text("scope", scope)
+            factory = self._require_component(
+                "verifier", self._verifier_factory, "the verifier (C6)"
+            )
+            # Built per call, not held: a verifier is given the index set it must walk, and a
+            # database registers indexes for as long as it is open. A verifier captured at open
+            # would quietly report a clean "indexes" scope for every index registered after it.
+            with self._transactions.page_access_section():
+                verifier = factory()  # type: ignore[operator]
+                report = verifier.verify(wanted_scope)  # type: ignore[attr-defined]
+                return _verification_report_view(report, requested_scope=wanted_scope)
 
     def recover(self) -> object:
         """Run a recovery pass and return its report (SPEC-M1 FR-8).
@@ -1508,7 +1541,7 @@ class Database:
         with self._transactions.page_access_section():
             return _builtin_int(self._pool.flush(), field="flush.count")
 
-    def checkpoint(self) -> object:
+    def checkpoint(self) -> RecycleReport:
         """Put the committed state on the platter, publish the checkpoint, and reclaim the log (BR-10).
 
         Returns the recycling report: what the log released, what it kept back for a pinned
@@ -1519,32 +1552,34 @@ class Database:
         whether or not a checkpoint ever runs, so skipping it costs space and recovery time,
         never data; when to run it is a lifecycle decision left to the caller (see CF-11).
         """
-        self._require_open()
-        self._require_writable("checkpoint the database")
-        report = self._transactions.checkpoint()
-        indexes = self._indexes
-        if indexes is not None:
-            # Checkpoint redo may have adopted schema and indexes committed by another
-            # participant after this handle opened. Keep the public inventory aligned with the
-            # registry that now serves queries, just as operator recovery does.
-            with self._transactions.page_access_section():
-                registered = indexes.indexes()  # type: ignore[attr-defined]
-                self._attached_indexes = tuple(
-                    _builtin_text(index.name, field="attached_index", empty=False)
-                    for index in registered
-                )
-                self._stale_indexes = tuple(
-                    _builtin_text(index.name, field="stale_index", empty=False)
-                    for index in indexes.open(  # type: ignore[attr-defined]
-                        self._transactions.published_lsn()
+        with self._public_operation("checkpoint"):
+            self._require_open()
+            self._require_writable("checkpoint the database")
+            report = self._transactions.checkpoint()
+            indexes = self._indexes
+            if indexes is not None:
+                # Checkpoint redo may have adopted schema and indexes committed by another
+                # participant after this handle opened. Keep the public inventory aligned with
+                # the registry that now serves queries, just as operator recovery does.
+                with self._transactions.page_access_section():
+                    registered = indexes.indexes()  # type: ignore[attr-defined]
+                    self._attached_indexes = tuple(
+                        _builtin_text(index.name, field="attached_index", empty=False)
+                        for index in registered
                     )
-                )
-        return report
+                    self._stale_indexes = tuple(
+                        _builtin_text(index.name, field="stale_index", empty=False)
+                        for index in indexes.open(  # type: ignore[attr-defined]
+                            self._transactions.published_lsn()
+                        )
+                    )
+            return _recycle_report_view(report)
 
     def snapshot_metrics(self) -> Mapping[str, object]:
         """Return the machine-readable current value of every metric this database emitted."""
-        self._require_open()
-        return self._metrics.snapshot()
+        with self._public_operation("snapshot_metrics"):
+            self._require_open()
+            return _metrics_snapshot_view(self._metrics.snapshot())
 
     def publish_metrics(self) -> None:
         """Publish a configured metrics document without exposing its mutable sink.
@@ -1555,21 +1590,25 @@ class Database:
         self._require_open()
         self._publish_metrics()
 
-    def inspect_index(self, name: str) -> tuple[object, ...]:
+    def inspect_index(self, name: str) -> tuple[IndexEntry, ...]:
         """Return immutable entry DTOs from one secondary index.
 
         This is an explicit potentially expensive read.  The index store itself stays private,
         so callers cannot mark it stale, advance its header or stage changes outside a
         transaction.
         """
-        self._require_open()
-        wanted = _require_text("index", name)
-        indexes = self._require_component(
-            "indexes", self._indexes, "the index framework (C7)"
-        )
-        with self._transactions.page_access_section():
-            index = indexes.index(wanted)  # type: ignore[attr-defined]
-            return tuple(index.walk())
+        with self._public_operation("inspect_index"):
+            self._require_open()
+            wanted = _require_text("index", name)
+            indexes = self._require_component(
+                "indexes", self._indexes, "the index framework (C7)"
+            )
+            with self._transactions.page_access_section():
+                index = indexes.index(wanted)  # type: ignore[attr-defined]
+                return tuple(
+                    _index_entry_view(entry)
+                    for entry in index.walk()  # type: ignore[attr-defined]
+                )
 
     def read_quarantine(self, name: str) -> bytes:
         """Return and checksum-verify the immutable bytes of one quarantine entry."""
@@ -1837,6 +1876,22 @@ class Database:
             raise failures[0]
 
     # --- internals ----------------------------------------------------------------------------
+
+    @contextmanager
+    def _public_operation(self, operation: str) -> Iterator[None]:
+        """Contain an ordinary collaborator failure at one explicit facade operation.
+
+        Grafx failures already carry the stable public taxonomy and therefore retain their
+        identity. ``Exception`` deliberately excludes ``KeyboardInterrupt``, ``SystemExit`` and
+        other process-control signals; those are not adapter failures and pass unchanged.
+        """
+        try:
+            with self._public_transition():
+                yield
+        except GrafxError:
+            raise
+        except Exception as failure:  # noqa: BLE001 - translated at the public boundary
+            raise _public_operation_failure(operation, failure) from failure
 
     @contextmanager
     def _public_transition(self) -> Iterator[None]:
