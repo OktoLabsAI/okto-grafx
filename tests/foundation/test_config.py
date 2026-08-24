@@ -16,6 +16,7 @@ from okto_grafx.runtime.config import (
     DEFAULT_OPENMETRICS_DESTINATION,
     MAX_PAGE_SIZE,
     MAX_PARTITIONS_PER_TABLE,
+    MAX_VECTOR_EF_SEARCH,
     METRICS_SINKS,
     MIN_PAGE_SIZE,
     MINIMUM_STORE_FRAMES,
@@ -42,6 +43,7 @@ def test_defaults_match_the_contract() -> None:
     assert config.metrics_destination is None
     assert config.vector_math == "auto"
     assert config.vector_exact_scan_threshold == 4096
+    assert config.vector_ef_search == 320
     assert config.vector_recall_target == 0.90
     assert config.read_only is False
 
@@ -285,6 +287,22 @@ def test_an_invalid_exact_scan_threshold_is_rejected(threshold: object) -> None:
     with pytest.raises(GrafxConfigurationError) as raised:
         DatabaseConfig(path=":memory:", vector_exact_scan_threshold=threshold)  # type: ignore[arg-type]
     assert raised.value.details["field"] == "vector_exact_scan_threshold"
+
+
+@pytest.mark.parametrize("width", [1, 320, 4096, MAX_VECTOR_EF_SEARCH])
+def test_a_bounded_hnsw_search_beam_is_accepted(width: int) -> None:
+    config = DatabaseConfig(path=":memory:", vector_ef_search=width)
+    assert config.vector_ef_search == width
+    assert type(config.vector_ef_search) is int
+
+
+@pytest.mark.parametrize(
+    "width", [0, -1, MAX_VECTOR_EF_SEARCH + 1, "320", 320.0, None, True]
+)
+def test_an_invalid_hnsw_search_beam_is_rejected(width: object) -> None:
+    with pytest.raises(GrafxConfigurationError) as raised:
+        DatabaseConfig(path=":memory:", vector_ef_search=width)  # type: ignore[arg-type]
+    assert raised.value.details["field"] == "vector_ef_search"
 
 
 @pytest.mark.parametrize("target", [0.5, 0.9, 1.0])
@@ -578,6 +596,7 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         wal_segment_bytes=_HostileInt(4096),
         checkpoint_interval_records=_HostileInt(32),
         vector_exact_scan_threshold=_HostileInt(128),
+        vector_ef_search=_HostileInt(640),
     )
 
     for field in (
@@ -587,6 +606,7 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         "wal_segment_bytes",
         "checkpoint_interval_records",
         "vector_exact_scan_threshold",
+        "vector_ef_search",
     ):
         assert type(getattr(config, field)) is int
     assert config.granularity_descriptor == "hash-v1;partitions_per_table=256"

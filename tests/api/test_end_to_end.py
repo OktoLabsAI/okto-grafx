@@ -383,6 +383,24 @@ def test_vector_ddl_through_the_public_door_attaches_its_index(tmp_path: Path) -
         assert reopened.recovery_report.outcome == "clean"
 
 
+def test_vector_ef_search_reaches_new_and_reopened_index_views(tmp_path: Path) -> None:
+    """The public knob configures the derived index of this composition, not persisted bytes."""
+    root = tmp_path / "db"
+    with connect(root, page_size=512, vector_ef_search=777) as db:
+        with db.begin("write") as txn:
+            txn.execute("CREATE VECTOR SPACE minilm_v2 {dimension: 4, metric: 'cosine'}")
+            txn.execute(
+                "CREATE NODE TABLE Chunk("
+                "id INT64, embedding VECTOR(minilm_v2), PRIMARY KEY(id))"
+            )
+        assert db.vectors.index("minilm_v2").ef_search == 777
+
+    # HNSW adjacency is derived state. A later composition may tune its search effort without a
+    # migration or rewrite, and the reattached index must expose that composition's real value.
+    with connect(root, page_size=512, vector_ef_search=901) as reopened:
+        assert reopened.vectors.index("minilm_v2").ef_search == 901
+
+
 def test_the_vector_engine_of_a_composed_database_can_attach(tmp_path: Path) -> None:
     # The same property one layer down, so a failure names the wiring rather than the grammar:
     # the engine reaches the pool and the registry of THIS database, by identity.

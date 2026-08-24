@@ -396,6 +396,7 @@ class DatabaseConfig:
     metrics: str = "noop"                  # "noop" | "openmetrics" | "json"
     vector_math: str = "auto"              # "auto" | "pure" | "numpy"
     vector_exact_scan_threshold: int = 4096   # calibrated (SPEC-VEC FR-5/FR-8)
+    vector_ef_search: int = 320                # calibrated HNSW beam, 1..1_048_576
     vector_recall_target: float = 0.90        # calibrated
     read_only: bool = False
 

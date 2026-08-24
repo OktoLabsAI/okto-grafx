@@ -503,6 +503,7 @@ refused with the field name the caller actually wrote.
 | `vector_math` | `"auto"` | `"auto"` and `"pure"` both bind the pure oracle; `"numpy"` requires `[accel]` |
 | `checksum` | `"auto"` | `"auto"` accelerates when available; `"pure"` pins the reference |
 | `vector_exact_scan_threshold` | `4096` | Below this many candidates, search is exhaustive |
+| `vector_ef_search` | `320` | Base HNSW beam in the approximate regime; integer from 1 through 1,048,576 |
 | `vector_recall_target` | `0.90` | |
 | `read_only` | `False` | Opens without writing anything, including recovery |
 

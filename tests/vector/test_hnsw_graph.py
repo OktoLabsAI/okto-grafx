@@ -27,6 +27,7 @@ from okto_grafx.domain.vector.hnsw import (
     DEFAULT_EF_CONSTRUCTION,
     DEFAULT_EF_SEARCH,
     DEFAULT_NEIGHBOURS,
+    MAX_EF_SEARCH,
     MAX_LEVEL,
     HnswGraph,
 )
@@ -319,7 +320,8 @@ def test_the_graph_defaults_are_the_literals_the_module_documents() -> None:
     """A56 and A68: a default that slides changes the shape of every index in the build."""
     assert DEFAULT_NEIGHBOURS == 16
     assert DEFAULT_EF_CONSTRUCTION == 200
-    assert DEFAULT_EF_SEARCH == 64
+    assert DEFAULT_EF_SEARCH == 320
+    assert MAX_EF_SEARCH == 1_048_576
     assert MAX_LEVEL == 32
 
 
