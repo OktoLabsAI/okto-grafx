@@ -28,6 +28,19 @@ from okto_grafx.runtime.bootstrap import build_default_registry, open_database
 from okto_grafx.runtime.config import DatabaseConfig
 
 PAGE_SIZE: int = 512
+RAW_MUTATORS: tuple[str, ...] = (
+    "create",
+    "remove",
+    "atomic_replace",
+    "recycle",
+    "allocate",
+    "write_page",
+    "append_log",
+    "truncate_log",
+    "durable_barrier",
+    "retry_pending_deletes",
+    "close",
+)
 
 
 def _snapshot(root: Path) -> dict[str, str]:
@@ -62,6 +75,21 @@ def _namespace_snapshot(root: Path) -> dict[str, str]:
         )
         for path in sorted(root.rglob("*"))
     }
+
+
+def _forbid_raw_mutations(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Install bombs on every raw storage mutator and return their recording trail."""
+    attempted: list[str] = []
+
+    def forbidden(
+        _device: LocalStorageDevice, *_args: object, **_kwargs: object
+    ) -> None:
+        attempted.append("attempted")
+        raise AssertionError("observational preflight reached a raw storage mutator")
+
+    for door in RAW_MUTATORS:
+        monkeypatch.setattr(LocalStorageDevice, door, forbidden)
+    return attempted
 
 
 def _seed(root: Path) -> object:
@@ -382,26 +410,7 @@ def test_read_only_foreign_tree_is_classified_without_changing_names_or_bytes(
         lock.parent.mkdir()
         lock.write_bytes(b"foreign lock payload that must survive")
     before = _namespace_snapshot(root)
-    raw_mutations: list[str] = []
-
-    def forbid_raw_mutation(
-        _device: LocalStorageDevice, *_args: object, **_kwargs: object
-    ) -> None:
-        raw_mutations.append("attempted")
-        raise AssertionError("foreign-tree preflight reached a raw storage mutator")
-
-    for door in (
-        "create",
-        "remove",
-        "atomic_replace",
-        "recycle",
-        "allocate",
-        "write_page",
-        "append_log",
-        "truncate_log",
-        "durable_barrier",
-    ):
-        monkeypatch.setattr(LocalStorageDevice, door, forbid_raw_mutation)
+    raw_mutations = _forbid_raw_mutations(monkeypatch)
 
     with pytest.raises(GrafxCorruptionDetected) as raised:
         connect(root, page_size=PAGE_SIZE, read_only=True)
@@ -409,6 +418,51 @@ def test_read_only_foreign_tree_is_classified_without_changing_names_or_bytes(
     assert raised.value.details["field"] == "identity_missing"
     assert raw_mutations == []
     assert _namespace_snapshot(root) == before
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected"),
+    [
+        ("foreign", GrafxCorruptionDetected),
+        ("truncated", GrafxSchemaVersionMismatch),
+        ("magic", GrafxCorruptionDetected),
+        ("checksum", GrafxCorruptionDetected),
+    ],
+)
+def test_read_only_meta_must_be_decodable_before_control_is_claimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+    expected: type[BaseException],
+) -> None:
+    """A reserved name is not authority until its page and identity validate observationally."""
+    seed = tmp_path / f"seed-{damage}"
+    with connect(seed, page_size=PAGE_SIZE):
+        pass
+    valid = bytearray((seed / META_FILE).read_bytes())
+    if damage == "foreign":
+        raw = (b"SQLite format 3\x00foreign" * PAGE_SIZE)[:PAGE_SIZE]
+    elif damage == "truncated":
+        raw = bytes(valid[:-1])
+    elif damage == "magic":
+        valid[0] ^= 0xFF
+        raw = bytes(valid)
+    else:
+        valid[-1] ^= 0xFF
+        raw = bytes(valid)
+
+    root = tmp_path / f"invalid-meta-{damage}"
+    root.mkdir()
+    (root / META_FILE).write_bytes(raw)
+    before = _namespace_snapshot(root)
+    raw_mutations = _forbid_raw_mutations(monkeypatch)
+
+    with pytest.raises(expected):
+        connect(root, page_size=PAGE_SIZE, read_only=True)
+
+    assert raw_mutations == []
+    assert _namespace_snapshot(root) == before
+    assert not (root / "control").exists()
 
 
 def test_read_only_valid_database_without_control_materializes_only_liveness(
@@ -419,8 +473,10 @@ def test_read_only_valid_database_without_control_materializes_only_liveness(
     with connect(root, page_size=PAGE_SIZE) as writer:
         identity = writer.identity
     shutil.rmtree(root / "control")
+    shutil.rmtree(root / "bootstrap")
     immutable = _data_snapshot(root)
     assert not (root / "control").exists()
+    assert not (root / "bootstrap").exists()
 
     with connect(root, page_size=PAGE_SIZE, read_only=True) as reader:
         assert reader.identity == identity

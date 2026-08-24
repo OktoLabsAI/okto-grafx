@@ -423,6 +423,7 @@ def build_default_registry(config: DatabaseConfig) -> PortRegistry:
                 _preflight_default_read_only_storage(
                     config,
                     built["storage"],  # type: ignore[arg-type]
+                    built["codec"],  # type: ignore[arg-type]
                 )
             context = PortContext(
                 config=config,

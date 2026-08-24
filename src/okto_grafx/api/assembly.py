@@ -45,6 +45,7 @@ from typing import TypeVar, cast
 from okto_grafx.adapters.coordination_local import CONTROL_DIRECTORY, LOCK_FILE_SUFFIX
 from okto_grafx.adapters.graph_guard import ConditionGuard
 from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
+from okto_grafx.adapters.metrics_noop import NoOpMetricsSink
 from okto_grafx.adapters.storage_read_only import ReadOnlyStorageDevice
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -819,6 +820,7 @@ def _open_identity(
 def _preflight_default_read_only_storage(
     config: DatabaseConfig,
     storage: StorageDevice,
+    codec: PageCodec,
 ) -> None:
     """Refuse an unclaimed default filesystem path before its coordinator creates ``control/``.
 
@@ -826,7 +828,9 @@ def _preflight_default_read_only_storage(
     ``first-open``. This earlier observation answers only whether the default composition has
     enough Grafx-owned evidence to construct that lock. Canonical first-open authorities are
     decoded by the same readers used under the section; isolated staging and an absent identity
-    are refused by the same helpers used by the final classifier.
+    are refused by the same helpers used by the final classifier. A lone ``grafx.meta`` is read
+    through an ephemeral read-only pool and the same :class:`MetaStore`, so its page envelope,
+    checksum, identity record and configured page size must all validate before liveness exists.
 
     An already-existing first-open lock is not database proof. It merely permits construction so
     a reader that arrived behind a creator can wait on the exact existing lock. Once admitted,
@@ -843,6 +847,18 @@ def _preflight_default_read_only_storage(
         return
     _require_no_bootstrap_orphan_for_read_only(config, storage)
     _require_existing_identity_name(config, storage)
+    observational = ReadOnlyStorageDevice(storage)
+    _require_budget_for_the_stores(config)
+    _require_page_size_of_record(config, observational)
+    pool = BufferPool(
+        observational,
+        codec,
+        NoOpMetricsSink(),
+        budget_bytes=config.buffer_budget_bytes,
+        db_label=database_label(config.path),
+        guard=threading.RLock(),
+    )
+    _read_existing_identity(config, observational, MetaStore(pool))
 
 
 def _open_completed_identity(
