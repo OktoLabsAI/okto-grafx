@@ -165,11 +165,8 @@ def _differential(corpus: list[list[float]], k: int) -> tuple[bool, str]:
 
 
 def _overlap(pre_truth: object, post_truth: object, k: int) -> float:
-    """Return the TR-4 overlap of one query: exact top-k(pre) against generous(post)."""
-    top_pre = [
-        record for _, record in pre_truth.ordered[: min(k, len(pre_truth.ordered))]
-    ]
-    return len(set(top_pre) & post_truth.members) / k
+    """Return the TR-4 overlap of one query: BILATERALLY generous, the shared formula."""
+    return min(len(pre_truth.members & post_truth.members), k) / k
 
 
 def _build_engine(quantized: list[list[float]], dimension: int):

@@ -227,3 +227,57 @@ def test_compare_truths_agrees_on_identical_truths_and_names_nonfinite_sides() -
     )
     disagreement = compare_truths(truth, poisoned, eps_rel=1e-9)
     assert "non-finite" in disagreement
+
+
+def test_a_tie_broken_by_the_cast_is_a_perfect_overlap_not_a_spurious_zero() -> None:
+    """The audit case: pre.members {0,1} (tie), post.members {1} -- bilateral generosity
+    scores 1.0 where the one-sided formula scored 0.0."""
+    from bench.recall_corpus import generous_overlap
+
+    pre = ground_truth([[1.0, 1e-9], [1.0, -1e-9], [0.0, 1.0]], [1.0, 0.0], 1)
+    assert pre.members == {0, 1}, "the construction must tie records 0 and 1"
+    post = ground_truth([[1.0, 1e-3], [1.0, 1e-9], [0.0, 1.0]], [1.0, 0.0], 1)
+    assert post.members == {1}, "the cast-like perturbation must break the tie"
+    overlap = generous_overlap(pre, post, 1)
+    assert overlap == 1.0
+    verdict = dtype_check(
+        [[1.0, 1e-9], [1.0, -1e-9], [0.0, 1.0]],
+        [[1.0, 1e-3], [1.0, 1e-9], [0.0, 1.0]],
+        [[1.0, 0.0]],
+        1,
+    )
+    assert verdict.per_query == (1.0,)
+
+
+def test_a_genuinely_displaced_ranking_still_drops_the_overlap() -> None:
+    """Generosity is not amnesty: disjoint generous bands score exactly their intersection."""
+    from bench.recall_corpus import generous_overlap
+
+    pre = ground_truth([[1.0, 0.0], [0.5, 0.5], [0.0, 1.0]], [1.0, 0.0], 1)
+    post = ground_truth([[0.0, 1.0], [0.5, 0.5], [1.0, 0.0]], [1.0, 0.0], 1)
+    assert pre.members == {0}
+    assert post.members == {2}
+    assert generous_overlap(pre, post, 1) == 0.0
+
+
+def test_the_post_side_tie_keeps_its_generosity_too() -> None:
+    """The mirror case: a tie that only exists after the cast also counts in full."""
+    from bench.recall_corpus import generous_overlap
+
+    pre = ground_truth([[1.0, 1e-3], [1.0, 1e-9], [0.0, 1.0]], [1.0, 0.0], 1)
+    post = ground_truth([[1.0, 1e-9], [1.0, -1e-9], [0.0, 1.0]], [1.0, 0.0], 1)
+    assert pre.members == {1}
+    assert post.members == {0, 1}
+    assert generous_overlap(pre, post, 1) == 1.0
+
+
+def test_generous_overlap_caps_at_one_and_refuses_bad_k() -> None:
+    """Massive tie bands cannot inflate past 1.0; k <= 0 refuses."""
+    from bench.recall_corpus import generous_overlap
+
+    corpus = [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]
+    tie = ground_truth(corpus, [1.0, 0.0], 1)
+    assert tie.members == {0, 1, 2}
+    assert generous_overlap(tie, tie, 1) == 1.0
+    with pytest.raises(ValueError):
+        generous_overlap(tie, tie, 0)

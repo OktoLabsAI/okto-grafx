@@ -148,6 +148,19 @@ class DtypeCheck:
         )
 
 
+def generous_overlap(pre: GroundTruth, post: GroundTruth, k: int) -> float:
+    """Return the BILATERALLY generous top-k overlap of two truths, capped at 1.0.
+
+    ``min(|pre.members ∩ post.members|, k) / k``: a tie band on EITHER side counts in full, so
+    a pre-quantization tie the cast happens to break (pre.members {0,1}, post.members {1}) is
+    a perfect overlap rather than a spurious zero — while a genuinely displaced ranking, whose
+    generous bands share nothing, still scores it. Symmetric by construction.
+    """
+    if k <= 0:
+        raise ValueError(f"the generous overlap needs k >= 1; got {k}.")
+    return min(len(pre.members & post.members), k) / k
+
+
 def dtype_check(
     pre_quantization: list[list[float]],
     quantized: list[list[float]],
@@ -156,17 +169,16 @@ def dtype_check(
 ) -> DtypeCheck:
     """Measure how much the float32 quantization disturbs the EXACT top-k (TR-4).
 
-    Both sides use the canonical ground truth with generous ties: ``overlap`` per query is
-    ``|top-k(pre) ∩ generous(post)| / k`` intersected symmetrically — a rank disturbance shows
-    up as a member that fell out of both generous bands.
+    Both sides use the canonical ground truth and BOTH tie bands are generous:
+    ``overlap = min(|pre.members ∩ post.members|, k) / k`` per query — a tie broken by the
+    cast on either side never reads as displacement, while a ranking the quantization truly
+    moved still drops the overlap.
     """
     overlaps: list[float] = []
     for query in queries:
         pre = ground_truth(pre_quantization, query, k)
         post = ground_truth(quantized, query, k)
-        top_pre = [index for _, index in pre.ordered[: min(k, len(pre.ordered))]]
-        overlap = len(set(top_pre) & post.members) / k
-        overlaps.append(overlap)
+        overlaps.append(generous_overlap(pre, post, k))
     if not overlaps:
         raise ValueError("the dtype check needs at least one query.")
     return DtypeCheck(
