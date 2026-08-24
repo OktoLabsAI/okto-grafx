@@ -118,40 +118,68 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
     return multiples, gauges, ""
 
 
-def _recall_measurements(document: str) -> list[object]:
-    """Every value published under the recall gauge, RAW -- bools and junk included.
+def _recall_measurement(document: str) -> tuple[str, object]:
+    """The ONE recall measurement, or the exact reason there is none.
 
     ``read_multiples`` collapses same-name entries last-wins and coerces through ``float``,
     which suits the legacy gauges and is WRONG for a required floor: the gate reads any
     metrics file, not only wiring output, so the gauge can arrive twice, or as ``true``,
     ``NaN``, ``Infinity``, or an out-of-range ratio -- and none of those is a measurement.
-    The caller refuses cardinality != 1 and every invalid single value as UNMEASURED. A
-    recall entry whose samples are missing, empty, or unreadable contributes one ``None``
-    so a malformed publication is refused rather than read as absent.
+    The result is a three-state verdict, because ABSENT and MALFORMED are different facts:
+    ``("absent", None)`` when no entry carries the name (tolerable when the gauge is not
+    required); ``("malformed", reason)`` whenever anything about the publication deviates
+    from the DECLARED shape -- more than one entry, an entry whose keys are not exactly
+    ``{name, kind, unit, samples}``, kind != "gauge", unit != "ratio", a samples list whose
+    length is not exactly 1, or a sample that is not a Mapping of exactly ``{"value"}`` --
+    and ``("value", raw)`` only for the one well-formed publication. Extra fields are
+    REFUSED, not ignored: the wiring publishes exactly this shape, so anything beyond it
+    did not come from the pipeline and cannot be trusted as THE measurement.
     """
     try:
         payload = json.loads(document)
     except ValueError:
-        return []
+        return ("absent", None)
     if not isinstance(payload, Mapping):
-        return []
+        return ("absent", None)
     metrics = payload.get("metrics")
     if not isinstance(metrics, list):
-        return []
-    values: list[object] = []
-    for entry in metrics:
-        if not (isinstance(entry, Mapping) and entry.get("name") == RECALL_METRIC):
-            continue
-        contributed = 0
-        samples = entry.get("samples")
-        if isinstance(samples, list):
-            for sample in samples:
-                if isinstance(sample, Mapping) and "value" in sample:
-                    values.append(sample["value"])
-                    contributed += 1
-        if contributed == 0:
-            values.append(None)
-    return values
+        return ("absent", None)
+    entries = [
+        entry
+        for entry in metrics
+        if isinstance(entry, Mapping) and entry.get("name") == RECALL_METRIC
+    ]
+    if not entries:
+        return ("absent", None)
+    if len(entries) != 1:
+        return (
+            "malformed",
+            f"published {len(entries)} times; exactly one entry is required",
+        )
+    entry = entries[0]
+    if set(entry) != {"name", "kind", "unit", "samples"}:
+        return (
+            "malformed",
+            f"entry keys {sorted(map(str, entry))} differ from the declared "
+            "{'kind', 'name', 'samples', 'unit'}",
+        )
+    if entry["kind"] != "gauge":
+        return ("malformed", f"kind {entry['kind']!r} is not 'gauge'")
+    if entry["unit"] != "ratio":
+        return ("malformed", f"unit {entry['unit']!r} is not 'ratio'")
+    samples = entry["samples"]
+    if not isinstance(samples, list) or len(samples) != 1:
+        described = (
+            len(samples) if isinstance(samples, list) else type(samples).__name__
+        )
+        return (
+            "malformed",
+            f"samples must be a list of exactly one sample; got {described}",
+        )
+    sample = samples[0]
+    if not isinstance(sample, Mapping) or set(sample) != {"value"}:
+        return ("malformed", "the sample must be a mapping of exactly {'value'}")
+    return ("value", sample["value"])
 
 
 def check(
@@ -161,7 +189,26 @@ def check(
     recall_target: float = DEFAULT_RECALL_TARGET,
     require_recall: bool = False,
 ) -> GateResult:
-    """Apply the D5 ceilings, and the recall floor when it is published."""
+    """Apply the D5 ceilings, and the recall floor when it is published.
+
+    ``recall_target`` is validated HERE as well as at the CLI boundary: a direct caller
+    passing bool/NaN/Inf or a value outside (0, 1] gets UNMEASURED, never an exception and
+    never a verdict computed against nonsense.
+    """
+    if (
+        isinstance(recall_target, bool)
+        or type(recall_target) not in (float, int)
+        or not math.isfinite(float(recall_target))
+        or not 0.0 < float(recall_target) <= 1.0
+    ):
+        return GateResult(
+            status=STATUS_UNMEASURED,
+            lines=(
+                f"vector_recall: UNMEASURED -- recall_target {recall_target!r} is not a "
+                "finite number in (0, 1]; the gate cannot be taken",
+            ),
+        )
+    recall_target = float(recall_target)
     multiples, _, error = read_multiples(document)
     if error:
         return GateResult(status=STATUS_UNMEASURED, lines=(error,))
@@ -195,8 +242,8 @@ def check(
         elif status == STATUS_MET:
             status = STATUS_EXCEEDED
 
-    published = _recall_measurements(document)
-    if not published:
+    state, value = _recall_measurement(document)
+    if state == "absent":
         message = f"{RECALL_METRIC} was not published"
         if require_recall:
             lines.append(f"vector_recall: UNMEASURED -- {message}")
@@ -205,17 +252,12 @@ def check(
             lines.append(
                 f"vector_recall: not calibrated yet ({message}); not required by default"
             )
-    elif len(published) > 1:
+    elif state == "malformed":
         # Present-but-malformed is refused even without --require-recall: an absent OPTIONAL
         # gauge is tolerable, a corrupt publication never is.
-        lines.append(
-            f"vector_recall: UNMEASURED -- {RECALL_METRIC} was published "
-            f"{len(published)} times; exactly one measurement is required, so none of "
-            "them can be trusted as THE measurement"
-        )
+        lines.append(f"vector_recall: UNMEASURED -- {RECALL_METRIC} {value}")
         status = STATUS_UNMEASURED
     else:
-        value = published[0]
         usable = (
             not isinstance(value, bool)
             and isinstance(value, (int, float))
@@ -332,7 +374,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         document = Path(arguments.metrics).read_text(encoding="utf-8")
-    except OSError as error:
+    except (OSError, ValueError) as error:
+        # ValueError covers UnicodeDecodeError: a metrics file that is not valid UTF-8 is
+        # UNREADABLE, and before this clause it escaped as a traceback whose exit status 1
+        # is this gate's code for CEILING EXCEEDED -- a false verdict from a broken file.
         print(
             f"D5 ceiling gate: UNMEASURED -- the metrics file could not be read: {error}"
         )

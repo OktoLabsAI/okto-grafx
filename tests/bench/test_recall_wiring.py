@@ -428,3 +428,121 @@ def test_the_cli_timeout_flag_propagates_to_the_stage(
     )
     assert code == 0
     assert seen["timeout"] == 123.5
+
+
+def test_malformed_roots_are_refused_before_the_worker_ever_spawns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(4): non-dict roots and a non-list metrics key refuse typed, worker untouched."""
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    array_out = tmp_path / "calibration.json"
+    array_out.write_text("[1, 2]", encoding="utf-8")
+    good_metrics = tmp_path / "metrics.json"
+    good_metrics.write_text(json.dumps({"metrics": []}), encoding="utf-8")
+    assert (
+        append_vector_recall(
+            profile="tiny",
+            gt_mode="auto",
+            out=array_out,
+            metrics=good_metrics,
+            workspace=tmp_path,
+        )
+        == 3
+    )
+    good_out = tmp_path / "calibration2.json"
+    good_out.write_text(json.dumps({"ceilings": []}), encoding="utf-8")
+    dict_metrics = tmp_path / "metrics2.json"
+    dict_metrics.write_text(json.dumps({"metrics": {}}), encoding="utf-8")
+    assert (
+        append_vector_recall(
+            profile="tiny",
+            gt_mode="auto",
+            out=good_out,
+            metrics=dict_metrics,
+            workspace=tmp_path,
+        )
+        == 3
+    )
+    missing = tmp_path / "absent.json"
+    assert (
+        append_vector_recall(
+            profile="tiny",
+            gt_mode="auto",
+            out=good_out,
+            metrics=missing,
+            workspace=tmp_path,
+        )
+        == 3
+    )
+    assert not called, "the worker must never spawn over a malformed document"
+
+
+def test_a_strip_failure_aborts_before_the_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(4): a bombing strip write exits 3 and the measurement never starts."""
+    out, metrics = _seed_documents(tmp_path)
+    document = json.loads(metrics.read_text(encoding="utf-8"))
+    document["metrics"].append(
+        {
+            "name": RECALL_METRIC,
+            "kind": "gauge",
+            "unit": "ratio",
+            "samples": [{"value": 0.42}],
+        }
+    )
+    metrics.write_text(json.dumps(document), encoding="utf-8")
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+
+    def bomb(path: Path, mutate: object) -> None:
+        raise OSError("synthetic strip bomb")
+
+    monkeypatch.setattr(wiring, "_replace_json", bomb)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    assert not called, "strip failure must abort BEFORE the worker"
+
+
+def test_an_ordinary_worker_exception_is_a_typed_exit_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(4): RuntimeError from the stage surfaces as exit 3 with documents intact."""
+    out, metrics = _seed_documents(tmp_path)
+    out_before = out.read_text(encoding="utf-8")
+    metrics_before = metrics.read_text(encoding="utf-8")
+
+    def explode(*args: object, **kwargs: object) -> dict[str, object]:
+        raise RuntimeError("synthetic engine explosion")
+
+    monkeypatch.setattr(wiring, "run_recall", explode)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    assert out.read_text(encoding="utf-8") == out_before
+    assert metrics.read_text(encoding="utf-8") == metrics_before
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0, -5, True])
+def test_an_invalid_timeout_is_refused_before_mkdir_or_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: object
+) -> None:
+    """(5): nan/inf/zero/negative/bool never reach the filesystem or a subprocess."""
+    from bench.harness.recall import run_recall
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("subprocess.run must not be reached")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", forbidden)
+    scratch = tmp_path / "never-created"
+    with pytest.raises(RecallStageError, match="finite positive"):
+        run_recall("tiny", scratch=scratch, timeout_seconds=bad)  # type: ignore[arg-type]
+    assert not scratch.exists(), "validation must precede mkdir"

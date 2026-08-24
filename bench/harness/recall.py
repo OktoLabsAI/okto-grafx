@@ -13,6 +13,7 @@ calls :func:`run_recall` and appends; nothing here writes calibration or metrics
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -52,11 +53,14 @@ def family() -> str:
 
 
 PROFILE_TIMEOUTS: dict[str, float] = {"tiny": 300.0, "smoke": 1800.0, "full": 9600.0}
-"""Wall-clock ceilings per profile, measured rather than guessed: the full HNSW build
-exceeded 3000s locally on a machine faster than the CI runners, so its inner ceiling is
-160 minutes -- under the scheduled job's 180-minute budget with room for setup and the
-gate -- while smoke keeps the original 30 and tiny stays test-sized. ``run_recall``
-resolves these when the caller passes no explicit timeout; an explicit value always wins."""
+"""Wall-clock ceilings per profile, measured rather than guessed: the full profile RUN
+exceeded 3000s locally on a machine faster than the CI runners -- and the measured cost
+lives in the per-query SEARCHES, not the build (a 2048-vector build takes seconds; the
+ACORN beam visits most of the graph at the frozen ef), so the ceiling covers the whole
+run: 160 minutes, under the scheduled job's 180-minute budget with room for setup and
+the gate, while smoke keeps the original 30 and tiny stays test-sized. ``run_recall``
+resolves these when the caller passes no explicit timeout; an explicit value always
+wins after validation."""
 
 
 def run_recall(
@@ -79,6 +83,17 @@ def run_recall(
         )
     if timeout_seconds is None:
         timeout_seconds = PROFILE_TIMEOUTS[profile]
+    if (
+        isinstance(timeout_seconds, bool)
+        or type(timeout_seconds) not in (int, float)
+        or not math.isfinite(float(timeout_seconds))
+        or not float(timeout_seconds) > 0.0
+    ):
+        raise RecallStageError(
+            f"timeout_seconds must be a finite positive number; got {timeout_seconds!r} "
+            "-- refused before any directory or process exists."
+        )
+    timeout_seconds = float(timeout_seconds)
     scratch.mkdir(parents=True, exist_ok=True)
     verdict_path = scratch / f"recall-{profile}.json"
     environment = dict(os.environ)
@@ -135,6 +150,10 @@ def build_section(
     ``frozen`` and ``observed.<family>`` are the deterministic projection two same-machine
     runs must reproduce identically; ``provenance.<family>`` holds every volatile value —
     duration, versions, the oracle path actually taken — outside every hash and comparison.
+
+    Schema note, recorded pre-freeze: the observed counter is ``queries_below_perfect``
+    (renamed from ``queries_below_target`` before any calibration was ever frozen — the
+    count is of NON-PERFECT queries, ``recall < 1.0``, and the old name lied).
     """
     home = family()
     hashes = dict(verdict["hashes"])  # type: ignore[arg-type]

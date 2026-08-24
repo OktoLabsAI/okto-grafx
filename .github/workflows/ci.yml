@@ -291,8 +291,12 @@ jobs:
         # OR-4: the gate reads oktografx_baseline_ceiling_multiple, not a log. A durable-commit
         # multiple above 10x is the 'consult JP' state of FR-15 and stops the pipeline.
         # C13: --require-recall makes a build that publishes no recall gauge FAIL (the C13
-        # observation closed), and the frozen floor comes from the committed calibration.
-        run: python -m bench.harness.gate --metrics metrics-${{ matrix.family }}.json --require-recall --calibration bench/calibration.json
+        # observation closed). The explicit --recall-target 0.90 is TEMPORARY: the
+        # committed calibration carries no vector_recall section yet (the first freeze is
+        # blocked on the engine-side HNSW quality fix), and the gate refuses an explicitly
+        # named artifact without a usable target rather than guessing. Once a valid freeze
+        # lands, drop the flag and the frozen artifact governs via precedence.
+        run: python -m bench.harness.gate --metrics metrics-${{ matrix.family }}.json --require-recall --recall-target 0.90 --calibration bench/calibration.json
 
       - name: Upload the calibration artefacts
         if: always()

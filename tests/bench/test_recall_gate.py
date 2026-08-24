@@ -40,7 +40,14 @@ def _metrics_document(path: Path, *, recall: float | None) -> Path:
         }
     ]
     if recall is not None:
-        entries.append({"name": RECALL_METRIC, "samples": [{"value": recall}]})
+        entries.append(
+            {
+                "name": RECALL_METRIC,
+                "kind": "gauge",
+                "unit": "ratio",
+                "samples": [{"value": recall}],
+            }
+        )
     document = path / "metrics.json"
     document.write_text(json.dumps({"metrics": entries}), encoding="utf-8")
     return document
@@ -187,7 +194,15 @@ def test_a_present_but_invalid_gauge_value_is_unmeasured_even_unrequired(
     """(c): bool, NaN, Inf, out-of-range and non-numeric are NOT measurements. A corrupt
     publication refuses even without --require-recall -- only ABSENCE is tolerable there."""
     document = _document_with_recall_entries(
-        tmp_path, [{"name": RECALL_METRIC, "samples": [{"value": value}]}]
+        tmp_path,
+        [
+            {
+                "name": RECALL_METRIC,
+                "kind": "gauge",
+                "unit": "ratio",
+                "samples": [{"value": value}],
+            }
+        ],
     )
     assert main(["--metrics", str(document)]) == 2
 
@@ -231,3 +246,71 @@ def test_an_unusable_named_calibration_fails_the_cli_as_unmeasured(
     absent = tmp_path / "absent.json"
     assert main(["--metrics", str(document), "--calibration", str(absent)]) == 2
     assert main(["--metrics", str(document)]) == 0
+
+
+def _shaped(samples: list[dict[str, object]], **overrides: object) -> dict[str, object]:
+    """One recall entry in the declared shape, with deliberate deviations on demand."""
+    entry: dict[str, object] = {
+        "name": RECALL_METRIC,
+        "kind": "gauge",
+        "unit": "ratio",
+        "samples": samples,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_a_junk_extra_sample_is_unmeasured_even_beside_a_valid_one(
+    tmp_path: Path,
+) -> None:
+    """The reaudit probe: [{"value":0.99},{}] passed as MET; now it is UNMEASURED."""
+    document = _document_with_recall_entries(tmp_path, [_shaped([{"value": 0.99}, {}])])
+    assert main(["--metrics", str(document)]) == 2
+
+
+def test_wrong_kind_or_unit_or_extra_fields_are_unmeasured(tmp_path: Path) -> None:
+    """The declared shape is exact: kind=gauge, unit=ratio, no extra keys anywhere."""
+    wrong_kind = _document_with_recall_entries(
+        tmp_path, [_shaped([{"value": 0.99}], kind="counter")]
+    )
+    assert main(["--metrics", str(wrong_kind)]) == 2
+    wrong_unit = _document_with_recall_entries(
+        tmp_path, [_shaped([{"value": 0.99}], unit="seconds")]
+    )
+    assert main(["--metrics", str(wrong_unit)]) == 2
+    extra_entry_field = _document_with_recall_entries(
+        tmp_path, [_shaped([{"value": 0.99}], labels=[])]
+    )
+    assert main(["--metrics", str(extra_entry_field)]) == 2
+    extra_sample_field = _document_with_recall_entries(
+        tmp_path, [_shaped([{"value": 0.99, "labels": {}}])]
+    )
+    assert main(["--metrics", str(extra_sample_field)]) == 2
+    bare_entry = _document_with_recall_entries(
+        tmp_path, [{"name": RECALL_METRIC, "samples": [{"value": 0.99}]}]
+    )
+    assert main(["--metrics", str(bare_entry)]) == 2
+
+
+@pytest.mark.parametrize(
+    "target", [float("nan"), float("inf"), 0.0, 1.5, -1.0, True, "0.9"]
+)
+def test_check_called_directly_with_an_invalid_target_is_unmeasured(
+    tmp_path: Path, target: object
+) -> None:
+    """(2): the library boundary defends itself -- UNMEASURED, never a raise or verdict."""
+    from bench.harness.gate import STATUS_UNMEASURED, check
+
+    document = _metrics_document(tmp_path, recall=0.95)
+    result = check(
+        document.read_text(encoding="utf-8"),
+        recall_target=target,  # type: ignore[arg-type]
+    )
+    assert result.status == STATUS_UNMEASURED
+
+
+def test_a_non_utf8_metrics_file_is_unmeasured_not_a_traceback(tmp_path: Path) -> None:
+    """(6): invalid bytes used to escape as ValueError -> exit 1 (false EXCEEDED)."""
+    document = tmp_path / "metrics.json"
+    document.write_bytes(b"\xff\xfe\x00garbage")
+    assert main(["--metrics", str(document)]) == 2

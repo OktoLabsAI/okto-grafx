@@ -51,13 +51,18 @@ def _strip_stale_gauge(metrics: Path) -> None:
     through a temporary file and ``os.replace`` as every other append. When the document
     holds NO recall entry -- the first run, and every legacy document -- this is a strict
     no-op: no rewrite, no format churn, no mtime change, so a failure before any append
-    still leaves both documents byte-identical. A missing or unreadable document is also
-    left alone here; the later appends are the ones that turn that into a typed failure.
+    still leaves both documents byte-identical. The document is guaranteed readable by the
+    caller's pre-validation, so nothing is swallowed here: any residual failure propagates
+    and aborts the stage BEFORE the worker is spawned.
+
+    Stale boundary, stated precisely: os.replace is atomic, so a failure BEFORE the replace
+    leaves the OLD document -- stale gauge included -- fully intact. In that case this
+    stage exits 3 and the workflow stops before the gate step ever runs, which is the
+    containment this cycle relies on. A contract that ran the gate INDEPENDENTLY of the
+    stage exit would need generation binding between section and gauge; that evolution is
+    recorded here rather than half-built.
     """
-    try:
-        document = json.loads(metrics.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
+    document = json.loads(metrics.read_text(encoding="utf-8"))
     entries = document.get("metrics") if isinstance(document, dict) else None
     if not isinstance(entries, list) or not any(
         isinstance(entry, dict) and entry.get("name") == RECALL_METRIC
@@ -126,6 +131,33 @@ def append_vector_recall(
             "gauge with no section; the gauge must be the LAST artifact, never the only one."
         )
         return 3
+    for label, path in (("--out", out), ("--metrics", metrics)):
+        if path is None:
+            continue
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as failure:
+            print(
+                f"vector recall stage: REFUSED -- {label} {path} is not a readable JSON "
+                f"document ({failure}); nothing was run and nothing was written."
+            )
+            return 3
+        if not isinstance(document, dict):
+            print(
+                f"vector recall stage: REFUSED -- {label} {path} holds "
+                f"{type(document).__name__}, not an object; nothing was run."
+            )
+            return 3
+        if (
+            label == "--metrics"
+            and "metrics" in document
+            and not isinstance(document["metrics"], list)
+        ):
+            print(
+                f"vector recall stage: REFUSED -- {label} {path} carries a 'metrics' key "
+                "that is not a list; a gauge could never land there. Nothing was run."
+            )
+            return 3
     try:
         if metrics is not None:
             _strip_stale_gauge(metrics)
@@ -138,13 +170,19 @@ def append_vector_recall(
     except RecallStageError as failure:
         print(f"vector recall: FAIL-CLOSED -- {failure}")
         return 3
-    section = build_section(verdict)
+    except (OSError, ValueError, TypeError, RuntimeError) as failure:
+        # An ORDINARY exception from the strip or the worker is still a stage failure:
+        # typed line, exit 3, no traceback -- and because the strip precedes the spawn,
+        # a strip failure aborts before any measurement begins.
+        print(f"vector recall: stage failed before publication -- {failure}")
+        return 3
     try:
+        section = build_section(verdict)
         if out is not None:
             _append_section(out, section)
         if metrics is not None:
             _append_gauge(metrics, float(verdict["gauge"]))  # type: ignore[arg-type]
-    except OSError as failure:
+    except (OSError, ValueError, TypeError, RuntimeError) as failure:
         print(f"vector recall: publication failed after measurement -- {failure}")
         return 3
     home = next(iter(section["observed"]))  # type: ignore[call-overload]
