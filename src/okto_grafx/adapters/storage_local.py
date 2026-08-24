@@ -84,8 +84,8 @@ from okto_grafx.domain.ids import PageIndex
 # resolves them to the very objects C1 defines, never to a second opinion.
 from okto_grafx.domain.page import (
     DEFAULT_PAGE_SIZE,
-    MAX_PAGE_SIZE,
-    MIN_PAGE_SIZE,
+    MAX_PAGE_SIZE as MAX_PAGE_SIZE,
+    MIN_PAGE_SIZE as MIN_PAGE_SIZE,
     validate_page_size,
 )
 
@@ -155,6 +155,9 @@ MAX_RETRY_SLEEP_SECONDS: float = 0.05
 
 MAX_PENDING_DELETE_ATTEMPTS: int = 256
 """How many passes a deferred deletion is retried automatically before it needs an explicit ask."""
+
+REALPATH_STABILITY_ATTEMPTS: int = 8
+"""Bounded containment probes when Windows exposes an unlinked NTFS replacement target."""
 
 WRITE_CHUNK_BYTES: int = 1 << 20
 """Largest block written by a single system call, so a big allocation stays bounded in memory."""
@@ -582,6 +585,43 @@ def _is_redirected_path(path: str, information: os.stat_result | None = None) ->
     return False
 
 
+def _comparable_real_path(path: str) -> str:
+    """Return one stable spelling for containment comparisons.
+
+    Windows ``realpath`` obtains a ``\\?\\`` final path and normally verifies the ordinary
+    spelling before removing that prefix.  An atomic replacement between those two system calls
+    can make the verification fail even though both spellings name the same path, leaving the
+    prefix in only one operand of ``commonpath``.  That transient representation difference is
+    not a path escape.  Canonical DOS-drive and UNC spellings are therefore compared without the
+    extended-length prefix; device namespaces such as ``\\?\\GLOBALROOT`` remain untouched and
+    still fail closed against an ordinary database root.
+    """
+    resolved = os.path.realpath(path)
+    if IS_WINDOWS:
+        folded = resolved.casefold()
+        if folded.startswith("\\\\?\\unc\\"):
+            resolved = "\\\\" + resolved[8:]
+        elif folded.startswith("\\\\?\\"):
+            candidate = resolved[4:]
+            drive, tail = os.path.splitdrive(candidate)
+            if len(drive) == 2 and drive[1] == ":" and tail.startswith(("\\", "/")):
+                resolved = candidate
+    return os.path.normcase(os.path.normpath(resolved))
+
+
+def _is_ntfs_deleted_real_path(path: str) -> bool:
+    """Return whether ``path`` is NTFS's private name for a just-unlinked open file."""
+    drive, tail = os.path.splitdrive(os.path.normcase(path))
+    components = tail.lstrip("\\/").replace("/", "\\").split("\\")
+    return (
+        len(drive) == 2
+        and drive[1] == ":"
+        and len(components) >= 2
+        and components[0] == "$extend"
+        and components[1] == "$deleted"
+    )
+
+
 class LocalStorageDevice:
     """StorageDevice backed by a real directory, with POSIX and Windows treated as equal citizens."""
 
@@ -627,7 +667,7 @@ class LocalStorageDevice:
                 "A database root may not itself be a symlink, junction or reparse point.",
                 file=self._root,
             )
-        self._root_real = os.path.realpath(self._root)
+        self._root_real = _comparable_real_path(self._root)
         self._root_identity = (root_information.st_dev, root_information.st_ino)
         # Publishing a newly-created root changes its PARENT namespace, not the root itself.
         # For a multi-level makedirs chain each created directory contributes exactly the parent
@@ -1170,8 +1210,7 @@ class LocalStorageDevice:
         if (
             observed != self._root_identity
             or _is_redirected_path(self._root, information)
-            or os.path.normcase(os.path.realpath(self._root))
-            != os.path.normcase(self._root_real)
+            or _comparable_real_path(self._root) != self._root_real
         ):
             raise refuse_operation(
                 "redirected_root",
@@ -1182,18 +1221,25 @@ class LocalStorageDevice:
 
     def _require_contained(self, name: str, path: str) -> None:
         """Refuse a real path whose resolution leaves the opened database root."""
-        resolved = os.path.realpath(path)
-        try:
-            common = os.path.commonpath((self._root_real, resolved))
-        except ValueError:
-            common = ""
-        if os.path.normcase(common) != os.path.normcase(self._root_real):
-            raise refuse_operation(
-                "path_escape",
-                f"Logical file {name!r} resolves outside the database root.",
-                file=name,
-                component=self._relative(path),
-            )
+        for _attempt in range(REALPATH_STABILITY_ATTEMPTS):
+            resolved = _comparable_real_path(path)
+            try:
+                common = os.path.commonpath((self._root_real, resolved))
+            except ValueError:
+                common = ""
+            if os.path.normcase(os.path.normpath(common)) == self._root_real:
+                return
+            if not (IS_WINDOWS and _is_ntfs_deleted_real_path(resolved)):
+                break
+            # os.replace can unlink the old file between CPython's two final-path syscalls. The
+            # first handle then resolves under C:\$Extend\$Deleted. Never normalize or accept
+            # that device path: retry the logical name, bounded, and require a contained result.
+        raise refuse_operation(
+            "path_escape",
+            f"Logical file {name!r} resolves outside the database root.",
+            file=name,
+            component=self._relative(path),
+        )
 
     def _require_safe_path(self, name: str) -> None:
         """Refuse every existing redirected component of one logical file path."""

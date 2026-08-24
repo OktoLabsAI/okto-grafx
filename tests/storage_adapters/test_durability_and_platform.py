@@ -118,6 +118,205 @@ def test_a_database_root_exchanged_for_a_redirect_is_refused_without_touching_vi
 
 
 @pytest.mark.platform_specific
+@pytest.mark.skipif(
+    not IS_WINDOWS,
+    reason="The transient extended-length spelling is emitted only by Windows realpath.",
+)
+def test_atomic_replacement_cannot_turn_an_equivalent_final_path_into_an_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Model the exact two-syscall realpath race while another participant publishes a file."""
+    root = tmp_path / "database"
+    control = root / "control"
+    control.mkdir(parents=True)
+    target = control / "writer.lease"
+    staging = control / "writer.lease.next"
+    target.write_bytes(b"old lease")
+    staging.write_bytes(b"new lease")
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE, create_root=False)
+    entered_realpath = threading.Event()
+    replacement_finished = threading.Event()
+    failures: list[BaseException] = []
+    answers: list[bool] = []
+    real_realpath = storage_local.os.path.realpath
+    target_key = os.path.normcase(str(target))
+    raced = [False]
+
+    def racing_realpath(path: Any) -> str:
+        resolved = real_realpath(path)
+        if (
+            threading.current_thread().name == "containment-reader"
+            and os.path.normcase(os.fspath(path)) == target_key
+            and not raced[0]
+        ):
+            raced[0] = True
+            entered_realpath.set()
+            if not replacement_finished.wait(timeout=5.0):
+                raise AssertionError("the publisher did not replace the control record")
+            # CPython can expose the old file through NTFS's deleted namespace when its final
+            # path syscall races the replacement. That device path cannot be normalized safely:
+            # the adapter must resolve the logical name again and observe the new record.
+            drive, _tail = os.path.splitdrive(resolved)
+            return f"{drive}\\$Extend\\$Deleted\\atomic-replacement"
+        return resolved
+
+    def observe() -> None:
+        try:
+            answers.append(device.exists("control/writer.lease"))
+        except BaseException as failure:
+            failures.append(failure)
+
+    monkeypatch.setattr(storage_local.os.path, "realpath", racing_realpath)
+    reader = threading.Thread(target=observe, name="containment-reader")
+    reader.start()
+    try:
+        assert entered_realpath.wait(timeout=5.0)
+        os.replace(staging, target)
+    finally:
+        replacement_finished.set()
+        reader.join(timeout=5.0)
+        monkeypatch.undo()
+        device.close()
+
+    assert not reader.is_alive()
+    assert failures == []
+    assert answers == [True]
+    assert target.read_bytes() == b"new lease"
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(
+    not IS_WINDOWS,
+    reason="Only Windows has extended-length drive and UNC spellings.",
+)
+@pytest.mark.parametrize(
+    ("extended", "ordinary"),
+    [
+        (r"\\?\C:\database\heap.dat", r"C:\database\heap.dat"),
+        (
+            r"\\?\UNC\server\share\database\heap.dat",
+            r"\\server\share\database\heap.dat",
+        ),
+    ],
+    ids=["drive", "unc"],
+)
+def test_only_equivalent_win32_extended_paths_are_canonicalized(
+    monkeypatch: pytest.MonkeyPatch,
+    extended: str,
+    ordinary: str,
+) -> None:
+    """Drive and UNC paths compare symmetrically despite their optional Win32 prefix."""
+    calls: list[object] = []
+
+    def extended_realpath(path: object) -> str:
+        calls.append(path)
+        return extended
+
+    monkeypatch.setattr(storage_local.os.path, "realpath", extended_realpath)
+    assert storage_local._comparable_real_path("ignored") == os.path.normcase(
+        os.path.normpath(ordinary)
+    )
+    assert calls == ["ignored"]
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(
+    not IS_WINDOWS,
+    reason="NTFS exposes its deleted-file namespace only on Windows.",
+)
+@pytest.mark.parametrize(
+    "eventually_contained", [True, False], ids=["settles", "persists"]
+)
+def test_ntfs_deleted_resolution_is_retried_but_never_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    eventually_contained: bool,
+) -> None:
+    """N-1 transient device paths settle; N device paths fail closed with exactly N probes."""
+    root = tmp_path / "database"
+    root.mkdir()
+    evidence = root / "operator.evidence"
+    evidence.write_bytes(b"authority")
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE, create_root=False)
+    real_realpath = storage_local.os.path.realpath
+    ordinary = real_realpath(evidence)
+    drive, _tail = os.path.splitdrive(ordinary)
+    deleted = f"{drive}\\$Extend\\$Deleted\\bounded-probe"
+    target_key = os.path.normcase(str(evidence))
+    calls = [0]
+
+    def sequenced_realpath(path: Any) -> str:
+        if os.path.normcase(os.fspath(path)) != target_key:
+            return real_realpath(path)
+        calls[0] += 1
+        if (
+            eventually_contained
+            and calls[0] == storage_local.REALPATH_STABILITY_ATTEMPTS
+        ):
+            return ordinary
+        return deleted
+
+    monkeypatch.setattr(storage_local.os.path, "realpath", sequenced_realpath)
+    try:
+        if eventually_contained:
+            device._require_contained("operator.evidence", str(evidence))
+        else:
+            with pytest.raises(GrafxUnsupportedOperation) as raised:
+                device._require_contained("operator.evidence", str(evidence))
+            assert raised.value.details["reason"] == "path_escape"
+        assert calls[0] == storage_local.REALPATH_STABILITY_ATTEMPTS
+        assert evidence.read_bytes() == b"authority"
+    finally:
+        monkeypatch.undo()
+        device.close()
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(
+    not IS_WINDOWS,
+    reason="Windows device namespaces use the extended-length prefix under test.",
+)
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\operator.evidence",
+        r"\\.\PhysicalDrive0",
+        r"\\?\Volume{00000000-0000-0000-0000-000000000000}\operator.evidence",
+        r"C:\$Extend\$Deleted\persistent-device-path",
+    ],
+    ids=["globalroot", "device", "volume-guid", "ntfs-deleted"],
+)
+def test_a_device_namespace_spelling_is_never_normalized_into_the_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hostile: str,
+) -> None:
+    """Only ordinary drive/UNC prefixes are equivalent; device namespaces remain escapes."""
+    root = tmp_path / "database"
+    root.mkdir()
+    evidence = root / "operator.evidence"
+    evidence.write_bytes(b"authority")
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE, create_root=False)
+    real_realpath = storage_local.os.path.realpath
+
+    def hostile_realpath(path: Any) -> str:
+        if os.path.normcase(os.fspath(path)) == os.path.normcase(str(evidence)):
+            return hostile
+        return real_realpath(path)
+
+    monkeypatch.setattr(storage_local.os.path, "realpath", hostile_realpath)
+    try:
+        with pytest.raises(GrafxUnsupportedOperation) as raised:
+            device.exists("operator.evidence")
+        assert raised.value.details["reason"] == "path_escape"
+        assert evidence.read_bytes() == b"authority"
+    finally:
+        monkeypatch.undo()
+        device.close()
+
+
+@pytest.mark.platform_specific
 @pytest.mark.skipif(IS_WINDOWS, reason="A FIFO namespace probe requires POSIX mkfifo.")
 def test_a_special_namespace_entry_is_refused_without_opening_or_mutating_it(
     tmp_path: Path,

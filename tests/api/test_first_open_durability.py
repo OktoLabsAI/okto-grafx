@@ -21,6 +21,8 @@ Three properties, through the public door and the fault bench of FR-16:
 from __future__ import annotations
 
 import os
+import stat
+import subprocess
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -481,6 +483,57 @@ def test_public_connect_refuses_fifo_evidence_without_opening_or_hiding_it(
         assert tuple(entry.name for entry in root.iterdir()) == ("operator.evidence",)
     finally:
         fifo.unlink()
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(
+    os.name != "nt", reason="An NTFS junction namespace probe requires Windows."
+)
+def test_public_connect_refuses_windows_junction_without_following_or_hiding_it(
+    tmp_path: Path,
+) -> None:
+    """A Windows reparse point remains evidence; its victim is never used as storage."""
+    root = tmp_path / "database"
+    victim = tmp_path / "victim"
+    root.mkdir()
+    victim.mkdir()
+    protected = victim / "first-open.intent"
+    protected.write_bytes(b"victim authority")
+    redirected = root / "bootstrap"
+    try:
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(redirected), str(victim)],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as failure:
+        pytest.skip(f"NTFS junction creation is unavailable: {failure}")
+    if created.returncode != 0:
+        pytest.skip(
+            "NTFS junction creation is unavailable: "
+            f"{created.stderr.strip() or created.stdout.strip()}"
+        )
+
+    try:
+        before_redirect = os.lstat(redirected)
+        reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        assert reparse_attribute
+        assert before_redirect.st_file_attributes & reparse_attribute
+        before_victim = {entry.name: entry.read_bytes() for entry in victim.iterdir()}
+        with pytest.raises(GrafxUnsupportedOperation) as raised:
+            connect(root)
+        after_redirect = os.lstat(redirected)
+        assert raised.value.details["reason"] == "redirected_path"
+        assert raised.value.details["file"] == "bootstrap"
+        assert after_redirect.st_file_attributes & reparse_attribute
+        assert {
+            entry.name: entry.read_bytes() for entry in victim.iterdir()
+        } == before_victim
+        assert tuple(entry.name for entry in root.iterdir()) == ("bootstrap",)
+    finally:
+        redirected.rmdir()
 
 
 def test_bootstrap_orphan_beside_published_database_is_never_retired() -> None:
