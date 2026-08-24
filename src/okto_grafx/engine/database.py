@@ -63,6 +63,7 @@ from okto_grafx.domain.ports.events import EventSink
 from okto_grafx.domain.ports.metrics import MetricsSink
 from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.ports.vectormath import VectorMath
+from okto_grafx.domain.query.plan import PlanNode
 from okto_grafx.domain.txn.context import (
     CommitReport,
     TransactionContext,
@@ -115,6 +116,10 @@ from okto_grafx.engine.public_views import (
     _metrics_snapshot_view,
     _pool_view,
     _quarantine_view,
+    _query_parameters_snapshot,
+    _query_plan_view,
+    _query_result_view,
+    _query_text_snapshot,
     _record_id_filter_snapshot,
     _recycle_report_view,
     _queries_view,
@@ -129,6 +134,7 @@ from okto_grafx.engine.public_views import (
     _vectors_view,
     _wal_view,
 )
+from okto_grafx.engine.query_engine import QueryResult
 from okto_grafx.engine.txn_manager import TransactionManager
 from okto_grafx.engine.vector_engine import VectorSearchResult
 from okto_grafx.engine.verifier import VERIFICATION_SCOPES
@@ -644,11 +650,12 @@ class Transaction:
 
     def execute(
         self, text: str, parameters: Mapping[str, object] | None = None
-    ) -> object:
+    ) -> QueryResult:
         """Run one statement inside this transaction and return its result.
 
-        The statement text is handed to the query engine unchanged. A database composed without
-        one refuses here with GrafxUnsupportedOperation rather than pretending to run anything.
+        Text and parameters are deeply canonicalised before the query engine is reached. A
+        database composed without one refuses here with GrafxUnsupportedOperation rather than
+        pretending to run anything.
         """
         self._require_active()
         return self._database._run_statement(self._context, text, parameters)
@@ -1342,7 +1349,7 @@ class Database:
 
     def execute(
         self, text: str, parameters: Mapping[str, object] | None = None
-    ) -> object:
+    ) -> QueryResult:
         """Run one statement in its own read transaction and return its result.
 
         This is the autocommit read of CONTRACT.md section 10. The transaction is opened, the
@@ -1362,41 +1369,55 @@ class Database:
         txn.commit()
         return result
 
-    def explain(self, text: str) -> object:
+    def explain(self, text: str) -> PlanNode:
         """Plan one statement without exposing the mutable query engine."""
-        self._require_open()
-        _require_text("statement", text)
-        engine = self._require_component(
-            "queries", self._queries, "the query engine (C10)"
-        )
-        with self._transactions.page_access_section():
-            return engine.explain(text)  # type: ignore[attr-defined]
+        with self._public_operation("explain"):
+            self._require_open()
+            statement = _query_text_snapshot(text)
+            engine = self._require_component(
+                "queries", self._queries, "the query engine (C10)"
+            )
+            with self._transactions.page_access_section():
+                # Recheck immediately before reaching the engine so a concurrent close cannot
+                # turn validation before canonicalisation into a stale permission to plan.
+                self._require_open()
+                raw_plan = engine.explain(statement)  # type: ignore[attr-defined]
+            return _query_plan_view(raw_plan)
 
     def _run_statement(
         self,
         context: TransactionContext,
         text: str,
         parameters: Mapping[str, object] | None = None,
-    ) -> object:
+    ) -> QueryResult:
         """Run one statement for a context already validated by the public Transaction."""
-        self._require_open()
-        _require_text("statement", text)
-        engine = self._require_component(
-            "queries", self._queries, "the query engine (C10)"
-        )
-        with self._transactions.page_access_section():
-            if not context.active:
-                raise GrafxTransactionStateError(
-                    f"Transaction {context.txn_id} is {context.state.value} and cannot execute "
-                    "another statement.",
-                    txn_id=context.txn_id,
-                    state=context.state.value,
+        with self._public_operation("query"):
+            self._require_open()
+            engine = self._require_component(
+                "queries", self._queries, "the query engine (C10)"
+            )
+            statement = _query_text_snapshot(text)
+            detached_parameters = _query_parameters_snapshot(parameters)
+            with self._transactions.page_access_section():
+                self._require_open()
+                if not context.active:
+                    raise GrafxTransactionStateError(
+                        f"Transaction {context.txn_id} is {context.state.value} and cannot execute "
+                        "another statement.",
+                        txn_id=context.txn_id,
+                        state=context.state.value,
+                    )
+                # Registration and statement execution share the participant section. Close can
+                # therefore neither miss a context that may have acquired a schema journal nor
+                # release storage while the statement is installing one.
+                self._public_contexts.setdefault(context.txn_id, context)
+                raw_result = engine.execute(  # type: ignore[attr-defined]
+                    statement, context, detached_parameters
                 )
-            # Registration and statement execution share the participant section. Close can
-            # therefore neither miss a context that may have acquired a schema journal nor
-            # release storage while the statement is installing one.
-            self._public_contexts.setdefault(context.txn_id, context)
-            return engine.execute(text, context, parameters)  # type: ignore[attr-defined]
+            # A collaborator result may itself be a hostile Mapping/Sequence. Rebuild it only
+            # after leaving page access, while _public_operation still translates ordinary host
+            # failures and deliberately lets process-control signals pass unchanged.
+            return _query_result_view(raw_result)
 
     def search_vectors(
         self,
