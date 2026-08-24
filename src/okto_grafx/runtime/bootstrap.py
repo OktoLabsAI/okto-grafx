@@ -142,7 +142,11 @@ def build_storage(context: PortContext) -> object:
     config = context.config
     if config.path == MEMORY_PATH:
         return MemoryStorageDevice(page_size=config.page_size)
-    return LocalStorageDevice(config.path, page_size=config.page_size)
+    return LocalStorageDevice(
+        config.path,
+        page_size=config.page_size,
+        create_root=not config.read_only,
+    )
 
 
 def build_clock(context: PortContext) -> object:
@@ -363,17 +367,28 @@ def release_ports(ports: PortRegistry) -> None:
     to the caller, and replacing that failure with a failure of the closing path would hide the
     reason the composition is being abandoned at all.
     """
+    _release_ports(ports, observational_storage=False)
+
+
+def _release_ports(ports: PortRegistry, *, observational_storage: bool) -> None:
+    """Release built adapters, optionally closing storage without writable housekeeping."""
     for slot in reversed(BUILD_ORDER):
         try:
             instance = ports.get(slot)
         except Exception:
             continue
-        closer = getattr(instance, "close", None)
+        closer = (
+            getattr(instance, "close_read_only", None)
+            if observational_storage and slot == "storage"
+            else None
+        )
+        if closer is None or not callable(closer):
+            closer = getattr(instance, "close", None)
         if closer is None or not callable(closer):
             continue
         try:
             closer()
-        except Exception:
+        except BaseException:
             continue
 
 
@@ -409,7 +424,7 @@ def build_default_registry(config: DatabaseConfig) -> PortRegistry:
     except GrafxError:
         # A47: the class a factory chose, and the retryable detail it carries, are what a
         # caller switches on. A Grafx failure leaves this guard exactly as it arrived.
-        release_ports(registry)
+        _release_ports(registry, observational_storage=config.read_only)
         raise
     except Exception as failure:
         # An adapter constructor is ordinary Python and can raise ordinary Python: a path
@@ -418,7 +433,7 @@ def build_default_registry(config: DatabaseConfig) -> PortRegistry:
         # is under open_database. The assembly converts foreign exceptions and this build
         # did not -- one invariant kept in two places with only one of them holding it
         # (A66).
-        release_ports(registry)
+        _release_ports(registry, observational_storage=config.read_only)
         raise GrafxConfigurationError(
             f"A port could not be built for the database at {config.path!r}: an adapter "
             f"raised {type(failure).__name__}: {failure}",
@@ -429,7 +444,7 @@ def build_default_registry(config: DatabaseConfig) -> PortRegistry:
     except BaseException:
         # KeyboardInterrupt and SystemExit are not failures of this build and are never
         # converted; what was already built is still released on the way past.
-        release_ports(registry)
+        _release_ports(registry, observational_storage=config.read_only)
         raise
     return registry
 

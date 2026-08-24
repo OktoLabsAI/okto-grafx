@@ -548,6 +548,18 @@ def _is_queueable(relative: str) -> bool:
     return _is_pending_delete(relative)
 
 
+def _deletion_namespace(name: str) -> str:
+    """Return the top-level namespace an automatic pending-delete retry may affect.
+
+    Root files form one data namespace (the empty string); reserved directories such as
+    ``control``, ``wal`` and ``index`` remain independent. A reader-registration create under
+    ``control/`` can therefore reclaim control debris without deleting queued database/WAL/index
+    evidence merely because the same raw device serves both planes.
+    """
+    head, separator, _tail = name.partition("/")
+    return head if separator else ""
+
+
 def _missing_directory_chain(path: str) -> tuple[str, ...]:
     """Return missing directories from the first absent ancestor through ``path``.
 
@@ -633,8 +645,9 @@ class LocalStorageDevice:
         max_open_files: int = MAX_OPEN_FILES,
         retry_attempts: int = RETRY_ATTEMPTS,
         retry_backoff_seconds: float = RETRY_BACKOFF_SECONDS,
+        create_root: bool = True,
     ) -> None:
-        """Open a device over the directory, creating it when it does not exist yet."""
+        """Open a device over the directory, optionally refusing an absent root."""
         self._page_size = validate_page_size(page_size)
         self._max_open_files = _validate_positive("max_open_files", max_open_files)
         self._retry_attempts = _validate_positive("retry_attempts", retry_attempts)
@@ -653,10 +666,20 @@ class LocalStorageDevice:
         self._pending_serial = 0
         self._closed = False
         missing_directories = _missing_directory_chain(self._root)
-        try:
-            os.makedirs(self._root, exist_ok=True)
-        except OSError as failure:
-            raise self._device_failure("open_root", self._root, failure) from failure
+        if missing_directories and not create_root:
+            raise refuse_operation(
+                "missing_root",
+                f"There is no database at {self._root!r}; an observational open cannot create it.",
+                file=self._root,
+                path=self._root,
+                field="read_only",
+                create_root=False,
+            )
+        if create_root:
+            try:
+                os.makedirs(self._root, exist_ok=True)
+            except OSError as failure:
+                raise self._device_failure("open_root", self._root, failure) from failure
         try:
             root_information = os.lstat(self._root)
         except OSError as failure:
@@ -731,7 +754,7 @@ class LocalStorageDevice:
             self._acknowledge(name)
             # Draining afterwards keeps this door an independent trigger for the deletion queue
             # without letting a pass destroy the very file the caller just asked about.
-            self.retry_pending_deletes()
+            self._retry_pending_deletes(namespace=_deletion_namespace(name))
 
     def remove(self, file: str) -> None:
         """Delete the named file. Removing a file the device does not hold is a failure."""
@@ -748,7 +771,7 @@ class LocalStorageDevice:
             self._forget_deferred(name)
             # Draining afterwards keeps this door an independent trigger for the deletion queue
             # without letting a pass take the very file the caller asked about.
-            self.retry_pending_deletes()
+            self._retry_pending_deletes(namespace=_deletion_namespace(name))
 
     def list_files(self, prefix: str = "") -> tuple[str, ...]:
         """Return every logical name starting with the prefix, sorted, deferred deletions apart."""
@@ -827,7 +850,7 @@ class LocalStorageDevice:
         name = normalize_logical_name(file)
         with self._lock:
             self._require_open()
-            self.retry_pending_deletes()
+            self._retry_pending_deletes(namespace=_deletion_namespace(name))
             if not self._resolve_identity(name):
                 # Recycling is a reclamation loop and must converge: a name that is already gone
                 # has already been reclaimed. remove() is the strict door for the same effect.
@@ -844,9 +867,10 @@ class LocalStorageDevice:
     def retry_pending_deletes(self, *, force: bool = False) -> int:
         """Try every deferred deletion once and return how many files were finally reclaimed.
 
-        One pass costs a couple of system calls per deferred file and never sleeps, so it can be
-        driven from any path; create, remove, recycle and close all drive it, and a caller that
-        recycles only once still gets its space back. A file that survived
+        One pass costs a couple of system calls per deferred file and never sleeps. This explicit
+        door and writable close drive the whole queue; create, remove and recycle automatically
+        drive only the top-level namespace they name, so control-plane traffic cannot erase
+        queued WAL/index/data evidence. A file that survived
         MAX_PENDING_DELETE_ATTEMPTS passes is left alone until the caller asks with force, which
         is the bounded attempt rule of FR-6; pending_deletes() keeps reporting it either way.
 
@@ -854,38 +878,49 @@ class LocalStorageDevice:
         a file another instance re-claimed: the queue holds reserved pending delete names only.
         """
         with self._lock:
-            if not self._deferred:
-                return 0
-            reclaimed = 0
-            for relative, attempts in tuple(self._deferred.items()):
-                path = os.path.join(self._root, *relative.split("/"))
-                if not self._entry_present(path):
-                    # Checked before the attempt cap: a file that is already gone must be
-                    # retired from the queue, otherwise an operator reads a phantom forever.
-                    del self._deferred[relative]
-                    self._acknowledge_namespace(path)
-                    reclaimed += 1
-                    continue
-                if attempts >= MAX_PENDING_DELETE_ATTEMPTS and not force:
-                    continue
-                try:
-                    _remove_file(path)
-                except FileNotFoundError:
-                    del self._deferred[relative]
-                    self._acknowledge_namespace(path)
-                    reclaimed += 1
-                except OSError:
+            return self._retry_pending_deletes(force=force)
+
+    def _retry_pending_deletes(
+        self,
+        *,
+        force: bool = False,
+        namespace: str | None = None,
+    ) -> int:
+        """Retry queued names in one automatic namespace, or every name when explicitly asked."""
+        if not self._deferred:
+            return 0
+        reclaimed = 0
+        for relative, attempts in tuple(self._deferred.items()):
+            if namespace is not None and _deletion_namespace(relative) != namespace:
+                continue
+            path = os.path.join(self._root, *relative.split("/"))
+            if not self._entry_present(path):
+                # Checked before the attempt cap: a file that is already gone must be
+                # retired from the queue, otherwise an operator reads a phantom forever.
+                del self._deferred[relative]
+                self._acknowledge_namespace(path)
+                reclaimed += 1
+                continue
+            if attempts >= MAX_PENDING_DELETE_ATTEMPTS and not force:
+                continue
+            try:
+                _remove_file(path)
+            except FileNotFoundError:
+                del self._deferred[relative]
+                self._acknowledge_namespace(path)
+                reclaimed += 1
+            except OSError:
+                self._deferred[relative] = attempts + 1
+            else:
+                if self._entry_present(path):
+                    # The platform armed its own pending delete: the entry disappears when
+                    # the last handle closes, and the next pass will see it gone.
                     self._deferred[relative] = attempts + 1
                 else:
-                    if self._entry_present(path):
-                        # The platform armed its own pending delete: the entry disappears when
-                        # the last handle closes, and the next pass will see it gone.
-                        self._deferred[relative] = attempts + 1
-                    else:
-                        del self._deferred[relative]
-                        self._acknowledge_namespace(path)
-                        reclaimed += 1
-            return reclaimed
+                    del self._deferred[relative]
+                    self._acknowledge_namespace(path)
+                    reclaimed += 1
+        return reclaimed
 
     # --- paged space --------------------------------------------------------------------
 
@@ -1076,6 +1111,15 @@ class LocalStorageDevice:
                 # Closing our own handles is often what lets a queued deletion finally complete.
                 with contextlib.suppress(GrafxUnsupportedOperation):
                     self.retry_pending_deletes()
+            for descriptor in self._handles.values():
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+            self._handles.clear()
+            self._closed = True
+
+    def close_read_only(self) -> None:
+        """Close descriptors without driving the writable pending-deletion queue."""
+        with self._lock:
             for descriptor in self._handles.values():
                 with contextlib.suppress(OSError):
                     os.close(descriptor)

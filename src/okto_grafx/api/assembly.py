@@ -44,6 +44,7 @@ from typing import TypeVar, cast
 
 from okto_grafx.adapters.graph_guard import ConditionGuard
 from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
+from okto_grafx.adapters.storage_read_only import ReadOnlyStorageDevice
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
@@ -225,7 +226,10 @@ def assemble_database(
     ``owns_ports`` says whether this composition built the adapters. When it did, closing the
     database closes them; when the caller bound its own registry, they are left open.
     """
-    storage = _port(ports, "storage", StorageDevice)
+    raw_storage = _port(ports, "storage", StorageDevice)
+    storage: StorageDevice = (
+        ReadOnlyStorageDevice(raw_storage) if config.read_only else raw_storage
+    )
     clock = _port(ports, "clock", Clock)
     codec = _port(ports, "codec", PageCodec)
     # The shell, not the sink. A host-supplied sink may do anything at all, and the engine
@@ -247,7 +251,7 @@ def assemble_database(
     endpoint: str | None = None
     try:
         if owns_ports:
-            closers.append(_closer_for(storage))
+            closers.append(_closer_for(raw_storage, observational=config.read_only))
         # G7 and A51: registration is the authority, and a sink refuses an emission under a name
         # it was never given. Declaring the WHOLE frozen catalogue once, before anything can
         # emit, is belt and braces rather than the guarantee: the component that emits a metric
@@ -429,6 +433,7 @@ def assemble_database(
             reader_stall_threshold=config.reader_stall_threshold_seconds,
             descriptor=config.granularity_descriptor,
             index_sync=lambda: sync_indexes(existing_only=True),
+            writable=not config.read_only,
         )
         queries = QueryEngine(
             catalog=catalog,
@@ -1610,9 +1615,15 @@ def _start_publisher(
     return publisher.url, publisher.stop
 
 
-def _closer_for(instance: object) -> Callable[[], None]:
-    """Return a callable that closes an adapter, or one that does nothing when it has no close."""
-    closer = getattr(instance, "close", None)
+def _closer_for(
+    instance: object,
+    *,
+    observational: bool = False,
+) -> Callable[[], None]:
+    """Return the owned closer, avoiding writable housekeeping for observational opens."""
+    closer = getattr(instance, "close_read_only", None) if observational else None
+    if closer is None or not callable(closer):
+        closer = getattr(instance, "close", None)
     if closer is None or not callable(closer):
         return _nothing_to_close
     return closer
