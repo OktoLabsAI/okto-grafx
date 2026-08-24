@@ -124,6 +124,9 @@ _FIRST_OPEN_DIRECTORY: str = "bootstrap"
 _FIRST_OPEN_INTENT: str = f"{_FIRST_OPEN_DIRECTORY}/first-open.intent"
 """Durable identity of an interrupted first open."""
 
+_FIRST_OPEN_INTENT_STAGING: str = f"{_FIRST_OPEN_INTENT}.staging"
+"""Unpublished intent bytes; safe to discard before any final file exists."""
+
 _FIRST_OPEN_META_STAGING: str = f"{_FIRST_OPEN_DIRECTORY}/grafx.meta.staging"
 """Complete identity page before its atomic publication."""
 
@@ -144,6 +147,26 @@ _FIRST_OPEN_INTENT_HEAD: struct.Struct = struct.Struct("<8sHH")
 
 _FIRST_OPEN_INTENT_TAIL: struct.Struct = struct.Struct("<I")
 """CRC-32C over the intent header and encoded identity."""
+
+_FIRST_OPEN_IDENTITY_MAX_BYTES: int = 0xFFFF
+"""Hard bound imposed by the intent's unsigned 16-bit identity length."""
+
+_FIRST_OPEN_INTENT_MAX_BYTES: int = (
+    _FIRST_OPEN_INTENT_HEAD.size
+    + _FIRST_OPEN_IDENTITY_MAX_BYTES
+    + _FIRST_OPEN_INTENT_TAIL.size
+)
+"""Largest read the intent decoder can ever ask a storage adapter to serve."""
+
+_FIRST_OPEN_STAGING_FILES: frozenset[str] = frozenset(
+    {
+        _FIRST_OPEN_INTENT_STAGING,
+        _FIRST_OPEN_META_STAGING,
+        _FIRST_OPEN_CATALOG_STAGING,
+        _FIRST_OPEN_HEAP_STAGING,
+    }
+)
+"""Names this protocol may retire as unpublished debris on an otherwise empty path."""
 
 _Port = TypeVar("_Port")
 """The protocol a port slot is read back as."""
@@ -725,22 +748,165 @@ def _open_identity(
     with coordinator.exclusive(
         _FIRST_OPEN_SECTION, timeout=config.commit_lock_timeout_seconds
     ):
-        # Readers take the same section even though they mutate no data file.  atomic_replace
-        # makes a complete final VISIBLE before the global barrier makes it DURABLE; without
-        # this wait a read-only open could observe all three final names in that interval and be
-        # handed to its caller while a power loss could still take the database back.
-        if config.read_only:
-            return _read_existing_identity(config, storage, meta)
+        # Readers take the same section even though they mutate no data file.  More importantly,
+        # they classify the intent BEFORE opening grafx.meta: atomic_replace makes complete
+        # finals visible before the global barrier makes the publication durable.  A creator
+        # that dies in that interval releases this section but leaves the intent as the durable
+        # authority; a reader must refuse it rather than interpret the visible meta page.
         intent = _read_first_open_intent(storage)
-        if intent is None and storage.exists(META_FILE):
+        if config.read_only:
+            if intent is not None:
+                _refuse_pending_first_open(config)
+            _require_no_bootstrap_orphan_for_read_only(config, storage)
             return _read_existing_identity(config, storage, meta)
+
         if intent is None:
+            bootstrap_files = _bootstrap_files(storage)
+            if bootstrap_files and (
+                _database_files_without_identity(storage)
+                or storage.exists(COMMIT_STATE_FILE)
+            ):
+                _require_no_bootstrap_without_intent(storage, bootstrap_files)
+            if storage.exists(META_FILE):
+                return _read_existing_identity(config, storage, meta)
             _require_no_database_without_identity(storage)
+            _retire_unpublished_bootstrap(storage, bootstrap_files)
             intent = _configured_identity(config, clock)
             _write_first_open_intent(storage, intent)
+        else:
+            _require_known_bootstrap_with_intent(storage)
+            _retire_duplicate_intent_staging(storage, intent)
         _require_identity_configuration(config, intent)
         _resume_first_open(storage, pool, intent)
         return intent
+
+
+def _refuse_pending_first_open(config: DatabaseConfig) -> None:
+    """Keep read-only inspection behind a still-authoritative first-open intent."""
+    raise GrafxUnsupportedOperation(
+        f"The database at {config.path!r} has a durable first-open intent. A writable open "
+        "must finish or diagnose that publication before read-only can observe its files.",
+        path=config.path,
+        file=_FIRST_OPEN_INTENT,
+        field="first_open_intent",
+        state="publication_pending",
+        repairable=True,
+    )
+
+
+def _bootstrap_files(storage: StorageDevice) -> tuple[str, ...]:
+    """Return all private first-open names, including unknown evidence."""
+    return storage.list_files(f"{_FIRST_OPEN_DIRECTORY}/")
+
+
+def _require_no_bootstrap_orphan_for_read_only(
+    config: DatabaseConfig, storage: StorageDevice
+) -> None:
+    """Refuse unpublished bootstrap evidence without changing one byte or name.
+
+    A partial intent staging file is decoded through the same bounded reader as the canonical
+    intent.  Thus damaged staging is reported as damage rather than silently collapsed into
+    absence; valid staging is still unpublished and receives the repairable refusal below.
+    """
+    files = _bootstrap_files(storage)
+    if not files:
+        return
+    if _FIRST_OPEN_INTENT_STAGING in files:
+        _read_first_open_intent_file(storage, _FIRST_OPEN_INTENT_STAGING)
+    raise GrafxUnsupportedOperation(
+        f"The database at {config.path!r} has unpublished first-open staging files. A writable "
+        "open must retire or resume them before read-only can observe the path.",
+        path=config.path,
+        file=files[0],
+        files=files,
+        field="bootstrap_orphan",
+        state="unpublished_staging",
+        repairable=True,
+    )
+
+
+def _require_no_bootstrap_without_intent(
+    storage: StorageDevice, files: tuple[str, ...]
+) -> None:
+    """Never hide orphan bootstrap evidence behind a published identity."""
+    if not files:
+        return
+    raise GrafxCorruptionDetected(
+        "Database state coexists with bootstrap staging but no canonical first-open "
+        "intent. The staging may be authoritative restore evidence and will not be discarded.",
+        file=files[0],
+        files=files,
+        field="bootstrap_orphan",
+        state="published_without_intent",
+        repairable=False,
+    )
+
+
+def _require_known_bootstrap_with_intent(storage: StorageDevice) -> None:
+    """Refuse foreign names even while a canonical intent authorises known staging."""
+    files = _bootstrap_files(storage)
+    allowed = _FIRST_OPEN_STAGING_FILES | {_FIRST_OPEN_INTENT}
+    unknown = tuple(name for name in files if name not in allowed)
+    if not unknown:
+        return
+    raise GrafxCorruptionDetected(
+        "A first-open intent coexists with unknown private bootstrap files. The intent cannot "
+        "authorise deleting or ignoring possible restore/operator evidence.",
+        file=unknown[0],
+        files=files,
+        field="bootstrap_orphan",
+        state="unknown_with_intent",
+        repairable=False,
+    )
+
+
+def _retire_unpublished_bootstrap(
+    storage: StorageDevice, files: tuple[str, ...]
+) -> None:
+    """Durably discard only recognised staging on a path proved otherwise empty.
+
+    This is the retry path for a crash after creating or partly appending the intent staging
+    file.  Unknown names are preserved as possible operator/restore evidence.  The caller has
+    already proved that no final or transaction state exists, so recognised names cannot have
+    become authoritative.
+    """
+    if not files:
+        return
+    unknown = tuple(name for name in files if name not in _FIRST_OPEN_STAGING_FILES)
+    if unknown:
+        raise GrafxCorruptionDetected(
+            "The private bootstrap namespace contains files this first-open protocol does not "
+            "own; they will not be discarded or treated as an empty database.",
+            file=unknown[0],
+            files=files,
+            field="bootstrap_orphan",
+            state="unknown_staging",
+            repairable=False,
+        )
+    for name in files:
+        storage.remove(name)
+    # Removal is a namespace mutation.  On POSIX the storage adapter retains the nested
+    # bootstrap directory as a barrier debt even though no file descriptor remains.
+    storage.durable_barrier(None)
+
+
+def _retire_duplicate_intent_staging(
+    storage: StorageDevice, canonical: DatabaseIdentity
+) -> None:
+    """Retire a byte-equivalent duplicate staging intent, refusing every divergence."""
+    if not storage.exists(_FIRST_OPEN_INTENT_STAGING):
+        return
+    staged = _read_first_open_intent_file(storage, _FIRST_OPEN_INTENT_STAGING)
+    if staged != canonical:
+        raise GrafxCorruptionDetected(
+            "Canonical and staging first-open intents name different database identities; "
+            "neither will be overwritten or discarded.",
+            file=_FIRST_OPEN_INTENT_STAGING,
+            field="identity",
+            state="divergent_intent_staging",
+        )
+    storage.remove(_FIRST_OPEN_INTENT_STAGING)
+    storage.durable_barrier(None)
 
 
 def _read_existing_identity(
@@ -820,6 +986,13 @@ def _require_identity_configuration(
 def _encode_first_open_intent(identity: DatabaseIdentity) -> bytes:
     """Encode a versioned, checksummed first-open intent carrying the future UUID."""
     encoded_identity = identity.encode()
+    if len(encoded_identity) > _FIRST_OPEN_IDENTITY_MAX_BYTES:
+        raise GrafxConfigurationError(
+            "The encoded database identity is too large for a first-open intent.",
+            field="granularity_descriptor",
+            value=len(encoded_identity),
+            maximum=_FIRST_OPEN_IDENTITY_MAX_BYTES,
+        )
     head = _FIRST_OPEN_INTENT_HEAD.pack(
         _FIRST_OPEN_INTENT_MAGIC,
         _FIRST_OPEN_INTENT_VERSION,
@@ -829,21 +1002,32 @@ def _encode_first_open_intent(identity: DatabaseIdentity) -> bytes:
     return body + _FIRST_OPEN_INTENT_TAIL.pack(crc32c(body))
 
 
-def _decode_first_open_intent(raw: bytes) -> DatabaseIdentity:
+def _decode_first_open_intent(
+    raw: bytes, *, file: str = _FIRST_OPEN_INTENT
+) -> DatabaseIdentity:
     """Decode one exact first-open intent, refusing truncation, extensions and damage."""
     minimum = _FIRST_OPEN_INTENT_HEAD.size + _FIRST_OPEN_INTENT_TAIL.size
     if len(raw) < minimum:
         raise GrafxCorruptionDetected(
             f"The first-open intent is at least {minimum} bytes; this one holds {len(raw)}.",
-            file=_FIRST_OPEN_INTENT,
+            file=file,
             field="length",
             value=len(raw),
+        )
+    if len(raw) > _FIRST_OPEN_INTENT_MAX_BYTES:
+        raise GrafxCorruptionDetected(
+            f"A first-open intent can hold at most {_FIRST_OPEN_INTENT_MAX_BYTES} bytes; "
+            f"this one holds {len(raw)}.",
+            file=file,
+            field="length",
+            value=len(raw),
+            maximum=_FIRST_OPEN_INTENT_MAX_BYTES,
         )
     magic, version, identity_length = _FIRST_OPEN_INTENT_HEAD.unpack_from(raw, 0)
     if magic != _FIRST_OPEN_INTENT_MAGIC:
         raise GrafxCorruptionDetected(
             "The first-open intent carries a foreign magic and cannot authorise publication.",
-            file=_FIRST_OPEN_INTENT,
+            file=file,
             field="magic",
             value=repr(magic),
         )
@@ -851,7 +1035,7 @@ def _decode_first_open_intent(raw: bytes) -> DatabaseIdentity:
         raise GrafxSchemaVersionMismatch(
             f"The first-open intent uses format {version}; this build reads up to "
             f"{_FIRST_OPEN_INTENT_VERSION}.",
-            file=_FIRST_OPEN_INTENT,
+            file=file,
             field="format_version",
             value=version,
             supported=_FIRST_OPEN_INTENT_VERSION,
@@ -859,7 +1043,7 @@ def _decode_first_open_intent(raw: bytes) -> DatabaseIdentity:
     if version != _FIRST_OPEN_INTENT_VERSION:
         raise GrafxCorruptionDetected(
             f"The first-open intent uses invalid format version {version}.",
-            file=_FIRST_OPEN_INTENT,
+            file=file,
             field="format_version",
             value=version,
         )
@@ -870,7 +1054,7 @@ def _decode_first_open_intent(raw: bytes) -> DatabaseIdentity:
         raise GrafxCorruptionDetected(
             f"The first-open intent declares {identity_length} identity bytes and therefore "
             f"must hold {expected} bytes; it holds {len(raw)}.",
-            file=_FIRST_OPEN_INTENT,
+            file=file,
             field="length",
             value=len(raw),
             expected=expected,
@@ -880,7 +1064,7 @@ def _decode_first_open_intent(raw: bytes) -> DatabaseIdentity:
     if stored_checksum != observed_checksum:
         raise GrafxCorruptionDetected(
             "The checksum of the first-open intent does not match its bytes.",
-            file=_FIRST_OPEN_INTENT,
+            file=file,
             field="crc32c",
             value=stored_checksum,
             observed=observed_checksum,
@@ -890,7 +1074,7 @@ def _decode_first_open_intent(raw: bytes) -> DatabaseIdentity:
     if identity.encode() != encoded_identity:
         raise GrafxCorruptionDetected(
             "The first-open intent carries non-canonical identity bytes.",
-            file=_FIRST_OPEN_INTENT,
+            file=file,
             field="identity",
         )
     return identity
@@ -900,28 +1084,136 @@ def _read_first_open_intent(storage: StorageDevice) -> DatabaseIdentity | None:
     """Return the durable first-open identity, or None only when its name is absent."""
     if not storage.exists(_FIRST_OPEN_INTENT):
         return None
-    size = storage.log_size(_FIRST_OPEN_INTENT)
-    return _decode_first_open_intent(
-        storage.read_log(_FIRST_OPEN_INTENT, 0, size)
+    return _read_first_open_intent_file(storage, _FIRST_OPEN_INTENT)
+
+
+def _read_first_open_intent_file(
+    storage: StorageDevice, file: str
+) -> DatabaseIdentity:
+    """Read one intent with a hard bound proved from its fixed header first.
+
+    ``log_size`` is metadata, not a read request.  No value obtained from it is ever handed
+    directly to ``read_log``: the fixed-size header is read first, its unsigned length is
+    checked against the protocol maximum and against the exact file size, and only that bounded
+    expected length is requested.  A hostile multi-gigabyte file therefore costs one stat and
+    no multi-gigabyte allocation.
+    """
+    size = storage.log_size(file)
+    minimum = _FIRST_OPEN_INTENT_HEAD.size + _FIRST_OPEN_INTENT_TAIL.size
+    if size < minimum or size > _FIRST_OPEN_INTENT_MAX_BYTES:
+        raise GrafxCorruptionDetected(
+            f"A first-open intent must hold between {minimum} and "
+            f"{_FIRST_OPEN_INTENT_MAX_BYTES} bytes; this one holds {size}.",
+            file=file,
+            field="length",
+            value=size,
+            minimum=minimum,
+            maximum=_FIRST_OPEN_INTENT_MAX_BYTES,
+        )
+    header = storage.read_log(file, 0, _FIRST_OPEN_INTENT_HEAD.size)
+    if len(header) != _FIRST_OPEN_INTENT_HEAD.size:
+        raise GrafxCorruptionDetected(
+            "The first-open intent header could not be read in full.",
+            file=file,
+            field="length",
+            value=len(header),
+            expected=_FIRST_OPEN_INTENT_HEAD.size,
+        )
+    magic, version, identity_length = _FIRST_OPEN_INTENT_HEAD.unpack(header)
+    if magic != _FIRST_OPEN_INTENT_MAGIC:
+        raise GrafxCorruptionDetected(
+            "The first-open intent carries a foreign magic and cannot authorise publication.",
+            file=file,
+            field="magic",
+            value=repr(magic),
+        )
+    if version > _FIRST_OPEN_INTENT_VERSION:
+        raise GrafxSchemaVersionMismatch(
+            f"The first-open intent uses format {version}; this build reads up to "
+            f"{_FIRST_OPEN_INTENT_VERSION}.",
+            file=file,
+            field="format_version",
+            value=version,
+            supported=_FIRST_OPEN_INTENT_VERSION,
+        )
+    if version != _FIRST_OPEN_INTENT_VERSION:
+        raise GrafxCorruptionDetected(
+            f"The first-open intent uses invalid format version {version}.",
+            file=file,
+            field="format_version",
+            value=version,
+        )
+    if identity_length > _FIRST_OPEN_IDENTITY_MAX_BYTES:  # defensive: the field is u16
+        raise GrafxCorruptionDetected(
+            "The first-open intent declares an identity beyond the protocol bound.",
+            file=file,
+            field="identity_length",
+            value=identity_length,
+            maximum=_FIRST_OPEN_IDENTITY_MAX_BYTES,
+        )
+    expected = (
+        _FIRST_OPEN_INTENT_HEAD.size
+        + identity_length
+        + _FIRST_OPEN_INTENT_TAIL.size
     )
+    if size != expected:
+        raise GrafxCorruptionDetected(
+            f"The first-open intent declares {identity_length} identity bytes and therefore "
+            f"must hold {expected} bytes; it holds {size}.",
+            file=file,
+            field="length",
+            value=size,
+            expected=expected,
+        )
+    raw = storage.read_log(file, 0, expected)
+    if len(raw) != expected:
+        raise GrafxCorruptionDetected(
+            "The first-open intent changed or was truncated while it was being read.",
+            file=file,
+            field="length",
+            value=len(raw),
+            expected=expected,
+        )
+    return _decode_first_open_intent(raw, file=file)
 
 
 def _write_first_open_intent(
     storage: StorageDevice, identity: DatabaseIdentity
 ) -> None:
-    """Create and barrier the intent before any authoritative database file is published."""
+    """Durably stage then atomically publish intent before any authoritative file."""
     payload = _encode_first_open_intent(identity)
-    storage.create(_FIRST_OPEN_INTENT)
-    terminal = storage.append_log(_FIRST_OPEN_INTENT, payload)
+    if storage.exists(_FIRST_OPEN_INTENT):
+        raise GrafxCorruptionDetected(
+            "A first-open intent already exists and will not be overwritten.",
+            file=_FIRST_OPEN_INTENT,
+            field="first_open_intent",
+            state="already_published",
+        )
+    storage.create(_FIRST_OPEN_INTENT_STAGING)
+    terminal = storage.append_log(_FIRST_OPEN_INTENT_STAGING, payload)
     if terminal != len(payload):
         raise GrafxCorruptionDetected(
             f"The first-open intent append reported terminal offset {terminal}; "
             f"{len(payload)} was required.",
-            file=_FIRST_OPEN_INTENT,
+            file=_FIRST_OPEN_INTENT_STAGING,
             field="terminal_offset",
             value=terminal,
             expected=len(payload),
         )
+    storage.durable_barrier(_FIRST_OPEN_INTENT_STAGING)
+    # The section is the engine-level exclusion.  This second observation is a fail-closed
+    # guard against an out-of-band restore racing the device namespace.
+    if storage.exists(_FIRST_OPEN_INTENT):
+        raise GrafxCorruptionDetected(
+            "A first-open intent appeared while its staging payload was being prepared; "
+            "neither name will be overwritten.",
+            file=_FIRST_OPEN_INTENT,
+            field="first_open_intent",
+            state="publication_race",
+        )
+    storage.atomic_replace(_FIRST_OPEN_INTENT_STAGING, _FIRST_OPEN_INTENT)
+    # Pins both the already-fsynced payload under its canonical name and the nested directory
+    # rename.  No final database file is allowed to appear before this returns.
     storage.durable_barrier(_FIRST_OPEN_INTENT)
 
 

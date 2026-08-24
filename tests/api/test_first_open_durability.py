@@ -38,7 +38,11 @@ from okto_grafx.adapters.storage_fault import (
     SimulatedCrash,
 )
 from okto_grafx.api import assembly
-from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxError
+from okto_grafx.domain.errors import (
+    GrafxCorruptionDetected,
+    GrafxError,
+    GrafxUnsupportedOperation,
+)
 from okto_grafx.engine.catalog_store import CATALOG_FILE
 from okto_grafx.engine.database import META_FILE
 from okto_grafx.engine.heap_store import HEAP_FILE
@@ -71,6 +75,52 @@ class _BlockingPublicationStorage(FaultInjectingStorageDevice):
             if not self.allow_publication_barrier.wait(30.0):
                 raise AssertionError("the test never released the first-open publication barrier")
         super().durable_barrier(file)
+
+
+class _CreatorDied(BaseException):
+    """Process death without a power loss; kernel-visible dirty bytes remain visible."""
+
+
+class _DieBeforePublicationBarrierStorage(_BlockingPublicationStorage):
+    """Abandon the creator after all finals are visible but before their global barrier."""
+
+    def durable_barrier(self, file: str | None = None) -> None:
+        finals = {META_FILE, CATALOG_FILE, HEAP_FILE}
+        if file is None and self._published == finals and not self._blocked:
+            self._blocked = True
+            self.publication_visible.set()
+            raise _CreatorDied("the first-open creator process died")
+        FaultInjectingStorageDevice.durable_barrier(self, file)
+
+
+class _DieAfterIntentStagingStorage(FaultInjectingStorageDevice):
+    """Leave the exact process-crash debris of create or append for a writable retry."""
+
+    def __init__(self, inner: Any, operation: str) -> None:
+        super().__init__(inner, seed=1)
+        self._operation = operation
+        self._died = False
+
+    def create(self, file: str, *, exclusive: bool = True) -> None:
+        super().create(file, exclusive=exclusive)
+        if (
+            not self._died
+            and self._operation == "create"
+            and file == assembly._FIRST_OPEN_INTENT_STAGING
+        ):
+            self._died = True
+            raise _CreatorDied("creator died after creating intent staging")
+
+    def append_log(self, file: str, payload: bytes) -> int:
+        terminal = super().append_log(file, payload)
+        if (
+            not self._died
+            and self._operation == "append_log"
+            and file == assembly._FIRST_OPEN_INTENT_STAGING
+        ):
+            self._died = True
+            raise _CreatorDied("creator died after appending intent staging")
+        return terminal
 
 
 def _volatile_data_files(bench: Any) -> tuple[str, ...]:
@@ -200,6 +250,184 @@ def test_read_only_waits_until_visible_first_open_files_are_durable(
     release_ports(registry)
 
 
+def test_read_only_refuses_a_dead_creator_before_reading_visible_finals() -> None:
+    """A valid intent outranks three visible-but-unbarriered final names.
+
+    Process death releases FIRST_OPEN_SECTION without rolling kernel caches back.  The next
+    read-only participant therefore can see all three complete final payloads, but must inspect
+    the still-durable intent first and refuse without changing any byte.  A writable retry is
+    the only participant allowed to finish this recoverable publication.
+    """
+    config = DatabaseConfig(path=":memory:")
+    registry = build_default_registry(config)
+    inner = registry.get("storage")
+    storage = _DieBeforePublicationBarrierStorage(inner)
+    storage.start_reordering()
+    registry.bind("storage", storage)
+
+    with pytest.raises(_CreatorDied):
+        connect(":memory:", registry=registry)
+    finals = (META_FILE, CATALOG_FILE, HEAP_FILE)
+    assert all(inner.exists(name) for name in finals)
+    assert set(finals).issubset(storage.volatile_files())
+    before = {
+        name: file_bytes(inner, name)
+        for name in (*finals, assembly._FIRST_OPEN_INTENT)
+    }
+    storage.clear_trail()
+
+    with pytest.raises(GrafxUnsupportedOperation) as raised:
+        connect(":memory:", registry=registry, read_only=True)
+    after = {
+        name: file_bytes(inner, name)
+        for name in (*finals, assembly._FIRST_OPEN_INTENT)
+    }
+    assert raised.value.details["field"] == "first_open_intent"
+    assert raised.value.details["repairable"] is True
+    assert after == before
+    assert not any(
+        record.file == META_FILE and record.method in {"page_count", "read_page"}
+        for record in storage.trail()
+    ), "read-only opened the visible identity page before classifying the intent"
+
+    with connect(":memory:", registry=registry) as recovered:
+        assert recovered.verify("all").findings == ()
+    assert not inner.exists(assembly._FIRST_OPEN_INTENT)
+    release_ports(registry)
+
+
+def test_read_only_validates_damaged_intent_before_visible_meta() -> None:
+    """A damaged intent is corruption even when every final name is already visible."""
+    config = DatabaseConfig(path=":memory:")
+    registry = build_default_registry(config)
+    inner = registry.get("storage")
+    storage = _DieBeforePublicationBarrierStorage(inner)
+    registry.bind("storage", storage)
+    with pytest.raises(_CreatorDied):
+        connect(":memory:", registry=registry)
+
+    intent = bytearray(file_bytes(inner, assembly._FIRST_OPEN_INTENT) or b"")
+    intent[-1] ^= 0x01
+    inner.truncate_log(assembly._FIRST_OPEN_INTENT, 0)
+    inner.append_log(assembly._FIRST_OPEN_INTENT, bytes(intent))
+    inner.durable_barrier(assembly._FIRST_OPEN_INTENT)
+    finals = (META_FILE, CATALOG_FILE, HEAP_FILE)
+    before = {
+        name: file_bytes(inner, name)
+        for name in (*finals, assembly._FIRST_OPEN_INTENT)
+    }
+    storage.clear_trail()
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        connect(":memory:", registry=registry, read_only=True)
+    after = {
+        name: file_bytes(inner, name)
+        for name in (*finals, assembly._FIRST_OPEN_INTENT)
+    }
+    assert raised.value.details["field"] == "crc32c"
+    assert after == before
+    assert not any(
+        record.file == META_FILE and record.method in {"page_count", "read_page"}
+        for record in storage.trail()
+    )
+    release_ports(registry)
+
+
+@pytest.mark.parametrize("operation", ["create", "append_log"])
+def test_writable_retry_discards_only_unpublished_partial_intent_staging(
+    operation: str,
+) -> None:
+    """Process death before intent publication cannot strand an otherwise empty path."""
+    config = DatabaseConfig(path=":memory:")
+    registry = build_default_registry(config)
+    inner = registry.get("storage")
+    storage = _DieAfterIntentStagingStorage(inner, operation)
+    registry.bind("storage", storage)
+
+    with pytest.raises(_CreatorDied):
+        connect(":memory:", registry=registry)
+    assert inner.exists(assembly._FIRST_OPEN_INTENT_STAGING)
+    assert not any(inner.exists(name) for name in (META_FILE, CATALOG_FILE, HEAP_FILE))
+
+    with connect(":memory:", registry=registry) as recovered:
+        assert recovered.verify("all").findings == ()
+    assert not inner.exists(assembly._FIRST_OPEN_INTENT_STAGING)
+    assert not inner.exists(assembly._FIRST_OPEN_INTENT)
+    release_ports(registry)
+
+
+def test_read_only_preserves_and_refuses_partial_intent_staging() -> None:
+    """Read-only never performs the cleanup writable retry is authorised to perform."""
+    config = DatabaseConfig(path=":memory:")
+    registry = build_default_registry(config)
+    inner = registry.get("storage")
+    inner.create(assembly._FIRST_OPEN_INTENT_STAGING)
+    inner.append_log(assembly._FIRST_OPEN_INTENT_STAGING, b"partial")
+    inner.durable_barrier(assembly._FIRST_OPEN_INTENT_STAGING)
+    before = file_bytes(inner, assembly._FIRST_OPEN_INTENT_STAGING)
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        connect(":memory:", registry=registry, read_only=True)
+    assert raised.value.details["field"] == "length"
+    assert file_bytes(inner, assembly._FIRST_OPEN_INTENT_STAGING) == before
+    release_ports(registry)
+
+
+def test_unknown_bootstrap_orphan_is_not_misclassified_as_an_empty_path() -> None:
+    """Only protocol-owned unpublished debris is eligible for automatic retirement."""
+    registry, _bench, inner = bench_registry(1)
+    orphan = "bootstrap/operator-restore.evidence"
+    inner.create(orphan)
+    inner.append_log(orphan, b"possibly authoritative")
+    inner.durable_barrier(orphan)
+    before = file_bytes(inner, orphan)
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        connect(":memory:", registry=registry)
+    assert raised.value.details["field"] == "bootstrap_orphan"
+    assert raised.value.details["state"] == "unknown_staging"
+    assert file_bytes(inner, orphan) == before
+    assert not inner.exists(assembly._FIRST_OPEN_INTENT)
+    assert not any(inner.exists(name) for name in (META_FILE, CATALOG_FILE, HEAP_FILE))
+    release_ports(registry)
+
+
+def test_bootstrap_orphan_beside_published_database_is_never_retired() -> None:
+    """A final identity removes the proof that any bootstrap payload is expendable."""
+    registry, _bench, inner = bench_registry(1)
+    with connect(":memory:", registry=registry) as database:
+        identity = database.identity
+    payload = assembly._encode_first_open_intent(identity)
+    inner.create(assembly._FIRST_OPEN_INTENT_STAGING)
+    inner.append_log(assembly._FIRST_OPEN_INTENT_STAGING, payload)
+    inner.durable_barrier(assembly._FIRST_OPEN_INTENT_STAGING)
+    before = {
+        name: file_bytes(inner, name)
+        for name in (
+            META_FILE,
+            CATALOG_FILE,
+            HEAP_FILE,
+            assembly._FIRST_OPEN_INTENT_STAGING,
+        )
+    }
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        connect(":memory:", registry=registry)
+    after = {
+        name: file_bytes(inner, name)
+        for name in (
+            META_FILE,
+            CATALOG_FILE,
+            HEAP_FILE,
+            assembly._FIRST_OPEN_INTENT_STAGING,
+        )
+    }
+    assert raised.value.details["field"] == "bootstrap_orphan"
+    assert raised.value.details["state"] == "published_without_intent"
+    assert after == before
+    release_ports(registry)
+
+
 def test_an_interrupted_intent_cannot_overwrite_a_database_with_history() -> None:
     registry, bench, inner = bench_registry(1)
     database = connect(":memory:", registry=registry)
@@ -243,6 +471,75 @@ def test_a_damaged_intent_is_never_interpreted_as_an_absent_intent() -> None:
     assert not inner.exists(META_FILE)
     assert not inner.exists(CATALOG_FILE)
     assert not inner.exists(HEAP_FILE)
+    release_ports(registry)
+
+
+def test_intent_publication_stages_complete_bytes_before_the_canonical_rename() -> None:
+    """The canonical name is an atomic publication of a barriered complete payload."""
+    registry, bench, inner = bench_registry(1)
+    identity = assembly._configured_identity(
+        DatabaseConfig(path=":memory:"), registry.get("clock")
+    )
+    payload = assembly._encode_first_open_intent(identity)
+    bench.clear_trail()
+
+    assembly._write_first_open_intent(bench, identity)
+
+    assert file_bytes(inner, assembly._FIRST_OPEN_INTENT) == payload
+    assert not inner.exists(assembly._FIRST_OPEN_INTENT_STAGING)
+    assert [
+        (record.method, record.file)
+        for record in bench.trail()
+    ] == [
+        ("exists", assembly._FIRST_OPEN_INTENT),
+        ("create", assembly._FIRST_OPEN_INTENT_STAGING),
+        ("append_log", assembly._FIRST_OPEN_INTENT_STAGING),
+        ("durable_barrier", assembly._FIRST_OPEN_INTENT_STAGING),
+        ("exists", assembly._FIRST_OPEN_INTENT),
+        ("atomic_replace", assembly._FIRST_OPEN_INTENT_STAGING),
+        ("durable_barrier", assembly._FIRST_OPEN_INTENT),
+    ]
+    release_ports(registry)
+
+
+def test_oversized_intent_is_refused_without_requesting_its_payload() -> None:
+    """The on-disk length is never trusted as a read/allocation size."""
+    registry, bench, inner = bench_registry(1)
+    inner.create(assembly._FIRST_OPEN_INTENT)
+    inner.append_log(
+        assembly._FIRST_OPEN_INTENT,
+        bytes(assembly._FIRST_OPEN_INTENT_MAX_BYTES + 1),
+    )
+    inner.durable_barrier(assembly._FIRST_OPEN_INTENT)
+    bench.clear_trail()
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        assembly._read_first_open_intent(bench)
+    assert raised.value.details["field"] == "length"
+    assert not bench.calls_of("read_log")
+    release_ports(registry)
+
+
+def test_intent_declared_length_is_checked_after_only_the_fixed_header() -> None:
+    """An extension cannot turn its file size into the decoder's second read request."""
+    registry, bench, inner = bench_registry(1)
+    header = assembly._FIRST_OPEN_INTENT_HEAD.pack(
+        assembly._FIRST_OPEN_INTENT_MAGIC,
+        assembly._FIRST_OPEN_INTENT_VERSION,
+        1,
+    )
+    payload = header + bytes(64)
+    inner.create(assembly._FIRST_OPEN_INTENT)
+    inner.append_log(assembly._FIRST_OPEN_INTENT, payload)
+    inner.durable_barrier(assembly._FIRST_OPEN_INTENT)
+    bench.clear_trail()
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        assembly._read_first_open_intent(bench)
+    reads = bench.calls_of("read_log")
+    assert raised.value.details["field"] == "length"
+    assert len(reads) == 1
+    assert f"length={assembly._FIRST_OPEN_INTENT_HEAD.size}" in reads[0].args_summary
     release_ports(registry)
 
 
@@ -341,12 +638,26 @@ def test_a_retry_refuses_one_divergent_byte_without_overwriting_any_final() -> N
     release_ports(registry)
 
 
-def test_a_crash_at_every_write_point_of_the_first_open_leaves_a_path_that_opens_or_refuses() -> (
-    None
-):
+def test_a_power_loss_at_every_first_open_write_point_makes_writable_progress() -> None:
+    """Every protocol crash window converges; a generic typed refusal is not success."""
     registry, bench, _inner = bench_registry(1)
-    points = bench.enumerate_write_points(lambda device: _open_and_close(registry))
+    surveyed = bench.enumerate_write_points(lambda device: _open_and_close(registry))
     release_ports(registry)
+    intent_remove = next(
+        point
+        for point in surveyed
+        if point.method == "remove" and point.file == assembly._FIRST_OPEN_INTENT
+    )
+    retirement = next(
+        point
+        for point in surveyed
+        if point.call_index > intent_remove.call_index
+        and point.method == "durable_barrier"
+        and point.file is None
+    )
+    points = tuple(
+        point for point in surveyed if point.call_index <= retirement.call_index
+    )
     assert len(points) >= 3, points
 
     outcomes: dict[str, str] = {}
@@ -382,11 +693,10 @@ def test_a_crash_at_every_write_point_of_the_first_open_leaves_a_path_that_opens
                     f"{getattr(report, 'outcome', report)}"
                 )
         release_ports(registry)
-    assert crashed >= 1, outcomes  # A72: the matrix really cut the first open off
+    assert crashed == len(points), outcomes  # every selected point was really exercised
     bad = {
         key: value
         for key, value in outcomes.items()
-        if value.startswith("died")
-        or (value.startswith("opened") and ":verify=0:" not in value)
+        if not value.startswith("opened") or ":verify=0:" not in value
     }
     assert not bad, {"bad": bad, "all": outcomes}
