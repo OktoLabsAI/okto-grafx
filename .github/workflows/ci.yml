@@ -230,7 +230,11 @@ jobs:
   calibration:
     name: D5 ceilings (${{ matrix.family }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # C13: the weekly FULL recall profile builds an 8192x384 HNSW in pure Python -- measured
+    # locally above 50 minutes on a machine faster than these runners -- so the scheduled run
+    # gets 180 minutes while pushes and pull requests (smoke profile) keep the original 60.
+    # The worker's own internal timeout stays the inner safety net either way.
+    timeout-minutes: ${{ github.event_name == 'schedule' && 180 || 60 }}
     strategy:
       fail-fast: false
       matrix:
@@ -272,8 +276,15 @@ jobs:
         # first, the gauge into the metrics document LAST (an interrupted run leaves
         # section-without-gauge, which --require-recall below reads as UNMEASURED).
         # Pushes run the smoke profile; the weekly schedule runs the full numpy oracle.
+        env:
+          RECALL_PROFILE: ${{ github.event_name == 'schedule' && 'full' || 'smoke' }}
         run: |
-          python -m bench.harness.recall_wiring             --profile ${{ github.event_name == 'schedule' && 'full' || 'smoke' }}             --gt auto             --out calibration-${{ matrix.family }}.json             --metrics metrics-${{ matrix.family }}.json             --workspace .recall-workspace
+          python -m bench.harness.recall_wiring \
+            --profile "$RECALL_PROFILE" \
+            --gt auto \
+            --out "calibration-${{ matrix.family }}.json" \
+            --metrics "metrics-${{ matrix.family }}.json" \
+            --workspace .recall-workspace
 
       - name: Apply the D5 ceilings to the PUBLISHED metric
         shell: bash
