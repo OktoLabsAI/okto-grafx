@@ -200,7 +200,9 @@ def run_baseline(
     if not samples:
         return (
             from_samples(
-                f"ladybug {operation}", (), unmeasured="the baseline worker kept no sample"
+                f"ladybug {operation}",
+                (),
+                unmeasured="the baseline worker kept no sample",
             ),
             payload,
         )
@@ -246,14 +248,20 @@ def calibrate(
         grafx_root, iterations=iterations, warmup=warmup
     )
     subject_read = grafx_ops.measure_point_read(
-        grafx_root, iterations=max(iterations, 200), warmup=max(warmup, 50), rows=read_rows
+        grafx_root,
+        iterations=max(iterations, 200),
+        warmup=max(warmup, 50),
+        rows=read_rows,
     )
     subject_replay = grafx_ops.measure_open_with_replay(
         grafx_root, iterations=iterations, warmup=warmup, records=replay_records
     )
 
     baseline_commit, _ = run_baseline(
-        "durable_commit", root=baseline_root / "commit", iterations=iterations, warmup=warmup
+        "durable_commit",
+        root=baseline_root / "commit",
+        iterations=iterations,
+        warmup=warmup,
     )
     baseline_read, _ = run_baseline(
         "point_read",
@@ -290,7 +298,12 @@ def calibrate(
         )
 
     ratios = (
-        ratio("durable_commit", CEILINGS["durable_commit"], subject_commit, baseline_commit),
+        ratio(
+            "durable_commit",
+            CEILINGS["durable_commit"],
+            subject_commit,
+            baseline_commit,
+        ),
         ratio("point_read", CEILINGS["point_read"], subject_read, baseline_read),
         ratio("open_replay", CEILINGS["open_replay"], subject_replay, baseline_replay),
     )
@@ -438,16 +451,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="python -m bench.harness",
         description="Measure the three D5 multiples against LadybugDB 0.16 and publish them.",
     )
-    parser.add_argument("--iterations", type=int, default=30, help="samples to keep per operation")
-    parser.add_argument("--warmup", type=int, default=5, help="samples to discard per operation")
-    parser.add_argument("--records", type=int, default=2000, help="records the replayed log holds")
-    parser.add_argument("--rows", type=int, default=512, help="rows in the point-read corpus")
     parser.add_argument(
-        "--partitions-per-table", type=int, default=64, help="the default this run freezes"
+        "--iterations", type=int, default=30, help="samples to keep per operation"
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=5, help="samples to discard per operation"
+    )
+    parser.add_argument(
+        "--records", type=int, default=2000, help="records the replayed log holds"
+    )
+    parser.add_argument(
+        "--rows", type=int, default=512, help="rows in the point-read corpus"
+    )
+    parser.add_argument(
+        "--partitions-per-table",
+        type=int,
+        default=64,
+        help="the default this run freezes",
     )
     parser.add_argument("--out", default=None, help="write calibration.json here")
-    parser.add_argument("--metrics", default=None, help="write the published metrics document here")
-    parser.add_argument("--workspace", default=None, help="a directory to build databases in")
+    parser.add_argument(
+        "--metrics", default=None, help="write the published metrics document here"
+    )
+    parser.add_argument(
+        "--workspace", default=None, help="a directory to build databases in"
+    )
     parser.add_argument(
         "--vector-recall",
         action="store_true",
@@ -485,7 +513,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         publish(result, Path(arguments.metrics))
     if arguments.out:
         Path(arguments.out).write_text(
-            json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
     # The vector recall stage is FINAL and ADDITIVE (C13 v4): every legacy output above is
     # already on disk, unconditionally. A recall failure exits non-zero with those intact;

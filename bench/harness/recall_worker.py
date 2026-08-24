@@ -437,7 +437,7 @@ def run_profile(profile_name: str, gt_mode: str = "auto") -> dict[str, object]:
         "observed": {
             "mean_recall_at_k": mean_recall,
             "min_recall_at_k": min(recalls),
-            "queries_below_target": below,
+            "queries_below_perfect": below,
             "dtype_check": {
                 "mean_overlap": dtype.mean_overlap,
                 "min_overlap": dtype.min_overlap,

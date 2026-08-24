@@ -24,6 +24,7 @@ Exit codes: ``0`` every required ceiling met, ``1`` a ceiling missed or the pipe
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import sys
 from collections.abc import Mapping, Sequence
@@ -117,6 +118,42 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
     return multiples, gauges, ""
 
 
+def _recall_measurements(document: str) -> list[object]:
+    """Every value published under the recall gauge, RAW -- bools and junk included.
+
+    ``read_multiples`` collapses same-name entries last-wins and coerces through ``float``,
+    which suits the legacy gauges and is WRONG for a required floor: the gate reads any
+    metrics file, not only wiring output, so the gauge can arrive twice, or as ``true``,
+    ``NaN``, ``Infinity``, or an out-of-range ratio -- and none of those is a measurement.
+    The caller refuses cardinality != 1 and every invalid single value as UNMEASURED. A
+    recall entry whose samples are missing, empty, or unreadable contributes one ``None``
+    so a malformed publication is refused rather than read as absent.
+    """
+    try:
+        payload = json.loads(document)
+    except ValueError:
+        return []
+    if not isinstance(payload, Mapping):
+        return []
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, list):
+        return []
+    values: list[object] = []
+    for entry in metrics:
+        if not (isinstance(entry, Mapping) and entry.get("name") == RECALL_METRIC):
+            continue
+        contributed = 0
+        samples = entry.get("samples")
+        if isinstance(samples, list):
+            for sample in samples:
+                if isinstance(sample, Mapping) and "value" in sample:
+                    values.append(sample["value"])
+                    contributed += 1
+        if contributed == 0:
+            values.append(None)
+    return values
+
+
 def check(
     document: str,
     *,
@@ -125,7 +162,7 @@ def check(
     require_recall: bool = False,
 ) -> GateResult:
     """Apply the D5 ceilings, and the recall floor when it is published."""
-    multiples, gauges, error = read_multiples(document)
+    multiples, _, error = read_multiples(document)
     if error:
         return GateResult(status=STATUS_UNMEASURED, lines=(error,))
 
@@ -158,22 +195,51 @@ def check(
         elif status == STATUS_MET:
             status = STATUS_EXCEEDED
 
-    recall = gauges.get(RECALL_METRIC)
-    if recall is None:
+    published = _recall_measurements(document)
+    if not published:
         message = f"{RECALL_METRIC} was not published"
         if require_recall:
             lines.append(f"vector_recall: UNMEASURED -- {message}")
             status = STATUS_UNMEASURED
         else:
-            lines.append(f"vector_recall: not calibrated yet ({message}); not required by default")
-    elif recall >= recall_target:
-        lines.append(f"vector_recall: {recall:.4f} at or above the {recall_target:g} target -- met")
-    else:
+            lines.append(
+                f"vector_recall: not calibrated yet ({message}); not required by default"
+            )
+    elif len(published) > 1:
+        # Present-but-malformed is refused even without --require-recall: an absent OPTIONAL
+        # gauge is tolerable, a corrupt publication never is.
         lines.append(
-            f"vector_recall: {recall:.4f} BELOW the {recall_target:g} target -- EXCEEDED"
+            f"vector_recall: UNMEASURED -- {RECALL_METRIC} was published "
+            f"{len(published)} times; exactly one measurement is required, so none of "
+            "them can be trusted as THE measurement"
         )
-        if status == STATUS_MET:
-            status = STATUS_EXCEEDED
+        status = STATUS_UNMEASURED
+    else:
+        value = published[0]
+        usable = (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+            and 0.0 <= float(value) <= 1.0
+        )
+        if not usable:
+            lines.append(
+                f"vector_recall: UNMEASURED -- published value {value!r} is not a recall "
+                "measurement (a ratio must be a non-bool finite number in [0, 1])"
+            )
+            status = STATUS_UNMEASURED
+        elif float(value) >= recall_target:
+            lines.append(
+                f"vector_recall: {float(value):.4f} at or above the "
+                f"{recall_target:g} target -- met"
+            )
+        else:
+            lines.append(
+                f"vector_recall: {float(value):.4f} BELOW the {recall_target:g} "
+                "target -- EXCEEDED"
+            )
+            if status == STATUS_MET:
+                status = STATUS_EXCEEDED
     return GateResult(status=status, lines=tuple(lines))
 
 
@@ -184,18 +250,32 @@ def _resolve_recall_target(
 
     The flag default is None deliberately (C13): a default equal to the built-in value would
     mask the frozen artifact, because an omitted flag and an explicit 0.9 would be
-    indistinguishable. An unreadable or sectionless calibration file falls through to the
-    built-in default, with the origin saying so -- the gate never guesses silently.
+    indistinguishable. An EXPLICIT flag value is validated here -- a target that is not a
+    finite number in (0, 1] cannot gate anything. An EXPLICITLY NAMED calibration file that
+    is unreadable or holds no usable frozen target REFUSES (the ``main`` catch-all turns the
+    raise into UNMEASURED, exit 2) instead of falling through: the caller asked for that
+    artifact to govern, and a silent built-in floor is one nobody chose. The built-in
+    default applies only when neither source was given at all.
     """
     if explicit is not None:
-        return explicit, "explicit flag"
+        if (
+            isinstance(explicit, bool)
+            or type(explicit) not in (float, int)
+            or not math.isfinite(float(explicit))
+            or not 0.0 < float(explicit) <= 1.0
+        ):
+            raise ValueError(
+                f"--recall-target must be a finite number in (0, 1]; got {explicit!r}"
+            )
+        return float(explicit), "explicit flag"
     if calibration:
         try:
             payload = json.loads(Path(calibration).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return DEFAULT_RECALL_TARGET, (
-                f"built-in default; {calibration!r} was unreadable"
-            )
+        except (OSError, ValueError) as error:
+            raise ValueError(
+                f"--calibration {calibration!r} was named explicitly but is unreadable "
+                f"({error}); refusing to fall back to a floor nobody chose"
+            ) from error
         candidate = (
             payload.get("vector_recall", {}).get("frozen", {}).get("target")
             if isinstance(payload, dict)
@@ -204,11 +284,13 @@ def _resolve_recall_target(
         if (
             isinstance(candidate, (int, float))
             and not isinstance(candidate, bool)
+            and math.isfinite(float(candidate))
             and 0.0 < float(candidate) <= 1.0
         ):
             return float(candidate), f"frozen in {calibration}"
-        return DEFAULT_RECALL_TARGET, (
-            f"built-in default; {calibration!r} holds no usable frozen target"
+        raise ValueError(
+            f"--calibration {calibration!r} holds no usable frozen vector_recall target; "
+            "refusing to fall back to a floor nobody chose"
         )
     return DEFAULT_RECALL_TARGET, "built-in default"
 
@@ -219,7 +301,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="python -m bench.harness.gate",
         description="Fail the build when a D5 ceiling is exceeded, reading the published metric.",
     )
-    parser.add_argument("--metrics", required=True, help="the published metrics JSON document")
+    parser.add_argument(
+        "--metrics", required=True, help="the published metrics JSON document"
+    )
     parser.add_argument(
         "--require",
         action="append",
@@ -249,7 +333,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         document = Path(arguments.metrics).read_text(encoding="utf-8")
     except OSError as error:
-        print(f"D5 ceiling gate: UNMEASURED -- the metrics file could not be read: {error}")
+        print(
+            f"D5 ceiling gate: UNMEASURED -- the metrics file could not be read: {error}"
+        )
         return 2
     try:
         recall_target, target_origin = _resolve_recall_target(

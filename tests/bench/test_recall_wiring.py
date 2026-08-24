@@ -84,7 +84,7 @@ def _verdict_stub() -> dict[str, object]:
         "observed": {
             "mean_recall_at_k": 0.975,
             "min_recall_at_k": 0.9,
-            "queries_below_target": 0,
+            "queries_below_perfect": 0,
             "dtype_check": {"mean_overlap": 1.0, "min_overlap": 1.0},
         },
         "blas_environment": {},
@@ -286,3 +286,145 @@ def test_a_failing_stage_fails_the_cli_with_legacy_outputs_already_on_disk(
     assert out.exists() and metrics.exists(), (
         "legacy outputs survive the vector failure"
     )
+
+
+def test_a_stale_gauge_from_a_previous_run_never_survives_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B2: with an OLD gauge already published, a crash between section and gauge leaves
+    the gauge ABSENT (UNMEASURED for a require gate) -- never the stale value."""
+    out, metrics = _seed_documents(tmp_path)
+    document = json.loads(metrics.read_text(encoding="utf-8"))
+    document["metrics"].append({"name": RECALL_METRIC, "samples": [{"value": 0.42}]})
+    metrics.write_text(json.dumps(document), encoding="utf-8")
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+
+    def torn(path: Path, value: float) -> None:
+        raise OSError("synthetic torn replace")
+
+    monkeypatch.setattr(wiring, "_append_gauge", torn)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    survived = json.loads(metrics.read_text(encoding="utf-8"))
+    assert all(entry["name"] != RECALL_METRIC for entry in survived["metrics"]), (
+        "the stale gauge must be stripped before anything else"
+    )
+    assert "vector_recall" in json.loads(out.read_text(encoding="utf-8"))
+
+
+def test_a_rerun_with_duplicate_old_gauges_ends_with_exactly_one_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B2: wholesale duplicate removal, then exactly one fresh gauge on success."""
+    out, metrics = _seed_documents(tmp_path)
+    document = json.loads(metrics.read_text(encoding="utf-8"))
+    document["metrics"].append({"name": RECALL_METRIC, "samples": [{"value": 0.1}]})
+    document["metrics"].append({"name": RECALL_METRIC, "samples": [{"value": 0.2}]})
+    metrics.write_text(json.dumps(document), encoding="utf-8")
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 0
+    final = json.loads(metrics.read_text(encoding="utf-8"))
+    gauges = [entry for entry in final["metrics"] if entry["name"] == RECALL_METRIC]
+    assert len(gauges) == 1
+    assert gauges[0]["samples"] == [{"value": 0.975}]
+
+
+def test_a_crash_after_the_strip_before_the_section_leaves_no_gauge_at_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B2 window: the strip landed, the run then failed -- absent gauge, untouched out."""
+    out, metrics = _seed_documents(tmp_path)
+    document = json.loads(metrics.read_text(encoding="utf-8"))
+    document["metrics"].append({"name": RECALL_METRIC, "samples": [{"value": 0.42}]})
+    metrics.write_text(json.dumps(document), encoding="utf-8")
+    out_before = out.read_text(encoding="utf-8")
+
+    def refuse(*args: object, **kwargs: object) -> dict[str, object]:
+        raise RecallStageError("synthetic fail-closed after strip")
+
+    monkeypatch.setattr(wiring, "run_recall", refuse)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    survived = json.loads(metrics.read_text(encoding="utf-8"))
+    assert all(entry["name"] != RECALL_METRIC for entry in survived["metrics"])
+    assert out.read_text(encoding="utf-8") == out_before
+
+
+def test_metrics_without_out_is_refused_before_any_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(a): the gauge may never be the ONLY artifact -- typed refusal, nothing touched,
+    the worker never spawned."""
+    _, metrics = _seed_documents(tmp_path)
+    before = metrics.read_text(encoding="utf-8")
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=None, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    assert not called, "refusal must precede the measurement, not follow it"
+    assert metrics.read_text(encoding="utf-8") == before
+
+
+def test_the_per_profile_timeout_resolves_and_an_explicit_value_wins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """B1: each profile resolves its measured ceiling; an explicit timeout overrides."""
+    from bench.harness.recall import PROFILE_TIMEOUTS, run_recall
+
+    seen: list[object] = []
+
+    def spy(command, **kwargs):
+        seen.append(kwargs.get("timeout"))
+        raise RecallStageError("stop after recording the timeout")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", spy)
+    for profile, expected in (("full", 9600.0), ("smoke", 1800.0), ("tiny", 300.0)):
+        with pytest.raises(RecallStageError):
+            run_recall(profile, scratch=tmp_path)
+        assert seen[-1] == expected == PROFILE_TIMEOUTS[profile]
+    with pytest.raises(RecallStageError):
+        run_recall("tiny", scratch=tmp_path, timeout_seconds=77.0)
+    assert seen[-1] == 77.0
+
+
+def test_the_cli_timeout_flag_propagates_to_the_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B1: --timeout-seconds reaches run_recall through append_vector_recall."""
+    out, metrics = _seed_documents(tmp_path)
+    seen: dict[str, object] = {}
+
+    def spy(profile, *, gt_mode, scratch, timeout_seconds=None):
+        seen["timeout"] = timeout_seconds
+        return _verdict_stub()
+
+    monkeypatch.setattr(wiring, "run_recall", spy)
+    code = wiring.main(
+        [
+            "--profile",
+            "tiny",
+            "--gt",
+            "auto",
+            "--out",
+            str(out),
+            "--metrics",
+            str(metrics),
+            "--workspace",
+            str(tmp_path),
+            "--timeout-seconds",
+            "123.5",
+        ]
+    )
+    assert code == 0
+    assert seen["timeout"] == 123.5

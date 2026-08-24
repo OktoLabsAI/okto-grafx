@@ -51,12 +51,20 @@ def family() -> str:
     return "windows" if os.name == "nt" else "posix"
 
 
+PROFILE_TIMEOUTS: dict[str, float] = {"tiny": 300.0, "smoke": 1800.0, "full": 9600.0}
+"""Wall-clock ceilings per profile, measured rather than guessed: the full HNSW build
+exceeded 3000s locally on a machine faster than the CI runners, so its inner ceiling is
+160 minutes -- under the scheduled job's 180-minute budget with room for setup and the
+gate -- while smoke keeps the original 30 and tiny stays test-sized. ``run_recall``
+resolves these when the caller passes no explicit timeout; an explicit value always wins."""
+
+
 def run_recall(
     profile: str,
     *,
     gt_mode: str = "auto",
     scratch: Path,
-    timeout_seconds: float = 1800.0,
+    timeout_seconds: float | None = None,
 ) -> dict[str, object]:
     """Run the worker subprocess for one profile and return the parsed verdict.
 
@@ -69,6 +77,8 @@ def run_recall(
         raise RecallStageError(
             f"unknown recall profile {profile!r}; use one of {sorted(PROFILES)}"
         )
+    if timeout_seconds is None:
+        timeout_seconds = PROFILE_TIMEOUTS[profile]
     scratch.mkdir(parents=True, exist_ok=True)
     verdict_path = scratch / f"recall-{profile}.json"
     environment = dict(os.environ)

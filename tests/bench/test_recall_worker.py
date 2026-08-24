@@ -82,6 +82,8 @@ def test_the_tiny_profile_measures_a_real_engine_and_is_deterministic() -> None:
     assert 0.9 <= first["gauge"] <= 1.0
     observed = first["observed"]
     assert observed["dtype_check"]["mean_overlap"] >= 0.99
+    assert "queries_below_perfect" in observed, "the count is of non-perfect queries"
+    assert "queries_below_target" not in observed, "the lying name must be gone"
     assert set(first["hashes"]) == {
         "corpus_sha256_f64",
         "corpus_sha256_f32",

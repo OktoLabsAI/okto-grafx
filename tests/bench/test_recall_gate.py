@@ -7,8 +7,8 @@ What these tests pin:
   governs;
 * an explicit flag beats the artifact; nothing at all means the built-in default; every
   resolution prints its ORIGIN;
-* an unreadable or sectionless calibration file falls through to the built-in default with
-  the origin saying so — never a silent guess;
+* an EXPLICITLY NAMED calibration file that is unreadable or holds no usable target
+  REFUSES (UNMEASURED, exit 2) — the built-in default applies only when no source was given;
 * the ROUND7 §3b anti-disconnection regression: a published gauge below the frozen target
   makes the gate exit non-zero — the knob is verifiably connected;
 * the legacy exit codes survive: met is 0, EXCEEDED is 1, UNMEASURED (a required gauge
@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+
+import pytest
 
 from bench.harness.gate import DEFAULT_RECALL_TARGET, _resolve_recall_target, main
 
@@ -67,24 +69,21 @@ def test_resolution_precedence_is_flag_then_artifact_then_builtin(
     assert built_in == (DEFAULT_RECALL_TARGET, "built-in default")
 
 
-def test_an_unreadable_or_sectionless_artifact_falls_through_loudly(
+def test_an_explicitly_named_but_unusable_artifact_refuses(
     tmp_path: Path,
 ) -> None:
-    """The gate never guesses silently: the origin names the fallback and its reason."""
-    missing = _resolve_recall_target(None, str(tmp_path / "absent.json"))
-    assert missing[0] == DEFAULT_RECALL_TARGET
-    assert "unreadable" in missing[1]
+    """(b): the caller asked for THAT artifact to govern; a silent 0.90 is a floor nobody
+    chose. Unreadable and target-less files raise; only calibration=None means built-in."""
+    with pytest.raises(ValueError, match="unreadable"):
+        _resolve_recall_target(None, str(tmp_path / "absent.json"))
     hollow = tmp_path / "hollow.json"
     hollow.write_text(json.dumps({"ceilings": []}), encoding="utf-8")
-    sectionless = _resolve_recall_target(None, str(hollow))
-    assert sectionless[0] == DEFAULT_RECALL_TARGET
-    assert "no usable frozen target" in sectionless[1]
-    bad_value = tmp_path / "bad.json"
-    bad_value.write_text(
-        json.dumps({"vector_recall": {"frozen": {"target": 7.5}}}), encoding="utf-8"
+    with pytest.raises(ValueError, match="no usable frozen"):
+        _resolve_recall_target(None, str(hollow))
+    assert _resolve_recall_target(None, None) == (
+        DEFAULT_RECALL_TARGET,
+        "built-in default",
     )
-    out_of_range = _resolve_recall_target(None, str(bad_value))
-    assert out_of_range[0] == DEFAULT_RECALL_TARGET
 
 
 def test_the_frozen_target_governs_the_verdict_anti_disconnection(
@@ -148,3 +147,87 @@ def test_legacy_exit_codes_survive(tmp_path: Path) -> None:
     assert main(["--metrics", str(document)]) == 0
     assert main(["--metrics", str(document), "--require-recall"]) == 2
     assert main(["--metrics", str(tmp_path / "missing.json")]) == 2
+
+
+def _document_with_recall_entries(path: Path, entries: list[dict[str, object]]) -> Path:
+    """A metrics document with all three ceilings met plus the given raw recall entries."""
+    payload: list[dict[str, object]] = [
+        {
+            "name": "oktografx_baseline_ceiling_multiple",
+            "samples": [
+                {"value": 1.0, "labels": {"ceiling": "durable_commit"}},
+                {"value": 1.0, "labels": {"ceiling": "point_read"}},
+                {"value": 1.0, "labels": {"ceiling": "open_replay"}},
+            ],
+        }
+    ]
+    payload.extend(entries)
+    document = path / "metrics.json"
+    document.write_text(json.dumps({"metrics": payload}), encoding="utf-8")
+    return document
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "0", "1.5", "-0.5"])
+def test_an_invalid_explicit_target_is_refused_as_unmeasured(
+    tmp_path: Path, bad: str
+) -> None:
+    """A --recall-target outside (0,1] or non-finite cannot gate anything: exit 2."""
+    document = _metrics_document(tmp_path, recall=0.95)
+    # The = form is deliberate: argparse reads a bare "-inf" as an option, which is a
+    # usage error (also exit 2) rather than the validation path this test pins.
+    assert main(["--metrics", str(document), f"--recall-target={bad}"]) == 2
+
+
+@pytest.mark.parametrize(
+    "value", [True, False, float("nan"), float("inf"), -0.5, 1.5, "0.9", None]
+)
+def test_a_present_but_invalid_gauge_value_is_unmeasured_even_unrequired(
+    tmp_path: Path, value: object
+) -> None:
+    """(c): bool, NaN, Inf, out-of-range and non-numeric are NOT measurements. A corrupt
+    publication refuses even without --require-recall -- only ABSENCE is tolerable there."""
+    document = _document_with_recall_entries(
+        tmp_path, [{"name": RECALL_METRIC, "samples": [{"value": value}]}]
+    )
+    assert main(["--metrics", str(document)]) == 2
+
+
+def test_duplicate_gauge_entries_or_samples_are_unmeasured(tmp_path: Path) -> None:
+    """(c): exactly ONE measurement; two entries or two samples mean none is THE one."""
+    twice = _document_with_recall_entries(
+        tmp_path,
+        [
+            {"name": RECALL_METRIC, "samples": [{"value": 0.99}]},
+            {"name": RECALL_METRIC, "samples": [{"value": 0.99}]},
+        ],
+    )
+    assert main(["--metrics", str(twice)]) == 2
+    multi = _document_with_recall_entries(
+        tmp_path,
+        [{"name": RECALL_METRIC, "samples": [{"value": 0.99}, {"value": 0.98}]}],
+    )
+    assert main(["--metrics", str(multi)]) == 2
+    hollow = _document_with_recall_entries(
+        tmp_path, [{"name": RECALL_METRIC, "samples": []}]
+    )
+    assert main(["--metrics", str(hollow)]) == 2
+
+
+def test_zero_recall_is_a_measurement_and_fails_as_exceeded(tmp_path: Path) -> None:
+    """0.0 is a legitimate (terrible) ratio: MEASURED, below every target -- exit 1."""
+    document = _metrics_document(tmp_path, recall=0.0)
+    assert main(["--metrics", str(document)]) == 1
+
+
+def test_an_unusable_named_calibration_fails_the_cli_as_unmeasured(
+    tmp_path: Path,
+) -> None:
+    """(b) end to end: a named-but-unusable --calibration exits 2; omitting it gates on
+    the built-in default."""
+    document = _metrics_document(tmp_path, recall=0.95)
+    hollow = tmp_path / "hollow.json"
+    hollow.write_text(json.dumps({"ceilings": []}), encoding="utf-8")
+    assert main(["--metrics", str(document), "--calibration", str(hollow)]) == 2
+    absent = tmp_path / "absent.json"
+    assert main(["--metrics", str(document), "--calibration", str(absent)]) == 2
+    assert main(["--metrics", str(document)]) == 0

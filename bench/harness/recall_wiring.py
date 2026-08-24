@@ -40,6 +40,43 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], None]) -> No
     os.replace(scratch, path)
 
 
+def _strip_stale_gauge(metrics: Path) -> None:
+    """Write step (0): remove EVERY existing recall gauge entry before anything else runs.
+
+    A rerun over a metrics document that already carries the gauge would otherwise leave a
+    STALE value satisfying the gate if this run crashed between the section append and the
+    new gauge append. Stripping first turns every crash window into gauge-ABSENT -- which a
+    ``--require-recall`` gate fails as UNMEASURED -- and a happy rerun ends with exactly one
+    entry. Duplicates are removed wholesale; the write is the same atomic read-modify-write
+    through a temporary file and ``os.replace`` as every other append. When the document
+    holds NO recall entry -- the first run, and every legacy document -- this is a strict
+    no-op: no rewrite, no format churn, no mtime change, so a failure before any append
+    still leaves both documents byte-identical. A missing or unreadable document is also
+    left alone here; the later appends are the ones that turn that into a typed failure.
+    """
+    try:
+        document = json.loads(metrics.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    entries = document.get("metrics") if isinstance(document, dict) else None
+    if not isinstance(entries, list) or not any(
+        isinstance(entry, dict) and entry.get("name") == RECALL_METRIC
+        for entry in entries
+    ):
+        return
+
+    def mutate(document: dict[str, object]) -> None:
+        stale = document.get("metrics")
+        if isinstance(stale, list):
+            document["metrics"] = [
+                entry
+                for entry in stale
+                if not (isinstance(entry, dict) and entry.get("name") == RECALL_METRIC)
+            ]
+
+    _replace_json(metrics, mutate)
+
+
 def _append_section(out: Path, section: dict[str, object]) -> None:
     """Write step (1): the calibration document gains its ``vector_recall`` section."""
 
@@ -74,6 +111,7 @@ def append_vector_recall(
     out: Path | None,
     metrics: Path | None,
     workspace: Path,
+    timeout_seconds: float | None = None,
 ) -> int:
     """Run the recall stage and append its results in the fail-safe order; return exit code.
 
@@ -82,8 +120,21 @@ def append_vector_recall(
     failure point, so the legacy outputs always survive and a partial vector publication can
     only ever be section-without-gauge, never the reverse.
     """
+    if metrics is not None and out is None:
+        print(
+            "vector recall stage: REFUSED -- --metrics without --out would publish the "
+            "gauge with no section; the gauge must be the LAST artifact, never the only one."
+        )
+        return 3
     try:
-        verdict = run_recall(profile, gt_mode=gt_mode, scratch=workspace / "recall")
+        if metrics is not None:
+            _strip_stale_gauge(metrics)
+        verdict = run_recall(
+            profile,
+            gt_mode=gt_mode,
+            scratch=workspace / "recall",
+            timeout_seconds=timeout_seconds,
+        )
     except RecallStageError as failure:
         print(f"vector recall: FAIL-CLOSED -- {failure}")
         return 3
@@ -126,6 +177,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--workspace", required=True, help="scratch directory for the worker"
     )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=None,
+        help="override the per-profile wall-clock ceiling (defaults to PROFILE_TIMEOUTS)",
+    )
     arguments = parser.parse_args(argv)
     return append_vector_recall(
         profile=arguments.profile,
@@ -133,6 +190,7 @@ def main(argv: list[str] | None = None) -> int:
         out=Path(arguments.out) if arguments.out else None,
         metrics=Path(arguments.metrics) if arguments.metrics else None,
         workspace=Path(arguments.workspace),
+        timeout_seconds=arguments.timeout_seconds,
     )
 
 
