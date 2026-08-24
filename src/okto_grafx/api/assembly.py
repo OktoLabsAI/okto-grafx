@@ -674,6 +674,11 @@ def _require_page_size_of_record(config: DatabaseConfig, storage: StorageDevice)
     this file and writes it as exactly ONE page, so its length IS the page size the database
     was created with. Pinned by ``test_the_identity_file_is_exactly_one_page``, which is what
     makes the equality below a fact about the format rather than an assumption about it.
+
+    This size-only preflight runs before the first-open section and may therefore notice the
+    complete meta rename just before its durability barrier. It cannot hand out or decode the
+    database: every identity/page observation that follows crosses ``_FIRST_OPEN_SECTION`` and
+    waits for that barrier. Its only early outcome is refusing an already visible size mismatch.
     """
     if config.path == MEMORY_PATH or not storage.exists(META_FILE):
         return
@@ -717,12 +722,15 @@ def _open_identity(
     complete file; a retry reads the intent and uses the same UUID.
     """
     meta = MetaStore(pool)
-    if config.read_only:
-        return _read_existing_identity(config, storage, meta)
-
     with coordinator.exclusive(
         _FIRST_OPEN_SECTION, timeout=config.commit_lock_timeout_seconds
     ):
+        # Readers take the same section even though they mutate no data file.  atomic_replace
+        # makes a complete final VISIBLE before the global barrier makes it DURABLE; without
+        # this wait a read-only open could observe all three final names in that interval and be
+        # handed to its caller while a power loss could still take the database back.
+        if config.read_only:
+            return _read_existing_identity(config, storage, meta)
         intent = _read_first_open_intent(storage)
         if intent is None and storage.exists(META_FILE):
             return _read_existing_identity(config, storage, meta)

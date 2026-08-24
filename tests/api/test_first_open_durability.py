@@ -20,6 +20,8 @@ Three properties, through the public door and the fault bench of FR-16:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from threading import Event, Thread, current_thread
 from typing import Any
 
 import pytest
@@ -31,16 +33,44 @@ from power_loss_support import (
 )
 
 from okto_grafx import connect
-from okto_grafx.adapters.storage_fault import SimulatedCrash
+from okto_grafx.adapters.storage_fault import (
+    FaultInjectingStorageDevice,
+    SimulatedCrash,
+)
 from okto_grafx.api import assembly
 from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxError
 from okto_grafx.engine.catalog_store import CATALOG_FILE
 from okto_grafx.engine.database import META_FILE
 from okto_grafx.engine.heap_store import HEAP_FILE
-from okto_grafx.runtime.bootstrap import release_ports
+from okto_grafx.runtime.bootstrap import build_default_registry, release_ports
 from okto_grafx.runtime.config import DatabaseConfig
 
 pytestmark = pytest.mark.timeout(300, method="thread")
+
+
+class _BlockingPublicationStorage(FaultInjectingStorageDevice):
+    """Pause the first global barrier after all three first-open replacements are visible."""
+
+    def __init__(self, inner: Any) -> None:
+        super().__init__(inner, seed=1)
+        self.publication_visible = Event()
+        self.allow_publication_barrier = Event()
+        self._published: set[str] = set()
+        self._blocked = False
+
+    def atomic_replace(self, source: str, target: str) -> None:
+        super().atomic_replace(source, target)
+        if target in (META_FILE, CATALOG_FILE, HEAP_FILE):
+            self._published.add(target)
+
+    def durable_barrier(self, file: str | None = None) -> None:
+        finals = {META_FILE, CATALOG_FILE, HEAP_FILE}
+        if file is None and self._published == finals and not self._blocked:
+            self._blocked = True
+            self.publication_visible.set()
+            if not self.allow_publication_barrier.wait(30.0):
+                raise AssertionError("the test never released the first-open publication barrier")
+        super().durable_barrier(file)
 
 
 def _volatile_data_files(bench: Any) -> tuple[str, ...]:
@@ -86,6 +116,88 @@ def test_an_identity_handed_out_by_the_first_open_survives_a_power_loss() -> Non
         outcome = ("opened", reopened.identity.database_uuid)
     release_ports(registry)
     assert outcome == ("opened", uuid)
+
+
+def test_read_only_waits_until_visible_first_open_files_are_durable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = DatabaseConfig(path=":memory:")
+    registry = build_default_registry(config)
+    inner = registry.get("storage")
+    storage = _BlockingPublicationStorage(inner)
+    storage.start_reordering()
+    registry.bind("storage", storage)
+    coordinator = registry.get("coordinator")
+
+    reader_name = "first-open-read-only"
+    reader_waiting = Event()
+    reader_done = Event()
+    creator_done = Event()
+    original_exclusive = type(coordinator).exclusive
+
+    def observed_exclusive(self: Any, name: str, *, timeout: float) -> Any:
+        section = original_exclusive(self, name, timeout=timeout)
+        if name != assembly._FIRST_OPEN_SECTION or current_thread().name != reader_name:
+            return section
+
+        @contextmanager
+        def wait_for_creator() -> Any:
+            reader_waiting.set()
+            with section:
+                if not creator_done.wait(30.0):
+                    raise AssertionError("the creator did not finish after releasing first-open")
+                yield
+
+        return wait_for_creator()
+
+    monkeypatch.setattr(type(coordinator), "exclusive", observed_exclusive)
+    creator_result: dict[str, object] = {}
+    reader_result: dict[str, object] = {}
+    failures: list[BaseException] = []
+
+    def create_database() -> None:
+        try:
+            database = connect(":memory:", registry=registry)
+            creator_result["uuid"] = database.identity.database_uuid
+            database.close()
+        except BaseException as failure:  # noqa: BLE001 - carried back to the test thread
+            failures.append(failure)
+        finally:
+            creator_done.set()
+
+    def open_read_only() -> None:
+        try:
+            with connect(":memory:", registry=registry, read_only=True) as database:
+                reader_result["uuid"] = database.identity.database_uuid
+                reader_result["findings"] = database.verify("all").findings
+        except BaseException as failure:  # noqa: BLE001 - carried back to the test thread
+            failures.append(failure)
+        finally:
+            reader_done.set()
+
+    creator = Thread(target=create_database, name="first-open-creator", daemon=True)
+    creator.start()
+    assert storage.publication_visible.wait(30.0)
+    finals = (META_FILE, CATALOG_FILE, HEAP_FILE)
+    visible_before_barrier = {name: file_bytes(inner, name) for name in finals}
+    assert all(visible_before_barrier.values())
+    assert set(finals).issubset(storage.volatile_files())
+
+    reader = Thread(target=open_read_only, name=reader_name, daemon=True)
+    reader.start()
+    assert reader_waiting.wait(30.0)
+    assert not reader_done.wait(0.1), "read_only escaped before the publication barrier"
+
+    storage.allow_publication_barrier.set()
+    creator.join(30.0)
+    reader.join(30.0)
+    assert not creator.is_alive()
+    assert not reader.is_alive()
+    assert not failures
+    assert reader_result == {"uuid": creator_result["uuid"], "findings": ()}
+    assert {name: file_bytes(inner, name) for name in finals} == visible_before_barrier
+    assert not set(finals).intersection(storage.volatile_files())
+    release_ports(registry)
 
 
 def test_an_interrupted_intent_cannot_overwrite_a_database_with_history() -> None:
