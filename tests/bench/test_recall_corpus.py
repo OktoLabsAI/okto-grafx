@@ -281,3 +281,94 @@ def test_generous_overlap_caps_at_one_and_refuses_bad_k() -> None:
     assert generous_overlap(tie, tie, 1) == 1.0
     with pytest.raises(ValueError):
         generous_overlap(tie, tie, 0)
+
+
+def test_duplicate_record_ids_in_a_truth_are_refused_before_the_distance_map() -> None:
+    """A dict would keep only the last duplicate and could hide the very NaN we hunt."""
+    from bench.recall_corpus import GroundTruth, compare_truths
+
+    corpus = [[1.0, 0.0], [0.0, 1.0]]
+    canonical = ground_truth(corpus, [1.0, 0.0], 1)
+    duplicated = GroundTruth(
+        ordered=((float("nan"), 0),) + canonical.ordered,
+        cut_distance=canonical.cut_distance,
+        members=canonical.members,
+    )
+    disagreement = compare_truths(canonical, duplicated, eps_rel=1e-9)
+    assert "more than once" in disagreement
+
+
+def test_a_hostile_float_subclass_is_refused_outright() -> None:
+    """The tolerance demands an EXACT built-in float or int; a subclass whose comparison
+    operators could lie never reaches any comparison at all."""
+
+    class Generous(float):
+        """A float whose comparisons lie."""
+
+        def __le__(self, other: object) -> bool:
+            return True
+
+        def __ge__(self, other: object) -> bool:
+            return True
+
+    corpus = [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]
+    with pytest.raises(ValueError, match="built-in"):
+        differential(corpus, [[1.0, 0.0]], 1, cosine_distance, eps_rel=Generous(1e-9))
+    exact = differential(corpus, [[1.0, 0.0]], 1, cosine_distance, eps_rel=1e-9)
+    assert exact.agreed, "an exact built-in float of the same value still works"
+
+
+@pytest.mark.parametrize("bad_k", (True, 1.5, float("nan"), float("inf"), 0, -3, "3"))
+def test_generous_overlap_refuses_every_non_exact_k(bad_k: object) -> None:
+    """bools, floats, NaN, infinity, fractions, zero and strings all refuse."""
+    from bench.recall_corpus import generous_overlap
+
+    truth = ground_truth([[1.0, 0.0], [0.0, 1.0]], [1.0, 0.0], 1)
+    with pytest.raises(ValueError):
+        generous_overlap(truth, truth, bad_k)  # type: ignore[arg-type]
+
+
+def test_generous_overlap_refuses_phantom_members() -> None:
+    """A member no oracle scored would inflate the intersection; it refuses instead."""
+    from bench.recall_corpus import GroundTruth, generous_overlap
+
+    truth = ground_truth([[1.0, 0.0], [0.0, 1.0]], [1.0, 0.0], 1)
+    phantom = GroundTruth(
+        ordered=truth.ordered,
+        cut_distance=truth.cut_distance,
+        members=frozenset(truth.members | {99}),
+    )
+    with pytest.raises(ValueError, match="never scored"):
+        generous_overlap(truth, phantom, 1)
+    with pytest.raises(ValueError, match="never scored"):
+        generous_overlap(phantom, truth, 1)
+
+
+def test_dtype_check_refuses_a_corpus_that_lost_or_reshaped_records() -> None:
+    """A missing record or a changed dimension is an identity break, never a 1.0."""
+    pre = [[1.0, 0.0], [0.0, 1.0]]
+    with pytest.raises(ValueError, match="SAME records"):
+        dtype_check(pre, pre[:1], [[1.0, 0.0]], 1)
+    with pytest.raises(ValueError, match="changed dimension"):
+        dtype_check(pre, [[1.0, 0.0], [0.0, 1.0, 0.0]], [[1.0, 0.0]], 1)
+
+
+def test_an_empty_differential_refuses_instead_of_passing_vacuously() -> None:
+    """Zero queries or an empty corpus prove nothing; the quietest fail-open refuses."""
+    corpus = [[1.0, 0.0], [0.0, 1.0]]
+    with pytest.raises(ValueError, match="vacuous"):
+        differential(corpus, [], 1, cosine_distance, eps_rel=1e-9)
+    with pytest.raises(ValueError, match="vacuous"):
+        differential([], [[1.0, 0.0]], 1, cosine_distance, eps_rel=1e-9)
+
+
+def test_the_disagreement_diagnostics_are_ascii_only() -> None:
+    """Windows CP-1252 consoles must be able to print every CLI diagnostic."""
+    corpus = [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]
+
+    def drifted(left: list[float], right: list[float]) -> float:
+        return cosine_distance(left, right) * (1.0 + 5e-9)
+
+    verdict = differential(corpus, [[1.0, 0.0]], 1, drifted, eps_rel=1e-12)
+    assert not verdict.agreed
+    verdict.first_disagreement.encode("ascii")

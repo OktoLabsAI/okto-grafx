@@ -154,10 +154,22 @@ def generous_overlap(pre: GroundTruth, post: GroundTruth, k: int) -> float:
     ``min(|pre.members ∩ post.members|, k) / k``: a tie band on EITHER side counts in full, so
     a pre-quantization tie the cast happens to break (pre.members {0,1}, post.members {1}) is
     a perfect overlap rather than a spurious zero — while a genuinely displaced ranking, whose
-    generous bands share nothing, still scores it. Symmetric by construction.
+    generous bands share nothing, still scores it. Symmetric by construction. ``k`` must be
+    an exact built-in integer >= 1 (a bool, a float, NaN or a fraction would quietly reshape
+    the ratio), and every member must be a record the truth actually scored — a phantom
+    member would inflate an intersection with ids no oracle produced.
     """
-    if k <= 0:
-        raise ValueError(f"the generous overlap needs k >= 1; got {k}.")
+    if isinstance(k, bool) or type(k) is not int or k < 1:
+        raise ValueError(
+            f"the generous overlap needs an exact built-in integer k >= 1; got {k!r}."
+        )
+    for label, truth in (("pre", pre), ("post", post)):
+        scored = {index for _, index in truth.ordered}
+        if not set(truth.members) <= scored:
+            raise ValueError(
+                f"the {label} truth carries members its oracle never scored: "
+                f"{sorted(set(truth.members) - scored)[:5]}."
+            )
     return min(len(pre.members & post.members), k) / k
 
 
@@ -174,6 +186,19 @@ def dtype_check(
     cast on either side never reads as displacement, while a ranking the quantization truly
     moved still drops the overlap.
     """
+    if len(pre_quantization) != len(quantized):
+        raise ValueError(
+            f"the dtype check compares the SAME records before and after quantization; got "
+            f"{len(pre_quantization)} pre-quantization and {len(quantized)} quantized."
+        )
+    for row, (before, after) in enumerate(
+        zip(pre_quantization, quantized, strict=True)
+    ):
+        if len(before) != len(after):
+            raise ValueError(
+                f"record {row} changed dimension across quantization: "
+                f"{len(before)} vs {len(after)}."
+            )
     overlaps: list[float] = []
     for query in queries:
         pre = ground_truth(pre_quantization, query, k)
@@ -198,13 +223,25 @@ class DifferentialVerdict:
 
 
 def _require_eps_rel(eps_rel: float) -> float:
-    """Refuse a tolerance that cannot refuse anything: NaN, infinity or a negative number."""
-    if not isinstance(eps_rel, float) or not math.isfinite(eps_rel) or eps_rel < 0.0:
+    """Return the tolerance as an EXACT built-in float, refusing everything else.
+
+    NaN, infinity and negatives cannot refuse anything; a hostile float subclass could lie
+    through its comparison operators. The value is therefore canonicalized through the float
+    constructor (an exact copy for any real number) and every later comparison uses THIS
+    return value, never the caller's object.
+    """
+    if isinstance(eps_rel, bool) or type(eps_rel) not in (float, int):
         raise ValueError(
-            f"the accelerated-oracle tolerance must be a finite non-negative float; "
-            f"got {eps_rel!r}."
+            f"the accelerated-oracle tolerance must be a finite non-negative built-in "
+            f"number; got {type(eps_rel).__name__}."
         )
-    return eps_rel
+    value = float(eps_rel)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(
+            f"the accelerated-oracle tolerance must be a finite non-negative built-in "
+            f"number; got {eps_rel!r}."
+        )
+    return value
 
 
 def compare_truths(
@@ -218,25 +255,33 @@ def compare_truths(
     Agreement demands identical generous membership AND every distance of the WHOLE subset —
     member or not — finite and within ``eps_rel`` relative tolerance. The comparison is
     written to REFUSE on NaN: a non-finite distance on either side, anywhere, is a
-    disagreement, never a silent pass.
+    disagreement, never a silent pass. A truth that scores the same record twice is refused
+    BEFORE any mapping: a dict would keep only the last entry, and the collapsed one could
+    hide exactly the NaN this comparator exists to catch.
     """
-    _require_eps_rel(eps_rel)
+    eps = _require_eps_rel(eps_rel)
     if canonical.members != fast.members:
         return (
             f"member sets differ ({sorted(canonical.members)[:5]}... vs "
             f"{sorted(fast.members)[:5]}...)"
         )
+    canonical_ids = [index for _, index in canonical.ordered]
+    fast_ids = [index for _, index in fast.ordered]
+    if len(canonical_ids) != len(set(canonical_ids)):
+        return "the canonical truth scored a record more than once"
+    if len(fast_ids) != len(set(fast_ids)):
+        return "the fast truth scored a record more than once"
     fast_distances = {index: score for score, index in fast.ordered}
-    if set(fast_distances) != {index for _, index in canonical.ordered}:
+    if set(fast_distances) != set(canonical_ids):
         return "the fast truth scored a different record set"
     for score, index in canonical.ordered:
         other = fast_distances[index]
         if not math.isfinite(score) or not math.isfinite(other):
             return f"record {index}: non-finite distance ({score!r} vs {other!r})"
         delta = abs(other - score)
-        if not delta / max(1.0, abs(score)) <= eps_rel:
+        if not delta / max(1.0, abs(score)) <= eps:
             return (
-                f"record {index}: |Δdistance| {delta:.3e} exceeds eps_rel {eps_rel:g}"
+                f"record {index}: |delta distance| {delta:.3e} exceeds eps_rel {eps:g}"
             )
     return ""
 
@@ -255,9 +300,16 @@ def differential(
     of the subset — member or not — finite and within ``eps_rel`` relative tolerance
     (c13_design_v4: "toda distância do subconjunto"). Any disagreement, any NaN anywhere, and
     any unusable tolerance is fail-closed — the accelerated path may speed the canonical
-    answer up, never replace it.
+    answer up, never replace it. Zero queries or an empty corpus prove nothing and refuse:
+    the profiles promise non-empty shapes, and a vacuous agreement is the quietest fail-open
+    of all.
     """
     _require_eps_rel(eps_rel)
+    if not corpus or not queries:
+        raise ValueError(
+            "the differential needs a non-empty corpus and at least one query; a vacuous "
+            "agreement proves nothing."
+        )
     for query_index, query in enumerate(queries):
         canonical = ground_truth(corpus, query, k)
         fast = ground_truth(corpus, query, k, distance=accelerated_distance)

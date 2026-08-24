@@ -186,3 +186,16 @@ def test_the_worker_cli_writes_the_verdict_and_exits_by_outcome(
     assert main(["--profile", "tiny", "--out", str(failed)]) == 3
     diagnostic = json.loads(failed.read_text(encoding="utf-8"))
     assert diagnostic["ok"] is False
+
+
+def test_the_worker_overlap_really_delegates_to_the_shared_formula(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spy replaces generous_overlap in the worker namespace; _overlap must call it."""
+    sentinel = 0.4242
+
+    def spy(pre: object, post: object, k: int) -> float:
+        return sentinel
+
+    monkeypatch.setattr(worker, "generous_overlap", spy)
+    assert worker._overlap(object(), object(), 3) == sentinel

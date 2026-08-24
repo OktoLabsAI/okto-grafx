@@ -33,6 +33,7 @@ from bench.recall_corpus import (
     DtypeCheck,
     compare_truths,
     generate_vectors,
+    generous_overlap,
     ground_truth,
     quantize_f32,
     recall_at_k,
@@ -165,8 +166,8 @@ def _differential(corpus: list[list[float]], k: int) -> tuple[bool, str]:
 
 
 def _overlap(pre_truth: object, post_truth: object, k: int) -> float:
-    """Return the TR-4 overlap of one query: BILATERALLY generous, the shared formula."""
-    return min(len(pre_truth.members & post_truth.members), k) / k
+    """Return the TR-4 overlap of one query by DELEGATING to the shared formula."""
+    return generous_overlap(pre_truth, post_truth, k)  # type: ignore[arg-type]
 
 
 def _build_engine(quantized: list[list[float]], dimension: int):
