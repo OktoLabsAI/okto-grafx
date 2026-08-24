@@ -184,6 +184,15 @@ _CONTROL_PREFIX: str = "control/"
 _LEASE_RECORD: str = "control/writer.lease"
 """The writer lease, exactly where the coordination adapter keeps it."""
 
+_MAX_CONTROL_RECORD_BYTES: int = 4096
+"""One page: far above any lease the coordination adapter writes (header 64 bytes + an owner
+id capped at 96 + CRC 4), far below anything worth reading blind. A control record whose SIZE
+already exceeds this is either damage the door does not need to READ to prove, or not a
+control record at all -- and reading it first would let a sparse or damaged file demand an
+arbitrary allocation before the probe ever types the corruption. Pinned two ways by the
+battery: a declared-gigantic size refuses with zero reads, and a REAL lease written by the
+production adapter fits with room to spare."""
+
 _LEASE_SECTION: str = "writer.lease"
 """The section every cooperating publisher of the lease serialises on.
 
@@ -865,6 +874,16 @@ class RecoveryManager:
         # decision below is about THESE bytes, and the door refuses rather than act on any
         # other generation it happens to find later.
         size = self._storage.log_size(name)
+        if size > _MAX_CONTROL_RECORD_BYTES:
+            raise GrafxRecoveryRefused(
+                f"The control record {name!r} claims {size} bytes, past the "
+                f"{_MAX_CONTROL_RECORD_BYTES} any record the coordination adapter writes can "
+                "occupy. That is either damage this door does not need to READ to prove, or "
+                "not a control record at all; nothing was read, quarantined or retired.",
+                field="length",
+                file=name,
+                length=size,
+            )
         body = self._storage.read_log(name, 0, size)
         digest = hashlib.sha256(body).hexdigest()
         damage = self._probe_damage(name)

@@ -532,3 +532,63 @@ def test_no_adapter_path_ever_opens_the_commit_section() -> None:
     assert "COMMIT_SECTION" not in source
     assert 'exclusive("commit"' not in source
     assert "exclusive('commit'" not in source
+
+
+class _GiganticSizeStorage:
+    """A device that declares an absurd size for the target and refuses to be read from it."""
+
+    def __init__(self, inner: object, name: str) -> None:
+        self._inner = inner
+        self._name = name
+
+    def __getattr__(self, attr: str) -> Any:
+        """Everything else is answered by the real device."""
+        return getattr(self._inner, attr)
+
+    def log_size(self, file: str) -> int:
+        """Claim a gigantic size for the target."""
+        if file == self._name:
+            return 10**9
+        return self._inner.log_size(file)  # type: ignore[attr-defined]
+
+    def read_log(self, file: str, offset: int, length: int) -> bytes:
+        """Refuse loudly if the door tries to read the oversized target anyway."""
+        assert file != self._name, "an oversized control record must never be read"
+        return self._inner.read_log(file, offset, length)  # type: ignore[attr-defined]
+
+
+def test_an_oversized_control_record_refuses_before_the_first_read(
+    stack: Stack,
+) -> None:
+    """A size past the cap is evidence enough: zero reads, zero evidence, zero removal."""
+    _seed(stack, LEASE)
+    quarantine_before = _quarantine_files(stack)
+    probe = _DamageProbe()
+    huge = _GiganticSizeStorage(stack.storage, LEASE)
+    with pytest.raises(GrafxRecoveryRefused, match="claims") as caught:
+        _manager(stack, storage=huge, control_probe=probe).retire_control_record(LEASE)
+    assert caught.value.details["length"] == 10**9
+    assert probe.calls == 0
+    assert len(stack.ledger.entries()) == 0
+    assert _quarantine_files(stack) == quarantine_before
+    assert _bytes_of(stack, LEASE) == DAMAGED
+
+
+def test_a_real_lease_written_by_the_adapter_fits_the_cap(tmp_path: Path) -> None:
+    """The cap can never refuse a legitimate lease: the production adapter's own record,
+    written end to end, stays a fraction of one page."""
+    from okto_grafx.engine.recovery_manager import _MAX_CONTROL_RECORD_BYTES  # noqa: PLC2701
+
+    root = tmp_path / "capdb"
+    root.mkdir()
+    coordinator = LocalProcessCoordinator(
+        LocalStorageDevice(str(root)),
+        SystemClock(),
+        owner_id="cap-check",
+        lock_directory=str(root / "control"),
+        poll_interval=0.002,
+    )
+    coordinator.acquire_writer_lease(timeout=5.0)
+    lease_file = root / "control" / "writer.lease"
+    assert lease_file.exists()
+    assert lease_file.stat().st_size <= _MAX_CONTROL_RECORD_BYTES // 4
