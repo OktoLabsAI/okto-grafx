@@ -53,14 +53,16 @@ def family() -> str:
 
 
 PROFILE_TIMEOUTS: dict[str, float] = {"tiny": 300.0, "smoke": 1800.0, "full": 9600.0}
-"""Wall-clock ceilings per profile, measured rather than guessed: the full profile RUN
-exceeded 3000s locally on a machine faster than the CI runners -- and the measured cost
-lives in the per-query SEARCHES, not the build (a 2048-vector build takes seconds; the
-ACORN beam visits most of the graph at the frozen ef), so the ceiling covers the whole
-run: 160 minutes, under the scheduled job's 180-minute budget with room for setup and
-the gate, while smoke keeps the original 30 and tiny stays test-sized. ``run_recall``
-resolves these when the caller passes no explicit timeout; an explicit value always
-wins after validation."""
+"""Wall-clock ceilings per profile, measured rather than guessed. The full profile run
+took ~53 minutes end to end on the freeze machine (faster than the CI runners), so its
+ceiling is 160 minutes -- whole-run, with margin, under the scheduled job's 180-minute
+budget. What IS separately measured about the phases: a 2048x384 build takes ~3
+seconds, and per-query searches at the frozen ef visit most of that graph (the ACORN
+pruning weakens while the result set stays unfilled). The phase breakdown of the full
+8192x384 run was NOT instrumented separately, so no phase is blamed here -- the
+ceiling simply covers all of them. Smoke keeps the original 30 minutes and tiny stays
+test-sized. ``run_recall`` resolves these when the caller passes no explicit timeout;
+an explicit value always wins after validation."""
 
 
 def _describe(value: object) -> str:
