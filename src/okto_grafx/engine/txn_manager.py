@@ -72,6 +72,7 @@ from okto_grafx.domain.errors import (
     GrafxLeaseStolen,
     GrafxRecoveryRefused,
     GrafxTransactionStateError,
+    GrafxUnsupportedOperation,
     GrafxWriteConflict,
 )
 from okto_grafx.domain.ids import (
@@ -236,6 +237,7 @@ class TransactionManager:
         "_recovery_required",
         "_page_staging_capability",
         "_mode_counts",
+        "_writable",
     )
 
     def __init__(
@@ -256,10 +258,11 @@ class TransactionManager:
         descriptor: str = "",
         retain_lease: bool = False,
         index_sync: Callable[[], object] | None = None,
+        writable: bool = True,
     ) -> None:
         """Build a manager over one database.
 
-        The three keyword arguments after the two the contract names are configuration this
+        The keyword arguments after the two the contract names are configuration this
         component cannot invent and must not guess:
 
         * ``lease_timeout`` -- how long a commit waits for the writer lease. It defaults to
@@ -272,7 +275,17 @@ class TransactionManager:
         * ``descriptor`` -- the granularity descriptor of SD-1. It is passed in rather than
           rebuilt here because ``DatabaseConfig`` already produces that exact string and two
           places producing one format string is how the two stop agreeing (amendment A24).
+        * ``writable`` -- the capability to open write transactions or checkpoint. Read-only
+          composition passes ``False`` so both doors refuse before coordination, WAL or storage;
+          the compatible default remains ``True`` for existing composition roots.
         """
+        if not isinstance(writable, bool):
+            raise GrafxConfigurationError(
+                f"writable is a capability flag; got {type(writable).__name__}.",
+                field="writable",
+                value=type(writable).__name__,
+            )
+        self._writable: bool = writable
         self._wal: Any = wal
         self._pool: BufferPool = pool
         self._heap: Any = heap
@@ -392,6 +405,11 @@ class TransactionManager:
         a missing row for an exact index, a silently short answer for a proximity one.
         """
         return self._index_manager
+
+    @property
+    def writable(self) -> bool:
+        """Return whether this manager may open or perform persistent write work."""
+        return self._writable
 
     @property
     def open_transactions(self) -> int:
@@ -521,6 +539,16 @@ class TransactionManager:
             required_lsn=self._published_high_water,
         )
 
+    def _require_writable(self, operation: str) -> None:
+        """Refuse persistent work before a lease, WAL, pool, or device door is reached."""
+        if self._writable:
+            return
+        raise GrafxUnsupportedOperation(
+            f"Cannot {operation} through a read-only transaction manager.",
+            operation=operation,
+            read_only=True,
+        )
+
     # --- life of a transaction ----------------------------------------------------------------
 
     def begin(self, mode: str) -> TransactionContext:
@@ -542,6 +570,8 @@ class TransactionManager:
         selecting -- the obvious order -- gives that guarantee away.
         """
         parsed = TransactionMode.parse(mode)
+        if parsed is TransactionMode.WRITE:
+            self._require_writable("begin a write transaction")
         with self._participant_section():
             self._require_recovery_complete()
             self._refresh_due_readers()
@@ -722,6 +752,7 @@ class TransactionManager:
         checkpoint allow together. A reader still pinned below the checkpoint holds the horizon
         back on its own account; nothing here evicts it.
         """
+        self._require_writable("checkpoint")
         with self._participant_section():
             self._require_recovery_complete()
             lease = self._hold_lease()
