@@ -25,6 +25,7 @@ from okto_grafx.domain.errors import (
     GrafxRecoveryRefused,
 )
 from okto_grafx.domain.index.definition import IndexDefinition
+from okto_grafx.domain.index.header import INDEX_HEADER_SLOT, IndexHeader
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.ledger.entry import LedgerEntry
 from okto_grafx.domain.model.schema import EmbeddingSpaceDef, TableDef
@@ -335,7 +336,11 @@ class TransactionManagerView:
 
 @dataclass(frozen=True, slots=True)
 class IndexView:
-    """Immutable public metadata for one registered secondary index."""
+    """Immutable public metadata for one committed secondary index.
+
+    Header positions are ``None`` when page zero was not already resident.  A diagnostic
+    property never faults that page in or evicts application data merely to fill these fields.
+    """
 
     name: str
     file: str
@@ -343,8 +348,8 @@ class IndexView:
     definition: IndexDefinition
     stale: bool
     stale_reason: str | None
-    built_through_lsn: int
-    reconciled_through_lsn: int
+    built_through_lsn: int | None
+    reconciled_through_lsn: int | None
     missing_targets: int
 
 
@@ -450,7 +455,10 @@ class QuarantineView:
 
 @dataclass(frozen=True, slots=True)
 class VectorIndexView:
-    """Immutable identity and search configuration of one vector index."""
+    """Immutable identity and search configuration of one committed vector index.
+
+    ``built_through_lsn`` is ``None`` when the header was cold at the observation point.
+    """
 
     name: str
     file: str
@@ -462,7 +470,7 @@ class VectorIndexView:
     ef_search: int
     stale: bool
     stale_reason: str | None
-    built_through_lsn: int
+    built_through_lsn: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -576,7 +584,7 @@ def _coordinator_view(coordinator: Any) -> CoordinatorView:
 
 
 def _pool_view(pool: Any) -> BufferPoolView:
-    """Snapshot buffer-pool counters and limits."""
+    """Snapshot buffer-pool counters and limits without pinning or evicting a page."""
     return BufferPoolView(
         int(pool.page_size),
         int(pool.budget_bytes),
@@ -587,8 +595,12 @@ def _pool_view(pool: Any) -> BufferPoolView:
 
 
 def _catalog_view(store: Any) -> CatalogStoreView:
-    """Snapshot catalog metadata and immutable schema definitions."""
-    catalog = store.catalog
+    """Copy the catalog already materialised by its store."""
+    return _catalog_view_from(store, store._catalog)
+
+
+def _catalog_view_from(store: Any, catalog: Any) -> CatalogStoreView:
+    """Copy one caller-validated catalog value without retaining it or its store."""
     return CatalogStoreView(
         str(store.file),
         int(store.chunk_capacity),
@@ -602,11 +614,14 @@ def _heap_view(heap: Any) -> HeapStoreView:
 
 
 def _wal_view(wal: Any) -> WalView:
-    """Snapshot WAL state and its immutable segment metadata."""
-    # Each of last_lsn/damage/segments/total_bytes ordinarily refreshes the same tail. Refresh
-    # once, then copy the cached values produced by that pass; a diagnostic snapshot must not do
-    # four directory surveys and four metric publications for one answer.
-    wal.refresh()
+    """Copy the WAL fields already observed by this handle, without storage or callbacks.
+
+    The caller holds the transaction manager's participant section, which is also held across
+    local append/barrier work.  Calling ``refresh`` here used to overwrite ``_unflushed`` while
+    a commit was preparing its barrier and also published size metrics from a property getter.
+    A pure copy is both coherent and side-effect free; cross-process publication remains
+    observable through ``database.transactions``.
+    """
     return WalView(
         int(wal._last_lsn),
         str(wal._directory),
@@ -635,10 +650,8 @@ def _transactions_view(transactions: Any) -> TransactionManagerView:
 
 
 def _index_view(index: Any) -> IndexView:
-    """Snapshot one registered index without retaining its store."""
-    # Both positions live in the same header. Read it once so the snapshot is coherent and does
-    # one checksum/page-cache access per index instead of two.
-    header = index.header
+    """Snapshot one registered index without retaining its store or faulting a page in."""
+    built_through, reconciled_through = _resident_index_positions(index)
     return IndexView(
         str(index.name),
         str(index.file),
@@ -646,16 +659,20 @@ def _index_view(index: Any) -> IndexView:
         index.definition,
         bool(index.stale),
         index.stale_reason,
-        int(header.built_through_lsn),
-        int(header.reconciled_through_lsn),
+        built_through,
+        reconciled_through,
         int(index.missing_targets),
     )
 
 
-def _indexes_view(indexes: Any) -> IndexRegistryView:
-    """Snapshot a complete registered-index inventory."""
+def _indexes_view(indexes: Any, table_ids: frozenset[int]) -> IndexRegistryView:
+    """Snapshot registrations whose tables belong to the validated committed catalog."""
     return IndexRegistryView(
-        tuple(_index_view(index) for index in indexes.indexes()),
+        tuple(
+            _index_view(index)
+            for index in indexes.indexes()
+            if index.definition.table_id in table_ids
+        ),
         int(indexes.published_lsn),
     )
 
@@ -676,7 +693,8 @@ def _quarantine_view(quarantine: Any) -> QuarantineView:
 
 
 def _vector_index_view(index: Any) -> VectorIndexView:
-    """Snapshot one vector index without retaining its engine or store."""
+    """Snapshot one vector index without retaining its engine or faulting a page in."""
+    built_through, _reconciled_through = _resident_index_positions(index)
     return VectorIndexView(
         str(index.name),
         str(index.file),
@@ -688,14 +706,43 @@ def _vector_index_view(index: Any) -> VectorIndexView:
         int(index.ef_search),
         bool(index.stale),
         index.stale_reason,
-        int(index.built_through_lsn),
+        built_through,
     )
 
 
-def _vectors_view(vectors: Any) -> VectorEngineView:
-    """Snapshot vector configuration, spaces and registered indexes."""
+def _resident_index_positions(index: Any) -> tuple[int | None, int | None]:
+    """Return header positions only when page zero is already resident.
+
+    ``IndexStore.header`` calls storage even on a cache hit and a cold ``BufferPool.pin`` may
+    evict a dirty page and publish metrics.  Observation builders must do neither while their
+    caller holds the participant section.  The pool guard makes this private, read-only peek
+    coherent with concurrent pin/eviction bookkeeping; absence means "not observed", not zero.
+    No frame, page, guard or store is retained by the returned values.
+    """
+    pool = index._pool
+    with pool._guard:
+        frame = pool._frames.get((index.file, 0))
+        if frame is None:
+            return None, None
+        page = frame.page
+        if page.slot_count <= INDEX_HEADER_SLOT:
+            return None, None
+        header = IndexHeader.decode(page.read_slot(INDEX_HEADER_SLOT))
+        return int(header.built_through_lsn), int(header.reconciled_through_lsn)
+
+
+def _vectors_view(
+    vectors: Any, spaces: Any, table_ids: frozenset[int]
+) -> VectorEngineView:
+    """Snapshot vector configuration against caller-validated catalog spaces."""
+    captured_spaces = tuple(spaces)
+    space_ids = frozenset(space.space_id for space in captured_spaces)
     return VectorEngineView(
         int(vectors.exact_scan_threshold),
-        tuple(vectors.spaces()),
-        tuple(_vector_index_view(index) for index in vectors.indexes()),
+        captured_spaces,
+        tuple(
+            _vector_index_view(index)
+            for index in vectors.indexes()
+            if index.space_id in space_ids and index.definition.table_id in table_ids
+        ),
     )

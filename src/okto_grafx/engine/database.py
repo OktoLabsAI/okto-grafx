@@ -65,8 +65,10 @@ from okto_grafx.domain.txn.context import (
     CommitReport,
     TransactionContext,
     TransactionMode,
+    TransactionState,
 )
 from okto_grafx.domain.txn.snapshot import Snapshot
+from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore
@@ -89,7 +91,7 @@ from okto_grafx.engine.public_views import (
     VectorEngineView,
     VectorMathView,
     WalView,
-    _catalog_view,
+    _catalog_view_from,
     _clock_view,
     _codec_view,
     _component_view,
@@ -188,6 +190,18 @@ def _require_text(field: str, value: object) -> str:
             value=repr(value),
         )
     return value
+
+
+def _note_cleanup_failure(primary: BaseException, cleanup: BaseException) -> None:
+    """Attach cleanup evidence without changing the exception that caused the unwind."""
+    try:
+        primary.add_note(
+            f"Additional cleanup failure: {type(cleanup).__name__}: {cleanup}"
+        )
+    except BaseException:
+        # Exception note support is diagnostic only; an exotic exception implementation must
+        # not replace either the primary failure or the cleanup result it was meant to report.
+        return
 
 
 @dataclass(frozen=True, slots=True)
@@ -610,6 +624,7 @@ class Database:
         "_read_only",
         "_closers",
         "_closed",
+        "_public_contexts",
         "_recovery_report",
         "_attached_indexes",
         "_stale_indexes",
@@ -679,6 +694,12 @@ class Database:
         self._metrics_endpoint: str | None = metrics_endpoint
         self._closers: tuple[Callable[[], None], ...] = tuple(closers)
         self._closed: bool = False
+        # Contexts never cross the public boundary, but the facade must remember every context
+        # that entered QueryEngine until its schema journal is retired. TransactionManager owns
+        # pins and transaction state; this map owns only the second half of public lifecycle
+        # settlement, so Database.close can finish it before storage and the pool disappear. A
+        # transaction that never executed a statement needs no entry and no post-close unwind.
+        self._public_contexts: dict[int, TransactionContext] = {}
         self._recovery_report: object = recovery_report
         self._attached_indexes: tuple[str, ...] = tuple(attached_indexes)
         self._stale_indexes: tuple[str, ...] = tuple(stale_indexes)
@@ -821,13 +842,18 @@ class Database:
     def pool(self) -> BufferPoolView:
         """Return immutable page-cache capacity and residency counters (FR-13)."""
         self._require_open()
-        return _pool_view(self._pool)
+        # Every public page operation enters this same section.  The snapshot therefore cannot
+        # straddle an eviction, while its builder only reads in-memory counters and never calls
+        # a storage or telemetry port with the section held.
+        with self._transactions._participant_section():
+            return _pool_view(self._pool)
 
     @property
     def catalog(self) -> CatalogStoreView:
-        """Return an immutable schema and catalog-layout snapshot."""
+        """Return a complete, linearized schema and catalog-layout snapshot."""
         self._require_open()
-        return _catalog_view(self._catalog)
+        snapshot, _epoch = self._catalog_snapshot()
+        return snapshot
 
     @property
     def heap(self) -> HeapStoreView:
@@ -837,9 +863,16 @@ class Database:
 
     @property
     def wal(self) -> WalView:
-        """Return an immutable write-ahead-log state and segment inventory (FR-5)."""
+        """Return the WAL state last observed by this handle and its segment inventory (FR-5).
+
+        This observation is deliberately cache-only.  Refreshing the directory here would both
+        turn a property read into storage I/O and race ``WalManager._unflushed`` with a commit's
+        durability barrier.  The participant section makes the cached fields one coherent cut
+        without running storage or metrics callbacks while it is held.
+        """
         self._require_open()
-        return _wal_view(self._wal)
+        with self._transactions._participant_section():
+            return _wal_view(self._wal)
 
     @property
     def transactions(self) -> TransactionManagerView:
@@ -855,10 +888,18 @@ class Database:
         """
         self._require_open()
         indexes = self._require_component("indexes", self._indexes, "the index framework (C7)")
-        # Built/reconciled positions live in index header pages.  Treat this observation like
-        # every other public page read so it cannot straddle a recovery-required latch.
-        with self._transactions.page_access_section():
-            return _indexes_view(indexes)
+        # Query DDL registers accelerators before commit and journals them for rollback.  Filter
+        # that speculative registry against the same linearized committed catalog the caller
+        # sees, and revalidate its epoch beside the registry snapshot.
+        while True:
+            catalog, epoch = self._catalog_snapshot()
+            table_ids = frozenset(
+                table.table_id for table in catalog.catalog.table_definitions
+            )
+            with self._transactions._participant_section():
+                if self._catalog._view_epoch() != epoch:
+                    continue
+                return _indexes_view(indexes, table_ids)
 
     @property
     def ledger(self) -> LedgerView:
@@ -890,9 +931,20 @@ class Database:
         """
         self._require_open()
         vectors = self._require_component("vectors", self._vectors, "the vector engine (C9)")
-        # Vector inventory includes the index header's built-through position.
-        with self._transactions.page_access_section():
-            return _vectors_view(vectors)
+        # A catalog refresh can read/evict pages and publish telemetry, so it happens before the
+        # participant section.  _catalog_snapshot validates the page epoch under that section;
+        # validate it once more beside the vector registry so a DDL commit cannot land in the
+        # small gap and produce spaces from one side with indexes from the other.
+        while True:
+            catalog, epoch = self._catalog_snapshot()
+            tables = frozenset(
+                table.table_id for table in catalog.catalog.table_definitions
+            )
+            spaces = catalog.catalog.space_definitions
+            with self._transactions._participant_section():
+                if self._catalog._view_epoch() != epoch:
+                    continue
+                return _vectors_view(vectors, spaces, tables)
 
     @property
     def queries(self) -> QueryEngineView:
@@ -918,7 +970,8 @@ class Database:
         parsed = TransactionMode.parse(mode)
         if parsed is TransactionMode.WRITE:
             self._require_writable("begin a write transaction")
-        return Transaction(self, self._transactions.begin(parsed.value))
+        context = self._transactions.begin(parsed.value)
+        return self._public_transaction(context)
 
     def retry(self, transaction: Transaction) -> Transaction:
         """Open the successor of a transaction optimistic validation refused (BR-6).
@@ -941,21 +994,42 @@ class Database:
                 field="transaction_owner",
                 path=self._path,
             )
-        # Hold the participant section across the wrapper-state check and manager retry. Without
-        # it a concurrent rollback could finish after this check but before TransactionManager
-        # inspects the context; its retry door intentionally accepts an already-aborted context
-        # when called internally, which is not the public contract here.
-        with self._transactions._participant_section():
-            transaction._require_active()
-            context = transaction._context
-            # TransactionManager.retry performs the conflict check, ownership check, rollback
-            # and successor open as one engine operation. Only AFTER all validation has succeeded
-            # do we settle query-schema bookkeeping. The old order settled the wrong database's
-            # working schema before the manager could reject a foreign or finished transaction.
+        transaction._require_active()
+        context = transaction._context
+        # TransactionManager.retry revalidates the CURRENT owned ACTIVE context, aborts it and
+        # registers its successor in one participant section.  Keeping a second outer section
+        # here would put the manager's failure telemetry under a facade lock and would still not
+        # be the authority for state. Only after that atomic operation succeeds may the public
+        # wrapper be retired and its query-schema journal unwound.
+        try:
             successor = self._transactions.retry(context)
-            transaction._finished = True
+        except BaseException as retry_failure:
+            # Manager retry can fail after it has fail-completely aborted the predecessor (for
+            # example, if opening the successor or publishing the decremented gauge fails). In
+            # that case its query journal belongs to the same unwind as a successful retry. A
+            # validation refusal leaves the context ACTIVE and therefore leaves the wrapper and
+            # journal untouched.
+            if context.state is TransactionState.ABORTED:
+                transaction._finished = True
+                try:
+                    self._settle_schema(context, committed=False)
+                except BaseException as settlement_failure:
+                    _note_cleanup_failure(retry_failure, settlement_failure)
+            raise
+        transaction._finished = True
+        try:
             self._settle_schema(context, committed=False)
-        return Transaction(self, successor)
+        except BaseException as settlement_failure:
+            # The successor has not escaped yet. Retire it immediately so a failure in the
+            # predecessor's schema unwind cannot leak a reader pin or an active transaction. A
+            # fail-complete manager may itself report cleanup trouble after retiring the pin;
+            # that evidence is attached without replacing the original settlement failure.
+            try:
+                self._transactions.rollback(successor)
+            except BaseException as cleanup_failure:
+                _note_cleanup_failure(settlement_failure, cleanup_failure)
+            raise
+        return self._public_transaction(successor)
 
     @contextmanager
     def transaction(self, mode: str = "write") -> Iterator[Transaction]:
@@ -1002,6 +1076,17 @@ class Database:
         _require_text("statement", text)
         engine = self._require_component("queries", self._queries, "the query engine (C10)")
         with self._transactions.page_access_section():
+            if not context.active:
+                raise GrafxTransactionStateError(
+                    f"Transaction {context.txn_id} is {context.state.value} and cannot execute "
+                    "another statement.",
+                    txn_id=context.txn_id,
+                    state=context.state.value,
+                )
+            # Registration and statement execution share the participant section. Close can
+            # therefore neither miss a context that may have acquired a schema journal nor
+            # release storage while the statement is installing one.
+            self._public_contexts.setdefault(context.txn_id, context)
             return engine.execute(text, context, parameters)  # type: ignore[attr-defined]
 
     def search_vectors(
@@ -1011,14 +1096,17 @@ class Database:
         space: str,
         query: Sequence[float],
         k: int,
-        candidate_filter: object = None,
+        candidate_filter: RecordIdFilter | None = None,
     ) -> object:
         """Search vectors under the fixed snapshot of one active transaction.
 
         This is the safe replacement for reaching through ``database.vectors.search`` and
         supplying a raw ``TransactionContext`` or snapshot.  Ownership and liveness are checked
         before the vector engine is reached, and the page-access section keeps the recovery latch
-        stable for the whole search.  The vector collaborator itself never leaves the database.
+        stable for the whole search.  The public filter is the immutable exact
+        :class:`RecordIdFilter`; accepting an arbitrary predicate would let caller code roll back
+        this transaction from inside the engine and withdraw its reader pin mid-search.  The
+        vector collaborator itself never leaves the database.
         """
         self._require_open()
         if not isinstance(transaction, Transaction):
@@ -1033,6 +1121,15 @@ class Database:
                 txn_id=transaction.txn_id,
                 field="transaction_owner",
                 path=self._path,
+            )
+        # Exact type, not isinstance: a subclass can add a callback or mutable backdoor to the
+        # otherwise frozen DTO.  Refuse it before resolving or entering the vector engine.
+        if candidate_filter is not None and type(candidate_filter) is not RecordIdFilter:
+            raise GrafxConfigurationError(
+                "A public vector candidate filter must be an immutable RecordIdFilter or None; "
+                f"got {type(candidate_filter).__name__}.",
+                field="candidate_filter",
+                value=type(candidate_filter).__name__,
             )
         vectors = self._require_component("vectors", self._vectors, "the vector engine (C9)")
         with self._transactions.page_access_section():
@@ -1247,20 +1344,77 @@ class Database:
             return
 
     def _close_transactions(self) -> None:
-        """Abort every open transaction and withdraw every reader registration."""
-        self._transactions.close()
+        """Abort contexts, withdraw pins and finish every public schema journal.
+
+        TransactionManager owns the terminal latch and reaches quiescence first. Schema unwind
+        is a distinct QueryEngine responsibility, however: rollback can already have released
+        its reader pin when it starts removing speculative index files. Keeping every adopted
+        context until that second phase succeeds lets close wait for an in-flight unwind or do
+        the unwind itself, before the pool and storage closers run.
+        """
+        failure: BaseException | None = None
+        try:
+            self._transactions.close()
+        except BaseException as close_failure:
+            failure = close_failure
+
+        # No statement registration can pass manager quiescence. Drain under the same section
+        # used by wrapper settlement, preserving the manager's final outcome: a commit that won
+        # before close is settled as committed, never mistaken for rollback work.
+        try:
+            with self._transactions._participant_section():
+                contexts = tuple(self._public_contexts.values())
+                for context in contexts:
+                    try:
+                        self._settle_schema_in_section(
+                            context,
+                            committed=context.state is TransactionState.COMMITTED,
+                        )
+                    except BaseException as settlement_failure:
+                        if failure is None:
+                            failure = settlement_failure
+                        else:
+                            _note_cleanup_failure(failure, settlement_failure)
+        except BaseException as snapshot_failure:
+            if failure is None:
+                failure = snapshot_failure
+            else:
+                _note_cleanup_failure(failure, snapshot_failure)
+        if failure is not None:
+            raise failure
 
     def _settle_schema(self, context: TransactionContext, *, committed: bool) -> None:
         """Tell the query engine one transaction's schema bookkeeping is over.
 
         On a rollback this is what takes back the two side effects a DDL statement makes outside
         the transaction -- the indexes it registered and the vector engine's space map -- and
-        drops the working catalog copy. Never raises: it runs on the rollback path.
+        drops the working catalog copy. It shares the participant section with close so storage
+        cannot be released between manager rollback and removal of speculative index files. The
+        context remains tracked if a foreign failure interrupts settlement, allowing close to
+        retry the cleanup instead of losing it.
         """
+        # A wrapper can return from manager commit/rollback after a racing close has already
+        # drained this exact context and released its resources. The absent-id fast path is what
+        # makes that late settlement a true no-op without even touching the coordinator.
+        if self._public_contexts.get(context.txn_id) is not context or self._closed:
+            return
+        with self._transactions._participant_section():
+            if self._closed:
+                # Close owns the drain once its terminal flag is visible.
+                return
+            self._settle_schema_in_section(context, committed=committed)
+
+    def _settle_schema_in_section(
+        self, context: TransactionContext, *, committed: bool
+    ) -> None:
+        """Settle one still-tracked query context while the participant section is held."""
+        if self._public_contexts.get(context.txn_id) is not context:
+            return
         queries = self._queries
         settle = getattr(queries, "settle_schema", None)
         if callable(settle):
             settle(context.txn_id, committed=committed)
+        self._public_contexts.pop(context.txn_id, None)
 
     def _flush_pages(self) -> None:
         """Write dirty pages back, unless the database was opened read-only.
@@ -1317,6 +1471,63 @@ class Database:
             raise failures[0]
 
     # --- internals ----------------------------------------------------------------------------
+
+    def _public_transaction(self, context: TransactionContext) -> Transaction:
+        """Wrap a manager context only if it still belongs to an open public facade.
+
+        Manager begin/retry may finish just as Database.close publishes its terminal flag. A
+        context that won before that flag is a valid pre-close result; one observed after close
+        is refused without entering coordination again, and manager.close owns its retirement.
+        """
+        self._require_open()
+        if not context.active:
+            raise GrafxTransactionStateError(
+                f"Transaction {context.txn_id} is {context.state.value} and cannot be handed "
+                "to a caller.",
+                txn_id=context.txn_id,
+                state=context.state.value,
+            )
+        return Transaction(self, context)
+
+    def _catalog_snapshot(self) -> tuple[CatalogStoreView, int]:
+        """Read one whole catalog generation without executing host code under a section.
+
+        A DDL commit applies several catalog pages while holding the participant section.  Page
+        reads and their storage/codec/metrics ports cannot safely run under that section, so the
+        observation is optimistic: copy the already-current in-memory catalog or read a fresh
+        value outside, then accept it only when the derived epoch stayed unchanged and still
+        matches after acquiring the participant section.  A read failure is validated the same
+        way: if pages moved while it was raised, retry instead of publishing transient partial
+        DDL as corruption.
+        """
+        store = self._catalog
+        while True:
+            before = int(store._view_epoch())
+            observed: object | None = None
+            snapshot: CatalogStoreView | None = None
+            failure: BaseException | None = None
+            try:
+                if int(store._loaded_epoch) == before:
+                    observed = store._catalog
+                else:
+                    observed = store.read_from_pages()
+                snapshot = _catalog_view_from(store, observed)
+            except BaseException as caught:  # noqa: BLE001 - preserve the original taxonomy
+                failure = caught
+            after = int(store._view_epoch())
+            with self._transactions._participant_section():
+                current = int(store._view_epoch())
+                if before != after or after != current:
+                    continue
+                if failure is not None:
+                    raise failure
+                if snapshot is None or observed is None:  # pragma: no cover - total above
+                    raise AssertionError("a successful catalog observation produced no value")
+                if int(store._loaded_epoch) != current:
+                    # Pure in-memory publication after the epoch proof.  It prevents every later
+                    # view/query from paying for the same refresh and runs no adapter callback.
+                    store.adopt(observed)
+                return snapshot, current
 
     def _require_writable(self, operation: str) -> None:
         """Refuse an operation that would write, on a database opened read-only.

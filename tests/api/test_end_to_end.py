@@ -250,11 +250,14 @@ def test_verification_walks_the_indexes_a_caller_registered_after_the_open(
     from okto_grafx.engine.index_manager import HashIndex
 
     with connect(tmp_path / "db", page_size=512) as db:
+        with db.begin("write") as schema:
+            schema.execute("CREATE NODE TABLE Person(id INT64)")
         before = db.verify("all")
         assert not any("person_by_id" in name for name in before.files_checked)
+        person = db.catalog.catalog.table("Person")
         definition = IndexDefinition(
             name="person_by_id",
-            table_id=1,
+            table_id=person.table_id,
             table_name="Person",
             positions=(0,),
             visibility=IndexVisibility.EXACT,

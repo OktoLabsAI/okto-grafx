@@ -207,7 +207,6 @@ def test_checkpoint_index_inventory_is_serialized_with_a_post_barrier_commit(
         )
         checkpoint_thread.start()
         assert inventory_entered.wait(timeout=5.0)
-        wal_at_inventory = database.wal.last_lsn
 
         commit_thread = threading.Thread(target=run_commit, name="latching-commit")
         commit_thread.start()
@@ -215,8 +214,9 @@ def test_checkpoint_index_inventory_is_serialized_with_a_post_barrier_commit(
             # IndexManager.open is after TransactionManager.checkpoint returned. Holding the same
             # participant section here must nevertheless keep commit from reaching its barrier.
             assert not commit_done.wait(timeout=0.2)
-            assert database.wal.last_lsn == wal_at_inventory
-            assert database.transactions.recovery_required is False
+            # WAL and transaction publication observations now join this same section. Asking
+            # for either here would correctly wait behind the paused checkpoint instead of
+            # reading a straddled cached snapshot; commit_done is the non-blocking evidence.
         finally:
             release_inventory.set()
 

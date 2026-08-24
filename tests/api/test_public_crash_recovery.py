@@ -601,7 +601,6 @@ def test_flush_cannot_race_a_post_barrier_recovery_latch(
                 commit_done.set()
 
         monkeypatch.setattr(BufferPool, "flush", paused_flush)
-        before_commit = database.wal.last_lsn
         flush_thread = threading.Thread(target=run_flush, name="public-flush")
         flush_thread.start()
         assert flush_entered.wait(timeout=5.0)
@@ -613,8 +612,9 @@ def test_flush_cannot_race_a_post_barrier_recovery_latch(
         # The flush owns the participant section. The commit cannot append/barrier or set the
         # latch until that earlier page operation has completely left the pool.
         assert not commit_done.wait(timeout=0.2)
-        assert database.wal.last_lsn == before_commit
-        assert database.transactions.recovery_required is False
+        # WAL and transaction publication observations join the participant section as well, so
+        # they intentionally wait behind this paused flush instead of reading straddled state;
+        # commit_done is the non-blocking evidence.
 
         release_flush.set()
         flush_thread.join(timeout=5.0)
