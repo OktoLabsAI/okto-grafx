@@ -92,10 +92,6 @@ def _read_only_outcome(registry: Any) -> tuple[str, object]:
         return ("answered", tuple(read_only.execute("MATCH (p:Person) RETURN p.id")))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P0.2 (pre-fix at 8c88e9d): read_only answered () for a row the log holds; the writable open recovers it. Pending M0C.",
-)
 def test_a_read_only_open_after_a_power_loss_answers_the_log_or_refuses() -> None:
     registry, bench, inner = _after_power_loss()
     outcome = _read_only_outcome(registry)
@@ -110,10 +106,6 @@ def test_a_read_only_open_after_a_power_loss_answers_the_log_or_refuses() -> Non
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P0.2/P1.1 (pre-fix at 8c88e9d): the read-only open rewrote index/pk_Person.idx. Pending M0C.",
-)
 def test_a_read_only_open_after_a_power_loss_writes_nothing() -> None:
     registry, bench, inner = _after_power_loss()
     before = data_digests(inner)

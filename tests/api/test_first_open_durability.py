@@ -49,10 +49,6 @@ def _volatile_data_files(bench: Any) -> tuple[str, ...]:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P0.3 (pre-fix at 8c88e9d): catalog.dat, grafx.meta and heap.dat had no barrier when connect() returned, nor after close(). Pending M0C.",
-)
 def test_the_first_open_returns_only_after_its_identity_and_headers_are_durable() -> (
     None
 ):

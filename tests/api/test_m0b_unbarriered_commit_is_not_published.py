@@ -134,10 +134,6 @@ def _reopen_and_observe(registry: Any) -> tuple[tuple[Any, ...], tuple[Any, ...]
     return found, findings
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="base 8c88e9d+probes: the refused commit's un-barriered append is replayed on reopen into the heap only -- a live row at heap page 1 slot 1, no index entry, commit.state still at the checkpoint; verify() = index_entry_missing while MATCH hides the row by MVCC (the half-published limbo of P0.1, reached from a commit the caller was told had failed). Pending M0B: replay must be whole (heap+index+state) or nothing.",
-)
 def test_a_commit_whose_barrier_refuses_publishes_nothing_and_replays_whole_or_not_at_all() -> (
     None
 ):
@@ -155,10 +151,6 @@ def test_a_commit_whose_barrier_refuses_publishes_nothing_and_replays_whole_or_n
     release_ports(registry)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="base 8c88e9d+probes: the refused commit's un-barriered append is replayed on reopen into the heap only -- a live row at heap page 1 slot 1, no index entry, commit.state still at the checkpoint; verify() = index_entry_missing while MATCH hides the row by MVCC (the half-published limbo of P0.1, reached from a commit the caller was told had failed). Pending M0B: replay must be whole (heap+index+state) or nothing.",
-)
 @pytest.mark.parametrize("foreign", [RuntimeError, KeyboardInterrupt])
 def test_a_foreign_exception_at_the_barrier_escapes_and_publishes_nothing(
     foreign: type[BaseException],

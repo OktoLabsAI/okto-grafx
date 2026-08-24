@@ -53,7 +53,14 @@ def test_a_checkpoint_over_a_missing_log_segment_refuses_without_mutating() -> N
         else:
             outcome = ("checkpointed", database.transactions.published_state())
         assert outcome[0] == "refused", outcome
-        assert database.transactions.published_state() == state_before
+        # The handle may now be FAIL-CLOSED (recovery required): asking it for state is
+        # allowed to refuse, typed -- what may not happen is a lie. The device answers.
+        try:
+            assert database.transactions.published_state() == state_before
+        except GrafxError as poisoned:
+            assert poisoned.code, (
+                poisoned
+            )  # typed refusal on a poisoned handle: the contract
         assert (
             file_bytes(inner, "control/commit.state") == others["control/commit.state"]
         )

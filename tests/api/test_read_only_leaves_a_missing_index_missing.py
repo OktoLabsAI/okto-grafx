@@ -40,10 +40,6 @@ def _data_tree(root: Path) -> dict[str, str]:
     return tree
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P1.1 (pre-fix at 8c88e9d): the read-only open recreated index/pk_Person.idx. Pending M0C.",
-)
 def test_a_read_only_open_does_not_recreate_a_missing_index_file(
     tmp_path: Path,
 ) -> None:

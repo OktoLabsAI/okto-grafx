@@ -23,12 +23,6 @@ from m0b_probe_support import crash_before_the_commit_state_publication, insert,
 pytestmark = pytest.mark.timeout(300, method="thread")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="M0B invariant 3 (base 8c88e9d): after the crash and a writable reopen, pk_Person says "
-    "built_through 8 while the published position is 4, and it is not stale -- certified "
-    "ahead of the published state; pending M0B.",
-)
 def test_an_index_ahead_of_the_published_position_is_never_certified_fresh() -> None:
     registry, bench, inner = crash_before_the_commit_state_publication(seed=1)
     try:

@@ -22,11 +22,6 @@ from power_loss_support import data_digests
 pytestmark = pytest.mark.timeout(300, method="thread")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="M0B invariant 1 (base 8c88e9d): the read-only open OPENED over a log holding a durable "
-    "COMMIT above commit.state and answered () from the published position; pending M0B.",
-)
 def test_read_only_refuses_when_the_log_holds_a_durable_commit_above_the_published_state() -> (
     None
 ):
