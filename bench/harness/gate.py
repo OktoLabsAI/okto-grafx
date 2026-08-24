@@ -118,7 +118,11 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
         # ValueError is the documented shape, RecursionError arrives from thousands of
         # nesting levels, and the promise covers whatever else an ordinary parse can
         # throw. KeyboardInterrupt and SystemExit are BaseException and still propagate.
-        return {}, {}, f"the metrics document is not readable JSON: {error}"
+        return (
+            {},
+            {},
+            f"the metrics document is not readable JSON: {_describe(error)}",
+        )
     if not isinstance(payload, Mapping):
         # `[]`, `null` and `3` are all VALID JSON, so the parse above accepts them and only the
         # shape refuses them. Without this line `payload.get` raises AttributeError, nothing
@@ -132,10 +136,13 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
             "the metrics document is valid JSON but not an object "
             f"({type(payload).__name__}), so it carries no metric list: UNMEASURED, not a verdict",
         )
-    metrics = payload.get("metrics")
-    if not isinstance(metrics, list):
-        return {}, {}, "the metrics document holds no metric list"
     try:
+        # Round-5 blocker 3: the boundary starts HERE, not after the .get. A hostile
+        # mapping handed back by a patched json.loads raised raw at payload.get, one
+        # line before the guard that was meant to contain exactly that.
+        metrics = payload.get("metrics")
+        if not isinstance(metrics, list):
+            return {}, {}, "the metrics document holds no metric list"
         return _collect_multiples(metrics)
     except Exception:  # noqa: BLE001 -- never-raise is absolute; KI/SE propagate
         return (
@@ -205,17 +212,29 @@ def _recall_measurement(document: str) -> tuple[str, object]:
         return ("absent", None)
     if not isinstance(payload, Mapping):
         return ("absent", None)
+    try:
+        # Round-5 blocker 3: the boundary covers EVERYTHING after the parse. It used to
+        # begin after payload.get("metrics") and end after the enumeration, leaving the
+        # .get and the whole shape validation -- set(entry), sorted(map(str, entry)),
+        # entry["kind"], the {!r} formats, set(sample), sample["value"] -- running a
+        # hostile object's own __iter__/__getitem__/__repr__/__str__ outside any guard.
+        # A publication that raises while being inspected is MALFORMED, which is a
+        # verdict the gate can act on; a traceback is exit 1, which is a lie.
+        return _resolve_measurement(payload)
+    except Exception:  # noqa: BLE001 -- never-raise is absolute; KI/SE propagate
+        return ("malformed", "raised while being inspected")
+
+
+def _resolve_measurement(payload: Mapping) -> tuple[str, object]:
+    """The shape resolution, guarded by ``_recall_measurement``'s absolute boundary."""
     metrics = payload.get("metrics")
     if not isinstance(metrics, list):
         return ("absent", None)
-    try:
-        entries = [
-            entry
-            for entry in metrics
-            if isinstance(entry, Mapping) and entry.get("name") == RECALL_METRIC
-        ]
-    except Exception:  # noqa: BLE001 -- a hostile mapping is a malformed publication
-        return ("malformed", "raised while being enumerated")
+    entries = [
+        entry
+        for entry in metrics
+        if isinstance(entry, Mapping) and entry.get("name") == RECALL_METRIC
+    ]
     if not entries:
         return ("absent", None)
     if len(entries) != 1:
@@ -225,15 +244,19 @@ def _recall_measurement(document: str) -> tuple[str, object]:
         )
     entry = entries[0]
     if set(entry) != {"name", "kind", "unit", "samples"}:
+        # Round-5 blocker 3: the describer, not a raw {!r}/{}, formats anything that
+        # came out of the document. The boundary above would catch a hostile repr, but
+        # then the whole verdict degrades to "raised while being inspected"; describing
+        # the offender keeps the specific, useful reason and cannot crash producing it.
         return (
             "malformed",
-            f"entry keys {sorted(map(str, entry))} differ from the declared "
+            f"entry keys {_describe(sorted(map(str, entry)))} differ from the declared "
             "{'kind', 'name', 'samples', 'unit'}",
         )
     if entry["kind"] != "gauge":
-        return ("malformed", f"kind {entry['kind']!r} is not 'gauge'")
+        return ("malformed", f"kind {_describe(entry['kind'])} is not 'gauge'")
     if entry["unit"] != "ratio":
-        return ("malformed", f"unit {entry['unit']!r} is not 'ratio'")
+        return ("malformed", f"unit {_describe(entry['unit'])} is not 'ratio'")
     samples = entry["samples"]
     if not isinstance(samples, list) or len(samples) != 1:
         described = (
@@ -372,7 +395,7 @@ def _resolve_recall_target(
         except (OSError, ValueError) as error:
             raise ValueError(
                 f"--calibration {calibration!r} was named explicitly but is unreadable "
-                f"({error}); refusing to fall back to a floor nobody chose"
+                f"({_describe(error)}); refusing to fall back to a floor nobody chose"
             ) from error
         candidate = (
             payload.get("vector_recall", {}).get("frozen", {}).get("target")
@@ -431,7 +454,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # UNREADABLE, and before this clause it escaped as a traceback whose exit status 1
         # is this gate's code for CEILING EXCEEDED -- a false verdict from a broken file.
         print(
-            f"D5 ceiling gate: UNMEASURED -- the metrics file could not be read: {error}"
+            "D5 ceiling gate: UNMEASURED -- the metrics file could not be read: "
+            f"{_describe(error)}"
         )
         return 2
     try:

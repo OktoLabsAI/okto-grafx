@@ -1227,3 +1227,396 @@ def test_an_invalid_timeout_is_refused_before_mkdir_or_spawn(
     with pytest.raises(RecallStageError, match="finite positive"):
         run_recall("tiny", scratch=scratch, timeout_seconds=bad)  # type: ignore[arg-type]
     assert not scratch.exists(), "validation must precede mkdir"
+
+
+# =====================================================================================
+# Round-5 blocker 1: a write that LIES about its byte count, and the unguarded gap
+# =====================================================================================
+
+
+@pytest.mark.parametrize(
+    "report",
+    [lambda data: True, lambda data: len(data) + 1],
+    ids=["bool-true-is-not-a-byte-count", "count-larger-than-the-remainder"],
+)
+def test_a_write_that_lies_about_its_byte_count_cannot_empty_a_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, report: object
+) -> None:
+    """Round-5 blocker 1a: ``isinstance(progress, int) and progress > 0`` accepted True
+    -- bool IS an int and True > 0 -- and accepted any count LARGER than what remained.
+    Either lie satisfied the loop with ZERO bytes on disk, and os.replace then swapped a
+    VALID document for an empty one. The count must be an exact int within the
+    remainder."""
+    import tempfile as tempfile_module
+
+    out, metrics = _seed_documents(tmp_path)
+    before = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    captured: dict[str, int] = {}
+    real_mkstemp = tempfile_module.mkstemp
+
+    def spy_mkstemp(*args: object, **kwargs: object):
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        captured["fd"] = descriptor
+        return descriptor, name
+
+    real_write = os.write
+
+    def lying_write(descriptor: int, data: bytes) -> object:
+        if descriptor == captured.get("fd"):
+            return report(data)  # type: ignore[operator]
+        return real_write(descriptor, data)
+
+    monkeypatch.setattr(tempfile_module, "mkstemp", spy_mkstemp)
+    monkeypatch.setattr(os, "write", lying_write)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    after = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    assert after == before, "an impossible byte count may not replace a valid document"
+    assert [p.name for p in tmp_path.iterdir() if ".c13-" in p.name] == []
+
+
+def test_a_partial_write_followed_by_a_stall_preserves_the_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-5 blocker 1: the honest torn write -- REAL progress and then a stall. The
+    bytes that landed are in the scratch and never in the document, which stays exactly
+    as it was."""
+    import tempfile as tempfile_module
+
+    out, metrics = _seed_documents(tmp_path)
+    before = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    captured: dict[str, int] = {}
+    real_mkstemp = tempfile_module.mkstemp
+
+    def spy_mkstemp(*args: object, **kwargs: object):
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        captured["fd"] = descriptor
+        return descriptor, name
+
+    real_write = os.write
+    calls: list[int] = []
+
+    def partial_then_stall(descriptor: int, data: bytes) -> int:
+        if descriptor != captured.get("fd"):
+            return real_write(descriptor, data)
+        calls.append(1)
+        if len(calls) == 1:
+            return real_write(descriptor, data[: max(1, len(data) // 2)])
+        return 0
+
+    monkeypatch.setattr(tempfile_module, "mkstemp", spy_mkstemp)
+    monkeypatch.setattr(os, "write", partial_then_stall)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    assert len(calls) >= 2, "the probe must exercise real progress before the stall"
+    after = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    assert after == before, "a half-written scratch may never become the document"
+    assert [p.name for p in tmp_path.iterdir() if ".c13-" in p.name] == []
+
+
+def test_an_unserializable_document_never_acquires_a_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-5 blocker 1b: json.dumps sat BETWEEN the mkstemp and the try, so a
+    serialization failure leaked the live descriptor AND the scratch file with nothing
+    to clean either up. The bytes are produced first, so a failure there acquires
+    nothing at all -- proved by forbidding mkstemp outright."""
+    import tempfile as tempfile_module
+
+    document = tmp_path / "document.json"
+    document.write_text(json.dumps({"kept": True}), encoding="utf-8")
+    before = document.read_text(encoding="utf-8")
+
+    def forbidden_mkstemp(*args: object, **kwargs: object):
+        raise AssertionError("no descriptor may be acquired before the bytes exist")
+
+    monkeypatch.setattr(tempfile_module, "mkstemp", forbidden_mkstemp)
+
+    def unserializable(payload: dict[str, object]) -> None:
+        payload["bad"] = object()
+
+    with pytest.raises(TypeError):
+        wiring._replace_json(document, unserializable)
+    assert document.read_text(encoding="utf-8") == before
+    assert [p.name for p in tmp_path.iterdir() if ".c13-" in p.name] == []
+
+
+# =====================================================================================
+# Round-5 blocker 2: the PRIMARY exception survives every cleanup shape
+# =====================================================================================
+
+
+@pytest.mark.parametrize(
+    "primary", [KeyboardInterrupt, SystemExit], ids=["worker-KI", "worker-SE"]
+)
+@pytest.mark.parametrize(
+    "cleanup",
+    [KeyboardInterrupt, SystemExit, RuntimeError],
+    ids=["cleanup-KI", "cleanup-SE", "cleanup-Exception"],
+)
+def test_the_primary_interrupt_survives_every_cleanup_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary: type[BaseException],
+    cleanup: type[BaseException],
+) -> None:
+    """Round-5 blocker 2, the full matrix: the reverse release ran under an
+    Exception-only clause, so a KeyboardInterrupt/SystemExit raised BY THE UNLINK
+    aborted the cleanup of the remaining locks and REPLACED the primary with a cleanup
+    accident. The release now absorbs every shape, reaches every lock, and what the
+    caller sees is always the primary."""
+    out, metrics = _seed_documents(tmp_path)
+
+    def interrupted_worker(*args: object, **kwargs: object) -> dict[str, object]:
+        raise primary("PRIMARY")
+
+    monkeypatch.setattr(wiring, "run_recall", interrupted_worker)
+    real_unlink = os.unlink
+    attempted: list[str] = []
+
+    def hostile_unlink(path: object, *args: object, **kwargs: object) -> None:
+        if str(path).endswith(".c13.lock"):
+            attempted.append(str(path))
+            raise cleanup("CLEANUP")
+        return real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "unlink", hostile_unlink)
+    with pytest.raises(primary) as caught:
+        append_vector_recall(
+            profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+        )
+    assert "PRIMARY" in str(caught.value), "a cleanup accident may not become the story"
+    assert len(attempted) == 2, "the reverse release must reach EVERY lock, any shape"
+
+
+def test_an_interrupt_closing_the_second_lock_still_releases_the_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-5 blocker 2: the final close ran under an Exception-only clause, so a KI/SE
+    closing the SECOND lock left the descriptor open AND both lock files on disk -- the
+    worst residue of any path here. The certain lock is released; only the lock whose
+    descriptor state is uncertain stays, and the interrupt propagates."""
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real_open, real_close = os.open, os.close
+    lock_descriptors: list[int] = []
+
+    def spy_open(path: object, *args: object, **kwargs: object) -> int:
+        descriptor = real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+        if str(path).endswith(".c13.lock"):
+            lock_descriptors.append(descriptor)
+        return descriptor
+
+    def interrupting_close(descriptor: int) -> None:
+        real_close(descriptor)
+        if len(lock_descriptors) == 2 and descriptor == lock_descriptors[-1]:
+            raise KeyboardInterrupt("interrupted closing the second lock")
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "close", interrupting_close)
+    with pytest.raises(KeyboardInterrupt):
+        append_vector_recall(
+            profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+        )
+    monkeypatch.undo()
+    leftover = sorted(
+        p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")
+    )
+    assert leftover == ["metrics.json.c13.lock"], (
+        "the certainly-closed lock is released; the uncertain one is left in place"
+    )
+
+
+def test_an_interrupt_preparing_the_verdict_file_removes_it_and_spawns_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-5 blocker 2: run_recall's initial close was Exception-only, so a KI/SE there
+    left the fresh per-run file behind with no cleanup at all. Every shape now runs the
+    same cleanup, and nothing is spawned on either path."""
+    from bench.harness.recall import run_recall
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("subprocess.run must not be reached")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", forbidden)
+    real_close = os.close
+
+    def interrupting_close(descriptor: int) -> None:
+        real_close(descriptor)
+        raise KeyboardInterrupt("interrupted preparing the verdict file")
+
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(os, "close", interrupting_close)
+    with pytest.raises(KeyboardInterrupt):
+        run_recall("tiny", scratch=scratch, timeout_seconds=30)
+    monkeypatch.undo()
+    assert list(scratch.iterdir()) == [], (
+        "the fresh temp file is removed on every shape"
+    )
+
+
+def test_an_interrupt_in_the_verdict_cleanup_cannot_replace_the_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-5 blocker 2: the finally's unlink was Exception-only, so a KI/SE raised
+    THERE became the reported outcome and erased the worker's own typed failure. A
+    leftover temp file is the lesser harm, and the residue check still speaks."""
+    import subprocess as subprocess_module
+
+    from bench.harness.recall import run_recall
+
+    def failing_worker(command: list[str], **kwargs: object):
+        return subprocess_module.CompletedProcess(
+            command, 7, stdout="", stderr="the worker died"
+        )
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", failing_worker)
+    real_unlink = Path.unlink
+
+    def interrupting_unlink(self: Path, *args: object, **kwargs: object) -> None:
+        if self.name.startswith("recall-tiny-"):
+            raise KeyboardInterrupt("interrupted during cleanup")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", interrupting_unlink)
+    with pytest.raises(RecallStageError) as caught:
+        run_recall("tiny", scratch=tmp_path / "scratch")
+    assert "exit 7" in str(caught.value), (
+        "the worker's own failure -- its exit code -- is what is reported, not the "
+        "KeyboardInterrupt the cleanup raised on top of it"
+    )
+
+
+def test_an_existence_check_that_cannot_answer_counts_as_residue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-5 blocker 2: Path.exists() sat outside every guard, so a check that raises
+    escaped run_recall untyped -- and an untyped escape from a stage whose contract is
+    RecallStageError is exactly the traceback the harness must never produce. A doubt
+    that cannot be resolved counts as residue."""
+    import subprocess as subprocess_module
+
+    from bench.harness.recall import run_recall
+
+    def writes_verdict(command: list[str], **kwargs: object):
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.write_text(json.dumps(_verdict_stub()), encoding="utf-8")
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
+    real_unlink, real_exists = Path.unlink, Path.exists
+
+    def sticky(self: Path, *args: object, **kwargs: object) -> None:
+        if self.name.startswith("recall-tiny-"):
+            raise OSError("sticky temp")
+        return real_unlink(self, *args, **kwargs)
+
+    def unanswerable(self: Path) -> bool:
+        if self.name.startswith("recall-tiny-"):
+            raise OSError("the existence of this path cannot be determined")
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "unlink", sticky)
+    monkeypatch.setattr(Path, "exists", unanswerable)
+    with pytest.raises(RecallStageError, match="residue"):
+        run_recall("tiny", scratch=tmp_path / "scratch")
+
+
+@pytest.mark.parametrize("target", ["open", "write", "close", "unlink"])
+def test_a_hostile_failure_in_the_lock_paths_refuses_without_re_executing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """Round-5 blocker 3: the acquisition and release reasons interpolated {failure}
+    RAW, so a hostile __str__ ran again inside the very refusal that was describing it,
+    and the refusal crashed. Every diagnosis goes through the guarded describer, so each
+    injection ends as a typed exit 3."""
+
+    class EvilError(RuntimeError):
+        def __str__(self) -> str:
+            raise RuntimeError("hostile str")
+
+        def __repr__(self) -> str:
+            raise RuntimeError("hostile repr")
+
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real = {name: getattr(os, name) for name in ("open", "write", "close", "unlink")}
+    lock_descriptors: list[int] = []
+
+    def hostile_open(path: object, *args: object, **kwargs: object) -> int:
+        if str(path).endswith(".c13.lock"):
+            if target == "open":
+                raise EvilError()
+            descriptor = real["open"](path, *args, **kwargs)
+            lock_descriptors.append(descriptor)
+            return descriptor
+        return real["open"](path, *args, **kwargs)
+
+    def hostile_write(descriptor: int, data: bytes) -> int:
+        if target == "write" and descriptor in lock_descriptors:
+            raise EvilError()
+        return real["write"](descriptor, data)
+
+    def hostile_close(descriptor: int) -> None:
+        if target == "close" and descriptor in lock_descriptors:
+            real["close"](descriptor)
+            raise EvilError()
+        return real["close"](descriptor)
+
+    def hostile_unlink(path: object, *args: object, **kwargs: object) -> None:
+        if target == "unlink" and str(path).endswith(".c13.lock"):
+            raise EvilError()
+        return real["unlink"](path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", hostile_open)
+    monkeypatch.setattr(os, "write", hostile_write)
+    monkeypatch.setattr(os, "close", hostile_close)
+    monkeypatch.setattr(os, "unlink", hostile_unlink)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3, "a hostile failure anywhere in the lock paths is a typed refusal"
+
+
+def test_a_file_exists_error_while_stamping_is_not_a_contention_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-5: the FileExistsError clause spanned the open AND the write, so this error
+    coming out of os.write -- after WE created the lock, with OUR descriptor open -- was
+    reported as another stage holding it. That refusal told the operator to delete a
+    file this process had just created, and it leaked the descriptor, because the
+    contention path has no descriptor to close. Creating and stamping are separate
+    phases now: only the open can conclude contention."""
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real_open, real_write = os.open, os.write
+    lock_descriptors: list[int] = []
+
+    def spy_open(path: object, *args: object, **kwargs: object) -> int:
+        descriptor = real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+        if str(path).endswith(".c13.lock"):
+            lock_descriptors.append(descriptor)
+        return descriptor
+
+    def refusing_write(descriptor: int, data: bytes) -> int:
+        if descriptor in lock_descriptors:
+            raise FileExistsError("the stamp failed with the contention error shape")
+        return real_write(descriptor, data)
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "write", refusing_write)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")] == [], (
+        "a lock this process created and could not stamp is its own to remove"
+    )

@@ -22,7 +22,15 @@ from pathlib import Path
 
 import pytest
 
-from bench.harness.gate import DEFAULT_RECALL_TARGET, _resolve_recall_target, main
+import bench.harness.gate as gate_module
+from bench.harness.gate import (
+    DEFAULT_RECALL_TARGET,
+    STATUS_UNMEASURED,
+    _resolve_recall_target,
+    check,
+    main,
+    read_multiples,
+)
 
 RECALL_METRIC = "oktografx_vector_recall_ratio"
 
@@ -454,3 +462,186 @@ def test_a_huge_integer_explicit_target_raises_the_typed_error_not_overflow() ->
         _resolve_recall_target(10**10000, None)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="finite number"):
         _resolve_recall_target(-(10**10000), None)  # type: ignore[arg-type]
+
+
+# =====================================================================================
+# Round-5 blocker 3: nothing after the parse escapes the never-raise boundaries
+# =====================================================================================
+
+
+class _HostileMapping(dict):
+    """A Mapping that passes isinstance and then raises at ONE chosen access.
+
+    The shape a monkeypatched ``json.loads`` can hand back, and the shape a dict
+    SUBCLASS in a real document can have: isinstance(payload, Mapping) says yes, and
+    then get/__iter__/keys/__getitem__ run the object's own code.
+    """
+
+    def __init__(self, mapping: dict[str, object], failing: str) -> None:
+        super().__init__(mapping)
+        self.failing = failing
+
+    def get(self, key: object, default: object = None) -> object:
+        if self.failing == "get":
+            raise RuntimeError("hostile get")
+        return dict.get(self, key, default)
+
+    def __iter__(self):
+        if self.failing == "iter":
+            raise RuntimeError("hostile iter")
+        return dict.__iter__(self)
+
+    def keys(self):
+        if self.failing == "keys":
+            raise RuntimeError("hostile keys")
+        return dict.keys(self)
+
+    def __getitem__(self, key: object) -> object:
+        if self.failing == "getitem":
+            raise RuntimeError("hostile getitem")
+        return dict.__getitem__(self, key)
+
+
+def _hostile_document(where: str, failing: str) -> _HostileMapping:
+    """A published document carrying the hostile mapping in one of the two positions.
+
+    ``where="payload"`` makes the document itself hostile (the object a patched
+    json.loads hands back); ``where="entry"`` makes the recall ENTRY hostile (the shape
+    a dict subclass inside a real document can have).
+    """
+    body: dict[str, object] = {
+        "name": RECALL_METRIC,
+        "kind": "gauge",
+        "unit": "ratio",
+        "samples": [{"value": 0.95}],
+    }
+    if where == "entry":
+        return _HostileMapping({"metrics": [_HostileMapping(body, failing)]}, "never")
+    return _HostileMapping({"metrics": [dict(body)]}, failing)
+
+
+@pytest.mark.parametrize(
+    ("where", "failing"),
+    [("payload", "get"), ("entry", "iter"), ("entry", "getitem")],
+    ids=["payload-get", "entry-iter", "entry-getitem"],
+)
+def test_a_hostile_mapping_is_a_malformed_publication_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, where: str, failing: str
+) -> None:
+    """Round-5 blocker 3: the boundary began AFTER payload.get("metrics") and ended
+    after the enumeration, so the .get and the whole shape validation ran the offender's
+    own code unguarded. These are the three accesses this reader actually performs on a
+    document -- payload.get("metrics"), set(entry)/sorted(map(str, entry)) through
+    __iter__, and entry["kind"]/entry["samples"] through __getitem__ -- and each one
+    used to be reachable outside every guard. A publication that raises while being
+    inspected is MALFORMED, which is a verdict the gate can act on; a traceback is
+    exit 1, which means CEILING EXCEEDED."""
+    payload = _hostile_document(where, failing)
+    monkeypatch.setattr(gate_module.json, "loads", lambda *a, **kw: payload)
+    state, _ = gate_module._recall_measurement("{}")
+    assert state == "malformed", "an inspection that raises is never a measurement"
+    verdict = check("{}", require_recall=True)
+    assert verdict.status == STATUS_UNMEASURED
+    assert verdict.exit_code == 2, "UNMEASURED is exit 2, never the exceeded 1"
+
+
+@pytest.mark.parametrize(
+    ("where", "failing"),
+    [("payload", "get"), ("entry", "get")],
+    ids=["payload-get", "entry-get"],
+)
+def test_a_hostile_mapping_reads_as_unmeasured_in_the_ceiling_reader(
+    monkeypatch: pytest.MonkeyPatch, where: str, failing: str
+) -> None:
+    """Round-5 blocker 3: read_multiples' guard also started one line too late -- after
+    payload.get("metrics"). This reader calls .get on the payload AND on every entry,
+    and both could raise straight out of a function whose docstring promises it never
+    raises."""
+    payload = _hostile_document(where, failing)
+    monkeypatch.setattr(gate_module.json, "loads", lambda *a, **kw: payload)
+    multiples, gauges, reason = read_multiples("{}")
+    assert (multiples, gauges) == ({}, {})
+    assert reason, "an unreadable document must say so, not raise"
+
+
+@pytest.mark.parametrize("failing", ["get", "iter", "keys", "getitem"])
+@pytest.mark.parametrize("where", ["payload", "entry"])
+def test_no_hostile_access_shape_escapes_either_reader(
+    monkeypatch: pytest.MonkeyPatch, where: str, failing: str
+) -> None:
+    """The auditor's four access shapes against both readers, in both positions.
+
+    Not every combination is on a reader's path: nothing in this module calls keys(),
+    and read_multiples never iterates an entry. Those cells are pinned as READ NORMALLY
+    rather than dressed up as refusals -- a probe that claimed a refusal the code does
+    not make would be fiction. What the matrix proves is the absolute property: whatever
+    the shape and wherever it sits, NEITHER reader raises, and every verdict stays one
+    of the three each is allowed to return. A cell that stops reading normally because
+    some future edit put keys() or an entry iteration on a path is a change this probe
+    forces someone to look at."""
+    payload = _hostile_document(where, failing)
+    monkeypatch.setattr(gate_module.json, "loads", lambda *a, **kw: payload)
+    state, _ = gate_module._recall_measurement("{}")
+    assert state in ("absent", "malformed", "value")
+    multiples, gauges, _ = read_multiples("{}")
+    assert isinstance(multiples, dict)
+    assert isinstance(gauges, dict)
+    assert check("{}", require_recall=True).exit_code in (0, 1, 2)
+
+
+def test_a_hostile_repr_in_the_document_is_described_not_executed_raw(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-5 blocker 3: the malformed reasons formatted document values with a raw
+    {!r}, so a hostile __repr__ crashed the refusal it was part of. The guarded
+    describer keeps the specific reason and cannot crash producing it."""
+
+    class _HostileRepr:
+        def __repr__(self) -> str:
+            raise RuntimeError("hostile repr")
+
+    document = json.dumps({"metrics": []})
+    payload = {
+        "metrics": [
+            {
+                "name": RECALL_METRIC,
+                "kind": _HostileRepr(),
+                "unit": "ratio",
+                "samples": [{"value": 0.95}],
+            }
+        ]
+    }
+    monkeypatch.setattr(gate_module.json, "loads", lambda *a, **kw: payload)
+    state, reason = gate_module._recall_measurement(document)
+    assert state == "malformed"
+    assert "repr raises" in str(reason), "the describer names the offender safely"
+    assert check(document, require_recall=True).status == STATUS_UNMEASURED
+
+
+def test_a_parse_failure_with_a_hostile_str_cannot_escape_either_reader(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round-5 blocker 3: both readers interpolated the parse error RAW, so an EvilError
+    whose __str__ raises turned the refusal itself into a traceback -- exit 1, the code
+    that means CEILING EXCEEDED, out of a file that simply could not be read."""
+
+    class EvilError(ValueError):
+        def __str__(self) -> str:
+            raise RuntimeError("hostile str")
+
+        def __repr__(self) -> str:
+            raise RuntimeError("hostile repr")
+
+    def evil_loads(*args: object, **kwargs: object) -> object:
+        raise EvilError()
+
+    monkeypatch.setattr(gate_module.json, "loads", evil_loads)
+    multiples, gauges, reason = read_multiples("{}")
+    assert (multiples, gauges) == ({}, {})
+    assert "not readable JSON" in reason
+    assert gate_module._recall_measurement("{}") == ("absent", None)
+    assert check("{}", require_recall=True).status == STATUS_UNMEASURED
+    metrics = tmp_path / "metrics.json"
+    metrics.write_text("{}", encoding="utf-8")
+    assert main(["--metrics", str(metrics), "--require-recall"]) == 2
+    assert "UNMEASURED" in capsys.readouterr().out

@@ -138,13 +138,19 @@ def run_recall(
     )
     try:
         os.close(descriptor)
-    except Exception as failure:  # noqa: BLE001 -- one attempt, no retry
-        # The descriptor state is uncertain; the temp file is removed best-effort
-        # and the stage refuses typed before any process exists.
+    except BaseException as failure:  # noqa: BLE001 -- ONE attempt, every shape
+        # Round-5 blocker 2: the handler used to be Exception-only, so a
+        # KeyboardInterrupt/SystemExit here left the fresh temp file behind with no
+        # cleanup at all. Every shape now runs the SAME cleanup -- one close attempt
+        # already spent, so the descriptor is never closed twice, and the temp file is
+        # removed best-effort -- after which an ordinary failure becomes the typed
+        # refusal and KI/SE propagate untouched. Nothing is spawned on either path.
         try:
             os.unlink(temp_name)
-        except Exception:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001 -- cleanup NEVER replaces the primary
             pass
+        if not isinstance(failure, Exception):
+            raise
         raise RecallStageError(
             "the fresh per-run verdict file could not be prepared "
             f"({_describe(failure)}); nothing was spawned."
@@ -201,10 +207,15 @@ def run_recall(
             )
         try:
             verdict = json.loads(raw)
-        except (ValueError, RecursionError) as failure:
+        except Exception as failure:  # noqa: BLE001 -- KI/SE still propagate
+            # Round-5 blocker 3: the tuple caught only ValueError/RecursionError, so a
+            # json.loads raising any other shape (the auditor's EvilError probe) escaped
+            # this function untyped; and {failure} re-executed a hostile __str__ inside
+            # the refusal itself. Whatever the parse raises, the verdict is unreadable
+            # and the stage says so through the guarded describer.
             raise RecallStageError(
                 f"the recall worker's verdict is not readable JSON "
-                f"(exit {completed.returncode}): {failure}"
+                f"(exit {completed.returncode}): {_describe(failure)}"
             ) from failure
         if not isinstance(verdict, dict):
             raise RecallStageError(
@@ -213,18 +224,30 @@ def run_recall(
     finally:
         try:
             verdict_path.unlink()
-        except Exception:  # noqa: BLE001 -- best-effort: an ordinary unlink failure
-            # must not replace the primary outcome (nor a propagating
-            # KeyboardInterrupt/SystemExit); the SUCCESS path re-checks below and
-            # refuses to report success over residue.
+        except BaseException:  # noqa: BLE001 -- cleanup NEVER replaces the primary
+            # Round-5 blocker 2: this runs inside a finally, so ANY exception raised
+            # here replaces what was propagating -- the worker's own typed failure, or
+            # the user's KeyboardInterrupt. An Exception-only clause let a KI/SE raised
+            # by the unlink itself become the reported outcome, erasing the primary. A
+            # leftover temp file is the lesser harm and is not silent: the SUCCESS path
+            # below refuses to report success over residue.
             cleanup_failed = True
         else:
             cleanup_failed = False
-    if cleanup_failed and verdict_path.exists():
-        raise RecallStageError(
-            "the worker verdict was parsed but its fresh per-run file could not be "
-            "removed; refusing to report success over residue."
-        )
+    if cleanup_failed:
+        # Round-5 blocker 2: Path.exists() sat outside every guard, and it can raise --
+        # an OSError the stdlib does not fold into False, or a hostile path object --
+        # which escaped run_recall untyped. A check that cannot answer counts as
+        # RESIDUE: the conservative side of the only honest doubt here.
+        try:
+            residual = verdict_path.exists()
+        except Exception:  # noqa: BLE001 -- KI/SE still propagate
+            residual = True
+        if residual:
+            raise RecallStageError(
+                "the worker verdict was parsed but its fresh per-run file could not be "
+                "removed; refusing to report success over residue."
+            )
     verdict["duration_seconds"] = duration
     verdict["exit_code"] = completed.returncode
     if completed.returncode != 0 or not verdict.get("ok", False):

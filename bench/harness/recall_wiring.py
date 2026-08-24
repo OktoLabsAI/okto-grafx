@@ -42,19 +42,32 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], None]) -> No
     """
     document = json.loads(path.read_text(encoding="utf-8"))
     mutate(document)
+    # Round-5 blocker 1b: the bytes are produced BEFORE any resource exists. This line
+    # used to sit between the mkstemp and the try, an unguarded gap where a mutation
+    # that made the document unserializable (or a RecursionError on a deep one) leaked
+    # the live descriptor AND the scratch file with nothing to clean either up. Now
+    # nothing is acquired until there is something to write.
+    payload = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
     descriptor, scratch_name = tempfile.mkstemp(
         prefix=path.name + ".c13-", suffix=".tmp", dir=str(path.parent)
     )
-    payload = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
     closed = False
     try:
         written = 0
         while written < len(payload):
+            remaining = len(payload) - written
             progress = os.write(descriptor, payload[written:])
-            if not isinstance(progress, int) or progress <= 0:
+            # Round-5 blocker 1a: `isinstance(progress, int) and progress > 0` accepted
+            # True -- bool IS an int and True > 0 -- and accepted any count LARGER than
+            # what remained. Either one satisfied the loop while ZERO bytes reached the
+            # file, and os.replace then swapped a VALID document for an empty one. A
+            # byte count must be an exact int, positive, and no larger than what was
+            # left to write; anything else is a write that cannot be trusted.
+            if type(progress) is not int or not 0 < progress <= remaining:
                 raise RuntimeError(
-                    "the scratch write made no progress; refusing to replace a "
-                    "valid document with a torn one"
+                    "the scratch write reported an impossible byte count "
+                    f"({_describe(progress)} with {remaining} left); refusing to "
+                    "replace a valid document with a torn or empty one"
                 )
             written += progress
         closed = True
@@ -63,15 +76,17 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], None]) -> No
     except BaseException:
         # Ownership is explicit: the raw descriptor is ours until the single close
         # attempt above. Cleanup is best-effort and can never replace the PRIMARY
-        # exception; ordinary shapes then die at the stage boundary as exit 3.
+        # exception -- round-5 blocker 2: the clauses were Exception-only, so a KI/SE
+        # raised by the close or the unlink DID replace it; every shape is swallowed
+        # here. Ordinary primaries then die at the stage boundary as exit 3.
         if not closed:
             try:
                 os.close(descriptor)
-            except Exception:  # noqa: BLE001
+            except BaseException:  # noqa: BLE001 -- never replaces the primary
                 pass
         try:
             os.unlink(scratch_name)
-        except Exception:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001 -- never replaces the primary
             pass
         raise
 
@@ -158,11 +173,48 @@ def _release_publication_locks(held: list[Path]) -> list[str]:
     for lock_path in reversed(held):
         try:
             os.unlink(str(lock_path))
-        except Exception as failure:  # noqa: BLE001 -- round-4: cleanup CONTINUES
-            # A hostile unlink (RuntimeError, not only OSError) must not abort the
-            # reverse cleanup of the REMAINING locks; it becomes residue diagnosis.
-            residue.append(f"{lock_path} ({failure})")
+        except BaseException as failure:  # noqa: BLE001 -- cleanup CONTINUES, any shape
+            # Round-5 blocker 2: an Exception-only clause let a KeyboardInterrupt or
+            # SystemExit raised BY THE UNLINK abort the reverse release, leaving every
+            # remaining lock on disk; and this function runs while a primary exception
+            # may already be propagating, so raising out of it would replace that
+            # primary with a cleanup accident. Every shape is absorbed, the loop always
+            # reaches the last lock, and the failure becomes residue diagnosis. The
+            # diagnosis is itself guarded -- describing a hostile failure must not be
+            # what aborts the cleanup -- and falls back to a CONSTANT.
+            try:
+                residue.append(f"{lock_path} ({_describe(failure)})")
+            except BaseException:  # noqa: BLE001 -- the diagnosis is best-effort too
+                residue.append("<a lock whose failure could not be described>")
     return residue
+
+
+def _unwind_lock_failure(
+    descriptor: int | None, lock_path: Path, held: list[Path]
+) -> tuple[Path | None, list[str]]:
+    """Release what is certainly ours after ONE close attempt; never raise.
+
+    Round-5 blocker 2. Shared by every acquisition failure path so the ordinary and the
+    KeyboardInterrupt/SystemExit unwinds cannot drift apart. Exactly one close is
+    attempted on the descriptor -- a second would risk a reused descriptor number -- and
+    a close that did not certainly succeed leaves ITS lock file in place, because
+    unlinking over a possibly-live descriptor would let another process acquire. The
+    locks that are certainly released are released. Nothing here raises, whatever the
+    shape: a primary exception may be propagating through this call, and a cleanup that
+    replaced it would destroy the only accurate account of what went wrong.
+
+    Returns the lock left behind as uncertain (or None) and the release residue.
+    """
+    close_ok = True
+    if descriptor is not None:
+        try:
+            os.close(descriptor)
+        except BaseException:  # noqa: BLE001 -- cleanup NEVER replaces the primary
+            close_ok = False
+    uncertain = None
+    if not close_ok and held and held[-1] == lock_path:
+        uncertain = held.pop()
+    return uncertain, _release_publication_locks(held)
 
 
 def _acquire_publication_locks(
@@ -177,17 +229,27 @@ def _acquire_publication_locks(
     closes the descriptor, releases everything, and surfaces typed; ordinary
     exceptions become the reason, KeyboardInterrupt/SystemExit propagate after
     the same cleanup.
+
+    The three phases -- create, stamp, close -- are kept apart on purpose: only the
+    CREATE can conclude that another stage holds the lock, and only the phases after it
+    own a descriptor. Collapsing them is what let a FileExistsError from the stamp
+    masquerade as contention.
     """
     ordered = sorted({str(document) for document in documents})
     held: list[Path] = []
     for target in ordered:
         lock_path = Path(target + ".c13.lock")
-        descriptor: int | None = None
+        # Round-5: the CREATION and the STAMPING are separate phases, because
+        # FileExistsError means completely different things in each. The single clause
+        # that used to span both read a FileExistsError from os.write -- raised AFTER we
+        # created the lock, with OUR descriptor open -- as "another stage holds it": it
+        # told the operator to delete a file this process had just made, and it left the
+        # descriptor open, since the contention path has no descriptor to close.
         try:
             descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            held.append(lock_path)
-            os.write(descriptor, str(os.getpid()).encode("ascii"))
         except FileExistsError:
+            # ONLY the open can conclude contention, and only here does no descriptor
+            # of ours exist.
             residue = _release_publication_locks(held)
             reason = (
                 f"{lock_path} exists, so another stage holds (or died holding) "
@@ -197,25 +259,39 @@ def _acquire_publication_locks(
             if residue:
                 reason += f" (release residue: {residue})"
             return [], reason
-        except Exception as failure:  # noqa: BLE001 -- round-4: any ordinary shape
-            # RuntimeError from a hostile os.open/os.write is as ordinary as OSError:
-            # close best-effort, unwind, refuse typed. If the best-effort close ALSO
-            # fails, this lock's descriptor state is uncertain and its file is left
-            # in place (never unlink over an uncertain descriptor); only the certain
-            # locks are released, and the leftover is named in the reason.
-            close_ok = True
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except Exception:  # noqa: BLE001 -- best-effort, never replaces
-                    close_ok = False
-            uncertain = None
-            if not close_ok and held and held[-1] == lock_path:
-                uncertain = held.pop()
-            residue = _release_publication_locks(held)
+        except BaseException as failure:  # noqa: BLE001 -- ONE unwind for every shape
+            # Nothing was created on this path, so there is no descriptor and no lock
+            # of ours to leave behind; only the locks already held are released.
+            _, residue = _unwind_lock_failure(None, lock_path, held)
+            if not isinstance(failure, Exception):
+                raise
             reason = (
-                f"the publication lock {lock_path} could not be taken or "
-                f"written ({failure})"
+                f"the publication lock {lock_path} could not be created "
+                f"({_describe(failure)})"
+            )
+            if residue:
+                reason += f" (release residue: {residue})"
+            return [], reason
+        # The lock file exists from here on: it is OURS, and every exit below must
+        # account for it.
+        held.append(lock_path)
+        try:
+            os.write(descriptor, str(os.getpid()).encode("ascii"))
+        except BaseException as failure:  # noqa: BLE001 -- ONE unwind for every shape
+            # Round-5 blocker 2: the ordinary and the KI/SE paths each carried their
+            # OWN copy of the unwind, and both closed the descriptor under an
+            # Exception-only clause -- so a KI/SE raised by the CLEANUP replaced the
+            # primary. There is now a single unwind, it absorbs every shape, and the
+            # two paths differ only in what they do afterwards: an ordinary failure
+            # becomes the typed refusal, KI/SE propagate untouched. A FileExistsError
+            # reaching HERE is just another ordinary failure of the stamping -- never
+            # a claim about who holds the lock.
+            uncertain, residue = _unwind_lock_failure(descriptor, lock_path, held)
+            if not isinstance(failure, Exception):
+                raise
+            reason = (
+                f"the publication lock {lock_path} was created but could not be "
+                f"stamped ({_describe(failure)})"
             )
             if uncertain is not None:
                 reason += (
@@ -225,23 +301,9 @@ def _acquire_publication_locks(
             if residue:
                 reason += f" (release residue: {residue})"
             return [], reason
-        except BaseException:
-            # KeyboardInterrupt/SystemExit: unwind the same way, then propagate the
-            # PRIMARY -- every cleanup below is best-effort and cannot replace it;
-            # a lock whose close failed stays in place for the same uncertainty rule.
-            close_ok = True
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except Exception:  # noqa: BLE001
-                    close_ok = False
-            if not close_ok and held and held[-1] == lock_path:
-                held.pop()
-            _release_publication_locks(held)
-            raise
         try:
             os.close(descriptor)
-        except Exception as failure:  # noqa: BLE001 -- round-4: close is ordinary too
+        except BaseException as failure:  # noqa: BLE001 -- ONE attempt, every shape
             # ONE close attempt, never a retry: a close that closed and THEN raised
             # would make a second close reach a possibly-reused descriptor number.
             # And because the descriptor state is now UNCERTAIN, this lock file is
@@ -249,12 +311,20 @@ def _acquire_publication_locks(
             # acquire while our descriptor possibly lives. The certain locks are
             # released, the refusal is typed, and the leftover is named as residue.
             # The OS closes the descriptor when the process ends.
+            #
+            # Round-5 blocker 2: this clause was Exception-only, so a KI/SE from the
+            # close of the SECOND lock left the descriptor open AND both lock files on
+            # disk -- the worst residue of any path here. Now every shape releases the
+            # certain locks first; only then does an ordinary failure become the typed
+            # refusal, or a KI/SE propagate.
             uncertain = held.pop()
             residue = _release_publication_locks(held)
+            if not isinstance(failure, Exception):
+                raise
             reason = (
                 f"the lock descriptor for {lock_path} could not be closed "
-                f"({failure}); {uncertain} is left in place because the descriptor "
-                "state is uncertain"
+                f"({_describe(failure)}); {uncertain} is left in place because the "
+                "descriptor state is uncertain"
             )
             if residue:
                 reason += f" (release residue: {residue})"
@@ -282,7 +352,10 @@ def _publish_documents(
             timeout_seconds=timeout_seconds,
         )
     except RecallStageError as failure:
-        print(f"vector recall: FAIL-CLOSED -- {failure}")
+        # Round-5 blocker 3: even OUR typed error prints through the guarded describer.
+        # RecallStageError carries whatever text built it, and one of those texts is
+        # built from a worker verdict; a str that raises here would crash the refusal.
+        print(f"vector recall: FAIL-CLOSED -- {_describe(failure)}")
         return 3
     except Exception as failure:  # noqa: BLE001 -- any ordinary failure is exit 3 typed
         # An ORDINARY exception from the strip or the worker is still a stage failure:
@@ -383,7 +456,8 @@ def append_vector_recall(
         except Exception as failure:  # noqa: BLE001 -- absolute boundary; KI/SE pass
             print(
                 f"vector recall stage: REFUSED -- {alias_label} {alias_path} could "
-                f"not be resolved to a physical document ({failure}); nothing was run."
+                "not be resolved to a physical document "
+                f"({_describe(failure)}); nothing was run."
             )
             return 3
         if link_count > 1:
@@ -414,7 +488,8 @@ def append_vector_recall(
         except Exception as failure:  # noqa: BLE001 -- absolute boundary; KI/SE propagate
             print(
                 f"vector recall stage: REFUSED -- {label} {path} is not a readable JSON "
-                f"document ({failure}); nothing was run and nothing was written."
+                f"document ({_describe(failure)}); nothing was run and nothing "
+                "was written."
             )
             return 3
         if not isinstance(document, dict):
