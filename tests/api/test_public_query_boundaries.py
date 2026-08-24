@@ -25,9 +25,11 @@ from okto_grafx.domain.model.value import (
 from okto_grafx.domain.query.limits import (
     MAX_LIST_ELEMENTS,
     MAX_MAP_ENTRIES,
+    MAX_NAME_CHARACTERS,
     MAX_PARAMETERS,
     MAX_PROJECTION_ITEMS,
     MAX_QUERY_CHARACTERS,
+    MAX_RENDERED_QUERY_CHARACTERS,
     MAX_STRING_CHARACTERS,
 )
 from okto_grafx.domain.query.ast import Literal, ReturnItem
@@ -169,6 +171,42 @@ def test_query_text_size_is_refused_before_page_access_and_before_engine(
         reader.rollback()
 
     assert reached is False
+
+
+def test_maximum_string_literal_keeps_its_query_derived_result_column() -> None:
+    literal = "x" * MAX_STRING_CHARACTERS
+    text = f"RETURN {literal!r}"
+    assert len(text) < MAX_QUERY_CHARACTERS
+
+    with connect(":memory:") as database:
+        plan = database.explain(text)
+        result = database.execute(text)
+
+    assert type(plan) is ProduceResults
+    assert plan.columns == (repr(literal),)
+    assert result.columns == (repr(literal),)
+    assert result.rows == ((literal,),)
+
+
+@pytest.mark.parametrize("character", ["\x00", "\U000e0001"])
+def test_maximum_nonprintable_string_literal_fits_rendered_query_bound(
+    character: str,
+) -> None:
+    assert not character.isprintable()
+    literal = character * MAX_STRING_CHARACTERS
+    text = "RETURN '" + literal + "'"
+    rendered = repr(literal)
+    assert len(text) == MAX_STRING_CHARACTERS + 9
+    assert MAX_QUERY_CHARACTERS < len(rendered) <= MAX_RENDERED_QUERY_CHARACTERS
+
+    with connect(":memory:") as database:
+        plan = database.explain(text)
+        result = database.execute(text)
+
+    assert type(plan) is ProduceResults
+    assert plan.columns == (rendered,)
+    assert result.columns == (rendered,)
+    assert result.rows == ((literal,),)
 
 
 @pytest.mark.parametrize("signal", [RuntimeError("boom"), KeyboardInterrupt()])
@@ -338,6 +376,35 @@ def test_query_result_statistics_are_exact_owned_and_mutable() -> None:
     assert statistics == {"rows": 1}
 
 
+def test_query_result_column_and_statistic_bounds_have_live_edges() -> None:
+    column = "c" * MAX_RENDERED_QUERY_CHARACTERS
+    statistic = "s" * MAX_NAME_CHARACTERS
+    result = QueryResult(
+        columns=(column,),
+        rows=((None,),),
+        statistics={statistic: INT64_MAX},
+    )
+    assert result.columns == (column,)
+    assert result.statistics == {statistic: INT64_MAX}
+
+    invalid = (
+        {"columns": (column + "x",)},
+        {"statistics": {statistic + "x": 1}},
+        {"statistics": {"rows": INT64_MAX + 1}},
+    )
+    for arguments in invalid:
+        with pytest.raises(GrafxPlanError):
+            QueryResult(**arguments)  # type: ignore[arg-type]
+
+
+def test_query_result_keeps_only_outer_ownership_before_the_public_facade() -> None:
+    payload = {"nested": [1]}
+    rows = ((payload,),)
+    result = QueryResult(columns=("payload",), rows=rows)  # type: ignore[arg-type]
+    assert result.rows is not rows
+    assert result.rows[0][0] is payload
+
+
 def test_query_result_constructor_validates_the_plan_tree() -> None:
     cyclic = ProduceResults(child=SingleRow())
     object.__setattr__(cyclic, "child", cyclic)
@@ -356,6 +423,35 @@ def test_query_result_constructor_validates_the_plan_tree() -> None:
     post_filtered = FilterRows(child=bounded_search, predicate=Literal(True))
     with pytest.raises(GrafxPlanError):
         QueryResult(plan=post_filtered)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("ordinary"),
+        GrafxPlanError("typed", field="plan", value="typed"),
+        KeyboardInterrupt(),
+        SystemExit(7),
+    ],
+)
+def test_query_result_plan_callback_failures_have_stable_taxonomy(
+    failure: BaseException,
+) -> None:
+    class HostilePlan(PlanNode):
+        def children(self) -> tuple[PlanNode, ...]:
+            raise failure
+
+    expected = (
+        GrafxPlanError
+        if isinstance(failure, Exception)
+        else type(failure)
+    )
+    with pytest.raises(expected) as caught:
+        QueryResult(plan=HostilePlan())
+    if isinstance(failure, GrafxPlanError) or not isinstance(failure, Exception):
+        assert caught.value is failure
+    else:
+        assert caught.value.__cause__ is failure
 
 
 def test_malformed_collaborator_result_is_refused(
@@ -381,6 +477,48 @@ def test_forged_result_arity_is_revalidated_outside_the_engine(
         with pytest.raises(GrafxPlanError):
             reader.execute("RETURN 1 AS x")
         reader.rollback()
+
+
+def test_hostile_oversized_result_columns_and_statistics_are_refused_without_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class HostileText(str):
+        def __str__(self) -> str:
+            events.append("text.__str__")
+            return str.__str__(self)
+
+        def __len__(self) -> int:
+            events.append("text.__len__")
+            return str.__len__(self)
+
+        def __hash__(self) -> int:
+            events.append("text.__hash__")
+            return str.__hash__(self)
+
+    oversized_column = HostileText("c" * (MAX_RENDERED_QUERY_CHARACTERS + 1))
+    oversized_statistic = HostileText("s" * (MAX_NAME_CHARACTERS + 1))
+    forged = QueryResult(columns=("x",), rows=((1,),))
+    candidates = (
+        ((oversized_column,), ((1,),), {}),
+        ((), (), {oversized_statistic: 1}),
+        ((), (), {"rows": INT64_MAX + 1}),
+    )
+    events.clear()
+
+    with connect(":memory:") as database:
+        reader = database.begin("read")
+        for columns, rows, statistics in candidates:
+            object.__setattr__(forged, "columns", columns)
+            object.__setattr__(forged, "rows", rows)
+            object.__setattr__(forged, "statistics", statistics)
+            monkeypatch.setattr(QueryEngine, "execute", lambda *_args, **_kwargs: forged)
+            with pytest.raises(GrafxPlanError):
+                reader.execute("RETURN 1 AS x")
+        reader.rollback()
+
+    assert events == []
 
 
 def test_collaborator_result_is_detached_only_after_page_access(
@@ -505,6 +643,33 @@ def test_exact_plan_nodes_are_rebuilt_with_exact_scalar_tuple_and_schema_leaves(
     assert type(scan.table.columns) is tuple
     assert type(scan.table.columns[0]) is ColumnDef
     assert type(scan.table.columns[0].name) is str
+
+
+def test_hostile_oversized_plan_column_is_refused_without_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class HostileText(str):
+        def __str__(self) -> str:
+            events.append("text.__str__")
+            return str.__str__(self)
+
+        def __len__(self) -> int:
+            events.append("text.__len__")
+            return str.__len__(self)
+
+    raw = ProduceResults(
+        child=SingleRow(),
+        columns=(HostileText("c" * (MAX_RENDERED_QUERY_CHARACTERS + 1)),),
+    )
+    monkeypatch.setattr(QueryEngine, "explain", lambda *_args: raw)
+
+    with connect(":memory:") as database:
+        with pytest.raises(GrafxPlanError):
+            database.explain("RETURN 1")
+
+    assert events == []
 
 
 def test_literal_value_graph_in_an_exact_plan_is_deeply_owned(

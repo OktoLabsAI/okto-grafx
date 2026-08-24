@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from okto_grafx.domain import query
 from okto_grafx.domain.model.schema import MAX_IDENTIFIER_LENGTH
 from okto_grafx.domain.model.value import INT64_MAX
 from okto_grafx.domain.query import limits
@@ -17,6 +18,7 @@ from okto_grafx.domain.query.plan import MAX_PLAN_DEPTH
 
 EXPECTED: dict[str, int] = {
     "MAX_QUERY_CHARACTERS": 65536,
+    "MAX_RENDERED_QUERY_CHARACTERS": 1048576,
     "MAX_TOKENS": 8192,
     "MAX_EXPRESSION_DEPTH": 48,
     "MAX_CLAUSES": 64,
@@ -44,6 +46,11 @@ def test_the_declared_bounds_are_exactly_the_ones_pinned_here() -> None:
     # A new bound that nothing pins is a bound that can be widened silently, so the set itself
     # is the thing under test rather than the individual numbers.
     assert set(limits.__all__) == set(EXPECTED)
+
+
+def test_the_rendered_query_bound_is_reexported_by_the_query_package() -> None:
+    assert query.MAX_RENDERED_QUERY_CHARACTERS == 1_048_576
+    assert "MAX_RENDERED_QUERY_CHARACTERS" in query.__all__
 
 
 def test_the_name_bound_matches_the_schema_identifier_rule() -> None:

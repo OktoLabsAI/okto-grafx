@@ -85,6 +85,7 @@ from okto_grafx.domain.query.limits import (
     MAX_PARAMETERS,
     MAX_PROJECTION_ITEMS,
     MAX_QUERY_CHARACTERS,
+    MAX_RENDERED_QUERY_CHARACTERS,
     MAX_STRING_CHARACTERS,
 )
 from okto_grafx.domain.query.plan import (
@@ -1811,6 +1812,14 @@ def _query_plan_dataclass_snapshot(
                 active=active,
                 expression_depth=child_depth,
                 field=f"plan.{expected.__name__}.{declared.name}",
+                string_limit=(
+                    MAX_RENDERED_QUERY_CHARACTERS
+                    if (
+                        expected is ProduceResults and declared.name == "columns"
+                    )
+                    or (expected is ReturnItem and declared.name == "alias")
+                    else None
+                ),
             )
         return expected(**arguments)
     finally:
@@ -1825,6 +1834,7 @@ def _query_plan_field_snapshot(
     active: set[int],
     expression_depth: int,
     field: str,
+    string_limit: int | None = None,
 ) -> object:
     """Clone a field according to the closed type annotation of its exact owner class."""
     origin = get_origin(annotation)
@@ -1846,6 +1856,7 @@ def _query_plan_field_snapshot(
             active=active,
             expression_depth=expression_depth,
             field=field,
+            string_limit=string_limit,
         )
     if origin is tuple:
         if not issubclass(type(value), tuple):
@@ -1885,6 +1896,7 @@ def _query_plan_field_snapshot(
                     active=active,
                     expression_depth=expression_depth,
                     field=f"{field}[{position}]",
+                    string_limit=string_limit,
                 )
                 for position, item in enumerate(raw_items)
             )
@@ -1915,12 +1927,13 @@ def _query_plan_field_snapshot(
         )
     if annotation is str:
         text = _builtin_text(value, field=field)
-        if len(text) > MAX_STRING_CHARACTERS:
+        limit = MAX_NAME_CHARACTERS if string_limit is None else string_limit
+        if len(text) > limit:
             raise GrafxPlanError(
-                f"A query plan string may carry at most {MAX_STRING_CHARACTERS} characters.",
+                f"A query plan string at {field} may carry at most {limit} characters.",
                 field=field,
                 value=len(text),
-                limit=MAX_STRING_CHARACTERS,
+                limit=limit,
             )
         return text
     if annotation is bool:
@@ -1998,6 +2011,14 @@ def _query_result_snapshot(value: object) -> QueryResult:
         column = _builtin_text(
             raw_column, field=f"query.result.columns[{position}]", empty=False
         )
+        if len(column) > MAX_RENDERED_QUERY_CHARACTERS:
+            raise GrafxConfigurationError(
+                f"A query result column may carry at most "
+                f"{MAX_RENDERED_QUERY_CHARACTERS} characters.",
+                field="query.result.columns",
+                value=len(column),
+                limit=MAX_RENDERED_QUERY_CHARACTERS,
+            )
         if column in seen_columns:
             raise GrafxConfigurationError(
                 f"A query result cannot publish duplicate column {column!r}.",
@@ -2069,6 +2090,14 @@ def _query_statistics_snapshot(value: object) -> dict[str, int]:
             field=f"query.result.statistics[{position}].name",
             empty=False,
         )
+        if len(name) > MAX_NAME_CHARACTERS:
+            raise GrafxConfigurationError(
+                f"A query result statistic name may carry at most {MAX_NAME_CHARACTERS} "
+                "characters.",
+                field="query.result.statistics",
+                value=len(name),
+                limit=MAX_NAME_CHARACTERS,
+            )
         if name in detached:
             raise GrafxConfigurationError(
                 f"Query result statistics contain duplicate counter {name!r}.",
@@ -2076,9 +2105,17 @@ def _query_statistics_snapshot(value: object) -> dict[str, int]:
                 value=name,
                 reason="duplicate",
             )
-        detached[name] = _require_nonnegative_integer(
+        count = _require_nonnegative_integer(
             f"query.result.statistics.{name}", raw_count
         )
+        if count > INT64_MAX:
+            raise GrafxConfigurationError(
+                "A query result statistic must fit in a signed 64-bit integer.",
+                field=f"query.result.statistics.{name}",
+                value=count,
+                limit=INT64_MAX,
+            )
+        detached[name] = count
     return detached
 
 
