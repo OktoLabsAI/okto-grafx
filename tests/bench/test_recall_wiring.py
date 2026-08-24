@@ -679,6 +679,104 @@ def test_an_unrealizable_summary_is_refused_and_the_possible_one_accepted(
     )
 
 
+def test_a_held_publication_lock_refuses_a_second_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 B: competing stages serialize behind the O_EXCL lock file; the second
+    refuses typed instead of interleaving, never spawns, never steals the lock --
+    and after a release the stage succeeds and cleans its OWN lock."""
+    out, metrics = _seed_documents(tmp_path)
+    before = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    lock = metrics.with_name(metrics.name + ".c13.lock")
+    lock.write_text("12345", encoding="ascii")
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    assert not called, "a contended stage must never spawn the worker"
+    assert (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8")) == (
+        before
+    )
+    assert lock.exists(), "a foreign lock must not be stolen or removed"
+    lock.unlink()
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 0
+    assert not lock.exists(), "the stage releases its own lock on every exit"
+
+
+def test_metrics_mutated_underneath_fails_typed_not_silent_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 B: 'metrics' turning into a dict between precheck and append used to
+    return SUCCESS with section-without-gauge. Typed exit 3 now; the section stays as
+    the honest partial a --require-recall gate reads as UNMEASURED."""
+    out, metrics = _seed_documents(tmp_path)
+
+    def sabotage(*args: object, **kwargs: object) -> dict[str, object]:
+        metrics.write_text(json.dumps({"metrics": {}}), encoding="utf-8")
+        return _verdict_stub()
+
+    monkeypatch.setattr(wiring, "run_recall", sabotage)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    assert "vector_recall" in json.loads(out.read_text(encoding="utf-8"))
+    assert json.loads(metrics.read_text(encoding="utf-8"))["metrics"] == {}
+
+
+def test_a_hostile_metaclass_timeout_is_still_the_typed_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 C, recall side: the refusal message must not touch the offender again."""
+    from bench.harness.recall import run_recall
+
+    class _HostileMeta(type):
+        @property
+        def __name__(cls) -> str:  # noqa: N804
+            raise RuntimeError("hostile metaclass")
+
+    class _Hostile(metaclass=_HostileMeta):
+        def __repr__(self) -> str:
+            raise RuntimeError("hostile repr")
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("subprocess.run must not be reached")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", forbidden)
+    with pytest.raises(RecallStageError, match="finite positive"):
+        run_recall("tiny", scratch=tmp_path / "never", timeout_seconds=_Hostile())  # type: ignore[arg-type]
+
+
+def test_a_non_utf8_verdict_is_a_typed_refusal_with_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 D: UnicodeDecodeError escaped run_recall as itself; now the typed
+    RecallStageError, with the fresh per-run file still cleaned outcome-neutrally."""
+    import subprocess as subprocess_module
+
+    from bench.harness.recall import run_recall
+
+    scratch = tmp_path / "scratch"
+
+    def writes_garbage(command, **kwargs):
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.write_bytes(b"\xff\xfe\x00garbage")
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_garbage)
+    with pytest.raises(RecallStageError, match="no readable verdict"):
+        run_recall("tiny", scratch=scratch)
+    leftovers = [p.name for p in scratch.iterdir() if p.name.startswith("recall-tiny-")]
+    assert leftovers == [], "cleanup must be outcome-neutral"
+
+
 def test_the_mean_acceptance_band_is_ulp_scaled_not_a_flat_epsilon() -> None:
     """Preliminary round-3 blocker: the flat 1e-6 accepted fabricated means down to
     1e-8 deltas. The band now hugs the honest rounding budget: real 1-ulp neighbours

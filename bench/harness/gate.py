@@ -79,7 +79,9 @@ def _describe(value: object) -> str:
     try:
         text = repr(value)
     except Exception:  # noqa: BLE001 -- a hostile __repr__ may raise anything ordinary
-        return f"<{type(value).__name__} whose repr raises>"
+        # CONSTANT fallback: even type(value).__name__ can execute a hostile
+        # metaclass property. The refusal path touches the offender zero more times.
+        return "<value whose repr raises>"
     return text if len(text) <= 80 else text[:77] + "..."
 
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -32,14 +33,28 @@ from bench.harness.recall import (
 
 
 def _replace_json(path: Path, mutate: Callable[[dict[str, object]], None]) -> None:
-    """Read a JSON document, apply one mutation, and atomically replace the file."""
+    """Read a JSON document, apply one mutation, and atomically replace the file.
+
+    The scratch file is UNIQUE per call (round-3 B): the old deterministic ``.c13.tmp``
+    name let two concurrent stages clobber each other's half-written scratch before the
+    replace. A failure unlinks the orphan scratch best-effort and re-raises.
+    """
     document = json.loads(path.read_text(encoding="utf-8"))
     mutate(document)
-    scratch = path.with_name(path.name + ".c13.tmp")
-    scratch.write_text(
-        json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    descriptor, scratch_name = tempfile.mkstemp(
+        prefix=path.name + ".c13-", suffix=".tmp", dir=str(path.parent)
     )
-    os.replace(scratch, path)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            json.dump(document, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(scratch_name, path)
+    except BaseException:
+        try:
+            os.unlink(scratch_name)
+        except OSError:
+            pass
+        raise
 
 
 def _strip_stale_gauge(metrics: Path) -> None:
@@ -98,68 +113,36 @@ def _append_gauge(metrics: Path, value: float) -> None:
 
     def mutate(document: dict[str, object]) -> None:
         entries = document.setdefault("metrics", [])
-        if isinstance(entries, list):
-            entries.append(
-                {
-                    "name": RECALL_METRIC,
-                    "kind": "gauge",
-                    "unit": "ratio",
-                    "samples": [{"value": value}],
-                }
+        if not isinstance(entries, list):
+            # Round-3 B: the document can change between the precheck and this append.
+            # Silently skipping used to return SUCCESS with section-without-gauge --
+            # an exit 0 that lied. Raising turns it into the boundary's typed exit 3.
+            raise RuntimeError(
+                "the metrics document's 'metrics' key is no longer a list; the gauge "
+                "cannot land, and success would be a lie"
             )
+        entries.append(
+            {
+                "name": RECALL_METRIC,
+                "kind": "gauge",
+                "unit": "ratio",
+                "samples": [{"value": value}],
+            }
+        )
 
     _replace_json(metrics, mutate)
 
 
-def append_vector_recall(
+def _publish_documents(
     *,
     profile: str,
     gt_mode: str,
     out: Path | None,
     metrics: Path | None,
     workspace: Path,
-    timeout_seconds: float | None = None,
+    timeout_seconds: float | None,
 ) -> int:
-    """Run the recall stage and append its results in the fail-safe order; return exit code.
-
-    Zero means both appends landed. Any failure — the worker refusing, a missing document, a
-    torn append — returns non-zero WITHOUT touching what was already written before the
-    failure point, so the legacy outputs always survive and a partial vector publication can
-    only ever be section-without-gauge, never the reverse.
-    """
-    if metrics is not None and out is None:
-        print(
-            "vector recall stage: REFUSED -- --metrics without --out would publish the "
-            "gauge with no section; the gauge must be the LAST artifact, never the only one."
-        )
-        return 3
-    for label, path in (("--out", out), ("--metrics", metrics)):
-        if path is None:
-            continue
-        try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as failure:  # noqa: BLE001 -- absolute boundary; KI/SE propagate
-            print(
-                f"vector recall stage: REFUSED -- {label} {path} is not a readable JSON "
-                f"document ({failure}); nothing was run and nothing was written."
-            )
-            return 3
-        if not isinstance(document, dict):
-            print(
-                f"vector recall stage: REFUSED -- {label} {path} holds "
-                f"{type(document).__name__}, not an object; nothing was run."
-            )
-            return 3
-        if (
-            label == "--metrics"
-            and "metrics" in document
-            and not isinstance(document["metrics"], list)
-        ):
-            print(
-                f"vector recall stage: REFUSED -- {label} {path} carries a 'metrics' key "
-                "that is not a list; a gauge could never land there. Nothing was run."
-            )
-            return 3
+    """The measurement and publication flow, entered ONLY with the lock held."""
     try:
         if metrics is not None:
             _strip_stale_gauge(metrics)
@@ -226,6 +209,103 @@ def append_vector_recall(
         f"{gauge_value:.4f} ({home}); section first, gauge last."
     )
     return 0
+
+
+def append_vector_recall(
+    *,
+    profile: str,
+    gt_mode: str,
+    out: Path | None,
+    metrics: Path | None,
+    workspace: Path,
+    timeout_seconds: float | None = None,
+) -> int:
+    """Run the recall stage and append its results in the fail-safe order; return exit code.
+
+    Zero means both appends landed. Any failure — the worker refusing, a missing document, a
+    torn append — returns non-zero WITHOUT touching what was already written before the
+    failure point, so the legacy outputs always survive and a partial vector publication can
+    only ever be section-without-gauge, never the reverse.
+    """
+    if metrics is not None and out is None:
+        print(
+            "vector recall stage: REFUSED -- --metrics without --out would publish the "
+            "gauge with no section; the gauge must be the LAST artifact, never the only one."
+        )
+        return 3
+    for label, path in (("--out", out), ("--metrics", metrics)):
+        if path is None:
+            continue
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as failure:  # noqa: BLE001 -- absolute boundary; KI/SE propagate
+            print(
+                f"vector recall stage: REFUSED -- {label} {path} is not a readable JSON "
+                f"document ({failure}); nothing was run and nothing was written."
+            )
+            return 3
+        if not isinstance(document, dict):
+            print(
+                f"vector recall stage: REFUSED -- {label} {path} holds "
+                f"{type(document).__name__}, not an object; nothing was run."
+            )
+            return 3
+        if (
+            label == "--metrics"
+            and "metrics" in document
+            and not isinstance(document["metrics"], list)
+        ):
+            print(
+                f"vector recall stage: REFUSED -- {label} {path} carries a 'metrics' key "
+                "that is not a list; a gauge could never land there. Nothing was run."
+            )
+            return 3
+    # Round-3 B: competing stages over the same documents interleaved -- one could
+    # publish between the other's strip and append, ending with two gauges or a
+    # window where the gate passed early. An O_EXCL lock file beside the metrics
+    # (or calibration) document serializes them: the second stage REFUSES typed
+    # instead of interleaving, and a crashed holder's leftover file also refuses --
+    # fail-closed beats silently stealing a lock that may still be live. Release
+    # sits in a finally, so every exit path of the delegate frees it.
+    lock_target = metrics if metrics is not None else out
+    lock_path = (
+        lock_target.with_name(lock_target.name + ".c13.lock")
+        if lock_target is not None
+        else None
+    )
+    if lock_path is not None:
+        try:
+            descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            print(
+                f"vector recall stage: REFUSED -- {lock_path} exists, so another "
+                "stage holds (or died holding) the publication lock; refusing to "
+                "interleave. Remove the file only after confirming no stage runs."
+            )
+            return 3
+        except OSError as failure:
+            print(
+                f"vector recall stage: REFUSED -- the publication lock {lock_path} "
+                f"could not be taken ({failure}); nothing was run."
+            )
+            return 3
+        os.write(descriptor, str(os.getpid()).encode("ascii"))
+        os.close(descriptor)
+    try:
+        return _publish_documents(
+            profile=profile,
+            gt_mode=gt_mode,
+            out=out,
+            metrics=metrics,
+            workspace=workspace,
+            timeout_seconds=timeout_seconds,
+        )
+    finally:
+        if lock_path is not None:
+            try:
+                os.unlink(str(lock_path))
+            except OSError:
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:

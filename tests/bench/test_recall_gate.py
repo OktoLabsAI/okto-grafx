@@ -344,6 +344,31 @@ class _EvilRepr:
         raise RuntimeError("hostile repr")
 
 
+class _HostileMeta(type):
+    """Round-3 C: even type(value).__name__ can execute a metaclass property."""
+
+    @property
+    def __name__(cls) -> str:  # noqa: N804
+        raise RuntimeError("hostile metaclass")
+
+
+class _HostileValue(metaclass=_HostileMeta):
+    def __repr__(self) -> str:
+        raise RuntimeError("hostile repr")
+
+
+def test_a_hostile_metaclass_cannot_escape_the_refusal_paths(tmp_path: Path) -> None:
+    """Round-3 C: the describer's fallback is a CONSTANT -- the refusal path touches
+    the offender zero more times, so check() and _resolve stay typed."""
+    from bench.harness.gate import STATUS_UNMEASURED, check
+
+    document = _metrics_document(tmp_path, recall=0.95).read_text(encoding="utf-8")
+    result = check(document, recall_target=_HostileValue())  # type: ignore[arg-type]
+    assert result.status == STATUS_UNMEASURED
+    with pytest.raises(ValueError, match="finite number"):
+        _resolve_recall_target(_HostileValue(), None)  # type: ignore[arg-type]
+
+
 def test_a_hostile_repr_cannot_escape_check_or_resolve(tmp_path: Path) -> None:
     """MEDIUM-4: the refusal path formats the offender through the guarded describer,
     so a repr raising RuntimeError still yields UNMEASURED / the typed ValueError."""

@@ -80,7 +80,9 @@ def _describe(value: object) -> str:
     try:
         text = repr(value)
     except Exception:  # noqa: BLE001 -- a hostile __repr__ may raise anything ordinary
-        return f"<{type(value).__name__} whose repr raises>"
+        # CONSTANT fallback: even type(value).__name__ can execute a hostile
+        # metaclass property. The refusal path touches the offender zero more times.
+        return "<value whose repr raises>"
     return text if len(text) <= 80 else text[:77] + "..."
 
 
@@ -168,7 +170,10 @@ def run_recall(
         duration = time.monotonic() - started
         try:
             raw = verdict_path.read_text(encoding="utf-8")
-        except OSError as failure:
+        except (OSError, UnicodeError) as failure:
+            # UnicodeError: a verdict file that is not valid UTF-8 is unreadable, and
+            # before this clause it escaped run_recall as UnicodeDecodeError instead
+            # of the typed RecallStageError; the finally still cleans the fresh file.
             raise RecallStageError(
                 f"the recall worker left no readable verdict "
                 f"(exit {completed.returncode}); stdout: {completed.stdout[-400:]!r} "
