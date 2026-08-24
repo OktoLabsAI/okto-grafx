@@ -378,7 +378,8 @@ measured (PERFORMANCE.md §2): disjoint 4-writer median 313 ms / p90 3.45 s / 25
 - Identity allocation *(verified)*: anchor `identity = extent.next_record_id` inside the
   "record identity" section of heap_store; its docstring states the safety rule: *"a counter
   behind an id in use would hand that identity out"* twice — the invariant the design must keep
-  is **durable counter ≥ every id any row has ever carried**.
+  is **durable `next_record_id` > every id any physical record header carries**. Equality is
+  already behind because the counter itself is what the next insert takes.
 - Gaps are sanctioned *(verified, txn_manager docstring)*: *"an id burned by a commit that then
   fails leaves a GAP in the sequence, which no reader can observe."*
 - Ids are allocated inside `_write_rows`, which runs INSIDE the commit section; the participant
@@ -387,9 +388,10 @@ measured (PERFORMANCE.md §2): disjoint 4-writer median 313 ms / p90 3.45 s / 25
   OCC refuses one — that is the mechanism that keeps leases disjoint, and it must remain: **a
   lease renewal MUST keep page 0 in its write set** (it does naturally: the renewal writes the
   page, `_attempt_pages()` measures it, `_declare_page_interest` declares it).
-- The verifier checks the counter against ids in use (anchor: the refusal text
-  `declares next_record_id` ... `below the` in heap_store) — leasing keeps the counter AHEAD, so
-  the check holds by construction, but the kill-tests below must prove it.
+- The verifier checks the counter from an independent device scan: page 0 and every physically
+  decodable heap header are read without the pool, catalog chain or visibility filter. Ended,
+  provisional, no-CSN and orphaned headers constrain it. Leasing must keep the counter strictly
+  ahead, and the kill/abort tests below must prove it.
 
 ### Design
 
@@ -418,36 +420,29 @@ restores today's behavior and is the fallback if a defect appears).
    (it becomes durable only when THIS commit commits).
 
 **The abort rule — this is the correctness heart, get it exactly right:** the renewal's page-0
-image is part of the commit attempt. If the attempt is REFUSED or the transaction rolls back, the
-durable counter never moved, and the in-memory lease MUST fall back to `durable_end`, or the next
-commit hands out ids the durable counter does not cover (a reopen would then hand them out AGAIN
-— duplicate identities, the one outcome the counter exists to prevent). Mechanism: hook the same
-seams the round-6 undo uses:
+image and provisional row headers are part of the same commit attempt, but eviction can put either
+on the device before the WAL accepts the batch. Therefore rollback depends on the proof already
+made by `_undo_pages`: whether any attempt page escaped. Hook the same seams the round-6 undo uses:
 - On commit SUCCESS (after step 3.7 publishes): promote `durable_end = speculative_end` for every
   table this commit renewed. Track renewals per attempt in the txn context or a heap-side
   per-attempt list keyed like `_dirty_mark` is (set at the mark point, consumed at
   success/abandon).
-- On `_abandon_rows` / rollback / `retry`: `speculative_end = durable_end`, `next =
-  min(next, durable_end)`... careful: ids already handed to the ABORTED txn's rows die with it —
-  `next` may simply reset to `durable_end` (the aborted rows' ids were ≥ durable_end iff they
-  came from the speculative range; ids handed below durable_end were durable-covered and burning
-  them is a sanctioned gap — resetting `next` to durable_end would REUSE them for the next txn…
-  NO: ids below durable_end already handed out may sit in COMMITTED rows of an earlier txn? No —
-  handed out only to THIS aborted txn (per-process single-flight, promote-on-commit). But an
-  earlier committed txn consumed from the same lease: its ids are < current `next` and ≤
-  durable_end after its promotion. So on abort: `next` must roll back only past the ids handed to
-  THE ABORTED ATTEMPT, i.e. snapshot `next` at attempt start (beside `_dirty_mark`) and restore
-  it on abandon, plus `speculative_end = durable_end`. Ids handed to the aborted attempt from the
-  DURABLE range are then reused by the next txn — safe, their rows never became visible, and
-  reuse-within-durable-cover is exactly today's behavior on abort (verify: today an aborted
-  commit's allocated ids ARE reused because the counter image was discarded — keep parity).
+- If NO attempt page escaped, `_undo_pages` discards every touched frame. That is proof that no
+  physical header carries the attempt's ids, so the attempt-start `next` may be restored and a
+  speculative renewal may fall back to `durable_end`.
+- If ANY page escaped, `_undo_pages` writes every touched page back in its invisible form. The
+  provisional/no-CSN headers remain physical, so every id handed to that attempt is BURNED even
+  when it came from an already-covered range. Keep page 0 strictly above their maximum and keep
+  `next` past them; for an escaped renewal, preserve/promote its end or invalidate the lease and
+  reload the device counter. Reusing an invisible physical id would defeat the verifier invariant.
+- If escape detection or cleanup fails, assume escape, burn conservatively and retain
+  `recovery_required`; uncertainty never authorizes reuse.
 - Kill between renewal-commit and use: reopen reads the durable counter (= extended) → gaps only.
-- Kill between handing ids and commit: rows never visible, counter durable at whatever the last
-  COMMITTED renewal wrote → no row carries an uncovered id. Invariant proof obligation for the
-  critic: **no row ever becomes visible carrying an id ≥ the durable counter at the moment of its
-  commit's barrier** — the renewal image rides IN THE SAME COMMIT as the first row that needs it,
-  so the barrier that makes the row durable makes the counter durable. State this in the
-  docstring; it is the whole argument.
+- Kill between handing ids and commit: rows remain invisible, but their physical ids still count;
+  page 0 must cover them after reopen. Invariant proof obligation for the critic: **no persisted
+  header, visible or not, may carry an id ≥ the device-resident next_record_id**. The renewal image
+  rides in the same attempt as the first row that needs it, and escaped-abort handling preserves
+  that coverage.
 
 Cross-process disjointness: renewals from two processes conflict on page 0 (both write the whole
 entry) → OCC retries one → it re-reads the advanced counter → disjoint blocks. No new mechanism.
@@ -464,11 +459,11 @@ numbers demand.
 - `test_a_renewal_rides_the_commit_that_needs_it` — WAL inspection: the commit that first
   allocates past the durable window carries a page-0 WRITE_PAGE image (decode as in
   `test_a_committed_schema_change_logs_the_catalog_header_page`).
-- `test_an_aborted_attempt_rolls_the_lease_back` — txn A inserts (consumes speculative ids),
-  conflict-abort it (page-half pattern from `tests/txn/test_chain_relink_regressions.py`), txn B
-  inserts; assert B's ids do not collide with A's aborted rows' ids after A RETRIES and commits
-  both — strongest form: force A's renewal, abort, then reopen the database (fresh process) and
-  insert — no duplicate-id refusal, verify clean.
+- `test_an_unescaped_aborted_attempt_rolls_the_lease_back` — txn A consumes ids without any page
+  reaching the device; conflict-abort it, then prove the attempt-start cursor is restored.
+- `test_an_escaped_aborted_attempt_burns_every_physical_id` — force provisional headers and page 0
+  onto the device before append refuses; txn B and a fresh process must allocate strictly after
+  those headers, with no duplicate physical id and `verify("all")` clean.
 - `test_a_kill_between_renewal_and_use_leaves_only_a_gap` — child renews (commit with one row),
   `os._exit(9)` before using the rest; parent reopens, inserts many rows, asserts uniqueness +
   verify clean + the gap exists (max id jumped).
@@ -478,8 +473,8 @@ numbers demand.
   existing refusal test).
 - A93 2×2 for the abort rule: (renewal, abort) × (renewal, kill).
 - Kill-checks: `speculative_end` promotion removed → uniqueness test fails after abort+retry;
-  lease reset on abandon removed → the aborted-attempt test fails; BLOCK=0 → behaves as today
-  (equivalence smoke).
+  unconditional lease reset on abandon → escaped-abort/verifier test fails; reset removed entirely
+  → unescaped rollback test fails; BLOCK=0 → behaves as today (equivalence smoke).
 
 ### Measurement (the point of the whole item)
 

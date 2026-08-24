@@ -8,10 +8,12 @@ only that the findings are empty but that the walk actually happened.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxCorruptionDetected
-from okto_grafx.domain.ids import NO_PAGE, RecordRef
+from okto_grafx.domain.ids import NO_CSN, NO_PAGE, PROVISIONAL_CSN, RecordRef
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import ValueType
@@ -43,6 +45,7 @@ from okto_grafx.engine.verifier import (
 from okto_grafx.adapters.codec_v1 import PageCodecV1
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
 from okto_grafx.engine.buffer_pool import BufferPool
+from okto_grafx.engine.heap_store import EXTENT_FIRST_SLOT, TableExtent
 
 from .conftest import HEAP_FILE, PAGE_SIZE, Stack
 
@@ -89,6 +92,65 @@ def _rewrite_page(stack: Stack, file: str, page_index: int, mutate) -> None:
     mutate(page)
     stack.storage.write_page(file, page_index, stack.codec.encode_page(page))  # type: ignore[attr-defined]
     stack.pool.invalidate()
+
+
+def _rewrite_device_counter(
+    stack: Stack,
+    table: TableDef,
+    next_record_id: int,
+    *,
+    invalidate: bool,
+) -> int:
+    """Replace one valid device-resident extent counter and return its physical slot."""
+    stack.pool.flush()
+    raw = stack.storage.read_page(HEAP_FILE, 0)  # type: ignore[attr-defined]
+    page = stack.codec.decode_page(raw, verify=True)
+    changed = -1
+    for slot, payload in page.iter_slots():
+        if slot < EXTENT_FIRST_SLOT:
+            continue
+        extent = TableExtent.decode(payload)
+        if extent.table_id == table.table_id:
+            page.update_slot(
+                slot, replace(extent, next_record_id=next_record_id).encode()
+            )
+            changed = slot
+            break
+    assert changed >= EXTENT_FIRST_SLOT, "the table has no physical directory entry"
+    stack.storage.write_page(  # type: ignore[attr-defined]
+        HEAP_FILE, 0, stack.codec.encode_page(page)
+    )
+    if invalidate:
+        stack.pool.invalidate()
+    return changed
+
+
+def _rewrite_first_record_header(stack: Stack, table: TableDef, **changes: int) -> None:
+    """Rewrite one reachable header while preserving its payload and a valid page checksum."""
+    reference = next(iter(stack.heap.scan_all(table)))[0]
+
+    def rewrite(page: Page) -> None:
+        content = page.read_slot(reference.slot)
+        header = RecordHeader.decode(content)
+        page.update_slot(
+            reference.slot,
+            replace(header, **changes).encode() + content[RECORD_HEADER_SIZE:],
+        )
+
+    _rewrite_page(stack, HEAP_FILE, reference.page, rewrite)
+
+
+def _append_orphan_header(stack: Stack, table: TableDef, record_id: int) -> int:
+    """Write a checksum-valid heap page that claims a table but is outside its chain."""
+    page = stack.pool.allocate(HEAP_FILE, int(PageType.HEAP))
+    page_index = page.page_index
+    try:
+        page.insert_slot(table.table_id.to_bytes(4, "little"))
+        page.insert_slot(RecordHeader(record_id=record_id, xmin=1).encode())
+    finally:
+        stack.pool.unpin(HEAP_FILE, page_index, dirty=True)
+    stack.pool.flush()
+    return page_index
 
 
 # --- the report shape ------------------------------------------------------------------------------
@@ -160,6 +222,157 @@ def test_each_scope_walks_only_what_it_names(stack: Stack) -> None:
     assert records.records_checked == 3 and records.pages_checked == 0
     indexes = verifier.verify(SCOPE_INDEXES)
     assert indexes.index_entries_checked == 0 and indexes.pages_checked == 0
+
+
+def test_a_durable_counter_equal_to_the_highest_physical_id_is_reported(
+    stack: Stack,
+) -> None:
+    """The field names the NEXT id, so equality would hand an existing identity out again."""
+    table = _populate(stack)
+    extent_slot = _rewrite_device_counter(stack, table, 3, invalidate=True)
+    before = stack.storage.read_page(HEAP_FILE, 0)  # type: ignore[attr-defined]
+
+    report = stack.verifier().verify(SCOPE_RECORDS)
+
+    found = report.findings_of(FindingKind.RECORD_ID_COUNTER)
+    assert len(found) == 1
+    assert found[0].location == FindingLocation(
+        file=HEAP_FILE, page=0, slot=extent_slot
+    )
+    assert "next_record_id 3" in found[0].detail
+    assert "id 3" in found[0].detail
+    assert report.records_checked == 3, (
+        "the independent oracle must not double-count records"
+    )
+    assert stack.storage.read_page(HEAP_FILE, 0) == before  # type: ignore[attr-defined]
+
+
+def test_the_counter_oracle_reads_page_zero_from_the_device_not_the_cache(
+    stack: Stack,
+) -> None:
+    """A good resident page zero must not certify lower, checksum-valid device bytes."""
+    table = _populate(stack)
+    assert stack.heap.next_record_id(table) == 4, "prime the resident good image"
+    _rewrite_device_counter(stack, table, 2, invalidate=False)
+    assert stack.heap.next_record_id(table) == 4, "the pool still holds the old image"
+
+    report = stack.verifier().verify(SCOPE_RECORDS)
+
+    found = report.findings_of(FindingKind.RECORD_ID_COUNTER)
+    assert len(found) == 1
+    assert "next_record_id 2" in found[0].detail and "id 3" in found[0].detail
+
+
+def test_the_same_lower_durable_counter_is_found_after_the_pool_is_invalidated(
+    stack: Stack,
+) -> None:
+    """The relation itself is checked, independently of the stale-cache regression above."""
+    table = _populate(stack)
+    _rewrite_device_counter(stack, table, 2, invalidate=True)
+    assert stack.heap.next_record_id(table) == 2
+
+    report = stack.verifier().verify(SCOPE_RECORDS)
+
+    assert len(report.findings_of(FindingKind.RECORD_ID_COUNTER)) == 1
+
+
+@pytest.mark.parametrize(
+    ("xmin", "xmax"),
+    (
+        (2, 3),
+        (PROVISIONAL_CSN, NO_CSN),
+        (NO_CSN, NO_CSN),
+    ),
+    ids=("ended", "provisional", "no-csn"),
+)
+def test_every_decodable_physical_lifetime_constrains_the_counter(
+    stack: Stack, xmin: int, xmax: int
+) -> None:
+    """Visibility cannot hide an id from a counter whose sole job is preventing its reuse."""
+    table = _populate(stack)
+    _rewrite_first_record_header(stack, table, record_id=90, xmin=xmin, xmax=xmax)
+
+    report = stack.verifier().verify(SCOPE_RECORDS)
+
+    found = report.findings_of(FindingKind.RECORD_ID_COUNTER)
+    assert len(found) == 1
+    assert "id 90" in found[0].detail
+
+
+def test_a_decodable_header_on_an_orphan_page_constrains_the_counter(
+    stack: Stack,
+) -> None:
+    """Following the table chain would miss the precise residue leasing must not reuse."""
+    table = _populate(stack)
+    orphan = _append_orphan_header(stack, table, 91)
+
+    report = stack.verifier().verify(SCOPE_RECORDS)
+
+    assert [
+        finding.location.page for finding in report.findings_of(FindingKind.ORPHAN_PAGE)
+    ] == [orphan]
+    counters = report.findings_of(FindingKind.RECORD_ID_COUNTER)
+    assert len(counters) == 1 and "id 91" in counters[0].detail
+    assert report.records_checked == 3, (
+        "the oracle pass is not a second public record count"
+    )
+
+
+def test_the_physical_high_water_is_a_maximum_not_the_last_header_seen(
+    stack: Stack,
+) -> None:
+    """A high id in an earlier slot must not be overwritten by lower later ids."""
+    table = _populate(stack)
+    _rewrite_first_record_header(stack, table, record_id=100)
+    _rewrite_device_counter(stack, table, 50, invalidate=True)
+
+    found = (
+        stack.verifier()
+        .verify(SCOPE_RECORDS)
+        .findings_of(FindingKind.RECORD_ID_COUNTER)
+    )
+
+    assert len(found) == 1 and "id 100" in found[0].detail
+
+
+def test_an_empty_or_ahead_counter_is_legal(stack: Stack) -> None:
+    """Gaps are sanctioned; only reuse, never density, is an integrity failure."""
+    table = _populate(stack)
+    _rewrite_device_counter(stack, table, 100, invalidate=True)
+    assert stack.verifier().verify(SCOPE_RECORDS).findings == ()
+
+    empty = TableDef(
+        table_id=2,
+        name="Empty",
+        kind="node",
+        columns=(ColumnDef(name="id", type=ValueType.INT64, nullable=False),),
+        primary_key="id",
+        from_table=None,
+        to_table=None,
+    )
+    stack.catalog.catalog.add_table(empty)
+    stack.catalog.save()
+    # Create its extent without leaving a record behind: allocation spends the range and an
+    # empty table may therefore begin arbitrarily far ahead.
+    assert stack.heap.allocate_record_id(empty) == 1
+    _rewrite_device_counter(stack, empty, 500, invalidate=True)
+    assert stack.verifier().verify(SCOPE_RECORDS).findings == ()
+
+
+def test_the_record_counter_check_belongs_only_to_records_and_all(stack: Stack) -> None:
+    table = _populate(stack)
+    _rewrite_device_counter(stack, table, 2, invalidate=True)
+
+    pages = stack.verifier().verify(SCOPE_PAGES)
+    indexes = stack.verifier().verify(SCOPE_INDEXES)
+    records = stack.verifier().verify(SCOPE_RECORDS)
+    everything = stack.verifier().verify(SCOPE_ALL)
+
+    assert pages.findings_of(FindingKind.RECORD_ID_COUNTER) == ()
+    assert indexes.findings_of(FindingKind.RECORD_ID_COUNTER) == ()
+    assert len(records.findings_of(FindingKind.RECORD_ID_COUNTER)) == 1
+    assert len(everything.findings_of(FindingKind.RECORD_ID_COUNTER)) == 1
+    assert pages.records_checked == indexes.records_checked == 0
 
 
 def test_the_page_walk_counts_every_checksum_it_took(stack: Stack) -> None:

@@ -68,7 +68,11 @@ from okto_grafx.domain.ids import (
 from okto_grafx.domain.index.keys import index_key
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
 from okto_grafx.domain.model.schema import TableDef
-from okto_grafx.domain.page.file_header import HEADER_PAGE_INDEX, FileHeaderPage
+from okto_grafx.domain.page.file_header import (
+    HEADER_PAGE_INDEX,
+    FileHeaderPage,
+    FileKind,
+)
 from okto_grafx.domain.page.layout import PageType, is_unwritten_image
 from okto_grafx.domain.page.slotted import Page
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
@@ -87,6 +91,11 @@ from okto_grafx.domain.verify.findings import (
 )
 from okto_grafx.domain.verify.routing import UNCLASSIFIED, route_page_refusal
 from okto_grafx.engine.buffer_pool import BufferPool
+from okto_grafx.engine.heap_store import (
+    DESCRIPTOR_SIZE,
+    EXTENT_FIRST_SLOT,
+    TableExtent,
+)
 from okto_grafx.engine.metrics_catalog import metric
 
 __all__ = [
@@ -274,7 +283,7 @@ class Verifier:
                     )
                 )
             if index == HEADER_PAGE_INDEX:
-                findings.extend(self._verify_header_page(file, page))
+                findings.extend(self._verify_header_page(file, page, reported))
         return checked, findings
 
     def _decode_page(
@@ -380,11 +389,19 @@ class Verifier:
             )
         )
 
-    def _verify_header_page(self, file: str, page: Page) -> list[VerificationFinding]:
+    def _verify_header_page(
+        self,
+        file: str,
+        page: Page,
+        reported: set[tuple[str, PageIndex]],
+    ) -> list[VerificationFinding]:
         """Check that page 0 is the reserved header page amendment A2 requires it to be."""
         try:
             FileHeaderPage.read(page)
         except GrafxError as failure:
+            if (file, HEADER_PAGE_INDEX) in reported:
+                return []
+            reported.add((file, HEADER_PAGE_INDEX))
             return [
                 VerificationFinding(
                     kind=FindingKind.FILE_HEADER,
@@ -401,20 +418,30 @@ class Verifier:
     ) -> tuple[int, list[VerificationFinding]]:
         """Verify the heap: its tables, their chains, their records and their version chains."""
         findings: list[VerificationFinding] = []
-        if self._heap is None or self._catalog is None:
+        if self._heap is None:
+            return 0, findings
+        heap_file = _store_file(self._heap)
+        owners, physical_maxima = self._physical_heap_inventory(
+            heap_file, findings, reported
+        )
+        findings.extend(
+            self._verify_record_id_counters(
+                heap_file, physical_maxima, findings, reported
+            )
+        )
+        if self._catalog is None:
             return 0, findings
         try:
             catalog = self._catalog.read_from_pages()
         except GrafxError as failure:
-            return 0, [
+            findings.append(
                 VerificationFinding(
                     kind=FindingKind.CATALOG_UNREADABLE,
                     location=FindingLocation(file=_store_file(self._catalog)),
                     detail=f"The catalog could not be read from its pages: {failure}",
                 )
-            ]
-        heap_file = _store_file(self._heap)
-        owners = self._page_owners(heap_file, findings, reported)
+            )
+            return 0, findings
         checked = 0
         for table in catalog.tables():
             counted, found = self._verify_table(table, heap_file, owners, reported)
@@ -422,25 +449,33 @@ class Verifier:
             findings.extend(found)
         return checked, findings
 
-    def _page_owners(
+    def _physical_heap_inventory(
         self,
         heap_file: str,
         findings: list[VerificationFinding],
         reported: set[tuple[str, PageIndex]],
-    ) -> dict[int, set[PageIndex]]:
-        """Return which pages each table claims, by scanning the file rather than by walking it.
+    ) -> tuple[dict[int, set[PageIndex]], dict[int, int]]:
+        """Return physical page owners and the greatest decodable record id of each table.
 
         This is the independent half of the structural check. It follows no ``next_page`` link and
         consults no directory entry: it opens every page of the file and reads the table
         identifier the page descriptor of amendment A21 carries in slot 0. A chain that has been
         damaged cannot influence this answer, which is precisely why comparing the two catches the
         case where a replayed hint and a corrupt chain agree with each other.
+
+        The record-id high water follows the same independence rule. Every physically decodable
+        header participates, including an ended, deleted, provisional, no-CSN or orphaned version.
+        Visibility is a reader's opinion and a directory counter cannot use it: handing out an id
+        already present in any persisted header would make the answer depend on whether that old
+        header happened to be visible. Pages and slots are read from the device, never through the
+        heap or its cache.
         """
         owners: dict[int, set[PageIndex]] = {}
+        maxima: dict[int, int] = {}
         try:
             total = self._pool.storage.page_count(heap_file)
         except GrafxError:
-            return owners
+            return owners, maxima
         for index in range(total):
             if index == HEADER_PAGE_INDEX:
                 continue
@@ -453,11 +488,117 @@ class Verifier:
                 descriptor = page.read_slot(_HEAP_DESCRIPTOR_SLOT)
             except GrafxError:
                 continue
-            if len(descriptor) < 4:
+            if len(descriptor) != DESCRIPTOR_SIZE:
                 continue
             table_id = int.from_bytes(descriptor[:4], "little")
             owners.setdefault(table_id, set()).add(index)
-        return owners
+            for slot in range(_FIRST_RECORD_SLOT, page.slot_count):
+                if page.is_slot_free(slot):
+                    continue
+                try:
+                    header = RecordHeader.decode(page.read_slot(slot))
+                except GrafxError:
+                    # This pass is the independent counter oracle. The ordinary record walk owns
+                    # the located RECORD_HEADER finding for a malformed reachable slot; an orphan
+                    # page is already a located ORPHAN_PAGE. With no decodable id there is no
+                    # number this pass may honestly compare against the counter.
+                    continue
+                previous = maxima.get(table_id)
+                if previous is None or header.record_id > previous:
+                    maxima[table_id] = header.record_id
+        return owners, maxima
+
+    def _verify_record_id_counters(
+        self,
+        heap_file: str,
+        physical_maxima: Mapping[int, int],
+        findings: list[VerificationFinding],
+        reported: set[tuple[str, PageIndex]],
+    ) -> list[VerificationFinding]:
+        """Compare device-resident directory counters with every physical record header.
+
+        ``next_record_id`` is the identity the next insert will take, so equality is already
+        behind: the stored counter must be STRICTLY greater than the largest id in any decodable
+        header. A counter ahead of the records is legal -- allocations and range leases burn gaps
+        deliberately -- and an empty table imposes no lower bound beyond TableExtent's own format
+        validation.
+
+        Page zero is decoded directly from ``storage``. Calling ``HeapStore.extent_of`` here would
+        let a resident old image certify lower bytes on the device, the precise failure a verifier
+        is meant to expose.
+        """
+        page = self._decode_page(heap_file, HEADER_PAGE_INDEX, findings, reported)
+        if page is None:
+            return []
+        try:
+            header = FileHeaderPage.read(page)
+        except GrafxError as failure:
+            self._report_page(
+                findings,
+                reported,
+                heap_file,
+                HEADER_PAGE_INDEX,
+                FindingKind.FILE_HEADER,
+                f"Page 0 is not a readable heap file header page: {failure}",
+            )
+            return []
+        if header.kind is not FileKind.HEAP:
+            self._report_page(
+                findings,
+                reported,
+                heap_file,
+                HEADER_PAGE_INDEX,
+                FindingKind.FILE_HEADER,
+                f"Page 0 carries a {header.kind.name.lower()} file header, not a heap header.",
+            )
+            return []
+        if header.page_size != self._pool.page_size:
+            self._report_page(
+                findings,
+                reported,
+                heap_file,
+                HEADER_PAGE_INDEX,
+                FindingKind.FILE_HEADER,
+                f"The heap header declares {header.page_size}-byte pages and this verifier uses "
+                f"{self._pool.page_size}-byte pages.",
+            )
+            return []
+
+        found: list[VerificationFinding] = []
+        for slot, payload in page.iter_slots():
+            if slot < EXTENT_FIRST_SLOT:
+                continue
+            try:
+                extent = TableExtent.decode(payload)
+            except GrafxError as failure:
+                found.append(
+                    VerificationFinding(
+                        kind=FindingKind.TABLE_UNREADABLE,
+                        location=FindingLocation(
+                            file=heap_file, page=HEADER_PAGE_INDEX, slot=slot
+                        ),
+                        detail=f"This heap directory entry could not be decoded: {failure}",
+                    )
+                )
+                continue
+            highest = physical_maxima.get(extent.table_id)
+            if highest is None or extent.next_record_id > highest:
+                continue
+            found.append(
+                VerificationFinding(
+                    kind=FindingKind.RECORD_ID_COUNTER,
+                    location=FindingLocation(
+                        file=heap_file, page=HEADER_PAGE_INDEX, slot=slot
+                    ),
+                    detail=(
+                        f"The directory entry of table {extent.table_id} declares next_record_id "
+                        f"{extent.next_record_id}, but a physically stored record header carries "
+                        f"id {highest}. The next id must be greater than every persisted id or a "
+                        "reopen can hand the same identity to another row."
+                    ),
+                )
+            )
+        return found
 
     def _verify_table(
         self,

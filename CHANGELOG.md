@@ -38,6 +38,11 @@ including the on-disk format.
 
 ### Fixed
 
+- **Verification now refuses a heap identity counter that can reuse a persisted id.** The records
+  walk reads page 0 and every heap record header straight from the storage device, so a resident
+  cache image, an ended or provisional version, or an orphan page cannot hide the physical high
+  water. `record_id_counter` identifies the exact directory slot when `next_record_id` is equal to
+  or below the greatest decodable id; gaps and counters ahead of empty tables remain valid.
 - **A checksum provider could forge equality and be installed without returning an integer.** The
   installer and native adapter now require and copy an exact unsigned 32-bit result before every
   comparison and runtime use, contain ordinary provider failures, cover the largest legal page in

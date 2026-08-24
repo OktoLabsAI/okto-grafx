@@ -716,6 +716,13 @@ class Verifier:
 Findings carry `kind`, `location` (`file`, `page`, `slot`, `lsn`, `index`), `detail` (en-US).
 A clean database returns an empty findings tuple.
 
+The records walk independently enforces the heap identity high-water invariant. It reads page 0
+and every heap record header directly from the storage device, never through the buffer pool,
+catalog reachability or snapshot visibility. For each table with a physically decodable header,
+`next_record_id` MUST be strictly greater than the greatest stored `record_id`; equality would hand
+an existing identity out again. Ended, deleted, provisional, no-CSN and orphaned headers all count.
+A counter ahead of the records is valid because allocation and range leasing may burn gaps.
+
 ### 8.7 `engine/index_manager.py` (C7)
 ```python
 class IndexVisibility(str, Enum):

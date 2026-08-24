@@ -23,12 +23,13 @@ lease renewals and chain-growth commits touch page 0.
 
 * **Pros:** redo model untouched (the crash proof does not move); no on-disk format change (the
   counter just advances in steps); crash gaps already sanctioned ("an id burned ... leaves a GAP,
-  which no reader can observe"); the verifier's invariant (counter ≥ every id in use) preserved by
-  construction; reversible (N=1 is today's behavior).
+  which no reader can observe"); the verifier's invariant (`next_record_id` strictly greater than
+  every physical record id) is preserved by construction; reversible (N=1 is today's behavior).
 * **Cons:** page-0 conflicts become rare, not zero (renewal + chain growth, ~1 in 9–50 commits in
   the measured workload).
-* **Resilience risk: LOW.** Recovery and verify unchanged. The one new corner — a kill between
-  lease and use — is the sanctioned gap.
+* **Resilience risk: LOW after the verifier prerequisite.** The on-disk format and redo stay
+  unchanged. A kill between lease and use is the sanctioned gap; an aborted header that reached
+  the device must burn its id, and only an attempt proven never to have escaped may reuse it.
 * **Performance:** conflicts →~0 for disjoint ingest; tails collapse to the section's fair queue
   (~2–4× unit cost); unlocks ~70 commits/s on Linux; Windows stays ~10/s until the publication fix.
 * **Frozen surfaces:** §8.5 untouched (changes WHEN page 0 is written, not the protocol); a light
