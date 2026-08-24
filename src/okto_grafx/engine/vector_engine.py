@@ -80,7 +80,11 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.ids import Csn, Lsn, RecordId, RecordRef
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.records import IndexChange, IndexOperation
-from okto_grafx.domain.index.visibility import IndexVisibility, SnapshotLike, entry_visible
+from okto_grafx.domain.index.visibility import (
+    IndexVisibility,
+    SnapshotLike,
+    entry_visible,
+)
 from okto_grafx.domain.model.record import HeapVersion
 from okto_grafx.domain.model.schema import EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import VectorValue
@@ -117,7 +121,11 @@ from okto_grafx.domain.vector.space import (
 from okto_grafx.domain.wal.record import WalRecord
 from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore
-from okto_grafx.engine.index_manager import IndexManager, ProximityIndex, StagingTransaction
+from okto_grafx.engine.index_manager import (
+    IndexManager,
+    ProximityIndex,
+    StagingTransaction,
+)
 from okto_grafx.engine.metrics_catalog import MetricEmitter, metric
 
 __all__ = [
@@ -322,29 +330,45 @@ def _guarded_admits(
 
 
 class GraphGuard(Protocol):
-    """What the derived graph needs from a lock: a context manager that can also wait and wake.
+    """What the derived graph needs from a lock: a context manager that can wait, wake, and say
+    which thread is asking.
 
-    A ``threading.Condition`` satisfies it, and the composition root hands one in (CF-13: the
+    The composition root hands one in (``adapters.graph_guard.ConditionGuard``; CF-13: the
     mechanism arrives by construction, the engine imports none). It is held across reference
     operations on the published picture only -- never across the walk, the resolver, the pool
     or the ``VectorMath`` port (A91, LESSONS L2) -- and the same guard may be shared by every
     index of one engine: a wake meant for another index costs its waiters one re-check.
+
+    ``thread_token`` is what keeps a build from waiting on itself: host code the build calls
+    through the ``VectorMath`` port may call back into a search on the same index, and that
+    search must be told apart from another thread's.
     """
 
     def __enter__(self) -> object:
         """Take the guard."""
         ...
 
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> object:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> bool | None:
         """Release the guard, whether or not the body raised."""
         ...
 
-    def wait_for(self, predicate: Callable[[], bool], timeout: float | None = None) -> bool:
+    def wait_for(
+        self, predicate: Callable[[], bool], timeout: float | None = None
+    ) -> bool:
         """Release the guard while waiting for the predicate, up to the timeout; return its value."""
         ...
 
     def notify_all(self) -> None:
         """Wake every thread waiting on this guard."""
+        ...
+
+    def thread_token(self) -> int:
+        """Return a token identifying the calling thread for as long as it lives."""
         ...
 
 
@@ -362,16 +386,27 @@ class _UnguardedBuild:
     def __enter__(self) -> object:
         return self
 
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> None:
         return None
 
-    def wait_for(self, predicate: Callable[[], bool], timeout: float | None = None) -> bool:
+    def wait_for(
+        self, predicate: Callable[[], bool], timeout: float | None = None
+    ) -> bool:
         """Answer the predicate at once: with no other thread, there is nothing to wait for."""
         return bool(predicate())
 
     def notify_all(self) -> None:
         """Wake nobody: an unguarded composition has no waiters."""
         return None
+
+    def thread_token(self) -> int:
+        """Return the one token of the one thread an unguarded composition has."""
+        return 0
 
 
 _BUILD_WAIT_SECONDS: float = 0.5
@@ -444,6 +479,7 @@ class VectorHnswIndex(ProximityIndex):
         "_guard",
         "_snapshot",
         "_building",
+        "_builder",
     )
 
     def __init__(
@@ -487,7 +523,10 @@ class VectorHnswIndex(ProximityIndex):
         # the guard, captured by ONE read; never edited into a different picture in place.
         self._snapshot: _GraphSnapshot | None = None
         # True while a thread of this process builds a picture; other searches wait behind it.
+        # The builder's thread token is kept beside it, so a call the build itself makes back
+        # into this index (host code behind the VectorMath port) is never made to wait on it.
         self._building: bool = False
+        self._builder: int | None = None
 
     # --- identity ---------------------------------------------------------------------------
 
@@ -633,13 +672,19 @@ class VectorHnswIndex(ProximityIndex):
         One build at a time per index: a thread that finds a build in flight waits on the guard
         for it, in bounded slices, and takes the published picture when it wakes. Past
         ``_BUILD_WAIT_SLICES`` it builds for itself, which is wasted work and never a wrong
-        answer.
+        answer. The build is OWNED by the thread that started it: only the owner clears the
+        flag and wakes the waiters, and a call the owner itself makes back into this index --
+        host code behind the ``VectorMath`` port calling ``search`` -- builds its own picture
+        at once rather than waiting on the build it is part of (the M0A cross-review's
+        self-wait: sixty seconds of a search waiting for itself).
 
         The header is read OUTSIDE the guard on every turn: reading it pins a page and takes the
         pool's lock, and this process's lock order is pool, then guard, never the reverse.
         Nothing under the guard reaches the pool, the heap, the resolver or the ``VectorMath``
         port (A91, LESSONS L2).
         """
+        token = self._guard.thread_token()
+        owner = False
         waited = 0
         while True:
             header = self.built_through_lsn
@@ -654,6 +699,13 @@ class VectorHnswIndex(ProximityIndex):
                     self._snapshot = None
                 if not self._building:
                     self._building = True
+                    self._builder = token
+                    owner = True
+                    break
+                if self._builder == token:
+                    # The build in flight is THIS thread's: host code it called through the
+                    # VectorMath port came back in through search(). Waiting would be waiting
+                    # on ourselves; build a picture for this call and leave the outer build be.
                     break
                 finished = self._guard.wait_for(
                     lambda: not self._building, timeout=_BUILD_WAIT_SECONDS
@@ -669,9 +721,8 @@ class VectorHnswIndex(ProximityIndex):
             # complete build, is not touched. The two early refusals inside the build (the
             # resolver failing, a dimension mismatch) used to re-raise with a partial graph
             # published, and every later search answered out of the fragment (C9 round-2 B3).
-            with self._guard:
-                self._building = False
-                self._guard.notify_all()
+            if owner:
+                self._release_build()
             raise
         with self._guard:
             current = self._snapshot
@@ -682,9 +733,18 @@ class VectorHnswIndex(ProximityIndex):
                 # the duplicate-build case. Both are complete; the published one is kept, and
                 # this search answers from it rather than from a picture nobody else can see.
                 built = current
-            self._building = False
-            self._guard.notify_all()
+            if owner:
+                self._building = False
+                self._builder = None
+                self._guard.notify_all()
         return built
+
+    def _release_build(self) -> None:
+        """Give the build up as its owner: clear the flag and wake whoever waited for it."""
+        with self._guard:
+            self._building = False
+            self._builder = None
+            self._guard.notify_all()
 
     def _build(self, mark: Lsn) -> _GraphSnapshot:
         """Build a complete picture in locals over the entries the store holds, marked at ``mark``.
@@ -707,7 +767,9 @@ class VectorHnswIndex(ProximityIndex):
             record_of_node={},
             mark=mark,
         )
-        for entry in sorted(self.walk(), key=lambda item: (item.born_csn, item.ref.encode())):
+        for entry in sorted(
+            self.walk(), key=lambda item: (item.born_csn, item.ref.encode())
+        ):
             self._install(picture, entry)
         return picture
 
@@ -748,7 +810,9 @@ class VectorHnswIndex(ProximityIndex):
             return
         self._install_fresh(picture, entry, encoded)
 
-    def _install_fresh(self, picture: _GraphSnapshot, entry: IndexEntry, encoded: int) -> None:
+    def _install_fresh(
+        self, picture: _GraphSnapshot, entry: IndexEntry, encoded: int
+    ) -> None:
         """Resolve, check and insert one entry that the picture does not hold yet."""
         try:
             resolved = self._resolve(entry.ref)
@@ -827,7 +891,9 @@ class VectorHnswIndex(ProximityIndex):
         if node is None:
             return True
         if change.operation is IndexOperation.TOMBSTONE:
-            picture.entry_of_node[node] = picture.entry_of_node[node].ended_at(change.csn)
+            picture.entry_of_node[node] = picture.entry_of_node[node].ended_at(
+                change.csn
+            )
             return True
         # A removal mutates the graph's neighbour lists and unlinks a node; done in place under
         # a traversal on another thread, that traversal can step onto a node that is no longer
@@ -909,6 +975,12 @@ class VectorHnswIndex(ProximityIndex):
 
         A stale index refuses here rather than answering: an omission looks exactly like an empty
         neighbourhood, and this is the door where that would be invisible.
+
+        PRECONDITION: ``snapshot`` is a FIXED view -- a transaction's, taken at ``begin()``
+        (amendment A19: the predicate belongs to the transaction manager). The picture this
+        search answers from is complete as of the moment its build started, and a commit that
+        lands after that is above any such snapshot. A predicate that admits versions committed
+        AFTER the search began is outside this contract and may see fewer of them than exist.
         """
         predicate = _require_snapshot(snapshot)
         self.require_readable()
@@ -1001,7 +1073,9 @@ class VectorEngine:
         :class:`GraphGuard`). The composition root hands in a ``threading.Condition``; a
         composition that hands in none gets indexes fit for a single thread.
         """
-        if isinstance(exact_scan_threshold, bool) or not isinstance(exact_scan_threshold, int):
+        if isinstance(exact_scan_threshold, bool) or not isinstance(
+            exact_scan_threshold, int
+        ):
             raise GrafxConfigurationError(
                 f"The exact scan threshold must be an integer; got "
                 f"{type(exact_scan_threshold).__name__}.",
@@ -1065,7 +1139,11 @@ class VectorEngine:
             )
         self._catalog.catalog.add_space(definition)
         self._catalog.save()
-        self._emit("vector.space_created", space=definition.name, dimension=definition.dimension)
+        self._emit(
+            "vector.space_created",
+            space=definition.name,
+            dimension=definition.dimension,
+        )
 
     def retire_space(self, name: str) -> None:
         """Close the write door of one embedding space, leaving it readable forever (FR-3)."""
@@ -1196,7 +1274,9 @@ class VectorEngine:
         def resolve(ref: RecordRef) -> tuple[RecordId, Sequence[float]]:
             """Return the record and the components of the version at a heap location."""
             version = self._heap.read(ref)
-            return version.record_id, self._vector_of_version(space, version, ref).values
+            return version.record_id, self._vector_of_version(
+                space, version, ref
+            ).values
 
         return resolve
 
@@ -1404,7 +1484,9 @@ class VectorEngine:
             candidates.append((version.record_id, stored.values))
         self._observe_phase(REGIME_EXACT, PHASE_TRAVERSE, started)
         started = self._reading()
-        ranked = self._math.top_k(query, candidates, k, space.metric) if candidates else []
+        ranked = (
+            self._math.top_k(query, candidates, k, space.metric) if candidates else []
+        )
         retired = not space.is_active
         hits = tuple(
             VectorHit(
@@ -1534,7 +1616,9 @@ class VectorEngine:
         if elapsed < 0.0:
             elapsed = 0.0
         self._publish(
-            lambda: self._metrics.observe(_LATENCY, elapsed, {"regime": regime, "phase": phase})
+            lambda: self._metrics.observe(
+                _LATENCY, elapsed, {"regime": regime, "phase": phase}
+            )
         )
 
     def _publish_search_metrics(self, plan: RegimePlan, achieved: int) -> None:

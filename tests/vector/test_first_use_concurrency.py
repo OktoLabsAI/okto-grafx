@@ -9,24 +9,32 @@ nodes, ``stale`` False, ``achieved_k`` reported as if complete. Found by Codex's
 because every insert past the first scores the new node through it, so parking the calling
 thread at the Nth score call is a point INSIDE a cold build that a test can hold and release.
 
-Three interleavings, in the order the handoff lists them:
+Four interleavings:
 
-* a search arriving mid-build answers from a COMPLETE picture (pre-fix: from the fragment);
+* a search arriving mid-build WAITS for the build and answers from the complete snapshot
+  (pre-fix: it answered at once, from the fragment; a single-flight that does not hold --
+  no wait, or a patience of zero -- fails the same assertions);
 * a builder that fails after another builder published does not erase that success (pre-fix:
   its ``except: invalidate_graph()`` dropped whatever was published);
-* a commit landing during the build is not certified into a picture that lacks it -- the
+* a commit landing during the build is not certified into a snapshot that lacks it -- the
   regression for the fixed protocol itself, which a naive "build in locals, stamp the header at
   the end" would fail, and which the pre-fix tree happens to pass for the wrong reason (it noted
-  the commit into the partial graph it had already published).
+  the commit into the partial graph it had already published);
+* a build that calls back into its own index (host code behind the ``VectorMath`` port calling
+  ``search``) does not wait on itself (the M0A cross-review's self-wait).
 
 Everything runs through the public door with the default composition, so the guard the assembly
-hands in is the one under test. The one private reading, ``index._snapshot``, is the derived
-state whose publication is the property.
+hands in is the one under test. Every answer is asserted by the record ids it returned, not by
+its count alone. The one private reading, ``index._snapshot``, is the derived state whose
+publication is the property; ``index._resolve`` is wrapped only to COUNT builds by the entries
+they resolve.
 """
 
 from __future__ import annotations
 
 import threading
+import time
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -41,6 +49,7 @@ from okto_grafx.runtime.bootstrap import build_default_registry, release_ports
 from okto_grafx.runtime.config import DatabaseConfig
 
 ROWS: int = 8
+ALL_IDS: tuple[int, ...] = tuple(range(1, ROWS + 1))
 PARK_AT: int = 4
 """The score call the builder is parked at: past the first insert, well before the eighth."""
 PATIENCE: float = 10.0
@@ -120,6 +129,29 @@ class GatingMath:
         return self._inner.top_k(query, candidates, k, metric)
 
 
+class ReentrantMath(GatingMath):
+    """Host code that, once, calls ``search()`` on the same space from inside the cold build."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            park_at=10**9
+        )  # never parks; the gate is not what this one is for
+        self.database: Any = None
+        self.inner: object = None
+        self.inner_seconds: float = -1.0
+        self._reentered = False
+
+    def score(
+        self, a: Sequence[float], b: Sequence[float], metric: DistanceMetric
+    ) -> float:
+        if not self._reentered and self.database is not None:
+            self._reentered = True
+            started = time.monotonic()
+            self.inner = _search(self.database)
+            self.inner_seconds = time.monotonic() - started
+        return super().score(a, b, metric)
+
+
 def _components(record_id: int) -> tuple[float, float, float, float]:
     """Return a distinct, non-degenerate vector for one row."""
     return (1.0 - record_id * 0.05, record_id * 0.05, 0.25, 0.0)
@@ -155,8 +187,8 @@ def _insert(txn: Any, record_id: int) -> None:
     )
 
 
-def _search(database: Any, k: int = ROWS) -> tuple[int, str]:
-    """Search under a fresh read snapshot and return (achieved_k, regime)."""
+def _search(database: Any, k: int = ROWS) -> tuple[int, str, tuple[int, ...]]:
+    """Search under a fresh read snapshot; return (achieved_k, regime, sorted record ids)."""
     reader = database.begin("read")
     try:
         hits = database.vectors.search(
@@ -165,7 +197,11 @@ def _search(database: Any, k: int = ROWS) -> tuple[int, str]:
             query=[1.0, 0.0, 0.25, 0.0],
             snapshot=reader.context.snapshot,
         )
-        return (hits.achieved_k, hits.regime)
+        return (
+            hits.achieved_k,
+            hits.regime,
+            tuple(sorted(hit.record_id for hit in hits.hits)),
+        )
     finally:
         reader.rollback()
 
@@ -185,53 +221,76 @@ def _finish(*threads: threading.Thread) -> None:
     assert not stuck, f"these searches never finished: {stuck}"
 
 
-def test_a_search_arriving_mid_build_answers_from_a_complete_picture(
+def _count_resolves(index: Any) -> Counter[int]:
+    """Wrap the index's resolver to count, per thread, the entries a build resolves."""
+    resolved = index._resolve  # noqa: SLF001 - builds are counted by what they resolve
+    resolves: Counter[int] = Counter()
+
+    def counting_resolve(ref: object) -> object:
+        resolves[threading.get_ident()] += 1
+        return resolved(ref)
+
+    index._resolve = counting_resolve  # type: ignore[assignment]  # noqa: SLF001
+    return resolves
+
+
+def test_a_search_arriving_mid_build_waits_and_answers_from_a_complete_snapshot(
     tmp_path: Path,
 ) -> None:
     """The first P0.5 interleaving: two cold searches, the second lands inside the first's build.
 
     Pre-fix the second search returned at once out of the fragment (three nodes of eight).
-    Post-fix it waits behind the build and answers from the complete picture, and the two
-    searches agree. A bounded join is what tells the two apart without a private hook: the
-    second thread finishing inside one second is the defect, waiting is the fix.
+    Post-fix it WAITS behind the build and answers from the complete snapshot, and the two
+    searches agree. The wait is asserted, not assumed: with the builder still parked one second
+    after the second search started, the second thread must still be alive (waiting) and must
+    have resolved no entry of its own. A search that finished, or built for itself, is the
+    defect -- or a single-flight that does not hold (``_BUILD_WAIT_SLICES = 0``, or no wait).
     """
     math = GatingMath()
     database, registry = _open(tmp_path / "db", math)
     outcomes: dict[str, object] = {}
+    idents: dict[str, int] = {}
     try:
         _populate(database, ROWS)
-        first = threading.Thread(
-            target=_search_into, args=(database, outcomes, "first")
-        )
+        resolves = _count_resolves(database.vectors.index("s"))
+
+        def search_as(name: str) -> None:
+            idents[name] = threading.get_ident()
+            _search_into(database, outcomes, name)
+
+        first = threading.Thread(target=search_as, args=("first",))
         first.start()
         assert math.parked.wait(PATIENCE), (
             "the first search never reached the parked score"
         )
-        second = threading.Thread(
-            target=_search_into, args=(database, outcomes, "second")
-        )
+        second = threading.Thread(target=search_as, args=("second",))
         second.start()
         second.join(1.0)
+        assert second.is_alive(), (
+            f"the second search finished while the build was still parked: {outcomes}"
+        )
+        assert resolves[idents["second"]] == 0, "the second search built for itself"
         math.release()
         _finish(first, second)
+        assert resolves[idents["second"]] == 0, "the second search built after waiting"
     finally:
         math.release()
         database.close()
         release_ports(registry)
-    assert outcomes["first"] == (ROWS, "approximate")
-    assert outcomes["second"] == (ROWS, "approximate"), outcomes
+    assert outcomes["first"] == (ROWS, "approximate", ALL_IDS)
+    assert outcomes["second"] == (ROWS, "approximate", ALL_IDS), outcomes
 
 
 def test_a_builder_failing_after_another_published_does_not_erase_the_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The second P0.5 interleaving: builder A fails AFTER builder B published a complete picture.
+    """The second P0.5 interleaving: builder A fails AFTER builder B published a complete snapshot.
 
     Post-fix a search that meets a build in flight waits behind it, so holding TWO builders at
     once takes shrinking that patience: the names do not exist pre-fix (``raising=False``), and
     pre-fix the second search does not wait at all, which is the first defect. Then the parked
-    builder is made to fail on its next resolve, and what must survive is B's picture: the
-    failure drops A's locals and nothing else, and a third search answers from B's picture
+    builder is made to fail on its next resolve, and what must survive is B's snapshot: the
+    failure drops A's locals and nothing else, and a third search answers from B's snapshot
     without rebuilding.
     """
     from okto_grafx.engine import vector_engine as engine_module
@@ -265,8 +324,8 @@ def test_a_builder_failing_after_another_published_does_not_erase_the_success(
         )
         second.start()
         _finish(second)
-        assert outcomes["second"] == (ROWS, "approximate"), outcomes
-        published = index._snapshot  # noqa: SLF001 - the property: B's complete picture
+        assert outcomes["second"] == (ROWS, "approximate", ALL_IDS), outcomes
+        published = index._snapshot  # noqa: SLF001 - the property: B's complete snapshot
         assert published is not None
 
         math.release()
@@ -274,7 +333,7 @@ def test_a_builder_failing_after_another_published_does_not_erase_the_success(
         assert outcomes["first"] == ("ERROR", "GrafxIndexError"), outcomes
         assert index._snapshot is published  # noqa: SLF001 - A's failure erased nothing
         index._resolve = resolved  # type: ignore[assignment]  # noqa: SLF001
-        assert _search(database) == (ROWS, "approximate")
+        assert _search(database) == (ROWS, "approximate", ALL_IDS)
         assert index._snapshot is published  # noqa: SLF001 - and nothing was rebuilt
     finally:
         math.release()
@@ -282,17 +341,18 @@ def test_a_builder_failing_after_another_published_does_not_erase_the_success(
         release_ports(registry)
 
 
-def test_a_commit_landing_during_the_build_is_not_certified_into_a_picture_that_lacks_it(
+def test_a_commit_landing_during_the_build_is_not_certified_into_a_snapshot_that_lacks_it(
     tmp_path: Path,
 ) -> None:
     """The third P0.5 interleaving: a commit lands while the cold build is parked.
 
     The build was started over seven rows; the eighth is committed while it is parked. Nothing
-    is published for that commit to note into, so the picture the build publishes lacks the
-    row -- which is fine for the search that built it (the row's commit is above its snapshot)
-    and must NOT be fine for the next one: the picture carries the header reading from BEFORE
-    the walk, the next search finds it behind and rebuilds. A build that stamped the header at
-    the end would certify the seven-row picture as current and answer seven for ever.
+    is published for that commit to note into, so the snapshot the build publishes lacks the
+    row -- which is fine for the search that built it (the row's commit is above its
+    transaction's snapshot) and must NOT be fine for the next one: the snapshot carries the
+    header reading from BEFORE the walk, the next search finds it behind and rebuilds. A build
+    that stamped the header at the end would certify the seven-row snapshot as current and
+    answer seven for ever.
     """
     math = GatingMath()
     database, registry = _open(tmp_path / "db", math)
@@ -310,9 +370,42 @@ def test_a_commit_landing_during_the_build_is_not_certified_into_a_picture_that_
             _insert(txn, ROWS)
         math.release()
         _finish(first)
-        assert outcomes["first"] == (ROWS - 1, "approximate"), outcomes
-        assert _search(database) == (ROWS, "approximate")
+        assert outcomes["first"] == (ROWS - 1, "approximate", ALL_IDS[:-1]), outcomes
+        assert _search(database) == (ROWS, "approximate", ALL_IDS)
     finally:
         math.release()
         database.close()
         release_ports(registry)
+
+
+def test_a_build_that_calls_back_into_its_own_index_does_not_wait_on_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The M0A cross-review's self-wait, through the public door.
+
+    The build scores through the VectorMath port, and the port is host code: here it calls
+    ``search()`` on the same space once, from inside the cold build. Before the fix the inner
+    search found the build in flight and waited for it -- for itself -- until the patience ran
+    out (sixty seconds under the defaults). The patience is shortened here so the pre-fix run
+    ends inside the test, at two seconds; the inner search must finish well inside that, and
+    both searches must answer every row.
+    """
+    from okto_grafx.engine import vector_engine as engine_module
+
+    monkeypatch.setattr(engine_module, "_BUILD_WAIT_SECONDS", 0.5, raising=False)
+    monkeypatch.setattr(engine_module, "_BUILD_WAIT_SLICES", 4, raising=False)
+    math = ReentrantMath()
+    database, registry = _open(tmp_path / "db", math)
+    try:
+        _populate(database, ROWS)
+        math.database = database
+        outer = _search(database)
+    finally:
+        database.close()
+        release_ports(registry)
+    assert math.inner is not None, "the port never called back into the index"
+    assert math.inner == (ROWS, "approximate", ALL_IDS)
+    assert outer == (ROWS, "approximate", ALL_IDS)
+    assert math.inner_seconds < 1.0, (
+        f"the re-entrant search took {math.inner_seconds:.2f}s: it waited on its own build"
+    )

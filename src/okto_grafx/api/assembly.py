@@ -72,6 +72,7 @@ from okto_grafx.engine.index_manager import (
 from okto_grafx.engine.ledger_store import LedgerStore
 from okto_grafx.engine.metrics_catalog import register_catalog
 from okto_grafx.engine.quarantine import QuarantineStore
+from okto_grafx.adapters.graph_guard import ConditionGuard
 from okto_grafx.engine.recovery_manager import RecoveryManager
 from okto_grafx.engine.query_engine import QueryEngine
 from okto_grafx.engine.txn_manager import TransactionManager
@@ -284,11 +285,12 @@ def assemble_database(
             indexes=indexes,
             exact_scan_threshold=config.vector_exact_scan_threshold,
             # P0.5: the derived HNSW graph of every vector index is published under this
-            # condition -- one complete picture per reference assignment, one build in flight
-            # per index. Mechanism, so it is handed in here like the pool's guard above rather
-            # than imported by the engine (the pure core imports none). A Condition and not a
-            # bare lock because a search that arrives mid-build waits on it for the build.
-            guard=threading.Condition(),
+            # guard -- one complete picture per reference assignment, one build in flight per
+            # index. Mechanism, so it is handed in here like the pool's guard above rather than
+            # imported by the engine (the pure core imports none). A condition and not a bare
+            # lock because a search that arrives mid-build waits on it for the build; and one
+            # that knows the calling thread, so the builder's own re-entrant call never waits.
+            guard=ConditionGuard(),
         )
         queries = QueryEngine(
             catalog=catalog,
