@@ -650,7 +650,7 @@ class Verifier:
                         )
                     )
                 continue
-            _slot, extent = entries[0]
+            slot, extent = entries[0]
             highest = physical_maxima.get(table_id)
             if highest is None or extent.next_record_id > highest:
                 continue
@@ -790,16 +790,15 @@ class Verifier:
             ]
         claimed = set(owners.get(table.table_id, ()))
         for orphan in sorted(claimed - set(chain)):
-            findings.append(
-                VerificationFinding(
-                    kind=FindingKind.ORPHAN_PAGE,
-                    location=FindingLocation(file=heap_file, page=orphan),
-                    detail=(
-                        f"This page carries the descriptor of table {table.name!r} and is not "
-                        "reachable from the chain that table's directory entry starts, so every "
-                        "record on it is invisible to a scan."
-                    ),
-                )
+            self._report_page(
+                findings,
+                reported,
+                heap_file,
+                orphan,
+                FindingKind.ORPHAN_PAGE,
+                f"This page carries the descriptor of table {table.name!r} and is not "
+                "reachable from the chain that table's directory entry starts, so every "
+                "record on it is invisible to a scan.",
             )
         findings.extend(self._verify_extent(table, heap_file, chain))
         checked, found = self._verify_versions(table, heap_file, chain, reported)

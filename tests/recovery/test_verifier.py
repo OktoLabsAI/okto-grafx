@@ -138,6 +138,25 @@ def _append_device_extent(stack: Stack, extent: TableExtent) -> int:
     return slot
 
 
+def _free_device_extent(stack: Stack, table: TableDef) -> int:
+    """Free one checksum-valid heap directory slot and return its physical location."""
+    stack.pool.flush()
+    raw = stack.storage.read_page(HEAP_FILE, 0)  # type: ignore[attr-defined]
+    page = stack.codec.decode_page(raw, verify=True)
+    changed = -1
+    for slot, payload in page.iter_slots():
+        if slot >= EXTENT_FIRST_SLOT and TableExtent.decode(payload).table_id == table.table_id:
+            page.free_slot(slot)
+            changed = slot
+            break
+    assert changed >= EXTENT_FIRST_SLOT, "the table has no physical directory entry"
+    stack.storage.write_page(  # type: ignore[attr-defined]
+        HEAP_FILE, 0, stack.codec.encode_page(page)
+    )
+    stack.pool.invalidate()
+    return changed
+
+
 def _rewrite_first_record_header(stack: Stack, table: TableDef, **changes: int) -> None:
     """Rewrite one reachable header while preserving its payload and a valid page checksum."""
     reference = next(iter(stack.heap.scan_all(table)))[0]
@@ -317,6 +336,36 @@ def test_the_same_lower_durable_counter_is_found_after_the_pool_is_invalidated(
     assert len(report.findings_of(FindingKind.RECORD_ID_COUNTER)) == 1
 
 
+def test_a_counter_finding_uses_its_own_extent_slot_in_a_multi_table_directory(
+    stack: Stack,
+) -> None:
+    first = _populate(stack)
+    second = replace(_table(), table_id=2, name="Company")
+    stack.catalog.catalog.add_table(second)
+    stack.catalog.save()
+    stack.heap.insert(second, 1, (1, "second-row"), xmin=4)
+    stack.pool.flush()
+    violated_slot = _rewrite_device_counter(stack, first, 2, invalidate=True)
+
+    raw = stack.storage.read_page(HEAP_FILE, 0)  # type: ignore[attr-defined]
+    page = stack.codec.decode_page(raw, verify=True)
+    extent_slots = {
+        TableExtent.decode(payload).table_id: slot
+        for slot, payload in page.iter_slots()
+        if slot >= EXTENT_FIRST_SLOT
+    }
+    assert extent_slots == {first.table_id: 1, second.table_id: 2}
+    assert violated_slot == 1
+
+    report = stack.verifier().verify(SCOPE_RECORDS)
+
+    found = report.findings_of(FindingKind.RECORD_ID_COUNTER)
+    assert len(found) == 1
+    assert found[0].location == FindingLocation(file=HEAP_FILE, page=0, slot=1)
+    assert "table 1" in found[0].detail
+    assert "next_record_id 2" in found[0].detail and "id 3" in found[0].detail
+
+
 @pytest.mark.parametrize(
     ("xmin", "xmax"),
     (
@@ -474,6 +523,21 @@ def test_an_exact_descriptor_without_a_directory_owner_is_a_located_orphan(
     ) == ()
     assert report.findings_of(FindingKind.RECORD_ID_COUNTER) == ()
     assert report.records_checked == 3
+    assert report.clean is False
+
+
+@pytest.mark.parametrize("scope", (SCOPE_RECORDS, SCOPE_ALL))
+def test_a_freed_extent_reports_each_physical_orphan_page_only_once(
+    stack: Stack, scope: str
+) -> None:
+    table = _populate(stack)
+    physical_page = stack.heap.pages_of(table)[0]
+    assert _free_device_extent(stack, table) == 1
+
+    report = stack.verifier().verify(scope)
+
+    orphans = report.findings_at(FindingKind.ORPHAN_PAGE, HEAP_FILE, physical_page)
+    assert len(orphans) == 1
     assert report.clean is False
 
 
