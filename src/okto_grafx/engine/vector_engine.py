@@ -81,7 +81,11 @@ from okto_grafx.domain.ids import Csn, Lsn, RecordId, RecordRef
 from okto_grafx.domain.index.definition import IndexDefinition
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.records import IndexChange, IndexOperation
-from okto_grafx.domain.index.visibility import IndexVisibility, SnapshotLike, entry_visible
+from okto_grafx.domain.index.visibility import (
+    IndexVisibility,
+    SnapshotLike,
+    entry_visible,
+)
 from okto_grafx.domain.model.record import HeapVersion
 from okto_grafx.domain.model.schema import EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import VectorValue
@@ -118,7 +122,11 @@ from okto_grafx.domain.vector.space import (
 from okto_grafx.domain.wal.record import WalRecord
 from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore
-from okto_grafx.engine.index_manager import IndexManager, ProximityIndex, StagingTransaction
+from okto_grafx.engine.index_manager import (
+    IndexManager,
+    ProximityIndex,
+    StagingTransaction,
+)
 from okto_grafx.engine.metrics_catalog import MetricEmitter, metric
 
 __all__ = [
@@ -323,29 +331,45 @@ def _guarded_admits(
 
 
 class GraphGuard(Protocol):
-    """What the derived graph needs from a lock: a context manager that can also wait and wake.
+    """What the derived graph needs from a lock: a context manager that can wait, wake, and say
+    which thread is asking.
 
-    A ``threading.Condition`` satisfies it, and the composition root hands one in (CF-13: the
+    The composition root hands one in (``adapters.graph_guard.ConditionGuard``; CF-13: the
     mechanism arrives by construction, the engine imports none). It is held across reference
     operations on the published picture only -- never across the walk, the resolver, the pool
     or the ``VectorMath`` port (A91, LESSONS L2) -- and the same guard may be shared by every
     index of one engine: a wake meant for another index costs its waiters one re-check.
+
+    ``thread_token`` is what keeps a build from waiting on itself: host code the build calls
+    through the ``VectorMath`` port may call back into a search on the same index, and that
+    search must be told apart from another thread's.
     """
 
     def __enter__(self) -> object:
         """Take the guard."""
         ...
 
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> object:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> bool | None:
         """Release the guard, whether or not the body raised."""
         ...
 
-    def wait_for(self, predicate: Callable[[], bool], timeout: float | None = None) -> bool:
+    def wait_for(
+        self, predicate: Callable[[], bool], timeout: float | None = None
+    ) -> bool:
         """Release the guard while waiting for the predicate, up to the timeout; return its value."""
         ...
 
     def notify_all(self) -> None:
         """Wake every thread waiting on this guard."""
+        ...
+
+    def thread_token(self) -> int:
+        """Return a token identifying the calling thread for as long as it lives."""
         ...
 
 
@@ -363,10 +387,17 @@ class _UnguardedBuild:
     def __enter__(self) -> object:
         return self
 
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> None:
         return None
 
-    def wait_for(self, predicate: Callable[[], bool], timeout: float | None = None) -> bool:
+    def wait_for(
+        self, predicate: Callable[[], bool], timeout: float | None = None
+    ) -> bool:
         """Answer the predicate at once: with no other thread, there is nothing to wait for."""
         return bool(predicate())
 
@@ -374,9 +405,21 @@ class _UnguardedBuild:
         """Wake nobody: an unguarded composition has no waiters."""
         return None
 
+    def thread_token(self) -> int:
+        """Return the one token of the one thread an unguarded composition has."""
+        return 0
+
 
 _BUILD_WAIT_SECONDS: float = 0.5
 """One slice of waiting behind another thread's build of the same index."""
+
+_BUILD_CATCH_UP_PASSES: int = 3
+"""Passes a cold build spends catching up with commits that landed while it ran.
+
+Each pass walks the store again, takes into the picture what it lacks, and re-reads the header;
+a store that keeps moving is left behind after the last pass, and the mark says so, so the next
+search rebuilds. Bounded, so a commit storm cannot hold a search hostage.
+"""
 
 _BUILD_WAIT_SLICES: int = 120
 """Slices a waiter spends behind another thread's build before it builds for itself.
@@ -391,10 +434,11 @@ behind a build that is slow past reason, or behind an unguarded composition's in
 class _GraphSnapshot:
     """One complete, consistent picture of the index: the graph, its maps and the mark.
 
-    ``mark`` is the ``built_through_lsn`` the header held when the build STARTED, which is the
-    only reading a picture can honestly claim: an entry the store received after it was read is
-    either in the walk (then the picture is ahead of its mark, which costs one rebuild) or not
-    (then the mark says so). The maps are mutated in place by the warm path, under the same
+    ``mark`` is a ``built_through_lsn`` reading taken BEFORE a walk that fed the picture -- at
+    the start of the build, or at the start of a catch-up pass -- which is the only reading a
+    picture can honestly claim: an entry the store received after it was read is either in the
+    walk (then the picture is ahead of its mark, which costs one rebuild) or not (then the mark
+    says so). The maps are mutated in place by the warm path, under the same
     discipline as the graph -- an entry is registered before its node becomes reachable -- and a
     search that captured this picture keeps every part of it for as long as it runs.
     """
@@ -445,6 +489,7 @@ class VectorHnswIndex(ProximityIndex):
         "_guard",
         "_snapshot",
         "_building",
+        "_builder",
     )
 
     def __init__(
@@ -488,7 +533,10 @@ class VectorHnswIndex(ProximityIndex):
         # the guard, captured by ONE read; never edited into a different picture in place.
         self._snapshot: _GraphSnapshot | None = None
         # True while a thread of this process builds a picture; other searches wait behind it.
+        # The builder's thread token is kept beside it, so a call the build itself makes back
+        # into this index (host code behind the VectorMath port) is never made to wait on it.
         self._building: bool = False
+        self._builder: int | None = None
 
     # --- identity ---------------------------------------------------------------------------
 
@@ -626,21 +674,31 @@ class VectorHnswIndex(ProximityIndex):
 
         Freshness is decided against the header's ``built_through_lsn`` read BEFORE the walk
         begins, and the picture carries that reading as its mark. A commit that lands during the
-        build is neither noted into the picture (nothing is published to note into) nor
-        certified by it: its mark stays behind the header and the next search rebuilds. The
-        search that built it answers correctly regardless -- that commit's CSN is above its
-        snapshot, so nothing of it is visible to it.
+        build is not noted into the picture (nothing is published to note into); before the
+        picture is published the build CATCHES UP with it (``_catch_up``): the header is read
+        again and, while it has moved, the picture is built again from a walk taken after that
+        reading. A caller with a fixed snapshot could not see that commit anyway; a caller whose
+        predicate admits it -- ``SnapshotLike`` is structural -- gets it too, as the protocol
+        before this one gave it (the M0A cross-review). If the store still moves past the last
+        pass, the mark stays behind the header and the next search rebuilds: never a
+        certification the build did not verify.
 
         One build at a time per index: a thread that finds a build in flight waits on the guard
         for it, in bounded slices, and takes the published picture when it wakes. Past
         ``_BUILD_WAIT_SLICES`` it builds for itself, which is wasted work and never a wrong
-        answer.
+        answer. The build is OWNED by the thread that started it: only the owner clears the
+        flag and wakes the waiters, and a call the owner itself makes back into this index --
+        host code behind the ``VectorMath`` port calling ``search`` -- builds its own picture
+        at once rather than waiting on the build it is part of (the M0A cross-review's
+        self-wait: sixty seconds of a search waiting for itself).
 
         The header is read OUTSIDE the guard on every turn: reading it pins a page and takes the
         pool's lock, and this process's lock order is pool, then guard, never the reverse.
         Nothing under the guard reaches the pool, the heap, the resolver or the ``VectorMath``
         port (A91, LESSONS L2).
         """
+        token = self._guard.thread_token()
+        owner = False
         waited = 0
         while True:
             header = self.built_through_lsn
@@ -655,6 +713,13 @@ class VectorHnswIndex(ProximityIndex):
                     self._snapshot = None
                 if not self._building:
                     self._building = True
+                    self._builder = token
+                    owner = True
+                    break
+                if self._builder == token:
+                    # The build in flight is THIS thread's: host code it called through the
+                    # VectorMath port came back in through search(). Waiting would be waiting
+                    # on ourselves; build a picture for this call and leave the outer build be.
                     break
                 finished = self._guard.wait_for(
                     lambda: not self._building, timeout=_BUILD_WAIT_SECONDS
@@ -663,16 +728,15 @@ class VectorHnswIndex(ProximityIndex):
                 if not finished and waited >= _BUILD_WAIT_SLICES:
                     break
         try:
-            built = self._build(header)
+            built = self._catch_up(self._build(header))
         except BaseException:
             # A build that does not finish leaves NOTHING behind -- and takes nothing away. Its
             # locals go with this frame; the published picture, which may be another thread's
             # complete build, is not touched. The two early refusals inside the build (the
             # resolver failing, a dimension mismatch) used to re-raise with a partial graph
             # published, and every later search answered out of the fragment (C9 round-2 B3).
-            with self._guard:
-                self._building = False
-                self._guard.notify_all()
+            if owner:
+                self._release_build()
             raise
         with self._guard:
             current = self._snapshot
@@ -683,9 +747,44 @@ class VectorHnswIndex(ProximityIndex):
                 # the duplicate-build case. Both are complete; the published one is kept, and
                 # this search answers from it rather than from a picture nobody else can see.
                 built = current
-            self._building = False
-            self._guard.notify_all()
+            if owner:
+                self._building = False
+                self._builder = None
+                self._guard.notify_all()
         return built
+
+    def _catch_up(self, picture: _GraphSnapshot) -> _GraphSnapshot:
+        """Replace a not-yet-published picture that the store moved under with a fresh build.
+
+        The walk that fed the build is a moment in the past. A commit that landed after it is in
+        the store and not in the picture, and nothing noted it there, because a picture under
+        construction is not published. A caller whose snapshot is fixed cannot see that commit
+        -- but ``SnapshotLike`` is taken by shape (A19), a predicate that admits it is a
+        supported caller, and the protocol before this one answered it whole (it noted commits
+        into the partial graph it had already published). So: read the header again and, while
+        it has moved past the mark, build the picture AGAIN from a walk taken after that reading.
+
+        Rebuilt, not patched. A pass that only offered the new walk to the old picture took in
+        what landed -- and kept what LEFT: an entry tombstoned and then reconciled away while
+        the build was parked is absent from the walk, so the old picture's copy of it stayed
+        live, with no ending stamp, and the published snapshot answered a deleted row as current
+        (M0A verification, Codex). A build over the new walk holds exactly what the store holds.
+        Bounded: past the last pass the mark stays behind the header and the next search
+        rebuilds; never a certification the build did not verify.
+        """
+        for _pass in range(_BUILD_CATCH_UP_PASSES):
+            header = self.built_through_lsn
+            if header == picture.mark:
+                return picture
+            picture = self._build(header)
+        return picture
+
+    def _release_build(self) -> None:
+        """Give the build up as its owner: clear the flag and wake whoever waited for it."""
+        with self._guard:
+            self._building = False
+            self._builder = None
+            self._guard.notify_all()
 
     def _build(self, mark: Lsn) -> _GraphSnapshot:
         """Build a complete picture in locals over the entries the store holds, marked at ``mark``.
@@ -708,7 +807,9 @@ class VectorHnswIndex(ProximityIndex):
             record_of_node={},
             mark=mark,
         )
-        for entry in sorted(self.walk(), key=lambda item: (item.born_csn, item.ref.encode())):
+        for entry in sorted(
+            self.walk(), key=lambda item: (item.born_csn, item.ref.encode())
+        ):
             self._install(picture, entry)
         return picture
 
@@ -749,7 +850,9 @@ class VectorHnswIndex(ProximityIndex):
             return
         self._install_fresh(picture, entry, encoded)
 
-    def _install_fresh(self, picture: _GraphSnapshot, entry: IndexEntry, encoded: int) -> None:
+    def _install_fresh(
+        self, picture: _GraphSnapshot, entry: IndexEntry, encoded: int
+    ) -> None:
         """Resolve, check and insert one entry that the picture does not hold yet."""
         try:
             resolved = self._resolve(entry.ref)
@@ -828,7 +931,9 @@ class VectorHnswIndex(ProximityIndex):
         if node is None:
             return True
         if change.operation is IndexOperation.TOMBSTONE:
-            picture.entry_of_node[node] = picture.entry_of_node[node].ended_at(change.csn)
+            picture.entry_of_node[node] = picture.entry_of_node[node].ended_at(
+                change.csn
+            )
             return True
         # A removal mutates the graph's neighbour lists and unlinks a node; done in place under
         # a traversal on another thread, that traversal can step onto a node that is no longer
@@ -910,6 +1015,15 @@ class VectorHnswIndex(ProximityIndex):
 
         A stale index refuses here rather than answering: an omission looks exactly like an empty
         neighbourhood, and this is the door where that would be invisible.
+
+        THE CONTRACT ON ``snapshot``. A transaction's fixed view (amendment A19: the predicate
+        belongs to the transaction manager) sees exactly what it is entitled to: the picture is
+        complete for every position the build verified, and a commit above the view's position
+        is invisible to it anyway. ``SnapshotLike`` is taken by shape, so any predicate is a
+        caller; what one that admits later commits is promised is linearization, not
+        "everything at return": the picture answered from was certified for a header position
+        the build verified (commits landing during the build are caught up, in bounded passes),
+        a commit past the last pass leaves the mark behind, and the NEXT search takes it.
         """
         predicate = _require_snapshot(snapshot)
         self.require_readable()
@@ -1002,7 +1116,9 @@ class VectorEngine:
         :class:`GraphGuard`). The composition root hands in a ``threading.Condition``; a
         composition that hands in none gets indexes fit for a single thread.
         """
-        if isinstance(exact_scan_threshold, bool) or not isinstance(exact_scan_threshold, int):
+        if isinstance(exact_scan_threshold, bool) or not isinstance(
+            exact_scan_threshold, int
+        ):
             raise GrafxConfigurationError(
                 f"The exact scan threshold must be an integer; got "
                 f"{type(exact_scan_threshold).__name__}.",
@@ -1066,7 +1182,11 @@ class VectorEngine:
             )
         self._catalog.catalog.add_space(definition)
         self._catalog.save()
-        self._emit("vector.space_created", space=definition.name, dimension=definition.dimension)
+        self._emit(
+            "vector.space_created",
+            space=definition.name,
+            dimension=definition.dimension,
+        )
 
     def retire_space(self, name: str) -> None:
         """Close the write door of one embedding space, leaving it readable forever (FR-3)."""
@@ -1205,7 +1325,9 @@ class VectorEngine:
         def resolve(ref: RecordRef) -> tuple[RecordId, Sequence[float]]:
             """Return the record and the components of the version at a heap location."""
             version = self._heap.read(ref)
-            return version.record_id, self._vector_of_version(space, version, ref).values
+            return version.record_id, self._vector_of_version(
+                space, version, ref
+            ).values
 
         return resolve
 
@@ -1413,7 +1535,9 @@ class VectorEngine:
             candidates.append((version.record_id, stored.values))
         self._observe_phase(REGIME_EXACT, PHASE_TRAVERSE, started)
         started = self._reading()
-        ranked = self._math.top_k(query, candidates, k, space.metric) if candidates else []
+        ranked = (
+            self._math.top_k(query, candidates, k, space.metric) if candidates else []
+        )
         retired = not space.is_active
         hits = tuple(
             VectorHit(
@@ -1543,7 +1667,9 @@ class VectorEngine:
         if elapsed < 0.0:
             elapsed = 0.0
         self._publish(
-            lambda: self._metrics.observe(_LATENCY, elapsed, {"regime": regime, "phase": phase})
+            lambda: self._metrics.observe(
+                _LATENCY, elapsed, {"regime": regime, "phase": phase}
+            )
         )
 
     def _publish_search_metrics(self, plan: RegimePlan, achieved: int) -> None:
