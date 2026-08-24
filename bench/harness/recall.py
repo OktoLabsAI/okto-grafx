@@ -17,6 +17,7 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from bench.harness.recall_worker import (
     DIFFERENTIAL_SLICE,
     DTYPE_MEAN_OVERLAP_MIN,
     DTYPE_PER_QUERY_OVERLAP_MIN,
+    GENERATOR_NAME,
     HNSW_FROZEN,
     PROFILES,
     QUERY_SEED,
@@ -71,8 +73,8 @@ def _describe(value: object) -> str:
     """
     try:
         text = repr(value)
-    except (ValueError, OverflowError):
-        return f"<{type(value).__name__} too large to print>"
+    except Exception:  # noqa: BLE001 -- a hostile __repr__ may raise anything ordinary
+        return f"<{type(value).__name__} whose repr raises>"
     return text if len(text) <= 80 else text[:77] + "..."
 
 
@@ -117,7 +119,16 @@ def run_recall(
         )
     timeout_seconds = as_float
     scratch.mkdir(parents=True, exist_ok=True)
-    verdict_path = scratch / f"recall-{profile}.json"
+    # Reaudit HIGH-2: a DETERMINISTIC verdict path let a worker that exited 0 without
+    # writing hand back a PREVIOUS run's file as this run's result. Every run now gets a
+    # unique fresh file (mkstemp; the handle closes at once so the Windows child can open
+    # it), an empty fresh file is a typed refusal -- absence is never acceptance -- and
+    # the cleanup in the finally below is outcome-neutral.
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f"recall-{profile}-", suffix=".json", dir=str(scratch)
+    )
+    os.close(descriptor)
+    verdict_path = Path(temp_name)
     environment = dict(os.environ)
     for name in _BLAS_THREAD_VARIABLES:
         environment[name] = "1"
@@ -134,26 +145,52 @@ def run_recall(
     ]
     started = time.monotonic()
     try:
-        completed = subprocess.run(
-            command,
-            env=environment,
-            timeout=timeout_seconds,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as failure:
-        raise RecallStageError(
-            f"the recall worker exceeded {timeout_seconds:g}s on profile {profile!r}; "
-            "nothing was published."
-        ) from failure
-    duration = time.monotonic() - started
-    if not verdict_path.exists():
-        raise RecallStageError(
-            f"the recall worker wrote no verdict (exit {completed.returncode}); "
-            f"stdout: {completed.stdout[-400:]!r} stderr: {completed.stderr[-400:]!r}"
-        )
-    verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+        try:
+            completed = subprocess.run(
+                command,
+                env=environment,
+                timeout=timeout_seconds,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as failure:
+            raise RecallStageError(
+                f"the recall worker exceeded {timeout_seconds:g}s on profile "
+                f"{profile!r}; nothing was published."
+            ) from failure
+        duration = time.monotonic() - started
+        try:
+            raw = verdict_path.read_text(encoding="utf-8")
+        except OSError as failure:
+            raise RecallStageError(
+                f"the recall worker left no readable verdict "
+                f"(exit {completed.returncode}); stdout: {completed.stdout[-400:]!r} "
+                f"stderr: {completed.stderr[-400:]!r}"
+            ) from failure
+        if not raw.strip():
+            raise RecallStageError(
+                "the recall worker wrote nothing into its fresh per-run file "
+                f"(exit {completed.returncode}); a stale file can never be mistaken "
+                f"for this run's result. stdout: {completed.stdout[-400:]!r} "
+                f"stderr: {completed.stderr[-400:]!r}"
+            )
+        try:
+            verdict = json.loads(raw)
+        except (ValueError, RecursionError) as failure:
+            raise RecallStageError(
+                f"the recall worker's verdict is not readable JSON "
+                f"(exit {completed.returncode}): {failure}"
+            ) from failure
+        if not isinstance(verdict, dict):
+            raise RecallStageError(
+                "the recall worker's verdict is not a JSON object; refusing it."
+            )
+    finally:
+        try:
+            verdict_path.unlink()
+        except OSError:
+            pass
     verdict["duration_seconds"] = duration
     verdict["exit_code"] = completed.returncode
     if completed.returncode != 0 or not verdict.get("ok", False):
@@ -162,6 +199,133 @@ def run_recall(
             f"{verdict.get('failure', f'worker exit {completed.returncode}')}"
         )
     return verdict
+
+
+def _validate_verdict(verdict: dict[str, object], profile_name: str) -> str | None:
+    """The reason this verdict cannot be published, or None when it is fully coherent.
+
+    Reaudit HIGH-1: the wiring validated only the gauge, so an adulterated verdict --
+    gauge 0.99 beside observed 0.01, a foreign hnsw block -- was published while
+    ``build_section`` stamped the FROZEN constants over whatever the verdict claimed.
+    Everything the section will freeze or the gate will read is therefore checked against
+    the declared contract here, and a contradiction is REFUSED, never normalized.
+    """
+    profile = PROFILES.get(profile_name)
+    if profile is None:
+        return f"unknown profile {profile_name!r}"
+    if verdict.get("ok") is not True:
+        return "ok is not True"
+    if verdict.get("profile") != profile_name:
+        return f"profile {_describe(verdict.get('profile'))} is not {profile_name!r}"
+    if verdict.get("generator") != GENERATOR_NAME:
+        return (
+            f"generator {_describe(verdict.get('generator'))} is not {GENERATOR_NAME!r}"
+        )
+    gt_path = verdict.get("gt_path_used")
+    oracle = verdict.get("oracle")
+    if gt_path not in ("numpy", "pure"):
+        return f"gt_path_used {_describe(gt_path)} is neither 'numpy' nor 'pure'"
+    if gt_path == "numpy":
+        if not profile.oracle.startswith("numpy"):
+            return "a pure-oracle profile cannot claim the numpy GT path"
+        if oracle != profile.oracle:
+            return (
+                f"oracle {_describe(oracle)} does not match the profile's declaration"
+            )
+    if gt_path == "pure":
+        if profile.oracle.startswith("numpy"):
+            return "a numpy-oracle profile cannot have taken the pure GT path"
+        if oracle != "pure-fsum":
+            return f"oracle {_describe(oracle)} does not match the pure GT path"
+    for field, expected in (
+        ("k", profile.k),
+        ("queries", profile.queries),
+        ("corpus_size", profile.corpus_size),
+        ("dimension", profile.dimension),
+    ):
+        value = verdict.get(field)
+        if isinstance(value, bool) or value != expected:
+            return f"{field} {_describe(value)} is not the profile's {expected}"
+    hashes = verdict.get("hashes")
+    declared_hashes = {
+        "corpus_sha256_f64",
+        "corpus_sha256_f32",
+        "query_sha256_f64",
+        "query_sha256_f32",
+    }
+    if not isinstance(hashes, dict) or set(hashes) != declared_hashes:
+        return "hashes are not exactly the four declared digests"
+    for key, digest in hashes.items():
+        if not (
+            isinstance(digest, str)
+            and len(digest) == 64
+            and all(ch in "0123456789abcdef" for ch in digest)
+        ):
+            return f"{key} is not a 64-character lowercase hex digest"
+    if verdict.get("hnsw") != dict(HNSW_FROZEN):
+        return "hnsw does not equal the frozen construction parameters"
+    observed = verdict.get("observed")
+    declared_observed = {
+        "mean_recall_at_k",
+        "min_recall_at_k",
+        "queries_below_perfect",
+        "dtype_check",
+    }
+    if not isinstance(observed, dict) or set(observed) != declared_observed:
+        return "observed is not exactly its declared keys"
+    mean = observed["mean_recall_at_k"]
+    minimum = observed["min_recall_at_k"]
+    for label, value in (("mean_recall_at_k", mean), ("min_recall_at_k", minimum)):
+        if (
+            isinstance(value, bool)
+            or type(value) is not float
+            or not math.isfinite(value)
+        ):
+            return f"observed.{label} {_describe(value)} is not a finite float"
+        if not 0.0 <= value <= 1.0:
+            return f"observed.{label} {_describe(value)} is outside [0, 1]"
+    if minimum > mean:
+        return "observed.min_recall_at_k exceeds the mean"
+    below = observed["queries_below_perfect"]
+    if (
+        isinstance(below, bool)
+        or type(below) is not int
+        or not 0 <= below <= profile.queries
+    ):
+        return (
+            f"observed.queries_below_perfect {_describe(below)} is not an int "
+            "within the query count"
+        )
+    if (below == 0) != (minimum >= 1.0):
+        return "queries_below_perfect and min_recall_at_k contradict each other"
+    dtype = observed["dtype_check"]
+    if not isinstance(dtype, dict) or set(dtype) != {"mean_overlap", "min_overlap"}:
+        return "dtype_check is not exactly its declared keys"
+    mean_overlap = dtype["mean_overlap"]
+    min_overlap = dtype["min_overlap"]
+    for label, value, floor in (
+        ("mean_overlap", mean_overlap, DTYPE_MEAN_OVERLAP_MIN),
+        ("min_overlap", min_overlap, DTYPE_PER_QUERY_OVERLAP_MIN),
+    ):
+        if (
+            isinstance(value, bool)
+            or type(value) is not float
+            or not math.isfinite(value)
+        ):
+            return f"dtype_check.{label} {_describe(value)} is not a finite float"
+        if not floor <= value <= 1.0:
+            return f"dtype_check.{label} {_describe(value)} is outside [{floor}, 1]"
+    if min_overlap > mean_overlap:
+        return "dtype_check.min_overlap exceeds the mean overlap"
+    gauge = verdict.get("gauge")
+    if isinstance(gauge, bool) or type(gauge) is not float or gauge != mean:
+        return "gauge does not EXACTLY equal observed.mean_recall_at_k"
+    blas = verdict.get("blas_environment")
+    if not isinstance(blas, dict) or any(
+        blas.get(name) != "1" for name in _BLAS_THREAD_VARIABLES
+    ):
+        return "blas_environment does not pin every thread variable to '1'"
+    return None
 
 
 def build_section(

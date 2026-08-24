@@ -17,7 +17,6 @@ Any recall failure returns non-zero with the legacy outputs already intact on di
 from __future__ import annotations
 
 import json
-import math
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -25,6 +24,7 @@ from pathlib import Path
 from bench.harness.recall import (
     RECALL_METRIC,
     RecallStageError,
+    _validate_verdict,
     build_section,
     run_recall,
 )
@@ -137,7 +137,7 @@ def append_vector_recall(
             continue
         try:
             document = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as failure:
+        except (OSError, ValueError, RecursionError) as failure:
             print(
                 f"vector recall stage: REFUSED -- {label} {path} is not a readable JSON "
                 f"document ({failure}); nothing was run and nothing was written."
@@ -178,29 +178,21 @@ def append_vector_recall(
         # BaseException: KeyboardInterrupt and SystemExit still propagate.
         print(f"vector recall: stage failed before publication -- {failure}")
         return 3
-    # The verdict's gauge is validated BEFORE any publication: an exact non-bool number,
-    # convertible without OverflowError (a huge integer raises inside float() itself),
-    # finite, in [0, 1]. A worker that emitted anything else did not measure a ratio, and
-    # normalizing junk into the metrics document would hand the gate a lie -- so nothing
-    # vectorial is written and the stage exits 3 typed, with out/metrics exactly as the
-    # strip left them. The value is deliberately NOT interpolated into the message: a
-    # huge integer's repr can itself raise past CPython's digit limit.
-    gauge = verdict.get("gauge") if isinstance(verdict, dict) else None
-    gauge_valid = not isinstance(gauge, bool) and type(gauge) in (int, float)
-    gauge_value = 0.0
-    if gauge_valid:
-        try:
-            gauge_value = float(gauge)  # type: ignore[arg-type]
-        except OverflowError:
-            gauge_valid = False
-        else:
-            gauge_valid = math.isfinite(gauge_value) and 0.0 <= gauge_value <= 1.0
-    if not gauge_valid:
-        print(
-            "vector recall: FAIL-CLOSED -- the worker verdict's gauge is not a finite "
-            "ratio in [0, 1]; nothing vectorial was published."
-        )
+    # Reaudit HIGH-1: the WHOLE verdict is validated before the first append -- an
+    # adulterated verdict (gauge 0.99 beside observed 0.01, NaN inside observed, a
+    # foreign hnsw block) was published with exit 0 while build_section stamped the
+    # frozen constants over it. Contradictions are refused, never normalized; the
+    # documents stay exactly as the strip left them, and junk is only ever printed
+    # through the guarded describer inside the validator.
+    reason = (
+        _validate_verdict(verdict, profile)
+        if isinstance(verdict, dict)
+        else "the verdict is not an object"
+    )
+    if reason is not None:
+        print(f"vector recall: FAIL-CLOSED -- incoherent verdict: {reason}")
         return 3
+    gauge_value = float(verdict["gauge"])  # validated: exact float == observed mean
     try:
         section = build_section(verdict)
         if out is not None:

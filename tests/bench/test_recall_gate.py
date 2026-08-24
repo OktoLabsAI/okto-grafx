@@ -323,6 +323,39 @@ def test_check_called_directly_with_an_invalid_target_is_unmeasured(
     assert result.status == STATUS_UNMEASURED
 
 
+def test_a_deeply_nested_document_is_unmeasured_not_a_recursion_error(
+    tmp_path: Path,
+) -> None:
+    """MEDIUM-3: json.loads overflows the parser's recursion at ~5000 levels, and
+    'never raises' includes that shape -- library check() and the CLI both."""
+    from bench.harness.gate import STATUS_UNMEASURED, check
+
+    deep = "[" * 5000 + "]" * 5000
+    assert check(deep).status == STATUS_UNMEASURED
+    document = tmp_path / "metrics.json"
+    document.write_text(deep, encoding="utf-8")
+    assert main(["--metrics", str(document)]) == 2
+
+
+class _EvilRepr:
+    """An object whose repr raises -- the hostile shape MEDIUM-4 names."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError("hostile repr")
+
+
+def test_a_hostile_repr_cannot_escape_check_or_resolve(tmp_path: Path) -> None:
+    """MEDIUM-4: the refusal path formats the offender through the guarded describer,
+    so a repr raising RuntimeError still yields UNMEASURED / the typed ValueError."""
+    from bench.harness.gate import STATUS_UNMEASURED, check
+
+    document = _metrics_document(tmp_path, recall=0.95).read_text(encoding="utf-8")
+    result = check(document, recall_target=_EvilRepr())  # type: ignore[arg-type]
+    assert result.status == STATUS_UNMEASURED
+    with pytest.raises(ValueError, match="finite number"):
+        _resolve_recall_target(_EvilRepr(), None)  # type: ignore[arg-type]
+
+
 def test_a_non_utf8_metrics_file_is_unmeasured_not_a_traceback(tmp_path: Path) -> None:
     """(6): invalid bytes used to escape as ValueError -> exit 1 (false EXCEEDED)."""
     document = tmp_path / "metrics.json"

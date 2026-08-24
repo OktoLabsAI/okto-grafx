@@ -30,6 +30,7 @@ import bench.harness.calibrate as calibrate_module
 import bench.harness.recall_wiring as wiring
 from bench.harness.recall import RECALL_METRIC, RecallStageError
 from bench.harness.recall_wiring import append_vector_recall
+from bench.harness.recall_worker import HNSW_FROZEN, _BLAS_THREAD_VARIABLES
 
 
 def _seed_documents(tmp_path: Path) -> tuple[Path, Path]:
@@ -84,11 +85,13 @@ def _verdict_stub() -> dict[str, object]:
         "observed": {
             "mean_recall_at_k": 0.975,
             "min_recall_at_k": 0.9,
-            "queries_below_perfect": 0,
+            # One query below perfect: coherent with a minimum under 1.0 -- the full
+            # verdict validator refuses a zero count beside an imperfect minimum.
+            "queries_below_perfect": 1,
             "dtype_check": {"mean_overlap": 1.0, "min_overlap": 1.0},
         },
-        "blas_environment": {},
-        "hnsw": {},
+        "blas_environment": {name: "1" for name in _BLAS_THREAD_VARIABLES},
+        "hnsw": dict(HNSW_FROZEN),
         "duration_seconds": 0.5,
         "exit_code": 0,
     }
@@ -555,6 +558,122 @@ def test_an_invalid_worker_gauge_is_refused_before_any_publication(
     assert code == 3
     assert out.read_text(encoding="utf-8") == out_before, "no section may land"
     assert metrics.read_text(encoding="utf-8") == metrics_before, "no gauge may land"
+
+
+def _broken(mutation) -> dict[str, object]:
+    """A coherent verdict with exactly one adulteration applied."""
+    verdict = _verdict_stub()
+    mutation(verdict)
+    return verdict
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda v: v.__setitem__("gauge", 0.99),
+        lambda v: v["observed"].__setitem__("mean_recall_at_k", float("nan")),
+        lambda v: v.__setitem__("hnsw", {}),
+        lambda v: v.__setitem__("corpus_size", 97),
+        lambda v: v["hashes"].__setitem__("corpus_sha256_f64", "short"),
+        lambda v: v["observed"]["dtype_check"].__setitem__("mean_overlap", 0.5),
+        lambda v: v["observed"].__setitem__("queries_below_perfect", 0),
+        lambda v: v.__setitem__("blas_environment", {}),
+        lambda v: v.__setitem__("gt_path_used", "numpy"),
+    ],
+    ids=[
+        "gauge-vs-mean",
+        "nan-observed",
+        "foreign-hnsw",
+        "wrong-corpus",
+        "bad-hash",
+        "dtype-below-floor",
+        "count-contradicts-min",
+        "unpinned-blas",
+        "oracle-gt-mismatch",
+    ],
+)
+def test_an_adulterated_verdict_is_refused_before_any_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation
+) -> None:
+    """Reaudit HIGH-1: gauge 0.99 beside observed 0.01 (and every sibling adulteration)
+    was published with exit 0. Exit 3 typed now, both documents byte-identical."""
+    out, metrics = _seed_documents(tmp_path)
+    out_before = out.read_text(encoding="utf-8")
+    metrics_before = metrics.read_text(encoding="utf-8")
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _broken(mutation))
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    assert out.read_text(encoding="utf-8") == out_before
+    assert metrics.read_text(encoding="utf-8") == metrics_before
+
+
+def test_a_worker_that_writes_nothing_cannot_resurrect_a_stale_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reaudit HIGH-2: a deterministic path let returncode-0-without-writing hand back a
+    PREVIOUS run's file. The fresh per-run file makes absence a typed refusal."""
+    import subprocess as subprocess_module
+
+    from bench.harness.recall import run_recall
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    stale = scratch / "recall-tiny.json"
+    stale_content = json.dumps(_verdict_stub())
+    stale.write_text(stale_content, encoding="utf-8")
+
+    def silent_success(command, **kwargs):
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", silent_success)
+    with pytest.raises(RecallStageError, match="fresh per-run"):
+        run_recall("tiny", scratch=scratch)
+    assert stale.read_text(encoding="utf-8") == stale_content, "never consumed"
+
+
+def test_run_recall_cleans_its_fresh_file_and_returns_the_written_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HIGH-2 happy path: the worker's own write is read back; cleanup is outcome-neutral."""
+    import subprocess as subprocess_module
+
+    from bench.harness.recall import run_recall
+
+    scratch = tmp_path / "scratch"
+
+    def writes_verdict(command, **kwargs):
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.write_text(json.dumps(_verdict_stub()), encoding="utf-8")
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
+    verdict = run_recall("tiny", scratch=scratch)
+    assert verdict["ok"] is True
+    assert verdict["exit_code"] == 0
+    leftovers = [p.name for p in scratch.iterdir() if p.name.startswith("recall-tiny-")]
+    assert leftovers == [], "the fresh per-run file must be cleaned outcome-neutrally"
+
+
+def test_a_deeply_nested_document_is_refused_before_any_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MEDIUM-3: json.loads raises RecursionError on ~5000 nesting levels; the
+    pre-validation refuses it typed, and the worker never spawns."""
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    deep = tmp_path / "calibration.json"
+    deep.write_text("[" * 5000 + "]" * 5000, encoding="utf-8")
+    metrics = tmp_path / "metrics.json"
+    metrics.write_text(json.dumps({"metrics": []}), encoding="utf-8")
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=deep, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    assert not called, "no spawn over an unreadable document"
 
 
 def test_a_malformed_ok_verdict_fails_typed_before_any_append(

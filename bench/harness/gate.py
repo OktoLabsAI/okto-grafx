@@ -78,8 +78,8 @@ def _describe(value: object) -> str:
     """
     try:
         text = repr(value)
-    except (ValueError, OverflowError):
-        return f"<{type(value).__name__} too large to print>"
+    except Exception:  # noqa: BLE001 -- a hostile __repr__ may raise anything ordinary
+        return f"<{type(value).__name__} whose repr raises>"
     return text if len(text) <= 80 else text[:77] + "..."
 
 
@@ -112,7 +112,9 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
     """
     try:
         payload = json.loads(document)
-    except ValueError as error:
+    except (ValueError, RecursionError) as error:
+        # RecursionError: json.loads on thousands of nesting levels overflows the
+        # parser's recursion, and "never raises" has to include that shape too.
         return {}, {}, f"the metrics document is not readable JSON: {error}"
     if not isinstance(payload, Mapping):
         # `[]`, `null` and `3` are all VALID JSON, so the parse above accepts them and only the
@@ -182,7 +184,7 @@ def _recall_measurement(document: str) -> tuple[str, object]:
     """
     try:
         payload = json.loads(document)
-    except ValueError:
+    except (ValueError, RecursionError):
         return ("absent", None)
     if not isinstance(payload, Mapping):
         return ("absent", None)
