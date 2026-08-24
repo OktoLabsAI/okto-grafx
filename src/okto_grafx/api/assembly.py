@@ -42,6 +42,7 @@ import uuid
 from collections.abc import Callable
 from typing import TypeVar, cast
 
+from okto_grafx.adapters.coordination_local import CONTROL_DIRECTORY, LOCK_FILE_SUFFIX
 from okto_grafx.adapters.graph_guard import ConditionGuard
 from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
 from okto_grafx.adapters.storage_read_only import ReadOnlyStorageDevice
@@ -118,6 +119,11 @@ validators that agree today stop agreeing tomorrow.
 
 _FIRST_OPEN_SECTION: str = "first-open"
 """Cross-process section that publishes a fresh database exactly once."""
+
+_FIRST_OPEN_SECTION_LOCK: str = (
+    f"{CONTROL_DIRECTORY}/{_FIRST_OPEN_SECTION}{LOCK_FILE_SUFFIX}"
+)
+"""Existing liveness evidence that lets a default reader wait without claiming a new path."""
 
 _FIRST_OPEN_DIRECTORY: str = "bootstrap"
 """Private namespace for first-open intent and unpublished paged files."""
@@ -810,6 +816,35 @@ def _open_identity(
         return intent
 
 
+def _preflight_default_read_only_storage(
+    config: DatabaseConfig,
+    storage: StorageDevice,
+) -> None:
+    """Refuse an unclaimed default filesystem path before its coordinator creates ``control/``.
+
+    The full and final classification still happens in :func:`_open_identity` while holding
+    ``first-open``. This earlier observation answers only whether the default composition has
+    enough Grafx-owned evidence to construct that lock. Canonical first-open authorities are
+    decoded by the same readers used under the section; isolated staging and an absent identity
+    are refused by the same helpers used by the final classifier.
+
+    An already-existing first-open lock is not database proof. It merely permits construction so
+    a reader that arrived behind a creator can wait on the exact existing lock. Once admitted,
+    the reader still crosses the section and receives the authoritative outcome. Opening that
+    existing file neither creates a namespace entry nor changes its bytes.
+    """
+    if not config.read_only or config.path == MEMORY_PATH:
+        return
+    intent = _read_first_open_intent(storage)
+    complete = _read_first_open_complete(storage)
+    if intent is not None or complete is not None:
+        return
+    if storage.exists(_FIRST_OPEN_SECTION_LOCK):
+        return
+    _require_no_bootstrap_orphan_for_read_only(config, storage)
+    _require_existing_identity_name(config, storage)
+
+
 def _open_completed_identity(
     config: DatabaseConfig,
     storage: StorageDevice,
@@ -1052,24 +1087,7 @@ def _read_existing_identity(
     config: DatabaseConfig, storage: StorageDevice, meta: MetaStore
 ) -> DatabaseIdentity:
     """Read a complete published identity, never interpreting a partial file as absence."""
-    if not storage.exists(META_FILE):
-        evidence = _database_files_without_identity(storage)
-        commit_state = storage.exists(COMMIT_STATE_FILE)
-        if evidence or commit_state:
-            raise GrafxCorruptionDetected(
-                f"The database identity {META_FILE!r} is absent while authoritative files "
-                f"remain: {evidence}. This is damage, not an empty path.",
-                file=META_FILE,
-                field="identity_missing",
-                files=evidence,
-                commit_state=commit_state,
-            )
-        raise GrafxUnsupportedOperation(
-            f"There is no database at {config.path!r} and read_only was requested, so there is "
-            "nothing to open and nothing may be created.",
-            path=config.path,
-            field="read_only",
-        )
+    _require_existing_identity_name(config, storage)
     if not meta.exists():
         raise GrafxCorruptionDetected(
             f"The published identity file {META_FILE!r} exists without its complete page; "
@@ -1081,6 +1099,29 @@ def _read_existing_identity(
     stored = meta.read()
     _require_identity_configuration(config, stored)
     return stored
+
+
+def _require_existing_identity_name(config: DatabaseConfig, storage: StorageDevice) -> None:
+    """Require ``grafx.meta`` or issue the one authoritative absent-identity classification."""
+    if storage.exists(META_FILE):
+        return
+    evidence = _database_files_without_identity(storage)
+    commit_state = storage.exists(COMMIT_STATE_FILE)
+    if evidence or commit_state:
+        raise GrafxCorruptionDetected(
+            f"The database identity {META_FILE!r} is absent while authoritative files remain: "
+            f"{evidence}. This is damage, not an empty path.",
+            file=META_FILE,
+            field="identity_missing",
+            files=evidence,
+            commit_state=commit_state,
+        )
+    raise GrafxUnsupportedOperation(
+        f"There is no database at {config.path!r} and read_only was requested, so there is "
+        "nothing to open and nothing may be created.",
+        path=config.path,
+        field="read_only",
+    )
 
 
 def _database_files_without_identity(storage: StorageDevice) -> tuple[str, ...]:

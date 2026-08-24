@@ -412,6 +412,18 @@ def build_default_registry(config: DatabaseConfig) -> PortRegistry:
             factory = _DEFAULT_PORT_FACTORIES.get(slot)
             if factory is None:
                 continue
+            if slot == "coordinator" and config.read_only and config.path != MEMORY_PATH:
+                # The coordinator constructor creates ``control/`` for its advisory locks. A
+                # default observational open must first prove that the path carries Grafx-owned
+                # evidence; otherwise even the expected "there is no database" refusal would
+                # claim an empty or foreign directory. The assembly owns this classification and
+                # repeats it under first-open, so the bootstrap imports rather than restates it.
+                from okto_grafx.api.assembly import _preflight_default_read_only_storage
+
+                _preflight_default_read_only_storage(
+                    config,
+                    built["storage"],  # type: ignore[arg-type]
+                )
             context = PortContext(
                 config=config,
                 ports=MappingProxyType(dict(built)),

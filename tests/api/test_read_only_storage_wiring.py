@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from types import MappingProxyType
 
 import pytest
 
 from okto_grafx import connect
+from okto_grafx.adapters.coordination_local import LocalProcessCoordinator
 from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.adapters.storage_read_only import ReadOnlyStorageDevice
 from okto_grafx.api import assembly
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
+    GrafxCorruptionDetected,
     GrafxSchemaVersionMismatch,
     GrafxUnsupportedOperation,
 )
@@ -40,6 +45,22 @@ def _data_snapshot(root: Path) -> dict[str, str]:
         name: digest
         for name, digest in _snapshot(root).items()
         if not name.startswith("control/")
+    }
+
+
+def _namespace_snapshot(root: Path) -> dict[str, str]:
+    """Return every directory name and every file digest, including an empty ``control/``."""
+    return {
+        (
+            f"{path.relative_to(root).as_posix()}/"
+            if path.is_dir()
+            else path.relative_to(root).as_posix()
+        ): (
+            "<directory>"
+            if path.is_dir()
+            else hashlib.sha256(path.read_bytes()).hexdigest()
+        )
+        for path in sorted(root.rglob("*"))
     }
 
 
@@ -328,6 +349,187 @@ def test_default_read_only_port_build_failure_preserves_the_primary_failure(
     assert observed[0].pending_deletes()
     assert _snapshot(root) == before
     assert set(pending) <= _snapshot(root).keys()
+
+
+def test_read_only_existing_empty_root_is_refused_before_claiming_control(
+    tmp_path: Path,
+) -> None:
+    """The expected empty-path refusal leaves even directory names byte-for-byte absent."""
+    root = tmp_path / "empty-existing"
+    root.mkdir()
+    before = _namespace_snapshot(root)
+
+    with pytest.raises(GrafxUnsupportedOperation) as raised:
+        connect(root, page_size=PAGE_SIZE, read_only=True)
+
+    assert raised.value.details["field"] == "read_only"
+    assert _namespace_snapshot(root) == before == {}
+
+
+@pytest.mark.parametrize("existing_first_open_lock", [False, True])
+def test_read_only_foreign_tree_is_classified_without_changing_names_or_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_first_open_lock: bool,
+) -> None:
+    """A lock is only permission to wait; foreign evidence still gets the shared classifier."""
+    root = tmp_path / ("foreign-with-lock" if existing_first_open_lock else "foreign")
+    victim = root / "owner" / "payload.bin"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"not an Okto Grafx database")
+    if existing_first_open_lock:
+        lock = root / "control" / "first-open.lock"
+        lock.parent.mkdir()
+        lock.write_bytes(b"foreign lock payload that must survive")
+    before = _namespace_snapshot(root)
+    raw_mutations: list[str] = []
+
+    def forbid_raw_mutation(
+        _device: LocalStorageDevice, *_args: object, **_kwargs: object
+    ) -> None:
+        raw_mutations.append("attempted")
+        raise AssertionError("foreign-tree preflight reached a raw storage mutator")
+
+    for door in (
+        "create",
+        "remove",
+        "atomic_replace",
+        "recycle",
+        "allocate",
+        "write_page",
+        "append_log",
+        "truncate_log",
+        "durable_barrier",
+    ):
+        monkeypatch.setattr(LocalStorageDevice, door, forbid_raw_mutation)
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        connect(root, page_size=PAGE_SIZE, read_only=True)
+
+    assert raised.value.details["field"] == "identity_missing"
+    assert raw_mutations == []
+    assert _namespace_snapshot(root) == before
+
+
+def test_read_only_valid_database_without_control_materializes_only_liveness(
+    tmp_path: Path,
+) -> None:
+    """Published Grafx authority is sufficient to recreate absent liveness, never data bytes."""
+    root = tmp_path / "valid-without-control"
+    with connect(root, page_size=PAGE_SIZE) as writer:
+        identity = writer.identity
+    shutil.rmtree(root / "control")
+    immutable = _data_snapshot(root)
+    assert not (root / "control").exists()
+
+    with connect(root, page_size=PAGE_SIZE, read_only=True) as reader:
+        assert reader.identity == identity
+        assert reader.verify("all").findings == ()
+
+    assert (root / "control").is_dir()
+    assert _data_snapshot(root) == immutable
+
+
+def test_default_read_only_waits_on_existing_first_open_lock_before_classifying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reader arriving before intent publication waits for the creator's exact lock."""
+    root = tmp_path / "concurrent-first-open"
+    writer_holding = threading.Event()
+    allow_writer = threading.Event()
+    reader_attempting = threading.Event()
+    reader_acquired = threading.Event()
+    writer_ready = threading.Event()
+    reader_done = threading.Event()
+    failures: list[BaseException] = []
+    results: dict[str, bytes] = {}
+    original_exclusive = LocalProcessCoordinator.exclusive
+
+    def observed_exclusive(
+        coordinator: LocalProcessCoordinator,
+        name: str,
+        *,
+        timeout: float,
+    ) -> object:
+        section = original_exclusive(coordinator, name, timeout=timeout)
+        if name != assembly._FIRST_OPEN_SECTION:
+            return section
+
+        @contextmanager
+        def observed_section() -> object:
+            is_writer = threading.current_thread().name == "first-open-writer"
+            is_reader = threading.current_thread().name == "first-open-reader"
+            if is_reader:
+                reader_attempting.set()
+            with section:
+                if is_writer:
+                    writer_holding.set()
+                    if not allow_writer.wait(30.0):
+                        raise AssertionError("the first-open writer was not released")
+                elif is_reader:
+                    reader_acquired.set()
+                    if not writer_ready.wait(30.0):
+                        raise AssertionError(
+                            "the writer did not finish database assembly"
+                        )
+                yield
+
+        return observed_section()
+
+    monkeypatch.setattr(LocalProcessCoordinator, "exclusive", observed_exclusive)
+
+    def create_database() -> None:
+        database = None
+        try:
+            database = connect(root, page_size=PAGE_SIZE)
+            results["writer"] = database.identity.database_uuid
+            writer_ready.set()
+            if not reader_done.wait(30.0):
+                raise AssertionError("the read-only participant did not finish")
+        except BaseException as failure:  # noqa: BLE001 - carried to the test thread
+            failures.append(failure)
+            writer_ready.set()
+        finally:
+            if database is not None:
+                database.close()
+
+    def open_reader() -> None:
+        try:
+            with connect(root, page_size=PAGE_SIZE, read_only=True) as database:
+                results["reader"] = database.identity.database_uuid
+        except BaseException as failure:  # noqa: BLE001 - carried to the test thread
+            failures.append(failure)
+        finally:
+            reader_done.set()
+
+    writer = threading.Thread(
+        target=create_database, name="first-open-writer", daemon=True
+    )
+    writer.start()
+    assert writer_holding.wait(30.0)
+    assert (root / "control" / "first-open.lock").is_file()
+    assert not (root / META_FILE).exists(), (
+        "the writer was paused before publishing identity"
+    )
+
+    reader = threading.Thread(target=open_reader, name="first-open-reader", daemon=True)
+    reader.start()
+    assert reader_attempting.wait(30.0), (
+        "preflight refused instead of reaching the existing lock"
+    )
+    assert not reader_acquired.wait(0.1), (
+        "the reader crossed a lock still held by the writer"
+    )
+    assert not reader_done.is_set()
+
+    allow_writer.set()
+    writer.join(30.0)
+    reader.join(30.0)
+    assert not writer.is_alive()
+    assert not reader.is_alive()
+    assert not failures
+    assert results["reader"] == results["writer"]
 
 
 def test_read_only_missing_root_is_refused_before_the_directory_exists(
