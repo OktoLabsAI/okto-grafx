@@ -1620,3 +1620,207 @@ def test_a_file_exists_error_while_stamping_is_not_a_contention_verdict(
     assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")] == [], (
         "a lock this process created and could not stamp is its own to remove"
     )
+
+
+# =====================================================================================
+# Round-6: a diagnostic never escapes a refusal, and never replaces a primary
+# =====================================================================================
+
+
+@pytest.mark.parametrize(
+    "shape", [SystemExit, KeyboardInterrupt], ids=["SystemExit", "KeyboardInterrupt"]
+)
+def test_the_describer_absorbs_a_repr_that_raises_any_shape(
+    shape: type[BaseException],
+) -> None:
+    """Round-6: _describe caught Exception only, so a __repr__ raising SystemExit or
+    KeyboardInterrupt escaped the one helper whose entire purpose is to keep a refusal
+    from crashing. Everywhere else KI/SE propagate because those places do WORK; here a
+    value is formatted for a message and the shape is chosen by the object described, so
+    an escaping SystemExit is not the process asking to exit -- it is hostile data
+    walking through the guard."""
+    from bench.harness.gate import _describe as gate_describe
+    from bench.harness.recall import _describe as recall_describe
+
+    class _Exploding:
+        def __repr__(self) -> str:
+            raise shape(71)
+
+        def __str__(self) -> str:
+            raise shape(71)
+
+    for describe in (recall_describe, gate_describe):
+        assert describe(_Exploding()) == "<value whose repr raises>"
+
+
+def test_a_hostile_path_object_cannot_mask_its_own_refusal(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round-6: the alias refusal interpolated the caller's object RAW, so a path-like
+    whose resolve() fails and whose __str__ raises SystemExit escaped through the very
+    message announcing the refusal. The refusal still names the offender -- safely."""
+
+    class _HostilePath:
+        def resolve(self, strict: bool = False) -> object:
+            raise RuntimeError("this path cannot be resolved")
+
+        def __str__(self) -> str:
+            raise SystemExit(72)
+
+        def __repr__(self) -> str:
+            raise SystemExit(72)
+
+    code = append_vector_recall(
+        profile="tiny",
+        gt_mode="auto",
+        out=_HostilePath(),  # type: ignore[arg-type]
+        metrics=None,
+        workspace=tmp_path,
+    )
+    assert code == 3, "a path that cannot be resolved is a typed refusal, not an exit"
+    assert "REFUSED" in capsys.readouterr().out
+
+
+def test_a_diagnostic_print_in_the_finally_cannot_replace_the_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-6: the residue warnings are printed from inside a finally. A print that
+    raises did not merely lose the message -- it REPLACED the primary with the failure
+    of the message about it. Here the worker is interrupted, both unlinks fail so there
+    IS residue to report, and the reporting itself exits: the caller must still see the
+    interrupt."""
+    import builtins
+
+    out, metrics = _seed_documents(tmp_path)
+
+    def interrupted(*args: object, **kwargs: object) -> dict[str, object]:
+        raise KeyboardInterrupt("PRIMARY")
+
+    monkeypatch.setattr(wiring, "run_recall", interrupted)
+    real_unlink, real_print = os.unlink, builtins.print
+
+    def failing_unlink(path: object, *args: object, **kwargs: object) -> None:
+        if str(path).endswith(".c13.lock"):
+            raise OSError("this lock cannot be removed")
+        return real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    def exiting_print(*args: object, **kwargs: object) -> None:
+        if args and "WARNING" in str(args[0]):
+            raise SystemExit(73)
+        return real_print(*args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", failing_unlink)
+    monkeypatch.setattr(builtins, "print", exiting_print)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        append_vector_recall(
+            profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+        )
+    monkeypatch.undo()
+    assert "PRIMARY" in str(caught.value), (
+        "the interrupt is the outcome; the failure of a warning about residue is not"
+    )
+
+
+def test_a_broken_stdout_does_not_change_an_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-6, structural: the exit code is this stage's contract and the text is the
+    courtesy. With every print raising, a refusal is still a refusal and a success is
+    still a success -- silent, but never a traceback whose status means something else."""
+    import builtins
+
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+
+    def broken_print(*args: object, **kwargs: object) -> None:
+        raise OSError("stdout is closed")
+
+    monkeypatch.setattr(builtins, "print", broken_print)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 0, "a publication that succeeded is still a success when silent"
+    assert json.loads(metrics.read_text(encoding="utf-8"))["metrics"][-1]["name"] == (
+        RECALL_METRIC
+    ), "and the gauge really landed"
+
+
+def test_a_document_that_cannot_be_named_is_never_locked() -> None:
+    """Round-6: the lock names come from str(document), which is the CALLER's code, and
+    it ran outside every guard -- before a single lock existed. A document that cannot
+    even be named cannot be locked, and that is a typed refusal."""
+
+    class _Unnameable:
+        def __str__(self) -> str:
+            raise RuntimeError("this document has no name")
+
+        def __repr__(self) -> str:
+            raise RuntimeError("nor a representation")
+
+    held, refusal = wiring._acquire_publication_locks([_Unnameable()])  # type: ignore[list-item]
+    assert held == []
+    assert refusal is not None and "named for locking" in refusal
+
+
+def test_an_exiting_existence_check_cannot_report_success_over_residue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-6 item 5: the residue check caught Exception, so exists() raising SystemExit
+    escaped run_recall -- and SystemExit(0) is the worst shape here, because the process
+    would exit SUCCESS with the temp still on disk and nothing published. An
+    unanswerable existence question counts as residue."""
+    import subprocess as subprocess_module
+
+    from bench.harness.recall import run_recall
+
+    def writes_verdict(command: list[str], **kwargs: object):
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.write_text(json.dumps(_verdict_stub()), encoding="utf-8")
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
+    real_unlink, real_exists = Path.unlink, Path.exists
+
+    def sticky(self: Path, *args: object, **kwargs: object) -> None:
+        if self.name.startswith("recall-tiny-"):
+            raise OSError("sticky temp")
+        return real_unlink(self, *args, **kwargs)
+
+    def exiting_exists(self: Path) -> bool:
+        if self.name.startswith("recall-tiny-"):
+            raise SystemExit(0)
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "unlink", sticky)
+    monkeypatch.setattr(Path, "exists", exiting_exists)
+    with pytest.raises(RecallStageError, match="residue"):
+        run_recall("tiny", scratch=tmp_path / "scratch")
+
+
+def test_a_failure_before_the_spawn_never_orphans_the_verdict_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-6 item 7: the fresh file is ours from the moment mkstemp's descriptor
+    closes, but the cleanup region began only after the environment copy, the command
+    construction and time.monotonic(). A failure in that gap left the file orphaned,
+    with no cleanup and no spawn. The clock is the cheapest way to stand in for the
+    whole region."""
+    from bench.harness import recall as recall_module
+    from bench.harness.recall import run_recall
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("subprocess.run must not be reached")
+
+    def broken_clock() -> float:
+        raise RuntimeError("the clock is unavailable")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", forbidden)
+    monkeypatch.setattr(recall_module.time, "monotonic", broken_clock)
+    scratch = tmp_path / "scratch"
+    with pytest.raises(RuntimeError, match="clock"):
+        run_recall("tiny", scratch=scratch, timeout_seconds=30)
+    monkeypatch.undo()
+    assert list(scratch.iterdir()) == [], (
+        "a failure anywhere after the acquisition still removes the fresh file"
+    )

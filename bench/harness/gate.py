@@ -59,13 +59,35 @@ def _as_finite_float(value: object) -> float | None:
     with it; a JSON document cannot even carry an integer above CPython's digit limit,
     but a direct caller can, and this boundary owes them a refusal, not a traceback.
     """
-    if isinstance(value, bool) or type(value) not in (float, int):
+    if _is_a(value, bool) or type(value) not in (float, int):
         return None
     try:
         coerced = float(value)
     except OverflowError:
         return None
     return coerced if math.isfinite(coerced) else None
+
+
+def _is_a(value: object, kind: object) -> bool:
+    """isinstance(), guarded: the check itself runs the INSPECTED object's code.
+
+    ``__instancecheck__`` and ``__subclasshook__`` (every ABC check, Mapping included)
+    and a ``__class__`` property (any check that falls back to it) are controlled by the
+    value being examined, so the SHAPE of what they raise is chosen by hostile data
+    rather than by an interrupt of our work -- the same reasoning that makes _describe
+    absorb everything. Widening the surrounding guard does not help: those guards catch
+    Exception, and a SystemExit raised from __instancecheck__ walks straight through the
+    line that decides "this is not a document".
+
+    A value whose type cannot be determined is not of that type. That single
+    conservative default is right for both uses here: an undecidable document value is
+    refused, and an undecidable exception is treated as NOT an ordinary Exception, so
+    the primary is re-raised instead of being converted into a typed refusal.
+    """
+    try:
+        return isinstance(value, kind)  # type: ignore[arg-type]
+    except BaseException:  # noqa: BLE001 -- the OBJECT chose this shape, not the process
+        return False
 
 
 def _describe(value: object) -> str:
@@ -78,11 +100,34 @@ def _describe(value: object) -> str:
     """
     try:
         text = repr(value)
-    except Exception:  # noqa: BLE001 -- a hostile __repr__ may raise anything ordinary
+    except BaseException:  # noqa: BLE001 -- a diagnostic NEVER decides an outcome
+        # Round-6: this caught Exception only, so a __repr__ raising SystemExit or
+        # KeyboardInterrupt escaped the one helper whose entire purpose is to keep a
+        # refusal from crashing. Everywhere else in this stage KI/SE propagate, and
+        # they should: those places do WORK, and an interrupt must be able to stop it.
+        # Nothing is done here -- a value is formatted for a message -- and the shape is
+        # chosen by the object being described, which makes an escaping SystemExit not
+        # the process asking to exit but hostile data walking through the guard.
+        # Absorbing it is the only way the promise this function exists to keep is true.
         # CONSTANT fallback: even type(value).__name__ can execute a hostile
         # metaclass property. The refusal path touches the offender zero more times.
         return "<value whose repr raises>"
     return text if len(text) <= 80 else text[:77] + "..."
+
+
+def _emit(line: str) -> None:
+    """print(), guarded: a diagnostic must never become the outcome it describes.
+
+    Round-6: the lock-residue warnings are printed from inside a ``finally``, so a print
+    that raises -- a closed stdout, a hostile replacement -- did not merely lose the
+    message: it REPLACED the primary exception with the failure of the message about it.
+    The exit code is this stage's contract and the text is the courtesy, so every shape
+    is absorbed here. A refusal that cannot be printed is still a refusal.
+    """
+    try:
+        print(line)
+    except BaseException:  # noqa: BLE001 -- a diagnostic NEVER decides an outcome
+        pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,25 +168,32 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
             {},
             f"the metrics document is not readable JSON: {_describe(error)}",
         )
-    if not isinstance(payload, Mapping):
-        # `[]`, `null` and `3` are all VALID JSON, so the parse above accepts them and only the
-        # shape refuses them. Without this line `payload.get` raises AttributeError, nothing
-        # catches it, and the process dies with a traceback -- which the shell reads as exit 1,
-        # the code that means CEILING EXCEEDED. A document that could not be read and a build
-        # that regressed are opposite facts; A75.2 forbids them sharing an encoding, and this
-        # module is the one that says so.
-        return (
-            {},
-            {},
-            "the metrics document is valid JSON but not an object "
-            f"({type(payload).__name__}), so it carries no metric list: UNMEASURED, not a verdict",
-        )
     try:
-        # Round-5 blocker 3: the boundary starts HERE, not after the .get. A hostile
-        # mapping handed back by a patched json.loads raised raw at payload.get, one
-        # line before the guard that was meant to contain exactly that.
+        # Round-5 blocker 3: the boundary starts right after the parse, not after the
+        # .get -- a hostile mapping raised raw at payload.get, one line before the guard
+        # meant to contain exactly that. Round-6 item 6 moved it one step earlier still:
+        # `isinstance(payload, Mapping)` against an ABC runs __instancecheck__ and
+        # __subclasshook__, which a hostile metaclass controls, so the very line that
+        # decides "this is not a document" could raise out of a function whose docstring
+        # promises it never raises -- and so could formatting the refusal it returns.
+        if not _is_a(payload, Mapping):
+            # `[]`, `null` and `3` are all VALID JSON, so the parse above accepts them and
+            # only the shape refuses them. Without this line `payload.get` raises
+            # AttributeError, nothing catches it, and the process dies with a traceback --
+            # which the shell reads as exit 1, the code that means CEILING EXCEEDED. A
+            # document that could not be read and a build that regressed are opposite
+            # facts; A75.2 forbids them sharing an encoding, and this module says so.
+            return (
+                {},
+                {},
+                # The describer, never type(payload).__name__: naming the offender must
+                # not execute the offender's metaclass.
+                "the metrics document is valid JSON but not an object "
+                f"({_describe(payload)}), so it carries no metric list: UNMEASURED, "
+                "not a verdict",
+            )
         metrics = payload.get("metrics")
-        if not isinstance(metrics, list):
+        if not _is_a(metrics, list):
             return {}, {}, "the metrics document holds no metric list"
         return _collect_multiples(metrics)
     except Exception:  # noqa: BLE001 -- never-raise is absolute; KI/SE propagate
@@ -159,17 +211,17 @@ def _collect_multiples(
     multiples: dict[str, float] = {}
     gauges: dict[str, float] = {}
     for entry in metrics:
-        if not isinstance(entry, Mapping):
+        if not _is_a(entry, Mapping):
             continue
         name = entry.get("name")
         samples = entry.get("samples")
-        if not isinstance(samples, list):
+        if not _is_a(samples, list):
             # samples can arrive as null, a number, anything: iterating a non-list raises
             # TypeError through the never-raise promise. A non-list is simply not samples,
             # so the entry contributes nothing and a required ceiling reads UNMEASURED.
             continue
         for sample in samples:
-            if not isinstance(sample, Mapping) or "value" not in sample:
+            if not _is_a(sample, Mapping) or "value" not in sample:
                 continue
             # The guarded coercion is load-bearing here too: float(10**400) raises
             # OverflowError, and a huge integer CAN arrive in a JSON sample. A value
@@ -180,11 +232,11 @@ def _collect_multiples(
             if coerced is None:
                 continue
             labels = sample.get("labels", {})
-            if name == METRIC_NAME and isinstance(labels, Mapping):
+            if name == METRIC_NAME and _is_a(labels, Mapping):
                 ceiling = labels.get("ceiling")
-                if isinstance(ceiling, str):
+                if _is_a(ceiling, str):
                     multiples[ceiling] = coerced
-            elif isinstance(name, str):
+            elif _is_a(name, str):
                 gauges[name] = coerced
     return multiples, gauges, ""
 
@@ -210,9 +262,11 @@ def _recall_measurement(document: str) -> tuple[str, object]:
         payload = json.loads(document)
     except Exception:  # noqa: BLE001 -- unreadable is absent; never-raise is absolute
         return ("absent", None)
-    if not isinstance(payload, Mapping):
-        return ("absent", None)
     try:
+        # Round-6 item 6: the isinstance is inside the boundary too -- an ABC check runs
+        # __instancecheck__/__subclasshook__, which a hostile metaclass controls.
+        if not _is_a(payload, Mapping):
+            return ("absent", None)
         # Round-5 blocker 3: the boundary covers EVERYTHING after the parse. It used to
         # begin after payload.get("metrics") and end after the enumeration, leaving the
         # .get and the whole shape validation -- set(entry), sorted(map(str, entry)),
@@ -228,12 +282,12 @@ def _recall_measurement(document: str) -> tuple[str, object]:
 def _resolve_measurement(payload: Mapping) -> tuple[str, object]:
     """The shape resolution, guarded by ``_recall_measurement``'s absolute boundary."""
     metrics = payload.get("metrics")
-    if not isinstance(metrics, list):
+    if not _is_a(metrics, list):
         return ("absent", None)
     entries = [
         entry
         for entry in metrics
-        if isinstance(entry, Mapping) and entry.get("name") == RECALL_METRIC
+        if _is_a(entry, Mapping) and entry.get("name") == RECALL_METRIC
     ]
     if not entries:
         return ("absent", None)
@@ -258,16 +312,14 @@ def _resolve_measurement(payload: Mapping) -> tuple[str, object]:
     if entry["unit"] != "ratio":
         return ("malformed", f"unit {_describe(entry['unit'])} is not 'ratio'")
     samples = entry["samples"]
-    if not isinstance(samples, list) or len(samples) != 1:
-        described = (
-            len(samples) if isinstance(samples, list) else type(samples).__name__
-        )
+    if not _is_a(samples, list) or len(samples) != 1:
+        described = len(samples) if _is_a(samples, list) else _describe(samples)
         return (
             "malformed",
             f"samples must be a list of exactly one sample; got {described}",
         )
     sample = samples[0]
-    if not isinstance(sample, Mapping) or set(sample) != {"value"}:
+    if not _is_a(sample, Mapping) or set(sample) != {"value"}:
         return ("malformed", "the sample must be a mapping of exactly {'value'}")
     return ("value", sample["value"])
 
@@ -399,7 +451,7 @@ def _resolve_recall_target(
             ) from error
         candidate = (
             payload.get("vector_recall", {}).get("frozen", {}).get("target")
-            if isinstance(payload, dict)
+            if _is_a(payload, dict)
             else None
         )
         frozen = _as_finite_float(candidate)
@@ -449,11 +501,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         document = Path(arguments.metrics).read_text(encoding="utf-8")
-    except (OSError, ValueError) as error:
+    except Exception as error:  # noqa: BLE001 -- KI/SE propagate; reading is WORK
         # ValueError covers UnicodeDecodeError: a metrics file that is not valid UTF-8 is
         # UNREADABLE, and before this clause it escaped as a traceback whose exit status 1
         # is this gate's code for CEILING EXCEEDED -- a false verdict from a broken file.
-        print(
+        #
+        # Round-6 item 6: the clause listed (OSError, ValueError), so ANY other ordinary
+        # shape -- a RuntimeError from a hostile path, whatever a filesystem layer
+        # raises -- escaped the same way, with the same false verdict. A file that
+        # cannot be read is UNMEASURED whatever the reason. KeyboardInterrupt and
+        # SystemExit still propagate on purpose: reading a file is WORK, and an
+        # interrupt must be able to stop it; only the DIAGNOSTIC helpers absorb those.
+        _emit(
             "D5 ceiling gate: UNMEASURED -- the metrics file could not be read: "
             f"{_describe(error)}"
         )
@@ -462,7 +521,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         recall_target, target_origin = _resolve_recall_target(
             arguments.recall_target, arguments.calibration
         )
-        print(f"vector recall target {recall_target:g} ({target_origin})")
+        _emit(f"vector recall target {recall_target:g} ({target_origin})")
         result = check(
             document,
             required=tuple(arguments.require) or tuple(CEILINGS),
@@ -474,14 +533,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         # keep is worse than none: every unhandled exception leaves the interpreter with status 1,
         # which is this gate's code for CEILING EXCEEDED. Whatever shape of input got here, the
         # honest answer is that the gate could not be taken.
-        print(
+        _emit(
             "D5 ceiling gate: UNMEASURED (exit 2) -- the gate itself failed: "
             f"{_describe(error)}"
         )
         return 2
-    print(f"D5 ceiling gate: {result.status.upper()} (exit {result.exit_code})")
+    _emit(f"D5 ceiling gate: {result.status.upper()} (exit {result.exit_code})")
     for line in result.lines:
-        print(f"  {line}")
+        _emit(f"  {line}")
     return result.exit_code
 
 

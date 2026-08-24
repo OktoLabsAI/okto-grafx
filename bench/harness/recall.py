@@ -74,17 +74,62 @@ test-sized. ``run_recall`` resolves these when the caller passes no explicit tim
 an explicit value always wins after validation."""
 
 
+def _is_a(value: object, kind: object) -> bool:
+    """isinstance(), guarded: the check itself runs the INSPECTED object's code.
+
+    ``__instancecheck__`` and ``__subclasshook__`` (every ABC check, Mapping included)
+    and a ``__class__`` property (any check that falls back to it) are controlled by the
+    value being examined, so the SHAPE of what they raise is chosen by hostile data
+    rather than by an interrupt of our work -- the same reasoning that makes _describe
+    absorb everything. Widening the surrounding guard does not help: those guards catch
+    Exception, and a SystemExit raised from __instancecheck__ walks straight through the
+    line that decides "this is not a document".
+
+    A value whose type cannot be determined is not of that type. That single
+    conservative default is right for both uses here: an undecidable document value is
+    refused, and an undecidable exception is treated as NOT an ordinary Exception, so
+    the primary is re-raised instead of being converted into a typed refusal.
+    """
+    try:
+        return isinstance(value, kind)  # type: ignore[arg-type]
+    except BaseException:  # noqa: BLE001 -- the OBJECT chose this shape, not the process
+        return False
+
+
 def _describe(value: object) -> str:
     """repr(), guarded and bounded: ``repr(10**10000)`` raises past CPython's digit
     limit, and the refusal message must not crash the refusal (mirrors gate._describe).
     """
     try:
         text = repr(value)
-    except Exception:  # noqa: BLE001 -- a hostile __repr__ may raise anything ordinary
+    except BaseException:  # noqa: BLE001 -- a diagnostic NEVER decides an outcome
+        # Round-6: this caught Exception only, so a __repr__ raising SystemExit or
+        # KeyboardInterrupt escaped the one helper whose entire purpose is to keep a
+        # refusal from crashing. Everywhere else in this stage KI/SE propagate, and
+        # they should: those places do WORK, and an interrupt must be able to stop it.
+        # Nothing is done here -- a value is formatted for a message -- and the shape is
+        # chosen by the object being described, which makes an escaping SystemExit not
+        # the process asking to exit but hostile data walking through the guard.
+        # Absorbing it is the only way the promise this function exists to keep is true.
         # CONSTANT fallback: even type(value).__name__ can execute a hostile
         # metaclass property. The refusal path touches the offender zero more times.
         return "<value whose repr raises>"
     return text if len(text) <= 80 else text[:77] + "..."
+
+
+def _emit(line: str) -> None:
+    """print(), guarded: a diagnostic must never become the outcome it describes.
+
+    Round-6: the lock-residue warnings are printed from inside a ``finally``, so a print
+    that raises -- a closed stdout, a hostile replacement -- did not merely lose the
+    message: it REPLACED the primary exception with the failure of the message about it.
+    The exit code is this stage's contract and the text is the courtesy, so every shape
+    is absorbed here. A refusal that cannot be printed is still a refusal.
+    """
+    try:
+        print(line)
+    except BaseException:  # noqa: BLE001 -- a diagnostic NEVER decides an outcome
+        pass
 
 
 def run_recall(
@@ -107,7 +152,7 @@ def run_recall(
         )
     if timeout_seconds is None:
         timeout_seconds = PROFILE_TIMEOUTS[profile]
-    invalid = isinstance(timeout_seconds, bool) or type(timeout_seconds) not in (
+    invalid = _is_a(timeout_seconds, bool) or type(timeout_seconds) not in (
         int,
         float,
     )
@@ -149,29 +194,35 @@ def run_recall(
             os.unlink(temp_name)
         except BaseException:  # noqa: BLE001 -- cleanup NEVER replaces the primary
             pass
-        if not isinstance(failure, Exception):
+        if not _is_a(failure, Exception):
             raise
         raise RecallStageError(
             "the fresh per-run verdict file could not be prepared "
             f"({_describe(failure)}); nothing was spawned."
         ) from failure
     verdict_path = Path(temp_name)
-    environment = dict(os.environ)
-    for name in _BLAS_THREAD_VARIABLES:
-        environment[name] = "1"
-    command = [
-        sys.executable,
-        "-m",
-        "bench.harness.recall_worker",
-        "--profile",
-        profile,
-        "--gt",
-        gt_mode,
-        "--out",
-        str(verdict_path),
-    ]
-    started = time.monotonic()
+    # Round-6 item 7: the file is OURS from the moment the mkstemp descriptor closed, so
+    # the cleanup region starts HERE. It used to start after the environment copy, the
+    # command construction and time.monotonic() -- three ordinary calls that can fail
+    # (a hostile os.environ, a patched clock) and left the fresh verdict file orphaned
+    # with no cleanup, no spawn and no diagnosis. Everything that follows the acquisition
+    # is now inside the same state machine that removes it.
     try:
+        environment = dict(os.environ)
+        for name in _BLAS_THREAD_VARIABLES:
+            environment[name] = "1"
+        command = [
+            sys.executable,
+            "-m",
+            "bench.harness.recall_worker",
+            "--profile",
+            profile,
+            "--gt",
+            gt_mode,
+            "--out",
+            str(verdict_path),
+        ]
+        started = time.monotonic()
         try:
             completed = subprocess.run(
                 command,
@@ -217,7 +268,7 @@ def run_recall(
                 f"the recall worker's verdict is not readable JSON "
                 f"(exit {completed.returncode}): {_describe(failure)}"
             ) from failure
-        if not isinstance(verdict, dict):
+        if not _is_a(verdict, dict):
             raise RecallStageError(
                 "the recall worker's verdict is not a JSON object; refusing it."
             )
@@ -241,7 +292,13 @@ def run_recall(
         # RESIDUE: the conservative side of the only honest doubt here.
         try:
             residual = verdict_path.exists()
-        except Exception:  # noqa: BLE001 -- KI/SE still propagate
+        except BaseException:  # noqa: BLE001 -- a diagnosis NEVER decides an outcome
+            # Round-6 item 5: this caught Exception only, so exists() raising SystemExit
+            # escaped -- and SystemExit(0) is the worst shape available here, because
+            # the process would exit SUCCESS with the temp still on disk and nothing
+            # published. Asking whether a file exists is a DIAGNOSIS, not work: every
+            # shape is absorbed and an unanswerable question counts as residue, which
+            # is the conservative side of the only honest doubt in this function.
             residual = True
         if residual:
             raise RecallStageError(

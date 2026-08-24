@@ -27,6 +27,8 @@ from bench.harness.recall import (
     RecallStageError,
     _canonical_verdict,
     _describe,
+    _emit,
+    _is_a,
     _validate_verdict,
     build_section,
     run_recall,
@@ -114,20 +116,19 @@ def _strip_stale_gauge(metrics: Path) -> None:
     recorded here rather than half-built.
     """
     document = json.loads(metrics.read_text(encoding="utf-8"))
-    entries = document.get("metrics") if isinstance(document, dict) else None
-    if not isinstance(entries, list) or not any(
-        isinstance(entry, dict) and entry.get("name") == RECALL_METRIC
-        for entry in entries
+    entries = document.get("metrics") if _is_a(document, dict) else None
+    if not _is_a(entries, list) or not any(
+        _is_a(entry, dict) and entry.get("name") == RECALL_METRIC for entry in entries
     ):
         return
 
     def mutate(document: dict[str, object]) -> None:
         stale = document.get("metrics")
-        if isinstance(stale, list):
+        if _is_a(stale, list):
             document["metrics"] = [
                 entry
                 for entry in stale
-                if not (isinstance(entry, dict) and entry.get("name") == RECALL_METRIC)
+                if not (_is_a(entry, dict) and entry.get("name") == RECALL_METRIC)
             ]
 
     _replace_json(metrics, mutate)
@@ -147,7 +148,7 @@ def _append_gauge(metrics: Path, value: float) -> None:
 
     def mutate(document: dict[str, object]) -> None:
         entries = document.setdefault("metrics", [])
-        if not isinstance(entries, list):
+        if not _is_a(entries, list):
             # Round-3 B: the document can change between the precheck and this append.
             # Silently skipping used to return SUCCESS with section-without-gauge --
             # an exit 0 that lied. Raising turns it into the boundary's typed exit 3.
@@ -235,7 +236,18 @@ def _acquire_publication_locks(
     own a descriptor. Collapsing them is what let a FileExistsError from the stamp
     masquerade as contention.
     """
-    ordered = sorted({str(document) for document in documents})
+    try:
+        # Round-6: str() on a caller-supplied path-like is the CALLER's code, and it ran
+        # outside every guard -- a __str__ raising SystemExit escaped before a single
+        # lock existed. A document that cannot even be named cannot be locked.
+        ordered = sorted({str(document) for document in documents})
+    except BaseException as failure:  # noqa: BLE001 -- KI/SE still reach the caller
+        if not _is_a(failure, Exception):
+            raise
+        return [], (
+            "a document could not be named for locking "
+            f"({_describe(failure)}); nothing was locked and nothing was run"
+        )
     held: list[Path] = []
     for target in ordered:
         lock_path = Path(target + ".c13.lock")
@@ -263,7 +275,7 @@ def _acquire_publication_locks(
             # Nothing was created on this path, so there is no descriptor and no lock
             # of ours to leave behind; only the locks already held are released.
             _, residue = _unwind_lock_failure(None, lock_path, held)
-            if not isinstance(failure, Exception):
+            if not _is_a(failure, Exception):
                 raise
             reason = (
                 f"the publication lock {lock_path} could not be created "
@@ -287,7 +299,7 @@ def _acquire_publication_locks(
             # reaching HERE is just another ordinary failure of the stamping -- never
             # a claim about who holds the lock.
             uncertain, residue = _unwind_lock_failure(descriptor, lock_path, held)
-            if not isinstance(failure, Exception):
+            if not _is_a(failure, Exception):
                 raise
             reason = (
                 f"the publication lock {lock_path} was created but could not be "
@@ -319,7 +331,7 @@ def _acquire_publication_locks(
             # refusal, or a KI/SE propagate.
             uncertain = held.pop()
             residue = _release_publication_locks(held)
-            if not isinstance(failure, Exception):
+            if not _is_a(failure, Exception):
                 raise
             reason = (
                 f"the lock descriptor for {lock_path} could not be closed "
@@ -355,14 +367,14 @@ def _publish_documents(
         # Round-5 blocker 3: even OUR typed error prints through the guarded describer.
         # RecallStageError carries whatever text built it, and one of those texts is
         # built from a worker verdict; a str that raises here would crash the refusal.
-        print(f"vector recall: FAIL-CLOSED -- {_describe(failure)}")
+        _emit(f"vector recall: FAIL-CLOSED -- {_describe(failure)}")
         return 3
     except Exception as failure:  # noqa: BLE001 -- any ordinary failure is exit 3 typed
         # An ORDINARY exception from the strip or the worker is still a stage failure:
         # typed line, exit 3, no traceback -- and because the strip precedes the spawn,
         # a strip failure aborts before any measurement begins. Exception, not
         # BaseException: KeyboardInterrupt and SystemExit still propagate.
-        print(f"vector recall: stage failed before publication -- {_describe(failure)}")
+        _emit(f"vector recall: stage failed before publication -- {_describe(failure)}")
         return 3
     # Reaudit HIGH-1: the WHOLE verdict is validated before the first append -- an
     # adulterated verdict (gauge 0.99 beside observed 0.01, NaN inside observed, a
@@ -384,13 +396,13 @@ def _publish_documents(
         # A dict SUBCLASS can pass isinstance and then raise from get/__eq__ inside the
         # validator; the boundary converts that into the same typed refusal. Exception,
         # never BaseException: KI and SystemExit still propagate.
-        print(
+        _emit(
             "vector recall: FAIL-CLOSED -- verdict validation itself failed: "
             f"{_describe(failure)}"
         )
         return 3
     if reason is not None:
-        print(f"vector recall: FAIL-CLOSED -- incoherent verdict: {reason}")
+        _emit(f"vector recall: FAIL-CLOSED -- incoherent verdict: {reason}")
         return 3
     gauge_value = float(canonical["gauge"])  # validated: exact float == observed mean
     try:
@@ -404,13 +416,13 @@ def _publish_documents(
         # the old four-type tuple missed. It runs INSIDE this boundary, before
         # _append_section, so a failure here leaves both documents exactly as the strip
         # left them. Exception, not BaseException: KI and SystemExit still propagate.
-        print(
+        _emit(
             "vector recall: publication failed after measurement -- "
             f"{_describe(failure)}"
         )
         return 3
     home = next(iter(section["observed"]))  # type: ignore[call-overload]
-    print(
+    _emit(
         f"vector recall: profile {profile} mean recall@k "
         f"{gauge_value:.4f} ({home}); section first, gauge last."
     )
@@ -434,7 +446,7 @@ def append_vector_recall(
     only ever be section-without-gauge, never the reverse.
     """
     if metrics is not None and out is None:
-        print(
+        _emit(
             "vector recall stage: REFUSED -- --metrics without --out would publish the "
             "gauge with no section; the gauge must be the LAST artifact, never the only one."
         )
@@ -454,15 +466,17 @@ def append_vector_recall(
             canonical = alias_path.resolve(strict=True)
             link_count = os.stat(canonical).st_nlink
         except Exception as failure:  # noqa: BLE001 -- absolute boundary; KI/SE pass
-            print(
-                f"vector recall stage: REFUSED -- {alias_label} {alias_path} could "
+            _emit(
+                f"vector recall stage: REFUSED -- {alias_label} "
+                f"{_describe(alias_path)} could "
                 "not be resolved to a physical document "
                 f"({_describe(failure)}); nothing was run."
             )
             return 3
         if link_count > 1:
-            print(
-                f"vector recall stage: REFUSED -- {alias_label} {alias_path} is "
+            _emit(
+                f"vector recall stage: REFUSED -- {alias_label} "
+                f"{_describe(alias_path)} is "
                 f"hardlinked (st_nlink={link_count}); os.replace would break the "
                 "aliases, so no coherent atomic publication exists. Nothing was run."
             )
@@ -473,7 +487,7 @@ def append_vector_recall(
         and "--metrics" in resolved
         and resolved["--out"] == resolved["--metrics"]
     ):
-        print(
+        _emit(
             "vector recall stage: REFUSED -- --out and --metrics resolve to the SAME "
             "physical document; the section and the gauge need distinct files."
         )
@@ -486,26 +500,27 @@ def append_vector_recall(
         try:
             document = json.loads(path.read_text(encoding="utf-8"))
         except Exception as failure:  # noqa: BLE001 -- absolute boundary; KI/SE propagate
-            print(
-                f"vector recall stage: REFUSED -- {label} {path} is not a readable JSON "
-                f"document ({_describe(failure)}); nothing was run and nothing "
-                "was written."
+            _emit(
+                f"vector recall stage: REFUSED -- {label} {_describe(path)} is not "
+                f"a readable JSON document ({_describe(failure)}); nothing was run "
+                "and nothing was written."
             )
             return 3
-        if not isinstance(document, dict):
-            print(
-                f"vector recall stage: REFUSED -- {label} {path} holds "
-                f"{type(document).__name__}, not an object; nothing was run."
+        if not _is_a(document, dict):
+            _emit(
+                f"vector recall stage: REFUSED -- {label} {_describe(path)} holds "
+                f"{_describe(document)}, not an object; nothing was run."
             )
             return 3
         if (
             label == "--metrics"
             and "metrics" in document
-            and not isinstance(document["metrics"], list)
+            and not _is_a(document["metrics"], list)
         ):
-            print(
-                f"vector recall stage: REFUSED -- {label} {path} carries a 'metrics' key "
-                "that is not a list; a gauge could never land there. Nothing was run."
+            _emit(
+                f"vector recall stage: REFUSED -- {label} {_describe(path)} carries a "
+                "'metrics' key that is not a list; a gauge could never land there. "
+                "Nothing was run."
             )
             return 3
     # Round-3 B, hardened per the lock blockers: EVERY non-None document gets its
@@ -520,7 +535,7 @@ def append_vector_recall(
         [path for path in (out, metrics) if path is not None]
     )
     if lock_refusal is not None:
-        print(f"vector recall stage: REFUSED -- {lock_refusal}")
+        _emit(f"vector recall stage: REFUSED -- {lock_refusal}")
         return 3
     residue: list[str] = []
     try:
@@ -535,7 +550,7 @@ def append_vector_recall(
     finally:
         residue = _release_publication_locks(held_locks)
         for residue_line in residue:
-            print(
+            _emit(
                 "vector recall stage: WARNING -- lock residue left behind: "
                 f"{residue_line}"
             )
@@ -543,7 +558,7 @@ def append_vector_recall(
         # Round-4: exit 0 with persisting locks would tell the next stage the field
         # is clear while the files say otherwise. Success is demoted to the typed
         # failure; the diagnostics above name every leftover.
-        print(
+        _emit(
             "vector recall stage: FAIL -- the publication succeeded but releasing "
             "the locks left residue behind; refusing to report success over a "
             "locked field."

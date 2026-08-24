@@ -645,3 +645,78 @@ def test_a_parse_failure_with_a_hostile_str_cannot_escape_either_reader(
     metrics.write_text("{}", encoding="utf-8")
     assert main(["--metrics", str(metrics), "--require-recall"]) == 2
     assert "UNMEASURED" in capsys.readouterr().out
+
+
+def test_an_unguarded_metaclass_cannot_escape_the_ceiling_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-6, the fourth site (same class as the auditor's three, found while mapping
+    them): read_multiples formats type(payload).__name__ in the not-an-object branch,
+    which sits BEFORE its guard opens. A metaclass whose __name__ is a property that
+    raises escaped a function whose docstring promises it never raises -- and an escape
+    from this reader means exit 1, which is this gate's code for CEILING EXCEEDED."""
+
+    class _ExitingMeta(type):
+        @property
+        def __name__(cls) -> str:  # noqa: N805
+            raise SystemExit(74)
+
+    class _Hostile(metaclass=_ExitingMeta):
+        pass
+
+    monkeypatch.setattr(gate_module.json, "loads", lambda *a, **kw: _Hostile())
+    multiples, gauges, reason = read_multiples("{}")
+    assert (multiples, gauges) == ({}, {})
+    assert "not an object" in reason
+    assert check("{}", require_recall=True).status == STATUS_UNMEASURED
+
+
+def test_any_unreadable_metrics_file_is_unmeasured_not_exceeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round-6 item 6: the read clause listed (OSError, ValueError), so any other
+    ordinary shape escaped as a traceback -- and this gate's exit 1 means CEILING
+    EXCEEDED, so a broken file produced a false regression verdict. Whatever the reason,
+    a file that cannot be read is UNMEASURED."""
+    metrics = tmp_path / "metrics.json"
+    metrics.write_text("{}", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def hostile_read(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "metrics.json":
+            raise RuntimeError("this file cannot be read")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", hostile_read)
+    assert main(["--metrics", str(metrics)]) == 2
+    monkeypatch.undo()
+    assert "UNMEASURED" in capsys.readouterr().out
+
+
+def test_a_hostile_instance_check_cannot_escape_either_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-6 item 6: both readers evaluated isinstance(payload, Mapping) OUTSIDE the
+    guard. An ABC check runs __instancecheck__/__subclasshook__, which a metaclass
+    controls, so the very line deciding "this is not a document" could raise out of a
+    function that promises it never raises -- exit 1, which this gate reads as CEILING
+    EXCEEDED."""
+
+    class _ExitingMeta(type):
+        def __instancecheck__(cls, instance: object) -> bool:
+            raise SystemExit(75)
+
+        def __subclasshook__(cls, subclass: type) -> bool:
+            raise SystemExit(75)
+
+    class _Hostile(metaclass=_ExitingMeta):
+        @property
+        def __class__(self) -> type:  # noqa: D105
+            raise SystemExit(75)
+
+    monkeypatch.setattr(gate_module.json, "loads", lambda *a, **kw: _Hostile())
+    multiples, gauges, reason = read_multiples("{}")
+    assert (multiples, gauges) == ({}, {})
+    assert reason, "an unreadable document must say so, not raise"
+    assert gate_module._recall_measurement("{}")[0] in ("absent", "malformed")
+    assert check("{}", require_recall=True).status == STATUS_UNMEASURED
