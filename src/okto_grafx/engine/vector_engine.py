@@ -841,13 +841,22 @@ class VectorHnswIndex(ProximityIndex):
     def commit(self, txn: StagingTransaction, csn: Csn) -> int:
         """Apply the transaction's staged changes, then bring the published picture in line.
 
-        The picture is captured ONCE, before the store moves; the changes are noted into that
-        picture and it is certified through the position the store now holds.
+        The picture is captured ONCE, before the store moves, together with the verdict on
+        whether it was current at that moment: its mark against the header, which the
+        transaction manager refreshed from the device at the start of this commit. A picture
+        that was already behind -- another PROCESS committed since it was built -- is retired
+        rather than certified, because this commit notes only its OWN changes: certifying it
+        would publish a graph missing that process's rows with a mark that says current, the
+        silent short answer of LESSONS L22 on the warm path (found by the P0.5 probe).
         """
         staged = self.pending(txn)
         picture = self._snapshot
+        current = picture is not None and picture.mark == self.built_through_lsn
         applied = super().commit(txn, csn)
         if picture is None:
+            return applied
+        if not current:
+            self._retire(picture)
             return applied
         for change in staged:
             if not self._note(picture, change):
@@ -861,8 +870,12 @@ class VectorHnswIndex(ProximityIndex):
 
         change = change_of(record)
         picture = self._snapshot
+        current = picture is not None and picture.mark == self.built_through_lsn
         super().apply(record)
         if change.index != self.name or picture is None:
+            return
+        if not current:
+            self._retire(picture)
             return
         if self._note(picture, change):
             self._certify(picture, self.built_through_lsn)

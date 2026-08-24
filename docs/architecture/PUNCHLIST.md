@@ -1196,3 +1196,23 @@ instrument and the README example) and cannot move the curve.
 Full decision record with the evolutionary-server analysis, the exclusive-section framing (the
 throughput ceiling no option moves), the two complements (Windows publication fix, group commit as
 option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`. Awaiting JP.
+
+## C9 — Vector engine (round 7, W0-A / P0.5; 2026-08-24)
+
+- **CLOSED** — the cold-build race (P0.5) and the warm-path certification defect the probe found:
+  COMPONENTS.md "C9 round 7". Four regressions, three of which fail at `12c67c8`.
+- **Recorded, NOT fixed** — a build that outlasts a waiter's patience (120 slices of 0.5 s) is
+  duplicated by the waiter. Both pictures are complete and the fresher mark wins, so this is CPU,
+  never correctness. The patience is a module constant rather than configuration on purpose
+  (A67: no second knob for a decision the guard already makes). Revisit with a measured graph
+  that takes a minute to build.
+- **Recorded** — one `Condition` per engine, shared by every vector index of the database: a
+  build finishing on index A wakes the waiters of index B, who re-check and wait again. One
+  header read per spurious wake; a per-index condition needs a factory through the assembly.
+  Not worth the seam until measured.
+- **Recorded** — `_UnguardedBuild` (no guard handed in) is fit for one thread, which is the
+  engine's own suite. A host that composes `VectorEngine` directly and drives it from threads
+  gets duplicate builds, never a wrong answer; the assembly always hands in a real condition.
+- **Recorded** — `apply()` certifies after each redo record with the header as it stands, as it
+  did before. During recovery there is no picture; the path is reached only by the checkpoint and
+  post-barrier redo of a warm process, and the same before-the-store-moves verdict applies.

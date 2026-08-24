@@ -1526,3 +1526,70 @@ commit: a reader registration per MANAGER rather than per `begin`, and a lease y
 holder releases at its next commit boundary when C3 reports a waiter) which is the only safe form of
 retention; (3) the redundant temp-file fsync in `_publish_once` (the target is fsynced after the
 rename on the same volume). None is a protocol change; all three are C2/C3/C5 seams.
+
+### C9 round 7 (W0-A, P0.5) — the derived graph is ONE picture, published by ONE assignment
+
+**Defect** (EVOLUTION_PLAN_CODEX.md P0.5; ROUND7-PLAN §1). `VectorHnswIndex.graph()` assigned
+`self._graph` and THEN installed the entries. Two searches on the first use: the second found
+`_graph is not None`, judged it not current (`_graph_mark` still unset), invalidated it -- replacing
+the three maps under the first thread's build -- and rebuilt; the first thread's `_install` then
+found `self._graph is None` mid-loop and returned, so ITS build "completed" with three of eight
+nodes and answered 3, `stale` False, while the exact regime answered 8. Reproduced
+deterministically: `GatingMath`, a `VectorMath` bound through the port registry, parks the first
+scoring thread (the cold builder) at its 4th `score()` call, and a second search is started while
+it is parked. Pre-fix at `12c67c8`: `(3, 'approximate')` for the search that built, `(8, ...)` for
+the one that interrupted it.
+
+**Design -- Codex's critique of the plan, accepted before code.** ROUND7-PLAN §1 proposed
+publishing the three maps, then the mark, then the graph. Four assignments are four interleaving
+windows: two builders can leave A's graph with B's maps, and a builder failing after another
+published would `invalidate_graph()` the success. Delivered instead:
+
+- `_GraphSnapshot` -- a frozen dataclass: graph + `node_of_ref` + `entry_of_node` +
+  `record_of_node` + `mark`. Built in locals (`_build`), published by one assignment under the
+  guard, captured ONCE by `search()`, never read a second time by anything that answers.
+- `GraphGuard` -- a protocol the assembly satisfies with `threading.Condition()` (the CF-13
+  pattern: mechanism is handed in, the pure core imports none; `_UnguardedBuild` stands in for a
+  direct composition). Held over reference operations ONLY -- publish, `_retire`
+  (compare-and-drop of the captured picture), `_certify` (compare-and-republish with a newer
+  mark) -- never over the walk, the resolver, the pool, the candidate filter or the math port
+  (A91, L2). The header is read OUTSIDE it because reading it pins a page: lock order is pool,
+  then guard, never the reverse.
+- Generation: the builder reads `built_through_lsn` BEFORE the walk and the picture carries that
+  reading. A commit landing during the build finds nothing published to note into and certifies
+  nothing; the mark stays behind the header and the next search rebuilds. The search that built
+  answers correctly regardless: that commit's CSN is above its snapshot (MVCC). A build that
+  stamped the header at the END would certify a picture missing the row for ever -- pinned by the
+  third regression.
+- Single-flight: a search meeting a build in flight waits on the guard in 0.5 s slices and takes
+  the published picture when it wakes; after 120 slices it builds for itself (wasted work, never a
+  wrong answer: both pictures are complete and publication keeps the fresher mark).
+- Failure: a build that raises drops its locals, wakes the waiters, and leaves the published
+  picture untouched. The warm path keeps its discard: `_note` retires the picture it contaminated,
+  and only that one.
+
+**The warm-path probe -- the handoff asked for a probe, not an improvisation -- found a second
+defect.** `commit()` and `apply()` noted their OWN changes and then stamped `_graph_mark =
+built_through_lsn`, whatever the header said. Process X warm at three rows; process Z commits row 4
+and exits; X commits row 5: X's stamp certified a graph missing row 4, and X's next search answered
+`(4, 'approximate')` for `k=5`, `stale` False, `verify()` clean. Same class as B6/L22, one path over
+from where L22 was fixed (the cold path re-checks the header before answering; the warm path
+never did). Fix: the commit captures the picture once and decides `current = picture.mark ==
+built_through_lsn` BEFORE `super().commit()` moves the store -- the header the transaction manager
+refreshed from the device at step 3.2 -- and then: not current → `_retire`; current → note →
+`_certify`. Pinned by `tests/vector/test_warm_graph_across_processes.py` (two interpreters;
+fails pre-fix with exactly that tuple).
+
+**Evidence.** Pre-fix at `12c67c8`: (a) mid-build search FAILS, `(3, 'approximate') != (8, ...)`;
+(b) failure-after-success FAILS (the interrupting search answered short); (c) commit-during-build
+PASSES for the wrong reason -- the commit was noted into the partial graph that had already been
+published -- so that test guards the FIXED protocol, and a variant that stamps the header at the
+end fails it; (d) cross-process warm FAILS, `(4, 'approximate') != (5, ...)`. Post-fix: all four
+pass; `tests/vector` and the import-boundary gate green; full suite: 7953 passed, 5 skipped, 0 failed on a clean copy of the final tree (`tests/smoke` deselected; exit 0). A five-mutant battery over the new guards -- publish before the loop, mark read after the build, no verdict before the store moves, a warm refusal keeping the picture, a cold failure invalidating the published picture -- was killed 5/5, each by the regression written for it (`M9`/`M16`/`M5` by `test_first_use_concurrency.py`, `M4` by `test_warm_graph_across_processes.py`, `M8` by the existing half-reachable-entry test).
+
+**Adapted tests.** `test_overflow_and_ordering.py` and `test_index_visibility.py` asserted on the
+old private fields (`_graph` and the three maps); they now assert `_snapshot is None` / `is not
+None` -- the same property (derived state discarded / retained) in the new shape. `VectorFixture`
+takes a `guard`; the engine's own suite composes without one.
+
+**Residue** recorded in PUNCHLIST ("C9 — round 7").

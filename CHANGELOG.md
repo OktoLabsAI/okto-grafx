@@ -5,6 +5,28 @@ All notable changes to Okto Grafx are recorded here. The format follows
 [semantic versioning](https://semver.org/) — with the caveat that below 0.1.0 anything may change,
 including the on-disk format.
 
+## [Unreleased]
+
+### Fixed
+
+- **Vector search: a search arriving while the HNSW graph was being built could answer from a
+  fragment** (Codex audit, P0.5). The derived graph was published before it was filled, so two
+  searches meeting on the first use raced: one answered three of eight rows with `stale` False
+  and `achieved_k` reported as if complete, and a build that failed part-way could erase another
+  thread's complete build. The graph, its maps and the log position it reflects are now ONE
+  immutable picture, built in locals and published by a single reference assignment under a guard
+  the assembly hands in; a search captures it once; a build in flight is waited for rather than
+  raced; a failed build drops its locals and nothing else.
+- **Vector search: a commit could certify a warm graph that another process had left behind.**
+  `commit()` noted its own changes into the warm graph and stamped it with the header's
+  `built_through_lsn` -- already past another process's commit -- so this process then answered
+  without that process's rows, `stale` False, `verify()` clean (the warm half of LESSONS L22).
+  A commit now certifies the picture only when it verified, before the store moved, that the
+  picture was current; otherwise it retires the picture and the next search rebuilds.
+- Regressions: `tests/vector/test_first_use_concurrency.py` (three deterministic interleavings
+  through the public door, the `VectorMath` port as the lever) and
+  `tests/vector/test_warm_graph_across_processes.py` (two interpreters).
+
 ## [0.0.1] — 2026-08-23
 
 First published release. **Pre-alpha**: the on-disk format, the public API and the query surface may

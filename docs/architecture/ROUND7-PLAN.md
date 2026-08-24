@@ -74,6 +74,17 @@ did not run.
 
 ## 1. HNSW partial-graph race (wrong results; fix first)
 
+> **Delivered 2026-08-24 (W0-A, branch `w0a/p0.5-hnsw-snapshot`), with two changes to the design
+> below, both from Codex's review of this plan and both accepted before code:** (1) the four
+> separate publications (three maps, mark, graph) are replaced by ONE immutable `_GraphSnapshot`
+> published by a single assignment, because four assignments are four interleaving windows and a
+> failing builder must not `invalidate_graph()` another builder's success; (2) the mark is the
+> header reading taken BEFORE the walk, so a commit landing during the build is never certified
+> into a picture that lacks it. The WARM-half probe below found a second defect -- `commit()`
+> certified a graph another process had left behind -- fixed in the same series. Record:
+> COMPONENTS.md "C9 round 7"; LESSONS L33; tests `tests/vector/test_first_use_concurrency.py`
+> and `tests/vector/test_warm_graph_across_processes.py`.
+
 ### Verified facts
 
 `src/okto_grafx/engine/vector_engine.py`, class `VectorHnswIndex`:

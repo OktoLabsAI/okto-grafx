@@ -851,3 +851,27 @@ that would not finish. Neither was found by anything that was looking.
 
 **Corollary for a review:** "component X is signed off" and "the feature X provides is reachable"
 are different claims, and a per-component definition of done can only ever establish the first.
+
+## L33 — a certificate says no more than its writer checked; derived state is published whole
+
+Two defects in one component, one probe apart, same shape. The cold path published a graph and
+then filled it, so what a second thread captured was whatever the build had reached. The warm path
+noted its own changes and then stamped the graph "current through the header" -- a header another
+process had already moved past. In both, a reader was handed a picture whose certificate said more
+than the writer had verified: "complete" before the loop had ended; "current" over rows the writer
+had never seen. Both answered short with `stale` False, which is the worst shape a wrong answer can
+take (L22).
+
+**The rule:** derived state gets ONE publication, of a whole picture, by one assignment, and the
+mark it carries is the reading taken BEFORE the work began -- the only reading the picture can
+honestly claim. A later certification is legitimate only for the thread that (1) verified the
+picture was current at the moment it started and (2) did the whole of the change it certifies.
+Anyone else retires the picture and lets the next reader rebuild. "Stale by one commit, and the
+next reader will know" is a state a system can be in; "certified current and short" is not.
+
+**Corollary for a review:** when a component holds derived state, ask WHO writes its freshness
+mark and whether every writer of the mark is also a witness of everything the mark claims. The
+warm path was reviewed twice (B4, B5) for what it did to the graph and never once for what it did
+to the mark. And ROUND7-PLAN §1 designed the cold fix as four assignments; the reviewer (Codex)
+caught that four assignments are four windows before a line was written. That correction cost one
+message; found by a blind critic it would have cost a round.
