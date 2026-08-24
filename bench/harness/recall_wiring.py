@@ -133,6 +133,84 @@ def _append_gauge(metrics: Path, value: float) -> None:
     _replace_json(metrics, mutate)
 
 
+def _release_publication_locks(held: list[Path]) -> list[str]:
+    """Unlink held locks in REVERSE order; return diagnostics for any residue."""
+    residue: list[str] = []
+    for lock_path in reversed(held):
+        try:
+            os.unlink(str(lock_path))
+        except OSError as failure:
+            residue.append(f"{lock_path} ({failure})")
+    return residue
+
+
+def _acquire_publication_locks(
+    documents: list[Path],
+) -> tuple[list[Path], str | None]:
+    """Acquire one O_EXCL lock per document, sorted, transactionally.
+
+    Returns (held, None) on success, or ([], reason) after unwinding every lock
+    already held. Deterministic ordering makes opposite caller argument orders
+    take the locks in the same sequence, so two stages can contend but never
+    deadlock. Any failure between creation and close -- injected or real --
+    closes the descriptor, releases everything, and surfaces typed; ordinary
+    exceptions become the reason, KeyboardInterrupt/SystemExit propagate after
+    the same cleanup.
+    """
+    ordered = sorted({str(document) for document in documents})
+    held: list[Path] = []
+    for target in ordered:
+        lock_path = Path(target + ".c13.lock")
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            held.append(lock_path)
+            os.write(descriptor, str(os.getpid()).encode("ascii"))
+        except FileExistsError:
+            residue = _release_publication_locks(held)
+            reason = (
+                f"{lock_path} exists, so another stage holds (or died holding) "
+                "the publication lock; refusing to interleave. Remove the file "
+                "only after confirming no stage runs."
+            )
+            if residue:
+                reason += f" (release residue: {residue})"
+            return [], reason
+        except OSError as failure:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            residue = _release_publication_locks(held)
+            reason = (
+                f"the publication lock {lock_path} could not be taken or "
+                f"written ({failure})"
+            )
+            if residue:
+                reason += f" (release residue: {residue})"
+            return [], reason
+        except BaseException:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            _release_publication_locks(held)
+            raise
+        try:
+            os.close(descriptor)
+        except OSError as failure:
+            residue = _release_publication_locks(held)
+            reason = (
+                f"the lock descriptor for {lock_path} could not be closed ({failure})"
+            )
+            if residue:
+                reason += f" (release residue: {residue})"
+            return [], reason
+    return held, None
+
+
 def _publish_documents(
     *,
     profile: str,
@@ -260,37 +338,20 @@ def append_vector_recall(
                 "that is not a list; a gauge could never land there. Nothing was run."
             )
             return 3
-    # Round-3 B: competing stages over the same documents interleaved -- one could
-    # publish between the other's strip and append, ending with two gauges or a
-    # window where the gate passed early. An O_EXCL lock file beside the metrics
-    # (or calibration) document serializes them: the second stage REFUSES typed
-    # instead of interleaving, and a crashed holder's leftover file also refuses --
-    # fail-closed beats silently stealing a lock that may still be live. Release
-    # sits in a finally, so every exit path of the delegate frees it.
-    lock_target = metrics if metrics is not None else out
-    lock_path = (
-        lock_target.with_name(lock_target.name + ".c13.lock")
-        if lock_target is not None
-        else None
+    # Round-3 B, hardened per the lock blockers: EVERY non-None document gets its
+    # own O_EXCL lock (a single-target lock let two runs sharing out but not
+    # metrics interleave on the section), acquired in deterministic sorted order
+    # so opposite argument orders cannot deadlock, and released in reverse. The
+    # acquisition itself is transactional: a failure while creating, writing or
+    # closing any lock unwinds every lock already held before the typed refusal --
+    # and KeyboardInterrupt/SystemExit unwind too, then propagate. A normal run
+    # whose release leaves residue prints a diagnostic rather than staying silent.
+    held_locks, lock_refusal = _acquire_publication_locks(
+        [path for path in (out, metrics) if path is not None]
     )
-    if lock_path is not None:
-        try:
-            descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            print(
-                f"vector recall stage: REFUSED -- {lock_path} exists, so another "
-                "stage holds (or died holding) the publication lock; refusing to "
-                "interleave. Remove the file only after confirming no stage runs."
-            )
-            return 3
-        except OSError as failure:
-            print(
-                f"vector recall stage: REFUSED -- the publication lock {lock_path} "
-                f"could not be taken ({failure}); nothing was run."
-            )
-            return 3
-        os.write(descriptor, str(os.getpid()).encode("ascii"))
-        os.close(descriptor)
+    if lock_refusal is not None:
+        print(f"vector recall stage: REFUSED -- {lock_refusal}")
+        return 3
     try:
         return _publish_documents(
             profile=profile,
@@ -301,11 +362,11 @@ def append_vector_recall(
             timeout_seconds=timeout_seconds,
         )
     finally:
-        if lock_path is not None:
-            try:
-                os.unlink(str(lock_path))
-            except OSError:
-                pass
+        for residue_line in _release_publication_locks(held_locks):
+            print(
+                "vector recall stage: WARNING -- lock residue left behind: "
+                f"{residue_line}"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:

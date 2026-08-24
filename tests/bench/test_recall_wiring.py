@@ -710,6 +710,58 @@ def test_a_held_publication_lock_refuses_a_second_stage(
     assert not lock.exists(), "the stage releases its own lock on every exit"
 
 
+def test_every_document_is_locked_not_just_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lock blocker 1: a lock held on OUT alone must refuse a run that shares out
+    with a different metrics -- the single-target lock only covered metrics. Both
+    locks are released after a successful run."""
+    out, metrics = _seed_documents(tmp_path)
+    out_lock = out.with_name(out.name + ".c13.lock")
+    out_lock.write_text("12345", encoding="ascii")
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    assert not called, "a contended OUT lock must refuse before the worker"
+    assert out_lock.exists(), "a foreign lock must not be stolen"
+    out_lock.unlink()
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 0
+    assert not out_lock.exists()
+    assert not metrics.with_name(metrics.name + ".c13.lock").exists()
+
+
+def test_a_failed_acquisition_unwinds_every_already_held_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lock blocker 2: with two documents, the SECOND lock contended must release the
+    first before the typed refusal -- no lock and no descriptor may leak."""
+    out, metrics = _seed_documents(tmp_path)
+    # Sorted order: calibration.json < metrics.json, so the metrics lock is second.
+    metrics_lock = metrics.with_name(metrics.name + ".c13.lock")
+    metrics_lock.write_text("12345", encoding="ascii")
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    assert code == 3
+    assert not called
+    out_lock = out.with_name(out.name + ".c13.lock")
+    assert not out_lock.exists(), "the first-acquired lock must be unwound"
+    assert metrics_lock.exists(), "the foreign lock stays"
+    metrics_lock.unlink()
+
+
 def test_metrics_mutated_underneath_fails_typed_not_silent_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
