@@ -20,7 +20,10 @@ Three properties, through the public door and the fault bench of FR-16:
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
+from dataclasses import replace
+from pathlib import Path
 from threading import Event, Thread, current_thread
 from typing import Any
 
@@ -123,6 +126,26 @@ class _DieAfterIntentStagingStorage(FaultInjectingStorageDevice):
         return terminal
 
 
+class _DieAfterPendingRemovalStorage(FaultInjectingStorageDevice):
+    """Lose process-local delete debt after COMPLETE is durable but before its barrier."""
+
+    def __init__(self, inner: Any) -> None:
+        super().__init__(inner, seed=1)
+        self._died = False
+
+    def remove(self, file: str) -> None:
+        super().remove(file)
+        if (
+            not self._died
+            and file == assembly._FIRST_OPEN_INTENT
+            and self.inner.exists(assembly._FIRST_OPEN_COMPLETE)
+        ):
+            self._died = True
+            raise _CreatorDied(
+                "creator died after removing pending intent and before its global barrier"
+            )
+
+
 def _volatile_data_files(bench: Any) -> tuple[str, ...]:
     """Return the data files with a write no barrier has pinned (the control plane excluded)."""
     return tuple(
@@ -166,6 +189,22 @@ def test_an_identity_handed_out_by_the_first_open_survives_a_power_loss() -> Non
         outcome = ("opened", reopened.identity.database_uuid)
     release_ports(registry)
     assert outcome == ("opened", uuid)
+
+
+def test_successful_first_open_keeps_a_checksummed_positive_completion_authority() -> None:
+    registry, bench, inner = bench_registry(1)
+    with connect(":memory:", registry=registry) as database:
+        identity = database.identity
+
+    assert assembly._read_first_open_complete(bench) == identity
+    assert file_bytes(inner, assembly._FIRST_OPEN_COMPLETE) == (
+        assembly._encode_first_open_intent(
+            identity, magic=assembly._FIRST_OPEN_COMPLETE_MAGIC
+        )
+    )
+    assert not inner.exists(assembly._FIRST_OPEN_INTENT)
+    assert not inner.exists(assembly._FIRST_OPEN_COMPLETE_STAGING)
+    release_ports(registry)
 
 
 def test_read_only_waits_until_visible_first_open_files_are_durable(
@@ -392,6 +431,31 @@ def test_unknown_bootstrap_orphan_is_not_misclassified_as_an_empty_path() -> Non
     release_ports(registry)
 
 
+def test_public_connect_never_follows_bootstrap_redirect_into_a_victim(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "database"
+    victim = tmp_path / "victim"
+    root.mkdir()
+    victim.mkdir()
+    protected = victim / "first-open.intent"
+    protected.write_bytes(b"victim authority")
+    redirected = root / "bootstrap"
+    try:
+        os.symlink(victim, redirected, target_is_directory=True)
+    except (NotImplementedError, OSError) as failure:
+        pytest.skip(f"directory symlink/reparse creation is unavailable: {failure}")
+    before = {entry.name: entry.read_bytes() for entry in victim.iterdir()}
+    try:
+        with pytest.raises(GrafxUnsupportedOperation) as raised:
+            connect(str(root))
+        assert raised.value.details["reason"] == "redirected_path"
+        assert {entry.name: entry.read_bytes() for entry in victim.iterdir()} == before
+        assert tuple(entry.name for entry in root.iterdir()) == ("bootstrap",)
+    finally:
+        redirected.unlink()
+
+
 def test_bootstrap_orphan_beside_published_database_is_never_retired() -> None:
     """A final identity removes the proof that any bootstrap payload is expendable."""
     registry, _bench, inner = bench_registry(1)
@@ -423,12 +487,12 @@ def test_bootstrap_orphan_beside_published_database_is_never_retired() -> None:
         )
     }
     assert raised.value.details["field"] == "bootstrap_orphan"
-    assert raised.value.details["state"] == "published_without_intent"
+    assert raised.value.details["state"] == "unexpected_after_complete"
     assert after == before
     release_ports(registry)
 
 
-def test_an_interrupted_intent_cannot_overwrite_a_database_with_history() -> None:
+def test_a_resurrected_matching_intent_beside_history_is_completed_not_resumed() -> None:
     registry, bench, inner = bench_registry(1)
     database = connect(":memory:", registry=registry)
     with database.begin("write") as txn:
@@ -441,15 +505,149 @@ def test_an_interrupted_intent_cannot_overwrite_a_database_with_history() -> Non
         name: file_bytes(inner, name)
         for name in (META_FILE, CATALOG_FILE, HEAP_FILE)
     }
-    with pytest.raises(GrafxCorruptionDetected) as raised:
-        connect(":memory:", registry=registry)
+    with connect(":memory:", registry=registry) as reopened:
+        assert reopened.identity == identity
+        assert reopened.verify("all").findings == ()
     after = {
         name: file_bytes(inner, name)
         for name in (META_FILE, CATALOG_FILE, HEAP_FILE)
     }
-    release_ports(registry)
-    assert raised.value.details["field"] == "transaction_history"
     assert after == before
+    assert not inner.exists(assembly._FIRST_OPEN_INTENT)
+    release_ports(registry)
+
+
+def test_read_only_validates_but_never_retires_matching_completed_pending_state() -> None:
+    registry, bench, inner = bench_registry(1)
+    with connect(":memory:", registry=registry) as database:
+        identity = database.identity
+    assembly._write_first_open_intent(bench, identity)
+    pending = file_bytes(inner, assembly._FIRST_OPEN_INTENT)
+
+    with connect(":memory:", registry=registry, read_only=True) as reader:
+        assert reader.identity == identity
+        assert reader.verify("all").findings == ()
+    assert file_bytes(inner, assembly._FIRST_OPEN_INTENT) == pending
+
+    with connect(":memory:", registry=registry) as writer:
+        assert writer.identity == identity
+    assert not inner.exists(assembly._FIRST_OPEN_INTENT)
+    release_ports(registry)
+
+
+def test_complete_marker_must_match_meta_without_changing_evidence() -> None:
+    registry, _bench, inner = bench_registry(1)
+    with connect(":memory:", registry=registry) as database:
+        identity = database.identity
+    foreign = replace(identity, database_uuid=bytes(reversed(identity.database_uuid)))
+    payload = assembly._encode_first_open_intent(
+        foreign, magic=assembly._FIRST_OPEN_COMPLETE_MAGIC
+    )
+    inner.truncate_log(assembly._FIRST_OPEN_COMPLETE, 0)
+    inner.append_log(assembly._FIRST_OPEN_COMPLETE, payload)
+    inner.durable_barrier(assembly._FIRST_OPEN_COMPLETE)
+    names = inner.list_files()
+    before = {name: file_bytes(inner, name) for name in names}
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        connect(":memory:", registry=registry)
+    assert raised.value.details["state"] == "complete_meta_mismatch"
+    assert inner.list_files() == names
+    assert {name: file_bytes(inner, name) for name in names} == before
+    release_ports(registry)
+
+
+def test_complete_and_pending_identity_mismatch_is_preserved_and_refused() -> None:
+    registry, bench, inner = bench_registry(1)
+    with connect(":memory:", registry=registry) as database:
+        identity = database.identity
+    foreign = replace(identity, database_uuid=bytes(reversed(identity.database_uuid)))
+    assembly._write_first_open_intent(bench, foreign)
+    names = inner.list_files()
+    before = {name: file_bytes(inner, name) for name in names}
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        connect(":memory:", registry=registry)
+    assert raised.value.details["state"] == "pending_complete_mismatch"
+    assert inner.list_files() == names
+    assert {name: file_bytes(inner, name) for name in names} == before
+    release_ports(registry)
+
+
+def test_a_damaged_complete_marker_is_not_hidden_by_valid_finals() -> None:
+    registry, bench, inner = bench_registry(1)
+    with connect(":memory:", registry=registry):
+        pass
+    payload = bytearray(file_bytes(inner, assembly._FIRST_OPEN_COMPLETE) or b"")
+    payload[-1] ^= 0x01
+    inner.truncate_log(assembly._FIRST_OPEN_COMPLETE, 0)
+    inner.append_log(assembly._FIRST_OPEN_COMPLETE, bytes(payload))
+    inner.durable_barrier(assembly._FIRST_OPEN_COMPLETE)
+    finals = (META_FILE, CATALOG_FILE, HEAP_FILE)
+    before = {name: file_bytes(inner, name) for name in (*finals, assembly._FIRST_OPEN_COMPLETE)}
+    bench.clear_trail()
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        connect(":memory:", registry=registry)
+    after = {name: file_bytes(inner, name) for name in (*finals, assembly._FIRST_OPEN_COMPLETE)}
+    assert raised.value.details["field"] == "crc32c"
+    assert after == before
+    assert not any(
+        record.file == META_FILE and record.method in {"page_count", "read_page"}
+        for record in bench.trail()
+    )
+    release_ports(registry)
+
+
+def test_new_adapter_reinforces_complete_before_history_and_survived_pending_returns() -> None:
+    """Absence of PENDING never authorises history; durable COMPLETE does.
+
+    The creator dies after removing PENDING but before the global barrier that would pin that
+    absence.  A wholly new fault adapter has no deletion debt to inherit.  It must first
+    reinforce the positive COMPLETE marker, may then commit history, and a later power loss of
+    the dead creator may resurrect matching PENDING (and the atomic-rename source staging).
+    The next writer classifies those bytes as an already completed first open, preserves the
+    transaction history, and durably retires only the matching duplicates.
+    """
+    config = DatabaseConfig(path=":memory:")
+    registry = build_default_registry(config)
+    inner = registry.get("storage")
+    creator = _DieAfterPendingRemovalStorage(inner)
+    creator.start_reordering()
+    registry.bind("storage", creator)
+
+    with pytest.raises(_CreatorDied):
+        connect(":memory:", registry=registry)
+    identity = assembly._read_first_open_complete(creator)
+    assert identity is not None
+    assert not inner.exists(assembly._FIRST_OPEN_INTENT)
+    assert assembly._FIRST_OPEN_INTENT in creator.volatile_files()
+
+    second_process = FaultInjectingStorageDevice(inner, seed=2)
+    registry.bind("storage", second_process)
+    with connect(":memory:", registry=registry) as writer:
+        assert writer.identity == identity
+        with writer.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE AfterComplete(id INT64, PRIMARY KEY(id))")
+        assert writer.verify("all").findings == ()
+
+    # The old process's process-local debt is deliberately the only thing that knows the
+    # removal was not pinned.  A lying-barrier power loss deterministically rolls all of that
+    # debt back, exactly as a new process cannot prevent.
+    creator.lie_on_barrier()
+    power_loss(creator)
+    assert inner.exists(assembly._FIRST_OPEN_INTENT)
+    assert inner.exists(assembly._FIRST_OPEN_COMPLETE_STAGING)
+
+    third_process = FaultInjectingStorageDevice(inner, seed=3)
+    registry.bind("storage", third_process)
+    with connect(":memory:", registry=registry) as reopened:
+        assert reopened.identity == identity
+        assert reopened.verify("all").findings == ()
+    assert not inner.exists(assembly._FIRST_OPEN_INTENT)
+    assert not inner.exists(assembly._FIRST_OPEN_COMPLETE_STAGING)
+    assert assembly._read_first_open_complete(third_process) == identity
+    release_ports(registry)
 
 
 def test_a_damaged_intent_is_never_interpreted_as_an_absent_intent() -> None:
@@ -471,6 +669,30 @@ def test_a_damaged_intent_is_never_interpreted_as_an_absent_intent() -> None:
     assert not inner.exists(META_FILE)
     assert not inner.exists(CATALOG_FILE)
     assert not inner.exists(HEAP_FILE)
+    release_ports(registry)
+
+
+def test_valid_pending_intent_refuses_foreign_namespace_evidence_without_mutation() -> None:
+    registry, bench, inner = bench_registry(1)
+    identity = assembly._configured_identity(
+        DatabaseConfig(path=":memory:"), registry.get("clock")
+    )
+    assembly._write_first_open_intent(bench, identity)
+    foreign = "operator/restore.evidence"
+    inner.create(foreign)
+    inner.append_log(foreign, b"do not classify me as empty")
+    inner.durable_barrier(foreign)
+    names = inner.list_files()
+    before = {name: file_bytes(inner, name) for name in names}
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        connect(":memory:", registry=registry)
+
+    assert raised.value.details["field"] == "first_open_namespace"
+    assert raised.value.details["state"] == "foreign_evidence"
+    assert inner.list_files() == names
+    assert {name: file_bytes(inner, name) for name in names} == before
+    assert not any(inner.exists(name) for name in (META_FILE, CATALOG_FILE, HEAP_FILE))
     release_ports(registry)
 
 
@@ -572,7 +794,7 @@ def test_missing_identity_over_existing_stores_never_mints_a_new_uuid() -> None:
 
     with pytest.raises(GrafxCorruptionDetected) as raised:
         connect(":memory:", registry=registry)
-    assert raised.value.details["field"] == "identity_missing"
+    assert raised.value.details["field"] == "first_open_complete"
     assert not inner.exists(META_FILE)
     assert file_bytes(inner, CATALOG_FILE) == catalog_before
     assert file_bytes(inner, HEAP_FILE) == heap_before
@@ -636,6 +858,46 @@ def test_a_retry_refuses_one_divergent_byte_without_overwriting_any_final() -> N
     assert not inner.exists(HEAP_FILE)
     assert inner.exists(assembly._FIRST_OPEN_INTENT)
     release_ports(registry)
+
+
+def test_crash_before_and_after_every_completion_marker_write_converges() -> None:
+    registry, bench, _inner = bench_registry(1)
+    surveyed = bench.enumerate_write_points(lambda device: _open_and_close(registry))
+    release_ports(registry)
+    marker_files = {
+        assembly._FIRST_OPEN_COMPLETE_STAGING,
+        assembly._FIRST_OPEN_COMPLETE,
+    }
+    points = tuple(point for point in surveyed if point.file in marker_files)
+    assert [(point.method, point.file) for point in points] == [
+        ("create", assembly._FIRST_OPEN_COMPLETE_STAGING),
+        ("append_log", assembly._FIRST_OPEN_COMPLETE_STAGING),
+        ("durable_barrier", assembly._FIRST_OPEN_COMPLETE_STAGING),
+        ("atomic_replace", assembly._FIRST_OPEN_COMPLETE_STAGING),
+        ("durable_barrier", assembly._FIRST_OPEN_COMPLETE),
+    ]
+
+    outcomes: dict[str, str] = {}
+    for point in points:
+        for moment in ("before", "after"):
+            registry, bench, inner = bench_registry(1)
+            bench.clear_trail()
+            bench.crash_at(point.call_index, moment=moment)
+            with pytest.raises(SimulatedCrash):
+                _open_and_close(registry)
+            bench.disarm()
+            key = f"{point.method}:{point.file}:{moment}"
+            try:
+                with connect(":memory:", registry=registry) as reopened:
+                    findings = reopened.verify("all").findings
+                    outcomes[key] = f"opened:verify={len(findings)}"
+            except GrafxError as refused:
+                outcomes[key] = f"refused:{type(refused).__name__}:{refused.code}"
+            assert inner.exists(assembly._FIRST_OPEN_COMPLETE), key
+            assert not inner.exists(assembly._FIRST_OPEN_INTENT), key
+            assert not inner.exists(assembly._FIRST_OPEN_COMPLETE_STAGING), key
+            release_ports(registry)
+    assert set(outcomes.values()) == {"opened:verify=0"}, outcomes
 
 
 def test_a_power_loss_at_every_first_open_write_point_makes_writable_progress() -> None:

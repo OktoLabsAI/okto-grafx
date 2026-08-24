@@ -127,6 +127,12 @@ _FIRST_OPEN_INTENT: str = f"{_FIRST_OPEN_DIRECTORY}/first-open.intent"
 _FIRST_OPEN_INTENT_STAGING: str = f"{_FIRST_OPEN_INTENT}.staging"
 """Unpublished intent bytes; safe to discard before any final file exists."""
 
+_FIRST_OPEN_COMPLETE: str = f"{_FIRST_OPEN_DIRECTORY}/first-open.complete"
+"""Permanent positive authority that the first-open unit reached durable completion."""
+
+_FIRST_OPEN_COMPLETE_STAGING: str = f"{_FIRST_OPEN_COMPLETE}.staging"
+"""Unpublished complete marker bytes before their atomic canonical publication."""
+
 _FIRST_OPEN_META_STAGING: str = f"{_FIRST_OPEN_DIRECTORY}/grafx.meta.staging"
 """Complete identity page before its atomic publication."""
 
@@ -138,6 +144,9 @@ _FIRST_OPEN_HEAP_STAGING: str = f"{_FIRST_OPEN_DIRECTORY}/heap.dat.staging"
 
 _FIRST_OPEN_INTENT_MAGIC: bytes = b"OKGFXOPN"
 """Eight-byte discriminator of a first-open intent record."""
+
+_FIRST_OPEN_COMPLETE_MAGIC: bytes = b"OKGFXCMP"
+"""Eight-byte discriminator of a completed first-open record."""
 
 _FIRST_OPEN_INTENT_VERSION: int = 1
 """Newest first-open intent format understood by this build."""
@@ -161,12 +170,18 @@ _FIRST_OPEN_INTENT_MAX_BYTES: int = (
 _FIRST_OPEN_STAGING_FILES: frozenset[str] = frozenset(
     {
         _FIRST_OPEN_INTENT_STAGING,
+        _FIRST_OPEN_COMPLETE_STAGING,
         _FIRST_OPEN_META_STAGING,
         _FIRST_OPEN_CATALOG_STAGING,
         _FIRST_OPEN_HEAP_STAGING,
     }
 )
 """Names this protocol may retire as unpublished debris on an otherwise empty path."""
+
+_FIRST_OPEN_PROTOCOL_FILES: frozenset[str] = (
+    _FIRST_OPEN_STAGING_FILES | {_FIRST_OPEN_INTENT, _FIRST_OPEN_COMPLETE}
+)
+"""Complete whitelist of names owned by the first-open state machine."""
 
 _Port = TypeVar("_Port")
 """The protocol a port slot is read back as."""
@@ -754,6 +769,15 @@ def _open_identity(
         # that dies in that interval releases this section but leaves the intent as the durable
         # authority; a reader must refuse it rather than interpret the visible meta page.
         intent = _read_first_open_intent(storage)
+        complete = _read_first_open_complete(storage)
+        if complete is not None:
+            return _open_completed_identity(
+                config,
+                storage,
+                meta,
+                intent=intent,
+                complete=complete,
+            )
         if config.read_only:
             if intent is not None:
                 _refuse_pending_first_open(config)
@@ -779,6 +803,110 @@ def _open_identity(
         _require_identity_configuration(config, intent)
         _resume_first_open(storage, pool, intent)
         return intent
+
+
+def _open_completed_identity(
+    config: DatabaseConfig,
+    storage: StorageDevice,
+    meta: MetaStore,
+    *,
+    intent: DatabaseIdentity | None,
+    complete: DatabaseIdentity,
+) -> DatabaseIdentity:
+    """Validate positive completion authority and reinforce it before any writable history."""
+    _require_identity_configuration(config, complete)
+    if intent is not None and intent != complete:
+        raise GrafxCorruptionDetected(
+            "Pending and completed first-open records name different database identities; "
+            "neither record will be changed.",
+            file=_FIRST_OPEN_COMPLETE,
+            field="identity",
+            state="pending_complete_mismatch",
+        )
+    bootstrap_files = _bootstrap_files(storage)
+    allowed = {_FIRST_OPEN_COMPLETE}
+    if intent is not None:
+        allowed.add(_FIRST_OPEN_INTENT)
+    duplicate_complete_staging = storage.exists(_FIRST_OPEN_COMPLETE_STAGING)
+    if duplicate_complete_staging:
+        staged_complete = _read_first_open_intent_file(
+            storage,
+            _FIRST_OPEN_COMPLETE_STAGING,
+            expected_magic=_FIRST_OPEN_COMPLETE_MAGIC,
+        )
+        if staged_complete != complete:
+            raise GrafxCorruptionDetected(
+                "Canonical and staging completion markers name different database identities; "
+                "neither record will be changed.",
+                file=_FIRST_OPEN_COMPLETE_STAGING,
+                field="identity",
+                state="divergent_complete_staging",
+            )
+        allowed.add(_FIRST_OPEN_COMPLETE_STAGING)
+    unexpected = tuple(name for name in bootstrap_files if name not in allowed)
+    if unexpected:
+        raise GrafxCorruptionDetected(
+            "A completed first-open marker coexists with unexpected bootstrap staging. The "
+            "evidence will not be deleted or ignored.",
+            file=unexpected[0],
+            files=bootstrap_files,
+            field="bootstrap_orphan",
+            state="unexpected_after_complete",
+        )
+    if not storage.exists(META_FILE):
+        raise GrafxCorruptionDetected(
+            "The first-open completion marker exists but grafx.meta is absent.",
+            file=META_FILE,
+            field="first_open_complete",
+            state="final_missing",
+        )
+    stored = _read_existing_identity(config, storage, meta)
+    if stored != complete:
+        raise GrafxCorruptionDetected(
+            "The permanent first-open completion identity does not match grafx.meta.",
+            file=_FIRST_OPEN_COMPLETE,
+            field="identity",
+            state="complete_meta_mismatch",
+        )
+    _require_complete_final_files(storage)
+    if config.read_only:
+        # Read-only validates every byte above but never cleans pending state or manufactures a
+        # durability acknowledgement. A writable participant owns both actions.
+        return stored
+
+    # A new process has no process-local knowledge of the marker's original rename. Re-fsyncing
+    # the positive authority is the fence before WalManager can create transaction history.
+    storage.durable_barrier(_FIRST_OPEN_COMPLETE)
+    cleanup = []
+    if duplicate_complete_staging:
+        cleanup.append(_FIRST_OPEN_COMPLETE_STAGING)
+    if intent is not None:
+        cleanup.append(_FIRST_OPEN_INTENT)
+    for file in cleanup:
+        storage.remove(file)
+    if cleanup:
+        storage.durable_barrier(None)
+    return stored
+
+
+def _require_complete_final_files(storage: StorageDevice) -> None:
+    """Require page-aligned, non-empty catalog and heap beside positive completion authority."""
+    for file in (CATALOG_FILE, HEAP_FILE):
+        if not storage.exists(file):
+            raise GrafxCorruptionDetected(
+                f"The first-open completion marker exists but final file {file!r} is absent.",
+                file=file,
+                field="first_open_complete",
+                state="final_missing",
+            )
+        pages = storage.page_count(file)
+        if pages < 1:
+            raise GrafxCorruptionDetected(
+                f"The first-open completion marker exists but final file {file!r} is empty.",
+                file=file,
+                field="first_open_complete",
+                state="final_empty",
+            )
 
 
 def _refuse_pending_first_open(config: DatabaseConfig) -> None:
@@ -813,6 +941,12 @@ def _require_no_bootstrap_orphan_for_read_only(
         return
     if _FIRST_OPEN_INTENT_STAGING in files:
         _read_first_open_intent_file(storage, _FIRST_OPEN_INTENT_STAGING)
+    if _FIRST_OPEN_COMPLETE_STAGING in files:
+        _read_first_open_intent_file(
+            storage,
+            _FIRST_OPEN_COMPLETE_STAGING,
+            expected_magic=_FIRST_OPEN_COMPLETE_MAGIC,
+        )
     raise GrafxUnsupportedOperation(
         f"The database at {config.path!r} has unpublished first-open staging files. A writable "
         "open must retire or resume them before read-only can observe the path.",
@@ -983,8 +1117,10 @@ def _require_identity_configuration(
         )
 
 
-def _encode_first_open_intent(identity: DatabaseIdentity) -> bytes:
-    """Encode a versioned, checksummed first-open intent carrying the future UUID."""
+def _encode_first_open_intent(
+    identity: DatabaseIdentity, *, magic: bytes = _FIRST_OPEN_INTENT_MAGIC
+) -> bytes:
+    """Encode a versioned, checksummed first-open authority carrying the database UUID."""
     encoded_identity = identity.encode()
     if len(encoded_identity) > _FIRST_OPEN_IDENTITY_MAX_BYTES:
         raise GrafxConfigurationError(
@@ -994,7 +1130,7 @@ def _encode_first_open_intent(identity: DatabaseIdentity) -> bytes:
             maximum=_FIRST_OPEN_IDENTITY_MAX_BYTES,
         )
     head = _FIRST_OPEN_INTENT_HEAD.pack(
-        _FIRST_OPEN_INTENT_MAGIC,
+        magic,
         _FIRST_OPEN_INTENT_VERSION,
         len(encoded_identity),
     )
@@ -1003,7 +1139,10 @@ def _encode_first_open_intent(identity: DatabaseIdentity) -> bytes:
 
 
 def _decode_first_open_intent(
-    raw: bytes, *, file: str = _FIRST_OPEN_INTENT
+    raw: bytes,
+    *,
+    file: str = _FIRST_OPEN_INTENT,
+    expected_magic: bytes = _FIRST_OPEN_INTENT_MAGIC,
 ) -> DatabaseIdentity:
     """Decode one exact first-open intent, refusing truncation, extensions and damage."""
     minimum = _FIRST_OPEN_INTENT_HEAD.size + _FIRST_OPEN_INTENT_TAIL.size
@@ -1024,7 +1163,7 @@ def _decode_first_open_intent(
             maximum=_FIRST_OPEN_INTENT_MAX_BYTES,
         )
     magic, version, identity_length = _FIRST_OPEN_INTENT_HEAD.unpack_from(raw, 0)
-    if magic != _FIRST_OPEN_INTENT_MAGIC:
+    if magic != expected_magic:
         raise GrafxCorruptionDetected(
             "The first-open intent carries a foreign magic and cannot authorise publication.",
             file=file,
@@ -1087,8 +1226,22 @@ def _read_first_open_intent(storage: StorageDevice) -> DatabaseIdentity | None:
     return _read_first_open_intent_file(storage, _FIRST_OPEN_INTENT)
 
 
+def _read_first_open_complete(storage: StorageDevice) -> DatabaseIdentity | None:
+    """Return the permanent completion identity, or None only when its name is absent."""
+    if not storage.exists(_FIRST_OPEN_COMPLETE):
+        return None
+    return _read_first_open_intent_file(
+        storage,
+        _FIRST_OPEN_COMPLETE,
+        expected_magic=_FIRST_OPEN_COMPLETE_MAGIC,
+    )
+
+
 def _read_first_open_intent_file(
-    storage: StorageDevice, file: str
+    storage: StorageDevice,
+    file: str,
+    *,
+    expected_magic: bytes = _FIRST_OPEN_INTENT_MAGIC,
 ) -> DatabaseIdentity:
     """Read one intent with a hard bound proved from its fixed header first.
 
@@ -1120,7 +1273,7 @@ def _read_first_open_intent_file(
             expected=_FIRST_OPEN_INTENT_HEAD.size,
         )
     magic, version, identity_length = _FIRST_OPEN_INTENT_HEAD.unpack(header)
-    if magic != _FIRST_OPEN_INTENT_MAGIC:
+    if magic != expected_magic:
         raise GrafxCorruptionDetected(
             "The first-open intent carries a foreign magic and cannot authorise publication.",
             file=file,
@@ -1174,7 +1327,11 @@ def _read_first_open_intent_file(
             value=len(raw),
             expected=expected,
         )
-    return _decode_first_open_intent(raw, file=file)
+    return _decode_first_open_intent(
+        raw,
+        file=file,
+        expected_magic=expected_magic,
+    )
 
 
 def _write_first_open_intent(
@@ -1217,6 +1374,45 @@ def _write_first_open_intent(
     storage.durable_barrier(_FIRST_OPEN_INTENT)
 
 
+def _write_first_open_complete(
+    storage: StorageDevice, identity: DatabaseIdentity
+) -> None:
+    """Publish the permanent positive authority before retiring the pending intent."""
+    payload = _encode_first_open_intent(identity, magic=_FIRST_OPEN_COMPLETE_MAGIC)
+    if storage.exists(_FIRST_OPEN_COMPLETE):
+        raise GrafxCorruptionDetected(
+            "A first-open completion marker already exists and will not be overwritten.",
+            file=_FIRST_OPEN_COMPLETE,
+            field="first_open_complete",
+            state="already_published",
+        )
+    if storage.exists(_FIRST_OPEN_COMPLETE_STAGING):
+        storage.remove(_FIRST_OPEN_COMPLETE_STAGING)
+        storage.durable_barrier(None)
+    storage.create(_FIRST_OPEN_COMPLETE_STAGING)
+    terminal = storage.append_log(_FIRST_OPEN_COMPLETE_STAGING, payload)
+    if terminal != len(payload):
+        raise GrafxCorruptionDetected(
+            f"The first-open completion append reported terminal offset {terminal}; "
+            f"{len(payload)} was required.",
+            file=_FIRST_OPEN_COMPLETE_STAGING,
+            field="terminal_offset",
+            value=terminal,
+            expected=len(payload),
+        )
+    storage.durable_barrier(_FIRST_OPEN_COMPLETE_STAGING)
+    if storage.exists(_FIRST_OPEN_COMPLETE):
+        raise GrafxCorruptionDetected(
+            "A first-open completion marker appeared while its staging payload was being "
+            "prepared; neither name will be overwritten.",
+            file=_FIRST_OPEN_COMPLETE,
+            field="first_open_complete",
+            state="publication_race",
+        )
+    storage.atomic_replace(_FIRST_OPEN_COMPLETE_STAGING, _FIRST_OPEN_COMPLETE)
+    storage.durable_barrier(_FIRST_OPEN_COMPLETE)
+
+
 def _resume_first_open(
     storage: StorageDevice, pool: BufferPool, identity: DatabaseIdentity
 ) -> None:
@@ -1230,6 +1426,7 @@ def _resume_first_open(
     can never be reclassified as a fresh database.
     """
     _require_resumable_first_open(storage)
+    _require_pending_first_open_namespace(storage)
     _stage_meta(storage, pool, identity)
     _stage_catalog(storage, pool)
     _stage_heap(storage, pool)
@@ -1249,6 +1446,10 @@ def _resume_first_open(
     # operation: it pins their complete payloads and the namespace entries before the intent can
     # disappear.  A power loss before here retains the intent and retries the same UUID.
     storage.durable_barrier(None)
+    # Absence can never be the authority that publication completed.  This permanent marker is
+    # staged and pinned while the intent is still present; only its positive, checksummed UUID
+    # lets a later process classify a resurrected intent beside real WAL as already completed.
+    _write_first_open_complete(storage, identity)
     storage.remove(_FIRST_OPEN_INTENT)
     # The absence is itself part of the protocol.  Pinning it means an old intent cannot return
     # after connect() has handed the database to user code and accepted real transactions.
@@ -1267,6 +1468,28 @@ def _require_resumable_first_open(storage: StorageDevice) -> None:
             wal_files=wal_files,
             commit_state=storage.exists(COMMIT_STATE_FILE),
         )
+
+
+def _require_pending_first_open_namespace(storage: StorageDevice) -> None:
+    """Allow pending publication to coexist only with its control and canonical files."""
+    finals = {META_FILE, CATALOG_FILE, HEAP_FILE}
+    foreign = tuple(
+        name
+        for name in storage.list_files()
+        if not name.startswith("control/")
+        and name not in _FIRST_OPEN_PROTOCOL_FILES
+        and name not in finals
+    )
+    if not foreign:
+        return
+    raise GrafxCorruptionDetected(
+        "A pending first-open intent coexists with files outside its complete namespace "
+        "whitelist. They are preserved as possible database/restore evidence.",
+        file=foreign[0],
+        files=foreign,
+        field="first_open_namespace",
+        state="foreign_evidence",
+    )
 
 
 def _discard_staging(storage: StorageDevice, file: str) -> None:
