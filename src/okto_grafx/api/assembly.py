@@ -12,12 +12,14 @@ is depended on by the ones after it:
 1. the page cache, because every store reads and writes through it;
 2. the identity page, because SPEC-M1 FR-1 says a database has an identity before it has content,
    and because opening a database at a different page size than it was created with must be
-   refused before a single page is decoded against the wrong layout;
+   refused before a single page is decoded against the wrong layout. On the very first open this
+   step publishes the identity, empty catalog and empty heap together from durable staging files;
 3. the log, the ledger and quarantine, because recovery needs all three;
 4. **recovery, before any transaction can be opened** (FR-1, FR-8) -- the whole point of running
    it at open is that nothing observes the database until the log has been believed or truncated;
-5. the catalog and the heap, whose bootstrap must not run before recovery has replayed the pages
-   that decide what they hold;
+5. the catalog and the heap: an existing database validates and loads them only after recovery
+   has replayed the pages that decide what they hold; a new database validates the complete empty
+   files that step 2 already published and never bootstraps an authoritative partial file;
 6. the index registry, the vector engine and the transaction manager, which serve callers.
 
 **Anything opened is registered before the next step can fail.** The assembly runs inside one
@@ -34,18 +36,23 @@ from __future__ import annotations
 
 import hashlib
 import os
+import struct
 import threading
 import uuid
 from collections.abc import Callable
 from typing import TypeVar, cast
 
+from okto_grafx.adapters.graph_guard import ConditionGuard
+from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
 from okto_grafx.domain.errors import (
-    GrafxUnsupportedOperation,
-    GrafxIndexError,
     GrafxConfigurationError,
+    GrafxCorruptionDetected,
     GrafxError,
+    GrafxIndexError,
     GrafxSchemaVersionMismatch,
+    GrafxUnsupportedOperation,
 )
+from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.codec import PageCodec
 from okto_grafx.domain.ports.coordination import ProcessCoordinator
@@ -53,13 +60,13 @@ from okto_grafx.domain.ports.events import EventSink
 from okto_grafx.domain.ports.metrics import MetricsSink
 from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.ports.vectormath import VectorMath
+from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE
 from okto_grafx.engine.buffer_pool import BufferPool
+from okto_grafx.engine.catalog_store import CATALOG_FILE, CatalogStore
 from okto_grafx.engine.catalog_store import MINIMUM_FRAMES as CATALOG_FRAMES
-from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.database import META_FILE, Database, DatabaseIdentity, MetaStore
+from okto_grafx.engine.heap_store import HEAP_FILE, HeapStore
 from okto_grafx.engine.heap_store import MINIMUM_FRAMES as HEAP_FRAMES
-from okto_grafx.engine.heap_store import HeapStore
-from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
 from okto_grafx.engine.index_manager import (
     IndexManager,
     edge_from_index_name,
@@ -72,12 +79,11 @@ from okto_grafx.engine.index_manager import (
 from okto_grafx.engine.ledger_store import LedgerStore
 from okto_grafx.engine.metrics_catalog import register_catalog
 from okto_grafx.engine.quarantine import QuarantineStore
-from okto_grafx.adapters.graph_guard import ConditionGuard
-from okto_grafx.engine.recovery_manager import RecoveryManager
 from okto_grafx.engine.query_engine import QueryEngine
+from okto_grafx.engine.recovery_manager import RecoveryManager
 from okto_grafx.engine.txn_manager import TransactionManager
-from okto_grafx.engine.verifier import Verifier
 from okto_grafx.engine.vector_engine import VectorEngine
+from okto_grafx.engine.verifier import Verifier
 from okto_grafx.engine.wal_manager import WalManager
 from okto_grafx.runtime.config import MEMORY_PATH, DatabaseConfig
 from okto_grafx.runtime.registry import PortRegistry
@@ -108,6 +114,36 @@ The catalog and the heap each declare their own floor; the composition root need
 the two and must never re-state either number, because a second copy of a bound is how two
 validators that agree today stop agreeing tomorrow.
 """
+
+_FIRST_OPEN_SECTION: str = "first-open"
+"""Cross-process section that publishes a fresh database exactly once."""
+
+_FIRST_OPEN_DIRECTORY: str = "bootstrap"
+"""Private namespace for first-open intent and unpublished paged files."""
+
+_FIRST_OPEN_INTENT: str = f"{_FIRST_OPEN_DIRECTORY}/first-open.intent"
+"""Durable identity of an interrupted first open."""
+
+_FIRST_OPEN_META_STAGING: str = f"{_FIRST_OPEN_DIRECTORY}/grafx.meta.staging"
+"""Complete identity page before its atomic publication."""
+
+_FIRST_OPEN_CATALOG_STAGING: str = f"{_FIRST_OPEN_DIRECTORY}/catalog.dat.staging"
+"""Complete empty catalog before its atomic publication."""
+
+_FIRST_OPEN_HEAP_STAGING: str = f"{_FIRST_OPEN_DIRECTORY}/heap.dat.staging"
+"""Complete empty heap before its atomic publication."""
+
+_FIRST_OPEN_INTENT_MAGIC: bytes = b"OKGFXOPN"
+"""Eight-byte discriminator of a first-open intent record."""
+
+_FIRST_OPEN_INTENT_VERSION: int = 1
+"""Newest first-open intent format understood by this build."""
+
+_FIRST_OPEN_INTENT_HEAD: struct.Struct = struct.Struct("<8sHH")
+"""Intent magic, format version and encoded identity length."""
+
+_FIRST_OPEN_INTENT_TAIL: struct.Struct = struct.Struct("<I")
+"""CRC-32C over the intent header and encoded identity."""
 
 _Port = TypeVar("_Port")
 """The protocol a port slot is read back as."""
@@ -219,7 +255,7 @@ def assemble_database(
             # re-entrant because a checkpoint flushes and an invalidation writes back.
             guard=threading.RLock(),
         )
-        identity = _open_identity(config, pool, clock)
+        identity = _open_identity(config, pool, clock, storage, coordinator)
 
         wal = WalManager(
             storage,
@@ -319,12 +355,14 @@ def assemble_database(
         # load the catalog; the proof performs no repair or other persistence.
         if config.read_only:
             recovery.require_read_only_consistent()
+            _require_published_stores(catalog, heap)
             load_catalog_and_sync_existing_indexes()
             report = None
         else:
             report = recovery.run()
 
         if not config.read_only:
+            _require_published_stores(catalog, heap)
             catalog.bootstrap()
             heap.bootstrap()
             # Identity, catalog and heap headers define whether this directory is a database at
@@ -653,35 +691,365 @@ def _require_page_size_of_record(config: DatabaseConfig, storage: StorageDevice)
     )
 
 
-def _open_identity(config: DatabaseConfig, pool: BufferPool, clock: Clock) -> DatabaseIdentity:
-    """Read the identity of an existing database, or stamp one on a database being created."""
-    meta = MetaStore(pool)
-    expected = DatabaseIdentity(
+def _configured_identity(config: DatabaseConfig, clock: Clock) -> DatabaseIdentity:
+    """Return the identity a first open would publish from this configuration."""
+    return DatabaseIdentity(
         database_uuid=new_database_uuid(),
         page_size=config.page_size,
         partitions_per_table=config.partitions_per_table,
         created_at_wall=clock.wall(),
         granularity_descriptor=config.granularity_descriptor,
     )
-    if not config.read_only:
-        return meta.open(expected)
-    if not meta.exists():
+
+
+def _open_identity(
+    config: DatabaseConfig,
+    pool: BufferPool,
+    clock: Clock,
+    storage: StorageDevice,
+    coordinator: ProcessCoordinator,
+) -> DatabaseIdentity:
+    """Read an existing identity or atomically publish one complete empty database.
+
+    A fresh database is assembled under a cross-process section.  Its versioned intent is
+    durable before any authoritative file appears, and every paged file is first checkpointed
+    under an unpublished name.  Atomic replacement therefore exposes either no final file or a
+    complete file; a retry reads the intent and uses the same UUID.
+    """
+    meta = MetaStore(pool)
+    if config.read_only:
+        return _read_existing_identity(config, storage, meta)
+
+    with coordinator.exclusive(
+        _FIRST_OPEN_SECTION, timeout=config.commit_lock_timeout_seconds
+    ):
+        intent = _read_first_open_intent(storage)
+        if intent is None and storage.exists(META_FILE):
+            return _read_existing_identity(config, storage, meta)
+        if intent is None:
+            _require_no_database_without_identity(storage)
+            intent = _configured_identity(config, clock)
+            _write_first_open_intent(storage, intent)
+        _require_identity_configuration(config, intent)
+        _resume_first_open(storage, pool, intent)
+        return intent
+
+
+def _read_existing_identity(
+    config: DatabaseConfig, storage: StorageDevice, meta: MetaStore
+) -> DatabaseIdentity:
+    """Read a complete published identity, never interpreting a partial file as absence."""
+    if not storage.exists(META_FILE):
+        evidence = _database_files_without_identity(storage)
+        commit_state = storage.exists(COMMIT_STATE_FILE)
+        if evidence or commit_state:
+            raise GrafxCorruptionDetected(
+                f"The database identity {META_FILE!r} is absent while authoritative files "
+                f"remain: {evidence}. This is damage, not an empty path.",
+                file=META_FILE,
+                field="identity_missing",
+                files=evidence,
+                commit_state=commit_state,
+            )
         raise GrafxUnsupportedOperation(
             f"There is no database at {config.path!r} and read_only was requested, so there is "
             "nothing to open and nothing may be created.",
             path=config.path,
             field="read_only",
         )
+    if not meta.exists():
+        raise GrafxCorruptionDetected(
+            f"The published identity file {META_FILE!r} exists without its complete page; "
+            "it is an interrupted or damaged database, not an empty path.",
+            file=META_FILE,
+            field="page_count",
+            value=storage.page_count(META_FILE),
+        )
     stored = meta.read()
-    if stored.page_size != config.page_size:
-        raise GrafxConfigurationError(
-            f"This database was created with {stored.page_size}-byte pages and is being opened "
+    _require_identity_configuration(config, stored)
+    return stored
+
+
+def _database_files_without_identity(storage: StorageDevice) -> tuple[str, ...]:
+    """Return namespace evidence that cannot belong to a path awaiting its first identity."""
+    return tuple(
+        name
+        for name in storage.list_files()
+        if not name.startswith("control/")
+        and not name.startswith(f"{_FIRST_OPEN_DIRECTORY}/")
+    )
+
+
+def _require_no_database_without_identity(storage: StorageDevice) -> None:
+    """Refuse to mint a UUID over files whose original identity is missing."""
+    evidence = _database_files_without_identity(storage)
+    if not evidence and not storage.exists(COMMIT_STATE_FILE):
+        return
+    raise GrafxCorruptionDetected(
+        f"The database identity {META_FILE!r} is absent while authoritative state remains; "
+        "a new UUID would mask an existing damaged database.",
+        file=META_FILE,
+        field="identity_missing",
+        files=evidence,
+        commit_state=storage.exists(COMMIT_STATE_FILE),
+    )
+
+
+def _require_identity_configuration(
+    config: DatabaseConfig, identity: DatabaseIdentity
+) -> None:
+    """Refuse to decode paged files at a size other than their durable identity declares."""
+    if identity.page_size != config.page_size:
+        raise GrafxSchemaVersionMismatch(
+            f"This database was created with {identity.page_size}-byte pages and is being opened "
             f"with {config.page_size}-byte pages.",
             field="page_size",
             value=config.page_size,
-            stored=stored.page_size,
+            stored=identity.page_size,
         )
-    return stored
+
+
+def _encode_first_open_intent(identity: DatabaseIdentity) -> bytes:
+    """Encode a versioned, checksummed first-open intent carrying the future UUID."""
+    encoded_identity = identity.encode()
+    head = _FIRST_OPEN_INTENT_HEAD.pack(
+        _FIRST_OPEN_INTENT_MAGIC,
+        _FIRST_OPEN_INTENT_VERSION,
+        len(encoded_identity),
+    )
+    body = head + encoded_identity
+    return body + _FIRST_OPEN_INTENT_TAIL.pack(crc32c(body))
+
+
+def _decode_first_open_intent(raw: bytes) -> DatabaseIdentity:
+    """Decode one exact first-open intent, refusing truncation, extensions and damage."""
+    minimum = _FIRST_OPEN_INTENT_HEAD.size + _FIRST_OPEN_INTENT_TAIL.size
+    if len(raw) < minimum:
+        raise GrafxCorruptionDetected(
+            f"The first-open intent is at least {minimum} bytes; this one holds {len(raw)}.",
+            file=_FIRST_OPEN_INTENT,
+            field="length",
+            value=len(raw),
+        )
+    magic, version, identity_length = _FIRST_OPEN_INTENT_HEAD.unpack_from(raw, 0)
+    if magic != _FIRST_OPEN_INTENT_MAGIC:
+        raise GrafxCorruptionDetected(
+            "The first-open intent carries a foreign magic and cannot authorise publication.",
+            file=_FIRST_OPEN_INTENT,
+            field="magic",
+            value=repr(magic),
+        )
+    if version > _FIRST_OPEN_INTENT_VERSION:
+        raise GrafxSchemaVersionMismatch(
+            f"The first-open intent uses format {version}; this build reads up to "
+            f"{_FIRST_OPEN_INTENT_VERSION}.",
+            file=_FIRST_OPEN_INTENT,
+            field="format_version",
+            value=version,
+            supported=_FIRST_OPEN_INTENT_VERSION,
+        )
+    if version != _FIRST_OPEN_INTENT_VERSION:
+        raise GrafxCorruptionDetected(
+            f"The first-open intent uses invalid format version {version}.",
+            file=_FIRST_OPEN_INTENT,
+            field="format_version",
+            value=version,
+        )
+    identity_start = _FIRST_OPEN_INTENT_HEAD.size
+    identity_end = identity_start + identity_length
+    expected = identity_end + _FIRST_OPEN_INTENT_TAIL.size
+    if len(raw) != expected:
+        raise GrafxCorruptionDetected(
+            f"The first-open intent declares {identity_length} identity bytes and therefore "
+            f"must hold {expected} bytes; it holds {len(raw)}.",
+            file=_FIRST_OPEN_INTENT,
+            field="length",
+            value=len(raw),
+            expected=expected,
+        )
+    (stored_checksum,) = _FIRST_OPEN_INTENT_TAIL.unpack_from(raw, identity_end)
+    observed_checksum = crc32c(raw[:identity_end])
+    if stored_checksum != observed_checksum:
+        raise GrafxCorruptionDetected(
+            "The checksum of the first-open intent does not match its bytes.",
+            file=_FIRST_OPEN_INTENT,
+            field="crc32c",
+            value=stored_checksum,
+            observed=observed_checksum,
+        )
+    encoded_identity = raw[identity_start:identity_end]
+    identity = DatabaseIdentity.decode(encoded_identity)
+    if identity.encode() != encoded_identity:
+        raise GrafxCorruptionDetected(
+            "The first-open intent carries non-canonical identity bytes.",
+            file=_FIRST_OPEN_INTENT,
+            field="identity",
+        )
+    return identity
+
+
+def _read_first_open_intent(storage: StorageDevice) -> DatabaseIdentity | None:
+    """Return the durable first-open identity, or None only when its name is absent."""
+    if not storage.exists(_FIRST_OPEN_INTENT):
+        return None
+    size = storage.log_size(_FIRST_OPEN_INTENT)
+    return _decode_first_open_intent(
+        storage.read_log(_FIRST_OPEN_INTENT, 0, size)
+    )
+
+
+def _write_first_open_intent(
+    storage: StorageDevice, identity: DatabaseIdentity
+) -> None:
+    """Create and barrier the intent before any authoritative database file is published."""
+    payload = _encode_first_open_intent(identity)
+    storage.create(_FIRST_OPEN_INTENT)
+    terminal = storage.append_log(_FIRST_OPEN_INTENT, payload)
+    if terminal != len(payload):
+        raise GrafxCorruptionDetected(
+            f"The first-open intent append reported terminal offset {terminal}; "
+            f"{len(payload)} was required.",
+            file=_FIRST_OPEN_INTENT,
+            field="terminal_offset",
+            value=terminal,
+            expected=len(payload),
+        )
+    storage.durable_barrier(_FIRST_OPEN_INTENT)
+
+
+def _resume_first_open(
+    storage: StorageDevice, pool: BufferPool, identity: DatabaseIdentity
+) -> None:
+    """Idempotently publish missing first-open files and retire the intent last.
+
+    A valid intent does not make an existing final expendable.  All three canonical files are
+    rebuilt under staging names first.  A final from an interrupted publication is accepted only
+    when every byte equals that canonical staging payload; equality lets the retry discard the
+    duplicate staging name and complete the missing finals.  One divergent byte refuses before
+    any final is replaced.  Without an intent this function is unreachable, so a partial final
+    can never be reclassified as a fresh database.
+    """
+    _require_resumable_first_open(storage)
+    _stage_meta(storage, pool, identity)
+    _stage_catalog(storage, pool)
+    _stage_heap(storage, pool)
+    publications = (
+        (_FIRST_OPEN_META_STAGING, META_FILE),
+        (_FIRST_OPEN_CATALOG_STAGING, CATALOG_FILE),
+        (_FIRST_OPEN_HEAP_STAGING, HEAP_FILE),
+    )
+    # Preflight EVERY existing final before publishing even one missing final.  A divergent
+    # catalog must not leave a previously absent meta installed merely because meta came first.
+    for staging, published in publications:
+        _require_identical_if_published(storage, staging, published)
+    for staging, published in publications:
+        _publish_missing_or_require_identical(storage, staging, published)
+
+    # The replacements above are atomic visibility operations.  This barrier is the durability
+    # operation: it pins their complete payloads and the namespace entries before the intent can
+    # disappear.  A power loss before here retains the intent and retries the same UUID.
+    storage.durable_barrier(None)
+    storage.remove(_FIRST_OPEN_INTENT)
+    # The absence is itself part of the protocol.  Pinning it means an old intent cannot return
+    # after connect() has handed the database to user code and accepted real transactions.
+    storage.durable_barrier(None)
+
+
+def _require_resumable_first_open(storage: StorageDevice) -> None:
+    """Refuse any transaction history before rebuilding canonical staging payloads."""
+    wal_files = storage.list_files(f"{WAL_DIRECTORY}/")
+    if wal_files or storage.exists(COMMIT_STATE_FILE):
+        raise GrafxCorruptionDetected(
+            "A first-open intent coexists with transaction history, so it cannot authorise "
+            "replacement of any authoritative file.",
+            file=_FIRST_OPEN_INTENT,
+            field="transaction_history",
+            wal_files=wal_files,
+            commit_state=storage.exists(COMMIT_STATE_FILE),
+        )
+
+
+def _discard_staging(storage: StorageDevice, file: str) -> None:
+    """Remove one unpublished staging name left by an interrupted first open."""
+    if storage.exists(file):
+        storage.remove(file)
+
+
+def _stage_meta(
+    storage: StorageDevice, pool: BufferPool, identity: DatabaseIdentity
+) -> None:
+    """Checkpoint the canonical identity page under its unpublished name."""
+    _discard_staging(storage, _FIRST_OPEN_META_STAGING)
+    MetaStore(pool, file=_FIRST_OPEN_META_STAGING).create(identity)
+
+
+def _stage_catalog(storage: StorageDevice, pool: BufferPool) -> None:
+    """Checkpoint the canonical empty catalog under its unpublished name."""
+    _discard_staging(storage, _FIRST_OPEN_CATALOG_STAGING)
+    catalog = CatalogStore(pool, file=_FIRST_OPEN_CATALOG_STAGING)
+    catalog.bootstrap()
+    pool.checkpoint(_FIRST_OPEN_CATALOG_STAGING)
+
+
+def _stage_heap(storage: StorageDevice, pool: BufferPool) -> None:
+    """Checkpoint the canonical empty heap under its unpublished name."""
+    _discard_staging(storage, _FIRST_OPEN_HEAP_STAGING)
+    catalog = CatalogStore(pool, file=_FIRST_OPEN_CATALOG_STAGING)
+    heap = HeapStore(pool, catalog, file=_FIRST_OPEN_HEAP_STAGING)
+    heap.bootstrap()
+    pool.checkpoint(_FIRST_OPEN_HEAP_STAGING)
+
+
+def _publish_missing_or_require_identical(
+    storage: StorageDevice, staging: str, published: str
+) -> None:
+    """Publish a missing final, or discard staging only after byte-for-byte equality."""
+    if not storage.exists(published):
+        storage.atomic_replace(staging, published)
+        return
+    _require_identical_if_published(storage, staging, published)
+    storage.remove(staging)
+
+
+def _require_identical_if_published(
+    storage: StorageDevice, staging: str, published: str
+) -> None:
+    """Preflight one existing final against every byte of its canonical staging file."""
+    if not storage.exists(published):
+        return
+    staging_pages = storage.page_count(staging)
+    published_pages = storage.page_count(published)
+    identical = staging_pages == published_pages and all(
+        storage.read_page(staging, page) == storage.read_page(published, page)
+        for page in range(staging_pages)
+    )
+    if not identical:
+        raise GrafxCorruptionDetected(
+            f"The published first-open file {published!r} differs from its canonical staging "
+            "payload and will not be overwritten.",
+            file=published,
+            field="published_bytes",
+            expected_pages=staging_pages,
+            observed_pages=published_pages,
+        )
+
+
+def _require_published_stores(catalog: CatalogStore, heap: HeapStore) -> None:
+    """Refuse missing or partial authoritative stores after recovery had its chance to replay."""
+    if not catalog.is_bootstrapped() or not catalog.chain_pages():
+        raise GrafxCorruptionDetected(
+            f"The identity exists but {CATALOG_FILE!r} has no complete published catalog; "
+            "it is damage, not a fresh database.",
+            file=CATALOG_FILE,
+            field="bootstrap",
+        )
+    if not heap.is_bootstrapped():
+        raise GrafxCorruptionDetected(
+            f"The identity exists but {HEAP_FILE!r} has no complete published heap header; "
+            "it is damage, not a fresh database.",
+            file=HEAP_FILE,
+            field="bootstrap",
+        )
 
 
 def _start_publisher(
