@@ -170,8 +170,20 @@ catalogue breaks the import of the module that uses it rather than a scrape in p
 | Adapter | Module | Use |
 |---|---|---|
 | **`NoOpMetricsSink`** *(default, `metrics="noop"`)* | `adapters/metrics_noop.py` | `enabled` is `False`; nothing is allocated or formatted |
-| `OpenMetricsSink` (`metrics="openmetrics"`) | `adapters/metrics_openmetrics.py` | Aggregates into the OpenMetrics text format, exposed at `GET /metrics` on a loopback port. The default port is **zero** — the OS picks a free one, so a database never fails to open because a fixed port was taken, and `Database.metrics_endpoint` reports the address actually bound. |
+| `OpenMetricsSink` (`metrics="openmetrics"`) | `adapters/metrics_openmetrics.py` | Aggregates into the OpenMetrics text format, exposed at `GET /metrics` on a loopback-by-default port. The default destination is `127.0.0.1:0` — the OS picks a free port, and `Database.metrics_endpoint` reports the address actually bound. |
 | `JsonMetricsSink` (`metrics="json"`) | `adapters/metrics_json.py` | Writes documents to the file `metrics_destination` names, through a rotating writer |
+
+The assembled OpenMetrics adapter validates the bind without DNS. With the default
+`allow_remote_metrics=False`, the host in `metrics_destination` must be an IP literal for which
+`ipaddress.ip_address(host).is_loopback` is true, for example IPv4 `127/8` or IPv6 `::1`. Hostnames, including
+`localhost`, and remote or wildcard addresses are refused. A hostname or non-loopback address is
+accepted only when `allow_remote_metrics=True`; the field is rejected for the no-op and JSON sinks.
+One `RuntimeWarning` is emitted when each remote-address or hostname publisher admitted by that
+override starts. It is bind consent, not authentication, TLS or firewall configuration.
+
+IPv6 destinations are configured in bracketed authority form, for example `[::1]:0`. The brackets
+are removed for the `::1`/`AF_INET6` bind and restored in the advertised URL, such as
+`http://[::1]:49152/metrics`.
 
 ---
 

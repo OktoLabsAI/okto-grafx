@@ -12,9 +12,11 @@ catalog, the heap and the transaction manager are the delivered ones, composed e
 
 from __future__ import annotations
 
+import socket
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -189,6 +191,53 @@ def test_the_default_install_exposes_the_metrics_endpoint(tmp_path: Path) -> Non
     # The socket belongs to the database, so closing it must give the port back.
     with pytest.raises(urllib.error.URLError):
         urllib.request.urlopen(endpoint, timeout=5)
+
+
+def test_the_default_install_can_bind_ipv6_loopback(tmp_path: Path) -> None:
+    if not socket.has_ipv6:
+        pytest.skip("this host has no IPv6 socket support")
+    probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        probe.bind(("::1", 0))
+    except OSError as failure:
+        pytest.skip(f"this host cannot bind IPv6 loopback: {failure}")
+    finally:
+        probe.close()
+
+    with connect(
+        tmp_path / "db-ipv6",
+        metrics="openmetrics",
+        metrics_destination="[::1]:0",
+    ) as db:
+        endpoint = db.metrics_endpoint
+        assert endpoint is not None
+        parsed = urlsplit(endpoint)
+        assert parsed.hostname == "::1"
+        assert parsed.port is not None
+        with socket.create_connection(("::1", parsed.port), timeout=5) as client:
+            client.sendall(
+                b"GET /metrics HTTP/1.1\r\nHost: [::1]\r\nConnection: close\r\n\r\n"
+            )
+            answer = bytearray()
+            while chunk := client.recv(65536):
+                answer.extend(chunk)
+        assert b"HTTP/1.1 200 OK" in answer
+        assert b"oktografx_database_opens_total" in answer
+
+
+def test_a_remote_metrics_override_warns_once_when_the_socket_starts(
+    tmp_path: Path,
+) -> None:
+    with pytest.warns(RuntimeWarning, match="allow_remote_metrics=True") as warned:
+        with connect(
+            tmp_path / "db-remote-metrics",
+            metrics="openmetrics",
+            metrics_destination="0.0.0.0:0",
+            allow_remote_metrics=True,
+        ) as db:
+            assert db.metrics_endpoint is not None
+            assert db.metrics_endpoint.startswith("http://0.0.0.0:")
+    assert len(warned) == 1
 
 
 @pytest.mark.parametrize("selector", ["noop", "json"])

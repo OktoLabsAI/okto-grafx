@@ -39,6 +39,7 @@ import os
 import struct
 import threading
 import uuid
+import warnings
 from collections.abc import Callable
 from typing import TypeVar, cast
 
@@ -92,6 +93,8 @@ from okto_grafx.runtime.config import (
     MINIMUM_STORE_FRAMES,
     DatabaseConfig,
     _canonical_database_config,
+    _is_loopback_metrics_host,
+    _openmetrics_host_port,
 )
 from okto_grafx.runtime.registry import PortRegistry, _snapshot_port_registry
 
@@ -1772,12 +1775,19 @@ def _start_publisher(
     destination = metrics_destination(config)
     if destination is None:  # pragma: no cover - A8 always resolves a destination here
         return None
-    host, _, port = destination.rpartition(":")
+    host, port = _openmetrics_host_port(destination)
+    if not _is_loopback_metrics_host(host):
+        warnings.warn(
+            f"OpenMetrics is binding to non-loopback address {destination!r} because "
+            "allow_remote_metrics=True; protect the endpoint at the network boundary.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
     # The publisher owns the sink's LIFECYCLE, so it gets the sink itself, not the containment
     # shell the engine records through -- the shell is for recording calls inside public doors,
     # and a publisher handed the shell cannot see the aggregator and answers 503.
     sink = getattr(metrics, "inner", metrics)
-    publisher = OpenMetricsPublisher(sink, host=host, port=int(port), events=events)
+    publisher = OpenMetricsPublisher(sink, host=host, port=port, events=events)
     publisher.start()
     # Read the URL back AFTER start: with the A8 default of port zero the operating system chose
     # the port, and the requested one says nothing about where the endpoint actually is.

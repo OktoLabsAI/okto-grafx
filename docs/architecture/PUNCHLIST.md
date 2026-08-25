@@ -1298,3 +1298,16 @@ option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`
   auxiliary scans, RSS, streaming, deadlines, traversal or spill. Sort, aggregate, distinct and
   eager operators may retain up to the admitted rows or states before their first yield; this is
   row admission, not a complete query-memory budget.
+
+## P1.15 / Fase 1.4 — OpenMetrics bind boundary (CLOSED, 2026-08-25)
+
+- **CLOSED** — `DatabaseConfig.allow_remote_metrics` is an exact boolean defaulting to `False` and
+  is accepted only for `metrics="openmetrics"`. Without it, `metrics_destination` requires an IP
+  literal classified by `ipaddress.ip_address(host).is_loopback`, for example IPv4 `127/8` or IPv6 `::1`.
+  Hostnames, including `localhost`, remote addresses and wildcard addresses are refused without
+  DNS resolution.
+- **CLOSED** — a hostname or non-loopback address requires `allow_remote_metrics=True`. One
+  `RuntimeWarning` is emitted when each hostname or non-loopback publisher admitted by the override
+  starts. This is bind consent only and supplies no authentication, authorization, TLS or firewall.
+- **CLOSED** — IPv6 loopback is configured as `[::1]:port`; the publisher binds `::1` with
+  `AF_INET6` and reports the bracketed `http://[::1]:<bound-port>/metrics` URL.

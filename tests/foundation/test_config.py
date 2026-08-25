@@ -48,6 +48,7 @@ def test_defaults_match_the_contract() -> None:
     assert config.max_wal_batch_bytes is None
     assert config.metrics == "noop"
     assert config.metrics_destination is None
+    assert config.allow_remote_metrics is False
     assert config.vector_math == "auto"
     assert config.vector_exact_scan_threshold == 4096
     assert config.vector_ef_search == 320
@@ -408,13 +409,68 @@ def test_the_openmetrics_publisher_defaults_to_an_ephemeral_local_port() -> None
 
 
 @pytest.mark.parametrize(
-    "destination", ["127.0.0.1:9100", "0.0.0.0:0", "localhost:65535", "[::1]:9100"]
+    "destination", ["127.0.0.1:9100", "127.255.255.254:0", "[::1]:9100"]
 )
-def test_the_openmetrics_publisher_accepts_a_host_and_port(destination: str) -> None:
+def test_the_openmetrics_publisher_accepts_a_loopback_host_and_port(
+    destination: str,
+) -> None:
     config = DatabaseConfig(
         path=":memory:", metrics="openmetrics", metrics_destination=destination
     )
     assert config.metrics_destination == destination
+
+
+@pytest.mark.parametrize(
+    "destination",
+    ["0.0.0.0:0", "192.0.2.1:9100", "localhost:9100", "example.com:9100", "[::]:0"],
+)
+def test_openmetrics_refuses_a_remote_bind_without_explicit_consent(
+    destination: str,
+) -> None:
+    with pytest.raises(GrafxConfigurationError) as raised:
+        DatabaseConfig(
+            path=":memory:", metrics="openmetrics", metrics_destination=destination
+        )
+    assert raised.value.details["field"] == "metrics_destination"
+
+
+@pytest.mark.parametrize(
+    "destination", ["0.0.0.0:0", "localhost:9100", "example.com:9100", "[::]:0"]
+)
+def test_openmetrics_accepts_a_remote_bind_with_explicit_consent(
+    destination: str,
+) -> None:
+    config = DatabaseConfig(
+        path=":memory:",
+        metrics="openmetrics",
+        metrics_destination=destination,
+        allow_remote_metrics=True,
+    )
+    assert config.metrics_destination == destination
+    assert config.allow_remote_metrics is True
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_allow_remote_metrics_requires_a_boolean(value: object) -> None:
+    with pytest.raises(GrafxConfigurationError) as raised:
+        DatabaseConfig(path=":memory:", allow_remote_metrics=value)  # type: ignore[arg-type]
+    assert raised.value.details["field"] == "allow_remote_metrics"
+
+
+@pytest.mark.parametrize(
+    ("metrics", "destination"), [("noop", None), ("json", "./metrics.json")]
+)
+def test_allow_remote_metrics_is_never_an_inert_option(
+    metrics: str, destination: str | None
+) -> None:
+    with pytest.raises(GrafxConfigurationError) as raised:
+        DatabaseConfig(
+            path=":memory:",
+            metrics=metrics,
+            metrics_destination=destination,
+            allow_remote_metrics=True,
+        )
+    assert raised.value.details["field"] == "allow_remote_metrics"
 
 
 @pytest.mark.parametrize(
@@ -429,6 +485,7 @@ def test_the_openmetrics_publisher_accepts_a_host_and_port(destination: str) -> 
         "host:65536",
         "host:-1",
         "host:" + "9" * 5000,
+        "::1:9100",
         "   ",
     ],
 )

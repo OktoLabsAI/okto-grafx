@@ -777,6 +777,7 @@ class _MetricsServer(ThreadingHTTPServer):
         self.sink = sink
         self.events = events
         self.connection_timeout = connection_timeout
+        self.address_family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
         self._stopping = False
         self._loop_exited = threading.Event()
         self._loop_exited.set()
@@ -1221,14 +1222,30 @@ class _MetricsRequestHandler(BaseHTTPRequestHandler):
 
 def _checked_host(host: str) -> str:
     """Return the interface to bind, or refuse one that cannot mean what the caller meant."""
-    if not isinstance(host, str) or not host:
+    if not isinstance(host, str):
         raise GrafxConfigurationError(
             f"The metrics publisher needs a non-empty host; got {host!r}. The empty string "
             f"binds every interface, which this endpoint never does implicitly.",
             field="host",
             value=repr(host),
         )
-    return host
+    plain = str.__str__(host)
+    if not plain:
+        raise GrafxConfigurationError(
+            "The metrics publisher needs a non-empty host; got ''. The empty string binds "
+            "every interface, which this endpoint never does implicitly.",
+            field="host",
+            value="''",
+        )
+    if str.startswith(plain, "[") and str.endswith(plain, "]"):
+        plain = plain[1:-1]
+        if not plain:
+            raise GrafxConfigurationError(
+                "The metrics publisher needs a non-empty host; got '[]'.",
+                field="host",
+                value="[]",
+            )
+    return plain
 
 
 def _checked_port(port: int) -> int:
@@ -1354,7 +1371,8 @@ class OpenMetricsPublisher:
     @property
     def url(self) -> str:
         """Return the absolute URL of the metrics endpoint."""
-        return f"http://{self._host}:{self.port}{_METRICS_PATH}"
+        authority = f"[{self._host}]" if ":" in self._host else self._host
+        return f"http://{authority}:{self.port}{_METRICS_PATH}"
 
     @property
     def live_connections(self) -> int:

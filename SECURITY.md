@@ -16,7 +16,7 @@ Do not open a public GitHub issue for a suspected vulnerability. Send a private 
 - the affected version and installation mode (core, `accel`, from source);
 - the operating system and filesystem;
 - the relevant configuration — buffer budget, page size, lease and timeout settings, the metrics
-  selector, and whether the database is opened read-only;
+  selector and destination, `allow_remote_metrics`, and whether the database is opened read-only;
 - reproduction steps or a minimal proof of concept;
 - the security impact and the data or permissions affected;
 - any suggested mitigation, if known.
@@ -31,9 +31,11 @@ policy does not promise a specific response or resolution time.
 
 ## What is in scope
 
-Okto Grafx is an **embedded library**. It has no authentication, no authorization, and no network
-listener other than the optional loopback metrics endpoint. The interesting boundary is therefore
-what the library does with the input it is given and with the bytes it reads from disk. In scope:
+Okto Grafx is an **embedded library**. It has no authentication or authorization and no network
+listener other than the optional OpenMetrics endpoint. That listener is loopback-only by default;
+the caller can explicitly permit a remote address or hostname. The interesting boundary is
+therefore what the library does with the input it is given and with the bytes it reads from disk.
+In scope:
 
 - **A crafted or corrupted database directory** that causes something worse than a typed `Grafx*`
   refusal — an unbounded allocation, a read outside the database directory, a write to a path the
@@ -42,8 +44,8 @@ what the library does with the input it is given and with the bytes it reads fro
   handle to, allocates without bound, or does not terminate.
 - **A path traversal** through any name a caller can influence — a table name, an index name, a
   metrics destination, a quarantine or ledger entry.
-- **The OpenMetrics endpoint** exposing more than metric values, or binding an address other than
-  loopback.
+- **The OpenMetrics endpoint** exposing more than metric values, bypassing the default loopback
+  refusal, or binding somewhere other than the configured destination.
 - **A concurrency defect that crosses a trust boundary**, such as one process being able to make
   another process write bytes it did not author.
 - **The forensic ledger or quarantine** writing content it was supposed to sanitise, or writing
@@ -72,5 +74,13 @@ owns its own security boundary. Operators are responsible for:
 - backup and restore;
 - binding, or not exposing, the optional metrics endpoint;
 - timely upgrades.
+
+For `metrics="openmetrics"`, `allow_remote_metrics` is an exact boolean and defaults to `False`.
+Without the override, `metrics_destination` must contain a literal IP for which
+`ipaddress.ip_address(host).is_loopback` is true, for example IPv4 `127/8` or IPv6 `::1`.
+Hostnames are not resolved, and `localhost` is therefore refused. A remote address or
+hostname requires `allow_remote_metrics=True`, which is rejected for the no-op and JSON sinks and
+emits one `RuntimeWarning` when each remote-address or hostname publisher starts. This override does
+not provide authentication, authorization, TLS or firewall configuration.
 
 Review [Status and limitations](README.md#status-and-limitations) before deployment.

@@ -166,6 +166,34 @@ def test_the_publisher_binds_an_ephemeral_loopback_port(publisher: OpenMetricsPu
     assert publisher.url == f"http://127.0.0.1:{publisher.port}/metrics"
 
 
+def test_the_publisher_binds_and_serves_ipv6_loopback(
+    recording_sink: OpenMetricsSink,
+) -> None:
+    if not socket.has_ipv6:
+        pytest.skip("this host has no IPv6 socket support")
+    probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        probe.bind(("::1", 0))
+    except OSError as failure:
+        pytest.skip(f"this host cannot bind IPv6 loopback: {failure}")
+    finally:
+        probe.close()
+
+    endpoint = OpenMetricsPublisher(recording_sink, host="::1", port=0)
+    endpoint.start()
+    try:
+        assert endpoint.host == "::1"
+        assert endpoint.url == f"http://[::1]:{endpoint.port}/metrics"
+        answer = _raw(
+            endpoint,
+            b"GET /metrics HTTP/1.1\r\nHost: [::1]\r\nConnection: close\r\n\r\n",
+        )
+        assert "HTTP/1.1 200 OK" in answer
+        assert "oktografx_ledger_depth" in answer
+    finally:
+        endpoint.stop()
+
+
 def test_get_metrics_answers_two_hundred_with_the_exposition_body(
     publisher: OpenMetricsPublisher, recording_sink: OpenMetricsSink
 ) -> None:

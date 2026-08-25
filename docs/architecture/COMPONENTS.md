@@ -729,6 +729,20 @@ distinct and eager operators may retain up to the admitted rows or states before
 payload bytes, internal structures and auxiliary scans are not charged, so these fields are not a
 complete query-memory budget.
 
+### Fase 1.4 / P1.15 — OpenMetrics loopback-by-default bind (C0/C8/C11; CLOSED)
+
+`DatabaseConfig.allow_remote_metrics` is an exact boolean defaulting to `False` and is meaningful
+only for `metrics="openmetrics"`; setting it for the no-op or JSON sink is refused. Without the
+override, `metrics_destination` admits only literal IPs classified by
+`ipaddress.ip_address(host).is_loopback`, for example IPv4 `127/8` or IPv6 `::1`. DNS is not consulted, so
+hostnames including `localhost`, remote addresses and wildcard addresses all require
+`allow_remote_metrics=True`.
+
+Each hostname or non-loopback publisher admitted by the override emits one `RuntimeWarning` when it
+starts. The override alters only bind consent and adds no authentication, authorization, TLS or
+firewall. `[::1]:port` is parsed as IPv6, bound to `::1` with `AF_INET6`, and exposed as the bracketed
+`http://[::1]:<bound-port>/metrics` URL.
+
 ### D5 durable_commit — MEASURED. Do not amend the ceiling. (coordinator-commissioned profile)
 
 **The 234 ms is not fsync.** A bare `os.fsync` on this volume is 0.29 ms; the one barrier §8.5 step 3.5

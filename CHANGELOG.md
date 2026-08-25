@@ -17,6 +17,14 @@ including the on-disk format.
   registries, and forged/uninitialised configuration instances receive typed refusals before a
   database root is created. The process-global `checksum` selector remains effective with a
   caller-supplied registry.
+- **OpenMetrics destinations are loopback-only unless the caller explicitly opts out.**
+  `DatabaseConfig.allow_remote_metrics` is a boolean that defaults to `False` and is valid only
+  with `metrics="openmetrics"`. Without that override, `metrics_destination` accepts only literal
+  IP addresses for which `ipaddress.ip_address(host).is_loopback` is true, for example IPv4
+  `127/8` or IPv6 `::1`; hostnames, including `localhost`, are refused without DNS resolution. A remote address or
+  hostname requires `allow_remote_metrics=True` and emits one `RuntimeWarning` when each publisher
+  starts. IPv6 destinations use `[::1]:port`, bind `::1` with `AF_INET6`, and report a bracketed
+  endpoint URL. The override changes bind consent only; it adds no authentication, TLS or firewall.
 - **Transactions now have four opt-in hard admission budgets, all defaulting to `None`.**
   `max_statement_writes` counts logical writes held by one statement; `max_transaction_rows`
   counts retained `row_intents`; `max_transaction_bytes` charges encoded row tuples, staged

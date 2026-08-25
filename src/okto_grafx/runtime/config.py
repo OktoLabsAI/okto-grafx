@@ -8,6 +8,7 @@ the first transaction.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+from ipaddress import ip_address
 from math import isfinite
 
 from okto_grafx.domain.errors import GrafxConfigurationError
@@ -132,6 +133,47 @@ def _reject(field: str, value: object, reason: str) -> GrafxConfigurationError:
     )
 
 
+def _openmetrics_host_port(destination: str) -> tuple[str, int]:
+    """Parse one OpenMetrics address without resolving caller-controlled names."""
+    host = ""
+    port = ""
+    if destination.startswith("["):
+        closing = destination.find("]")
+        if closing > 1 and destination[closing + 1 : closing + 2] == ":":
+            host = destination[1:closing]
+            port = destination[closing + 2 :]
+            if "]" in port:
+                host = ""
+    else:
+        host, separator, port = destination.rpartition(":")
+        if not separator or ":" in host:
+            host = ""
+
+    port_is_valid = (
+        bool(host)
+        and 1 <= len(port) <= 5
+        and port.isascii()
+        and port.isdigit()
+        and 0 <= int(port) <= 65535
+    )
+    if not port_is_valid:
+        raise _reject(
+            "metrics_destination",
+            destination,
+            "the OpenMetrics publisher needs host:port (or [IPv6]:port) with a port "
+            "between 0 and 65535.",
+        )
+    return host, int(port)
+
+
+def _is_loopback_metrics_host(host: str) -> bool:
+    """Return whether a literal host is unambiguously local without doing DNS I/O."""
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _require_text(field: str, value: object, *, empty: bool = True) -> str:
     """Copy a string into an exact built-in value without invoking subclass hooks."""
     if not issubclass(type(value), str):
@@ -211,6 +253,7 @@ class DatabaseConfig:
     max_wal_batch_bytes: int | None = None
     metrics: str = "noop"
     metrics_destination: str | None = None
+    allow_remote_metrics: bool = False
     vector_math: str = "auto"
     checksum: str = "auto"
     vector_exact_scan_threshold: int = 4096
@@ -324,6 +367,12 @@ class DatabaseConfig:
             object.__setattr__(
                 self, field, _require_choice(field, getattr(self, field), choices)
             )
+        if type(self.allow_remote_metrics) is not bool:
+            raise _reject(
+                "allow_remote_metrics",
+                self.allow_remote_metrics,
+                "a boolean is required.",
+            )
         self._validate_metrics_destination()
 
         if type(self.read_only) is not bool:
@@ -342,6 +391,12 @@ class DatabaseConfig:
             object.__setattr__(self, "metrics_destination", destination)
 
         if self.metrics == "noop":
+            if self.allow_remote_metrics:
+                raise _reject(
+                    "allow_remote_metrics",
+                    self.allow_remote_metrics,
+                    "False is required unless metrics is 'openmetrics'.",
+                )
             if destination is not None:
                 raise _reject(
                     "metrics_destination",
@@ -351,6 +406,12 @@ class DatabaseConfig:
             return
 
         if self.metrics == "json":
+            if self.allow_remote_metrics:
+                raise _reject(
+                    "allow_remote_metrics",
+                    self.allow_remote_metrics,
+                    "False is required unless metrics is 'openmetrics'.",
+                )
             if destination is None or not destination.strip():
                 raise _reject(
                     "metrics_destination",
@@ -367,20 +428,13 @@ class DatabaseConfig:
                 destination,
                 f"a non-empty host:port is required, or None for {DEFAULT_OPENMETRICS_DESTINATION}.",
             )
-        host, separator, port = destination.rpartition(":")
-        port_is_valid = (
-            bool(separator)
-            and bool(host)
-            and 1 <= len(port) <= 5
-            and port.isascii()
-            and port.isdigit()
-            and 0 <= int(port) <= 65535
-        )
-        if not port_is_valid:
+        host, _ = _openmetrics_host_port(destination)
+        if not _is_loopback_metrics_host(host) and not self.allow_remote_metrics:
             raise _reject(
                 "metrics_destination",
                 destination,
-                "the OpenMetrics publisher needs a host:port with a port between 0 and 65535.",
+                "a loopback host is required unless allow_remote_metrics=True explicitly "
+                "permits a remote bind.",
             )
 
     @property

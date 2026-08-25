@@ -513,7 +513,10 @@ def test_the_openmetrics_default_is_applied_where_the_composition_happens() -> N
     assert (
         bootstrap.metrics_destination(
             DatabaseConfig(
-                path="./mydb", metrics="openmetrics", metrics_destination="0.0.0.0:9100"
+                path="./mydb",
+                metrics="openmetrics",
+                metrics_destination="0.0.0.0:9100",
+                allow_remote_metrics=True,
             )
         )
         == "0.0.0.0:9100"

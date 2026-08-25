@@ -119,8 +119,8 @@ other transaction when it commits — schema changes are transactions like any o
 
 - A frozen metric catalogue: every metric declared once, in one place, so a name that leaves the
   catalogue breaks the import rather than a scrape in production.
-- Three sinks: no-op (allocates and formats nothing), OpenMetrics over a loopback endpoint, and
-  JSON documents to a rotating file.
+- Three sinks: no-op (allocates and formats nothing), OpenMetrics over a loopback-by-default
+  endpoint, and JSON documents to a rotating file.
 - A sanitised, bounded event sink on a standard-library logger.
 
 ### Windows and POSIX as equal citizens
@@ -506,12 +506,25 @@ refused with the field name the caller actually wrote.
 | `max_transaction_bytes` | `None` | Optional hard limit on encoded row tuples, staged logical-record `encoded_length()` values and retained page-image generations; ordinary replacement charges the byte delta, while a rollback preimage held by a live statement mark remains charged until settle/discard |
 | `max_wal_batch_bytes` | `None` | Optional hard limit on the sum of final record `encoded_length()` values, including `COMMIT` and excluding `SEGMENT_HEADER`; checked before WAL append |
 | `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
-| `metrics_destination` | `None` | Required for `"json"` |
+| `metrics_destination` | `None` | Required file path for `"json"`; for `"openmetrics"`, `None` means `127.0.0.1:0` and an explicit IPv6 destination uses `[address]:port` |
+| `allow_remote_metrics` | `False` | Exact boolean, valid only for `"openmetrics"`; permits a hostname or non-loopback address when explicitly `True` |
 | `vector_math` | `"auto"` | `"auto"` and `"pure"` both bind the pure oracle; `"numpy"` requires `[accel]` |
 | `checksum` | `"auto"` | `"auto"` accelerates when available; `"pure"` pins the reference |
 | `vector_exact_scan_threshold` | `4096` | Below this many candidates, search is exhaustive |
 | `vector_ef_search` | `320` | Base HNSW beam in the approximate regime; integer from 1 through 1,048,576 |
 | `read_only` | `False` | Opens without writing anything, including recovery |
+
+Without an override, an OpenMetrics destination must name a literal IP address that
+`ipaddress.ip_address(host).is_loopback` classifies as loopback, for example IPv4 `127/8` or IPv6 `::1`.
+Hostnames are not resolved for this decision, so even `localhost` is refused. A remote address or
+hostname requires `allow_remote_metrics=True`; setting it for the no-op or JSON sink is itself
+refused. Each remote-address or hostname publisher admitted by that override emits one
+`RuntimeWarning` when it starts. This consent changes only where OpenMetrics may bind: it does not
+add authentication, TLS or a firewall.
+
+Configure IPv6 loopback as `metrics_destination="[::1]:0"`. The publisher binds `::1` with
+`AF_INET6`, and `Database.metrics_endpoint` reports the usable bracketed URL
+`http://[::1]:<chosen-port>/metrics`.
 
 Recall is an offline calibration result, not a per-database runtime promise. The former
 `vector_recall_target` connection option was removed; passing it now returns a typed migration
@@ -590,10 +603,12 @@ practice:
 - **Known gaps are written down** rather than hidden: see `docs/architecture/PUNCHLIST.md`.
 
 **Deployment responsibility.** Okto Grafx is an embedded library for local or controlled
-single-tenant use. It has no authentication, no authorization and no network listener other than the
-optional loopback metrics endpoint. Operators are responsible for filesystem permissions, access
-control, backup, and for keeping the database directory off shared network filesystems whose locking
-semantics differ from a local disk.
+single-tenant use. It has no authentication or authorization and no network listener other than the
+optional OpenMetrics endpoint. That endpoint is loopback-only by default; a caller can permit a
+remote address or hostname only with `allow_remote_metrics=True`, which adds no authentication, TLS
+or firewall. Operators are responsible for filesystem permissions, access control, backup, metrics
+endpoint exposure, and for keeping the database directory off shared network filesystems whose
+locking semantics differ from a local disk.
 
 ---
 

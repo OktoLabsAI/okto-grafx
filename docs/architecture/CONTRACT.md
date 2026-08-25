@@ -404,6 +404,8 @@ class DatabaseConfig:
     max_transaction_bytes: int | None = None
     max_wal_batch_bytes: int | None = None
     metrics: str = "noop"                  # "noop" | "openmetrics" | "json"
+    metrics_destination: str | None = None
+    allow_remote_metrics: bool = False
     vector_math: str = "auto"              # "auto" | "pure" | "numpy"
     vector_exact_scan_threshold: int = 4096   # calibrated (SPEC-VEC FR-5/FR-8)
     vector_ef_search: int = 320                # calibrated HNSW beam, 1..1_048_576
@@ -416,6 +418,20 @@ class PortRegistry:
     def get(self, slot: str) -> object:  # GrafxPortNotConfigured when empty
     def require_complete(self) -> None:  # GrafxPortNotConfigured listing every missing slot
 ```
+
+**P1.15 / Fase 1.4 — OpenMetrics bind contract (CLOSED).** `allow_remote_metrics` is an exact
+built-in `bool`, defaults to `False`, and may be `True` only when `metrics == "openmetrics"`.
+Without the override, the host parsed from `metrics_destination` must be a literal IP for which
+`ipaddress.ip_address(host).is_loopback` is true, for example IPv4 `127/8` or IPv6 `::1`. No hostname is
+resolved for this decision; `localhost` is refused along with remote and wildcard addresses. A
+hostname or non-loopback address requires `allow_remote_metrics=True`. Starting each hostname or
+non-loopback publisher admitted by that override emits exactly one `RuntimeWarning`. The override
+changes only bind consent and does not supply authentication, authorization, TLS or firewall
+configuration.
+
+The OpenMetrics destination grammar is `host:port` for IPv4/hostnames and `[IPv6]:port` for IPv6.
+`[::1]:port` binds the address `::1` using `AF_INET6`; the reported URL encloses the IPv6 address in
+brackets: `http://[::1]:<bound-port>/metrics`.
 
 The four transaction limits are operational, positive integers when set, and disabled by `None`:
 
@@ -967,10 +983,16 @@ with an open transaction aborts it and never corrupts. Every public method has a
 * **A6** Every module declares `__all__` (convention established by C0, enforced by
   `tests/foundation/test_public_surface.py`). Keep it.
 * **A7** Sources under `src/` are ASCII-only (enforced by `tests/test_language_surface.py`).
-* **A8** `DatabaseConfig` gains `metrics_destination: str | None = None` — required when
-  `metrics == "json"` (a file path) and optional when `metrics == "openmetrics"` (a `host:port`;
-  default `127.0.0.1:0` = ephemeral). C0 owns the field; C11 wires it in `bootstrap`.
-  Rationale: `JsonMetricsSink` needs a writer and the config had no way to express one.
+* **A8 (revised by P1.15 / Fase 1.4)** `DatabaseConfig` gains
+  `metrics_destination: str | None = None` — required when `metrics == "json"` (a file path) and
+  optional when `metrics == "openmetrics"` (default `127.0.0.1:0` = ephemeral). OpenMetrics accepts
+  `host:port` or `[IPv6]:port`. It also gains `allow_remote_metrics: bool = False`, valid only for
+  OpenMetrics. Without the override, the host must be a literal IP classified as loopback by
+  `ipaddress.ip_address(host).is_loopback` (for example, `127/8` or `::1`);
+  hostnames including `localhost` are refused. Remote addresses and hostnames require the explicit
+  override and warn once per started publisher. C0 owns the fields; C11 wires them in `bootstrap`.
+  The override provides no authentication, authorization, TLS or firewall. Rationale: the JSON sink
+  needs a writer, while the HTTP publisher needs an explicit, non-DNS bind boundary.
 * **A9** Label name for vector-index metrics is `space` (CONTRACT §9), not `space_id` as SPEC-VEC
   OR-2 phrases it. The contract is the authoritative realization; the spec's intent (bounded label
   identifying the embedding space) is preserved exactly.
