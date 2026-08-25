@@ -18,6 +18,7 @@ import okto_grafx
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
 PYPROJECT: Path = PROJECT_ROOT / "pyproject.toml"
+CI_WORKFLOW: Path = PROJECT_ROOT / ".github" / "workflows" / "ci.yml"
 
 
 @pytest.fixture(scope="module")
@@ -52,8 +53,24 @@ def test_optional_dependencies_are_the_declared_extras(manifest: dict[str, Any])
     assert extras == {
         "accel": ["numpy>=1.24", "google-crc32c>=1.5"],
         "bench": ["ladybug==0.16.0", "numpy>=1.24"],
-        "dev": ["pytest>=8", "pytest-timeout"],
+        "dev": ["pytest>=8", "pytest-timeout", "ruff==0.15.1"],
     }
+
+
+def test_the_linter_baseline_is_pinned_and_enforced_by_ci(
+    manifest: dict[str, Any],
+) -> None:
+    """The zero-diagnostic baseline is reproducible and cannot silently leave the workflow."""
+    ruff = manifest["tool"]["ruff"]
+    assert ruff["target-version"] == "py311"
+    assert ruff["lint"]["select"] == ["E4", "E7", "E9", "F"]
+
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    start = workflow.index("  lint:\n")
+    end = workflow.index("\n  suite:\n", start)
+    lint_job = workflow[start:end]
+    assert 'python -m pip install -e ".[dev]"' in lint_job
+    assert "python -m ruff check src tests" in lint_job
 
 
 def test_every_accelerator_the_accel_extra_names_is_one_an_adapter_knows_how_to_use(

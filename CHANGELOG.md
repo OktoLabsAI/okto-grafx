@@ -43,6 +43,12 @@ including the on-disk format.
 
 ### Fixed
 
+- **The test tree now has a zero-diagnostic Ruff baseline enforced in CI.** The cleanup exposed
+  and repaired a non-string map fixture where Python collapsed the distinct-looking keys `1` and
+  `True`, removed a dead platform-family resolver that referenced a nonexistent helper, and made
+  deferred `PageIndex`/`StepClock` annotations resolvable at runtime. Ruff is pinned in the
+  development extra and runs once in a dedicated Linux job before inherited lint debt can hide a
+  future defect.
 - **Verification now refuses a heap identity counter that can reuse a persisted id.** The records
   walk reads page 0 and every heap record header straight from the storage device, so a resident
   cache image, an ended or provisional version, or an orphan page cannot hide the physical high

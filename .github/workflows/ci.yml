@@ -43,6 +43,25 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    name: lint (Ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install the pinned development tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Enforce the zero-diagnostic baseline
+        run: python -m ruff check src tests
+
   suite:
     name: suite (${{ matrix.family }} / ${{ matrix.profile }})
     runs-on: ${{ matrix.os }}
