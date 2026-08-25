@@ -2976,7 +2976,11 @@ def test_a_worker_result_that_cannot_be_read_fails_the_stage_typed(
 
 @pytest.mark.parametrize(
     "answer",
-    [("only-one",), (True, "name"), (3, b"bytes")],
+    # 9999 is deliberately a descriptor this process does not own: the conservative
+    # cleanup closes whatever half it managed to prove, and a probe that handed it a
+    # LIVE descriptor would have the test close pytest's own capture rather than
+    # exercise the code.
+    [("only-one",), (True, "name"), (9999, b"bytes")],
     ids=["short-tuple", "bool-descriptor", "bytes-name"],
 )
 def test_a_mkstemp_result_that_is_not_a_pair_of_builtins_is_refused(
@@ -3089,3 +3093,160 @@ def test_a_document_with_no_metric_list_is_refused_before_anything_happens(
     assert (out.stat().st_mtime_ns, metrics.stat().st_mtime_ns) == stamps
     assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")] == []
     assert [p.name for p in tmp_path.iterdir() if ".c13-" in p.name] == []
+
+
+def test_a_real_interrupt_preparing_the_scratch_still_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boundary review (2): os.fspath on the argument and the construction of OUR path
+    shared one clause, so a genuine interrupt of the constructor was absorbed. The
+    argument's shape is data; building the path is work."""
+    from bench.harness.recall import run_recall
+
+    real_path = recall_module_for_paths.Path
+
+    def interrupted(*args: object, **kwargs: object):
+        if args and "scratch" in str(args[0]):
+            raise KeyboardInterrupt("interrupted preparing the scratch")
+        return real_path(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(recall_module_for_paths, "Path", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        run_recall("tiny", scratch=tmp_path / "scratch", timeout_seconds=30)
+    monkeypatch.undo()
+
+
+def test_a_hostile_workspace_is_refused_before_any_lock_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boundary review (3): `workspace / "recall"` ran the CALLER's object, and it ran
+    inside the publication -- after the locks were taken and with the worker about to
+    start. The workspace is reduced and proved before anything is acquired."""
+
+    class _HostileScratch:
+        """The join SUCCEEDS and hands back something that only fails later."""
+
+        def __fspath__(self) -> str:
+            raise SystemExit(241)
+
+        def mkdir(self, *args: object, **kwargs: object) -> None:
+            raise SystemExit(241)
+
+    class _HostileWorkspace:
+        def __fspath__(self) -> str:
+            raise SystemExit(241)
+
+        def __truediv__(self, other: object) -> object:
+            # Nothing raises here: a guard has nothing to catch. Only reducing the
+            # workspace to a builtin name keeps this object off the path at all.
+            return _HostileScratch()
+
+    out, metrics = _seed_documents(tmp_path)
+    ran: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: ran.append(1) or _verdict_stub()
+    )
+    code = append_vector_recall(
+        profile="tiny",
+        gt_mode="auto",
+        out=out,
+        metrics=metrics,
+        workspace=_HostileWorkspace(),  # type: ignore[arg-type]
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert not ran
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")] == []
+
+
+def test_a_verdict_text_that_is_not_a_plain_string_is_a_typed_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boundary review (6): proving the text inside the read's clause meant a str
+    subclass raised RuntimeError past the (OSError, UnicodeError) tuple, leaving
+    run_recall with a raw error instead of the typed one its callers are promised."""
+    import subprocess as subprocess_module
+
+    from bench.harness.recall import run_recall
+
+    class _HostileText(str):
+        pass
+
+    def writes_verdict(command: list[str], **kwargs: object):
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.write_text(json.dumps(_verdict_stub()), encoding="utf-8")
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    real_read_text = Path.read_text
+
+    def hostile(self: Path, *args: object, **kwargs: object):
+        if self.name.startswith("recall-tiny-"):
+            return _HostileText(real_read_text(self, *args, **kwargs))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
+    monkeypatch.setattr(Path, "read_text", hostile)
+    scratch = tmp_path / "scratch"
+    with pytest.raises(RecallStageError, match="not plain text"):
+        run_recall("tiny", scratch=scratch)
+    monkeypatch.undo()
+    assert list(scratch.iterdir()) == [], "and the fresh file is still removed"
+
+
+def test_the_lock_stamp_survives_a_partial_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boundary review: a short write is legal for os.write, so the stamp is a progress
+    LOOP. Refusing a partial write outright would turn a legitimate short write into a
+    failure; the loop ends only when every byte is accounted for."""
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real_open, real_write = os.open, os.write
+    descriptors: list[int] = []
+    calls: list[int] = []
+
+    def spy_open(path: object, *a: object, **kw: object):
+        descriptor = real_open(path, *a, **kw)  # type: ignore[arg-type]
+        if str(path).endswith(".c13.lock"):
+            descriptors.append(descriptor)
+        return descriptor
+
+    def one_byte_at_a_time(descriptor: object, data: bytes):
+        if descriptor in descriptors:
+            calls.append(1)
+            return real_write(descriptor, data[:1])  # type: ignore[arg-type]
+        return real_write(descriptor, data)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "write", one_byte_at_a_time)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 0, "a short write is legal and the loop must finish the stamp"
+    assert len(calls) > 2, "the probe must actually exercise the loop"
+
+
+def test_the_deterministic_projection_returns_an_exact_string(tmp_path: Path) -> None:
+    """Boundary review (5): this return value IS the equality two runs are compared on,
+    so a str subclass here would decide a freeze comparison with code of its own."""
+    from bench.harness.recall import build_section, deterministic_projection
+
+    section = build_section(_verdict_stub())
+    projection = deterministic_projection(section)
+    assert type(projection) is str
+
+    class _Subclassed(str):
+        pass
+
+    from bench.harness import recall as recall_module
+
+    real_dumps = recall_module.json.dumps
+    recall_module.json.dumps = lambda *a, **kw: _Subclassed(real_dumps(*a, **kw))
+    try:
+        # Without the proof this returns the subclass and the freeze comparison is
+        # decided by an object with code of its own.
+        with pytest.raises(RuntimeError, match="plain string"):
+            deterministic_projection(section)
+    finally:
+        recall_module.json.dumps = real_dumps

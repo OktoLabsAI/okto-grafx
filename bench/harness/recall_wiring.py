@@ -425,9 +425,20 @@ def _acquire_publication_locks(
             # True and os.write answering True or 0 both produced a "held" lock with an
             # empty file behind it.
             stamp = str(_exact_int(os.getpid(), "the process id", 1)).encode("ascii")
-            stamped = _exact_int(os.write(descriptor, stamp), "the stamp byte count", 1)
-            if stamped != len(stamp):
-                raise RuntimeError("the lock stamp was only partially written")
+            # Boundary review: a partial write is legal for os.write, so the contract is
+            # the same progress LOOP the scratch writer uses -- each report an exact int
+            # within what is left, and the loop ends only when every byte is accounted
+            # for. Refusing a partial write outright would have turned a legitimate
+            # short write into a failure.
+            stamped = 0
+            while stamped < len(stamp):
+                remaining = len(stamp) - stamped
+                progress = _exact_int(
+                    os.write(descriptor, stamp[stamped:]), "the stamp byte count", 1
+                )
+                if progress > remaining:
+                    raise RuntimeError("the lock stamp write reported too many bytes")
+                stamped += progress
         except BaseException as failure:  # noqa: BLE001 -- ONE unwind for every shape
             # Round-5 blocker 2: the ordinary and the KI/SE paths each carried their
             # OWN copy of the unwind, and both closed the descriptor under an
@@ -489,7 +500,7 @@ def _publish_documents(
     gt_mode: str,
     out: Path | None,
     metrics: Path | None,
-    workspace: Path,
+    scratch_root: Path,
     timeout_seconds: float | None,
 ) -> int:
     """The measurement and publication flow, entered ONLY with the lock held."""
@@ -499,7 +510,7 @@ def _publish_documents(
         verdict = run_recall(
             profile,
             gt_mode=gt_mode,
-            scratch=workspace / "recall",
+            scratch=scratch_root,
             timeout_seconds=timeout_seconds,
         )
     except RecallStageError as failure:
@@ -767,6 +778,18 @@ def append_vector_recall(
     # closing any lock unwinds every lock already held before the typed refusal --
     # and KeyboardInterrupt/SystemExit unwind too, then propagate. A normal run
     # whose release leaves residue prints a diagnostic rather than staying silent.
+    # Boundary review (3): the join `workspace / "recall"` ran the CALLER's object,
+    # and it happened inside the publication -- after the locks were taken and with the
+    # worker about to start. The workspace is reduced and proved HERE, before anything
+    # is acquired, so the scratch root handed downstream is one of ours.
+    try:
+        scratch_root = _trusted_path(os.fspath(workspace)) / "recall"
+    except BaseException as failure:  # noqa: BLE001 -- the ARGUMENT chose the shape
+        _emit(
+            "vector recall stage: REFUSED -- the workspace is not a usable path "
+            f"({_describe(failure)}); nothing was run."
+        )
+        return 3
     held_locks, lock_refusal = _acquire_publication_locks(
         [path for path in (out, metrics) if path is not None]
     )
@@ -779,7 +802,7 @@ def append_vector_recall(
             gt_mode=gt_mode,
             out=out,
             metrics=metrics,
-            workspace=workspace,
+            scratch_root=scratch_root,
             timeout_seconds=timeout_seconds,
         )
     except BaseException:

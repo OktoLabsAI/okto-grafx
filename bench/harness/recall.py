@@ -262,10 +262,23 @@ def run_recall(
     # the caller, the mkdir here, the mkstemp below -- ran its code. It is reduced to a
     # trusted native path first, so nothing hostile survives into the filesystem calls.
     try:
-        scratch = _trusted_path(os.fspath(scratch))
+        # DATA: os.fspath runs the ARGUMENT's __fspath__, so every shape it chooses
+        # becomes a typed refusal.
+        scratch_name = os.fspath(scratch)
     except BaseException as failure:  # noqa: BLE001 -- the ARGUMENT chose the shape
         raise RecallStageError(
             f"the scratch directory is not a usable path ({_describe(failure)}); "
+            "nothing was created and nothing was spawned."
+        ) from None
+    try:
+        # WORK: building OUR path. An ordinary failure is a typed refusal; a genuine
+        # interrupt of the constructor belongs to the caller and propagates. Sharing one
+        # clause with the line above absorbed it, which is the same conflation the lock
+        # names had.
+        scratch = _trusted_path(scratch_name)
+    except Exception as failure:  # noqa: BLE001 -- KI/SE propagate; this is OUR work
+        raise RecallStageError(
+            f"the scratch directory could not be prepared ({_describe(failure)}); "
             "nothing was created and nothing was spawned."
         ) from None
     scratch.mkdir(parents=True, exist_ok=True)
@@ -277,21 +290,41 @@ def run_recall(
     made = tempfile.mkstemp(  # WORK: a genuine interrupt propagates.
         prefix=f"recall-{profile}-", suffix=".json", dir=str(scratch)
     )
+    proved_descriptor: int | None = None
+    proved_name: str | None = None
     try:
         # Round-11 (4): the RESULT is snapshotted once and proved. Unpacking it ran the
         # returned object's __iter__, and the two halves went straight into os.close,
         # os.unlink and a command line without ever being shown to be an int and a str.
         if type(made) is not tuple or len(made) != 2:
             raise RuntimeError("mkstemp did not return a pair")
-        descriptor = _exact_int(made[0], "the temp file descriptor", 0)
-        temp_name = _exact_str(made[1], "the temp file name")
-        if not temp_name:
+        proved_descriptor = _exact_int(made[0], "the temp file descriptor", 0)
+        proved_name = _exact_str(made[1], "the temp file name")
+        if not proved_name:
             raise RuntimeError("mkstemp returned an empty name")
     except BaseException as failure:  # noqa: BLE001 -- the RESULT chose the shape
+        # Boundary review (4): a pair whose FIRST half proved and whose second did not
+        # left a real descriptor open and a real file on disk, because the refusal came
+        # before any ownership existed. Whatever was proved is cleaned up here, each
+        # component independently and best-effort, and no cleanup replaces the primary.
+        if proved_descriptor is not None:
+            try:
+                os.close(proved_descriptor)
+            except BaseException:  # noqa: BLE001 -- never replaces the primary
+                pass
+        if proved_name is not None:
+            try:
+                os.unlink(proved_name)
+            except BaseException:  # noqa: BLE001 -- never replaces the primary
+                pass
+        if not isinstance(failure, Exception):
+            raise
         raise RecallStageError(
             "the fresh per-run verdict file could not be prepared "
             f"({_describe(failure)}); nothing was spawned."
         ) from None
+    descriptor = proved_descriptor
+    temp_name = proved_name
     try:
         os.close(descriptor)
     except BaseException as failure:  # noqa: BLE001 -- ONE attempt, every shape
@@ -398,9 +431,11 @@ def run_recall(
             )
         duration = ended - started
         try:
-            raw = _exact_str(
-                verdict_path.read_text(encoding="utf-8"), "the verdict text"
-            )
+            # The READ is work and keeps its interrupts; the TEXT it returned is
+            # data. Boundary review (6): proving it inside this clause meant a str
+            # subclass raised RuntimeError past the (OSError, UnicodeError) tuple and
+            # left run_recall with a raw error instead of its typed one.
+            raw = verdict_path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as failure:
             # UnicodeError: a verdict file that is not valid UTF-8 is unreadable, and
             # before this clause it escaped run_recall as UnicodeDecodeError instead
@@ -410,6 +445,13 @@ def run_recall(
                 f"(exit {returncode}); stdout: {stdout[-400:]!r} "
                 f"stderr: {stderr[-400:]!r}"
             ) from failure
+        try:
+            raw = _exact_str(raw, "the verdict text")
+        except Exception as failure:  # noqa: BLE001 -- KI/SE propagate
+            raise RecallStageError(
+                "the recall worker's verdict is not plain text "
+                f"({_describe(failure)}); refusing it."
+            ) from None
         if not raw.strip():
             raise RecallStageError(
                 "the recall worker wrote nothing into its fresh per-run file "
@@ -985,6 +1027,11 @@ def build_section(
 def deterministic_projection(section: dict[str, object]) -> str:
     """Serialize ``frozen`` plus ``observed`` canonically — the equality two runs must hold."""
     projection = {"frozen": section["frozen"], "observed": section["observed"]}
-    return json.dumps(
-        projection, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    # Boundary review (5): this return value IS the equality two runs are compared on,
+    # so a str subclass here decides a freeze comparison with code of its own.
+    return _exact_str(
+        json.dumps(
+            projection, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ),
+        "the deterministic projection",
     )
