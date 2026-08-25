@@ -226,12 +226,23 @@ class GateResult:
         return 1
 
 
-def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], str]:
-    """Return the published multiples by ceiling, the plain gauges, and any read error.
+_UNREADABLE = object()
+"""Sentinel: the PARSE failed. Distinct from _UNCANONICAL, which means it parsed."""
 
-    Never raises. A document that cannot be read yields empty mappings and a reason, which the
-    caller turns into UNMEASURED -- a metrics file that failed to parse and a build with no
-    regressions are opposite facts and must not share an encoding.
+
+def _snapshot(document: str) -> tuple[object, str]:
+    """Parse and canonicalize ONCE; return (snapshot, parse-error text).
+
+    Round-10 (A). `check` used to hand the same TEXT to two readers, each of which
+    parsed it again -- so a json.loads answering differently on the second call let the
+    ceilings be judged from one document and the recall from another. Both then reported
+    honestly about the tree they saw, and the combination was a lie: ceilings_met with
+    the gauge "not published", exit 0. Canonicalizing did not help, because both trees
+    were canonical; the defect was that there were TWO.
+
+    The parse failure and the rebuild failure stay distinguishable, because absent and
+    malformed are opposite facts: _UNREADABLE means the text was not JSON, _UNCANONICAL
+    means it was JSON that cannot be trusted.
     """
     try:
         parsed = json.loads(document)
@@ -239,18 +250,34 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
         # ValueError is the documented shape, RecursionError arrives from thousands of
         # nesting levels, and the promise covers whatever else an ordinary parse can
         # throw. KeyboardInterrupt and SystemExit are BaseException and still propagate.
-        return (
-            {},
-            {},
-            f"the metrics document is not readable JSON: {_describe(error)}",
+        return _UNREADABLE, (
+            f"the metrics document is not readable JSON: {_describe(error)}"
         )
-    # Round-8 (B): the reader exported keys taken straight from the document, so a str
-    # SUBCLASS became a ceiling or metric name and lied to the CONSUMER's __eq__ long
-    # after this function returned. Canonicalizing means every key and value that leaves
-    # is an exact builtin. Round-9 (3): the rebuild is a SEPARATE event from the parse.
-    # Sharing one clause made a rebuild failure indistinguishable from an unreadable
-    # file, and the two are opposite facts.
-    payload = _canonical_json(parsed)
+    return _canonical_json(parsed), ""
+
+
+def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], str]:
+    """Return the published multiples by ceiling, the plain gauges, and any read error.
+
+    Never raises. A document that cannot be read yields empty mappings and a reason, which the
+    caller turns into UNMEASURED -- a metrics file that failed to parse and a build with no
+    regressions are opposite facts and must not share an encoding.
+    """
+    payload, parse_error = _snapshot(document)
+    return _multiples_from(payload, parse_error)
+
+
+def _multiples_from(
+    payload: object, parse_error: str
+) -> tuple[dict[str, float], dict[str, float], str]:
+    """The ceiling reader, over a snapshot somebody else took. Never raises.
+
+    Round-10 (A): the text entry point above stays for every existing caller, but the
+    decision now happens here, on an instance the caller can share with the recall
+    reader. One parse per decision, not one per reader.
+    """
+    if payload is _UNREADABLE:
+        return {}, {}, parse_error
     try:
         # Round-5 blocker 3: the boundary starts right after the parse, not after the
         # .get -- a hostile mapping raised raw at payload.get, one line before the guard
@@ -357,18 +384,20 @@ def _recall_measurement(document: str) -> tuple[str, object]:
     REFUSED, not ignored: the wiring publishes exactly this shape, so anything beyond it
     did not come from the pipeline and cannot be trusted as THE measurement.
     """
-    try:
-        parsed = json.loads(document)
-    except Exception:  # noqa: BLE001 -- unreadable is absent; never-raise is absolute
+    payload, _ = _snapshot(document)
+    return _measurement_from(payload)
+
+
+def _measurement_from(payload: object) -> tuple[str, object]:
+    """The recall reader, over a snapshot somebody else took. Never raises.
+
+    Round-9 (3) lives here: unreadable is ABSENT, which is tolerated without
+    --require-recall; parsed-but-untrustworthy is MALFORMED, which never is. Round-10
+    (A) is why it takes a snapshot rather than text -- so `check` can judge the ceilings
+    and the recall from the SAME tree.
+    """
+    if payload is _UNREADABLE:
         return ("absent", None)
-    # Round-9 (3): the rebuild used to share the clause above, so a document that PARSED
-    # and then failed to rebuild was reported as ABSENT -- and absent is TOLERATED
-    # without --require-recall, so `check` answered ceilings_met and exit 0 over a
-    # publication nothing could vouch for. Unreadable is absent; present-and-
-    # untrustworthy is malformed. They are opposite facts and must not share an
-    # encoding, which is the same rule that made the rebuild return a sentinel rather
-    # than None.
-    payload = _canonical_json(parsed)
     if payload is _UNCANONICAL:
         # A document that PARSED but cannot be rebuilt is MALFORMED, never absent:
         # absent is TOLERATED without --require-recall and malformed never is, so
@@ -468,7 +497,9 @@ def check(
             ),
         )
     recall_target = coerced_target
-    multiples, _, error = read_multiples(document)
+    # Round-10 (A): ONE parse, ONE rebuild, ONE instance for both readers below.
+    payload, parse_error = _snapshot(document)
+    multiples, _, error = _multiples_from(payload, parse_error)
     if error:
         return GateResult(status=STATUS_UNMEASURED, lines=(error,))
 
@@ -501,7 +532,7 @@ def check(
         elif status == STATUS_MET:
             status = STATUS_EXCEEDED
 
-    state, value = _recall_measurement(document)
+    state, value = _measurement_from(payload)
     if state == "absent":
         message = f"{RECALL_METRIC} was not published"
         if require_recall:

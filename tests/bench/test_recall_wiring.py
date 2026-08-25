@@ -1342,8 +1342,9 @@ def test_an_unserializable_document_never_acquires_a_descriptor(
 
     monkeypatch.setattr(tempfile_module, "mkstemp", forbidden_mkstemp)
 
-    def unserializable(payload: dict[str, object]) -> None:
+    def unserializable(payload: dict[str, object]) -> bool:
         payload["bad"] = object()
+        return True
 
     with pytest.raises(TypeError):
         wiring._replace_json(document, unserializable)
@@ -2133,6 +2134,12 @@ def test_a_path_that_refuses_to_be_built_still_removes_the_verdict_file(
 # =====================================================================================
 
 
+def _adds_a_key(document: dict[str, object]) -> bool:
+    """A mutation that really does change the tree, and says so."""
+    document["added"] = 1
+    return True
+
+
 class _IgnoreSet(dict):
     """A mapping that accepts every write and keeps none of them.
 
@@ -2159,7 +2166,7 @@ def test_a_mutation_that_cannot_land_is_refused_not_reported_as_success(
         wiring.json, "loads", lambda *a, **kw: _IgnoreSet({"kept": True})
     )
     with pytest.raises(RecallStageError, match="JSON-native"):
-        wiring._replace_json(document, lambda doc: doc.__setitem__("added", 1))
+        wiring._replace_json(document, _adds_a_key)
     monkeypatch.undo()
     assert document.read_text(encoding="utf-8") == before
 
@@ -2648,3 +2655,148 @@ def test_an_established_refusal_survives_an_interrupted_release(
     )
     monkeypatch.undo()
     assert code == 3, "the stage's own refusal stands; the cleanup's interrupt does not"
+
+
+def test_a_stat_result_whose_link_count_exits_is_a_typed_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-10 (B, code 194): the syscall is work and keeps its interrupts, but what it
+    RETURNED is not ours. Reading st_nlink and comparing it runs the returned object's
+    code, and an st_nlink whose __gt__ raises escaped with no lock taken."""
+
+    class _ExitingCount:
+        def __gt__(self, other: object) -> bool:
+            raise SystemExit(194)
+
+    class _HostileStat:
+        st_nlink = _ExitingCount()
+
+    out, metrics = _seed_documents(tmp_path)
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    monkeypatch.setattr(os, "stat", lambda *a, **kw: _HostileStat())
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert not called
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")] == []
+
+
+def test_a_hostile_second_path_never_reaches_the_identity_comparison(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-10 (B, code 193): a factory answering with a real Path first and an object
+    whose __eq__ raises second escaped through the out==metrics comparison, with no lock
+    ever taken. Identity now lives as a builtin str and is compared as one, and a Path is
+    only accepted when it reduces back to the exact name it was built from."""
+
+    class _HostileEquality:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        def __eq__(self, other: object) -> bool:
+            raise SystemExit(193)
+
+        def __hash__(self) -> int:
+            return 0
+
+        def __fspath__(self) -> str:
+            return self._name
+
+    out, metrics = _seed_documents(tmp_path)
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    real_path = wiring.Path
+    built: dict[str, int] = {}
+
+    def alternating(*args: object, **kwargs: object):
+        if args and str(args[0]).endswith(".json"):
+            key = str(args[0])
+            built[key] = built.get(key, 0) + 1
+            if built[key] == 2:
+                return _HostileEquality(key)
+        return real_path(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wiring, "Path", alternating)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3, "a path object that is not the path we asked for is refused"
+    assert not called
+
+
+def test_a_divergent_reread_inside_the_replace_cannot_erase_the_legacy_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-10 (A), the worst of the four: the strip decided on one read and
+    _replace_json wrote from ANOTHER, so a second read answering `{}` published that
+    empty tree over the real one -- destroying oktografx_baseline_ceiling_multiple with
+    exit 0, in a module whose whole premise is that legacy documents survive byte for
+    byte. One read now decides and acts, so there is no second tree to publish."""
+    out, metrics = _seed_documents(tmp_path)
+    document = json.loads(metrics.read_text(encoding="utf-8"))
+    document["metrics"].append(
+        {
+            "name": RECALL_METRIC,
+            "kind": "gauge",
+            "unit": "ratio",
+            "samples": [{"value": 0.10}],
+        }
+    )
+    metrics.write_text(json.dumps(document), encoding="utf-8")
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real_loads = json.loads
+    seen: list[int] = []
+
+    def empty_after_the_prevalidations(text: str, *a: object, **kw: object) -> object:
+        parsed = real_loads(text, *a, **kw)
+        if not isinstance(parsed, dict):
+            return parsed
+        seen.append(1)
+        return {} if len(seen) >= 3 else parsed
+
+    monkeypatch.setattr(wiring.json, "loads", empty_after_the_prevalidations)
+    append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    published = json.loads(metrics.read_text(encoding="utf-8"))
+    names = [entry.get("name") for entry in published.get("metrics", [])]
+    assert "oktografx_baseline_ceiling_multiple" in names, (
+        "a legacy metric may never be erased by a publication that only adds"
+    )
+
+
+def test_a_strip_with_nothing_to_remove_does_not_touch_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-10 (A): the no-op must stay a real no-op now that the decision moved inside
+    the read-modify-write -- same bytes, same mtime, no format churn. The declaration is
+    the only way not to write, so this pins that the declaration is made correctly."""
+    out, metrics = _seed_documents(tmp_path)
+    before_bytes = metrics.read_bytes()
+    before_mtime = metrics.stat().st_mtime_ns
+    wiring._strip_stale_gauge(metrics)
+    assert metrics.read_bytes() == before_bytes
+    assert metrics.stat().st_mtime_ns == before_mtime
+
+
+def test_a_mutation_that_does_not_declare_its_outcome_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Round-10 (A): a mutation that merely happens to leave the tree alone must not
+    lead to a write either -- the bytes would come from a snapshot nobody inspected,
+    which is the same defect one level down. The declaration is mandatory."""
+    document = tmp_path / "document.json"
+    document.write_text(json.dumps({"kept": True}), encoding="utf-8")
+    before = document.read_bytes()
+    with pytest.raises(RecallStageError, match="declare"):
+        wiring._replace_json(document, lambda doc: None)
+    assert document.read_bytes() == before

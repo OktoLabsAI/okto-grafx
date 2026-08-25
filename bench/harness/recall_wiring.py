@@ -36,7 +36,7 @@ from bench.harness.recall import (
 )
 
 
-def _replace_json(path: Path, mutate: Callable[[dict[str, object]], None]) -> None:
+def _replace_json(path: Path, mutate: Callable[[dict[str, object]], bool]) -> None:
     """Read a JSON document, apply one mutation, and atomically replace the file.
 
     The scratch file is UNIQUE per call (round-3 B): the old deterministic ``.c13.tmp``
@@ -58,7 +58,20 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], None]) -> No
             f"{path} is not plain JSON-native data, so a mutation of it cannot be "
             "trusted to land; refusing to publish."
         )
-    mutate(document)
+    # Round-10 (A): the mutation DECLARES whether it changed anything, and that
+    # declaration is the only way not to write. A mutation that merely happened to leave
+    # the tree alone must not lead to a write either, because the bytes written would
+    # come from a snapshot nobody inspected -- which is the same defect one level down.
+    changed = mutate(document)
+    if type(changed) is not bool:
+        raise RecallStageError(
+            f"the mutation of {path} did not declare whether it changed anything; "
+            "refusing to publish on an undeclared outcome."
+        )
+    if not changed:
+        # A true no-op: no write, no format churn, no mtime change -- the property the
+        # legacy documents are entitled to, now decided ON the snapshot itself.
+        return
     # Round-5 blocker 1b: the bytes are produced BEFORE any resource exists. This line
     # used to sit between the mkstemp and the try, an unguarded gap where a mutation
     # that made the document unserializable (or a RecursionError on a deep one) leaked
@@ -130,49 +143,28 @@ def _strip_stale_gauge(metrics: Path) -> None:
     stage exit would need generation binding between section and gauge; that evolution is
     recorded here rather than half-built.
     """
-    # The read and the parse are WORK: a real KeyboardInterrupt or SystemExit there
-    # still propagates, and the caller's boundary turns ordinary failures into exit 3.
-    document = _canonical_json(json.loads(metrics.read_text(encoding="utf-8")))
-    if type(document) is not dict:
-        # Round-9 (4): canonicalizing was not enough -- the SHAPE was never required. A
-        # type-exact `[]` rebuilds perfectly and then reads as "no gauge here", so the
-        # strip silently did nothing and the run published a new gauge beside a stale
-        # one: two gauges, and the invariant that every crash window reads as
-        # gauge-ABSENT quietly gone. The snapshot that is actually inspected must have
-        # the topology the inspection assumes, and the prevalidation's agreement on an
-        # earlier read is not evidence about THIS one.
-        raise RecallStageError(
-            "the metrics document is not a plain JSON object at the moment it is read "
-            "for a stale recall gauge, so one cannot be ruled out; refusing to publish "
-            "over an unknown state."
-        )
-    try:
-        # Round-7 (5): everything from here is the parsed OBJECT's code -- .get, the
-        # iteration, each entry's .get. A subclass raising SystemExit here escaped with
-        # the locks already held. We cannot prove there is no stale gauge, and stripping
-        # is the step that makes every crash window read as gauge-ABSENT, so a document
-        # we cannot inspect is a stage failure rather than a silent skip.
-        entries = document.get("metrics") if _is_a(document, dict) else None
-        carries_gauge = _is_a(entries, list) and any(
-            _is_a(entry, dict) and entry.get("name") == RECALL_METRIC
-            for entry in entries
-        )
-    except BaseException as failure:  # noqa: BLE001 -- inspection of parsed data only
-        raise RecallStageError(
-            "the metrics document could not be inspected for a stale recall gauge "
-            f"({_describe(failure)}); refusing to publish over an unknown state."
-        ) from None
-    if not carries_gauge:
-        return
 
-    def mutate(document: dict[str, object]) -> None:
-        stale = document.get("metrics")
-        if _is_a(stale, list):
-            document["metrics"] = [
-                entry
-                for entry in stale
-                if not (_is_a(entry, dict) and entry.get("name") == RECALL_METRIC)
-            ]
+    # Round-10 (A): there is no decision read any more. This step used to read the
+    # document to decide whether a stale gauge existed and then, through _replace_json,
+    # read it AGAIN to remove one -- two snapshots, so the decision and the action could
+    # disagree. A second read answering `{}` made the strip skip while the file still
+    # carried a stale gauge, so the run published a second one; and a second read
+    # answering `{}` from INSIDE _replace_json published that empty tree over the real
+    # one, destroying the legacy ceiling metrics with exit 0. One read decides and acts.
+    def mutate(document: dict[str, object]) -> bool:
+        entries = document.get("metrics")
+        if not _is_a(entries, list):
+            # Nothing here could hold a gauge, and this is not our document to rewrite.
+            return False
+        kept = [
+            entry
+            for entry in entries
+            if not (_is_a(entry, dict) and entry.get("name") == RECALL_METRIC)
+        ]
+        if len(kept) == len(entries):
+            return False
+        document["metrics"] = kept
+        return True
 
     _replace_json(metrics, mutate)
 
@@ -180,8 +172,9 @@ def _strip_stale_gauge(metrics: Path) -> None:
 def _append_section(out: Path, section: dict[str, object]) -> None:
     """Write step (1): the calibration document gains its ``vector_recall`` section."""
 
-    def mutate(document: dict[str, object]) -> None:
+    def mutate(document: dict[str, object]) -> bool:
         document["vector_recall"] = section
+        return True
 
     _replace_json(out, mutate)
 
@@ -189,8 +182,19 @@ def _append_section(out: Path, section: dict[str, object]) -> None:
 def _append_gauge(metrics: Path, value: float) -> None:
     """Write step (2), LAST: the metrics document gains the recall gauge the gate reads."""
 
-    def mutate(document: dict[str, object]) -> None:
-        entries = document.setdefault("metrics", [])
+    def mutate(document: dict[str, object]) -> bool:
+        # Round-10 (A), the deepest instance: `setdefault` CREATED the list when the
+        # snapshot did not have one, so a read that came back `{}` produced a document
+        # holding nothing but the new gauge -- and the legacy ceiling metrics, which the
+        # prevalidation had just seen, were gone. This module only ever ADDS, so a
+        # snapshot with no metric list is not the document that was validated, and
+        # publishing into it would be inventing a file rather than appending to one.
+        entries = document.get("metrics")
+        if entries is None:
+            raise RecallStageError(
+                "the metrics document lost its metric list between validation and "
+                "publication; refusing to publish a document that would replace it."
+            )
         if not _is_a(entries, list):
             # Round-3 B: the document can change between the precheck and this append.
             # Silently skipping used to return SUCCESS with section-without-gauge --
@@ -207,6 +211,7 @@ def _append_gauge(metrics: Path, value: float) -> None:
                 "samples": [{"value": value}],
             }
         )
+        return True
 
     _replace_json(metrics, mutate)
 
@@ -245,6 +250,32 @@ def _release_publication_locks(
             except BaseException:  # noqa: BLE001 -- the diagnosis is best-effort too
                 residue.append("<a lock whose failure could not be described>")
     return residue, interrupted
+
+
+def _trusted_path(name: str) -> Path:
+    """Build a Path from a builtin name and prove it is the path we asked for.
+
+    Round-10 (B): reducing the caller's object to a builtin string is only worth
+    anything if the string is what SURVIVES. Rebuilding a Path from it and carrying that
+    object between steps hands the environment a fresh chance to return something else
+    -- and it did: a factory answering with a real Path first and an object whose __eq__
+    raises second escaped through the identity comparison, with no lock ever taken.
+
+    So the object is never trusted on type. It is proved by BEHAVIOUR: whatever comes
+    back must reduce to exactly the builtin name we passed in, compared as strings.
+    Anything else is an ordinary failure, which the caller turns into a typed refusal.
+    """
+    try:
+        candidate = Path(name)
+    except BaseException as failure:  # noqa: BLE001 -- the CONSTRUCTOR chose the shape
+        raise RuntimeError(
+            f"a path object could not be built from {name!r} ({_describe(failure)})"
+        ) from None
+    if _normalized_name(candidate) != name:
+        raise RuntimeError(
+            f"the path constructor did not yield {name!r}; refusing to use it"
+        )
+    return candidate
 
 
 def _normalized_name(resolved: object) -> str:
@@ -548,7 +579,7 @@ def append_vector_recall(
     # outright: os.replace necessarily breaks the link relation, so no atomic
     # publication coherent across all names exists. Two arguments resolving to the
     # SAME file are refused for the same reason.
-    resolved: dict[str, Path] = {}
+    resolved: dict[str, str] = {}
     for alias_label, alias_path in (("--out", out), ("--metrics", metrics)):
         if alias_path is None:
             continue
@@ -580,7 +611,6 @@ def append_vector_recall(
             # RuntimeError instead of the typed exit 3 -- and it is the same kind of
             # call as the resolve above, so it belongs under the same clause.
             canonical_name = _normalized_name(resolved_object)
-            canonical = Path(canonical_name)
         except Exception as failure:  # noqa: BLE001 -- KI/SE propagate; this is I/O
             _emit(
                 f"vector recall stage: REFUSED -- {alias_label} "
@@ -592,12 +622,33 @@ def append_vector_recall(
         try:
             # Real I/O, on a builtin string: a genuine KeyboardInterrupt or SystemExit
             # here is an interrupt of WORK and keeps propagating as the primary.
-            link_count = os.stat(canonical_name).st_nlink
+            stat_result = os.stat(canonical_name)
         except Exception as failure:  # noqa: BLE001 -- KI/SE propagate; this is I/O
             _emit(
                 f"vector recall stage: REFUSED -- {alias_label} "
                 f"{_describe(alias_path)} could not be inspected on disk "
                 f"({_describe(failure)}); nothing was run."
+            )
+            return 3
+        try:
+            # Round-10 (B): the SYSCALL above is work and keeps its interrupts, but what
+            # it RETURNED is not ours -- reading st_nlink and comparing it runs the
+            # returned object's code, and an st_nlink whose __gt__ raises escaped with
+            # no lock taken. Reading it is a data boundary, and the value must be an
+            # exact int before any comparison happens.
+            link_count = stat_result.st_nlink
+        except BaseException as failure:  # noqa: BLE001 -- the RESULT chose the shape
+            _emit(
+                f"vector recall stage: REFUSED -- {alias_label} "
+                f"{_describe(alias_path)} reported an unreadable link count "
+                f"({_describe(failure)}); nothing was run."
+            )
+            return 3
+        if type(link_count) is not int or link_count < 1:
+            _emit(
+                f"vector recall stage: REFUSED -- {alias_label} "
+                f"{_describe(alias_path)} reported a link count that is not a positive "
+                f"integer ({_describe(link_count)}); nothing was run."
             )
             return 3
         if link_count > 1:
@@ -608,7 +659,7 @@ def append_vector_recall(
                 "aliases, so no coherent atomic publication exists. Nothing was run."
             )
             return 3
-        resolved[alias_label] = canonical
+        resolved[alias_label] = canonical_name
     if (
         "--out" in resolved
         and "--metrics" in resolved
@@ -619,8 +670,19 @@ def append_vector_recall(
             "physical document; the section and the gauge need distinct files."
         )
         return 3
-    out = resolved.get("--out", out)
-    metrics = resolved.get("--metrics", metrics)
+    # Round-10 (B): the Paths are built HERE, from the builtin names, each proved to
+    # be the path it was asked for. Nothing constructed earlier survives to this point.
+    try:
+        if "--out" in resolved:
+            out = _trusted_path(resolved["--out"])
+        if "--metrics" in resolved:
+            metrics = _trusted_path(resolved["--metrics"])
+    except Exception as failure:  # noqa: BLE001 -- KI/SE propagate
+        _emit(
+            "vector recall stage: REFUSED -- a canonical path could not be rebuilt "
+            f"({_describe(failure)}); nothing was run."
+        )
+        return 3
     for label, path in (("--out", out), ("--metrics", metrics)):
         if path is None:
             continue

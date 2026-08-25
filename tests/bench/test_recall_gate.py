@@ -885,3 +885,76 @@ def test_a_rebuild_failure_is_malformed_and_never_a_tolerated_absence(
     finally:
         sys.setrecursionlimit(original_limit)
     monkeypatch.undo()
+
+
+def test_check_parses_the_document_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-10 (A): `check` handed the same TEXT to two readers and each parsed it
+    again, so a json.loads answering differently the second time let the ceilings be
+    judged from one document and the recall from another. Both reported honestly about
+    the tree they saw, and the combination was a lie: ceilings_met with the gauge "not
+    published", exit 0. Counting the parses is the property; the verdict below is the
+    consequence."""
+    ceilings = {
+        "metrics": [
+            {
+                "name": "oktografx_baseline_ceiling_multiple",
+                "samples": [
+                    {"value": 1.0, "labels": {"ceiling": "durable_commit"}},
+                    {"value": 1.0, "labels": {"ceiling": "point_read"}},
+                    {"value": 1.0, "labels": {"ceiling": "open_replay"}},
+                ],
+            }
+        ]
+    }
+    calls: list[int] = []
+
+    def counted(*args: object, **kwargs: object) -> object:
+        calls.append(1)
+        return ceilings if len(calls) == 1 else []
+
+    monkeypatch.setattr(gate_module.json, "loads", counted)
+    verdict = check("{}")
+    monkeypatch.undo()
+    assert len(calls) == 1, "one parse per decision; a second is a second document"
+    assert verdict.status != "ceilings_met" or verdict.exit_code == 0
+    # With a single snapshot the two readers agree by construction: the ceilings are met
+    # AND the recall is genuinely absent in that same tree, which without --require-recall
+    # is exit 0 honestly. The lie was reaching that verdict from two different documents.
+    assert verdict.exit_code == 0
+
+
+@pytest.mark.parametrize(
+    "second", [[], {}, {"metrics": []}], ids=["list", "empty-dict", "empty-metrics"]
+)
+def test_a_divergent_second_parse_cannot_produce_a_passing_gate(
+    monkeypatch: pytest.MonkeyPatch, second: object
+) -> None:
+    """Round-10 (A): whatever the second read would have said, it is never consulted --
+    so no combination of two documents can be assembled into a verdict."""
+    document = json.dumps(
+        {
+            "metrics": [
+                {
+                    "name": RECALL_METRIC,
+                    "kind": "gauge",
+                    "unit": "ratio",
+                    "samples": [{"value": 0.10}],
+                }
+            ]
+        }
+    )
+    calls: list[int] = []
+    real_loads = json.loads
+
+    def counted(text: str, *args: object, **kwargs: object) -> object:
+        calls.append(1)
+        return real_loads(text, *args, **kwargs) if len(calls) == 1 else second
+
+    monkeypatch.setattr(gate_module.json, "loads", counted)
+    verdict = check(document, require_recall=True)
+    monkeypatch.undo()
+    assert len(calls) == 1
+    # 0.10 is below the 0.90 floor in the ONE snapshot, so the gate refuses.
+    assert verdict.exit_code != 0
