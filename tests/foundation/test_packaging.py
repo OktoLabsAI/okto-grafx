@@ -70,7 +70,7 @@ def test_the_linter_baseline_is_pinned_and_enforced_by_ci(
     end = workflow.index("\n  suite:\n", start)
     lint_job = workflow[start:end]
     assert 'python -m pip install -e ".[dev]"' in lint_job
-    assert "python -m ruff check src tests" in lint_job
+    assert "python -m ruff check ." in lint_job
 
 
 def test_every_accelerator_the_accel_extra_names_is_one_an_adapter_knows_how_to_use(

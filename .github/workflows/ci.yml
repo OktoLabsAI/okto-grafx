@@ -60,7 +60,7 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Enforce the zero-diagnostic baseline
-        run: python -m ruff check src tests
+        run: python -m ruff check .
 
   suite:
     name: suite (${{ matrix.family }} / ${{ matrix.profile }})
