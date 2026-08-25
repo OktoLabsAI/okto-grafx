@@ -12,7 +12,6 @@ and a bounded scan. Correctness stays asserted at the end -- latency numbers fro
 rows would be numbers about a broken database.
 """
 import json
-import os
 import shutil
 import statistics
 import subprocess
