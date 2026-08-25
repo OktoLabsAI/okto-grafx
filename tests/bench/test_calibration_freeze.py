@@ -95,6 +95,18 @@ EXPECTED_GATE_MATRIX: dict[str, list[dict[str, str]]] = {
     ]
 }
 
+EXPECTED_CALIBRATION_JOB_SHA256: str = (
+    "be5907510ee635287282e62b3e4c8e1d0fe7eb72c7f508de02f426e9b1491dcc"
+)
+"""Canonical execution fingerprint of the whole calibration job, excluding YAML comments."""
+
+EXPECTED_WORKFLOW_TRIGGERS: dict[str, object] = {
+    "push": None,
+    "pull_request": None,
+    "schedule": [{"cron": "0 6 * * 1"}],
+    "workflow_dispatch": None,
+}
+
 FORBIDDEN_WORKFLOW_GATE_CONTROLS: frozenset[str] = frozenset({"defaults", "env"})
 FORBIDDEN_GATE_JOB_CONTROLS: frozenset[str] = frozenset(
     {"container", "continue-on-error", "defaults", "env", "if", "needs"}
@@ -452,6 +464,17 @@ def _tokenize_gate_script(script: str) -> list[str]:
     return restored
 
 
+def _canonical_mapping_sha256(mapping: dict[object, object]) -> str:
+    """Hash a parsed workflow mapping so syntax-only YAML edits do not move authority."""
+    encoded = json.dumps(
+        mapping,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _gate_command(workflow_text: str | None = None) -> list[str]:
     """The sole unconditional, fatal workflow gate command and its exact argv."""
     document, invocations = _gate_invocations(workflow_text)
@@ -469,6 +492,15 @@ def _gate_command(workflow_text: str | None = None) -> list[str]:
     assert not workflow_controls, (
         "workflow-wide execution controls can replace the gate environment or shell: "
         f"{workflow_controls}"
+    )
+    # PyYAML follows YAML 1.1 and therefore decodes the unquoted GitHub Actions key ``on``
+    # as boolean ``True``. Accept either representation, but never both or neither.
+    trigger_keys = [key for key in ("on", True) if key in document]
+    assert len(trigger_keys) == 1, "the workflow must declare one unambiguous on: trigger mapping"
+    triggers = document[trigger_keys[0]]
+    assert triggers == EXPECTED_WORKFLOW_TRIGGERS, (
+        "the calibration gate must run for push, pull request, weekly full recall and manual "
+        f"dispatch; found {triggers!r}"
     )
     job_controls = sorted(FORBIDDEN_GATE_JOB_CONTROLS.intersection(job))
     assert not job_controls, (
@@ -496,6 +528,12 @@ def _gate_command(workflow_text: str | None = None) -> list[str]:
     assert tuple(argv) == EXPECTED_GATE_ARGV, (
         "the effective gate command changed; review every token rather than allowing an "
         f"implicit flag or shell operator: {argv}"
+    )
+    job_sha256 = _canonical_mapping_sha256(job)
+    assert job_sha256 == EXPECTED_CALIBRATION_JOB_SHA256, (
+        "the calibration job structure changed outside the individually governed controls; "
+        "review every executable step and then update its canonical fingerprint: "
+        f"{job_sha256}"
     )
     return argv
 
@@ -1524,6 +1562,26 @@ def test_a_conditional_decoy_cannot_capture_the_check_for_a_weaker_real_gate() -
         _gate_command(mutated)
 
 
+def test_a_prior_step_cannot_mutate_a_load_bearing_input_behind_an_exact_gate() -> None:
+    """The final step is insufficient authority when an earlier step can rewrite its input."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    governed_step = "      - name: Apply the D5 ceilings to the PUBLISHED metric"
+    assert workflow.count(governed_step) == 1
+    mutator = "\n".join(
+        (
+            "      - name: Silently weaken the frozen artifact at run time",
+            "        shell: bash",
+            "        run: |",
+            '          python -c "import json; from pathlib import Path; '
+            "p=Path('bench/calibration.json'); d=json.loads(p.read_text()); "
+            "d['vector_recall']['frozen']['target']=0.1; p.write_text(json.dumps(d))\"",
+        )
+    )
+    mutated = workflow.replace(governed_step, f"{mutator}\n\n{governed_step}")
+    with pytest.raises(AssertionError, match="calibration job structure changed"):
+        _gate_command(mutated)
+
+
 @pytest.mark.parametrize(
     "mutant_command",
     (
@@ -1612,6 +1670,16 @@ def test_workflow_wide_context_cannot_redirect_the_gate(control: str, value: str
     assert workflow.count(name_line) == 1
     mutated = workflow.replace(name_line, f"{name_line}\n\n{control}: {value}")
     with pytest.raises(AssertionError, match=rf"workflow-wide.*{re.escape(control)}"):
+        _gate_command(mutated)
+
+
+def test_the_pull_request_trigger_cannot_disappear_while_the_job_stays_exact() -> None:
+    """A perfect job that no proposed change runs is not a pull-request gate."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    trigger_line = "  pull_request:\n"
+    assert workflow.count(trigger_line) == 1
+    mutated = workflow.replace(trigger_line, "")
+    with pytest.raises(AssertionError, match="must run for push, pull request"):
         _gate_command(mutated)
 
 
