@@ -79,6 +79,7 @@ dev = [
     "pytest>=8",
     "pytest-timeout",
     "ruff==0.15.1",
+    "PyYAML>=6",
 ]
 
 [project.scripts]

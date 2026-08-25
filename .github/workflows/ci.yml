@@ -37,6 +37,8 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "0 6 * * 1"  # weekly full-profile recall calibration (C13)
   workflow_dispatch:
 
 permissions:
@@ -92,6 +94,11 @@ jobs:
             extras: "accel,bench"
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The C13 freeze proves both measured sources as commit:path -> blob -> SHA-256.
+          # A depth-1 checkout contains the integration tree but not those historical objects,
+          # which would turn an honest provenance gate into a CI-only rev-parse failure.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -247,7 +254,11 @@ jobs:
   calibration:
     name: D5 ceilings (${{ matrix.family }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # C13: the weekly FULL recall profile builds an 8192x384 HNSW in pure Python -- measured
+    # locally above 50 minutes on a machine faster than these runners -- so the scheduled run
+    # gets 180 minutes while pushes and pull requests (smoke profile) keep the original 60.
+    # The worker's own internal timeout stays the inner safety net either way.
+    timeout-minutes: ${{ github.event_name == 'schedule' && 180 || 60 }}
     strategy:
       fail-fast: false
       matrix:
@@ -281,11 +292,35 @@ jobs:
             --out calibration-${{ matrix.family }}.json \
             --metrics metrics-${{ matrix.family }}.json || true
 
+      - name: Vector recall stage (fail-closed, C13)
+        shell: bash
+        # SPEC-VEC FR-8: no || true here -- a recall failure (dtype check, differential,
+        # worker refusal) fails the job BEFORE the gate step, so the gate can never pass over
+        # a broken vector stage. Appends are ordered: section into the calibration document
+        # first, the gauge into the metrics document LAST (an interrupted run leaves
+        # section-without-gauge, which --require-recall below reads as UNMEASURED).
+        # Pushes run the smoke profile; the weekly schedule runs the full numpy oracle.
+        env:
+          RECALL_PROFILE: ${{ github.event_name == 'schedule' && 'full' || 'smoke' }}
+        run: |
+          python -m bench.harness.recall_wiring \
+            --profile "$RECALL_PROFILE" \
+            --gt auto \
+            --out "calibration-${{ matrix.family }}.json" \
+            --metrics "metrics-${{ matrix.family }}.json" \
+            --workspace .recall-workspace
+
       - name: Apply the D5 ceilings to the PUBLISHED metric
         shell: bash
         # OR-4: the gate reads oktografx_baseline_ceiling_multiple, not a log. A durable-commit
         # multiple above 10x is the 'consult JP' state of FR-15 and stops the pipeline.
-        run: python -m bench.harness.gate --metrics metrics-${{ matrix.family }}.json
+        # C13: --require-recall makes a build that publishes no recall gauge FAIL (the C13
+        # observation closed). The temporary --recall-target override is GONE: the freeze
+        # landed, so bench/calibration.json carries vector_recall.frozen.target and the
+        # versioned artifact governs the floor through _resolve_recall_target's precedence
+        # (flag > frozen artifact > built-in). Moving the floor is now a reviewable change
+        # to a committed file rather than a flag edited inside a workflow.
+        run: python -m bench.harness.gate --metrics metrics-${{ matrix.family }}.json --require-recall --calibration bench/calibration.json
 
       - name: Upload the calibration artefacts
         if: always()
