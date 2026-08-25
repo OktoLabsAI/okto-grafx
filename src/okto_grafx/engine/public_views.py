@@ -1230,11 +1230,60 @@ _QUARANTINE_INVENTORY_STATES: tuple[str, ...] = (
 """Closed public spelling of every conclusive quarantine inventory state."""
 
 
+# These constants deliberately mirror the portable logical-name grammar owned by the storage
+# adapter.  Importing that adapter here would reverse the engine dependency boundary (G2).
+_QUARANTINE_MAX_LOGICAL_NAME_LENGTH = 255
+_QUARANTINE_MAX_PATH_COMPONENT_LENGTH = 128
+_QUARANTINE_PENDING_DELETE_MARKER = ".pending-delete-"
+_QUARANTINE_FORBIDDEN_PATH_CHARACTERS = frozenset('<>:"|?*\\')
+_QUARANTINE_RESERVED_DEVICE_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+)
+
+
 def _quarantine_path_component(value: str) -> bool:
     """Return whether an exact string is one canonical storage-path component."""
-    return bool(value) and value not in (".", "..") and not any(
-        separator in value for separator in ("/", "\\", "\x00")
+    return (
+        bool(value)
+        and len(value) <= _QUARANTINE_MAX_PATH_COMPONENT_LENGTH
+        and value not in (".", "..")
+        and "/" not in value
+        and value == value.strip()
+        and not value.endswith(".")
+        and all(
+            character not in _QUARANTINE_FORBIDDEN_PATH_CHARACTERS
+            and 32 <= ord(character) < 127
+            for character in value
+        )
+        and value.split(".", 1)[0].upper() not in _QUARANTINE_RESERVED_DEVICE_NAMES
+        and _QUARANTINE_PENDING_DELETE_MARKER not in value.lower()
     )
+
+
+def _quarantine_logical_name(value: str) -> bool:
+    """Return whether an exact string is one canonical relative storage logical name."""
+    return (
+        bool(value)
+        and len(value) <= _QUARANTINE_MAX_LOGICAL_NAME_LENGTH
+        and not value.startswith("/")
+        and not (len(value) >= 2 and value[1] == ":")
+        and all(_quarantine_path_component(segment) for segment in value.split("/"))
+    )
+
+
+def _quarantine_restore_receipt(file: str, directory: str) -> bool:
+    """Classify a receipt without letting an invalid numeric envelope escape untyped."""
+    try:
+        return _is_restore_receipt(file, directory)
+    except (OverflowError, ValueError):
+        return False
 
 
 def _quarantine_inventory_item(
@@ -1311,19 +1360,21 @@ def _quarantine_inventory_item(
                 manifest_parent, manifest_separator, manifest_leaf = (
                     manifest_file.rpartition("/")
                 )
-                payload_parent, payload_separator, payload_leaf = payload_file.rpartition(
-                    "/"
+                payload_parent, payload_separator, payload_leaf = (
+                    payload_file.rpartition("/")
                 )
                 if directory is None:
-                    parent_directory, parent_separator, _ = manifest_parent.rpartition(
-                        "/"
+                    parent_directory, parent_separator, parent_name = (
+                        manifest_parent.rpartition("/")
                     )
-                    expected_parent = (
-                        f"{parent_directory}/{item.name}"
-                        if parent_separator
-                        else item.name
+                    root_is_canonical = (
+                        bool(parent_separator)
+                        and parent_name == item.name
+                        and _quarantine_logical_name(parent_directory)
                     )
+                    expected_parent = manifest_parent
                 else:
+                    root_is_canonical = _quarantine_logical_name(directory)
                     expected_parent = f"{directory}/{item.name}"
                 expected_manifest_file = f"{expected_parent}/{MANIFEST_FILE_NAME}"
                 expected_payload_file = f"{expected_parent}/{expected_payload_leaf}"
@@ -1331,8 +1382,10 @@ def _quarantine_inventory_item(
                 folded_files = tuple(file.casefold() for file in item.files)
                 required_files = (expected_manifest_file, expected_payload_file)
                 coherent = (
-                    _quarantine_path_component(item.name)
+                    root_is_canonical
+                    and _quarantine_path_component(item.name)
                     and _quarantine_path_component(payload_leaf)
+                    and all(_quarantine_logical_name(file) for file in item.files)
                     and bool(manifest_separator)
                     and bool(payload_separator)
                     and item.name == expected_name
@@ -1352,7 +1405,7 @@ def _quarantine_inventory_item(
                     and len(set(folded_files)) == len(folded_files)
                     and all(
                         file in required_files
-                        or _is_restore_receipt(file, expected_parent)
+                        or _quarantine_restore_receipt(file, expected_parent)
                         for file in item.files
                     )
                     and manifest.entry_name == item.name
@@ -3273,6 +3326,12 @@ def _quarantine_view(quarantine: Any) -> QuarantineView:
     directory = _builtin_text(
         quarantine.directory, field="quarantine.directory", empty=False
     )
+    if not _quarantine_logical_name(directory):
+        raise GrafxConfigurationError(
+            "The quarantine directory must be a canonical relative logical name.",
+            field="quarantine.directory",
+            value="noncanonical",
+        )
     captured_inventory = tuple(
         _quarantine_inventory_item(item, directory=directory)
         for item in _tuple_items(quarantine.inventory(), field="quarantine.inventory")
