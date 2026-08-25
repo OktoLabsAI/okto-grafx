@@ -44,9 +44,13 @@ from typing import Literal
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
+    GrafxDeviceFull,
+    GrafxDurabilityBarrierFailed,
     GrafxError,
     GrafxPortNotConfigured,
     GrafxQuarantineError,
+    GrafxStorageError,
+    GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import NO_LSN, Lsn
 from okto_grafx.domain.ports.clock import Clock
@@ -117,6 +121,56 @@ QUARANTINE_ENTRIES: str = "oktografx_quarantine_entries"
 
 QUARANTINE_METRICS: tuple[MetricDescriptor, ...] = (metric(QUARANTINE_ENTRIES),)
 """Every metric this store emits, taken from the frozen catalogue by name and never invented."""
+
+_INVENTORY_RETRY_DEFAULTS: tuple[tuple[type[GrafxError], bool], ...] = (
+    (GrafxCorruptionDetected, False),
+    (GrafxDeviceFull, True),
+    (GrafxDurabilityBarrierFailed, False),
+    (GrafxStorageError, True),
+    (GrafxUnsupportedOperation, False),
+)
+"""Closed retry policy for exact errors the storage namespace may legitimately report.
+
+This is an identity-scanned tuple rather than a dictionary: looking up an unknown exception
+class in a mapping could dispatch hostile metaclass hashing or equality. Subclasses are not
+trusted diagnostics and therefore fall back to ``False`` without any inspection.
+"""
+
+_INVENTORY_MISSING = object()
+
+
+def _exact_dict_value(container: object, key: str) -> object:
+    """Read one literal key from an exact builtin dictionary without foreign dispatch."""
+    if type(container) is not dict:
+        return _INVENTORY_MISSING
+    for candidate, value in dict.items(container):
+        if type(candidate) is str and candidate == key:
+            return value
+    return _INVENTORY_MISSING
+
+
+def _inventory_retryable(failure: GrafxError) -> bool:
+    """Classify a caught namespace failure without invoking diagnostics it controls."""
+    failure_type = type(failure)
+    for trusted_type, default in _INVENTORY_RETRY_DEFAULTS:
+        if failure_type is not trusted_type:
+            continue
+
+        # The identity check above is the capability to inspect instance state. The concrete
+        # trusted error types all use GrafxError's builtin __dict__; an unknown subclass returns
+        # before this point, so its attributes, metaclass and containers are never dispatched.
+        state = object.__getattribute__(failure, "__dict__")
+        if type(state) is not dict:
+            return default
+        details = _exact_dict_value(state, "details")
+        declared = _exact_dict_value(details, "retryable")
+        if type(declared) is bool:
+            return declared
+        override = _exact_dict_value(state, "retryable")
+        if type(override) is bool:
+            return override
+        return default
+    return False
 
 
 def _identity_suffix_candidate(name: str) -> str | None:
@@ -386,14 +440,10 @@ class QuarantineStore:
         try:
             observed = self._storage.list_files(prefix)
         except GrafxError as failure:
-            try:
-                retryable = is_retryable(failure)
-            except BaseException:
-                retryable = False
             raise GrafxQuarantineError(
                 f"The quarantine inventory is inconclusive because {self._directory!r} could "
                 "not be listed.",
-                retryable=retryable,
+                retryable=_inventory_retryable(failure),
                 field="inventory",
                 operation="list_files",
                 directory=self._directory,

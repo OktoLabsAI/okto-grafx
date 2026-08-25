@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterator
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -848,6 +849,9 @@ def test_an_inventory_whose_namespace_listing_fails_is_typed_and_inconclusive(
     _capture(stack, 13)
     device = _device(stack)
     before = _tree(device)
+    read_only = QuarantineStore(
+        ReadOnlyStorageDevice(device), stack.clock, RecordingMetricsSink()
+    )
     failure = GrafxStorageError(
         "The quarantine directory could not be listed.",
         operation="list_files",
@@ -859,13 +863,123 @@ def test_an_inventory_whose_namespace_listing_fails_is_typed_and_inconclusive(
     monkeypatch.setattr(device, "list_files", unavailable)
 
     with pytest.raises(GrafxQuarantineError) as caught:
-        stack.quarantine.inventory()
+        read_only.inventory()
 
     assert caught.value.__cause__ is failure
     assert caught.value.retryable is True
     assert caught.value.details["field"] == "inventory"
     assert caught.value.details["conclusive"] is False
     assert caught.value.details["inconclusive"] is True
+    monkeypatch.undo()
+    assert _tree(device) == before
+
+
+def test_inventory_preserves_an_exact_storage_retry_override_without_dispatching_details(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _capture(stack, 29)
+    device = _device(stack)
+    before = _tree(device)
+    read_only = QuarantineStore(
+        ReadOnlyStorageDevice(device), stack.clock, RecordingMetricsSink()
+    )
+    dispatches: list[str] = []
+
+    class HostileDetails(dict[str, object]):
+        """Expose every attempted use of this untrusted container subclass."""
+
+        def __getattribute__(self, name: str) -> object:
+            dispatches.append(f"attribute:{name}")
+            return super().__getattribute__(name)
+
+        def __getitem__(self, key: str) -> object:
+            dispatches.append("getitem")
+            return super().__getitem__(key)
+
+        def __iter__(self) -> Iterator[str]:
+            dispatches.append("iter")
+            return super().__iter__()
+
+    failure = GrafxStorageError(
+        "The quarantine directory is permanently unavailable.",
+        retryable=False,
+        operation="list_files",
+    )
+    failure.details = HostileDetails({"retryable": True})
+    dispatches.clear()
+
+    def unavailable(_prefix: str = "") -> tuple[str, ...]:
+        raise failure
+
+    monkeypatch.setattr(device, "list_files", unavailable)
+
+    with pytest.raises(GrafxQuarantineError) as caught:
+        read_only.inventory()
+
+    assert caught.value.__cause__ is failure
+    assert caught.value.retryable is False
+    assert dispatches == []
+    monkeypatch.undo()
+    assert _tree(device) == before
+
+
+def test_inventory_never_dispatches_a_nonthrowing_unknown_failure_subclass(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _capture(stack, 30)
+    device = _device(stack)
+    before = _tree(device)
+    read_only = QuarantineStore(
+        ReadOnlyStorageDevice(device), stack.clock, RecordingMetricsSink()
+    )
+    dispatches: list[str] = []
+
+    class CountingFailureName(type):
+        """Record class inspection even when it would otherwise appear to succeed."""
+
+        def __getattribute__(cls, name: str) -> object:
+            dispatches.append(f"class-attribute:{name}")
+            return super().__getattribute__(name)
+
+        def __hash__(cls) -> int:
+            dispatches.append("class-hash")
+            return type.__hash__(cls)
+
+        def __eq__(cls, other: object) -> bool:
+            dispatches.append("class-equality")
+            return cls is other
+
+    class CountingStorage(GrafxStorageError, metaclass=CountingFailureName):
+        """Record all instance diagnostics while returning their ordinary values."""
+
+        def __getattribute__(self, name: str) -> object:
+            dispatches.append(f"instance-attribute:{name}")
+            return super().__getattribute__(name)
+
+        def __str__(self) -> str:
+            dispatches.append("instance-str")
+            return "counting storage failure"
+
+        def __repr__(self) -> str:
+            dispatches.append("instance-repr")
+            return "CountingStorage()"
+
+    failure = CountingStorage(
+        "The quarantine directory could not be listed.", retryable=True
+    )
+    dispatches.clear()
+
+    def unavailable(_prefix: str = "") -> tuple[str, ...]:
+        raise failure
+
+    monkeypatch.setattr(device, "list_files", unavailable)
+
+    with pytest.raises(GrafxQuarantineError) as caught:
+        read_only.inventory()
+
+    assert caught.value.__cause__ is failure
+    assert caught.value.retryable is False
+    assert dispatches == []
     monkeypatch.undo()
     assert _tree(device) == before
 
@@ -879,27 +993,44 @@ def test_inventory_contains_hostile_diagnostics_from_a_caught_listing_failure(
     read_only = QuarantineStore(
         ReadOnlyStorageDevice(device), stack.clock, RecordingMetricsSink()
     )
+    dispatches: list[str] = []
 
     class HostileFailureName(type):
         """Turn diagnostic access to the caught failure's type name into the same signal."""
 
         def __getattribute__(cls, name: str) -> object:
+            dispatches.append(f"class-attribute:{name}")
             if name == "__name__":
                 raise SystemExit(211)
             return super().__getattribute__(name)
+
+        def __hash__(cls) -> int:
+            dispatches.append("class-hash")
+            raise SystemExit(211)
+
+        def __eq__(cls, _other: object) -> bool:
+            dispatches.append("class-equality")
+            raise SystemExit(211)
 
     class HostileStorage(GrafxStorageError, metaclass=HostileFailureName):
         """Turn every diagnostic attribute read into a process signal."""
 
         def __getattribute__(self, name: str) -> object:
+            dispatches.append(f"instance-attribute:{name}")
             if name in {"code", "message", "retryable", "details", "__class__"}:
                 raise SystemExit(211)
             return super().__getattribute__(name)
 
+        def __str__(self) -> str:
+            dispatches.append("instance-str")
+            raise SystemExit(211)
+
         def __repr__(self) -> str:
+            dispatches.append("instance-repr")
             raise SystemExit(211)
 
     failure = HostileStorage("The quarantine directory could not be listed.")
+    dispatches.clear()
 
     def unavailable(_prefix: str = "") -> tuple[str, ...]:
         raise failure
@@ -914,6 +1045,7 @@ def test_inventory_contains_hostile_diagnostics_from_a_caught_listing_failure(
     assert caught.value.details["cause"] == "storage_failure"
     assert caught.value.details["conclusive"] is False
     assert caught.value.details["inconclusive"] is True
+    assert dispatches == []
     monkeypatch.undo()
     assert _tree(device) == before
 
@@ -937,5 +1069,29 @@ def test_inventory_preserves_a_direct_namespace_listing_signal(
         read_only.inventory()
 
     assert caught.value.code == 213
+    monkeypatch.undo()
+    assert _tree(device) == before
+
+
+def test_inventory_preserves_a_direct_namespace_listing_keyboard_interrupt(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _capture(stack, 31)
+    device = _device(stack)
+    before = _tree(device)
+    read_only = QuarantineStore(
+        ReadOnlyStorageDevice(device), stack.clock, RecordingMetricsSink()
+    )
+    interruption = KeyboardInterrupt()
+
+    def interrupted_listing(_prefix: str = "") -> tuple[str, ...]:
+        raise interruption
+
+    monkeypatch.setattr(device, "list_files", interrupted_listing)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        read_only.inventory()
+
+    assert caught.value is interruption
     monkeypatch.undo()
     assert _tree(device) == before
