@@ -117,7 +117,12 @@ from okto_grafx.domain.query.plan import (
     VectorSearch,
     validate_plan,
 )
-from okto_grafx.domain.recovery.manifest import MANIFEST_FILE_NAME, QuarantineManifest
+from okto_grafx.domain.recovery.manifest import (
+    MANIFEST_FILE_NAME,
+    RESTORE_RECEIPT_PREFIX,
+    QuarantineManifest,
+    stamp_of,
+)
 from okto_grafx.domain.recovery.report import RecoveryFinding, RecoveryReport
 from okto_grafx.domain.txn.commit_state import CommitState
 from okto_grafx.domain.txn.partitions import partition_of
@@ -143,6 +148,8 @@ from okto_grafx.engine.quarantine import (
     QuarantineEntry,
     QuarantineInventoryItem,
     QuarantineInventoryState,
+    _is_restore_receipt,
+    _payload_file_name,
 )
 from okto_grafx.engine.vector_engine import VectorHit, VectorSearchResult
 
@@ -1223,6 +1230,13 @@ _QUARANTINE_INVENTORY_STATES: tuple[str, ...] = (
 """Closed public spelling of every conclusive quarantine inventory state."""
 
 
+def _quarantine_path_component(value: str) -> bool:
+    """Return whether an exact string is one canonical storage-path component."""
+    return bool(value) and value not in (".", "..") and not any(
+        separator in value for separator in ("/", "\\", "\x00")
+    )
+
+
 def _quarantine_inventory_item(
     value: Any, *, directory: str | None = None
 ) -> QuarantineInventoryItem:
@@ -1286,27 +1300,65 @@ def _quarantine_inventory_item(
             and payload_file is not None
         )
         if coherent:
-            manifest_parent, manifest_separator, manifest_leaf = manifest_file.rpartition(
-                "/"
-            )
-            payload_parent, payload_separator, payload_leaf = payload_file.rpartition("/")
-            expected_parent = (
-                f"{directory}/{item.name}" if directory is not None else manifest_parent
-            )
-            coherent = (
-                bool(manifest_separator)
-                and bool(payload_separator)
-                and manifest_leaf == MANIFEST_FILE_NAME
-                and bool(payload_leaf)
-                and payload_leaf != MANIFEST_FILE_NAME
-                and manifest_parent == expected_parent
-                and payload_parent == expected_parent
-                and manifest_parent.rpartition("/")[2] == item.name
-                and manifest_file in item.files
-                and payload_file in item.files
-                and manifest.entry_name == item.name
-                and manifest.payload_file == payload_file
-            )
+            try:
+                expected_name = (
+                    f"{stamp_of(manifest.captured_at_wall)}-{manifest.suffix}"
+                )
+                expected_payload_leaf = _payload_file_name(manifest.origin)
+            except (GrafxConfigurationError, OverflowError, ValueError):
+                coherent = False
+            else:
+                manifest_parent, manifest_separator, manifest_leaf = (
+                    manifest_file.rpartition("/")
+                )
+                payload_parent, payload_separator, payload_leaf = payload_file.rpartition(
+                    "/"
+                )
+                if directory is None:
+                    parent_directory, parent_separator, _ = manifest_parent.rpartition(
+                        "/"
+                    )
+                    expected_parent = (
+                        f"{parent_directory}/{item.name}"
+                        if parent_separator
+                        else item.name
+                    )
+                else:
+                    expected_parent = f"{directory}/{item.name}"
+                expected_manifest_file = f"{expected_parent}/{MANIFEST_FILE_NAME}"
+                expected_payload_file = f"{expected_parent}/{expected_payload_leaf}"
+                folded_payload_leaf = payload_leaf.casefold()
+                folded_files = tuple(file.casefold() for file in item.files)
+                required_files = (expected_manifest_file, expected_payload_file)
+                coherent = (
+                    _quarantine_path_component(item.name)
+                    and _quarantine_path_component(payload_leaf)
+                    and bool(manifest_separator)
+                    and bool(payload_separator)
+                    and item.name == expected_name
+                    and manifest_leaf == MANIFEST_FILE_NAME
+                    and payload_leaf == expected_payload_leaf
+                    and folded_payload_leaf != MANIFEST_FILE_NAME.casefold()
+                    and not folded_payload_leaf.startswith(
+                        RESTORE_RECEIPT_PREFIX.casefold()
+                    )
+                    and manifest_parent == expected_parent
+                    and payload_parent == expected_parent
+                    and manifest_file == expected_manifest_file
+                    and payload_file == expected_payload_file
+                    and manifest_file in item.files
+                    and payload_file in item.files
+                    and len(set(item.files)) == len(item.files)
+                    and len(set(folded_files)) == len(folded_files)
+                    and all(
+                        file in required_files
+                        or _is_restore_receipt(file, expected_parent)
+                        for file in item.files
+                    )
+                    and manifest.entry_name == item.name
+                    and manifest.payload_file == payload_file
+                    and item.detail == ""
+                )
         if not coherent:
             raise GrafxConfigurationError(
                 "A complete quarantine inventory item must carry a self-consistent "

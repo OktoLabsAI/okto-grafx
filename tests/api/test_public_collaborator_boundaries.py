@@ -44,7 +44,11 @@ from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.ports.vectormath import DistanceMetric
-from okto_grafx.domain.recovery.manifest import QuarantineManifest
+from okto_grafx.domain.recovery.manifest import (
+    QuarantineManifest,
+    entry_suffix,
+    stamp_of,
+)
 from okto_grafx.domain.recovery.report import RecoveryFinding, RecoveryReport
 from okto_grafx.domain.txn.commit_state import CommitState
 from okto_grafx.domain.txn.context import CommitReport, TransactionContext
@@ -613,16 +617,21 @@ def _hostile_ledger_values(
 
 def _hostile_quarantine_entry(counts: dict[str, int]) -> QuarantineEntry:
     """Build one complete evidence DTO whose nested leaves are all host-owned subclasses."""
+    origin = "wal/000000000001.wal"
+    captured_at_wall = 3.5
+    name = f"{stamp_of(captured_at_wall)}-{entry_suffix(origin, 1, 2)}"
+    payload_file = f"quarantine/{name}/000000000001.wal"
+    manifest_file = f"quarantine/{name}/manifest.json"
     manifest = QuarantineManifest(
-        origin="wal/000000000001.wal",
+        origin=origin,
         offset=1,
         length=2,
         reason="checksum_failure",
         detail="bad checksum",
-        captured_at_wall=3.5,
+        captured_at_wall=captured_at_wall,
         digest="0" * 64,
-        payload_file="quarantine/evidence/payload.wal",
-        entry_name="evidence",
+        payload_file=payload_file,
+        entry_name=name,
         expected_lsn=4,
     )
     _replace_leaves(
@@ -640,10 +649,10 @@ def _hostile_quarantine_entry(counts: dict[str, int]) -> QuarantineEntry:
         schema=_CapabilityInt(manifest.schema, counts),
     )
     entry = QuarantineEntry(
-        name="evidence",
+        name=name,
         manifest=manifest,
-        payload_file="quarantine/evidence/payload.wal",
-        manifest_file="quarantine/evidence/manifest.json",
+        payload_file=payload_file,
+        manifest_file=manifest_file,
     )
     _replace_leaves(
         entry,
@@ -660,7 +669,7 @@ def _hostile_quarantine_inventory_item(
     """Build one inventory DTO whose tuple and every nested leaf are host subclasses."""
     entry = _hostile_quarantine_entry(counts)
     item = QuarantineInventoryItem(
-        name="evidence",
+        name=entry.name,
         state="complete",
         files=(entry.manifest_file, entry.payload_file),
         manifest_file=entry.manifest_file,
@@ -1916,32 +1925,50 @@ def test_legacy_quarantine_view_refuses_to_invent_an_empty_inventory() -> None:
         "manifest_payload_file",
         "crossed_manifest_directory",
         "crossed_payload_directory",
+        "dot_item_name",
+        "parent_item_name",
+        "backslash_item_name",
+        "parent_payload_leaf",
+        "backslash_payload_leaf",
+        "manifest_case_alias",
+        "restore_receipt_case_alias",
+        "unexpected_extra_file",
+        "foreign_extra_file",
+        "payload_not_derived_from_origin",
+        "duplicate_file",
+        "casefold_file_collision",
     ),
 )
+@pytest.mark.parametrize(
+    "directory", ("quarantine", None), ids=("known-root", "derived-root")
+)
 def test_quarantine_view_refuses_an_incoherent_complete_inventory_item(
-    contradiction: str,
+    contradiction: str, directory: str | None
 ) -> None:
     """A store cannot label contradictory physical evidence as legacy-complete."""
+    origin = "wal/000000000001.wal"
+    captured_at_wall = 3.5
+    name = f"{stamp_of(captured_at_wall)}-{entry_suffix(origin, 1, 2)}"
+    item_directory = f"quarantine/{name}"
+    manifest_file = f"{item_directory}/manifest.json"
+    payload_file = f"{item_directory}/000000000001.wal"
     manifest = QuarantineManifest(
-        origin="wal/000000000001.wal",
+        origin=origin,
         offset=1,
         length=2,
         reason="checksum_failure",
         detail="bad checksum",
-        captured_at_wall=3.5,
+        captured_at_wall=captured_at_wall,
         digest="0" * 64,
-        payload_file="quarantine/hollow/payload.wal",
-        entry_name="hollow",
+        payload_file=payload_file,
+        entry_name=name,
     )
     complete = QuarantineInventoryItem(
-        name="hollow",
+        name=name,
         state="complete",
-        files=(
-            "quarantine/hollow/manifest.json",
-            "quarantine/hollow/payload.wal",
-        ),
-        manifest_file="quarantine/hollow/manifest.json",
-        payload_file="quarantine/hollow/payload.wal",
+        files=(manifest_file, payload_file),
+        manifest_file=manifest_file,
+        payload_file=payload_file,
         manifest=manifest,
     )
     if contradiction == "missing_manifest":
@@ -1958,7 +1985,7 @@ def test_quarantine_view_refuses_an_incoherent_complete_inventory_item(
         incoherent = replace(
             complete,
             manifest=replace(
-                manifest, payload_file="quarantine/hollow/another-payload.wal"
+                manifest, payload_file=f"{item_directory}/another-payload.wal"
             ),
         )
     elif contradiction == "crossed_manifest_directory":
@@ -1968,7 +1995,7 @@ def test_quarantine_view_refuses_an_incoherent_complete_inventory_item(
             manifest_file=crossed,
             files=(crossed, complete.payload_file),
         )
-    else:
+    elif contradiction == "crossed_payload_directory":
         crossed = "quarantine/another-entry/payload.wal"
         incoherent = replace(
             complete,
@@ -1976,16 +2003,107 @@ def test_quarantine_view_refuses_an_incoherent_complete_inventory_item(
             manifest=replace(manifest, payload_file=crossed),
             files=(complete.manifest_file, crossed),
         )
+    elif contradiction in ("dot_item_name", "parent_item_name", "backslash_item_name"):
+        crossed_name = {
+            "dot_item_name": ".",
+            "parent_item_name": "..",
+            "backslash_item_name": "nested\\entry",
+        }[contradiction]
+        manifest_file = f"quarantine/{crossed_name}/manifest.json"
+        payload_file = f"quarantine/{crossed_name}/payload.wal"
+        incoherent = replace(
+            complete,
+            name=crossed_name,
+            files=(manifest_file, payload_file),
+            manifest_file=manifest_file,
+            payload_file=payload_file,
+            manifest=replace(
+                manifest, entry_name=crossed_name, payload_file=payload_file
+            ),
+        )
+    else:
+        if contradiction in (
+            "parent_payload_leaf",
+            "backslash_payload_leaf",
+            "manifest_case_alias",
+            "restore_receipt_case_alias",
+            "payload_not_derived_from_origin",
+        ):
+            payload_leaf = {
+                "parent_payload_leaf": "..",
+                "backslash_payload_leaf": "nested\\payload.wal",
+                "manifest_case_alias": "MANIFEST.JSON",
+                "restore_receipt_case_alias": "RESTORE-1.JSON",
+                "payload_not_derived_from_origin": "another-payload.wal",
+            }[contradiction]
+            contradictory_payload = f"{item_directory}/{payload_leaf}"
+            incoherent = replace(
+                complete,
+                files=(complete.manifest_file, contradictory_payload),
+                payload_file=contradictory_payload,
+                manifest=replace(manifest, payload_file=contradictory_payload),
+            )
+        elif contradiction == "unexpected_extra_file":
+            incoherent = replace(
+                complete, files=(*complete.files, f"{item_directory}/unexpected.bin")
+            )
+        elif contradiction == "foreign_extra_file":
+            incoherent = replace(
+                complete, files=(*complete.files, "quarantine/other/foreign.bin")
+            )
+        elif contradiction == "duplicate_file":
+            incoherent = replace(complete, files=(*complete.files, manifest_file))
+        else:
+            incoherent = replace(
+                complete, files=(*complete.files, f"{item_directory}/MANIFEST.JSON")
+            )
 
     with pytest.raises(GrafxConfigurationError) as raised:
-        public_views_module._quarantine_inventory_item(
-            incoherent, directory="quarantine"
-        )
+        public_views_module._quarantine_inventory_item(incoherent, directory=directory)
 
     assert raised.value.details == {
         "field": "quarantine.inventory.item",
         "value": "incomplete_complete_item",
     }
+
+
+def test_quarantine_view_accepts_only_canonical_restore_receipts_as_extra_files() -> (
+    None
+):
+    """A numbered receipt is part of a complete layout; arbitrary neighbours are not."""
+    origin = "wal/000000000001.wal"
+    captured_at_wall = 3.5
+    name = f"{stamp_of(captured_at_wall)}-{entry_suffix(origin, 1, 2)}"
+    directory = f"quarantine/{name}"
+    manifest_file = f"{directory}/manifest.json"
+    payload_file = f"{directory}/000000000001.wal"
+    receipt = f"{directory}/restore-1.json"
+    manifest = QuarantineManifest(
+        origin=origin,
+        offset=1,
+        length=2,
+        reason="checksum_failure",
+        detail="bad checksum",
+        captured_at_wall=captured_at_wall,
+        digest="0" * 64,
+        payload_file=payload_file,
+        entry_name=name,
+    )
+    complete = QuarantineInventoryItem(
+        name=name,
+        state="complete",
+        files=(manifest_file, payload_file, receipt),
+        manifest_file=manifest_file,
+        payload_file=payload_file,
+        manifest=manifest,
+    )
+
+    observed = public_views_module._quarantine_inventory_item(
+        complete, directory="quarantine"
+    )
+
+    assert observed == complete
+    assert observed.entry is not None
 
 
 def test_database_quarantine_view_captures_inventory_once_and_derives_legacy_entries(
@@ -2027,7 +2145,7 @@ def test_database_quarantine_view_captures_inventory_once_and_derives_legacy_ent
     observed = view.inventory()
     assert inventory_calls == [1]
     assert [item.state for item in observed] == ["complete", "incomplete"]
-    assert [item.name for item in observed] == ["evidence", "orphan"]
+    assert [item.name for item in observed] == [complete.name, "orphan"]
     assert all(type(item.name) is str for item in observed)
     assert type(observed[0].files) is tuple
     assert all(type(file) is str for item in observed for file in item.files)
