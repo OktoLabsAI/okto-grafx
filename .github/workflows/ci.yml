@@ -64,6 +64,48 @@ jobs:
       - name: Enforce the zero-diagnostic baseline
         run: python -m ruff check .
 
+  consumer:
+    name: installed consumer (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build the wheel and source distribution
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build mypy
+          python -m build
+
+      - name: Install and verify the wheel as a consumer
+        shell: bash
+        run: |
+          python -m venv .venv-wheel
+          .venv-wheel/bin/python -m pip install --no-deps dist/*.whl
+          .venv-wheel/bin/python -m pip check
+          .venv-wheel/bin/python tests/consumer/smoke.py
+          python -m mypy --strict --follow-imports=silent \
+            --python-executable .venv-wheel/bin/python tests/consumer/smoke.py
+
+      - name: Install and verify the source distribution as a consumer
+        shell: bash
+        run: |
+          python -m venv .venv-sdist
+          .venv-sdist/bin/python -m pip install --no-deps dist/*.tar.gz
+          .venv-sdist/bin/python -m pip check
+          .venv-sdist/bin/python tests/consumer/smoke.py
+          python -m mypy --strict --follow-imports=silent \
+            --python-executable .venv-sdist/bin/python tests/consumer/smoke.py
+
   suite:
     name: suite (${{ matrix.family }} / ${{ matrix.profile }})
     runs-on: ${{ matrix.os }}
