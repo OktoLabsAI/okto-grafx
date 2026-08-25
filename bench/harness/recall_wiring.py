@@ -110,6 +110,8 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], bool]) -> No
             f"the scratch file could not be prepared ({refusal}); nothing was written."
         )
     closed = False
+    # Round-14: set ONLY after a non-None return from os.replace, never by a type.
+    keep_scratch = False
     try:
         written = 0
         while written < len(payload):
@@ -136,24 +138,19 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], bool]) -> No
         # deliberately KEPT and accounted for by the clause below rather than removed as
         # though the publication had landed.
         replaced = os.replace(scratch_name, path)
+        # Round-14: the flag is set only AFTER the call has RETURNED. Round-13 signalled
+        # this case with a private exception type, and a type is a channel the call
+        # itself can write to: an os.replace that RAISED _InconclusiveReplace was
+        # reclassified as our own marker and had its scratch preserved, when an exception
+        # from the call means the replace did not happen and the scratch is just debris.
+        # Local state cannot be forged by the callee -- reaching this line at all is the
+        # proof, and no exception can produce it.
         if replaced is not None:
-            # Not _certify_none: this one needs a type of its own so the cleanup below
-            # can tell it apart and keep the scratch.
-            raise _InconclusiveReplace(
+            keep_scratch = True
+            raise RuntimeError(
                 f"replacing {path} did not report completion, so it may or may not "
                 "have happened"
             )
-    except _InconclusiveReplace:
-        # Round-13: the scratch is KEPT, and this is the code that keeps it rather than
-        # a comment saying so. The replace may have happened or may not; the scratch is
-        # the only copy that might carry the intended content, and removing it would
-        # destroy the evidence needed to tell which. The descriptor is still released.
-        if not closed:
-            try:
-                os.close(descriptor)
-            except BaseException:  # noqa: BLE001 -- never replaces the primary
-                pass
-        raise
     except BaseException:
         # Ownership is explicit: the raw descriptor is ours until the single close
         # attempt above. Cleanup is best-effort and can never replace the PRIMARY
@@ -165,10 +162,15 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], bool]) -> No
                 os.close(descriptor)
             except BaseException:  # noqa: BLE001 -- never replaces the primary
                 pass
-        try:
-            os.unlink(scratch_name)
-        except BaseException:  # noqa: BLE001 -- never replaces the primary
-            pass
+        if not keep_scratch:
+            # An exception from the call -- including one that happens to be any type at
+            # all -- means the replace did not happen, so the scratch is debris. Only a
+            # non-None RETURN leaves it in place, because only then is the outcome
+            # genuinely unknown and the scratch the one candidate copy.
+            try:
+                os.unlink(scratch_name)
+            except BaseException:  # noqa: BLE001 -- never replaces the primary
+                pass
         raise
 
 
@@ -324,20 +326,6 @@ def _normalized_name(resolved: object) -> str:
     if type(name) is not str:
         raise RuntimeError("resolve() did not yield a filesystem path")
     return name
-
-
-class _InconclusiveReplace(Exception):
-    """The replace may or may not have happened, so the scratch is the only candidate.
-
-    Round-13. The previous commit CLAIMED, in a comment and in its message, that an
-    unproved replace keeps the scratch -- and the cleanup unlinked it unconditionally,
-    destroying the only copy that might hold the intended content. The claim was wrong
-    about its own code, and the probe did not catch it because it asserted the outcome
-    around the scratch rather than the scratch itself.
-
-    A distinct type is what makes the promise keepable: every other primary still gets
-    the ordinary cleanup, and only this one is told apart and left with its evidence.
-    """
 
 
 class _InconclusiveLock(Exception):

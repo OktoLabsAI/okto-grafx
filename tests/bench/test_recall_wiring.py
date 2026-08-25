@@ -3645,3 +3645,91 @@ def test_an_unwind_close_that_does_not_report_completion_keeps_the_lock(
             pass
     for name in leftover:
         (tmp_path / name).unlink()
+
+
+# =====================================================================================
+# Round-14: only a RETURN keeps the scratch -- never a type the call could raise
+# =====================================================================================
+
+
+class _InconclusiveReplace(Exception):
+    """The type round-13 used as its marker, kept HERE so the probe can forge it.
+
+    It no longer exists in the module: the point of these probes is that no type, not
+    even this one, buys the treatment that only a non-None return earns.
+    """
+
+
+class _SubclassOfTheOldMarker(_InconclusiveReplace):
+    """And a subclass, since `except` matches those too."""
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        _InconclusiveReplace,
+        _SubclassOfTheOldMarker,
+        OSError,
+        RuntimeError,
+        KeyboardInterrupt,
+        SystemExit,
+    ],
+    ids=["old-marker", "marker-subclass", "oserror", "runtimeerror", "ki", "se"],
+)
+def test_an_exception_from_the_replace_call_always_removes_the_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: type[BaseException]
+) -> None:
+    """Round-14: round-13 signalled the inconclusive case with a private exception TYPE,
+    and a type is a channel the CALL can write to. An os.replace that raised that type
+    was reclassified as our own marker and had its scratch preserved -- but an exception
+    from the call means the replace did not happen, so the scratch is debris.
+
+    The old marker and a subclass of it are included deliberately: they are the exact
+    shapes the previous design would have mistaken for its own signal."""
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+
+    def raising_replace(*a: object, **kw: object):
+        raise raised("FROM-SYSCALL")
+
+    monkeypatch.setattr(os, "replace", raising_replace)
+    try:
+        code = append_vector_recall(
+            profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+        )
+    except BaseException as failure:  # noqa: BLE001 -- KI/SE reach the caller
+        assert type(failure) is raised, "the primary keeps its identity"
+        assert "FROM-SYSCALL" in str(failure)
+    else:
+        assert code == 3
+    monkeypatch.undo()
+    assert [p.name for p in tmp_path.iterdir() if ".c13-" in p.name] == [], (
+        "an exception from the call means the replace did not happen: the scratch is "
+        "debris and is removed, whatever type was raised"
+    )
+    for lock in tmp_path.glob("*.c13.lock"):
+        lock.unlink()
+
+
+def test_only_a_non_none_return_keeps_the_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: a RETURN is something no exception can produce, so reaching the
+    line after the call is itself the proof that the outcome is unknown rather than
+    known-failed. That is the whole reason the flag is set there and nowhere else."""
+    out, metrics = _seed_documents(tmp_path)
+    target_before = out.read_bytes()
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    monkeypatch.setattr(os, "replace", lambda *a, **kw: True)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert out.read_bytes() == target_before
+    scratches = [p for p in tmp_path.iterdir() if ".c13-" in p.name]
+    assert scratches, "the scratch survives, because the outcome is genuinely unknown"
+    payload = json.loads(scratches[0].read_text(encoding="utf-8"))
+    assert "vector_recall" in payload
+    for scratch in scratches:
+        scratch.unlink()
