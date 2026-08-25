@@ -26,6 +26,9 @@ from bench.harness.recall import (
     RECALL_METRIC,
     RecallStageError,
     _canonical_json,
+    _caller_path,
+    _certify_none,
+    _claim_temp,
     _canonical_verdict,
     _describe,
     _exact_int,
@@ -89,14 +92,23 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], bool]) -> No
     made = tempfile.mkstemp(  # WORK: a genuine interrupt propagates.
         prefix=path.name + ".c13-", suffix=".tmp", dir=str(path.parent)
     )
-    # Round-11 (4): the pair is proved before either half is used; the descriptor goes
-    # to os.write and os.close and the name to os.replace and os.unlink.
-    if type(made) is not tuple or len(made) != 2:
-        raise RecallStageError("mkstemp did not return a pair; nothing was written.")
-    descriptor = _exact_int(made[0], "the scratch descriptor", 0)
-    scratch_name = _exact_str(made[1], "the scratch name")
-    if not scratch_name:
-        raise RecallStageError("mkstemp returned an empty name; nothing was written.")
+    # Round-12 (B): the same ownership machine as the verdict temp. The wiring used to
+    # raise a raw RuntimeError here and leave both the descriptor and the file behind.
+    descriptor, scratch_name, refusal = _claim_temp(made)
+    if refusal is not None:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException:  # noqa: BLE001 -- never replaces the refusal
+                pass
+        if scratch_name is not None:
+            try:
+                os.unlink(scratch_name)
+            except BaseException:  # noqa: BLE001 -- never replaces the refusal
+                pass
+        raise RecallStageError(
+            f"the scratch file could not be prepared ({refusal}); nothing was written."
+        )
     closed = False
     try:
         written = 0
@@ -117,8 +129,13 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], bool]) -> No
                 )
             written += progress
         closed = True
-        os.close(descriptor)
-        os.replace(scratch_name, path)
+        _certify_none(os.close(descriptor), "closing the scratch file")
+        # Round-12 (C): a replace answering True may not have happened, and the stage
+        # reported 0 with neither the section nor the gauge in the document and the
+        # scratch still on disk. An unproved replace is inconclusive, so the scratch is
+        # deliberately KEPT and accounted for by the clause below rather than removed as
+        # though the publication had landed.
+        _certify_none(os.replace(scratch_name, path), "replacing the document")
     except BaseException:
         # Ownership is explicit: the raw descriptor is ours until the single close
         # attempt above. Cleanup is best-effort and can never replace the PRIMARY
@@ -249,7 +266,9 @@ def _release_publication_locks(
     interrupted: BaseException | None = None
     for lock_path in reversed(held):
         try:
-            os.unlink(str(lock_path))
+            # Round-12 (C): an unlink answering True may not have removed the lock,
+            # and the run reported success with the field still locked.
+            _certify_none(os.unlink(str(lock_path)), "releasing the lock")
         except BaseException as failure:  # noqa: BLE001 -- cleanup CONTINUES, any shape
             # Round-5 blocker 2: an Exception-only clause let a KeyboardInterrupt or
             # SystemExit raised BY THE UNLINK abort the reverse release, leaving every
@@ -287,6 +306,21 @@ def _normalized_name(resolved: object) -> str:
     if type(name) is not str:
         raise RuntimeError("resolve() did not yield a filesystem path")
     return name
+
+
+class _InconclusiveLock(Exception):
+    """The lock may exist and may hold a descriptor nobody can name.
+
+    Round-12 (D). os.open returning something that is not a descriptor does not mean it
+    did nothing: the file may be there and a descriptor may be live. Reporting "not
+    created" would be a claim the code cannot support, and releasing the pathname would
+    invite a second stage onto a field that may still be held. Fail-closed: the name
+    stays blocked, the possibility is recorded, and the stage refuses.
+    """
+
+    def __init__(self, lock_path: object) -> None:
+        super().__init__(lock_path)
+        self.lock_path = lock_path
 
 
 def _unwind_lock_failure(
@@ -385,11 +419,28 @@ def _acquire_publication_locks(
         # told the operator to delete a file this process had just made, and it left the
         # descriptor open, since the contention path has no descriptor to close.
         try:
-            descriptor = _exact_int(
-                os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY),
-                "the lock descriptor",
-                0,
+            opened = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            if type(opened) is not int or opened < 0:
+                # Round-12 (D): the call may well have CREATED the file and opened a
+                # descriptor we can no longer name. There is nothing to close and
+                # nothing that can honestly be called absent, so ownership is
+                # inconclusive: the pathname stays blocked and accounted for, and the
+                # diagnosis says so instead of claiming it was never created.
+                raise _InconclusiveLock(lock_path)
+            descriptor = opened
+        except _InconclusiveLock as inconclusive:
+            # The certain locks are released; THIS pathname is not, because it may hold
+            # a descriptor we cannot close. It is named as possibly live.
+            residue, _ = _release_publication_locks(held)
+            reason = (
+                f"the publication lock {inconclusive.lock_path} may exist and may hold "
+                "an open descriptor: the open call answered with something that is not "
+                "a descriptor, so neither closing nor removing it is possible. The name "
+                "is left blocked deliberately; confirm no stage runs before removing it."
             )
+            if residue:
+                reason += f" (release residue: {residue})"
+            return [], reason
         except FileExistsError:
             # ONLY the open can conclude contention, and only here does no descriptor
             # of ours exist.
@@ -783,8 +834,11 @@ def append_vector_recall(
     # worker about to start. The workspace is reduced and proved HERE, before anything
     # is acquired, so the scratch root handed downstream is one of ours.
     try:
-        scratch_root = _trusted_path(os.fspath(workspace)) / "recall"
-    except BaseException as failure:  # noqa: BLE001 -- the ARGUMENT chose the shape
+        # Round-12 (A): the helper holds BOTH boundaries, so this clause is Exception --
+        # an interrupt of OUR construction belongs to the caller. The previous
+        # BaseException here swallowed it, which is the same mistake the scratch had.
+        scratch_root = _caller_path(workspace, "the workspace") / "recall"
+    except Exception as failure:  # noqa: BLE001 -- KI/SE propagate; this is OUR work
         _emit(
             "vector recall stage: REFUSED -- the workspace is not a usable path "
             f"({_describe(failure)}); nothing was run."

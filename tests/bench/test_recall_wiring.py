@@ -3250,3 +3250,199 @@ def test_the_deterministic_projection_returns_an_exact_string(tmp_path: Path) ->
             deterministic_projection(section)
     finally:
         recall_module.json.dumps = real_dumps
+
+
+# =====================================================================================
+# Round-12: ownership is proved, completion is certified, and doubt is never success
+# =====================================================================================
+
+
+class _SubclassName(str):
+    """A name that is operationally unusable but from which cleanup can be derived."""
+
+
+class _SubclassPair(tuple):
+    """A pair whose own __len__/__getitem__ must never be consulted."""
+
+    def __len__(self) -> int:
+        raise SystemExit(251)
+
+    def __getitem__(self, item: object) -> object:
+        raise SystemExit(251)
+
+
+@pytest.mark.parametrize(
+    "shape", ["subclass-name", "subclass-pair"], ids=["name-subclass", "tuple-subclass"]
+)
+def test_a_temp_pair_that_is_not_usable_leaves_nothing_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """Round-12 (B): a pair whose descriptor was real and whose name was a str subclass
+    closed the descriptor and left the FILE; a tuple subclass left both, because its own
+    __len__ decided the shape. Both halves are read through non-dispatchable builtin
+    access, and whatever can be RECLAIMED is released -- independently, so one failing
+    does not strand the other."""
+    import tempfile as tempfile_module
+
+    from bench.harness.recall import run_recall
+
+    real_mkstemp = tempfile_module.mkstemp
+    created: list[str] = []
+
+    def hostile_mkstemp(*args: object, **kwargs: object):
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        created.append(name)
+        if shape == "subclass-name":
+            return (descriptor, _SubclassName(name))
+        return _SubclassPair((descriptor, name))
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("subprocess.run must not be reached")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", forbidden)
+    monkeypatch.setattr(tempfile_module, "mkstemp", hostile_mkstemp)
+    scratch = tmp_path / "scratch"
+    with pytest.raises(RecallStageError, match="could not be prepared"):
+        run_recall("tiny", scratch=scratch, timeout_seconds=30)
+    monkeypatch.undo()
+    assert created, "the probe must have made a real temp file to reclaim"
+    assert list(scratch.iterdir()) == [], "the file it really created is removed"
+
+
+def test_a_replace_that_does_not_report_completion_is_never_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-12 (C): os.replace returns None. One answering True is a call whose EFFECT
+    is unknown, and the stage reported 0 with neither the section nor the gauge in the
+    documents and the scratch still on disk."""
+    out, metrics = _seed_documents(tmp_path)
+    before = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    monkeypatch.setattr(os, "replace", lambda *a, **kw: True)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code != 0, "an unproved replace may never be reported as a publication"
+    assert (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8")) == (
+        before
+    )
+
+
+def test_a_lock_release_that_does_not_report_completion_demotes_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-12 (C): an unlink answering True may not have removed the lock, and the run
+    reported 0 with the field still locked for whoever came next."""
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real_unlink = os.unlink
+
+    def no_op_unlink(target: object, *a: object, **kw: object):
+        if str(target).endswith(".c13.lock"):
+            return True
+        return real_unlink(target, *a, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "unlink", no_op_unlink)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code != 0, "success is demoted while the field may still be locked"
+    for lock in tmp_path.glob("*.c13.lock"):
+        lock.unlink()
+
+
+def test_a_verdict_unlink_that_does_not_report_completion_is_residue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-12 (C): the same certification for the verdict temp -- run_recall returned a
+    parsed verdict as success with the temporary possibly still there."""
+    import subprocess as subprocess_module
+
+    from bench.harness.recall import run_recall
+
+    def writes_verdict(command: list[str], **kwargs: object):
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.write_text(json.dumps(_verdict_stub()), encoding="utf-8")
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    real_unlink = os.unlink
+
+    def no_op_unlink(target: object, *a: object, **kw: object):
+        if "recall-tiny-" in str(target):
+            return True
+        return real_unlink(target, *a, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
+    monkeypatch.setattr(os, "unlink", no_op_unlink)
+    with pytest.raises(RecallStageError, match="residue"):
+        run_recall("tiny", scratch=tmp_path / "scratch")
+    monkeypatch.undo()
+
+
+def test_an_open_that_answers_with_a_non_descriptor_leaves_ownership_inconclusive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round-12 (D): os.open returning something that is not a descriptor does NOT mean
+    it did nothing -- the file may exist and a descriptor may be live and unnameable.
+    Saying "not created" would be a claim the code cannot support, and releasing the
+    pathname would invite a second stage onto a field that may still be held."""
+    out, metrics = _seed_documents(tmp_path)
+    ran: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: ran.append(1) or _verdict_stub()
+    )
+    real_open = os.open
+
+    leaked: list[int] = []
+
+    def opens_then_lies(path: object, *a: object, **kw: object):
+        if str(path).endswith(".c13.lock"):
+            # The file really is created and a descriptor really is live -- which is the
+            # whole point: the code cannot name it, so it cannot close it. The probe
+            # keeps its own reference purely so the temp directory can be cleaned up
+            # afterwards; the code under test has no such luxury.
+            leaked.append(real_open(path, *a, **kw))  # type: ignore[arg-type]
+            return True
+        return real_open(path, *a, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", opens_then_lies)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert not ran
+    printed = capsys.readouterr().out
+    assert "may exist" in printed
+    assert "not created" not in printed
+    for descriptor in leaked:
+        os.close(descriptor)
+    for lock in tmp_path.glob("*.c13.lock"):
+        lock.unlink()
+
+
+@pytest.mark.parametrize(
+    "shape", [KeyboardInterrupt, SystemExit], ids=["workspace-KI", "workspace-SE"]
+)
+def test_a_real_interrupt_building_the_workspace_path_still_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: type[BaseException]
+) -> None:
+    """Round-12 (A): the workspace clause absorbed an interrupt of OUR construction. The
+    helper holds both boundaries now, so the call site catches Exception only."""
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real_path = recall_module_for_paths.Path
+
+    def interrupted(*args: object, **kwargs: object):
+        if args and str(args[0]) == str(tmp_path):
+            raise shape("interrupted building the workspace path")
+        return real_path(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(recall_module_for_paths, "Path", interrupted)
+    with pytest.raises(shape):
+        append_vector_recall(
+            profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+        )
+    monkeypatch.undo()

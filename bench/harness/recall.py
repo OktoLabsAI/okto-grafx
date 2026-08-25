@@ -160,6 +160,90 @@ def _exact_clock(reading: object) -> float:
     return reading
 
 
+def _caller_path(value: object, what: str) -> Path:
+    """Reduce a CALLER's object to a path of OURS, with both boundaries inside.
+
+    Round-12 (A). The separation is right but four rounds have shown it does not survive
+    being written by hand at each site: resolve/stat, the lock names, run_recall's
+    scratch and the wiring's workspace each got it wrong once. So the two halves live
+    here, and call sites do not repeat them.
+
+    The first half is DATA: os.fspath runs the ARGUMENT's __fspath__, so every shape it
+    chooses becomes a typed refusal. The second is WORK: building our own path, where an
+    ordinary failure is a refusal and a genuine interrupt belongs to the caller and
+    propagates. A call site that wraps this whole function in one clause would undo that,
+    which is why the wrappers below catch Exception, never BaseException.
+    """
+    try:
+        name = os.fspath(value)
+    except BaseException as failure:  # noqa: BLE001 -- the ARGUMENT chose the shape
+        raise RecallStageError(
+            f"{what} is not a usable path ({_describe(failure)})"
+        ) from None
+    return _trusted_path(name)
+
+
+def _certify_none(result: object, what: str) -> None:
+    """Prove a syscall that reports completion by returning None actually did.
+
+    Round-12 (C): os.close, os.replace and os.unlink return None. A replacement
+    answering True is not merely odd -- it is a call whose EFFECT is unknown, and the
+    stage treated it as success. A replace that may not have happened published nothing
+    while reporting 0; an unlink that may not have happened left locks and temporaries
+    behind the same way. An unproved completion is INCONCLUSIVE, never done.
+    """
+    if result is not None:
+        raise RuntimeError(f"{what} did not report completion; the outcome is unknown")
+
+
+def _claim_temp(made: object) -> tuple[int | None, str | None, str | None]:
+    """Snapshot BOTH halves of a mkstemp result before judging either.
+
+    Round-12 (B): a pair whose descriptor was real and whose name was a str subclass
+    closed the descriptor and left the FILE; a tuple subclass left both. The two are
+    read first, through non-dispatchable builtin access so a tuple subclass cannot
+    answer with its own code, and only then judged.
+
+    Returns (descriptor, name, refusal). When refusal is None the pair is usable. When
+    it is not, the descriptor and the name are whatever could be RECLAIMED -- a name
+    derived from a str subclass through str.__str__, which does not dispatch to the
+    override, so it can be used to remove the file without ever being accepted
+    operationally. A shape from which nothing can be reclaimed returns both as None with
+    a constant text, because ownership is then genuinely inconclusive.
+    """
+    if not _is_a(made, tuple):
+        return None, None, "the temp file result is not a pair"
+    try:
+        if tuple.__len__(made) != 2:
+            return None, None, "the temp file result is not a pair"
+        first = tuple.__getitem__(made, 0)
+        second = tuple.__getitem__(made, 1)
+    except BaseException:  # noqa: BLE001 -- an unreadable result owns nothing we know
+        return None, None, "the temp file result could not be read"
+    descriptor = first if type(first) is int and first >= 0 else None
+    name: str | None = None
+    if type(second) is str:
+        name = second if second else None
+    elif _is_a(second, str):
+        try:
+            derived = str.__str__(second)
+        except BaseException:  # noqa: BLE001 -- nothing reclaimable from this one
+            derived = ""
+        name = derived if type(derived) is str and derived else None
+    # A tuple SUBCLASS is never accepted operationally, however well-formed its
+    # contents: its own __len__ and __getitem__ decide what the rest of the program
+    # sees, and this function only reached the real halves by refusing to ask it.
+    # Reclaiming from it is fine -- using it is not.
+    if (
+        type(made) is tuple
+        and descriptor is not None
+        and type(second) is str
+        and second
+    ):
+        return descriptor, second, None
+    return descriptor, name, "the temp file result is not a usable pair"
+
+
 def _describe(value: object) -> str:
     """repr(), guarded and bounded: ``repr(10**10000)`` raises past CPython's digit
     limit, and the refusal message must not crash the refusal (mirrors gate._describe).
@@ -262,20 +346,7 @@ def run_recall(
     # the caller, the mkdir here, the mkstemp below -- ran its code. It is reduced to a
     # trusted native path first, so nothing hostile survives into the filesystem calls.
     try:
-        # DATA: os.fspath runs the ARGUMENT's __fspath__, so every shape it chooses
-        # becomes a typed refusal.
-        scratch_name = os.fspath(scratch)
-    except BaseException as failure:  # noqa: BLE001 -- the ARGUMENT chose the shape
-        raise RecallStageError(
-            f"the scratch directory is not a usable path ({_describe(failure)}); "
-            "nothing was created and nothing was spawned."
-        ) from None
-    try:
-        # WORK: building OUR path. An ordinary failure is a typed refusal; a genuine
-        # interrupt of the constructor belongs to the caller and propagates. Sharing one
-        # clause with the line above absorbed it, which is the same conflation the lock
-        # names had.
-        scratch = _trusted_path(scratch_name)
+        scratch = _caller_path(scratch, "the scratch directory")
     except Exception as failure:  # noqa: BLE001 -- KI/SE propagate; this is OUR work
         raise RecallStageError(
             f"the scratch directory could not be prepared ({_describe(failure)}); "
@@ -290,43 +361,27 @@ def run_recall(
     made = tempfile.mkstemp(  # WORK: a genuine interrupt propagates.
         prefix=f"recall-{profile}-", suffix=".json", dir=str(scratch)
     )
-    proved_descriptor: int | None = None
-    proved_name: str | None = None
-    try:
-        # Round-11 (4): the RESULT is snapshotted once and proved. Unpacking it ran the
-        # returned object's __iter__, and the two halves went straight into os.close,
-        # os.unlink and a command line without ever being shown to be an int and a str.
-        if type(made) is not tuple or len(made) != 2:
-            raise RuntimeError("mkstemp did not return a pair")
-        proved_descriptor = _exact_int(made[0], "the temp file descriptor", 0)
-        proved_name = _exact_str(made[1], "the temp file name")
-        if not proved_name:
-            raise RuntimeError("mkstemp returned an empty name")
-    except BaseException as failure:  # noqa: BLE001 -- the RESULT chose the shape
-        # Boundary review (4): a pair whose FIRST half proved and whose second did not
-        # left a real descriptor open and a real file on disk, because the refusal came
-        # before any ownership existed. Whatever was proved is cleaned up here, each
-        # component independently and best-effort, and no cleanup replaces the primary.
-        if proved_descriptor is not None:
+    descriptor, temp_name, refusal = _claim_temp(made)
+    if refusal is not None:
+        # Round-12 (B): whatever could be RECLAIMED is released -- the descriptor closed
+        # exactly once, the file removed by a name derived without dispatching to a
+        # subclass -- and each independently, so one failing does not strand the other.
+        if descriptor is not None:
             try:
-                os.close(proved_descriptor)
-            except BaseException:  # noqa: BLE001 -- never replaces the primary
+                os.close(descriptor)
+            except BaseException:  # noqa: BLE001 -- never replaces the refusal
                 pass
-        if proved_name is not None:
+        if temp_name is not None:
             try:
-                os.unlink(proved_name)
-            except BaseException:  # noqa: BLE001 -- never replaces the primary
+                os.unlink(temp_name)
+            except BaseException:  # noqa: BLE001 -- never replaces the refusal
                 pass
-        if not isinstance(failure, Exception):
-            raise
         raise RecallStageError(
-            "the fresh per-run verdict file could not be prepared "
-            f"({_describe(failure)}); nothing was spawned."
-        ) from None
-    descriptor = proved_descriptor
-    temp_name = proved_name
+            f"the fresh per-run verdict file could not be prepared ({refusal}); "
+            "nothing was spawned."
+        )
     try:
-        os.close(descriptor)
+        _certify_none(os.close(descriptor), "closing the fresh verdict file")
     except BaseException as failure:  # noqa: BLE001 -- ONE attempt, every shape
         # Round-5 blocker 2: the handler used to be Exception-only, so a
         # KeyboardInterrupt/SystemExit here left the fresh temp file behind with no
@@ -498,7 +553,10 @@ def run_recall(
             # The Path object is built inside the region above, so on the failure path
             # that removal exists it may not exist at all -- and a cleanup that depends
             # on the object that failed is not a cleanup.
-            os.unlink(temp_name)
+            # Round-12 (C): an unlink answering True may not have removed anything, and
+            # the run reported success with the temporary still there. Completion is
+            # certified, and anything else counts as residue.
+            _certify_none(os.unlink(temp_name), "removing the fresh verdict file")
         except BaseException as failure:  # noqa: BLE001 -- never replaces a primary
             # Round-5 blocker 2: this runs inside a finally, so ANY exception raised
             # here replaces what was propagating -- the worker's own typed failure, or
