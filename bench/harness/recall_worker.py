@@ -96,7 +96,14 @@ DTYPE_PER_QUERY_OVERLAP_MIN: float = 0.90
 HNSW_FROZEN: dict[str, object] = {
     "neighbours": 16,
     "ef_construction": 200,
-    "ef_search": 64,
+    # FROZEN at 320 by the C13 calibration. 64 was the pre-calibration default and
+    # measured 0.5055 mean recall on the full profile -- far below the 0.90 floor. This
+    # is a frozen CONSTANT of the calibration, never a runtime knob: nothing reads
+    # vector_recall_target and turns it into ef_search. The target stays a verifiable SLO
+    # of the harness, not a per-query promise, and _validate_verdict requires a verdict's
+    # own hnsw block to equal this dict -- so the frozen evidence stops validating if
+    # this value drifts.
+    "ef_search": 320,
     "index_seed": "0x0C701A11F0C0FFEE",
 }
 

@@ -787,5 +787,98 @@
   ],
   "partitions_per_table": 64,
   "status": "consult_jp",
+  "vector_recall": {
+    "frozen": {
+      "corpus": {
+        "generator": "uniform-int53-v1",
+        "seed": 1337,
+        "sha256_f32": "a17bd95c6bada8e5bdb8185d695d9391a79fb5c572e23aee50dba5146a7a1468",
+        "sha256_f64": "654adaa7b189618c7698da9108c9e69a378ff7256f114409622a48b43cdcc1ed",
+        "size": 8192
+      },
+      "dimension": 384,
+      "dtype_check": {
+        "mean_overlap_min": 0.99,
+        "per_query_overlap_min": 0.9
+      },
+      "gate_required": true,
+      "gt": {
+        "accel_equivalence_eps_rel": 1e-09,
+        "canonical": "pure-python math.fsum",
+        "differential": {
+          "corpus_slice": 1024,
+          "queries": 16,
+          "selection": "deterministic by seed"
+        },
+        "oracle": "numpy-bruteforce-v1 (differential pure-fsum 16x1024)"
+      },
+      "hnsw": {
+        "ef_construction": 200,
+        "ef_search": 320,
+        "index_seed": "0x0C701A11F0C0FFEE",
+        "neighbours": 16
+      },
+      "k": 10,
+      "metric": "cosine",
+      "queries": 256,
+      "query_set": {
+        "held_out": true,
+        "seed": 4242,
+        "sha256_f32": "1995f66674d68f34062a495a6b92cd38c28f6b653ce7ea12898da544938521c5",
+        "sha256_f64": "5207fa9897934bc4400549476e9ece7334bdc84c9855ba845d3b7f04b278af87"
+      },
+      "regime_threshold": 4096,
+      "storage_dtype": "float32",
+      "target": 0.9,
+      "ties": "generous: GT admits every record at or under the k-th distance"
+    },
+    "observed": {
+      "windows": {
+        "dtype_check": {
+          "mean_overlap": 1.0,
+          "min_overlap": 1.0
+        },
+        "mean_recall_at_k": 0.9546875,
+        "min_recall_at_k": 0.7,
+        "queries_below_perfect": 92
+      }
+    },
+    "provenance": {
+      "windows": {
+        "blas_environment": {
+          "MKL_NUM_THREADS": "1",
+          "NUMEXPR_NUM_THREADS": "1",
+          "OMP_NUM_THREADS": "1",
+          "OPENBLAS_NUM_THREADS": "1"
+        },
+        "duration_seconds": 3882.100647799991,
+        "frozen_from": {
+          "blas_environment": {
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1"
+          },
+          "finished_at_utc": "2026-08-24T20:56:39.290891+00:00",
+          "measured_ef_search": 320,
+          "metadata_sha256": "ff2958f90f598ae88d0f56e66cb99a1c3b766b620f238c9d194360fbf3d97440",
+          "note": "measured once and authenticated independently; this freeze records that measurement and does not re-run it",
+          "numpy": "2.5.1",
+          "platform": "Windows-11-10.0.26200-SP0",
+          "python": "3.13.1 (tags/v3.13.1:0671451, Dec  3 2024, 19:06:28) [MSC v.1942 64 bit (AMD64)]",
+          "raw_sha256": "b4c020f9624b104df7ce9bff72bc4497ffbd4cd28355b7d126338e6ca7f58b59",
+          "source_commits": {
+            "c13": "c7a493f7d39e7f616e74ae9beab4bcf0ccee3593",
+            "hnsw": "5e2fa294e144c4ebf4dfb3e3723af455ddc5d422"
+          }
+        },
+        "gt_path_used": "numpy",
+        "numpy": "2.5.1",
+        "profile": "full",
+        "python": "3.13.1"
+      }
+    },
+    "schema_version": 1
+  },
   "version": 1
 }
