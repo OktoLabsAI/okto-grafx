@@ -493,7 +493,9 @@ def _every_reachable_error_class() -> set[type[GrafxError]]:
     The public list is the taxonomy an application sees; it is not the set of codes that can
     reach a metric label. A component may declare its own internal subclass, and a query
     boundary that writes ``{"code": failure.code}`` will hand that code straight to the sink.
-    Importing every module is what makes those visible to ``__subclasses__``.
+    Importing every module is what makes those visible to ``__subclasses__``.  The subclass
+    registry is process-global, though, so test doubles and host-application subclasses may be
+    present too; only classes declared by this package are reachable production error types.
     """
     for module in pkgutil.walk_packages(okto_grafx.__path__, f"{okto_grafx.__name__}."):
         # A module of another component that cannot be imported right now also cannot raise
@@ -509,7 +511,24 @@ def _every_reachable_error_class() -> set[type[GrafxError]]:
             if subclass not in found:
                 found.add(subclass)
                 pending.append(subclass)
-    return found | {GrafxError}
+    package_prefix = f"{okto_grafx.__name__}."
+    return {
+        error
+        for error in found | {GrafxError}
+        if error.__module__ == okto_grafx.__name__
+        or error.__module__.startswith(package_prefix)
+    }
+
+
+def test_the_error_walk_ignores_a_foreign_hostile_subclass() -> None:
+    class _ForeignTestDouble(GrafxError):
+        """A host-owned subclass whose diagnostic descriptor is deliberately unsafe."""
+
+        @property
+        def code(self) -> str:
+            raise AssertionError("a foreign descriptor must never be inspected")
+
+    assert _ForeignTestDouble not in _every_reachable_error_class()
 
 
 def test_the_error_code_label_covers_every_reachable_error_code() -> None:
