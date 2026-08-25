@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from okto_grafx.domain.errors import (
@@ -399,7 +399,9 @@ class QuarantineStore:
                 continue
             grouped.setdefault(name, []).append(file)
 
-        items = [self._inventory_item(name, tuple(grouped[name])) for name in sorted(grouped)]
+        items = [
+            self._inventory_item(name, tuple(grouped[name])) for name in sorted(grouped)
+        ]
         items.extend(
             QuarantineInventoryItem(
                 name=file[len(prefix) :],
@@ -410,7 +412,7 @@ class QuarantineStore:
             for file in unexpected
         )
         items.sort(key=lambda item: (item.name, item.files))
-        return tuple(items)
+        return self._apply_global_inventory_invariants(items, files)
 
     def list(self) -> tuple[QuarantineEntry, ...]:
         """Return every complete entry, oldest first by the stamp its name begins with.
@@ -531,10 +533,10 @@ class QuarantineStore:
         self, observed: object, prefix: str
     ) -> tuple[str, ...]:
         """Return one trustworthy namespace snapshot or refuse it as inconclusive."""
-        if not isinstance(observed, tuple):
+        if type(observed) is not tuple:
             raise GrafxQuarantineError(
                 "The quarantine inventory is inconclusive because list_files returned a value "
-                "that is not its tuple contract.",
+                "that is not its exact built-in tuple contract.",
                 field="inventory",
                 operation="list_files",
                 directory=self._directory,
@@ -543,7 +545,18 @@ class QuarantineStore:
                 observed=type(observed).__name__,
             )
         for file in observed:
-            if not isinstance(file, str) or not file.startswith(prefix) or file == prefix:
+            if type(file) is not str:
+                raise GrafxQuarantineError(
+                    "The quarantine inventory is inconclusive because list_files returned a "
+                    "name that is not an exact built-in string.",
+                    field="inventory",
+                    operation="list_files",
+                    directory=self._directory,
+                    conclusive=False,
+                    inconclusive=True,
+                    observed=f"{type(file).__name__}: {file!r}",
+                )
+            if not file.startswith(prefix) or file == prefix:
                 raise GrafxQuarantineError(
                     "The quarantine inventory is inconclusive because list_files returned a "
                     "name outside the requested namespace.",
@@ -554,7 +567,103 @@ class QuarantineStore:
                     inconclusive=True,
                     observed=repr(file),
                 )
-        return tuple(sorted(set(observed)))
+        counts: dict[str, int] = {}
+        for file in observed:
+            counts[file] = counts.get(file, 0) + 1
+        duplicates = tuple(sorted(file for file, count in counts.items() if count > 1))
+        if duplicates:
+            raise GrafxQuarantineError(
+                "The quarantine inventory is inconclusive because list_files returned exact "
+                "duplicate names.",
+                field="inventory",
+                operation="list_files",
+                directory=self._directory,
+                conclusive=False,
+                inconclusive=True,
+                duplicates=duplicates,
+            )
+        return tuple(sorted(observed))
+
+    def _apply_global_inventory_invariants(
+        self,
+        items: list[QuarantineInventoryItem],
+        files: tuple[str, ...],
+    ) -> tuple[QuarantineInventoryItem, ...]:
+        """Downgrade every item participating in a global identity or namespace collision."""
+        problems: dict[int, set[str]] = {}
+
+        identities: dict[tuple[str, int, int], list[int]] = {}
+        for index, item in enumerate(items):
+            manifest = item.manifest
+            if manifest is None:
+                continue
+            identity = (manifest.origin, manifest.offset, manifest.length)
+            identities.setdefault(identity, []).append(index)
+        for identity, indexes in identities.items():
+            if len(indexes) < 2:
+                continue
+            entries = tuple(sorted(items[index].name for index in indexes))
+            digests = tuple(
+                sorted(
+                    {
+                        items[index].manifest.digest
+                        for index in indexes
+                        if items[index].manifest is not None
+                    }
+                )
+            )
+            agreement = "different digests" if len(digests) > 1 else "the same digest"
+            detail = (
+                f"Duplicate quarantine identity {identity!r} appears in entries {entries!r} "
+                f"with {agreement} {digests!r}."
+            )
+            for index in indexes:
+                problems.setdefault(index, set()).add(detail)
+
+        owner_of = {
+            file: index for index, item in enumerate(items) for file in item.files
+        }
+        nodes: dict[str, dict[tuple[str, str], set[str]]] = {}
+        for file in files:
+            segments = file.split("/")
+            for depth in range(1, len(segments)):
+                node = "/".join(segments[:depth])
+                nodes.setdefault(node.casefold(), {}).setdefault(
+                    (node, "directory"), set()
+                ).add(file)
+            nodes.setdefault(file.casefold(), {}).setdefault((file, "file"), set()).add(
+                file
+            )
+        for shapes in nodes.values():
+            if len(shapes) < 2:
+                continue
+            labels = tuple(
+                f"{role}:{node}"
+                for node, role in sorted(shapes, key=lambda shape: shape)
+            )
+            detail = f"A case-insensitive namespace collision exists among {labels!r}."
+            affected = {file for owned in shapes.values() for file in owned}
+            for file in affected:
+                problems.setdefault(owner_of[file], set()).add(detail)
+
+        classified: list[QuarantineInventoryItem] = []
+        for index, item in enumerate(items):
+            found = problems.get(index)
+            if not found:
+                classified.append(item)
+                continue
+            details: list[str] = []
+            if item.state != "complete" and item.detail:
+                details.append(f"Initial {item.state}: {item.detail}")
+            details.extend(sorted(found))
+            classified.append(
+                replace(
+                    item,
+                    state="unexpected_layout",
+                    detail=" ".join(details),
+                )
+            )
+        return tuple(classified)
 
     def _inventory_item(
         self, name: str, files: tuple[str, ...]
@@ -574,6 +683,14 @@ class QuarantineStore:
         try:
             raw = self._storage.read_log(
                 manifest_file, 0, self._storage.log_size(manifest_file)
+            )
+        except GrafxCorruptionDetected as failure:
+            return QuarantineInventoryItem(
+                name=name,
+                state="corrupt_manifest",
+                files=files,
+                manifest_file=manifest_file,
+                detail=f"{failure.code}: {failure.message}",
             )
         except GrafxError as failure:
             return QuarantineInventoryItem(
@@ -596,7 +713,21 @@ class QuarantineStore:
             )
 
         payload_file = f"{directory}/{_payload_file_name(manifest.origin)}"
+        try:
+            expected_name = f"{stamp_of(manifest.captured_at_wall)}-{manifest.suffix}"
+        except (GrafxError, OverflowError, ValueError) as failure:
+            return QuarantineInventoryItem(
+                name=name,
+                state="corrupt_manifest",
+                files=files,
+                manifest_file=manifest_file,
+                payload_file=payload_file,
+                manifest=manifest,
+                detail=f"The manifest cannot derive an entry identity: {failure!s}",
+            )
         mismatch: list[str] = []
+        if name != expected_name:
+            mismatch.append("name")
         if manifest.entry_name != name:
             mismatch.append("entry_name")
         if manifest.payload_file != payload_file:
@@ -609,7 +740,8 @@ class QuarantineStore:
                 manifest_file=manifest_file,
                 payload_file=payload_file,
                 manifest=manifest,
-                detail="The manifest disagrees with its directory in: " + ", ".join(mismatch),
+                detail="The manifest disagrees with its directory in: "
+                + ", ".join(mismatch),
             )
         if payload_file not in files:
             return QuarantineInventoryItem(
@@ -670,7 +802,9 @@ class QuarantineStore:
             return None
         try:
             manifest = QuarantineManifest.parse(
-                self._storage.read_log(manifest_file, 0, self._storage.log_size(manifest_file))
+                self._storage.read_log(
+                    manifest_file, 0, self._storage.log_size(manifest_file)
+                )
             )
         except GrafxError:
             return None
@@ -709,7 +843,9 @@ class QuarantineStore:
         taken = sum(1 for found in self._files_under(name) if found.startswith(prefix))
         return f"{prefix}{taken + 1}.json"
 
-    def _require_two_files(self, name: str, payload_file: str, manifest_file: str) -> None:
+    def _require_two_files(
+        self, name: str, payload_file: str, manifest_file: str
+    ) -> None:
         """Prove against the DEVICE that the capture wrote both files, not one twice.
 
         LESSONS L5, and this component has now supplied the third instance in this build: an
