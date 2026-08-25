@@ -1819,17 +1819,10 @@ def test_the_final_knob_spelling_is_only_a_typed_migration_refusal() -> None:
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    owners = {
-        name: len(_knob_occurrences(function))
-        for name, function in functions.items()
-        if _knob_occurrences(function)
-    }
-    assert owners == {"_configure": 1, "_removed_recall_target": 1}
-
-    configure = functions["_configure"]
     refusals = [
-        node
-        for node in ast.walk(configure)
+        (node, owner)
+        for owner in functions.values()
+        for node in ast.walk(owner)
         if isinstance(node, ast.If)
         and isinstance(node.test, ast.Compare)
         and isinstance(node.test.left, ast.Constant)
@@ -1838,21 +1831,30 @@ def test_the_final_knob_spelling_is_only_a_typed_migration_refusal() -> None:
         and isinstance(node.test.ops[0], ast.In)
         and len(node.test.comparators) == 1
         and isinstance(node.test.comparators[0], ast.Name)
-        and node.test.comparators[0].id == "options"
+        and node.test.comparators[0].id
+        in {
+            argument.arg
+            for argument in (
+                *owner.args.posonlyargs,
+                *owner.args.args,
+                *owner.args.kwonlyargs,
+            )
+        }
     ]
     assert len(refusals) == 1
-    refusal = refusals[0]
+    refusal, _refusal_owner = refusals[0]
     assert len(refusal.body) == 1 and isinstance(refusal.body[0], ast.Raise)
     raised = refusal.body[0].exc
     assert (
         isinstance(raised, ast.Call)
         and isinstance(raised.func, ast.Name)
-        and raised.func.id == "_removed_recall_target"
         and not raised.args
         and not raised.keywords
     )
+    helper_name = raised.func.id
 
-    migration = functions["_removed_recall_target"]
+    assert helper_name in functions
+    migration = functions[helper_name]
     returns = [node for node in ast.walk(migration) if isinstance(node, ast.Return)]
     assert len(returns) == 1 and isinstance(returns[0].value, ast.Call)
     error = returns[0].value
@@ -1863,6 +1865,10 @@ def test_the_final_knob_spelling_is_only_a_typed_migration_refusal() -> None:
     assert keywords["field"].value == KNOB
     assert isinstance(keywords["replacement"], ast.Constant)
     assert keywords["replacement"].value == "bench.harness.gate --recall-target"
+    assert {id(node) for node in occurrences} == {
+        id(refusal.test.left),
+        id(keywords["field"]),
+    }
 
 
 def test_the_surviving_knob_carries_no_execution_load() -> None:
