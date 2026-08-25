@@ -34,14 +34,21 @@ from okto_grafx.adapters.metrics_noop import NoOpMetricsSink
 from okto_grafx.adapters.metrics_openmetrics import OpenMetricsSink
 from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
+from okto_grafx.adapters.storage_read_only import ReadOnlyStorageDevice
 from okto_grafx.adapters.checksum_pure import PureCrc32c
 from okto_grafx.domain.page.checksum import crc32c_implementation
 from okto_grafx.adapters.vectormath_pure import PureVectorMath
+from okto_grafx.domain import errors as grafx_errors
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
+    GrafxCorruptionDetected,
     GrafxError,
     GrafxPortNotConfigured,
+    GrafxQuarantineError,
+    GrafxUnsupportedOperation,
 )
+from okto_grafx.engine.public_views import QuarantineView, _quarantine_view
+from okto_grafx.engine.quarantine import QuarantineStore
 from okto_grafx.runtime.config import (
     DEFAULT_OPENMETRICS_DESTINATION,
     MEMORY_PATH,
@@ -58,6 +65,7 @@ __all__ = [
     "CONTROL_DIRECTORY_NAME",
     "PortContext",
     "PortFactory",
+    "QuarantineInventoryReader",
     "build_clock",
     "build_codec",
     "build_coordinator",
@@ -72,6 +80,7 @@ __all__ = [
     "release_ports",
     "build_default_registry",
     "open_database",
+    "open_quarantine_inventory",
 ]
 
 CONTROL_DIRECTORY_NAME: str = "control"
@@ -127,6 +136,235 @@ class PortContext:
                 missing=[slot],
                 available=list(self.ports),
             ) from None
+
+
+_DetachedCloseOutcome = tuple[str, str, str, bool, bool]
+"""Only inert builtins retained from a close failure.
+
+The fields are category, public type name, message, retryability and inconclusive status.  The
+original exception is deliberately absent: its traceback would retain the storage frame and its
+``args`` or arbitrary attributes could themselves be capabilities.
+"""
+
+_DECLARED_GRAFX_ERROR_TYPES: tuple[type[GrafxError], ...] = tuple(
+    error_type
+    for name in grafx_errors.__all__
+    if isinstance((error_type := getattr(grafx_errors, name)), type)
+    and issubclass(error_type, GrafxError)
+)
+"""The engine-owned error classes whose base fields are safe to detach without dispatch."""
+
+
+class _DetachedQuarantineCloseFailure(GrafxError):
+    """A fresh typed refusal reconstructed without the source exception or traceback."""
+
+    def __init__(self, outcome: _DetachedCloseOutcome) -> None:
+        category, error_type, message, retryable, inconclusive = outcome
+        super().__init__(
+            message,
+            retryable=retryable,
+            close_error_type=error_type,
+            inconclusive=inconclusive,
+        )
+        self.code = category
+        self.error_type = error_type
+        self.inconclusive = inconclusive
+
+    def to_dict(self) -> dict[str, object]:
+        """Keep the public taxonomy captured at the source while remaining detached."""
+        document = super().to_dict()
+        document["type"] = self.error_type
+        return document
+
+
+def _detach_close_failure(failure: Exception) -> _DetachedCloseOutcome:
+    """Copy routing facts without invoking any method supplied by the caught object."""
+    try:
+        failure_type = type(failure)
+        if not any(
+            failure_type is declared for declared in _DECLARED_GRAFX_ERROR_TYPES
+        ):
+            return "", "", "A foreign close failure was safely detached.", False, False
+
+        # Every declared class inherits GrafxError's concrete instance fields.  Direct base
+        # lookup plus exact builtin checks avoids __str__, __repr__, custom mappings and values
+        # hidden in ``args``; an injected subclass is deliberately treated as foreign above.
+        captured_message = _declared_error_field(failure, "message")
+        message = (
+            captured_message
+            if type(captured_message) is str
+            else "A Grafx close failure had no safe text message."
+        )
+        captured_code = _declared_error_field(failure, "code")
+        category = captured_code if type(captured_code) is str else "grafx_error"
+        retryable = _declared_error_field(failure, "retryable") is True
+        captured_details = _declared_error_field(failure, "details")
+        inconclusive = (
+            type(captured_details) is dict
+            and dict.get(captured_details, "inconclusive") is True
+        )
+        error_type = failure_type.__name__
+        if type(error_type) is not str:
+            error_type = "GrafxError"
+        return category, error_type, message, retryable, inconclusive
+    except BaseException:
+        return "", "", "A close failure could not be safely detached.", False, False
+
+
+def _declared_error_field(failure: GrafxError, name: str) -> object | None:
+    """Read an engine-owned base field with a no-throw fallback for malformed instances."""
+    try:
+        return object.__getattribute__(failure, name)
+    except BaseException:
+        return None
+
+
+class QuarantineInventoryReader:
+    """A capability-safe immutable view of just one database quarantine.
+
+    A normal read-only database still participates in cross-process coordination, and the local
+    coordinator's advisory lock names are persistent filesystem objects.  A forensic inventory
+    must not create even those objects in the namespace it is diagnosing.  This smaller
+    composition therefore captures the public :class:`QuarantineView` over a read-only storage
+    capability; it never exposes the raw device or constructs the coordinator, WAL, recovery
+    manager or database engine.
+    """
+
+    __slots__ = ("__close_outcome", "__closed", "path", "quarantine")
+
+    def __init__(
+        self,
+        path: str,
+        quarantine: QuarantineView,
+        close_outcome: _DetachedCloseOutcome | None = None,
+    ) -> None:
+        """Retain only values detached from the storage that produced the snapshot."""
+        self.path = path
+        self.quarantine = quarantine
+        self.__close_outcome = close_outcome
+        self.__closed = False
+
+    def close(self) -> None:
+        """Report the source close outcome once; no storage capability is retained."""
+        if self.__closed:
+            return
+        self.__closed = True
+        outcome = self.__close_outcome
+        self.__close_outcome = None
+        if outcome is None:
+            return
+        if outcome[0] == GrafxCorruptionDetected.code:
+            raise GrafxCorruptionDetected(outcome[2])
+        if outcome[0]:
+            raise _DetachedQuarantineCloseFailure(outcome)
+        raise RuntimeError(outcome[2])
+
+
+def _close_quarantine_inventory_storage_quietly(
+    storage: LocalStorageDevice,
+) -> None:
+    """Release a half-built reader without replacing the failure that caused cleanup."""
+    try:
+        storage.close_read_only()
+    except BaseException:
+        pass
+
+
+def open_quarantine_inventory(config: DatabaseConfig) -> QuarantineInventoryReader:
+    """Open only the capabilities needed to inventory persisted quarantine evidence.
+
+    The caller must explicitly request a read-only configuration.  Filesystem storage is opened
+    with ``create_root=False`` and then hidden behind :class:`ReadOnlyStorageDevice`, so neither a
+    missed call site nor cleanup can mutate the database.  The no-op metrics sink is deliberate:
+    an evidence inventory has no hot-path measurement to publish and must not acquire an external
+    output capability merely because it is inspecting damage.
+    """
+    config = _canonical_database_config(config)
+    if not config.read_only:
+        raise GrafxConfigurationError(
+            "A quarantine inventory reader requires an explicitly read-only configuration.",
+            field="read_only",
+            value=False,
+        )
+    if config.path == MEMORY_PATH:
+        raise GrafxUnsupportedOperation(
+            "An in-memory database has no persisted quarantine namespace to inventory.",
+            component="quarantine",
+            path=config.path,
+            read_only=True,
+        )
+
+    storage = LocalStorageDevice(
+        config.path,
+        page_size=config.page_size,
+        create_root=False,
+    )
+    try:
+        # This is the authoritative identity classification expressed without constructing a
+        # coordinator.  A foreign file merely named ``grafx.meta``, incomplete first-open state,
+        # configuration that disagrees with the durable layout, or divergent completion evidence
+        # must never be reported as a conclusively empty quarantine.
+        from okto_grafx.api.assembly import _observe_default_read_only_identity
+
+        identity = _observe_default_read_only_identity(
+            config,
+            storage,
+            PageCodecV1(config.page_size),
+        )
+        quarantine = _quarantine_view(
+            QuarantineStore(
+                ReadOnlyStorageDevice(storage),
+                SystemClock(),
+                NoOpMetricsSink(),
+            )
+        )
+        confirmed = _observe_default_read_only_identity(
+            config,
+            storage,
+            PageCodecV1(config.page_size),
+        )
+        if confirmed != identity:
+            raise GrafxQuarantineError(
+                "The database identity changed while quarantine was being inventoried, so the "
+                "snapshot cannot be certified.",
+                component="quarantine",
+                path=config.path,
+                conclusive=False,
+                inconclusive=True,
+                retryable=True,
+            )
+    except BaseException:
+        _close_quarantine_inventory_storage_quietly(storage)
+        raise
+
+    # ``_quarantine_view`` owns only exact immutable values.  Close the concrete device before
+    # returning so no public attribute, bound method or closure can recover a writable storage
+    # capability from the reader.  A normal close failure is transported as inert outcome state:
+    # the command can then preserve already-captured findings while still reporting the problem.
+    close_outcome: _DetachedCloseOutcome | None = None
+    try:
+        storage.close_read_only()
+    except Exception as failure:
+        try:
+            close_outcome = _detach_close_failure(failure)
+        except BaseException:
+            close_outcome = (
+                "",
+                "",
+                "A close failure could not be safely detached.",
+                False,
+                False,
+            )
+        finally:
+            _close_quarantine_inventory_storage_quietly(storage)
+    except BaseException:
+        _close_quarantine_inventory_storage_quietly(storage)
+        raise
+    return QuarantineInventoryReader(
+        path=config.path,
+        quarantine=quarantine,
+        close_outcome=close_outcome,
+    )
 
 
 PortFactory = Callable[[PortContext], object]

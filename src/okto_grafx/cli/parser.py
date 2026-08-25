@@ -101,6 +101,7 @@ class CommandSpec:
     subcommand: str = ""
     details: tuple[str, ...] = ()
     repeats_last: bool = False
+    force_read_only: bool = False
 
     @property
     def label(self) -> str:
@@ -253,6 +254,7 @@ def _database_command(
     subcommand: str = "",
     details: tuple[str, ...] = (),
     repeats_last: bool = False,
+    force_read_only: bool = False,
 ) -> CommandSpec:
     """Return a command specification with the shared connection options already attached."""
     return CommandSpec(
@@ -263,6 +265,7 @@ def _database_command(
         subcommand=subcommand,
         details=details,
         repeats_last=repeats_last,
+        force_read_only=force_read_only,
     )
 
 
@@ -410,6 +413,16 @@ COMMANDS: tuple[CommandSpec, ...] = (
         "quarantine",
         "List the preserved evidence quarantine holds.",
         subcommand="list",
+    ),
+    _database_command(
+        "quarantine",
+        "Inventory every complete, incomplete or malformed quarantine artifact.",
+        subcommand="inventory",
+        force_read_only=True,
+        details=(
+            "This command always opens read-only: inventory must never recover, create or mutate",
+            "the database it is diagnosing. --create is therefore refused before anything opens.",
+        ),
     ),
     _database_command(
         "quarantine",
@@ -568,6 +581,11 @@ def _parse_arguments(spec: CommandSpec, tokens: Sequence[str]) -> ParseOutcome:
     problem = _value_problem(spec, positionals)
     if problem is not None:
         return _usage_failure(problem)
+    if spec.force_read_only and options.get("create") is True:
+        return _usage_failure(
+            f"The {spec.label!r} command is always read-only and cannot use --create. "
+            "Nothing was opened or created."
+        )
     return ParseOutcome(
         invocation=Invocation(
             spec=spec, positionals=tuple(positionals), options=dict(options)

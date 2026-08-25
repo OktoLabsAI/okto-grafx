@@ -24,6 +24,7 @@ from okto_grafx.cli.exits import (
     RETRY,
     USAGE,
     exit_code_for,
+    is_inconclusive,
     is_retryable,
     result_word,
 )
@@ -32,6 +33,7 @@ from okto_grafx.domain.errors import (
     GrafxCorruptionDetected,
     GrafxError,
     GrafxLeaseTimeout,
+    GrafxQuarantineError,
     GrafxUnsupportedOperation,
     GrafxWriteConflict,
 )
@@ -99,6 +101,29 @@ def test_a_failure_that_says_nothing_about_retrying_is_not_retryable() -> None:
     failure = GrafxError("Something permanent.")
     assert is_retryable(failure) is False
     assert exit_code_for(failure) == REFUSED
+
+
+def test_an_explicitly_inconclusive_failure_is_not_flattened_into_refused() -> None:
+    failure = GrafxQuarantineError(
+        "The namespace snapshot could not be certified.",
+        conclusive=False,
+        inconclusive=True,
+    )
+
+    assert is_inconclusive(failure) is True
+    assert exit_code_for(failure) == INCONCLUSIVE
+
+
+def test_damage_and_retry_take_precedence_over_inconclusive() -> None:
+    damaged = GrafxCorruptionDetected(
+        "Stored bytes are damaged.", retryable=True, inconclusive=True
+    )
+    retry = GrafxQuarantineError(
+        "The namespace is temporarily unavailable.", retryable=True, inconclusive=True
+    )
+
+    assert exit_code_for(damaged) == DAMAGED
+    assert exit_code_for(retry) == RETRY
 
 
 def _concrete_grafx_errors() -> list[type[GrafxError]]:

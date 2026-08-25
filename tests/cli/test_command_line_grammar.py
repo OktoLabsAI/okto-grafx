@@ -37,6 +37,7 @@ def test_the_command_table_covers_the_operator_surface() -> None:
         "ledger inspect",
         "ledger export",
         "quarantine list",
+        "quarantine inventory",
         "quarantine inspect",
         "quarantine read",
         "metrics",
@@ -96,6 +97,31 @@ def test_help_for_a_subcommanded_command_lists_its_subcommands(cli: CliRunner) -
     assert run.code == OK
     for subcommand in ("ledger list", "ledger inspect", "ledger export"):
         assert subcommand in run.out
+
+    quarantine = cli("quarantine", "--help")
+    for subcommand in (
+        "quarantine list",
+        "quarantine inventory",
+        "quarantine inspect",
+        "quarantine read",
+    ):
+        assert subcommand in quarantine.out
+
+
+def test_quarantine_inventory_is_declared_forced_read_only() -> None:
+    spec = next(item for item in COMMANDS if item.label == "quarantine inventory")
+
+    assert spec.force_read_only is True
+    assert "always opens read-only" in command_help(spec)
+
+
+def test_quarantine_inventory_refuses_create_during_parsing() -> None:
+    outcome = parse(["quarantine", "inventory", "database", "--create"])
+
+    assert outcome.invocation is None
+    assert outcome.exit_code == USAGE
+    assert "always read-only" in outcome.message
+    assert "Nothing was opened or created" in outcome.message
 
 
 @pytest.mark.parametrize(

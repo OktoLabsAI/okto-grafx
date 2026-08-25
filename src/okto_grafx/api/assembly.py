@@ -880,6 +880,80 @@ def _preflight_default_read_only_storage(
     _read_existing_identity(config, observational, MetaStore(pool))
 
 
+def _observe_default_read_only_identity(
+    config: DatabaseConfig,
+    storage: StorageDevice,
+    codec: PageCodec,
+) -> DatabaseIdentity:
+    """Validate one filesystem identity without coordination or a writable capability.
+
+    The ordinary read-only composition first performs a conservative preflight and then crosses
+    the ``first-open`` coordination section before making its authoritative decision.  A forensic
+    quarantine inventory must not construct that coordinator because doing so can create lock
+    names in the namespace being diagnosed.  It therefore needs the same final classification
+    expressed entirely as observations.
+
+    A concurrent first open can make those observations fail closed, but can never make them
+    write.  Completed publications are checked against their permanent marker, ``grafx.meta`` and
+    both required final stores; pending publications and orphan staging remain explicit refusals.
+    The page-size check happens before any page is decoded through the caller's codec.
+    """
+    if not config.read_only:
+        raise GrafxConfigurationError(
+            "An observational identity read requires a read-only configuration.",
+            field="read_only",
+            value=False,
+        )
+    if config.path == MEMORY_PATH:
+        raise GrafxUnsupportedOperation(
+            "An in-memory database has no persistent identity to inspect.",
+            path=config.path,
+            field="path",
+            read_only=True,
+        )
+
+    observational = ReadOnlyStorageDevice(storage)
+    _require_budget_for_the_stores(config)
+    _require_page_size_of_record(config, observational)
+    pool = BufferPool(
+        observational,
+        codec,
+        NoOpMetricsSink(),
+        budget_bytes=config.buffer_budget_bytes,
+        db_label=database_label(config.path),
+        guard=threading.RLock(),
+    )
+    meta = MetaStore(pool)
+    intent = _read_first_open_intent(observational)
+    complete = _read_first_open_complete(observational)
+    if complete is not None:
+        identity = _open_completed_identity(
+            config,
+            observational,
+            meta,
+            intent=intent,
+            complete=complete,
+        )
+    else:
+        if intent is not None:
+            _refuse_pending_first_open(config)
+        _require_no_bootstrap_orphan_for_read_only(config, observational)
+        identity = _read_existing_identity(config, observational, meta)
+        # A completion marker was introduced with the durable first-open protocol, but databases
+        # created by earlier releases legitimately have none.  Their identity is not sufficient
+        # on its own: the same two final stores required beside a marker distinguish a complete
+        # legacy database from a copied or orphaned ``grafx.meta``.
+        _require_complete_final_files(observational)
+
+    # Existence and alignment are not content proofs: an aligned page full of zeros (or a page
+    # belonging to another file kind) must not turn a copied identity into a database.  These are
+    # the same predicates a normal read-only open uses after its consistency proof.  They decode
+    # envelopes, checksums, headers and the catalog chain without bootstrapping or repairing.
+    catalog = CatalogStore(pool)
+    _require_published_stores(catalog, HeapStore(pool, catalog))
+    return identity
+
+
 def _open_completed_identity(
     config: DatabaseConfig,
     storage: StorageDevice,

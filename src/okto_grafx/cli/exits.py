@@ -42,6 +42,7 @@ __all__ = [
     "RETRY",
     "USAGE",
     "exit_code_for",
+    "is_inconclusive",
     "is_retryable",
     "result_word",
 ]
@@ -125,18 +126,32 @@ def is_retryable(failure: GrafxError) -> bool:
     return False
 
 
+def is_inconclusive(failure: GrafxError) -> bool:
+    """Return whether a typed failure explicitly says that it certified nothing."""
+    if getattr(failure, "inconclusive", None) is True:
+        return True
+    details = getattr(failure, "details", None)
+    if isinstance(details, Mapping):
+        return details.get("inconclusive") is True
+    return False
+
+
 def exit_code_for(failure: GrafxError) -> int:
     """Return the exit code that reports one typed failure to a script.
 
     Damaged bytes come first and have their own code, because FR-8 and FR-10 turn that class into
     truncation, quarantine and a forensic ledger entry: an operator's automation must be able to
     branch on it without reading the message. Everything else is told apart by whether the
-    failure says it is worth retrying.
+    failure says it is worth retrying. An explicit inconclusive declaration comes next: it is
+    neither a permanent refusal nor a clean answer, and retry remains the more useful action when
+    a failure declares both.
     """
     if isinstance(failure, GrafxCorruptionDetected):
         return DAMAGED
     if is_retryable(failure):
         return RETRY
+    if is_inconclusive(failure):
+        return INCONCLUSIVE
     return REFUSED
 
 

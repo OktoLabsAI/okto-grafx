@@ -44,6 +44,7 @@ from okto_grafx.cli.exits import (
     INCONCLUSIVE,
     OK,
     exit_code_for,
+    is_inconclusive,
     is_retryable,
 )
 from okto_grafx.cli.output import describe, render_table
@@ -56,7 +57,11 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.recovery.report import OUTCOME_CLEAN
 from okto_grafx.engine.database import META_FILE
-from okto_grafx.runtime.config import MEMORY_PATH
+from okto_grafx.runtime.bootstrap import (
+    QuarantineInventoryReader,
+    open_quarantine_inventory,
+)
+from okto_grafx.runtime.config import MEMORY_PATH, DatabaseConfig
 
 __all__ = [
     "MAX_PREVIEW_BYTES",
@@ -223,7 +228,7 @@ def _connect_options(invocation: Invocation) -> dict[str, object]:
         value = invocation.options.get(key)
         if value is not None:
             options[key] = value
-    if invocation.flag("read_only"):
+    if invocation.flag("read_only") or invocation.spec.force_read_only:
         options["read_only"] = True
     return options
 
@@ -356,21 +361,30 @@ def _wanted_the_write_door(invocation: Invocation, failure: GrafxError) -> bool:
 def _refusal(invocation: Invocation, failure: GrafxError) -> Report:
     """Return the report for a typed refusal, with the taxonomy on show rather than flattened."""
     retryable = is_retryable(failure)
+    inconclusive = is_inconclusive(failure)
+    exit_code = exit_code_for(failure)
+    error_type = _public_error_type(failure)
     payload = {
         **_head(invocation),
         "error": {
-            "type": type(failure).__name__,
+            "type": error_type,
             "code": getattr(failure, "code", "grafx_error"),
             "message": getattr(failure, "message", describe(failure)),
             "retryable": retryable,
+            "inconclusive": inconclusive,
             "details": dict(getattr(failure, "details", {}) or {}),
         },
     }
-    advice = "may succeed if tried again" if retryable else "will not succeed if tried again"
+    if retryable:
+        advice = "may succeed if tried again"
+    elif inconclusive:
+        advice = "certified nothing; never read this as clean"
+    else:
+        advice = "will not succeed if tried again"
     problems = [
         f"{invocation.spec.label}: refused",
         f"  code      {getattr(failure, 'code', 'grafx_error')} ({advice})",
-        f"  type      {type(failure).__name__}",
+        f"  type      {error_type}",
         f"  message   {getattr(failure, 'message', describe(failure))}",
     ]
     details = getattr(failure, "details", None)
@@ -380,7 +394,22 @@ def _refusal(invocation: Invocation, failure: GrafxError) -> Report:
     if _wanted_the_write_door(invocation, failure):
         problems.append(WRITE_DOOR_HINT)
         payload["hint"] = WRITE_DOOR_HINT.split("hint      ", 1)[-1]
-    return Report(exit_code=exit_code_for(failure), payload=payload, problems=tuple(problems))
+    return Report(exit_code=exit_code, payload=payload, problems=tuple(problems))
+
+
+def _public_error_type(failure: GrafxError) -> str:
+    """Return a detached failure's original public type without trusting foreign attributes."""
+    try:
+        declared = getattr(failure, "error_type", None)
+    except BaseException:
+        declared = None
+    if type(declared) is str:
+        return declared
+    try:
+        name = type(failure).__name__
+    except BaseException:
+        return "GrafxError"
+    return name if type(name) is str else "GrafxError"
 
 
 def _field_lines(pairs: Sequence[tuple[str, object]]) -> tuple[str, ...]:
@@ -1187,6 +1216,179 @@ def _quarantine_list_body(invocation: Invocation, database: Database) -> Report:
     )
 
 
+def _quarantine_inventory(invocation: Invocation) -> Report:
+    """Inventory quarantine without composing the coordination or recovery machinery."""
+    reader = _open_quarantine_inventory(invocation)
+    try:
+        report = _quarantine_inventory_body(invocation, reader)
+    except GrafxError as failure:
+        note = _close_quarantine_inventory_quietly(reader)
+        refusal = _refusal(invocation, failure)
+        return (
+            refusal
+            if note is None
+            else Report(
+                exit_code=refusal.exit_code,
+                payload={**refusal.payload, "close_problem": note},
+                lines=refusal.lines,
+                problems=(*refusal.problems, note),
+            )
+        )
+    except BaseException:
+        _close_quarantine_inventory_quietly(reader)
+        raise
+    try:
+        reader.close()
+    except GrafxError as failure:
+        closing = _refusal(invocation, failure)
+        if report.exit_code != OK:
+            note = (
+                "The quarantine inventory reader could not close: "
+                f"{failure.message}"
+            )
+            return Report(
+                exit_code=report.exit_code,
+                payload={**report.payload, "close_problem": failure.message},
+                lines=report.lines,
+                problems=(*report.problems, note),
+            )
+        return Report(
+            exit_code=closing.exit_code,
+            payload={
+                **report.payload,
+                **closing.payload,
+                "close_problem": failure.message,
+            },
+            lines=report.lines,
+            problems=(*report.problems, *closing.problems),
+        )
+    except Exception as failure:
+        # A non-clean inventory is the operator's primary answer.  A foreign close defect is
+        # still reported beside it, but cannot erase evidence by changing the exit code.  With a
+        # clean result there is no stronger answer to preserve, so the CLI's outer containment
+        # reports the unforeseen close failure as INTERNAL.
+        if report.exit_code == OK:
+            raise
+        note = (
+            "The quarantine inventory reader could not close: "
+            f"{_describe_quarantine_cleanup_failure(failure)}"
+        )
+        return Report(
+            exit_code=report.exit_code,
+            payload={**report.payload, "close_problem": note},
+            lines=report.lines,
+            problems=(*report.problems, note),
+        )
+    return report
+
+
+def _close_quarantine_inventory_quietly(
+    reader: QuarantineInventoryReader,
+) -> str | None:
+    """Close during unwind without letting cleanup replace a primary failure."""
+    try:
+        reader.close()
+    except BaseException as failure:
+        return (
+            "The quarantine inventory reader could not close: "
+            f"{_describe_quarantine_cleanup_failure(failure)}"
+        )
+    return None
+
+
+def _describe_quarantine_cleanup_failure(failure: BaseException) -> str:
+    """Describe secondary cleanup without allowing hostile rendering to change the outcome."""
+    try:
+        return describe(failure)
+    except BaseException:
+        return "<an unprintable cleanup failure>"
+
+
+def _open_quarantine_inventory(invocation: Invocation) -> QuarantineInventoryReader:
+    """Build the dedicated zero-write reader for one existing filesystem database."""
+    _require_database(invocation)
+    options = _connect_options(invocation)
+    options["read_only"] = True
+    config = DatabaseConfig(path=invocation.path, **options)  # type: ignore[arg-type]
+    return open_quarantine_inventory(config)
+
+
+def _quarantine_inventory_body(invocation: Invocation, database: object) -> Report:
+    """Build one conclusive report from the quarantine's full captured inventory."""
+    store = _require_quarantine(database)
+    items = tuple(store.inventory())
+    payload = {
+        **_head(invocation),
+        "directory": getattr(store, "directory", ""),
+        "conclusive": True,
+        "items": [_quarantine_inventory_payload(item) for item in items],
+        "count": len(items),
+    }
+    lines = [
+        f"quarantine inventory of {database.path}",
+        *_field_lines(
+            [
+                ("directory", getattr(store, "directory", "")),
+                ("items", len(items)),
+                ("conclusive", True),
+            ]
+        ),
+    ]
+    if items:
+        lines.append("")
+        lines.extend(
+            render_table(
+                ("state", "name", "files", "manifest", "payload", "detail"),
+                [
+                    (
+                        item.state,
+                        item.name,
+                        str(len(item.files)),
+                        item.manifest_file or "none",
+                        item.payload_file or "none",
+                        item.detail or "none",
+                    )
+                    for item in items
+                ],
+            )
+        )
+    else:
+        lines.extend(("", "(the quarantine inventory is conclusively empty)"))
+    return Report(
+        exit_code=FINDINGS if items else OK, payload=payload, lines=tuple(lines)
+    )
+
+
+def _quarantine_inventory_payload(item: object) -> Mapping[str, object]:
+    """Return every field of one conclusive inventory item in JSON-native form."""
+    manifest = item.manifest
+    manifest_payload = None
+    if manifest is not None:
+        manifest_payload = {
+            "origin": manifest.origin,
+            "offset": manifest.offset,
+            "length": manifest.length,
+            "reason": manifest.reason,
+            "detail": manifest.detail,
+            "captured_at_wall": manifest.captured_at_wall,
+            "captured_at": _wall_time(manifest.captured_at_wall),
+            "digest": manifest.digest,
+            "payload_file": manifest.payload_file,
+            "entry_name": manifest.entry_name,
+            "expected_lsn": manifest.expected_lsn,
+            "schema": manifest.schema,
+        }
+    return {
+        "name": item.name,
+        "state": item.state,
+        "files": list(item.files),
+        "manifest_file": item.manifest_file,
+        "payload_file": item.payload_file,
+        "manifest": manifest_payload,
+        "detail": item.detail,
+    }
+
+
 def _quarantine_payload(entry: object) -> Mapping[str, object]:
     """Return the machine-readable form of one quarantine entry."""
     manifest = entry.manifest
@@ -1444,6 +1646,7 @@ _HANDLERS: Mapping[str, Callable[[Invocation], Report]] = {
     "ledger inspect": _ledger_inspect,
     "ledger export": _ledger_export,
     "quarantine list": _quarantine_list,
+    "quarantine inventory": _quarantine_inventory,
     "quarantine inspect": _quarantine_inspect,
     "quarantine read": _quarantine_read,
     "metrics": _metrics,
