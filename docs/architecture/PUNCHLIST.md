@@ -1284,3 +1284,17 @@ option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`
   snapshots of page images, their proofs, write partitions and charged bytes. Marks are matched by
   exact tuple-object identity and settled on success; `discard_since()` restores both an image
   replaced at an existing key and an added key that sorts before older keys.
+
+## F1 — opt-in query row budgets (2026-08-25)
+
+- **CLOSED** — `max_result_rows` and `max_intermediate_rows` are positive integers when set and
+  default to `None`. The result limit incrementally refuses row N+1 before retaining it, consuming
+  the remaining stream or calling `context.release()`. The intermediate limit counts each
+  non-terminal physical operator separately over the full execution; it is not cumulative. The
+  public terminal is result-only, while a terminal with no public columns counts as intermediate.
+- **CLOSED** — both overruns raise non-retryable `GrafxQueryBudgetExceeded`. Refusal neither
+  truncates state nor releases a partial write statement to the transaction.
+- **BOUNDARY** — these two fields do not limit cumulative work, payload bytes, internal structures,
+  auxiliary scans, RSS, streaming, deadlines, traversal or spill. Sort, aggregate, distinct and
+  eager operators may retain up to the admitted rows or states before their first yield; this is
+  row admission, not a complete query-memory budget.

@@ -713,6 +713,22 @@ restores the exact staging it received, while a final-batch refusal neither appe
 the WAL; neither path can persist half a statement. This is transaction admission only: it does not
 claim query streaming, query-memory/RSS enforcement or chunked WAL commits.
 
+### F1 query row budgets — per-operator admission (C0/C10; CLOSED)
+
+`max_result_rows` and `max_intermediate_rows` are opt-in positive integers defaulting to `None`.
+The result counter advances while the public terminal is consumed: row N+1 is consumed only far
+enough to refuse it, before retaining it, consuming the remaining stream or calling
+`context.release()`. The intermediate limit maintains one count per non-terminal physical operator
+for the full execution rather than one cumulative query-wide count. The node feeding a public result
+is charged only as result; a terminal with no public columns is charged as intermediate.
+
+Both paths raise non-retryable `GrafxQueryBudgetExceeded` and neither truncates state nor hands a
+partial write statement to its transaction. The scope is deliberately rows, not RSS or total work:
+there is no streaming-result, deadline, traversal, spill or cumulative budget here. Sort, aggregate,
+distinct and eager operators may retain up to the admitted rows or states before their first yield;
+payload bytes, internal structures and auxiliary scans are not charged, so these fields are not a
+complete query-memory budget.
+
 ### D5 durable_commit — MEASURED. Do not amend the ceiling. (coordinator-commissioned profile)
 
 **The 234 ms is not fsync.** A bare `os.fsync` on this volume is 0.29 ms; the one barrier §8.5 step 3.5

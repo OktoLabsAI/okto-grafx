@@ -28,6 +28,7 @@ __all__ = [
     "GrafxQuarantineError",
     "GrafxIndexError",
     "GrafxQueryError",
+    "GrafxQueryBudgetExceeded",
     "GrafxParseError",
     "GrafxPlanError",
     "GrafxVectorValidationError",
@@ -229,6 +230,13 @@ class GrafxQueryError(GrafxError):
     """A query could not be processed. Parse and plan failures are the specialised subclasses."""
 
     code: str = "query_error"
+    retryable: bool = False
+
+
+class GrafxQueryBudgetExceeded(GrafxQueryError):
+    """A query exceeded one of its configured row-admission budgets."""
+
+    code: str = "query_budget_exceeded"
     retryable: bool = False
 
 

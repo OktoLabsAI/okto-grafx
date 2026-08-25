@@ -500,6 +500,8 @@ refused with the field name the caller actually wrote.
 | `wal_max_bytes` | `None` | Optional soft high-water trigger: after a durable write, checkpoint when live WAL bytes reach this value; reader pins, atomic batches and deferred recycling may retain more without data loss |
 | `checkpoint_interval_records` | `512` | After a durable write, checkpoint when the published WAL distance reaches this many records; a failed attempt is reported and retried after the next write |
 | `max_statement_writes` | `None` | Optional hard limit on logical row writes retained by one statement |
+| `max_result_rows` | `None` | Optional hard limit on public result rows; row N+1 is refused before it is retained and before any remaining input is consumed |
+| `max_intermediate_rows` | `None` | Optional hard limit per non-terminal physical operator over one execution; it is not a cumulative query-wide count |
 | `max_transaction_rows` | `None` | Optional hard limit on retained `row_intents` in one transaction |
 | `max_transaction_bytes` | `None` | Optional hard limit on encoded row tuples, staged logical-record `encoded_length()` values and retained page-image generations; ordinary replacement charges the byte delta, while a rollback preimage held by a live statement mark remains charged until settle/discard |
 | `max_wal_batch_bytes` | `None` | Optional hard limit on the sum of final record `encoded_length()` values, including `COMMIT` and excluding `SEGMENT_HEADER`; checked before WAL append |
@@ -522,6 +524,18 @@ raises the non-retryable `GrafxTransactionBudgetExceeded`. A refused statement r
 pre-statement staging, and a refused final WAL batch is rejected before append; these refusals do
 not truncate the WAL or persist a partial statement.
 
+The two query row limits are also opt-in positive integers. `max_result_rows` counts the public
+terminal incrementally; it consumes row N+1 only to refuse it, before retaining it or consuming the
+rest of the stream and before `context.release()`. `max_intermediate_rows` counts each non-terminal
+physical operator separately for the whole execution. A public terminal is charged only as result;
+a terminal with no public columns is charged as intermediate. Overrun raises the non-retryable
+`GrafxQueryBudgetExceeded`, without truncating state or releasing a partial write statement.
+
+These are row-admission limits, not a complete query-memory budget. They do not bound cumulative
+work, payload bytes, internal structures, auxiliary scans, RSS, deadlines, traversal work, spill or
+stream results. Sort, aggregate, distinct and eager operators may retain up to the configured rows
+or states before their first yield; the memory of those payloads and structures is not bounded here.
+
 ---
 
 ## Errors
@@ -540,6 +554,7 @@ located `details`. Nothing else escapes a public door.
 | `GrafxRecoveryRefused` | ❌ | Recovery would not be safe; the evidence is preserved |
 | `GrafxBufferBudgetExceeded` | ✅ | The working set exceeded the budget |
 | `GrafxTransactionBudgetExceeded` | ❌ | An enabled statement, transaction or final WAL-batch limit was exceeded before partial persistence |
+| `GrafxQueryBudgetExceeded` | ❌ | An enabled public-result or per-operator intermediate row limit was exceeded before statement release |
 | `GrafxSchemaVersionMismatch` | ❌ | This build cannot read this database |
 | `GrafxPortNotConfigured` | ❌ | An incomplete registry, naming every missing slot |
 | `GrafxTransactionStateError` | ❌ | The transaction is not in a state that allows this |

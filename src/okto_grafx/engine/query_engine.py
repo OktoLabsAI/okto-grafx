@@ -56,6 +56,7 @@ from okto_grafx.domain.errors import (
     GrafxEmbeddingSpaceMismatch,
     GrafxError,
     GrafxPlanError,
+    GrafxQueryBudgetExceeded,
     GrafxQueryError,
     GrafxTransactionBudgetExceeded,
     GrafxTransactionStateError,
@@ -465,6 +466,8 @@ class _Context:
     # tables and spaces from the same picture the planner did -- a row materialised for a table
     # whose vector space exists only in the working copy cannot ask the live catalog for it.
     catalog: Catalog | None = None
+    result_node: PlanNode | None = None
+    intermediate_rows: dict[int, int] = field(default_factory=dict)
     staged_rows: list[_HeldRow] = field(default_factory=list)
     staged_partitions: list[tuple[int, bytes]] = field(default_factory=list)
     tokens_issued: int = 0
@@ -623,6 +626,24 @@ class _Context:
         """Add to one statistic of this statement."""
         self.statistics[name] = self.statistics.get(name, 0) + amount
 
+    def admit_intermediate(self, node: PlanNode) -> None:
+        """Admit one row emitted by this physical operator during the statement."""
+        limit = self.engine._max_intermediate_rows
+        if limit is None:
+            return
+        identity = id(node)
+        observed = self.intermediate_rows.get(identity, 0) + 1
+        if observed > limit:
+            raise GrafxQueryBudgetExceeded(
+                f"Operator {node.label} would exceed max_intermediate_rows: "
+                f"limit {limit}, observed {observed}.",
+                field="max_intermediate_rows",
+                limit=limit,
+                observed=observed,
+                operator=node.label,
+            )
+        self.intermediate_rows[identity] = observed
+
 
 class QueryEngine:
     """The query surface of one database (CONTRACT.md section 8.9).
@@ -649,6 +670,8 @@ class QueryEngine:
         "_txn_effects",
         "_page_stager",
         "_max_statement_writes",
+        "_max_result_rows",
+        "_max_intermediate_rows",
     )
 
     def __init__(
@@ -663,6 +686,8 @@ class QueryEngine:
         vectors: object = None,
         page_stager: Callable[[object, str, int, bytes], None] | None = None,
         max_statement_writes: int | None = None,
+        max_result_rows: int | None = None,
+        max_intermediate_rows: int | None = None,
     ) -> None:
         """Adopt one catalog, one heap, one pool and whichever engines this composition has."""
         self._catalog = catalog
@@ -691,6 +716,12 @@ class QueryEngine:
         self._page_stager = page_stager
         self._max_statement_writes = _require_optional_positive_limit(
             "max_statement_writes", max_statement_writes
+        )
+        self._max_result_rows = _require_optional_positive_limit(
+            "max_result_rows", max_result_rows
+        )
+        self._max_intermediate_rows = _require_optional_positive_limit(
+            "max_intermediate_rows", max_intermediate_rows
         )
         self._metrics = MetricEmitter(metrics)
         self._clock = clock
@@ -884,8 +915,10 @@ class QueryEngine:
             analysis=plan.analysis,
             statistics=statistics,
             catalog=catalog,
+            result_node=root.child if root.columns else None,
         )
-        rows = tuple(self._rows(root.child, context))
+        stream = self._rows(root.child, context)
+        rows = self._collect_result_rows(stream) if root.columns else tuple(stream)
         context.release()
         produced: tuple[tuple[Value, ...], ...] = ()
         if root.columns:
@@ -906,7 +939,37 @@ class QueryEngine:
                 field="operator",
                 value=node.label,
             )
-        return handler(self, node, context)
+        rows = handler(self, node, context)
+        if self._max_intermediate_rows is None or node is context.result_node:
+            return rows
+        return self._admit_intermediate_rows(node, context, rows)
+
+    def _collect_result_rows(self, rows: Iterator[_Row]) -> tuple[_Row, ...]:
+        """Collect public results incrementally, refusing before retaining row limit + 1."""
+        limit = self._max_result_rows
+        if limit is None:
+            return tuple(rows)
+        accepted: list[_Row] = []
+        for row in rows:
+            observed = len(accepted) + 1
+            if observed > limit:
+                raise GrafxQueryBudgetExceeded(
+                    f"Query would exceed max_result_rows: limit {limit}, "
+                    f"observed {observed}.",
+                    field="max_result_rows",
+                    limit=limit,
+                    observed=observed,
+                )
+            accepted.append(row)
+        return tuple(accepted)
+
+    def _admit_intermediate_rows(
+        self, node: PlanNode, context: _Context, rows: Iterator[_Row]
+    ) -> Iterator[_Row]:
+        """Refuse before an operator delivers row limit + 1 to its parent."""
+        for row in rows:
+            context.admit_intermediate(node)
+            yield row
 
     # --- schema ------------------------------------------------------------------------------
 

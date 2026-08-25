@@ -41,6 +41,8 @@ def test_defaults_match_the_contract() -> None:
     assert config.wal_max_bytes is None
     assert config.checkpoint_interval_records == 512
     assert config.max_statement_writes is None
+    assert config.max_result_rows is None
+    assert config.max_intermediate_rows is None
     assert config.max_transaction_rows is None
     assert config.max_transaction_bytes is None
     assert config.max_wal_batch_bytes is None
@@ -183,6 +185,14 @@ def test_a_positive_wal_maximum_is_canonicalized() -> None:
 )
 @pytest.mark.parametrize("value", [0, -1, "1024", 1024.5, True])
 def test_an_invalid_transaction_budget_is_rejected(field: str, value: object) -> None:
+    with pytest.raises(GrafxConfigurationError) as raised:
+        DatabaseConfig(path=":memory:", **{field: value})
+    assert raised.value.details["field"] == field
+
+
+@pytest.mark.parametrize("field", ["max_result_rows", "max_intermediate_rows"])
+@pytest.mark.parametrize("value", [0, -1, "1024", 1024.5, True])
+def test_an_invalid_query_row_budget_is_rejected(field: str, value: object) -> None:
     with pytest.raises(GrafxConfigurationError) as raised:
         DatabaseConfig(path=":memory:", **{field: value})
     assert raised.value.details["field"] == field
@@ -608,6 +618,8 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         wal_max_bytes=_HostileInt(8192),
         checkpoint_interval_records=_HostileInt(32),
         max_statement_writes=_HostileInt(64),
+        max_result_rows=_HostileInt(256),
+        max_intermediate_rows=_HostileInt(512),
         max_transaction_rows=_HostileInt(128),
         max_transaction_bytes=_HostileInt(16384),
         max_wal_batch_bytes=_HostileInt(8192),
@@ -623,6 +635,8 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         "wal_max_bytes",
         "checkpoint_interval_records",
         "max_statement_writes",
+        "max_result_rows",
+        "max_intermediate_rows",
         "max_transaction_rows",
         "max_transaction_bytes",
         "max_wal_batch_bytes",

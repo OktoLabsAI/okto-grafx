@@ -470,7 +470,13 @@ class QueryStack:
         assert record is not None
 
 
-def build_query_stack(*, budget_pages: int = 64, with_indexes: bool = True) -> QueryStack:
+def build_query_stack(
+    *,
+    budget_pages: int = 64,
+    with_indexes: bool = True,
+    max_result_rows: int | None = None,
+    max_intermediate_rows: int | None = None,
+) -> QueryStack:
     """Assemble a database with a person table, a chunk table and one embedding space."""
     device = MemoryDevice()
     codec = PageCodecV1(page_size=device.page_size)
@@ -593,6 +599,8 @@ def build_query_stack(*, budget_pages: int = 64, with_indexes: bool = True) -> Q
         clock=clock,
         indexes=indexes,
         vectors=vectors,
+        max_result_rows=max_result_rows,
+        max_intermediate_rows=max_intermediate_rows,
     )
     return QueryStack(
         device=device,

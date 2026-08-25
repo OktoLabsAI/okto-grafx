@@ -139,13 +139,15 @@ Concrete classes (`code`, `retryable`) — **exact names, en-US messages**:
 | `GrafxQuarantineError` | `quarantine_error` | False |
 | `GrafxIndexError` | `index_error` | False |
 | `GrafxQueryError` | `query_error` | False |
+| `GrafxQueryBudgetExceeded` | `query_budget_exceeded` | False |
 | `GrafxVectorValidationError` | `vector_validation` | False |
 | `GrafxEmbeddingSpaceMismatch` | `embedding_space_mismatch` | False |
 | `GrafxSpaceRetired` | `space_retired` | False |
 | `GrafxConfigurationError` | `configuration_error` | False |
 | `GrafxUnsupportedOperation` | `unsupported_operation` | False |
 
-`GrafxQueryError` gets subclasses `GrafxParseError` (`parse_error`) and `GrafxPlanError` (`plan_error`).
+`GrafxQueryError` gets subclasses `GrafxQueryBudgetExceeded` (`query_budget_exceeded`),
+`GrafxParseError` (`parse_error`) and `GrafxPlanError` (`plan_error`).
 
 ---
 
@@ -396,6 +398,8 @@ class DatabaseConfig:
     wal_max_bytes: int | None = None          # optional soft checkpoint high-water
     checkpoint_interval_records: int = 512
     max_statement_writes: int | None = None
+    max_result_rows: int | None = None
+    max_intermediate_rows: int | None = None
     max_transaction_rows: int | None = None
     max_transaction_bytes: int | None = None
     max_wal_batch_bytes: int | None = None
@@ -427,6 +431,22 @@ The four transaction limits are operational, positive integers when set, and dis
 An exceeded limit raises non-retryable `GrafxTransactionBudgetExceeded`. Statement handover is
 restored to its exact pre-statement staging on refusal. The final WAL-batch limit is checked before
 `append_many`; no budget refusal truncates the WAL or persists a partial statement.
+
+The two query row limits are positive integers when set and disabled by `None`:
+
+* `max_result_rows` incrementally counts rows from the public terminal. It consumes row N+1 only
+  to refuse it, before retaining it, before consuming any remaining stream and before
+  `context.release()` can hand statement writes to the transaction.
+* `max_intermediate_rows` counts emissions separately for each non-terminal physical plan node over
+  the entire execution. Counts are not summed across operators. The physical node feeding a public
+  result is charged only to `max_result_rows`; when there are no public columns, that terminal node
+  is instead charged as intermediate.
+
+Either overrun raises non-retryable `GrafxQueryBudgetExceeded`. Refusal does not truncate state and
+does not release any write from the refused statement. These are not cumulative-work, payload-byte,
+RSS, streaming, deadline, traversal or spill limits. Sort, aggregate, distinct and eager operators
+may retain up to the configured rows or states before their first yield; the payload bytes, internal
+structures and auxiliary scans behind those rows are not bounded by these two fields.
 
 Recall has no runtime configuration field. Its floor belongs to the offline calibration gate,
 `bench.harness.gate --recall-target`; it cannot honestly promise recall for an individual query
@@ -833,7 +853,9 @@ class VectorEngine:
 ### 8.9 `engine/query_engine.py` (C10)
 ```python
 class QueryEngine:
-    def __init__(..., *, max_statement_writes: int | None = None)
+    def __init__(..., *, max_statement_writes: int | None = None,
+                 max_result_rows: int | None = None,
+                 max_intermediate_rows: int | None = None)
     def parse(self, text: str) -> "Statement"
     def plan(self, statement: "Statement", snapshot: Snapshot) -> "PlanNode"
     def execute(self, text: str, txn, parameters: Mapping[str, object] | None = None) -> "QueryResult"
@@ -852,6 +874,12 @@ ORDER BY score DESC LIMIT 10
 ```
 `explain()` must return **one** operator tree; a plan containing an over-fetch node followed by a
 post-filter node is a contract violation (BR-6/AC-7).
+
+Row admission wraps physical operator outputs. The public terminal bypasses intermediate admission
+only when it has public columns, because the incremental result collector owns that same stream.
+All other physical nodes, including a no-column terminal, keep one counter per node for the full
+execution. The result collector runs before statement `context.release()`, so either row-budget
+refusal leaves the transaction exactly as it entered the statement.
 
 ---
 

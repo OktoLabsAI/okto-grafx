@@ -26,6 +26,16 @@ including the on-disk format.
   `COMMIT` and excluding `SEGMENT_HEADER`, and is checked before WAL append. Overruns raise the
   non-retryable `GrafxTransactionBudgetExceeded`; refusal neither truncates the WAL nor persists a
   partial statement.
+- **Queries now have two opt-in positive row-admission limits, both defaulting to `None`.**
+  `max_result_rows` counts the public terminal incrementally and refuses row N+1 before retaining
+  it, consuming the rest of the stream or calling `context.release()`. `max_intermediate_rows`
+  counts each non-terminal physical operator separately for the whole execution; the public
+  terminal is charged only as result, while a terminal with no public columns is intermediate.
+  Overruns raise non-retryable `GrafxQueryBudgetExceeded` without truncating or releasing partial
+  writes. These limits are not cumulative and do not provide RSS, streaming, deadline, traversal
+  or spill budgets. Sort, aggregate, distinct and eager operators can retain up to the configured
+  rows or states before their first yield; payload bytes, internal structures and auxiliary scans
+  remain outside this slice.
 - **Record and byte thresholds now drive automatic WAL maintenance.** After a durable write commit
   and schema settlement, writable databases checkpoint when `last_committed_lsn - checkpoint_lsn`
   reaches `checkpoint_interval_records` or when the optional `wal_max_bytes` high-water is crossed.

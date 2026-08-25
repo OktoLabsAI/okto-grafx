@@ -204,6 +204,8 @@ class DatabaseConfig:
     wal_max_bytes: int | None = None
     checkpoint_interval_records: int = 512
     max_statement_writes: int | None = None
+    max_result_rows: int | None = None
+    max_intermediate_rows: int | None = None
     max_transaction_rows: int | None = None
     max_transaction_bytes: int | None = None
     max_wal_batch_bytes: int | None = None
@@ -273,6 +275,8 @@ class DatabaseConfig:
         for field in (
             "wal_max_bytes",
             "max_statement_writes",
+            "max_result_rows",
+            "max_intermediate_rows",
             "max_transaction_rows",
             "max_transaction_bytes",
             "max_wal_batch_bytes",

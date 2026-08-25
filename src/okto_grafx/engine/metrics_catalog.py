@@ -186,6 +186,7 @@ _ERROR_CODE = LabelSpec(
             "quarantine_error",
             "index_error",
             "query_error",
+            "query_budget_exceeded",
             "parse_error",
             "plan_error",
             "vector_validation",

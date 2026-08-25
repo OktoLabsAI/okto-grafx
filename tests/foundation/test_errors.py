@@ -36,6 +36,7 @@ CONTRACT_TABLE: tuple[tuple[str, str, bool], ...] = (
     ("GrafxQuarantineError", "quarantine_error", False),
     ("GrafxIndexError", "index_error", False),
     ("GrafxQueryError", "query_error", False),
+    ("GrafxQueryBudgetExceeded", "query_budget_exceeded", False),
     ("GrafxParseError", "parse_error", False),
     ("GrafxPlanError", "plan_error", False),
     ("GrafxVectorValidationError", "vector_validation", False),
