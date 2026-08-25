@@ -272,7 +272,8 @@ class TableExtent:
     Unlike next_table_id in the catalog, this counter cannot be DERIVED from what is in use: the
     ids in use are spread over every page of the table, and deriving one would cost a full scan
     on every open. So it is stored, and the invariant is the weaker one A40 uses for the page
-    count -- at or above every id in use, never below (observe_record_id is what enforces it).
+    count -- strictly above every id in use, never equal to or below it
+    (observe_record_id is what enforces it).
     """
 
     def encode(self) -> bytes:
@@ -550,9 +551,9 @@ class HeapStore:
            the insert was given, and this door is never on their path.
         3. REPLAY MUST NOT RE-ALLOCATE. Recovery does not call this at all. A WAL insert record
            carries the id it was written with, and insert() feeds that id to observe_record_id,
-           which only ever raises the counter. So the counter ends at or above every id in use,
-           which is the same rule A40 gives the page count, for the same reason: a stored number
-           that is merely ahead is repairable, and one that is behind is a wrong answer.
+           which only ever raises the counter. So the counter ends strictly above every id in
+           use, which is stronger than A40's page-count hint for a reason: a stored number that
+           is merely ahead is valid, and one equal to or behind an existing id would reuse it.
 
         Allocating is a WRITE, so it can refuse -- the pin can evict a dirty page and the device
         speaks there. It refuses before the counter moves, so a refused allocation spends no id.

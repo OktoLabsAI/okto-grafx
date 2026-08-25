@@ -734,6 +734,27 @@ def test_verify_accepts_all_inclusive_location_boundaries(
         assert database.verify("all") == report
 
 
+def test_verify_accepts_the_record_id_counter_finding_vocabulary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The facade must carry the verifier's new located finding instead of rejecting it."""
+    report = VerificationReport(
+        scope="records",
+        findings=(
+            VerificationFinding(
+                FindingKind.RECORD_ID_COUNTER,
+                FindingLocation(file="heap.dat", page=0, slot=1),
+                "The stored counter is behind a physical record id.",
+            ),
+        ),
+        records_checked=3,
+    )
+    monkeypatch.setattr(Verifier, "verify", lambda _verifier, _scope: report)
+
+    with connect(":memory:") as database:
+        assert database.verify("records") == report
+
+
 @pytest.mark.parametrize(
     ("scope", "report"),
     (

@@ -360,7 +360,7 @@ offline controls; CHANGELOG records the pre-alpha removal.
 
 ---
 
-## 4. Option 1 — identity-range leasing per participant (authorized amendment)
+## 4. Option 1 — identity-range leasing per participant (safety prerequisite only)
 
 Read `docs/architecture/W6-WRITE-CEILING.md` first; it is the decision record. Baselines to beat,
 measured (PERFORMANCE.md §2): disjoint 4-writer median 313 ms / p90 3.45 s / 254 conflicts /
@@ -374,108 +374,43 @@ measured (PERFORMANCE.md §2): disjoint 4-writer median 313 ms / p90 3.45 s / 25
 - Identity allocation *(verified)*: anchor `identity = extent.next_record_id` inside the
   "record identity" section of heap_store; its docstring states the safety rule: *"a counter
   behind an id in use would hand that identity out"* twice — the invariant the design must keep
-  is **durable counter ≥ every id any row has ever carried**.
+  is **durable `next_record_id` > every id any physical record header carries**. Equality is
+  already behind because the counter itself is what the next insert takes.
 - Gaps are sanctioned *(verified, txn_manager docstring)*: *"an id burned by a commit that then
   fails leaves a GAP in the sequence, which no reader can observe."*
-- Ids are allocated inside `_write_rows`, which runs INSIDE the commit section; the participant
-  section serializes the threads of one process — so per-process allocation is single-flight
-  *(verified)*. Two PROCESSES renewing concurrently produce two conflicting page-0 images and
-  OCC refuses one — that is the mechanism that keeps leases disjoint, and it must remain: **a
-  lease renewal MUST keep page 0 in its write set** (it does naturally: the renewal writes the
-  page, `_attempt_pages()` measures it, `_declare_page_interest` declares it).
-- The verifier checks the counter against ids in use (anchor: the refusal text
-  `declares next_record_id` ... `below the` in heap_store) — leasing keeps the counter AHEAD, so
-  the check holds by construction, but the kill-tests below must prove it.
+- Ids are allocated inside `_write_rows`, which runs inside the current commit attempt and writes
+  page 0 today *(verified)*. That fact describes the existing one-at-a-time allocator; it is not a
+  proof that a future range may be reserved safely by the same attempt that first consumes it.
+- The verifier checks the counter from an independent device scan: page 0 and every physically
+  decodable heap header are read without the pool, catalog chain or visibility filter. Ended,
+  provisional, no-CSN and orphaned headers constrain it. Malformed descriptors, duplicate
+  extents, and directory ids absent from the decoded catalog fail closed without inventing a
+  counter association. Leasing must keep the counter strictly ahead, and any future design's
+  kill/abort tests must prove it.
 
-### Design
+### Safety boundary; detailed design pending
 
-Add to `HeapStore` (slots!): `_identity_leases: dict[int, _IdentityLease]` where
+The former same-attempt renewal proof is withdrawn. A dirty row page may reach the device before
+the attempt's page-0 counter image is durable, so staging the range extension beside its first
+consumer does not prove the physical high-water invariant. Conditional cursor rollback based on a
+belief that the attempt did not escape is also not a safe leasing foundation.
 
-```python
-@dataclass(slots=True)
-class _IdentityLease:
-    next: RecordId          # the next id to hand out
-    durable_end: RecordId   # ids below this are covered by a COMMITTED counter
-    speculative_end: RecordId  # ids below this are covered by a counter write staged in the
-                               # CURRENT commit attempt; equals durable_end between attempts
-```
+No leasing data structure, block size, renewal state machine or cross-process handoff is authorized
+by this plan yet. A separately reviewed design MUST establish all of these properties:
 
-Constant `IDENTITY_LEASE_BLOCK: int = 1024` with a docstring: why 1024 (a u64 id space makes the
-burn irrelevant; one renewal per ~1024 rows makes page-0 writes ~0.1% of insert commits; N=1
-restores today's behavior and is the fallback if a defect appears).
+1. A range reservation is committed and durable **before the first identity in that range is
+   handed to row construction**.
+2. Once an identity is handed out, the participant cursor is burn-only: abort, retry and uncertain
+   cleanup never move it backwards or authorize reuse.
+3. Kill/reopen preserves `device next_record_id > every physically decodable record_id`, including
+   invisible and orphaned headers; unused reserved identities become gaps.
+4. Concurrent processes receive disjoint durable reservations under an explicit coordination or
+   fencing proof, not an assumed ordering of dirty-page eviction.
 
-`allocate_identity(table)` (rename/extend the existing allocation site):
-1. If the lease for `table_id` has `next < speculative_end`: hand out `next`, bump. **No page
-   write.**
-2. Else: renewal — read the entry (as today), write the entry with
-   `next_record_id += IDENTITY_LEASE_BLOCK` through the pool (dirty page, exactly like today's
-   single-step advance: the commit's measured page set picks it up, logs it, declares it), set
-   `next = old_counter`, `speculative_end = old_counter + BLOCK`, leave `durable_end` unchanged
-   (it becomes durable only when THIS commit commits).
-
-**The abort rule — this is the correctness heart, get it exactly right:** the renewal's page-0
-image is part of the commit attempt. If the attempt is REFUSED or the transaction rolls back, the
-durable counter never moved, and the in-memory lease MUST fall back to `durable_end`, or the next
-commit hands out ids the durable counter does not cover (a reopen would then hand them out AGAIN
-— duplicate identities, the one outcome the counter exists to prevent). Mechanism: hook the same
-seams the round-6 undo uses:
-- On commit SUCCESS (after step 3.7 publishes): promote `durable_end = speculative_end` for every
-  table this commit renewed. Track renewals per attempt in the txn context or a heap-side
-  per-attempt list keyed like `_dirty_mark` is (set at the mark point, consumed at
-  success/abandon).
-- On `_abandon_rows` / rollback / `retry`: `speculative_end = durable_end`, `next =
-  min(next, durable_end)`... careful: ids already handed to the ABORTED txn's rows die with it —
-  `next` may simply reset to `durable_end` (the aborted rows' ids were ≥ durable_end iff they
-  came from the speculative range; ids handed below durable_end were durable-covered and burning
-  them is a sanctioned gap — resetting `next` to durable_end would REUSE them for the next txn…
-  NO: ids below durable_end already handed out may sit in COMMITTED rows of an earlier txn? No —
-  handed out only to THIS aborted txn (per-process single-flight, promote-on-commit). But an
-  earlier committed txn consumed from the same lease: its ids are < current `next` and ≤
-  durable_end after its promotion. So on abort: `next` must roll back only past the ids handed to
-  THE ABORTED ATTEMPT, i.e. snapshot `next` at attempt start (beside `_dirty_mark`) and restore
-  it on abandon, plus `speculative_end = durable_end`. Ids handed to the aborted attempt from the
-  DURABLE range are then reused by the next txn — safe, their rows never became visible, and
-  reuse-within-durable-cover is exactly today's behavior on abort (verify: today an aborted
-  commit's allocated ids ARE reused because the counter image was discarded — keep parity).
-- Kill between renewal-commit and use: reopen reads the durable counter (= extended) → gaps only.
-- Kill between handing ids and commit: rows never visible, counter durable at whatever the last
-  COMMITTED renewal wrote → no row carries an uncovered id. Invariant proof obligation for the
-  critic: **no row ever becomes visible carrying an id ≥ the durable counter at the moment of its
-  commit's barrier** — the renewal image rides IN THE SAME COMMIT as the first row that needs it,
-  so the barrier that makes the row durable makes the counter durable. State this in the
-  docstring; it is the whole argument.
-
-Cross-process disjointness: renewals from two processes conflict on page 0 (both write the whole
-entry) → OCC retries one → it re-reads the advanced counter → disjoint blocks. No new mechanism.
-
-**Extent hints are OUT OF SCOPE this round** (they still put page 0 in ~1/9 of 5-row-commit write
-sets via chain growth). Measure after; the W6 record says hint-offloading is the follow-up if
-numbers demand.
-
-### Tests (`tests/txn/test_identity_leasing.py`, plus multiprocess)
-
-- `test_ids_are_unique_across_processes_under_concurrent_load` — 3 writer processes × 40 txns × 5
-  rows on ONE table, then assert all ids distinct, verify clean, reopen identical (extend or
-  reuse the `tests/smoke` child pattern).
-- `test_a_renewal_rides_the_commit_that_needs_it` — WAL inspection: the commit that first
-  allocates past the durable window carries a page-0 WRITE_PAGE image (decode as in
-  `test_a_committed_schema_change_logs_the_catalog_header_page`).
-- `test_an_aborted_attempt_rolls_the_lease_back` — txn A inserts (consumes speculative ids),
-  conflict-abort it (page-half pattern from `tests/txn/test_chain_relink_regressions.py`), txn B
-  inserts; assert B's ids do not collide with A's aborted rows' ids after A RETRIES and commits
-  both — strongest form: force A's renewal, abort, then reopen the database (fresh process) and
-  insert — no duplicate-id refusal, verify clean.
-- `test_a_kill_between_renewal_and_use_leaves_only_a_gap` — child renews (commit with one row),
-  `os._exit(9)` before using the rest; parent reopens, inserts many rows, asserts uniqueness +
-  verify clean + the gap exists (max id jumped).
-- `test_the_verifier_still_holds_the_counter_invariant` — after all of the above, `verify("all")`
-  findings == () and a hand-corrupted counter (write a LOWER counter into page 0 via the pool in
-  a test double) is still REFUSED (L1: the guard must not be narrowed — find and keep the
-  existing refusal test).
-- A93 2×2 for the abort rule: (renewal, abort) × (renewal, kill).
-- Kill-checks: `speculative_end` promotion removed → uniqueness test fails after abort+retry;
-  lease reset on abandon removed → the aborted-attempt test fails; BLOCK=0 → behaves as today
-  (equivalence smoke).
+The future design requires abort and kill-window tests, multi-process uniqueness, reopen checks,
+the independent verifier after every adversarial path, and mutants that remove durable-before-use
+or rewind the cursor. Extent-hint offloading remains out of scope. Only after that design and its
+critic are accepted should implementation and the measurements below begin.
 
 ### Measurement (the point of the whole item)
 
@@ -486,9 +421,8 @@ unit cost). Throughput will NOT move (~10.8 rows/s — the exclusive section; sa
 the numbers be read as a regression). Update PERFORMANCE.md §2 with a before/after table and the
 W6-WRITE-CEILING.md status line; the next lever (Windows publication fix) stays recorded.
 
-Docs: CF-22 with the amendment note (identity density: ids may jump by up to BLOCK across
-process lifetimes; gaps were always sanctioned, now they are routine); CHANGELOG; README only if
-the id-density note belongs in "limitations" (it does: one line).
+Documentation of block size, identity density and operational limits belongs to the future design;
+none is frozen by this prerequisite.
 
 ---
 
@@ -497,15 +431,16 @@ the id-density note belongs in "limitations" (it does: one line).
 1. Item 1 (HNSW cold) → suite in halves → commit `fix(vector): ...` → push.
 2. Item 2 (WAL race) → suite → commit `fix(recovery): ...` → push.
 3. Item 3 (knobs) → suite → commit `fix(config): ...` → push.
-4. Item 4 (leasing) → suite + `tools/measure_concurrency.py` before/after → commit
-   `feat(txn,heap): identity-range leasing ...` → push.
+4. Item 4 (leasing) → produce the durable-before-use/burn-only state machine and independent crash
+   critic first. Implementation, suite and `tools/measure_concurrency.py` are a later authorized
+   milestone only after that proof is accepted.
 5. Blind-critic round over the whole series (one agent), on a fork from
    `git archive <final-commit>`, `.battery-root` stamped, main tree untouchable, §14 applied
    literally, instructed to run a mutation battery over every new guard and to assume there is
    exactly one unheld guard to find (the six-round base rate). Feed it the per-item "what to
    attack" lists: the publish-order in `graph()`; the section acquisition in recovery (and the
-   dead-writer path NOT narrowed); `_maybe_checkpoint` reentry and refusal-swallowing; the lease
-   abort rule (promote/rollback seams), the renewal-in-same-commit invariant, and cross-process
+   dead-writer path NOT narrowed); `_maybe_checkpoint` reentry and refusal-swallowing; and the
+   future lease proof's durable-before-handout boundary, burn-only cursor and cross-process
    disjointness under kill storms.
 6. Fix what it finds (plan for one round), update COMPONENTS/PUNCHLIST, final push.
 

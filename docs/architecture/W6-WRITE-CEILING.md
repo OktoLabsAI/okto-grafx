@@ -1,7 +1,9 @@
 # W6 decision record — the write ceiling and the three-plus-one options
 
-Status: **awaiting JP's decision.** Measured premises verified 2026-08-23 at `903d611`;
-instruments `tools/measure_concurrency.py` and the D5 harness.
+Status: **preferred direction; crash-safe leasing design pending.** Measured premises verified
+2026-08-23 at `903d611`; instruments `tools/measure_concurrency.py` and the D5 harness. This record
+does not authorize implementation until durable-before-use reservation and burn-only cursor
+semantics have an independently reviewed state machine.
 
 ## The system truth that frames every option
 
@@ -18,24 +20,28 @@ and WASTE, and unlock throughput only together with the complements at the end.
 
 ### Option 1 — identity-range leasing per participant  ← RECOMMENDED FIRST
 
-A writer leases N identities by advancing `next_record_id` once, allocates from memory; only
-lease renewals and chain-growth commits touch page 0.
+A participant may allocate a reserved range from memory only after advancing `next_record_id` has
+committed durably **before the first handout**. Its in-memory cursor is burn-only after handout;
+only future durable reservations and chain-growth commits should need to touch page 0.
 
-* **Pros:** redo model untouched (the crash proof does not move); no on-disk format change (the
-  counter just advances in steps); crash gaps already sanctioned ("an id burned ... leaves a GAP,
-  which no reader can observe"); the verifier's invariant (counter ≥ every id in use) preserved by
-  construction; reversible (N=1 is today's behavior).
+* **Pros, if the pending design proves them:** no on-disk format change (the counter advances in
+  steps); crash gaps are already sanctioned ("an id burned ... leaves a GAP, which no reader can
+  observe"); the verifier's invariant (`next_record_id` strictly greater than every physical
+  record id) remains the acceptance oracle; N=1 can remain the operational fallback.
 * **Cons:** page-0 conflicts become rare, not zero (renewal + chain growth, ~1 in 9–50 commits in
   the measured workload).
-* **Resilience risk: LOW.** Recovery and verify unchanged. The one new corner — a kill between
-  lease and use — is the sanctioned gap.
+* **Resilience risk: DESIGN BLOCKED after the verifier prerequisite.** A same-attempt counter
+  update and first row is insufficient because either dirty page may escape first. A kill after a
+  durable reservation and before use may leave a sanctioned gap; after any handout, abort and
+  uncertainty burn the identity and never rewind the cursor. Cross-process range ownership and
+  fencing still require a proof.
 * **Performance:** conflicts →~0 for disjoint ingest; tails collapse to the section's fair queue
   (~2–4× unit cost); unlocks ~70 commits/s on Linux; Windows stays ~10/s until the publication fix.
-* **Frozen surfaces:** §8.5 untouched (changes WHEN page 0 is written, not the protocol); a light
-  amendment note on identity density.
-* **Complexity / effort:** low-medium; C1/C5, two code points; **1–2 builder+critic rounds.** Key
-  tests: multi-process id uniqueness with a kill between lease and use (A93 2×2), battery,
-  before/after via `tools/measure_concurrency.py`.
+* **Surfaces to prove:** reservation durability, §8.5 interaction, cross-process ownership, reopen
+  and identity density. None is frozen by this record.
+* **Complexity / effort:** pending the separate state-machine design and critic. Required evidence
+  includes multi-process uniqueness, abort/kill windows, reopen plus verifier checks, a rewind
+  mutant, and before/after measurement via `tools/measure_concurrency.py`.
 
 ### Option 2 — per-table directory pages
 
