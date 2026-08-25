@@ -25,6 +25,8 @@ from pathlib import Path
 from bench.harness.recall import (
     RECALL_METRIC,
     RecallStageError,
+    _UNCANONICAL,
+    _canonical_json,
     _canonical_verdict,
     _describe,
     _emit,
@@ -42,7 +44,21 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], None]) -> No
     name let two concurrent stages clobber each other's half-written scratch before the
     replace. A failure unlinks the orphan scratch best-effort and re-raises.
     """
-    document = json.loads(path.read_text(encoding="utf-8"))
+    # Round-8 CRITICAL: this is a SECOND read of a document the caller already
+    # validated, and it was mutated exactly as parsed. A json.loads returning a mapping
+    # whose __setitem__ quietly does nothing made the mutation a no-op while every
+    # other step succeeded: append_vector_recall returned 0 having published the gauge
+    # and NOT the section -- an exit 0 that lied, and the precise inversion of the
+    # invariant this module exists to hold. Guarding the call sites would not have
+    # helped, because nothing raised. The document is rebuilt into exact builtins and
+    # ONLY that copy is mutated and serialized, so a mutation cannot be intercepted.
+    parsed = json.loads(path.read_text(encoding="utf-8"))
+    document = _canonical_json(parsed)
+    if type(document) is not dict:
+        raise RecallStageError(
+            f"{path} is not plain JSON-native data, so a mutation of it cannot be "
+            "trusted to land; refusing to publish."
+        )
     mutate(document)
     # Round-5 blocker 1b: the bytes are produced BEFORE any resource exists. This line
     # used to sit between the mkstemp and the try, an unguarded gap where a mutation
@@ -117,7 +133,12 @@ def _strip_stale_gauge(metrics: Path) -> None:
     """
     # The read and the parse are WORK: a real KeyboardInterrupt or SystemExit there
     # still propagates, and the caller's boundary turns ordinary failures into exit 3.
-    document = json.loads(metrics.read_text(encoding="utf-8"))
+    document = _canonical_json(json.loads(metrics.read_text(encoding="utf-8")))
+    if document is _UNCANONICAL:
+        raise RecallStageError(
+            "the metrics document is not plain JSON-native data, so a stale recall "
+            "gauge cannot be ruled out; refusing to publish over an unknown state."
+        )
     try:
         # Round-7 (5): everything from here is the parsed OBJECT's code -- .get, the
         # iteration, each entry's .get. A subclass raising SystemExit here escaped with
@@ -183,9 +204,21 @@ def _append_gauge(metrics: Path, value: float) -> None:
     _replace_json(metrics, mutate)
 
 
-def _release_publication_locks(held: list[Path]) -> list[str]:
-    """Unlink held locks in REVERSE order; return diagnostics for any residue."""
+def _release_publication_locks(
+    held: list[Path],
+) -> tuple[list[str], BaseException | None]:
+    """Unlink held locks in REVERSE order; report residue and any real interrupt.
+
+    Round-8 (F): absorbing every shape keeps the cleanup complete, but absorbing a
+    KeyboardInterrupt or SystemExit raised by the unlink SYSCALL also erased it when
+    there was nothing else to report -- a real interrupt of a successful run came back
+    as exit 3. Swallowing is only justified while a primary exception is propagating,
+    because then the interrupt would REPLACE something more accurate. So the first
+    non-ordinary shape is remembered and handed to the caller, which knows whether a
+    primary exists: the unwind paths discard it, and the success path re-raises it.
+    """
     residue: list[str] = []
+    interrupted: BaseException | None = None
     for lock_path in reversed(held):
         try:
             os.unlink(str(lock_path))
@@ -198,11 +231,13 @@ def _release_publication_locks(held: list[Path]) -> list[str]:
             # reaches the last lock, and the failure becomes residue diagnosis. The
             # diagnosis is itself guarded -- describing a hostile failure must not be
             # what aborts the cleanup -- and falls back to a CONSTANT.
+            if interrupted is None and not _is_a(failure, Exception):
+                interrupted = failure
             try:
                 residue.append(f"{lock_path} ({_describe(failure)})")
             except BaseException:  # noqa: BLE001 -- the diagnosis is best-effort too
                 residue.append("<a lock whose failure could not be described>")
-    return residue
+    return residue, interrupted
 
 
 def _unwind_lock_failure(
@@ -230,7 +265,11 @@ def _unwind_lock_failure(
     uncertain = None
     if not close_ok and held and held[-1] == lock_path:
         uncertain = held.pop()
-    return uncertain, _release_publication_locks(held)
+    # A primary is propagating through every caller of this helper, so an interrupt
+    # raised by the cleanup itself is deliberately dropped: it would replace a more
+    # accurate account of what went wrong.
+    residue, _ = _release_publication_locks(held)
+    return uncertain, residue
 
 
 def _acquire_publication_locks(
@@ -256,6 +295,12 @@ def _acquire_publication_locks(
         # outside every guard -- a __str__ raising SystemExit escaped before a single
         # lock existed. A document that cannot even be named cannot be locked.
         ordered = sorted({str(document) for document in documents})
+        # Round-8 (C): the lock NAMES are built here, before a single lock exists.
+        # Building them inside the acquisition loop meant the second Path could fail
+        # after the first lock was already held, and the failure path for a name that
+        # does not exist yet had nothing to release it with -- an orphaned lock left on
+        # disk by a stage that never ran. Nothing is acquired until every name is known.
+        lock_paths = [Path(target + ".c13.lock") for target in ordered]
     except BaseException as failure:  # noqa: BLE001 -- naming runs ONLY caller code
         # Round-7 (C): this used to re-raise anything that was not an ordinary
         # Exception, which handed the caller a SystemExit the DATA had fabricated --
@@ -267,8 +312,7 @@ def _acquire_publication_locks(
             f"({_describe(failure)}); nothing was locked and nothing was run"
         )
     held: list[Path] = []
-    for target in ordered:
-        lock_path = Path(target + ".c13.lock")
+    for lock_path in lock_paths:
         # Round-5: the CREATION and the STAMPING are separate phases, because
         # FileExistsError means completely different things in each. The single clause
         # that used to span both read a FileExistsError from os.write -- raised AFTER we
@@ -280,7 +324,7 @@ def _acquire_publication_locks(
         except FileExistsError:
             # ONLY the open can conclude contention, and only here does no descriptor
             # of ours exist.
-            residue = _release_publication_locks(held)
+            residue, _ = _release_publication_locks(held)
             reason = (
                 f"{lock_path} exists, so another stage holds (or died holding) "
                 "the publication lock; refusing to interleave. Remove the file "
@@ -348,7 +392,7 @@ def _acquire_publication_locks(
             # certain locks first; only then does an ordinary failure become the typed
             # refusal, or a KI/SE propagate.
             uncertain = held.pop()
-            residue = _release_publication_locks(held)
+            residue, _ = _release_publication_locks(held)
             if not _is_a(failure, Exception):
                 raise
             reason = (
@@ -481,14 +525,31 @@ def append_vector_recall(
         if alias_path is None:
             continue
         try:
-            # Round-7 (3): resolve() is the ARGUMENT's code, not ours -- a path-like can
-            # choose the shape it raises, so every shape here becomes a typed refusal.
-            # The result is reduced to a builtin string immediately, which is what takes
-            # the object out of every line that follows.
-            canonical_name = os.fspath(alias_path.resolve(strict=True))
+            # Round-8 (E), step one -- DATA. os.fspath runs the ARGUMENT's __fspath__,
+            # so the shape raised here is the caller's object choosing it, and every
+            # shape becomes a typed refusal. Round-7 got this half right but ran
+            # resolve() inside the same clause, which meant a REAL interrupt of the
+            # filesystem call was absorbed too. The argument is reduced to a builtin
+            # string first; nothing after this line touches the caller's object.
+            alias_name = os.fspath(alias_path)
+            if type(alias_name) is not str:
+                raise TypeError("the argument is not a filesystem path")
+        except BaseException as failure:  # noqa: BLE001 -- the ARGUMENT chose the shape
+            _emit(
+                f"vector recall stage: REFUSED -- {alias_label} "
+                f"{_describe(alias_path)} is not a usable filesystem path "
+                f"({_describe(failure)}); nothing was run."
+            )
+            return 3
+        try:
+            # Step two -- WORK. resolve() walks the filesystem and Path() is ours, so a
+            # genuine KeyboardInterrupt or SystemExit here is an interrupt of work and
+            # keeps propagating; an ordinary failure, RuntimeError included, is a typed
+            # refusal with no fallback.
+            canonical_name = os.fspath(Path(alias_name).resolve(strict=True))
             if type(canonical_name) is not str:
                 raise TypeError("resolve() did not yield a filesystem path")
-        except BaseException as failure:  # noqa: BLE001 -- the ARGUMENT chose the shape
+        except Exception as failure:  # noqa: BLE001 -- KI/SE propagate; this is I/O
             _emit(
                 f"vector recall stage: REFUSED -- {alias_label} "
                 f"{_describe(alias_path)} could "
@@ -581,7 +642,6 @@ def append_vector_recall(
     if lock_refusal is not None:
         _emit(f"vector recall stage: REFUSED -- {lock_refusal}")
         return 3
-    residue: list[str] = []
     try:
         outcome = _publish_documents(
             profile=profile,
@@ -591,13 +651,28 @@ def append_vector_recall(
             workspace=workspace,
             timeout_seconds=timeout_seconds,
         )
-    finally:
-        residue = _release_publication_locks(held_locks)
-        for residue_line in residue:
+    except BaseException:
+        # Round-8 (F): a primary is propagating. The locks are still released and the
+        # residue still reported, but anything the cleanup itself raises is dropped --
+        # replacing the primary would destroy the only accurate account of the failure.
+        primary_residue, _ = _release_publication_locks(held_locks)
+        for residue_line in primary_residue:
             _emit(
                 "vector recall stage: WARNING -- lock residue left behind: "
                 f"{residue_line}"
             )
+        raise
+    residue, interrupted = _release_publication_locks(held_locks)
+    for residue_line in residue:
+        _emit(
+            f"vector recall stage: WARNING -- lock residue left behind: {residue_line}"
+        )
+    if interrupted is not None:
+        # Round-8 (F): there was NO primary, so this interrupt is the only thing that
+        # happened. Absorbing it turned a real KeyboardInterrupt during cleanup into a
+        # quiet exit 3 -- a stage failure the operator never asked for and an interrupt
+        # they did. It reappears here, after the cleanup completed and was reported.
+        raise interrupted
     if outcome == 0 and residue:
         # Round-4: exit 0 with persisting locks would tell the next stage the field
         # is clear while the files say otherwise. Success is demoted to the typed

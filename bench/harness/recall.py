@@ -234,6 +234,7 @@ def run_recall(
     # (a hostile os.environ, a patched clock) and left the fresh verdict file orphaned
     # with no cleanup, no spawn and no diagnosis. Everything that follows the acquisition
     # is now inside the same state machine that removes it.
+    cleanup_interrupt: BaseException | None = None
     try:
         verdict_path = Path(temp_name)
         environment = dict(os.environ)
@@ -296,14 +297,16 @@ def run_recall(
                 f"the recall worker's verdict is not readable JSON "
                 f"(exit {completed.returncode}): {_describe(failure)}"
             ) from failure
+        # Round-8 (A): requiring an exact dict at the TOP was not enough -- the
+        # values inside it are still whatever the parse produced, so verdict["ok"]
+        # could carry a __bool__ that raises and verdict["failure"] a __format__ that
+        # raises, both reached below while reporting a failure. The whole tree is
+        # rebuilt into exact builtins here, before ANY access, and a document that
+        # cannot be rebuilt is refused.
+        verdict = _canonical_json(verdict)
         if type(verdict) is not dict:
-            # Round-7 (6): _is_a accepted a dict SUBCLASS, which can answer every read
-            # coherently and then raise from __setitem__ when duration_seconds and
-            # exit_code are written in below -- after the file was already cleaned up.
-            # json.loads produces an exact dict, so requiring one costs nothing real and
-            # removes the object's code from the two writes that follow.
             raise RecallStageError(
-                "the recall worker's verdict is not a plain JSON object; refusing it."
+                "the recall worker's verdict is not plain JSON-native data; refusing it."
             )
     finally:
         try:
@@ -312,7 +315,7 @@ def run_recall(
             # that removal exists it may not exist at all -- and a cleanup that depends
             # on the object that failed is not a cleanup.
             os.unlink(temp_name)
-        except BaseException:  # noqa: BLE001 -- cleanup NEVER replaces the primary
+        except BaseException as failure:  # noqa: BLE001 -- never replaces a primary
             # Round-5 blocker 2: this runs inside a finally, so ANY exception raised
             # here replaces what was propagating -- the worker's own typed failure, or
             # the user's KeyboardInterrupt. An Exception-only clause let a KI/SE raised
@@ -320,15 +323,31 @@ def run_recall(
             # leftover temp file is the lesser harm and is not silent: the SUCCESS path
             # below refuses to report success over residue.
             cleanup_failed = True
+            if not _is_a(failure, Exception):
+                # Round-8 (F): swallowing is only justified while a primary is
+                # propagating. If this finally runs on the SUCCESS path, a real
+                # interrupt of the unlink syscall is the only event there is, and
+                # turning it into a RecallStageError reports a stage failure that did
+                # not happen while losing the interrupt that did.
+                cleanup_interrupt = failure
         else:
             cleanup_failed = False
+    if cleanup_interrupt is not None:
+        # Reached only when nothing else was propagating: the lines after a finally do
+        # not run while a primary is in flight.
+        raise cleanup_interrupt
     if cleanup_failed:
         # Round-5 blocker 2: Path.exists() sat outside every guard, and it can raise --
         # an OSError the stdlib does not fold into False, or a hostile path object --
         # which escaped run_recall untyped. A check that cannot answer counts as
         # RESIDUE: the conservative side of the only honest doubt here.
         try:
-            residual = os.path.exists(temp_name)
+            answer = os.path.exists(temp_name)
+            # Round-8 (D): the guard covered the CALL but not the value it returned --
+            # a replacement exists() could hand back an object whose __bool__ raises,
+            # and the truth of it was taken outside this try. Only an exact bool is an
+            # answer; anything else leaves the question open, which counts as residue.
+            residual = answer if type(answer) is bool else True
         except BaseException:  # noqa: BLE001 -- a diagnosis NEVER decides an outcome
             # Round-6 item 5: this caught Exception only, so exists() raising SystemExit
             # escaped -- and SystemExit(0) is the worst shape available here, because
@@ -344,10 +363,14 @@ def run_recall(
             )
     verdict["duration_seconds"] = duration
     verdict["exit_code"] = completed.returncode
-    if completed.returncode != 0 or not verdict.get("ok", False):
+    if completed.returncode != 0 or verdict.get("ok") is not True:
+        # Round-8 (A): identity, not truthiness. The verdict is canonical by now, so
+        # this is belt and braces -- but "ok" means the worker said True, and any other
+        # value, however truthy, is not that. The failure text is described rather than
+        # interpolated for the same reason.
         raise RecallStageError(
             f"recall stage failed closed on profile {profile!r}: "
-            f"{verdict.get('failure', f'worker exit {completed.returncode}')}"
+            f"{_describe(verdict.get('failure', f'worker exit {completed.returncode}'))}"
         )
     return verdict
 
@@ -451,6 +474,53 @@ class _NotCanonical(Exception):
     """A node that is not exact builtin data; the rebuild refuses it."""
 
 
+class _NotCanonical(Exception):
+    """Raised inside the rebuild when a node is not JSON-native with EXACT types."""
+
+
+_UNCANONICAL = object()
+"""Sentinel: the document could not be rebuilt. NOT None -- ``null`` is valid JSON."""
+
+
+def _canonical_json(node: object) -> object:
+    """Deep-rebuild a parsed document into EXACT builtin types, or _UNCANONICAL.
+
+    Round-8 CRITICAL. Parsing is not the same as trusting: json.loads is replaceable, and
+    what it returns can be a dict subclass whose __setitem__ silently does nothing, whose
+    .get raises, or whose keys are str subclasses that lie to the consumer's __eq__. Every
+    guard added around such an object protects one call site; this removes the object.
+
+    The rebuild accepts only None, bool, int, float, str, dict and list -- type-exact,
+    subclasses refused -- and requires every mapping key to be an exact str. What comes
+    back is JSON-native data with no code of its own, so nothing downstream can be
+    hostile: not the reads, not the mutations, not the keys the caller later exports.
+    Failure returns the _UNCANONICAL sentinel rather than None, because ``null`` is a
+    perfectly valid JSON document and None is its honest rebuild. Conflating the two
+    would turn a hostile document into an ABSENT one -- and absent is TOLERATED without
+    --require-recall, while malformed never is. That is the difference between a gate
+    that refuses a corrupt publication and one that shrugs at it.
+    """
+
+    def rebuild(value: object) -> object:
+        if value is None or type(value) in (bool, int, float, str):
+            return value
+        if type(value) is dict:
+            rebuilt: dict[str, object] = {}
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise _NotCanonical()
+                rebuilt[key] = rebuild(item)
+            return rebuilt
+        if type(value) is list:
+            return [rebuild(item) for item in value]
+        raise _NotCanonical()
+
+    try:
+        return rebuild(node)
+    except _NotCanonical:
+        return _UNCANONICAL
+
+
 def _canonical_verdict(verdict: object) -> dict[str, object] | None:
     """A deep rebuild into EXACT builtin types, or None -- the TOCTOU antidote.
 
@@ -463,24 +533,7 @@ def _canonical_verdict(verdict: object) -> dict[str, object] | None:
     caller's boundary as ordinary exceptions.
     """
 
-    def rebuild(node: object) -> object:
-        if node is None or type(node) in (bool, int, float, str):
-            return node
-        if type(node) is dict:
-            rebuilt: dict[str, object] = {}
-            for key, value in node.items():
-                if type(key) is not str:
-                    raise _NotCanonical()
-                rebuilt[key] = rebuild(value)
-            return rebuilt
-        if type(node) is list:
-            return [rebuild(item) for item in node]
-        raise _NotCanonical()
-
-    try:
-        result = rebuild(verdict)
-    except _NotCanonical:
-        return None
+    result = _canonical_json(verdict)
     return result if type(result) is dict else None
 
 

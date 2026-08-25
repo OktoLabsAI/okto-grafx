@@ -2042,7 +2042,7 @@ def test_a_verdict_dict_subclass_is_refused_before_anything_is_written_into_it(
         lambda text, *a, **k: _ExitingSetItem(real_loads(text, *a, **k)),
     )
     scratch = tmp_path / "scratch"
-    with pytest.raises(RecallStageError, match="plain JSON object"):
+    with pytest.raises(RecallStageError, match="plain JSON-native data"):
         run_recall("tiny", scratch=scratch)
     monkeypatch.undo()
     assert list(scratch.iterdir()) == [], "and the fresh file is still removed"
@@ -2125,3 +2125,296 @@ def test_a_path_that_refuses_to_be_built_still_removes_the_verdict_file(
         "the file is ours from the moment the descriptor closed, so it goes even when "
         "the object naming it never existed"
     )
+
+
+# =====================================================================================
+# Round-8: parsing is not trusting -- and a cleanup interrupt is not a stage failure
+# =====================================================================================
+
+
+class _IgnoreSet(dict):
+    """A mapping that accepts every write and keeps none of them.
+
+    The critical shape: nothing raises, so no guard anywhere can notice. Only rebuilding
+    the document into exact builtins takes this object off the path.
+    """
+
+    def __setitem__(self, key: object, value: object) -> None:
+        return None
+
+
+def test_a_mutation_that_cannot_land_is_refused_not_reported_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-8 CRITICAL: _replace_json re-read a SECOND object and mutated it exactly as
+    parsed. A mapping whose __setitem__ quietly does nothing made the mutation a no-op
+    while every other step succeeded -- so the caller was told the write landed when the
+    document had not changed at all. Nothing raised, which is why no boundary caught
+    it."""
+    document = tmp_path / "document.json"
+    document.write_text(json.dumps({"kept": True}), encoding="utf-8")
+    before = document.read_text(encoding="utf-8")
+    monkeypatch.setattr(
+        wiring.json, "loads", lambda *a, **kw: _IgnoreSet({"kept": True})
+    )
+    with pytest.raises(RecallStageError, match="JSON-native"):
+        wiring._replace_json(document, lambda doc: doc.__setitem__("added", 1))
+    monkeypatch.undo()
+    assert document.read_text(encoding="utf-8") == before
+
+
+def test_the_gauge_is_never_published_without_its_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-8 CRITICAL, end to end: with the section's write silently dropped, the run
+    returned 0 having published the GAUGE and not the SECTION -- the exact inversion of
+    the invariant this module exists to hold, reported as success. The stage must fail
+    instead, and the reachable partial state stays section-without-gauge, never the
+    reverse."""
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real_loads = json.loads
+    seen: list[int] = []
+
+    def dropping_loads(text: str, *args: object, **kwargs: object) -> object:
+        parsed = real_loads(text, *args, **kwargs)
+        if not isinstance(parsed, dict):
+            return parsed
+        seen.append(1)
+        # The two prevalidation reads and the strip's read come first; the fourth is
+        # the section's read-modify-write.
+        return _IgnoreSet(parsed) if len(seen) >= 4 else parsed
+
+    monkeypatch.setattr(wiring.json, "loads", dropping_loads)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code != 0, "a publication whose write cannot land is never a success"
+    published = json.loads(metrics.read_text(encoding="utf-8"))
+    names = [entry.get("name") for entry in published.get("metrics", [])]
+    assert RECALL_METRIC not in names, "the gauge may never appear without its section"
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")] == []
+    assert [p.name for p in tmp_path.iterdir() if ".c13-" in p.name] == []
+
+
+@pytest.mark.parametrize("field", ["ok", "failure"], ids=["ok-141", "failure-142"])
+def test_a_verdict_value_that_exits_cannot_escape_run_recall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    """Round-8 (A): requiring an exact dict at the top left the VALUES inside it as
+    whatever the parse produced -- ok with a __bool__ that raises (141) and failure with
+    a __format__ that raises (142), both reached while reporting a failure. The whole
+    tree is rebuilt before any access."""
+    import subprocess as subprocess_module
+
+    from bench.harness import recall as recall_module
+    from bench.harness.recall import run_recall
+
+    class _ExitingBool:
+        def __bool__(self) -> bool:
+            raise SystemExit(141)
+
+    class _ExitingFormat:
+        def __format__(self, spec: str) -> str:
+            raise SystemExit(142)
+
+        def __str__(self) -> str:
+            raise SystemExit(142)
+
+    def writes_verdict(command: list[str], **kwargs: object):
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.write_text(json.dumps(_verdict_stub()), encoding="utf-8")
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    real_loads = json.loads
+
+    def hostile_loads(text: str, *args: object, **kwargs: object) -> object:
+        parsed = real_loads(text, *args, **kwargs)
+        parsed[field] = _ExitingBool() if field == "ok" else _ExitingFormat()
+        if field == "failure":
+            parsed["ok"] = False
+        return parsed
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
+    monkeypatch.setattr(recall_module.json, "loads", hostile_loads)
+    scratch = tmp_path / "scratch"
+    with pytest.raises(RecallStageError, match="JSON-native"):
+        run_recall("tiny", scratch=scratch)
+    monkeypatch.undo()
+    assert list(scratch.iterdir()) == [], "and the fresh file is still removed"
+
+
+def test_a_second_lock_name_that_cannot_be_built_orphans_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-8 (C): the lock names were built inside the acquisition loop, so the SECOND
+    Path could fail after the first lock was already held -- and the failure path for a
+    name that does not exist yet had nothing to release it with. Every name is built
+    before anything is acquired."""
+    out, metrics = _seed_documents(tmp_path)
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    real_path = wiring.Path
+    built: list[int] = []
+
+    class _RefusingSecondPath:
+        def __new__(cls, *args: object, **kwargs: object):
+            if args and str(args[0]).endswith(".c13.lock"):
+                built.append(1)
+                if len(built) == 2:
+                    raise RuntimeError("the second lock name cannot be built")
+            return real_path(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wiring, "Path", _RefusingSecondPath)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert not called, "nothing runs when the field could not even be named"
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")] == [], (
+        "a name that failed to build may not leave an earlier lock on disk"
+    )
+
+
+def test_an_existence_answer_that_is_not_a_bool_counts_as_residue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-8 (D): the guard covered the exists() CALL but not the value it returned,
+    so an object whose __bool__ raises (171) was evaluated for truth outside the try.
+    Only an exact bool is an answer."""
+    import subprocess as subprocess_module
+
+    from bench.harness.recall import run_recall
+
+    class _ExitingTruth:
+        def __bool__(self) -> bool:
+            raise SystemExit(171)
+
+    def writes_verdict(command: list[str], **kwargs: object):
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.write_text(json.dumps(_verdict_stub()), encoding="utf-8")
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    real_unlink = os.unlink
+
+    def sticky(target: object, *args: object, **kwargs: object) -> None:
+        if "recall-tiny-" in str(target):
+            raise OSError("sticky temp")
+        return real_unlink(target, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
+    monkeypatch.setattr(os, "unlink", sticky)
+    monkeypatch.setattr(os.path, "exists", lambda *a, **kw: _ExitingTruth())
+    with pytest.raises(RecallStageError, match="residue"):
+        run_recall("tiny", scratch=tmp_path / "scratch")
+    monkeypatch.undo()
+
+
+def test_a_real_interrupt_of_the_resolve_still_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-8 (E): resolve() walks the filesystem, so a KeyboardInterrupt raised THERE
+    (181) is an interrupt of work. Round-7 ran it in the same clause as the argument's
+    own __fspath__ and absorbed both; the argument is reduced to a builtin string first,
+    and the filesystem call keeps Exception."""
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real_resolve = Path.resolve
+
+    def interrupted_resolve(self: Path, *args: object, **kwargs: object):
+        if self.name in ("calibration.json", "metrics.json"):
+            raise KeyboardInterrupt("interrupted while resolving")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", interrupted_resolve)
+    with pytest.raises(KeyboardInterrupt):
+        append_vector_recall(
+            profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+        )
+    monkeypatch.undo()
+
+
+def test_a_cleanup_interrupt_with_no_primary_is_not_swallowed_into_exit_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-8 (F, code 182): on a SUCCESSFUL publication the lock release absorbed every
+    shape, so a real KeyboardInterrupt raised by the unlink syscall came back as exit 3 --
+    a stage failure that did not happen, and a lost interrupt that did. With no primary
+    to protect, the interrupt reappears after the cleanup completed."""
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real_unlink = os.unlink
+
+    def interrupted_unlink(target: object, *args: object, **kwargs: object) -> None:
+        if str(target).endswith(".c13.lock"):
+            raise KeyboardInterrupt("interrupted releasing the lock")
+        return real_unlink(target, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "unlink", interrupted_unlink)
+    with pytest.raises(KeyboardInterrupt):
+        append_vector_recall(
+            profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+        )
+    monkeypatch.undo()
+
+
+def test_a_temp_cleanup_interrupt_with_no_primary_is_not_a_stage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-8 (F, code 183): the same rule for the verdict temp. A successful run whose
+    unlink is interrupted used to report RecallStageError; the interrupt is what
+    happened."""
+    import subprocess as subprocess_module
+
+    from bench.harness.recall import run_recall
+
+    def writes_verdict(command: list[str], **kwargs: object):
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.write_text(json.dumps(_verdict_stub()), encoding="utf-8")
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    real_unlink = os.unlink
+
+    def interrupted_unlink(target: object, *args: object, **kwargs: object) -> None:
+        if "recall-tiny-" in str(target):
+            raise KeyboardInterrupt("interrupted removing the verdict file")
+        return real_unlink(target, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
+    monkeypatch.setattr(os, "unlink", interrupted_unlink)
+    with pytest.raises(KeyboardInterrupt):
+        run_recall("tiny", scratch=tmp_path / "scratch")
+    monkeypatch.undo()
+
+
+def test_a_cleanup_interrupt_never_replaces_an_existing_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for (F), and the reason the rule is conditional rather than absolute:
+    when a primary IS propagating, an interrupt raised by the cleanup must still be
+    dropped. Here the worker fails with SystemExit and the lock release is interrupted;
+    the caller must see the worker's SystemExit, not the cleanup's KeyboardInterrupt."""
+    out, metrics = _seed_documents(tmp_path)
+
+    def failing_worker(*args: object, **kwargs: object) -> dict[str, object]:
+        raise SystemExit("PRIMARY")
+
+    monkeypatch.setattr(wiring, "run_recall", failing_worker)
+    real_unlink = os.unlink
+
+    def interrupted_unlink(target: object, *args: object, **kwargs: object) -> None:
+        if str(target).endswith(".c13.lock"):
+            raise KeyboardInterrupt("CLEANUP")
+        return real_unlink(target, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "unlink", interrupted_unlink)
+    with pytest.raises(SystemExit) as caught:
+        append_vector_recall(
+            profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+        )
+    monkeypatch.undo()
+    assert "PRIMARY" in str(caught.value)

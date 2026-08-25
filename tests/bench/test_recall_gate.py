@@ -614,7 +614,11 @@ def test_a_hostile_repr_in_the_document_is_described_not_executed_raw(
     monkeypatch.setattr(gate_module.json, "loads", lambda *a, **kw: payload)
     state, reason = gate_module._recall_measurement(document)
     assert state == "malformed"
-    assert "repr raises" in str(reason), "the describer names the offender safely"
+    # Round-8: the rejection now happens EARLIER, at the canonical rebuild, so the
+    # hostile __repr__ is never reached rather than being safely described. The probe
+    # still pins what matters -- present-but-uninspectable is MALFORMED, never absent
+    # and never a traceback -- and the describer keeps its own dedicated probes.
+    assert "not plain JSON-native data" in str(reason)
     assert check(document, require_recall=True).status == STATUS_UNMEASURED
 
 
@@ -667,7 +671,9 @@ def test_an_unguarded_metaclass_cannot_escape_the_ceiling_reader(
     monkeypatch.setattr(gate_module.json, "loads", lambda *a, **kw: _Hostile())
     multiples, gauges, reason = read_multiples("{}")
     assert (multiples, gauges) == ({}, {})
-    assert "not an object" in reason
+    # Round-8: the rebuild refuses this object before the not-an-object branch can even
+    # format it, so the metaclass property is never touched at all.
+    assert "not plain JSON-native data" in reason
     assert check("{}", require_recall=True).status == STATUS_UNMEASURED
 
 
@@ -742,9 +748,10 @@ def test_a_payload_whose_get_exits_is_a_verdict_not_an_exit(
     multiples, gauges, reason = read_multiples("{}")
     assert (multiples, gauges) == ({}, {})
     assert reason
+    # Round-8: refused at the rebuild, before any .get is reached.
     assert gate_module._recall_measurement("{}") == (
         "malformed",
-        "raised while being inspected",
+        "the document is not plain JSON-native data",
     )
     assert check("{}", require_recall=True).exit_code == 2
 
@@ -775,3 +782,37 @@ def test_a_calibration_payload_whose_get_exits_reads_as_unmeasured(
     assert main(["--metrics", str(metrics), "--calibration", str(calibration)]) == 2
     monkeypatch.undo()
     assert "UNMEASURED" in capsys.readouterr().out
+
+
+def test_a_str_subclass_key_never_reaches_the_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-8 (B, code 161): the reader exported keys taken straight from the document,
+    so a str SUBCLASS became a ceiling or metric name and answered the CONSUMER's __eq__
+    however it liked, long after this function returned. The rebuild refuses a document
+    whose keys are not exact strings, so nothing of the sort can leave."""
+
+    class _LyingKey(str):
+        def __eq__(self, other: object) -> bool:
+            raise SystemExit(161)
+
+        def __hash__(self) -> int:
+            return hash(str(self))
+
+    payload = {
+        "metrics": [
+            {
+                "name": "oktografx_baseline_ceiling_multiple",
+                "samples": [
+                    {"value": 1.0, "labels": {_LyingKey("ceiling"): "point_read"}}
+                ],
+            }
+        ]
+    }
+    monkeypatch.setattr(gate_module.json, "loads", lambda *a, **kw: payload)
+    multiples, gauges, reason = read_multiples("{}")
+    monkeypatch.undo()
+    assert (multiples, gauges) == ({}, {})
+    assert "not plain JSON-native data" in reason
+    for key in list(multiples) + list(gauges):
+        assert type(key) is str

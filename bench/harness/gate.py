@@ -68,6 +68,54 @@ def _as_finite_float(value: object) -> float | None:
     return coerced if math.isfinite(coerced) else None
 
 
+class _NotCanonical(Exception):
+    """Raised inside the rebuild when a node is not JSON-native with EXACT types."""
+
+
+_UNCANONICAL = object()
+"""Sentinel: the document could not be rebuilt. NOT None -- ``null`` is valid JSON."""
+
+
+def _canonical_json(node: object) -> object:
+    """Deep-rebuild a parsed document into EXACT builtin types, or _UNCANONICAL.
+
+    Round-8 (B). Mirrors recall._canonical_json; this module is standalone by
+    design and carries its own copy, as it does for _describe. Parsing is not the same as trusting: json.loads is replaceable, and
+    what it returns can be a dict subclass whose __setitem__ silently does nothing, whose
+    .get raises, or whose keys are str subclasses that lie to the consumer's __eq__. Every
+    guard added around such an object protects one call site; this removes the object.
+
+    The rebuild accepts only None, bool, int, float, str, dict and list -- type-exact,
+    subclasses refused -- and requires every mapping key to be an exact str. What comes
+    back is JSON-native data with no code of its own, so nothing downstream can be
+    hostile: not the reads, not the mutations, not the keys the caller later exports.
+    Failure returns the _UNCANONICAL sentinel rather than None, because ``null`` is a
+    perfectly valid JSON document and None is its honest rebuild. Conflating the two
+    would turn a hostile document into an ABSENT one -- and absent is TOLERATED without
+    --require-recall, while malformed never is. That is the difference between a gate
+    that refuses a corrupt publication and one that shrugs at it.
+    """
+
+    def rebuild(value: object) -> object:
+        if value is None or type(value) in (bool, int, float, str):
+            return value
+        if type(value) is dict:
+            rebuilt: dict[str, object] = {}
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise _NotCanonical()
+                rebuilt[key] = rebuild(item)
+            return rebuilt
+        if type(value) is list:
+            return [rebuild(item) for item in value]
+        raise _NotCanonical()
+
+    try:
+        return rebuild(node)
+    except _NotCanonical:
+        return _UNCANONICAL
+
+
 def _is_a(value: object, kind: object) -> bool:
     """isinstance(), guarded: the check itself runs the INSPECTED object's code.
 
@@ -180,7 +228,11 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
     regressions are opposite facts and must not share an encoding.
     """
     try:
-        payload = json.loads(document)
+        # Round-8 (B): the reader exported keys taken straight from the document, so a
+        # str SUBCLASS became a ceiling or metric name and lied to the CONSUMER's __eq__
+        # long after this function returned. Canonicalizing here means every key and
+        # value that leaves is an exact builtin.
+        payload = _canonical_json(json.loads(document))
     except Exception as error:  # noqa: BLE001 -- "never raises" is absolute here
         # ValueError is the documented shape, RecursionError arrives from thousands of
         # nesting levels, and the promise covers whatever else an ordinary parse can
@@ -198,6 +250,13 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
         # __subclasshook__, which a hostile metaclass controls, so the very line that
         # decides "this is not a document" could raise out of a function whose docstring
         # promises it never raises -- and so could formatting the refusal it returns.
+        if payload is _UNCANONICAL:
+            return (
+                {},
+                {},
+                "the metrics document is not plain JSON-native data, so nothing "
+                "in it can be trusted as a measurement: UNMEASURED, not a verdict",
+            )
         if not _is_a(payload, Mapping):
             # `[]`, `null` and `3` are all VALID JSON, so the parse above accepts them and
             # only the shape refuses them. Without this line `payload.get` raises
@@ -290,9 +349,14 @@ def _recall_measurement(document: str) -> tuple[str, object]:
     did not come from the pipeline and cannot be trusted as THE measurement.
     """
     try:
-        payload = json.loads(document)
+        payload = _canonical_json(json.loads(document))
     except Exception:  # noqa: BLE001 -- unreadable is absent; never-raise is absolute
         return ("absent", None)
+    if payload is _UNCANONICAL:
+        # A document that PARSED but cannot be rebuilt is MALFORMED, never absent:
+        # absent is TOLERATED without --require-recall and malformed never is, so
+        # collapsing them would let a corrupt publication through a default gate.
+        return ("malformed", "the document is not plain JSON-native data")
     try:
         # Round-6 item 6: the isinstance is inside the boundary too -- an ABC check runs
         # __instancecheck__/__subclasshook__, which a hostile metaclass controls.
@@ -483,7 +547,9 @@ def _resolve_recall_target(
         return coerced, "explicit flag"
     if calibration:
         try:
-            payload = json.loads(Path(calibration).read_text(encoding="utf-8"))
+            payload = _canonical_json(
+                json.loads(Path(calibration).read_text(encoding="utf-8"))
+            )
         except (OSError, ValueError) as error:
             raise ValueError(
                 f"--calibration {calibration!r} was named explicitly but is unreadable "
