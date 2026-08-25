@@ -331,7 +331,7 @@ class _TransactionStub:
 class _Snapshot:
     """A snapshot that sees every committed version (the corpus is fully committed)."""
 
-    read_lsn: int = 2
+    read_lsn: int = 1
 
     def visible(self, xmin: int, xmax: int) -> bool:
         """CONTRACT.md §8.5 visibility, verbatim."""
