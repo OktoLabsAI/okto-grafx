@@ -135,7 +135,25 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], bool]) -> No
         # scratch still on disk. An unproved replace is inconclusive, so the scratch is
         # deliberately KEPT and accounted for by the clause below rather than removed as
         # though the publication had landed.
-        _certify_none(os.replace(scratch_name, path), "replacing the document")
+        replaced = os.replace(scratch_name, path)
+        if replaced is not None:
+            # Not _certify_none: this one needs a type of its own so the cleanup below
+            # can tell it apart and keep the scratch.
+            raise _InconclusiveReplace(
+                f"replacing {path} did not report completion, so it may or may not "
+                "have happened"
+            )
+    except _InconclusiveReplace:
+        # Round-13: the scratch is KEPT, and this is the code that keeps it rather than
+        # a comment saying so. The replace may have happened or may not; the scratch is
+        # the only copy that might carry the intended content, and removing it would
+        # destroy the evidence needed to tell which. The descriptor is still released.
+        if not closed:
+            try:
+                os.close(descriptor)
+            except BaseException:  # noqa: BLE001 -- never replaces the primary
+                pass
+        raise
     except BaseException:
         # Ownership is explicit: the raw descriptor is ours until the single close
         # attempt above. Cleanup is best-effort and can never replace the PRIMARY
@@ -308,6 +326,20 @@ def _normalized_name(resolved: object) -> str:
     return name
 
 
+class _InconclusiveReplace(Exception):
+    """The replace may or may not have happened, so the scratch is the only candidate.
+
+    Round-13. The previous commit CLAIMED, in a comment and in its message, that an
+    unproved replace keeps the scratch -- and the cleanup unlinked it unconditionally,
+    destroying the only copy that might hold the intended content. The claim was wrong
+    about its own code, and the probe did not catch it because it asserted the outcome
+    around the scratch rather than the scratch itself.
+
+    A distinct type is what makes the promise keepable: every other primary still gets
+    the ordinary cleanup, and only this one is told apart and left with its evidence.
+    """
+
+
 class _InconclusiveLock(Exception):
     """The lock may exist and may hold a descriptor nobody can name.
 
@@ -342,7 +374,11 @@ def _unwind_lock_failure(
     close_ok = True
     if descriptor is not None:
         try:
-            os.close(descriptor)
+            # Round-13: certified here too. A close answering True leaves a descriptor
+            # that may still be open, and treating it as done let the unwind REMOVE a
+            # lock whose descriptor may be live -- the one outcome this helper exists to
+            # prevent. One attempt, as always.
+            _certify_none(os.close(descriptor), "closing the lock descriptor")
         except BaseException:  # noqa: BLE001 -- cleanup NEVER replaces the primary
             close_ok = False
     uncertain = None
@@ -515,7 +551,10 @@ def _acquire_publication_locks(
                 reason += f" (release residue: {residue})"
             return [], reason
         try:
-            os.close(descriptor)
+            # Round-13: a close answering True is not a closed descriptor. It joins the
+            # uncertain-close machine below, which leaves the lock file in place and
+            # refuses -- never publishing behind a lock it cannot prove it released.
+            _certify_none(os.close(descriptor), "closing the lock descriptor")
         except BaseException as failure:  # noqa: BLE001 -- ONE attempt, every shape
             # ONE close attempt, never a retry: a close that closed and THEN raised
             # would make a second close reach a possibly-reused descriptor number.

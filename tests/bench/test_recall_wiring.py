@@ -3446,3 +3446,202 @@ def test_a_real_interrupt_building_the_workspace_path_still_propagates(
             profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
         )
     monkeypatch.undo()
+
+
+# =====================================================================================
+# Round-13: a close that is not proved closed, and the scratch that must really survive
+# =====================================================================================
+
+
+@pytest.mark.parametrize(
+    "really_close", [True, False], ids=["close-real-then-True", "no-op-then-True"]
+)
+def test_a_lock_close_that_does_not_report_completion_never_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, really_close: bool
+) -> None:
+    """Round-13 (1)(2): os.close returns None. One answering True leaves a descriptor
+    that may still be open, and the stage went on to publish behind a lock it could not
+    prove it held -- or, on the unwind path, REMOVED a lock whose descriptor may be
+    live. Both shapes are covered: one where the close really happened and lied anyway,
+    one where nothing happened at all."""
+    out, metrics = _seed_documents(tmp_path)
+    before = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    ran: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: ran.append(1) or _verdict_stub()
+    )
+    real_open, real_close = os.open, os.close
+    lock_descriptors: list[int] = []
+
+    def spy_open(path: object, *a: object, **kw: object):
+        descriptor = real_open(path, *a, **kw)  # type: ignore[arg-type]
+        if str(path).endswith(".c13.lock"):
+            lock_descriptors.append(descriptor)
+        return descriptor
+
+    closes: list[int] = []
+
+    def lying_close(descriptor: object):
+        if descriptor in lock_descriptors:
+            closes.append(1)
+            if really_close:
+                real_close(descriptor)  # type: ignore[arg-type]
+            return True
+        return real_close(descriptor)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "close", lying_close)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3, "an unproved close never authorizes a publication"
+    assert not ran, "the worker never runs behind a lock we cannot prove we hold"
+    assert (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8")) == (
+        before
+    ), "and nothing is published"
+    assert len(closes) == 1, "exactly one close attempt, never a retry"
+    leftover = sorted(
+        p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")
+    )
+    assert leftover == ["calibration.json.c13.lock"], (
+        "the lock whose descriptor is uncertain is LEFT IN PLACE, never unlinked"
+    )
+    # The probe made the close a no-op, so the descriptor really is still open -- which
+    # is exactly the state the code refused to reason past. Only the probe can close it,
+    # because only the probe still knows the number.
+    for descriptor in lock_descriptors:
+        try:
+            real_close(descriptor)
+        except OSError:
+            pass
+    for name in leftover:
+        (tmp_path / name).unlink()
+
+
+def test_an_inconclusive_replace_really_keeps_the_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-13 (3): the previous commit CLAIMED, in a comment and in its message, that
+    an unproved replace keeps the scratch -- and the cleanup unlinked it
+    unconditionally. The claim was wrong about its own code, and the earlier probe did
+    not catch it because it asserted the outcome AROUND the scratch instead of the
+    scratch itself. This one asserts the scratch: that it exists, and that it holds the
+    payload the replace was supposed to install."""
+    out, metrics = _seed_documents(tmp_path)
+    target_before = out.read_bytes()
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real_replace = os.replace
+
+    def no_op_replace(source: object, target: object, *a: object, **kw: object):
+        return True
+
+    monkeypatch.setattr(os, "replace", no_op_replace)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert out.read_bytes() == target_before, "the target is byte-identical"
+    scratches = [p for p in tmp_path.iterdir() if ".c13-" in p.name]
+    assert scratches, "the scratch is the only candidate copy and must survive"
+    payload = json.loads(scratches[0].read_text(encoding="utf-8"))
+    assert "vector_recall" in payload, (
+        "and it holds the content the replace was supposed to install"
+    )
+    for scratch in scratches:
+        scratch.unlink()
+    assert real_replace is os.replace or True
+
+
+def test_an_ordinary_replace_failure_still_removes_the_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for (3): only the INCONCLUSIVE replace keeps its scratch. An ordinary
+    failure is still cleaned up, because there the outcome is known and the scratch is
+    just debris."""
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+
+    def failing_replace(*a: object, **kw: object):
+        raise OSError("the replace failed outright")
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert [p.name for p in tmp_path.iterdir() if ".c13-" in p.name] == [], (
+        "a known failure leaves no scratch behind"
+    )
+
+
+def test_an_unwind_close_that_does_not_report_completion_keeps_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round-13 (1), the UNWIND path specifically. The earlier probe reaches the normal
+    close first, so it cannot see this one: only a failure DURING acquisition sends the
+    code through _unwind_lock_failure. There, a close answering True used to be treated
+    as done, and the unwind then REMOVED a lock whose descriptor may still be live --
+    handing the field to the next stage while ours was arguably still holding it."""
+    out, metrics = _seed_documents(tmp_path)
+    ran: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: ran.append(1) or _verdict_stub()
+    )
+    real_open, real_close, real_write = os.open, os.close, os.write
+    lock_descriptors: list[int] = []
+
+    def spy_open(path: object, *a: object, **kw: object):
+        descriptor = real_open(path, *a, **kw)  # type: ignore[arg-type]
+        if str(path).endswith(".c13.lock"):
+            lock_descriptors.append(descriptor)
+        return descriptor
+
+    def failing_stamp(descriptor: object, data: bytes):
+        # The stamp of the SECOND lock fails, which is what sends acquisition into the
+        # unwind while a descriptor of ours is open.
+        if descriptor in lock_descriptors and len(lock_descriptors) == 2:
+            raise OSError("the stamp failed")
+        return real_write(descriptor, data)  # type: ignore[arg-type]
+
+    closes: list[int] = []
+
+    def lying_close(descriptor: object):
+        # Only the SECOND lock's descriptor lies, so the first is acquired cleanly and
+        # the run really does reach the unwind with a descriptor of ours open.
+        if lock_descriptors[1:] and descriptor == lock_descriptors[1]:
+            closes.append(1)
+            return True  # never really closed, and says it was
+        return real_close(descriptor)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "write", failing_stamp)
+    monkeypatch.setattr(os, "close", lying_close)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert not ran
+    leftover = sorted(
+        p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")
+    )
+    assert "metrics.json.c13.lock" in leftover, (
+        "the lock whose descriptor could not be proved closed stays on disk"
+    )
+    # The file surviving is NOT what distinguishes the two versions here: on Windows an
+    # open descriptor blocks the unlink either way, so an uncertified close would leave
+    # the same file behind by accident of the OS while believing it had released it.
+    # What differs is what the code KNOWS, and it has to say so.
+    assert "descriptor state is uncertain" in capsys.readouterr().out, (
+        "the refusal must name the uncertainty, not report a release it cannot prove"
+    )
+    for descriptor in lock_descriptors:
+        try:
+            real_close(descriptor)
+        except OSError:
+            pass
+    for name in leftover:
+        (tmp_path / name).unlink()
