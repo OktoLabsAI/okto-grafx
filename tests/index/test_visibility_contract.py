@@ -54,6 +54,11 @@ class CountingHeap:
         """Return the catalog store the real heap uses."""
         return self._heap.catalog
 
+    @property
+    def file(self) -> str:
+        """Return the companion file whose reads this wrapper counts."""
+        return self._heap.file
+
     def read(self, ref: RecordRef) -> object:
         """Return the version at that location and count the read."""
         self.reads += 1
@@ -375,7 +380,9 @@ def test_a_record_shaped_for_the_other_contract_is_refused_rather_than_stored(
     assert refused.value.details["field"] == "versioned"
     assert refused.value.details["index"] == database.proximity.name
     assert database.proximity.walk() == (), "nothing of the wrong shape reached the file"
-    assert database.proximity.lookup(key, SnapshotDouble(ENDED)) == ()
+    # No commit was published: ask only for the durable prefix this deliberately empty index
+    # can certify.  A later snapshot must now fail closed instead of silently trusting it.
+    assert database.proximity.lookup(key, SnapshotDouble(0)) == ()
     assert [f.kind for f in database.manager.verify("person_near_name")] == ["missing_entry"]
 
 

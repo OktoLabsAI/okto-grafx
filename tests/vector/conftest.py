@@ -42,6 +42,9 @@ PAGE_SIZE: int = 4096
 BUDGET_BYTES: int = 256 * PAGE_SIZE
 """Room for enough pages that no test in this suite meets the budget refusal by accident."""
 
+FIXTURE_READ_LSN: int = 1_000_000
+"""Closed-world ceiling maintained by the fixture's coupled heap/index helpers."""
+
 
 @dataclass
 class Emission:
@@ -361,7 +364,15 @@ class VectorFixture:
 
     def attach(self, table: TableDef, space_name: str) -> object:
         """Register the index of one space over one table, which is what makes it searchable."""
-        return self.engine.attach(table, space_name)
+        # This fixture mutates its catalog synchronously and has no independent WAL publisher.
+        # Passing that catalog lets attach certify the new empty index before attachment-time
+        # metrics inspect every registered space (including this one).
+        index = self.engine.attach(table, space_name, catalog=self.catalog_store.catalog)
+        # The fixture has no independent WAL writer: every exposed row mutation updates the heap
+        # and its vector index in one helper. Its far-future snapshots therefore name this
+        # synthetic closed-world ceiling, not an unrepresented backlog of commits.
+        self.registry.mark_built_through(FIXTURE_READ_LSN)
+        return index
 
     def create_table(self, name: str, space_name: str) -> TableDef:
         """Create one node table whose third column stores vectors of a space."""
@@ -383,7 +394,7 @@ class VectorFixture:
         self.catalog_store.catalog.add_table(table)
         self.catalog_store.save()
         self.table = table
-        self.engine.attach(table, space_name)
+        self.attach(table, space_name)
         return table
 
     # --- rows ----------------------------------------------------------------------------
@@ -461,4 +472,4 @@ def database(
 @pytest.fixture
 def snapshot() -> SnapshotDouble:
     """Return a snapshot open far enough ahead to see every commit a test writes."""
-    return SnapshotDouble(1_000_000)
+    return SnapshotDouble(FIXTURE_READ_LSN)

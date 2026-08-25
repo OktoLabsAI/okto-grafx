@@ -143,8 +143,8 @@ def test_two_spaces_over_one_table_are_two_indexes(database: VectorFixture) -> N
     )
     database.catalog_store.catalog.add_table(table)
     database.catalog_store.save()
-    left = database.engine.attach(table, "minilm")
-    right = database.engine.attach(table, "bge")
+    left = database.attach(table, "minilm")
+    right = database.attach(table, "bge")
     assert left is not right
     assert left.name != right.name
     assert {left.name, right.name} <= {index.name for index in database.registry.indexes()}

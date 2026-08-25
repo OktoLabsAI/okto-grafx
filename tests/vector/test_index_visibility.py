@@ -14,6 +14,8 @@ why the refusal has to be the index's own and not a caller's judgement.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from okto_grafx.domain.errors import (
@@ -23,6 +25,7 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.index.records import IndexOperation, change_of
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.ids import RecordRef
+from okto_grafx.domain.model.value import VectorValue
 
 from .conftest import (
     RecordingMetrics,
@@ -159,6 +162,7 @@ def test_a_rebuilt_index_answers_again(database: VectorFixture) -> None:
     index = database.engine.index("space")
     index.mark_stale("a test marked this index stale")
     index.clear_stale(index.built_through_lsn)
+    database.pool.flush(database.heap.file)
     result = database.engine.search(
         space="space", query=(0.0, 1.0, 2.0, 3.0), k=4, snapshot=SnapshotDouble(1000)
     )
@@ -381,6 +385,8 @@ def test_a_redo_record_reaches_a_graph_that_is_already_built(
     index.apply(record)
     assert len(index.walk()) == 4
     assert len(index.graph()) == 4
+    database.pool.flush(index.file)
+    database.pool.flush(database.heap.file)
     scored, _stats = index.search((9.0, 9.0, 9.0, 9.0), 1, SnapshotDouble(1000))
     assert [item.record_id for item in scored] == [9]
 
@@ -499,6 +505,196 @@ def test_a_reopened_database_finds_its_vectors_without_replaying_anything(
     assert [hit.score for hit in after.hits] == [hit.score for hit in before.hits]
 
 
+def test_a_warm_vector_graph_rebases_after_a_foreign_rebuild(
+    metrics: RecordingMetrics, clock: StepClock
+) -> None:
+    """A second participant's healthy generation replaces both warm pages and the warm graph."""
+    from okto_grafx.adapters.codec_v1 import PageCodecV1
+    from okto_grafx.adapters.vectormath_pure import PureVectorMath
+    from okto_grafx.engine.buffer_pool import BufferPool
+    from okto_grafx.engine.catalog_store import CatalogStore
+    from okto_grafx.engine.heap_store import HeapStore
+    from okto_grafx.engine.index_manager import IndexManager
+    from okto_grafx.engine.vector_engine import VectorEngine
+
+    reader = VectorFixture(metrics=metrics, clock=clock, exact_scan_threshold=0, ef_search=32)
+    space = reader.create_space("space", 4)
+    table = reader.create_table("Chunk", "space")
+    corpus = [tuple(float(index + position) for position in range(4)) for index in range(4)]
+    for record_id, values in enumerate(corpus, start=1):
+        reader.insert_row(table, record_id, 0, space, values, csn=10 + record_id)
+    before = reader.engine.search(
+        space="space", query=corpus[0], k=5, snapshot=SnapshotDouble(1000)
+    )
+    assert before.achieved_k == 4
+    assert reader.engine.index("space")._snapshot is not None  # noqa: SLF001
+    reader.pool.flush()
+
+    pool = BufferPool(
+        reader.device,
+        PageCodecV1(reader.device.page_size),
+        metrics,
+        budget_bytes=256 * reader.device.page_size,
+        db_label="foreign_rebuilder",
+    )
+    catalog = CatalogStore(pool)
+    catalog.load()
+    heap = HeapStore(pool, catalog)
+    registry = IndexManager(pool, heap, metrics)
+    writer = VectorEngine(
+        catalog=catalog,
+        heap=heap,
+        pool=pool,
+        indexes=registry,
+        math=PureVectorMath(),
+        metrics=metrics,
+        clock=clock,
+        exact_scan_threshold=0,
+        ef_search=32,
+    )
+    writer_index = writer.attach(catalog.catalog.table("Chunk"), "space")
+    writer_space = catalog.catalog.space("space")
+    writer_table = catalog.catalog.table("Chunk")
+    new_values = (20.0, 21.0, 22.0, 23.0)
+    stored = writer.validate_vector(writer_space, new_values)
+    heap.insert(
+        writer_table,
+        5,
+        (
+            5,
+            0,
+            VectorValue(stored, writer_space.space_id, writer_space.storage_dtype),
+        ),
+        20,
+    )
+    pool.flush(heap.file)
+    through = reader.engine.index("space").built_through_lsn
+    rebuild = TransactionDouble(txn_id=901)
+    registry.rebuild(writer_index.name, rebuild, through)
+    registry.commit(rebuild, through)
+    registry.clear_stale(writer_index.name, through)
+
+    after = reader.engine.search(
+        space="space", query=new_values, k=5, snapshot=SnapshotDouble(1000)
+    )
+    assert after.achieved_k == 5
+    assert {hit.record_id for hit in after.hits} == {1, 2, 3, 4, 5}
+
+
+def test_an_inflight_graph_build_cannot_publish_across_a_foreign_rebuild(
+    metrics: RecordingMetrics, clock: StepClock
+) -> None:
+    """A build from generation A is discarded when generation B lands at the same LSN."""
+    from okto_grafx.adapters.codec_v1 import PageCodecV1
+    from okto_grafx.adapters.graph_guard import ConditionGuard
+    from okto_grafx.adapters.vectormath_pure import PureVectorMath
+    from okto_grafx.engine.buffer_pool import BufferPool
+    from okto_grafx.engine.catalog_store import CatalogStore
+    from okto_grafx.engine.heap_store import HeapStore
+    from okto_grafx.engine.index_manager import IndexManager
+    from okto_grafx.engine.vector_engine import VectorEngine
+
+    reader = VectorFixture(
+        metrics=metrics,
+        clock=clock,
+        exact_scan_threshold=0,
+        ef_search=32,
+        guard=ConditionGuard(),
+    )
+    space = reader.create_space("space", 4)
+    table = reader.create_table("Chunk", "space")
+    corpus = [tuple(float(index + position) for position in range(4)) for index in range(4)]
+    for record_id, values in enumerate(corpus, start=1):
+        reader.insert_row(table, record_id, 0, space, values, csn=10 + record_id)
+    reader.pool.flush()
+    index = reader.engine.index("space")
+
+    parked = threading.Event()
+    released = threading.Event()
+    original_resolve = index._resolve  # noqa: SLF001 - deterministic build interleaving
+    first_resolve = True
+
+    def park_first_resolve(ref: RecordRef) -> object:
+        nonlocal first_resolve
+        if first_resolve:
+            first_resolve = False
+            parked.set()
+            assert released.wait(5.0), "the foreign rebuild never released the old builder"
+        return original_resolve(ref)
+
+    index._resolve = park_first_resolve  # type: ignore[assignment]  # noqa: SLF001
+    failures: list[BaseException] = []
+
+    def build_old_generation() -> None:
+        try:
+            index.snapshot()
+        except BaseException as failure:  # pragma: no cover - asserted below
+            failures.append(failure)
+
+    builder = threading.Thread(target=build_old_generation)
+    builder.start()
+    try:
+        assert parked.wait(5.0), "the generation-A graph build never parked"
+
+        pool = BufferPool(
+            reader.device,
+            PageCodecV1(reader.device.page_size),
+            metrics,
+            budget_bytes=256 * reader.device.page_size,
+            db_label="inflight_foreign_rebuilder",
+        )
+        catalog = CatalogStore(pool)
+        catalog.load()
+        heap = HeapStore(pool, catalog)
+        registry = IndexManager(pool, heap, metrics)
+        writer = VectorEngine(
+            catalog=catalog,
+            heap=heap,
+            pool=pool,
+            indexes=registry,
+            math=PureVectorMath(),
+            metrics=metrics,
+            clock=clock,
+            exact_scan_threshold=0,
+            ef_search=32,
+        )
+        writer_index = writer.attach(catalog.catalog.table("Chunk"), "space")
+        writer_space = catalog.catalog.space("space")
+        writer_table = catalog.catalog.table("Chunk")
+        new_values = (20.0, 21.0, 22.0, 23.0)
+        stored = writer.validate_vector(writer_space, new_values)
+        heap.insert(
+            writer_table,
+            5,
+            (
+                5,
+                0,
+                VectorValue(stored, writer_space.space_id, writer_space.storage_dtype),
+            ),
+            20,
+        )
+        pool.flush(heap.file)
+        through = index.built_through_lsn
+        rebuild = TransactionDouble(txn_id=902)
+        registry.rebuild(writer_index.name, rebuild, through)
+        registry.commit(rebuild, through)
+        registry.clear_stale(writer_index.name, through)
+
+        certificate = index.begin_exact_read(1000)
+        index._refresh_companion(certificate)  # noqa: SLF001 - same composed read fence
+    finally:
+        released.set()
+        builder.join(5.0)
+
+    assert not builder.is_alive(), "the superseded graph builder did not finish"
+    assert failures == []
+    after = reader.engine.search(
+        space="space", query=(20.0, 21.0, 22.0, 23.0), k=5, snapshot=SnapshotDouble(1000)
+    )
+    assert after.achieved_k == 5
+    assert {hit.record_id for hit in after.hits} == {1, 2, 3, 4, 5}
+
+
 def test_a_reset_clears_the_store_and_the_graph_derived_from_it(
     database: VectorFixture,
 ) -> None:
@@ -513,9 +709,10 @@ def test_a_reset_clears_the_store_and_the_graph_derived_from_it(
     index = database.engine.index("space")
     assert len(index.graph()) == 4
     txn = TransactionDouble()
+    index.mark_stale("the reset is a rebuild generation")
     record = index.stage_reset(txn, index.built_through_lsn)
     assert txn.records == [record]
-    index.commit(txn, 100)
+    database.engine.commit("space", txn, 100)
     assert index.walk() == ()
     assert len(index.graph()) == 0
     result = database.engine.search(

@@ -269,6 +269,7 @@ def make_pool(
     *,
     budget_pages: int = 8,
     db_label: str = "testdb",
+    page_sequence_fence: Callable[[str, PageIndex], bool] | None = None,
 ) -> BufferPool:
     """Build a pool over the device with a budget expressed in whole pages."""
     return BufferPool(
@@ -277,6 +278,7 @@ def make_pool(
         metrics,
         budget_bytes=device.page_size * budget_pages,
         db_label=db_label,
+        page_sequence_fence=page_sequence_fence,
     )
 
 

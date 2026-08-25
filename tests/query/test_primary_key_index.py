@@ -28,7 +28,7 @@ import pytest
 import okto_grafx
 from okto_grafx.domain.errors import GrafxQueryError
 from okto_grafx.domain.query.plan import IndexSeek, NodeScan
-from okto_grafx.engine.index_manager import primary_key_index_name
+from okto_grafx.engine.index_manager import IndexManager, primary_key_index_name
 
 
 @pytest.fixture()
@@ -228,6 +228,27 @@ def test_the_duplicate_key_refusal_survives_the_index_answering_it(database) -> 
     assert database.execute("MATCH (p:Person) WHERE p.id = 1 RETURN p.name").rows == (
         ("reused",),
     )
+
+
+def test_primary_key_uniqueness_crosses_the_central_exact_view_fence(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with database.begin("write") as txn:
+        txn.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:Person {id: 1})")
+    crossed: list[str] = []
+    original = IndexManager.validated
+
+    def recording(self, index, key, snapshot):
+        crossed.append(index.name)
+        return original(self, index, key, snapshot)
+
+    monkeypatch.setattr(IndexManager, "validated", recording)
+    with pytest.raises(GrafxQueryError):
+        with database.begin("write") as txn:
+            txn.execute("CREATE (:Person {id: 1})")
+    assert primary_key_index_name("Person") in crossed
 
 
 # --- it survives the process --------------------------------------------------------------------

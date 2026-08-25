@@ -106,7 +106,11 @@ class IndexChange:
       because zero is the value that means "not ended";
     * ``REMOVE`` -- the snapshot horizon that authorised the physical removal, so a replay of the
       reconciliation can be read back against the rule that permitted it;
-    * ``RESET`` -- the log position the rebuilt index is declared to cover.
+    * ``RESET`` -- the log position the rebuilt index is declared to cover. ``ref.page`` is the
+      even page-0 sequence of the durable stale mark that authorised this rebuild and
+      ``ref.slot`` is zero. Older records wrote the null reference; token zero remains the
+      backward-compatible recovery form and is rebound to the stale certificate observed by
+      the replaying process.
     """
 
     index: str
@@ -207,6 +211,16 @@ class IndexChange:
             raise GrafxIndexError(
                 "A reset clears the whole index, so it names no key.",
                 field="key",
+                operation=self.operation.name,
+            )
+        if self.operation is IndexOperation.RESET and (
+            self.ref.slot != 0 or self.ref.page & 1
+        ):
+            raise GrafxIndexError(
+                "A reset rebuild token is an even page-0 sequence stored in ref.page and "
+                "uses ref.slot zero.",
+                field="rebuild_token",
+                value=self.ref.encode(),
                 operation=self.operation.name,
             )
 

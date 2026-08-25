@@ -185,8 +185,8 @@ def test_a_staged_record_for_another_space_is_refused_by_the_index(
     )
     database.catalog_store.catalog.add_table(table)
     database.catalog_store.save()
-    database.engine.attach(table, "alpha")
-    database.engine.attach(table, "beta")
+    database.attach(table, "alpha")
+    database.attach(table, "beta")
     ref = database.heap.insert(
         table,
         1,

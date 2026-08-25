@@ -257,9 +257,12 @@ def test_an_index_replayed_from_its_own_records_answers_identically(
         replayed.heap.insert(
             table, index + 1, (index + 1, 0, _vector(replayed, space, values)), 10 + index
         )
-    rebuilt = replayed.engine.attach(table, "space")
+    rebuilt = replayed.attach(table, "space")
     for record in records:
         rebuilt.apply(record)
+    # Direct store replay deliberately has no per-record flush.  Recovery owns the prefix
+    # boundary and publishes it once all records have been applied.
+    replayed.registry.mark_built_through(1000)
     assert len(rebuilt.walk()) == len(database.engine.index("space").walk())
     scored, _stats = rebuilt.search(corpus[3], 8, snapshot)
     assert [item.record_id for item in scored] == [hit.record_id for hit in original.hits]

@@ -64,20 +64,24 @@ def test_a_reopened_provisional_update_is_ignored_by_indexes_and_remains_repaira
 
     reopened = cold_view(database)
     snapshot = Snapshot(COMMITTED_LATER)
+    exact_snapshot = Snapshot(BORN)
     old_key = database.key(1, "Ada")
     ghost_key = database.key(1, "never committed")
 
     assert reopened.heap.read(original).live is True
     assert reopened.heap.read(ghost).live is False
     assert reopened.heap.lookup(database.table, 1, snapshot).values == (1, "Ada")  # type: ignore[union-attr]
-    assert reopened.manager.lookup(reopened.exact.name, old_key, snapshot) == (
+    # The synthetic future predicate is useful to prove the ghost stays invisible, but an exact
+    # lookup now also proves its durable build covers the requested snapshot. BORN is the latest
+    # position this fixture actually published into the index.
+    assert reopened.manager.lookup(reopened.exact.name, old_key, exact_snapshot) == (
         original,
     )
-    assert reopened.manager.lookup(reopened.proximity.name, old_key, snapshot) == (
+    assert reopened.manager.lookup(reopened.proximity.name, old_key, exact_snapshot) == (
         original,
     )
-    assert reopened.manager.lookup(reopened.exact.name, ghost_key, snapshot) == ()
-    assert reopened.manager.lookup(reopened.proximity.name, ghost_key, snapshot) == ()
+    assert reopened.manager.lookup(reopened.exact.name, ghost_key, exact_snapshot) == ()
+    assert reopened.manager.lookup(reopened.proximity.name, ghost_key, exact_snapshot) == ()
     assert reopened.manager.verify() == ()
     assert (
         Verifier(

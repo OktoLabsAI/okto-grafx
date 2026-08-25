@@ -671,8 +671,7 @@ def test_a_column_attached_by_the_statement_is_searchable_at_once() -> None:
         ddl,
     )
     built.apply_schema(ddl)
-    table = built.catalog_store.catalog.table("Note")
-    ref = built.heap.insert(table, 1, (1, vector((1.0, 0.0, 0.0, 0.0))), 1)
+    ref = built.insert("Note", 1, (1, vector((1.0, 0.0, 0.0, 0.0))), 1)
     transaction = built.transaction()
     built.vectors.stage_insert("minilm_v2", 1, ref, (1.0, 0.0, 0.0, 0.0), 1, transaction)
     built.indexes.commit(transaction, 1)

@@ -67,7 +67,7 @@ def test_a_transaction_that_never_commits_leaves_no_entry(database: Database) ->
     assert database.manager.commit(txn, BORN) == 0
     assert database.entries() == {"person_by_name": (), "person_near_name": ()}
     assert (
-        database.manager.lookup("person_near_name", database.key(1, "Ada"), SnapshotDouble(999))
+        database.manager.lookup("person_near_name", database.key(1, "Ada"), SnapshotDouble(0))
         == ()
     )
 

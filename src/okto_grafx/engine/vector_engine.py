@@ -77,7 +77,7 @@ from okto_grafx.domain.errors import (
     GrafxIndexError,
     GrafxVectorValidationError,
 )
-from okto_grafx.domain.ids import Csn, Lsn, RecordId, RecordRef
+from okto_grafx.domain.ids import NO_LSN, Csn, Lsn, RecordId, RecordRef
 from okto_grafx.domain.index.definition import IndexDefinition
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.records import IndexChange, IndexOperation
@@ -505,7 +505,9 @@ class VectorHnswIndex(ProximityIndex):
         "_ef_construction",
         "_ef_search",
         "_guard",
+        "_refresh",
         "_snapshot",
+        "_graph_generation",
         "_building",
         "_builder",
     )
@@ -528,6 +530,7 @@ class VectorHnswIndex(ProximityIndex):
         ef_construction: int = DEFAULT_EF_CONSTRUCTION,
         ef_search: int = DEFAULT_EF_SEARCH,
         guard: GraphGuard | None = None,
+        refresh: Callable[[str, object], None] | None = None,
     ) -> None:
         """Build the index of one embedding space over one paged store.
 
@@ -548,9 +551,14 @@ class VectorHnswIndex(ProximityIndex):
         self._ef_construction = ef_construction
         self._ef_search = search_width
         self._guard: GraphGuard = _UnguardedBuild() if guard is None else guard
+        self._refresh = refresh
         # The published picture, or None while there is none. Replaced by ONE assignment under
         # the guard, captured by ONE read; never edited into a different picture in place.
         self._snapshot: _GraphSnapshot | None = None
+        # Identity of the paged generation from which a graph may be published. A durable cache
+        # rebase replaces this token even when built_through_lsn stays equal, so a build that
+        # started over the superseded pages cannot publish after the rebase.
+        self._graph_generation: object = object()
         # True while a thread of this process builds a picture; other searches wait behind it.
         # The builder's thread token is kept beside it, so a call the build itself makes back
         # into this index (host code behind the VectorMath port) is never made to wait on it.
@@ -655,13 +663,22 @@ class VectorHnswIndex(ProximityIndex):
 
     def live_count(self) -> int:
         """Return how many entries have not been ended by any commit."""
-        return sum(1 for entry in self.walk() if entry.live)
+        return sum(1 for entry in self._stable_entries(NO_LSN) if entry.live)
 
     def visible_count(self, snapshot: SnapshotLike) -> int:
         """Return how many entries one snapshot may see."""
         return len(self.visible_entries(_require_snapshot(snapshot)))
 
     # --- the derived graph ------------------------------------------------------------------
+
+    def _cache_rebased(self) -> None:
+        """Retire a graph derived from bucket frames belonging to an older generation."""
+        self.invalidate_graph()
+
+    def _refresh_companion(self, certificate: object) -> None:
+        """Rebase heap/resolver state to the same certificate when composition supplied a hook."""
+        if self._refresh is not None:
+            self._refresh(self.file, certificate)
 
     def invalidate_graph(self) -> None:
         """Drop the published picture, so the next search rebuilds it from the entries the store holds.
@@ -678,6 +695,7 @@ class VectorHnswIndex(ProximityIndex):
         """
         with self._guard:
             self._snapshot = None
+            self._graph_generation = object()
 
     def graph(self) -> HnswGraph:
         """Return the graph of the current picture, building one when there is none or it is behind."""
@@ -717,60 +735,69 @@ class VectorHnswIndex(ProximityIndex):
         port (A91, LESSONS L2).
         """
         token = self._guard.thread_token()
-        owner = False
-        waited = 0
         while True:
-            header = self.built_through_lsn
+            owner = False
+            waited = 0
+            while True:
+                header = self.built_through_lsn
+                with self._guard:
+                    current = self._snapshot
+                    if current is not None:
+                        if current.mark == header:
+                            return current
+                        # The store moved under this picture -- a commit of this process noted
+                        # elsewhere, or a commit of another process (LESSONS L22). Retire exactly
+                        # this one; whatever is published by the time the build ends is judged then.
+                        self._snapshot = None
+                    if not self._building:
+                        self._building = True
+                        self._builder = token
+                        owner = True
+                        generation = self._graph_generation
+                        break
+                    if self._builder == token:
+                        # The build in flight is THIS thread's: host code it called through the
+                        # VectorMath port came back in through search(). Waiting would be waiting
+                        # on ourselves; build a picture for this call and leave the outer build be.
+                        generation = self._graph_generation
+                        break
+                    finished = self._guard.wait_for(
+                        lambda: not self._building, timeout=_BUILD_WAIT_SECONDS
+                    )
+                    waited += 1
+                    if not finished and waited >= _BUILD_WAIT_SLICES:
+                        generation = self._graph_generation
+                        break
+            try:
+                built = self._catch_up(self._build(header))
+            except BaseException:
+                # A build that does not finish leaves NOTHING behind -- and takes nothing away.
+                # Its locals go with this frame; the published picture, which may be another
+                # thread's complete build, is not touched.
+                if owner:
+                    self._release_build()
+                raise
+            superseded = False
             with self._guard:
-                current = self._snapshot
-                if current is not None:
-                    if current.mark == header:
-                        return current
-                    # The store moved under this picture -- a commit of this process noted
-                    # elsewhere, or a commit of another process (LESSONS L22). Retire exactly
-                    # this one; whatever is published by the time the build ends is judged then.
-                    self._snapshot = None
-                if not self._building:
-                    self._building = True
-                    self._builder = token
-                    owner = True
-                    break
-                if self._builder == token:
-                    # The build in flight is THIS thread's: host code it called through the
-                    # VectorMath port came back in through search(). Waiting would be waiting
-                    # on ourselves; build a picture for this call and leave the outer build be.
-                    break
-                finished = self._guard.wait_for(
-                    lambda: not self._building, timeout=_BUILD_WAIT_SECONDS
-                )
-                waited += 1
-                if not finished and waited >= _BUILD_WAIT_SLICES:
-                    break
-        try:
-            built = self._catch_up(self._build(header))
-        except BaseException:
-            # A build that does not finish leaves NOTHING behind -- and takes nothing away. Its
-            # locals go with this frame; the published picture, which may be another thread's
-            # complete build, is not touched. The two early refusals inside the build (the
-            # resolver failing, a dimension mismatch) used to re-raise with a partial graph
-            # published, and every later search answered out of the fragment (C9 round-2 B3).
-            if owner:
-                self._release_build()
-            raise
-        with self._guard:
-            current = self._snapshot
-            if current is None or current.mark < built.mark:
-                self._snapshot = built
-            else:
-                # Somebody published a picture at least as fresh while this one was built --
-                # the duplicate-build case. Both are complete; the published one is kept, and
-                # this search answers from it rather than from a picture nobody else can see.
-                built = current
-            if owner:
-                self._building = False
-                self._builder = None
-                self._guard.notify_all()
-        return built
+                if generation is not self._graph_generation:
+                    # A durable rebase can replace the whole file at the SAME LSN. The mark
+                    # therefore cannot distinguish this local picture from the new generation;
+                    # discard it and rebuild from the rebased pages before returning anything.
+                    superseded = True
+                else:
+                    current = self._snapshot
+                    if current is None or current.mark < built.mark:
+                        self._snapshot = built
+                    else:
+                        # Somebody published a picture at least as fresh while this one was
+                        # built. Both belong to this generation; keep the published one.
+                        built = current
+                if owner:
+                    self._building = False
+                    self._builder = None
+                    self._guard.notify_all()
+            if not superseded:
+                return built
 
     def _catch_up(self, picture: _GraphSnapshot) -> _GraphSnapshot:
         """Replace a not-yet-published picture that the store moved under with a fresh build.
@@ -1045,36 +1072,41 @@ class VectorHnswIndex(ProximityIndex):
         a commit past the last pass leaves the mark behind, and the NEXT search takes it.
         """
         predicate = _require_snapshot(snapshot)
-        self.require_readable()
-        width = self._ef_search if ef is None else ef
-        if width < k:
-            width = k
-        # The picture this search answers from is fixed HERE, by one capture. A commit on
-        # another thread may retire or replace the published picture while the traversal runs;
-        # the traversal keeps this one and finishes on one consistent picture. A node that
-        # vanished from it (removed concurrently) is simply not visible.
-        picture = self.snapshot()
-        entries = picture.entry_of_node
-        records = picture.record_of_node
+        read_lsn = self._require_exact_read_lsn(predicate)
 
-        def visible_and_admitted(node: int) -> bool:
-            """Return True when this snapshot may see the entry and the filter admits it."""
-            entry = entries.get(node)
-            if entry is None or not entry_visible(entry, predicate):
-                return False
-            if admits is None:
-                return True
-            record = records.get(node)
-            return record is not None and bool(admits(record))
+        def traverse(certificate: object) -> tuple[tuple[ScoredEntry, ...], TraversalStats]:
+            """Search one graph and companion heap view under a durable certificate."""
+            self._refresh_companion(certificate)
+            width = self._ef_search if ef is None else ef
+            if width < k:
+                width = k
+            # The picture this search answers from is fixed HERE, by one capture. A commit on
+            # another thread may retire or replace the published picture while the traversal
+            # runs; the outer certificate rejects it if a foreign durable generation changed.
+            picture = self.snapshot()
+            entries = picture.entry_of_node
+            records = picture.record_of_node
 
-        ranked, stats = picture.graph.search(query, width, visible_and_admitted)
-        scored = [
-            ScoredEntry(entry=entries[node], record_id=records[node], score=score)
-            for score, node in ranked
-            if node in entries and node in records
-        ]
-        scored.sort(key=lambda item: (-item.score, item.record_id))
-        return tuple(scored[:k]), stats
+            def visible_and_admitted(node: int) -> bool:
+                """Return True when this snapshot may see the entry and the filter admits it."""
+                entry = entries.get(node)
+                if entry is None or not entry_visible(entry, predicate):
+                    return False
+                if admits is None:
+                    return True
+                record = records.get(node)
+                return record is not None and bool(admits(record))
+
+            ranked, stats = picture.graph.search(query, width, visible_and_admitted)
+            scored = [
+                ScoredEntry(entry=entries[node], record_id=records[node], score=score)
+                for score, node in ranked
+                if node in entries and node in records
+            ]
+            scored.sort(key=lambda item: (-item.score, item.record_id))
+            return tuple(scored[:k]), stats
+
+        return self._stable_view(read_lsn, traverse)  # type: ignore[arg-type]
 
     def __repr__(self) -> str:
         return (
@@ -1263,9 +1295,17 @@ class VectorEngine:
             ef_construction=self._ef_construction,
             ef_search=self._ef_search,
             guard=self._guard,
+            refresh=self._refresh_heap_view,
         )
         registry.register(
-            index, existing_only=existing_only, persist_stale=persist_stale
+            index,
+            complete_through=(
+                registry.published_lsn
+                if catalog is not None and not existing_only
+                else None
+            ),
+            existing_only=existing_only,
+            persist_stale=persist_stale,
         )
         self._by_space[space.name] = index
         self._maintained_at[space.name] = self._clock.monotonic()
@@ -1421,7 +1461,14 @@ class VectorEngine:
 
     def commit(self, space_name: str, txn: StagingTransaction, csn: Csn) -> int:
         """Apply everything a transaction staged into one space's index."""
-        applied = self.index(space_name).commit(txn, csn)
+        index = self.index(space_name)
+        try:
+            applied = index.commit(txn, csn)
+        finally:
+            # The durable store may have completed before a derived-graph update refused. Its
+            # resident certificate still belongs to this pool and must remain paired with the
+            # local heap frames; the graph itself is retired and rebuilt on the next search.
+            self._require_registry()._bind_local_heap_view(index)
         self._maintained_at[space_name] = self._clock.monotonic()
         self._publish_space_metrics()
         return applied
@@ -1452,6 +1499,10 @@ class VectorEngine:
 
     # --- searching ------------------------------------------------------------------------------
 
+    def _refresh_heap_view(self, index_file: str, certificate: object) -> None:
+        """Attach resolver/scan heap frames to the vector index's durable generation."""
+        self._require_registry()._prepare_heap_view(index_file, certificate)
+
     def search(
         self,
         *,
@@ -1478,11 +1529,9 @@ class VectorEngine:
         _require_snapshot(snapshot)
         components = validate_query_components(definition, query)
         index = self.index(space)
-        # Both regimes enumerate their candidates from the index -- the exact one reads the heap
-        # to decide what each candidate IS, but it never learns about a row the index never
-        # received. So an index behind the heap omits rows in both regimes, and the refusal
-        # belongs here rather than only inside the traversal.
-        index.require_readable()
+        # ``live_count`` is itself generation-fenced. It either rebases a handle that observed a
+        # foreign rebuild or refuses while the durable index is unavailable, before regime
+        # selection can turn stale cardinality into either scan or traversal work.
         plan = plan_regime(
             space_size=index.live_count(),
             filter_cardinality=_filter_cardinality(candidate_filter),
@@ -1523,53 +1572,59 @@ class VectorEngine:
         before ANY distance has been computed and no partial ranking exists to hand back, which is
         what BR-1 requires and what a scan-and-score loop could not provide.
         """
-        started = self._reading()
-        admits = _guarded_admits(candidate_filter)
-        candidates: list[tuple[int, tuple[float, ...]]] = []
-        location: dict[int, RecordRef] = {}
-        scanned: set[int] = set()
-        for entry in index.walk():
-            # Two entries may name one heap location -- an entry filed under a key the row no
-            # longer carries sits beside the one that matches it, and the walk yields both. That
-            # is a divergence for the verifier to report, not a reason to read the same row
-            # twice: the traversal side dedupes by location because the graph holds one node per
-            # location, and the scan has to agree with it or the two regimes would disagree on a
-            # damaged index. The refusal below is for two DISTINCT locations showing one record,
-            # which is the MVCC violation it was written for.
-            encoded = entry.ref.encode()
-            if encoded in scanned:
-                continue
-            scanned.add(encoded)
-            version = self._heap.read(entry.ref)
-            if not snapshot.visible(version.xmin, version.xmax):
-                continue
-            if admits is not None and not admits(version.record_id):
-                continue
-            stored = self._vector_of_version(space, version, entry.ref)
-            require_space_identity(space, stored.space_ref, origin="stored vector")
-            if version.record_id in location:
-                raise _duplicate_version(
-                    space, version.record_id, entry.ref, location[version.record_id]
-                )
-            location[version.record_id] = entry.ref
-            candidates.append((version.record_id, stored.values))
-        self._observe_phase(REGIME_EXACT, PHASE_TRAVERSE, started)
-        started = self._reading()
-        ranked = (
-            self._math.top_k(query, candidates, k, space.metric) if candidates else []
-        )
-        retired = not space.is_active
-        hits = tuple(
-            VectorHit(
-                record_id=record_id,
-                score=score,
-                ref=location[record_id],
-                retired=retired,
+        read_lsn = index._require_exact_read_lsn(snapshot)
+
+        def scan(certificate: object) -> tuple[VectorHit, ...]:
+            """Scan heap candidates bound to one stable durable index generation."""
+            self._refresh_heap_view(index.file, certificate)
+            started = self._reading()
+            admits = _guarded_admits(candidate_filter)
+            candidates: list[tuple[int, tuple[float, ...]]] = []
+            location: dict[int, RecordRef] = {}
+            scanned: set[int] = set()
+            for entry in index.walk():
+                # Two entries may name one heap location -- an entry filed under a key the row no
+                # longer carries sits beside the one that matches it, and the walk yields both.
+                # The traversal side dedupes by location because the graph holds one node per
+                # location; the refusal below is for two DISTINCT locations showing one record.
+                encoded = entry.ref.encode()
+                if encoded in scanned:
+                    continue
+                scanned.add(encoded)
+                version = self._heap.read(entry.ref)
+                if not snapshot.visible(version.xmin, version.xmax):
+                    continue
+                if admits is not None and not admits(version.record_id):
+                    continue
+                stored = self._vector_of_version(space, version, entry.ref)
+                require_space_identity(space, stored.space_ref, origin="stored vector")
+                if version.record_id in location:
+                    raise _duplicate_version(
+                        space, version.record_id, entry.ref, location[version.record_id]
+                    )
+                location[version.record_id] = entry.ref
+                candidates.append((version.record_id, stored.values))
+            self._observe_phase(REGIME_EXACT, PHASE_TRAVERSE, started)
+            started = self._reading()
+            ranked = (
+                self._math.top_k(query, candidates, k, space.metric)
+                if candidates
+                else []
             )
-            for record_id, score in ranked
-        )
-        self._observe_phase(REGIME_EXACT, PHASE_VALIDATE, started)
-        return hits
+            retired = not space.is_active
+            hits = tuple(
+                VectorHit(
+                    record_id=record_id,
+                    score=score,
+                    ref=location[record_id],
+                    retired=retired,
+                )
+                for record_id, score in ranked
+            )
+            self._observe_phase(REGIME_EXACT, PHASE_VALIDATE, started)
+            return hits
+
+        return index._stable_view(read_lsn, scan)
 
     def _search_approximately(
         self,

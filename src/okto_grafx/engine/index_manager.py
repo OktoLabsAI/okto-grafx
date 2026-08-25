@@ -50,13 +50,15 @@ with a located error instead of hanging (amendment A42).
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from typing import TypeVar
 
 from okto_grafx.domain.errors import (
     GrafxCorruptionDetected,
     GrafxError,
     GrafxIndexError,
+    GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import (
     NO_CSN,
@@ -122,6 +124,7 @@ from okto_grafx.engine.metrics_catalog import metric
 __all__ = [
     "INDEX_DIRECTORY",
     "INDEX_FLAG_STALE",
+    "INDEX_READ_RETRY_BUDGET",
     "INDEX_METRICS",
     "RECONCILIATION_TOTAL",
     "TOMBSTONE_BACKLOG",
@@ -148,6 +151,9 @@ against the position the database has published, and that comparison needs a num
 not carry; remembering the verdict where the file can be reopened means the answer survives a
 restart that never asks the question again.
 """
+
+INDEX_READ_RETRY_BUDGET: int = 2
+"""Fresh exact-index views retried after a concurrent header transition before refusing."""
 
 TOMBSTONE_BACKLOG: str = "oktografx_vector_tombstone_backlog"
 RECONCILIATION_TOTAL: str = "oktografx_vector_reconciliation_total"
@@ -204,6 +210,26 @@ class _Staged:
     changes: list[IndexChange] = field(default_factory=list)
 
 
+@dataclass(frozen=True, slots=True)
+class _IndexReadCertificate:
+    """The durable page-0 state to which this process's bucket cache is attached."""
+
+    seq: int
+    header: IndexHeader
+
+
+@dataclass(frozen=True, slots=True)
+class _RebuildAuthority:
+    """The stale page-0 generation one RESET may replace, and no other."""
+
+    token: int
+    header_seq: int
+    through_lsn: Lsn
+
+
+_ReadResult = TypeVar("_ReadResult")
+
+
 class IndexStore:
     """The paged store both kinds of index are built on: a file of bucket chains.
 
@@ -234,8 +260,14 @@ class IndexStore:
         "_metrics",
         "_staged",
         "_stale_reason",
+        "_stale_device_seq",
         "_missing_targets",
         "_short_commit",
+        "_cache_certificate",
+        "_local_certificate",
+        "_rebuild_authority",
+        "_completed_rebuild_through",
+        "_replaying",
     )
 
     def __init__(
@@ -253,6 +285,12 @@ class IndexStore:
         self._metrics: MetricsSink = metrics
         self._staged: dict[int, _Staged] = {}
         self._stale_reason: str | None = None
+        # The durable generation that justified ``_stale_reason``.  ``None`` while a reason is
+        # present means the current handle was poisoned by process-local uncertainty (for
+        # example a partial recovery) and may not heal itself merely because page 0 looks
+        # healthy.  A concrete sequence may be released after a different, healthy generation
+        # is observed and all clean derived frames have been rebased to it.
+        self._stale_device_seq: int | None = None
         self._missing_targets: int = 0
         # The transaction whose part-applied commit is the ONLY reason this index is stale, or
         # None. It is what lets a retry of that same transaction lift the mark its own failure
@@ -260,6 +298,20 @@ class IndexStore:
         # commit succeeded" would let an unrelated transaction clear a refusal it knows nothing
         # about.
         self._short_commit: int | None = None
+        # None means the resident bucket frames have not been proved to belong to any current
+        # durable page-0 state. The first exact read establishes it by dropping clean frames.
+        self._cache_certificate: _IndexReadCertificate | None = None
+        # The last certificate THIS handle published. Unlike ``_cache_certificate`` it is never
+        # replaced by a foreign read rebase, so the manager can distinguish local dirty/current
+        # companion heap frames from a genuinely foreign generation.
+        self._local_certificate: _IndexReadCertificate | None = None
+        # Set only after RESET has re-proved the durable stale generation while holding the
+        # file's page-0 write section. It is the authority required to publish healthy again.
+        self._rebuild_authority: _RebuildAuthority | None = None
+        # Remembers an automatically completed local rebuild so its legacy follow-up
+        # ``clear_stale`` call cannot accidentally clear a newer foreign participant's mark.
+        self._completed_rebuild_through: Lsn | None = None
+        self._replaying: bool = False
         if metrics.enabled:
             for descriptor in INDEX_METRICS:
                 metrics.register(descriptor)
@@ -466,8 +518,21 @@ class IndexStore:
                 field="bucket_count",
                 value=header.bucket_count,
             )
-        if header.flags & INDEX_FLAG_STALE and self._stale_reason is None:
-            self._stale_reason = f"Index {definition.name!r} was recorded as stale and has not been rebuilt."
+        if header.flags & INDEX_FLAG_STALE:
+            # ``_read_header`` may have returned a resident page 0 from before another process
+            # completed a rebuild.  Bind the refusal to one detached durable generation, never
+            # to an unversioned process-local impression.  If that generation is already gone,
+            # return the fresh healthy header and let the read-view fence rebase bucket frames.
+            certificate = self._fresh_certificate()
+            header = certificate.header
+            if header.flags & INDEX_FLAG_STALE:
+                if self._stale_reason is None:
+                    self._stale_reason = (
+                        f"Index {definition.name!r} was recorded as stale and has not been rebuilt."
+                    )
+                    self._stale_device_seq = certificate.seq
+                elif self._stale_device_seq is not None:
+                    self._stale_device_seq = certificate.seq
         return header
 
     def _require_file_header(self, page: Page) -> FileHeader:
@@ -502,22 +567,211 @@ class IndexStore:
                 file=self.file,
             )
         with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
-            self._require_file_header(page)
-            if page.slot_count <= INDEX_HEADER_SLOT:
-                raise GrafxCorruptionDetected(
-                    f"The header page of {self.file!r} carries no index header.",
-                    file=self.file,
-                    page=HEADER_PAGE_INDEX,
-                    field="slot_count",
-                    value=page.slot_count,
-                )
-            return IndexHeader.decode(page.read_slot(INDEX_HEADER_SLOT))
+            return self._decode_header_page(page)
+
+    def _decode_header_page(self, page: Page) -> IndexHeader:
+        """Decode and identify an index header from a resident or detached page 0."""
+        self._require_file_header(page)
+        if page.slot_count <= INDEX_HEADER_SLOT:
+            raise GrafxCorruptionDetected(
+                f"The header page of {self.file!r} carries no index header.",
+                file=self.file,
+                page=HEADER_PAGE_INDEX,
+                field="slot_count",
+                value=page.slot_count,
+            )
+        header = IndexHeader.decode(page.read_slot(INDEX_HEADER_SLOT))
+        definition = self._definition
+        if header.digest != definition.digest():
+            raise GrafxIndexError(
+                f"The file {self.file!r} was written under a different definition of index "
+                f"{definition.name!r}.",
+                field="digest",
+                index=definition.name,
+                file=self.file,
+            )
+        if header.visibility is not definition.visibility:
+            raise GrafxIndexError(
+                f"The file {self.file!r} holds a {header.visibility.value} index and this "
+                f"definition declares a {definition.visibility.value} one.",
+                field="visibility",
+                index=definition.name,
+                file=self.file,
+            )
+        return header
+
+    def _fresh_certificate(self) -> _IndexReadCertificate:
+        """Collect one detached, checksum-verified certificate directly from the device."""
+        page = self._pool.read_fresh_page(self.file, HEADER_PAGE_INDEX)
+        return _IndexReadCertificate(seq=page.seq, header=self._decode_header_page(page))
+
+    def _remember_local_certificate(self) -> _IndexReadCertificate:
+        """Bind resident derived state to the page-0 image this handle just published.
+
+        This intentionally reads the resident clean frame rather than the device again. Another
+        participant may publish immediately after our flush; remembering that participant's
+        certificate would falsely bless our older heap/index cache as its generation. Remembering
+        our own image makes the next fresh read detect that race and take the rebase path.
+        """
+        with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
+            certificate = _IndexReadCertificate(
+                seq=page.seq, header=self._decode_header_page(page)
+            )
+        self._cache_certificate = certificate
+        self._local_certificate = certificate
+        return certificate
+
+    def _require_safe_certificate(
+        self, certificate: _IndexReadCertificate, required_lsn: Lsn
+    ) -> None:
+        """Refuse a durable state that cannot answer the requested snapshot completely."""
+        header = certificate.header
+        if header.flags & INDEX_FLAG_STALE:
+            raise GrafxIndexError(
+                f"Index {self.name!r} is durably unavailable while it is stale or rebuilding.",
+                field="index_view_unavailable",
+                index=self.name,
+                file=self.file,
+                seq=certificate.seq,
+                retryable=True,
+            )
+        if header.built_through_lsn < required_lsn:
+            raise GrafxIndexError(
+                f"Index {self.name!r} covers position {header.built_through_lsn}, before the "
+                f"snapshot at {required_lsn}; a lookup could omit a row.",
+                field="index_view_unavailable",
+                index=self.name,
+                file=self.file,
+                built_through_lsn=header.built_through_lsn,
+                required_lsn=required_lsn,
+                seq=certificate.seq,
+                retryable=True,
+            )
+
+    def _foreign_healthy_replaces_stale(
+        self, certificate: _IndexReadCertificate, required_lsn: Lsn
+    ) -> bool:
+        """Say whether a different healthy generation may release this handle's refusal.
+
+        A process-local poison has no durable sequence and is intentionally permanent for this
+        handle: page 0 cannot prove that its dirty or partially-applied frames are harmless.  A
+        refusal learned from a durable generation is different.  Once another generation is
+        healthy and covers the requested view, dropping every clean derived frame makes the
+        handle equivalent to a cold open and it may resume without a restart.
+        """
+        if self._stale_reason is None:
+            return False
+        stale_seq = self._stale_device_seq
+        if stale_seq is None:
+            self._require_readable()
+        if certificate.header.flags & INDEX_FLAG_STALE:
+            # Follow a foreign claimant while keeping the refusal retryable.  A later healthy
+            # sequence may release it; this one cannot.
+            if certificate.seq == stale_seq:
+                self._require_readable()
+            self._stale_device_seq = certificate.seq
+            self._require_safe_certificate(certificate, required_lsn)
+        if certificate.seq == stale_seq:
+            self._require_readable()
+        try:
+            self._require_safe_certificate(certificate, required_lsn)
+        except GrafxIndexError:
+            # The stale flag was cleared but coverage is not sufficient yet. Bind to that
+            # intermediate generation so a later page-0 advance can release the refusal.
+            self._stale_device_seq = certificate.seq
+            raise
+        return True
+
+    def _cache_rebased(self) -> None:
+        """Notify derived in-memory structures that their paged source was discarded."""
+
+    def begin_exact_read(self, required_lsn: Lsn) -> _IndexReadCertificate:
+        """Attach cached derived state to one fresh healthy durable certificate."""
+        certificate = self._fresh_certificate()
+        recovering = self._foreign_healthy_replaces_stale(certificate, required_lsn)
+        self._require_safe_certificate(certificate, required_lsn)
+        if certificate != self._cache_certificate or recovering:
+            # The mismatch includes first use. Pre/post equality alone cannot detect a rebuild
+            # that finished before this lookup while old bucket frames remained resident.
+            self._pool.discard_clean_file(self.file)
+            certificate = self._fresh_certificate()
+            recovering = self._foreign_healthy_replaces_stale(
+                certificate, required_lsn
+            )
+            self._require_safe_certificate(certificate, required_lsn)
+            if recovering:
+                self._stale_reason = None
+                self._stale_device_seq = None
+                self._rebuild_authority = None
+            self._cache_certificate = certificate
+            self._cache_rebased()
+        return certificate
+
+    def finish_exact_read(
+        self, before: _IndexReadCertificate, required_lsn: Lsn
+    ) -> bool:
+        """Say whether traversal+heap validation stayed inside one durable index view."""
+        after = self._fresh_certificate()
+        if after == before:
+            self._require_safe_certificate(after, required_lsn)
+            return True
+        # Do not carry any frame from the losing attempt into its retry. The discard is
+        # zero-write and refuses dirty/pinned uncertainty rather than writing stale state back.
+        self._cache_certificate = None
+        self._pool.discard_clean_file(self.file)
+        self._cache_rebased()
+        return False
 
     def _write_header(self, header: IndexHeader) -> None:
         """Replace the index header stored in slot 1 of the reserved header page."""
         with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
             self._require_file_header(page)
             page.update_slot(INDEX_HEADER_SLOT, header.encode())
+
+    def _publish_header_transition(
+        self,
+        transition: Callable[[IndexHeader], IndexHeader],
+        *,
+        force_write: bool = False,
+    ) -> IndexHeader:
+        """Fresh-read/CAS one dangerous page-0 transition with bounded conflict retry."""
+        for attempt in range(INDEX_READ_RETRY_BUDGET + 1):
+            self._pool.discard_clean_page(self.file, HEADER_PAGE_INDEX)
+            current = self._read_header()
+            updated = transition(current)
+            if (updated is current or updated == current) and not force_write:
+                return current
+            self._write_header(updated)
+            try:
+                self._pool.write_back(self.file, HEADER_PAGE_INDEX)
+            except BaseException as failure:
+                # The attempted image is never a safe cache base after an unconfirmed publish.
+                # This includes the device-completed-then-raised case: a retry must re-read the
+                # device to discover which side won, rather than carrying dirty bytes forward.
+                try:
+                    self._pool.discard(self.file, HEADER_PAGE_INDEX)
+                except BaseException as cleanup_failure:  # pragma: no cover - defensive note
+                    failure.add_note(
+                        "Discarding the unconfirmed page-0 attempt also failed: "
+                        f"{cleanup_failure!r}"
+                    )
+                if (
+                    not isinstance(failure, GrafxUnsupportedOperation)
+                    or
+                    failure.details.get("field") != "page_sequence_conflict"
+                    or attempt >= INDEX_READ_RETRY_BUDGET
+                ):
+                    raise
+                continue
+            self._cache_certificate = None
+            return updated
+        raise AssertionError("bounded header transition loop did not return or raise")
+
+    def _touch_header(self) -> None:
+        """Make the current header the final dirty certificate for a bucket publication."""
+        current = self._read_header()
+        self._write_header(current)
+        self._cache_certificate = None
 
     @property
     def header(self) -> IndexHeader:
@@ -550,15 +804,18 @@ class IndexStore:
                 value=repr(reason),
                 index=self.name,
             )
+        self._completed_rebuild_through = None
         self._stale_reason = reason
         if not persist:
             # A failed recovery may have changed an unknown prefix and must poison the current
             # handle without turning an otherwise non-mutating refusal into another device
             # write. The retained WAL lets the next open retry and derive a durable verdict.
+            self._stale_device_seq = None
             return
-        header = self._read_header()
-        if not header.flags & INDEX_FLAG_STALE:
-            self._write_header(_with_flags(header, header.flags | INDEX_FLAG_STALE))
+        self._publish_header_transition(
+            lambda header: _with_flags(header, header.flags | INDEX_FLAG_STALE)
+        )
+        self._stale_device_seq = self._fresh_certificate().seq
         # This is the SECOND write this component makes that no log record covers, and it is the
         # one whose loss is a wrong answer rather than wasted work. Nothing in the log says "this
         # index is behind the heap": the verdict is DERIVED, by comparing the position the file
@@ -574,8 +831,36 @@ class IndexStore:
         # cache but not on the device is exactly what a refused flush leaves behind, and skipping
         # the retry would make the second call weaker than the first. It is a flush and NOT a
         # barrier, for the reason section 8.5 step 6 gives -- what this owes is that every other
-        # process, and this one after a restart, READS the refusal.
-        self._pool.flush(self.file)
+        # process, and this one after a restart, READS the refusal. The transition helper
+        # publishes page 0 before releasing its cross-process section.
+
+    def _claim_rebuild(self, reason: str) -> int:
+        """Publish a unique stale generation and return its page-0 sequence token."""
+        if not isinstance(reason, str) or not reason:
+            raise GrafxIndexError(
+                "Claiming an index rebuild needs a reason a reader can act on.",
+                field="reason",
+                value=repr(reason),
+                index=self.name,
+            )
+        self._completed_rebuild_through = None
+        self._stale_reason = reason
+        self._publish_header_transition(
+            lambda header: _with_flags(header, header.flags | INDEX_FLAG_STALE),
+            force_write=True,
+        )
+        certificate = self._fresh_certificate()
+        if not certificate.header.flags & INDEX_FLAG_STALE:
+            raise GrafxIndexError(
+                f"Index {self.name!r} did not retain the stale mark that claimed its rebuild.",
+                field="rebuild_authority",
+                index=self.name,
+                file=self.file,
+                seq=certificate.seq,
+                retryable=True,
+            )
+        self._stale_device_seq = certificate.seq
+        return certificate.seq
 
     def _mark_stale_after_failure(self, reason: str) -> None:
         """Mark this index stale after an operation left it part-applied, without masking why.
@@ -597,28 +882,26 @@ class IndexStore:
         try:
             self.mark_stale(reason)
         except GrafxError:
+            self._completed_rebuild_through = None
             self._stale_reason = reason
+            self._stale_device_seq = None
 
-    def _lift_short_commit_mark(self) -> None:
+    def _lift_short_commit_mark(self, built_through: Lsn) -> None:
         """Take back the mark a part-applied commit set, once its retry has completed.
 
-        Narrower than :meth:`clear_stale` in every way, and deliberately so. It moves no
-        position -- the caller's own ``_advance`` does that, under the ordinary rule -- and it
-        runs only when the transaction that set the mark is the transaction that just finished
-        applying every one of its changes. A retry that converges is the only evidence a short
-        index can offer that it is whole again, and refusing to read that evidence would send
-        every transient budget refusal to a full rebuild of a structure that is already correct.
+        It runs only after the transaction that set the mark has finished every change AND its
+        bucket pages have reached the device. The clear and build advance then publish together
+        as page 0's final certificate; clearing earlier would expose a healthy old header while
+        the repaired buckets were still process-local.
         """
         self._short_commit = None
+        self._publish_header_transition(
+            lambda header: _with_flags(
+                header, header.flags & ~INDEX_FLAG_STALE
+            ).advanced_to(built_through)
+        )
         self._stale_reason = None
-        header = self._read_header()
-        if header.flags & INDEX_FLAG_STALE:
-            self._write_header(_with_flags(header, header.flags & ~INDEX_FLAG_STALE))
-            # The mark was flushed when it was set, so taking it back has to reach the device
-            # too. Leaving the bit on the platter while this process believes it cleared would be
-            # the durability defect of mark_stale in the mirror: every OTHER participant, and
-            # this one after a restart, would go on refusing an index that is whole.
-            self._pool.flush(self.file)
+        self._stale_device_seq = None
 
     def check_freshness(
         self,
@@ -649,10 +932,14 @@ class IndexStore:
                 value=published_lsn,
                 index=self.name,
             )
-        header = self._read_header()
+        certificate = self._fresh_certificate()
+        header = certificate.header
         if header.flags & INDEX_FLAG_STALE:
             if self._stale_reason is None:
                 self._stale_reason = f"Index {self.name!r} was recorded as stale and has not been rebuilt."
+                self._stale_device_seq = certificate.seq
+            elif self._stale_device_seq is not None:
+                self._stale_device_seq = certificate.seq
             return True
         if header.built_through_lsn < published_lsn:
             reason = (
@@ -666,6 +953,7 @@ class IndexStore:
                 # A read-only open still refuses the unsafe access path, but records that verdict
                 # only in this participant. Persisting it would make inspection modify the DB.
                 self._stale_reason = reason
+                self._stale_device_seq = certificate.seq
             return True
         if header.built_through_lsn > published_lsn and not allow_ahead:
             reason = (
@@ -677,7 +965,26 @@ class IndexStore:
                 self.mark_stale(reason)
             else:
                 self._stale_reason = reason
+                self._stale_device_seq = certificate.seq
             return True
+        if self._stale_reason is None:
+            return False
+        stale_seq = self._stale_device_seq
+        if stale_seq is None or certificate.seq == stale_seq:
+            return True
+        # A different durable generation is now healthy and agrees with this published view.
+        # Rebase before lifting the in-memory refusal; a sticky bucket frame from the stale
+        # generation would otherwise make a recovered handle less safe than a cold one.
+        self._pool.discard_clean_file(self.file)
+        after = self._fresh_certificate()
+        if after != certificate:
+            self._stale_device_seq = after.seq
+            return True
+        self._cache_certificate = after
+        self._stale_reason = None
+        self._stale_device_seq = None
+        self._rebuild_authority = None
+        self._cache_rebased()
         return False
 
     def _require_readable(self) -> None:
@@ -755,17 +1062,52 @@ class IndexStore:
             ),
         )
 
-    def stage_reset(self, txn: StagingTransaction, built_through: Lsn) -> WalRecord:
-        """Stage the clearing of every bucket, which is how a rebuild starts."""
+    def stage_reset(
+        self,
+        txn: StagingTransaction,
+        built_through: Lsn,
+        *,
+        rebuild_token: int = 0,
+    ) -> WalRecord:
+        """Stage a bucket reset bound to the durable stale generation that authorised it."""
+        certificate = self._require_durable_stale_for_reset()
+        if rebuild_token and certificate.seq != rebuild_token:
+            raise GrafxIndexError(
+                f"Index {self.name!r} changed after rebuild generation {rebuild_token} was "
+                f"claimed; the durable generation is now {certificate.seq}.",
+                field="rebuild_superseded",
+                index=self.name,
+                file=self.file,
+                rebuild_token=rebuild_token,
+                device_seq=certificate.seq,
+                retryable=True,
+            )
+        token = certificate.seq if rebuild_token == 0 else rebuild_token
         return self._stage(
             txn,
             IndexChange(
                 index=self.name,
                 operation=IndexOperation.RESET,
+                ref=RecordRef(token, 0),
                 csn=self._require_csn("built_through", built_through),
                 versioned=self._definition.versioned,
             ),
         )
+
+    def _require_durable_stale_for_reset(self) -> _IndexReadCertificate:
+        """Prove from the device that RESET cannot make a healthy index temporarily short."""
+        certificate = self._fresh_certificate()
+        if not certificate.header.flags & INDEX_FLAG_STALE:
+            raise GrafxIndexError(
+                f"Index {self.name!r} is durably healthy; RESET is permitted only after a "
+                "stale mark has reached page 0.",
+                field="reset_requires_stale",
+                index=self.name,
+                file=self.file,
+                seq=certificate.seq,
+                retryable=True,
+            )
+        return certificate
 
     def _stage(self, txn: StagingTransaction, change: IndexChange) -> WalRecord:
         """Put a change in this transaction's staging area and hand its record to the log."""
@@ -842,11 +1184,56 @@ class IndexStore:
         staged = self._staged.get(txn_id)
         if staged is None:
             return 0
+        resets = [
+            change
+            for change in staged.changes
+            if change.operation is IndexOperation.RESET
+        ]
+        if len(resets) > 1:
+            raise GrafxIndexError(
+                f"Transaction {txn_id} staged {len(resets)} resets for index {self.name!r}; "
+                "one rebuild has exactly one generation authority.",
+                field="reset_count",
+                index=self.name,
+                txn_id=txn_id,
+                value=len(resets),
+            )
+        reset = resets[0] if resets else None
+        if reset is None:
+            applied = self._commit_staged(txn_id, staged, stamp, reset=None)
+            self._remember_local_certificate()
+            return applied
+        # The same cross-process section that serialises page-0 CAS covers the dangerous
+        # interval from RESET's generation proof through bucket publication and the final
+        # healthy certificate. Readers remain optimistic and never acquire it.
+        with self._pool.page_write_fence(self.file, HEADER_PAGE_INDEX):
+            applied = self._commit_staged(txn_id, staged, stamp, reset=reset)
+            self._remember_local_certificate()
+            return applied
+
+    def _commit_staged(
+        self,
+        txn_id: int,
+        staged: _Staged,
+        stamp: Csn,
+        *,
+        reset: IndexChange | None,
+    ) -> int:
+        """Apply one staged batch; a RESET caller already holds the whole-file fence."""
         applied = 0
+        moved_any = False
         for change in staged.changes:
             try:
-                self._apply_change(change, stamp)
+                moved_any = self._apply_change(change, stamp) or moved_any
             except GrafxError as failure:
+                if applied == 0 and failure.details.get("field") in {
+                    "rebuild_superseded",
+                    "reset_requires_stale",
+                }:
+                    # A generation proof refused before the first bucket moved. The durable
+                    # header already belongs to the winning rebuild; poisoning it would turn a
+                    # clean arbitration result into needless global unavailability.
+                    raise
                 if self._stale_reason is None:
                     # Only a commit that found the index HEALTHY may claim to be the reason it is
                     # stale, because only then is a completed retry proof that nothing else is
@@ -861,9 +1248,24 @@ class IndexStore:
                 raise
             applied += 1
         self._staged.pop(txn_id, None)
-        if self._short_commit == txn_id:
-            self._lift_short_commit_mark()
-        self._advance(stamp)
+        if reset is not None:
+            self._complete_rebuild(reset.csn)
+        elif self._short_commit == txn_id:
+            # Keep the durable refusal in place while the repaired buckets are published, then
+            # clear+advance page 0 as the final certificate.
+            self._pool.flush(self.file)
+            self._lift_short_commit_mark(stamp)
+        else:
+            self._advance(stamp)
+            if moved_any:
+                # Even when the payload position was already at ``stamp``, changed buckets need
+                # a new durable clock. Touching page 0 after them puts it at the LRU tail so the
+                # existing flush boundary publishes the certificate last.
+                self._touch_header()
+            # The exact read fence certifies the durable header, not this process's dirty frame.
+            # Publish bucket changes before page 0 (the _advance read moved it to the LRU tail)
+            # so a fresh certificate never advertises a position whose entries are process-local.
+            self._pool.flush(self.file)
         if self._metrics.enabled and self._definition.versioned:
             self._metrics.set_gauge(TOMBSTONE_BACKLOG, float(self._tombstone_backlog()))
         return applied
@@ -890,6 +1292,7 @@ class IndexStore:
         # re-advances it -- and flushing per record would turn a replay into one device write per
         # record for a number redo reconstructs for free (see the note on apply()).
         self._pool.flush(self.file)
+        self._remember_local_certificate()
 
     def clear_stale(self, built_through: Lsn) -> None:
         """Declare this index rebuilt through a position, so it may answer lookups again.
@@ -901,10 +1304,69 @@ class IndexStore:
         stale again. The repair would not stick, and nothing would say why.
         """
         position = _require_position("built_through", built_through)
-        self._stale_reason = None
-        header = self._read_header()
-        cleared = _with_flags(header, header.flags & ~INDEX_FLAG_STALE)
-        self._write_header(cleared.advanced_to(position))
+        with self._pool.page_write_fence(self.file, HEADER_PAGE_INDEX):
+            certificate = self._fresh_certificate()
+            if not certificate.header.flags & INDEX_FLAG_STALE:
+                if certificate.header.built_through_lsn < position:
+                    raise GrafxIndexError(
+                        f"Index {self.name!r} is healthy only through "
+                        f"{certificate.header.built_through_lsn}; clearing it through {position} "
+                        "without a stale rebuild would invent coverage.",
+                        field="rebuild_authority",
+                        index=self.name,
+                        file=self.file,
+                        built_through_lsn=certificate.header.built_through_lsn,
+                        required_lsn=position,
+                        retryable=True,
+                    )
+                if self._rebuild_authority is not None:
+                    self._completed_rebuild_through = position
+                self._rebuild_authority = None
+                self._stale_reason = None
+                self._stale_device_seq = None
+                self._cache_certificate = certificate
+                return
+            if (
+                self._rebuild_authority is None
+                and self._completed_rebuild_through is not None
+            ):
+                raise GrafxIndexError(
+                    f"Index {self.name!r} acquired a new stale generation after this handle "
+                    "completed its rebuild; a late clear cannot consume another participant's "
+                    "mark.",
+                    field="rebuild_superseded",
+                    index=self.name,
+                    file=self.file,
+                    completed_through=self._completed_rebuild_through,
+                    device_seq=certificate.seq,
+                    retryable=True,
+                )
+            if self._rebuild_authority is not None:
+                self._complete_rebuild(position)
+                return
+            # Backward-compatible operator/recovery door. With no RESET authority this is an
+            # explicit assertion that repair happened outside this store. Holding the page-0
+            # section and flushing first still prevents it from interleaving with a rebuild.
+            self._pool.flush(self.file)
+            before_clear = self._fresh_certificate()
+            if before_clear != certificate:
+                raise GrafxIndexError(
+                    f"Index {self.name!r} changed while its manual stale clear was prepared.",
+                    field="rebuild_superseded",
+                    index=self.name,
+                    file=self.file,
+                    expected_seq=certificate.seq,
+                    device_seq=before_clear.seq,
+                    retryable=True,
+                )
+            self._publish_header_transition(
+                lambda header: _with_flags(
+                    header, header.flags & ~INDEX_FLAG_STALE
+                ).advanced_to(position)
+            )
+            self._stale_reason = None
+            self._stale_device_seq = None
+            self._remember_local_certificate()
         # Clearing the mark is unlogged for the same reason setting it is, and it errs the other
         # way: a repair that never reached the device leaves the file still saying stale, so the
         # next open rebuilds an index that was already rebuilt. Wasted work, never a wrong
@@ -912,7 +1374,91 @@ class IndexStore:
         # a cached clear can undo would mean an index this process believes repaired and every
         # other process still refuses, and two participants disagreeing about whether an index
         # may answer is worse than either verdict.
+        # The transition helper makes the clear durable before this process lifts its refusal.
+
+    def _complete_rebuild(self, built_through: Lsn) -> None:
+        """Publish rebuilt buckets, then consume exactly their stale-generation authority."""
+        position = _require_position("built_through", built_through)
+        authority = self._rebuild_authority
+        if authority is None or authority.through_lsn != position:
+            raise GrafxIndexError(
+                f"Index {self.name!r} has no matching RESET authority through {position}.",
+                field="rebuild_authority",
+                index=self.name,
+                file=self.file,
+                required_lsn=position,
+                authority_lsn=None if authority is None else authority.through_lsn,
+                retryable=True,
+            )
+        before_flush = self._fresh_certificate()
+        if (
+            not before_flush.header.flags & INDEX_FLAG_STALE
+            or before_flush.seq != authority.header_seq
+        ):
+            for file, page_index in self._pool.modified_pages(self.file):
+                if file == self.file:
+                    self._pool.discard(file, page_index)
+            self._rebuild_authority = None
+            raise GrafxIndexError(
+                f"Index {self.name!r} rebuild generation {authority.header_seq} was superseded "
+                f"by durable generation {before_flush.seq} before bucket publication.",
+                field="rebuild_superseded",
+                index=self.name,
+                file=self.file,
+                rebuild_token=authority.token,
+                expected_seq=authority.header_seq,
+                device_seq=before_flush.seq,
+                retryable=True,
+            )
+        # Bucket pages reach the device while the stale refusal remains durable. Page 0 is clean
+        # here, so it cannot be emitted before them by this flush.
         self._pool.flush(self.file)
+        after_flush = self._fresh_certificate()
+        if after_flush != before_flush:
+            self._rebuild_authority = None
+            raise GrafxIndexError(
+                f"Index {self.name!r} changed while rebuilt buckets were being published.",
+                field="rebuild_superseded",
+                index=self.name,
+                file=self.file,
+                expected_seq=before_flush.seq,
+                device_seq=after_flush.seq,
+                retryable=True,
+            )
+        try:
+            self._publish_header_transition(
+                lambda header: _with_flags(
+                    header, header.flags & ~INDEX_FLAG_STALE
+                ).advanced_to(position)
+            )
+        except BaseException as failure:
+            # A device is allowed to complete a write and then report interruption. Preserve
+            # that original evidence, but do not retain an authority that durable page 0 has
+            # already consumed: it would suppress the header clock on later same-LSN repairs.
+            try:
+                completed = self._fresh_certificate()
+            except BaseException as observation_failure:  # pragma: no cover - diagnostic only
+                failure.add_note(
+                    "Observing page 0 after the final rebuild publication also failed: "
+                    f"{observation_failure!r}"
+                )
+            else:
+                if (
+                    not completed.header.flags & INDEX_FLAG_STALE
+                    and completed.header.built_through_lsn >= position
+                ):
+                    self._rebuild_authority = None
+                    self._completed_rebuild_through = position
+                    self._stale_reason = None
+                    self._stale_device_seq = None
+                    self._cache_certificate = completed
+                    self._local_certificate = completed
+            raise
+        self._rebuild_authority = None
+        self._completed_rebuild_through = position
+        self._stale_reason = None
+        self._stale_device_seq = None
+        self._remember_local_certificate()
 
     def _advance(self, lsn: Lsn) -> None:
         """Raise the position this index claims to cover, unless it is known to be stale."""
@@ -970,22 +1516,187 @@ class IndexStore:
                 operation=change.operation.name,
             )
         position = lsn_of(record)
+        fenced = change.operation is IndexOperation.RESET or self._rebuild_authority is not None
         try:
-            self._apply_change(change, position)
-            self._advance(position)
-            if change.operation is IndexOperation.REMOVE:
-                # A reconciliation record carries both the erasure and the horizon that made it
-                # legal. Restoring only the erasure makes verification report a cleanly
-                # reclaimed entry as missing after a crash.
-                self._record_reconciled(change.csn)
+            if fenced:
+                # A replay API offers one logical record at a time, so it cannot retain a lock
+                # across calls.  Instead every rebuild record is a small complete-or-refuse
+                # publication: validate the generation, mutate, and flush while holding the same
+                # cross-process section. No stale dirty frame may survive the section boundary.
+                with self._pool.page_write_fence(self.file, HEADER_PAGE_INDEX):
+                    if change.operation is not IndexOperation.RESET:
+                        self._require_active_replay_generation()
+                    self._apply_replay_change(change, position)
+                    self._publish_active_replay_prefix()
+            else:
+                self._apply_replay_change(change, position)
         except GrafxError as failure:
-            self._mark_stale_after_failure(
-                f"Replaying log position {position} into index {self.name!r} failed, so the "
-                f"current handle cannot prove the index complete: {failure.message}"
-            )
+            if fenced:
+                self._discard_replay_frames(failure)
+            if failure.details.get("field") not in {
+                "rebuild_superseded",
+                "reset_requires_stale",
+            }:
+                self._mark_stale_after_failure(
+                    f"Replaying log position {position} into index {self.name!r} failed, so the "
+                    f"current handle cannot prove the index complete: {failure.message}"
+                )
+            raise
+        except BaseException as failure:
+            if fenced:
+                self._discard_replay_frames(failure)
             raise
 
+    def _apply_replay_change(self, change: IndexChange, position: Lsn) -> None:
+        """Apply one already-validated logical record without choosing its outer fence."""
+        self._replaying = True
+        try:
+            moved = self._apply_change(change, position)
+        finally:
+            self._replaying = False
+        self._advance(position)
+        if change.operation is IndexOperation.REMOVE:
+            # A reconciliation record carries both the erasure and the horizon that made it
+            # legal. Restoring only the erasure makes verification report a cleanly reclaimed
+            # entry as missing after a crash.
+            self._record_reconciled(change.csn)
+        if moved and self._rebuild_authority is None:
+            # Logical redo may repair a missing bucket at an LSN the header already covers. The
+            # payload then stays byte-identical, but the durable view did not: make page 0 the
+            # final dirty clock at the caller's existing recovery flush boundary.
+            self._touch_header()
+
+    def _require_active_replay_generation(self) -> None:
+        """Refuse a replay prefix whose RESET generation another participant superseded."""
+        authority = self._rebuild_authority
+        if authority is None:
+            return
+        certificate = self._fresh_certificate()
+        if (
+            certificate.header.flags & INDEX_FLAG_STALE
+            and certificate.seq == authority.header_seq
+        ):
+            return
+        failure = GrafxIndexError(
+            f"Index {self.name!r} rebuild generation {authority.header_seq} was superseded by "
+            f"durable generation {certificate.seq} before replay completed.",
+            field="rebuild_superseded",
+            index=self.name,
+            file=self.file,
+            rebuild_token=authority.token,
+            expected_seq=authority.header_seq,
+            device_seq=certificate.seq,
+            retryable=True,
+        )
+        self._rebuild_authority = None
+        self._discard_replay_frames(failure)
+        raise failure
+
+    def _publish_active_replay_prefix(self) -> None:
+        """Flush one rebuild prefix while stale and rebind authority to any own header write."""
+        authority = self._rebuild_authority
+        if authority is None:
+            return
+        self._pool.flush(self.file)
+        certificate = self._fresh_certificate()
+        if not certificate.header.flags & INDEX_FLAG_STALE:
+            raise GrafxIndexError(
+                f"Index {self.name!r} became healthy before its replay prefix completed.",
+                field="rebuild_superseded",
+                index=self.name,
+                file=self.file,
+                expected_seq=authority.header_seq,
+                device_seq=certificate.seq,
+                retryable=True,
+            )
+        self._rebuild_authority = replace(authority, header_seq=certificate.seq)
+        self._stale_device_seq = certificate.seq
+
+    def _discard_replay_frames(self, failure: BaseException) -> None:
+        """Drop every local frame a refused rebuild replay could otherwise write later."""
+        for file, page_index in self._pool.modified_pages(self.file):
+            if file != self.file:
+                continue
+            try:
+                self._pool.discard(file, page_index)
+            except BaseException as cleanup_failure:  # pragma: no cover - diagnostic only
+                failure.add_note(
+                    f"Discarding replay frame {file!r}:{page_index} also failed: "
+                    f"{cleanup_failure!r}"
+                )
+        try:
+            self._pool.discard_clean_file(self.file)
+        except BaseException as cleanup_failure:  # pragma: no cover - diagnostic only
+            failure.add_note(
+                "Discarding clean replay frames after refusal also failed: "
+                f"{cleanup_failure!r}"
+            )
+
     # --- reading ----------------------------------------------------------------------------
+
+    def _require_exact_read_lsn(self, snapshot: object) -> Lsn:
+        """Return the durable position an authoritative public lookup must prove."""
+        if not isinstance(snapshot, SnapshotLike):
+            raise GrafxIndexError(
+                f"A lookup needs a snapshot; got {type(snapshot).__name__}.",
+                field="snapshot",
+                value=type(snapshot).__name__,
+                index=self.name,
+            )
+        read_lsn = getattr(snapshot, "read_lsn", None)
+        if (
+            isinstance(read_lsn, bool)
+            or not isinstance(read_lsn, int)
+            or not NO_LSN <= read_lsn < PROVISIONAL_CSN
+        ):
+            raise GrafxIndexError(
+                "An index lookup needs an integer snapshot.read_lsn so freshness can be "
+                "proved against the durable build position.",
+                field="snapshot.read_lsn",
+                value=repr(read_lsn),
+                index=self.name,
+            )
+        return read_lsn
+
+    def _stable_view(
+        self,
+        required_lsn: Lsn,
+        operation: Callable[[_IndexReadCertificate], _ReadResult],
+    ) -> _ReadResult:
+        """Run one materialising read wholly inside a durable page-0 generation."""
+        for attempt in range(INDEX_READ_RETRY_BUDGET + 1):
+            try:
+                certificate = self.begin_exact_read(required_lsn)
+            except GrafxIndexError as failure:
+                if (
+                    failure.details.get("field") == "index_view_unavailable"
+                    and attempt < INDEX_READ_RETRY_BUDGET
+                ):
+                    continue
+                raise
+            result = operation(certificate)
+            if self.finish_exact_read(certificate, required_lsn):
+                return result
+        raise GrafxIndexError(
+            f"Index {self.name!r} changed during every durable read attempt.",
+            field="index_view_changed",
+            index=self.name,
+            file=self.file,
+            attempts=INDEX_READ_RETRY_BUDGET + 1,
+            retryable=True,
+        )
+
+    def _stable_candidates(
+        self, wanted: bytes, required_lsn: Lsn
+    ) -> tuple[IndexEntry, ...]:
+        """Return candidates traversed wholly inside one durable index view."""
+        return self._stable_view(
+            required_lsn, lambda _certificate: self._candidates_unchecked(wanted)
+        )
+
+    def _stable_entries(self, required_lsn: Lsn) -> tuple[IndexEntry, ...]:
+        """Return the complete stored entry set from one durable index view."""
+        return self._stable_view(required_lsn, lambda _certificate: self.walk())
 
     def candidates(self, key: bytes) -> tuple[IndexEntry, ...]:
         """Return every stored entry under this key, in the order the bucket holds them.
@@ -995,6 +1706,10 @@ class IndexStore:
         """
         self._require_readable()
         wanted = self._require_key(key)
+        return self._candidates_unchecked(wanted)
+
+    def _candidates_unchecked(self, wanted: bytes) -> tuple[IndexEntry, ...]:
+        """Walk one already-validated key; the manager surrounds this with its view fence."""
         found: list[IndexEntry] = []
         for page_index in self._bucket_pages(
             bucket_of(wanted, self._definition.bucket_count)
@@ -1135,7 +1850,7 @@ class IndexStore:
     def _apply_change(self, change: IndexChange, lsn: Lsn) -> bool:
         """Apply one change to the pages and say whether anything moved."""
         if change.operation is IndexOperation.RESET:
-            return self._reset(lsn)
+            return self._reset(change, lsn)
         bucket = bucket_of(change.key, self._definition.bucket_count)
         pages = self._bucket_pages(bucket)
         located = self._find_entry(pages, change.key, change.ref)
@@ -1175,8 +1890,47 @@ class IndexStore:
             return self._rewrite(page_index, slot, entry.ended_at(change.csn), lsn)
         return self._erase(page_index, slot, lsn)
 
-    def _reset(self, lsn: Lsn) -> bool:
+    def _reset(self, change: IndexChange, lsn: Lsn) -> bool:
         """Clear every entry of every bucket, keeping the pages and the chains they form."""
+        # Re-check immediately before the first bucket mutation. The RESET record's ref.page is
+        # the exact stale generation claimed at staging; a later claimant supersedes it.
+        certificate = self._fresh_certificate()
+        if not certificate.header.flags & INDEX_FLAG_STALE:
+            if self._replaying and certificate.header.built_through_lsn >= change.csn:
+                # A retained WAL may replay after this rebuild (or a later one) was already
+                # published healthy. Re-clearing now would erase subsequent entries; the
+                # following logical inserts/tombstones remain idempotent repair operations.
+                self._rebuild_authority = None
+                return False
+            raise GrafxIndexError(
+                f"Index {self.name!r} is durably healthy only through "
+                f"{certificate.header.built_through_lsn}; RESET through {change.csn} needs a "
+                "durable stale authority.",
+                field=("rebuild_superseded" if change.ref.page else "reset_requires_stale"),
+                index=self.name,
+                file=self.file,
+                seq=certificate.seq,
+                retryable=True,
+            )
+        token = change.ref.page
+        if token and certificate.seq != token:
+            raise GrafxIndexError(
+                f"Index {self.name!r} rebuild generation {token} was superseded by durable "
+                f"generation {certificate.seq}.",
+                field="rebuild_superseded",
+                index=self.name,
+                file=self.file,
+                rebuild_token=token,
+                device_seq=certificate.seq,
+                retryable=True,
+            )
+        self._completed_rebuild_through = None
+        self._rebuild_authority = _RebuildAuthority(
+            token=token,
+            header_seq=certificate.seq,
+            through_lsn=change.csn,
+        )
+        self._stale_device_seq = certificate.seq
         for bucket in range(self._definition.bucket_count):
             for page_index in self._bucket_pages(bucket):
                 with self._pool.pinned(self.file, page_index) as page:
@@ -1469,14 +2223,21 @@ class HashIndex(IndexStore):
         after the snapshot opened. Validating each hit against the heap under the caller's own
         snapshot is mandatory, and :meth:`IndexManager.lookup` is where that happens.
         """
-        if not isinstance(snapshot, SnapshotLike):
-            raise GrafxIndexError(
-                f"A lookup needs a snapshot; got {type(snapshot).__name__}.",
-                field="snapshot",
-                value=type(snapshot).__name__,
-                index=self.name,
-            )
-        return tuple(entry.ref for entry in self.candidates(key))
+        read_lsn = self._require_exact_read_lsn(snapshot)
+        wanted = self._require_key(key)
+        return tuple(
+            entry.ref for entry in self._stable_candidates(wanted, read_lsn)
+        )
+
+    def candidates(self, key: bytes) -> tuple[IndexEntry, ...]:
+        """Return a stable candidate superset at the index's current durable frontier.
+
+        This lower-level door has no caller snapshot and therefore cannot promise coverage of a
+        later position. It does prove that the returned bucket traversal belongs to one healthy
+        durable certificate; callers needing a snapshot answer use :meth:`lookup` or the manager.
+        """
+        wanted = self._require_key(key)
+        return self._stable_candidates(wanted, NO_LSN)
 
 
 class ProximityIndex(IndexStore):
@@ -1514,11 +2275,18 @@ class ProximityIndex(IndexStore):
 
     def lookup(self, key: bytes, snapshot: SnapshotLike) -> tuple[RecordRef, ...]:
         """Return exactly the heap locations this snapshot may see under this key."""
+        read_lsn = self._require_exact_read_lsn(snapshot)
+        wanted = self._require_key(key)
         return tuple(
             entry.ref
-            for entry in self.candidates(key)
+            for entry in self._stable_candidates(wanted, read_lsn)
             if entry_visible(entry, snapshot)
         )
+
+    def candidates(self, key: bytes) -> tuple[IndexEntry, ...]:
+        """Return candidates from one healthy durable generation at its current frontier."""
+        wanted = self._require_key(key)
+        return self._stable_candidates(wanted, NO_LSN)
 
     def visible_entries(self, snapshot: SnapshotLike) -> tuple[IndexEntry, ...]:
         """Return every entry of the whole index this snapshot may see.
@@ -1527,8 +2295,12 @@ class ProximityIndex(IndexStore):
         navigator the same visibility answer the keyed lookup gives, so a graph built on top of
         this store never has to re-derive the rule -- and never has to consult the heap.
         """
-        self._require_readable()
-        return tuple(entry for entry in self.walk() if entry_visible(entry, snapshot))
+        read_lsn = self._require_exact_read_lsn(snapshot)
+        return tuple(
+            entry
+            for entry in self._stable_entries(read_lsn)
+            if entry_visible(entry, snapshot)
+        )
 
 
 def _tables_written_by(txn: object) -> frozenset[int] | None:
@@ -1674,7 +2446,14 @@ class IndexManager:
     exact lookup must not skip, and the comparison against the heap that ``verify`` reports.
     """
 
-    __slots__ = ("_pool", "_heap", "_metrics", "_indexes", "_published_lsn")
+    __slots__ = (
+        "_pool",
+        "_heap",
+        "_metrics",
+        "_indexes",
+        "_published_lsn",
+        "_heap_cache_certificates",
+    )
 
     def __init__(self, pool: BufferPool, heap: HeapStore, metrics: MetricsSink) -> None:
         """Build the registry over the pool and heap of one database."""
@@ -1683,6 +2462,12 @@ class IndexManager:
         self._metrics: MetricsSink = metrics
         self._indexes: dict[str, IndexStore] = {}
         self._published_lsn: Lsn = NO_LSN
+        # Exact answers validate index candidates against heap pages.  The index certificate is
+        # therefore also the clock for the heap cache used by that validation: every committed
+        # row change of the covered table advances its maintained index page 0 before becoming
+        # visible.  A new certificate drops clean heap frames before they can confirm a deleted
+        # or superseded version from another process.
+        self._heap_cache_certificates: dict[str, _IndexReadCertificate] = {}
 
     # --- registry ---------------------------------------------------------------------------
 
@@ -1755,6 +2540,21 @@ class IndexManager:
         index.check_freshness(
             self._published_lsn, persist=persist_stale, allow_ahead=True
         )
+        if not index.stale:
+            try:
+                index._stable_view(
+                    NO_LSN,
+                    lambda certificate: self._prepare_heap_view(
+                        index.file, certificate
+                    ),
+                )
+            except GrafxUnsupportedOperation as failure:
+                if failure.details.get("field") != "dirty":
+                    raise
+                # Registration may share a pool with local heap work that is not yet publishable.
+                # Leave the companion generation unbound; the first authoritative lookup will
+                # fail closed unless a successful local commit binds it first.
+                self._heap_cache_certificates.pop(index.file, None)
         return index
 
     def unregister(self, name: str) -> bool:
@@ -1771,7 +2571,11 @@ class IndexManager:
         """
         if not isinstance(name, str):
             return False
-        return self._indexes.pop(name.lower(), None) is not None
+        removed = self._indexes.pop(name.lower(), None)
+        if removed is None:
+            return False
+        self._heap_cache_certificates.pop(removed.file, None)
+        return True
 
     def indexes(self) -> tuple[IndexStore, ...]:
         """Return every registered index, in the order names sort, so a report is reproducible."""
@@ -1869,6 +2673,7 @@ class IndexManager:
         position = _require_position("lsn", lsn)
         for index in self.indexes():
             index.advance_built_through(position)
+            self._bind_local_heap_view(index)
         self._published_lsn = max(self._published_lsn, position)
 
     def mark_all_stale(self, reason: str, *, persist: bool = False) -> None:
@@ -2145,6 +2950,11 @@ class IndexManager:
             # entry is there. It is a flush and not a barrier, for the reason section 8.5 step 6
             # gives: the log is the authority on durability and the redo is idempotent.
             self._pool.flush(file)
+        # These certificates name images published by THIS pool. Binding them does not discard
+        # the dirty/current heap frames that supplied the same commit. A later foreign page-0
+        # generation differs and takes the zero-write rebase path before validation.
+        for index in self.indexes():
+            self._bind_local_heap_view(index)
         return applied
 
     def rollback(self, txn: StagingTransaction) -> int:
@@ -2197,33 +3007,68 @@ class IndexManager:
         is the contract rather than a defect. A candidate that cannot be READ is a different
         matter and is raised: the heap is the truth, and a truth that will not decode is damage.
         """
-        if not isinstance(snapshot, SnapshotLike):
-            raise GrafxIndexError(
-                f"A lookup needs a snapshot; got {type(snapshot).__name__}.",
-                field="snapshot",
-                value=type(snapshot).__name__,
-                index=index.name,
-            )
+        read_lsn = index._require_exact_read_lsn(snapshot)
         definition = index.definition
-        confirmed: list[RecordRef] = []
-        for entry in index.candidates(key):
-            version = self._heap.read(entry.ref)
-            if version.table_id != definition.table_id:
-                raise GrafxCorruptionDetected(
-                    f"Index {definition.name!r} points at a row of table {version.table_id} and "
-                    f"covers table {definition.table_id}.",
-                    file=index.file,
-                    page=entry.page,
-                    slot=entry.slot,
-                    index=definition.name,
-                    field="table_id",
-                )
-            if not snapshot.visible(version.xmin, version.xmax):
-                continue
-            if definition.key_for(version.values) != entry.key:
-                continue
-            confirmed.append(entry.ref)
-        return tuple(confirmed)
+        wanted = index._require_key(key)
+
+        def confirm(certificate: _IndexReadCertificate) -> tuple[RecordRef, ...]:
+            """Validate candidates against heap frames bound to this index generation."""
+            self._prepare_heap_view(index.file, certificate)
+            confirmed: list[RecordRef] = []
+            for entry in index._candidates_unchecked(wanted):
+                version = self._heap.read(entry.ref)
+                if version.table_id != definition.table_id:
+                    raise GrafxCorruptionDetected(
+                        f"Index {definition.name!r} points at a row of table "
+                        f"{version.table_id} and covers table {definition.table_id}.",
+                        file=index.file,
+                        page=entry.page,
+                        slot=entry.slot,
+                        index=definition.name,
+                        field="table_id",
+                    )
+                if not snapshot.visible(version.xmin, version.xmax):
+                    continue
+                if definition.key_for(version.values) != entry.key:
+                    continue
+                confirmed.append(entry.ref)
+            return tuple(confirmed)
+
+        return index._stable_view(read_lsn, confirm)
+
+    def _prepare_heap_view(
+        self, index_file: str, certificate: object
+    ) -> None:
+        """Attach clean heap frames to the durable index generation validating them."""
+        if not isinstance(certificate, _IndexReadCertificate):
+            raise GrafxIndexError(
+                "A companion heap view needs a durable index certificate.",
+                field="certificate",
+                value=type(certificate).__name__,
+                file=index_file,
+            )
+        if self._heap_cache_certificates.get(index_file) == certificate:
+            return
+        local = next(
+            (index for index in self._indexes.values() if index.file == index_file),
+            None,
+        )
+        if local is not None and local._local_certificate == certificate:
+            # The index generation and the heap frames were produced by this same pool. Dropping
+            # dirty heap pages here would either lose local work or reject a valid direct index
+            # commit; a later foreign sequence cannot equal this non-wrapping certificate.
+            self._heap_cache_certificates[index_file] = certificate
+            return
+        # The heap participates in the same answer as the index traversal. Rebase it while the
+        # surrounding pre/post certificate can still catch a commit that lands during the read.
+        self._pool.discard_clean_file(self._heap.file)
+        self._heap_cache_certificates[index_file] = certificate
+
+    def _bind_local_heap_view(self, index: IndexStore) -> None:
+        """Bind companion heap frames to an index image published by this same pool."""
+        certificate = index._cache_certificate
+        if certificate is not None:
+            self._heap_cache_certificates[index.file] = certificate
 
     # --- maintenance ---------------------------------------------------------------------------
 
@@ -2262,8 +3107,14 @@ class IndexManager:
         definition = index.definition
         table = self._heap.catalog.catalog.table_by_id(definition.table_id)
         position = _require_position("through_lsn", through_lsn)
+        # RESET can expose an empty/partial index while its replacement entries are staged and
+        # applied. Publish the refusal first, even when an operator proactively rebuilds a
+        # healthy index; a crash then leaves a durable stale verdict, never a short answer.
+        rebuild_token = index._claim_rebuild(
+            f"Index {index.name!r} is being rebuilt through position {position}."
+        )
         staged = 1
-        index.stage_reset(txn, position)
+        index.stage_reset(txn, position, rebuild_token=rebuild_token)
         for ref, version in self._heap.scan_all(table):
             if is_provisional_csn(version.xmin):
                 continue
@@ -2283,7 +3134,9 @@ class IndexManager:
         that was staged and never committed changed nothing, and an index that started answering
         at staging time would answer from a structure the log had not yet accepted.
         """
-        self.index(name).clear_stale(through_lsn)
+        index = self.index(name)
+        index.clear_stale(through_lsn)
+        self._bind_local_heap_view(index)
 
     # --- verification --------------------------------------------------------------------------
 
