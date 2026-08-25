@@ -18,6 +18,7 @@ What these tests pin:
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -816,3 +817,71 @@ def test_a_str_subclass_key_never_reaches_the_consumer(
     assert "not plain JSON-native data" in reason
     for key in list(multiples) + list(gauges):
         assert type(key) is str
+
+
+def _deep_document(depth: int) -> str:
+    """A type-exact JSON tree deep enough to exhaust the rebuild's recursion."""
+    return "[" * depth + "1" + "]" * depth
+
+
+def test_a_deeply_nested_metrics_document_is_unmeasured_at_every_reader(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round-9 (2): a type-exact tree deeper than the interpreter's limit raises
+    RecursionError from inside the RECURSIVE rebuild. Each public boundary must answer
+    with its own verdict -- UNMEASURED, exit 2 -- and never with the exit 1 that this
+    gate reads as CEILING EXCEEDED."""
+    document = '{"metrics": ' + _deep_document(400) + "}"
+    metrics = tmp_path / "metrics.json"
+    metrics.write_text(document, encoding="utf-8")
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(
+        '{"vector_recall": ' + _deep_document(400) + "}", encoding="utf-8"
+    )
+    original_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(200)
+    try:
+        multiples, gauges, reason = read_multiples(document)
+        assert (multiples, gauges) == ({}, {})
+        assert reason
+        state, _ = gate_module._recall_measurement(document)
+        assert state in ("absent", "malformed")
+        assert check(document, require_recall=True).exit_code == 2
+        assert main(["--metrics", str(metrics), "--require-recall"]) == 2
+        assert main(["--metrics", str(metrics), "--calibration", str(calibration)]) == 2
+    finally:
+        sys.setrecursionlimit(original_limit)
+    assert "UNMEASURED" in capsys.readouterr().out
+
+
+def test_a_rebuild_failure_is_malformed_and_never_a_tolerated_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-9 (3), the fail-open: the parse and the rebuild shared one except clause, so
+    a document that PARSED and then failed to rebuild was reported ABSENT -- and absent
+    is TOLERATED without --require-recall, so `check` answered ceilings_met and exit 0
+    over a publication nothing could vouch for.
+
+    The tree here is handed back ALREADY PARSED, which is what makes this a probe of the
+    REBUILD rather than of json.loads. An earlier version of this test fed the depth as
+    text, so the RecursionError came from the parse and the rebuild was never exercised
+    at all -- it passed against the bug, and the reverse mutation is what caught it."""
+    deep: object = 1
+    for _ in range(300):
+        deep = [deep]
+    document = json.dumps({"metrics": []})
+    monkeypatch.setattr(gate_module.json, "loads", lambda *a, **kw: {"metrics": deep})
+    original_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(150)
+    try:
+        state, reason = gate_module._recall_measurement(document)
+        assert state == "malformed", "present-and-untrustworthy is never absent"
+        multiples, gauges, read_reason = read_multiples(document)
+        assert (multiples, gauges) == ({}, {})
+        assert read_reason
+        verdict = check(document)
+        assert verdict.exit_code == 2, "UNMEASURED, not the tolerated exit 0"
+        assert verdict.status == STATUS_UNMEASURED
+    finally:
+        sys.setrecursionlimit(original_limit)
+    monkeypatch.undo()

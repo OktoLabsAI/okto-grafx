@@ -112,7 +112,13 @@ def _canonical_json(node: object) -> object:
 
     try:
         return rebuild(node)
-    except _NotCanonical:
+    except (_NotCanonical, RecursionError):
+        # Round-9: the rebuild is RECURSIVE, so a type-exact tree deeper than the
+        # interpreter's limit raises RecursionError from inside it -- a shape the
+        # _NotCanonical clause never saw. The sentinel already means "this cannot be
+        # rebuilt", and a document too deep to walk is precisely that: refusing it is
+        # the same fail-closed answer, reached for a different reason. Nothing else is
+        # caught here, so a genuine KeyboardInterrupt or SystemExit still propagates.
         return _UNCANONICAL
 
 
@@ -228,11 +234,7 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
     regressions are opposite facts and must not share an encoding.
     """
     try:
-        # Round-8 (B): the reader exported keys taken straight from the document, so a
-        # str SUBCLASS became a ceiling or metric name and lied to the CONSUMER's __eq__
-        # long after this function returned. Canonicalizing here means every key and
-        # value that leaves is an exact builtin.
-        payload = _canonical_json(json.loads(document))
+        parsed = json.loads(document)
     except Exception as error:  # noqa: BLE001 -- "never raises" is absolute here
         # ValueError is the documented shape, RecursionError arrives from thousands of
         # nesting levels, and the promise covers whatever else an ordinary parse can
@@ -242,6 +244,13 @@ def read_multiples(document: str) -> tuple[dict[str, float], dict[str, float], s
             {},
             f"the metrics document is not readable JSON: {_describe(error)}",
         )
+    # Round-8 (B): the reader exported keys taken straight from the document, so a str
+    # SUBCLASS became a ceiling or metric name and lied to the CONSUMER's __eq__ long
+    # after this function returned. Canonicalizing means every key and value that leaves
+    # is an exact builtin. Round-9 (3): the rebuild is a SEPARATE event from the parse.
+    # Sharing one clause made a rebuild failure indistinguishable from an unreadable
+    # file, and the two are opposite facts.
+    payload = _canonical_json(parsed)
     try:
         # Round-5 blocker 3: the boundary starts right after the parse, not after the
         # .get -- a hostile mapping raised raw at payload.get, one line before the guard
@@ -349,9 +358,17 @@ def _recall_measurement(document: str) -> tuple[str, object]:
     did not come from the pipeline and cannot be trusted as THE measurement.
     """
     try:
-        payload = _canonical_json(json.loads(document))
+        parsed = json.loads(document)
     except Exception:  # noqa: BLE001 -- unreadable is absent; never-raise is absolute
         return ("absent", None)
+    # Round-9 (3): the rebuild used to share the clause above, so a document that PARSED
+    # and then failed to rebuild was reported as ABSENT -- and absent is TOLERATED
+    # without --require-recall, so `check` answered ceilings_met and exit 0 over a
+    # publication nothing could vouch for. Unreadable is absent; present-and-
+    # untrustworthy is malformed. They are opposite facts and must not share an
+    # encoding, which is the same rule that made the rebuild return a sentinel rather
+    # than None.
+    payload = _canonical_json(parsed)
     if payload is _UNCANONICAL:
         # A document that PARSED but cannot be rebuilt is MALFORMED, never absent:
         # absent is TOLERATED without --require-recall and malformed never is, so
@@ -547,14 +564,20 @@ def _resolve_recall_target(
         return coerced, "explicit flag"
     if calibration:
         try:
-            payload = _canonical_json(
-                json.loads(Path(calibration).read_text(encoding="utf-8"))
-            )
-        except (OSError, ValueError) as error:
+            parsed = json.loads(Path(calibration).read_text(encoding="utf-8"))
+        except Exception as error:  # noqa: BLE001 -- KI/SE propagate; this is I/O
+            # Round-9: the tuple missed RecursionError, which a deeply nested
+            # calibration file raises from json.loads itself. A file that cannot be read
+            # or parsed is unreadable whatever the reason; the caller turns this into
+            # UNMEASURED, exit 2, rather than the exit 1 that means CEILING EXCEEDED.
             raise ValueError(
                 f"--calibration {calibration!r} was named explicitly but is unreadable "
                 f"({_describe(error)}); refusing to fall back to a floor nobody chose"
             ) from error
+        # Round-9 (3): the rebuild sits outside the read's clause, so a payload that
+        # parsed and then failed to rebuild is a payload with no usable target -- which
+        # the refusal below turns into UNMEASURED, never a floor nobody chose.
+        payload = _canonical_json(parsed)
         try:
             # Round-7 (5): three chained .get calls on a parsed object -- all of them the
             # OBJECT's code. A dict subclass raising SystemExit here escaped main's

@@ -25,7 +25,6 @@ from pathlib import Path
 from bench.harness.recall import (
     RECALL_METRIC,
     RecallStageError,
-    _UNCANONICAL,
     _canonical_json,
     _canonical_verdict,
     _describe,
@@ -134,10 +133,18 @@ def _strip_stale_gauge(metrics: Path) -> None:
     # The read and the parse are WORK: a real KeyboardInterrupt or SystemExit there
     # still propagates, and the caller's boundary turns ordinary failures into exit 3.
     document = _canonical_json(json.loads(metrics.read_text(encoding="utf-8")))
-    if document is _UNCANONICAL:
+    if type(document) is not dict:
+        # Round-9 (4): canonicalizing was not enough -- the SHAPE was never required. A
+        # type-exact `[]` rebuilds perfectly and then reads as "no gauge here", so the
+        # strip silently did nothing and the run published a new gauge beside a stale
+        # one: two gauges, and the invariant that every crash window reads as
+        # gauge-ABSENT quietly gone. The snapshot that is actually inspected must have
+        # the topology the inspection assumes, and the prevalidation's agreement on an
+        # earlier read is not evidence about THIS one.
         raise RecallStageError(
-            "the metrics document is not plain JSON-native data, so a stale recall "
-            "gauge cannot be ruled out; refusing to publish over an unknown state."
+            "the metrics document is not a plain JSON object at the moment it is read "
+            "for a stale recall gauge, so one cannot be ruled out; refusing to publish "
+            "over an unknown state."
         )
     try:
         # Round-7 (5): everything from here is the parsed OBJECT's code -- .get, the
@@ -238,6 +245,27 @@ def _release_publication_locks(
             except BaseException:  # noqa: BLE001 -- the diagnosis is best-effort too
                 residue.append("<a lock whose failure could not be described>")
     return residue, interrupted
+
+
+def _normalized_name(resolved: object) -> str:
+    """Reduce what resolve() RETURNED to a builtin string; never raise a foreign shape.
+
+    Round-9 (5): resolve() itself is work, and a genuine interrupt of it must propagate.
+    The object it hands back is a different matter -- os.fspath on that result runs the
+    RETURNED object's __fspath__, and sharing one clause with the call let a SystemExit
+    from there escape as though the filesystem had been interrupted. The call keeps its
+    Exception clause; this normalization is data, so every shape becomes the ordinary
+    error the caller already turns into a typed refusal.
+    """
+    try:
+        name = os.fspath(resolved)
+    except BaseException as failure:  # noqa: BLE001 -- the RESULT chose this shape
+        raise RuntimeError(
+            f"resolve() returned something that is not a path ({_describe(failure)})"
+        ) from None
+    if type(name) is not str:
+        raise RuntimeError("resolve() did not yield a filesystem path")
+    return name
 
 
 def _unwind_lock_failure(
@@ -546,9 +574,13 @@ def append_vector_recall(
             # genuine KeyboardInterrupt or SystemExit here is an interrupt of work and
             # keeps propagating; an ordinary failure, RuntimeError included, is a typed
             # refusal with no fallback.
-            canonical_name = os.fspath(Path(alias_name).resolve(strict=True))
-            if type(canonical_name) is not str:
-                raise TypeError("resolve() did not yield a filesystem path")
+            resolved_object = Path(alias_name).resolve(strict=True)
+            # Round-9: this construction sat OUTSIDE every boundary. A Path replacement
+            # that allows the first construction and refuses the second escaped as a raw
+            # RuntimeError instead of the typed exit 3 -- and it is the same kind of
+            # call as the resolve above, so it belongs under the same clause.
+            canonical_name = _normalized_name(resolved_object)
+            canonical = Path(canonical_name)
         except Exception as failure:  # noqa: BLE001 -- KI/SE propagate; this is I/O
             _emit(
                 f"vector recall stage: REFUSED -- {alias_label} "
@@ -557,7 +589,6 @@ def append_vector_recall(
                 f"({_describe(failure)}); nothing was run."
             )
             return 3
-        canonical = Path(canonical_name)
         try:
             # Real I/O, on a builtin string: a genuine KeyboardInterrupt or SystemExit
             # here is an interrupt of WORK and keeps propagating as the primary.
@@ -594,7 +625,11 @@ def append_vector_recall(
         if path is None:
             continue
         try:
-            document = json.loads(path.read_text(encoding="utf-8"))
+            # Round-9: this parse was raw, so the prevalidation was inspecting an object
+            # while the commit claimed every parse is canonicalized. It agrees with the
+            # later reads now -- though each read still validates its OWN snapshot,
+            # because agreement here is not evidence about a later one.
+            document = _canonical_json(json.loads(path.read_text(encoding="utf-8")))
         except Exception as failure:  # noqa: BLE001 -- absolute boundary; KI/SE propagate
             _emit(
                 f"vector recall stage: REFUSED -- {label} {_describe(path)} is not "
@@ -602,7 +637,7 @@ def append_vector_recall(
                 "and nothing was written."
             )
             return 3
-        if not _is_a(document, dict):
+        if type(document) is not dict:
             _emit(
                 f"vector recall stage: REFUSED -- {label} {_describe(path)} holds "
                 f"{_describe(document)}, not an object; nothing was run."
@@ -668,9 +703,20 @@ def append_vector_recall(
             f"vector recall stage: WARNING -- lock residue left behind: {residue_line}"
         )
     if interrupted is not None:
-        # Round-8 (F): there was NO primary, so this interrupt is the only thing that
-        # happened. Absorbing it turned a real KeyboardInterrupt during cleanup into a
-        # quiet exit 3 -- a stage failure the operator never asked for and an interrupt
+        if outcome != 0:
+            # Round-9 (6): a non-zero outcome IS a primary -- the stage already decided,
+            # in a typed refusal the caller is entitled to. Re-raising here replaced that
+            # verdict with an interrupt raised by the cleanup of it, which is the same
+            # mistake round-8 fixed in the other direction. Diagnosed and dropped; the
+            # refusal stands.
+            _emit(
+                "vector recall stage: WARNING -- the lock release was interrupted "
+                f"({_describe(interrupted)}); the stage's own failure stands."
+            )
+            return 3
+        # Round-8 (F): the publication SUCCEEDED, so this interrupt is the only thing
+        # that happened. Absorbing it turned a real KeyboardInterrupt during cleanup into
+        # a quiet exit 3 -- a stage failure the operator never asked for and an interrupt
         # they did. It reappears here, after the cleanup completed and was reported.
         raise interrupted
     if outcome == 0 and residue:

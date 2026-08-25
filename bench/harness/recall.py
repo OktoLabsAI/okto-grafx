@@ -303,7 +303,17 @@ def run_recall(
         # raises, both reached below while reporting a failure. The whole tree is
         # rebuilt into exact builtins here, before ANY access, and a document that
         # cannot be rebuilt is refused.
-        verdict = _canonical_json(verdict)
+        try:
+            # Round-9: this sat OUTSIDE the parse's try, so anything the rebuild raised
+            # left run_recall without the RecallStageError its callers are promised.
+            # The rebuild contains the deep-tree case itself now; this clause is the
+            # local contract, so no future shape can leak past it either.
+            verdict = _canonical_json(verdict)
+        except Exception as failure:  # noqa: BLE001 -- KI/SE still propagate
+            raise RecallStageError(
+                "the recall worker's verdict could not be rebuilt as plain JSON-native "
+                f"data (exit {completed.returncode}): {_describe(failure)}"
+            ) from failure
         if type(verdict) is not dict:
             raise RecallStageError(
                 "the recall worker's verdict is not plain JSON-native data; refusing it."
@@ -471,10 +481,6 @@ def _reachable_means(
 
 
 class _NotCanonical(Exception):
-    """A node that is not exact builtin data; the rebuild refuses it."""
-
-
-class _NotCanonical(Exception):
     """Raised inside the rebuild when a node is not JSON-native with EXACT types."""
 
 
@@ -517,7 +523,13 @@ def _canonical_json(node: object) -> object:
 
     try:
         return rebuild(node)
-    except _NotCanonical:
+    except (_NotCanonical, RecursionError):
+        # Round-9: the rebuild is RECURSIVE, so a type-exact tree deeper than the
+        # interpreter's limit raises RecursionError from inside it -- a shape the
+        # _NotCanonical clause never saw. The sentinel already means "this cannot be
+        # rebuilt", and a document too deep to walk is precisely that: refusing it is
+        # the same fail-closed answer, reached for a different reason. Nothing else is
+        # caught here, so a genuine KeyboardInterrupt or SystemExit still propagates.
         return _UNCANONICAL
 
 

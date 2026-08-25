@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -2418,3 +2419,232 @@ def test_a_cleanup_interrupt_never_replaces_an_existing_primary(
         )
     monkeypatch.undo()
     assert "PRIMARY" in str(caught.value)
+
+
+# =====================================================================================
+# Round-9: a construction outside the boundary, and a tree too deep to walk
+# =====================================================================================
+
+
+def _deep_json(depth: int) -> str:
+    """A type-exact JSON tree deep enough to exhaust the rebuild's recursion."""
+    return "[" * depth + "1" + "]" * depth
+
+
+def test_a_path_that_refuses_its_second_construction_is_a_typed_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-9 (1): `canonical = Path(canonical_name)` sat outside every boundary. A Path
+    replacement that allows the first construction and the resolve, then refuses the
+    second, escaped as a raw RuntimeError instead of the typed exit 3 -- from a function
+    whose contract is an exit code."""
+    out, metrics = _seed_documents(tmp_path)
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    real_path = wiring.Path
+    built: list[int] = []
+
+    class _RefusingSecondConstruction:
+        def __new__(cls, *args: object, **kwargs: object):
+            if args and str(args[0]).endswith(".json"):
+                built.append(1)
+                if len(built) == 2:
+                    raise RuntimeError("this path cannot be constructed twice")
+            return real_path(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wiring, "Path", _RefusingSecondConstruction)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3, "an ordinary failure building our own Path is a typed refusal"
+    assert not called
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")] == []
+
+
+def test_a_tree_too_deep_to_rebuild_is_refused_not_escaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-9 (2): the rebuild is RECURSIVE, so a type-exact tree deeper than the
+    interpreter's limit raises RecursionError from inside it -- a shape the
+    _NotCanonical clause never saw. Every public boundary that canonicalizes must still
+    answer with its own verdict."""
+    from bench.harness.recall import _UNCANONICAL, _canonical_json
+
+    deep = json.loads(_deep_json(200))
+    for _ in range(40):
+        deep = [deep]
+    monkeypatch.setattr(sys, "setrecursionlimit", sys.setrecursionlimit)
+    original_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(120)
+    try:
+        rebuilt = _canonical_json(deep)
+    finally:
+        sys.setrecursionlimit(original_limit)
+    assert rebuilt is _UNCANONICAL, "a tree too deep to walk cannot be rebuilt"
+
+
+def test_a_deeply_nested_verdict_fails_the_stage_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-9 (2), run_recall's boundary: the canonicalization sat outside the parse's
+    try, so anything it raised left this function without the RecallStageError its
+    callers are promised -- and the fresh verdict file still has to go."""
+    import subprocess as subprocess_module
+
+    from bench.harness.recall import run_recall
+
+    def writes_deep_verdict(command: list[str], **kwargs: object):
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.write_text('{"ok": ' + _deep_json(400) + "}", encoding="utf-8")
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_deep_verdict)
+    scratch = tmp_path / "scratch"
+    original_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(200)
+    try:
+        with pytest.raises(RecallStageError):
+            run_recall("tiny", scratch=scratch)
+    finally:
+        sys.setrecursionlimit(original_limit)
+    monkeypatch.undo()
+    assert list(scratch.iterdir()) == [], "and the fresh file is still removed"
+
+
+def test_a_deeply_nested_document_refuses_the_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-9 (2), the wiring's boundaries: a document too deep to rebuild cannot be
+    read for a stale gauge nor mutated, so the stage refuses typed with both documents
+    untouched and no locks left behind."""
+    out, metrics = _seed_documents(tmp_path)
+    out.write_text('{"ceilings": ' + _deep_json(400) + "}", encoding="utf-8")
+    before = (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8"))
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    original_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(200)
+    try:
+        code = append_vector_recall(
+            profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+        )
+    finally:
+        sys.setrecursionlimit(original_limit)
+    monkeypatch.undo()
+    assert code == 3
+    assert (out.read_text(encoding="utf-8"), metrics.read_text(encoding="utf-8")) == (
+        before
+    )
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")] == []
+
+
+def test_a_strip_snapshot_of_the_wrong_shape_never_leaves_two_gauges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-9 (4): the strip canonicalized but never required the TOPOLOGY it then
+    inspects. A type-exact `[]` rebuilds perfectly and reads as "no gauge here", so the
+    strip silently did nothing and the run published a new gauge beside the stale one --
+    two gauges, and the invariant that every crash window reads as gauge-ABSENT quietly
+    gone. The prevalidation's agreement on an EARLIER read is not evidence about this
+    one."""
+    out, metrics = _seed_documents(tmp_path)
+    stale = json.loads(metrics.read_text(encoding="utf-8"))
+    stale["metrics"].append(
+        {
+            "name": RECALL_METRIC,
+            "kind": "gauge",
+            "unit": "ratio",
+            "samples": [{"value": 0.10}],
+        }
+    )
+    metrics.write_text(json.dumps(stale), encoding="utf-8")
+    before = metrics.read_text(encoding="utf-8")
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real_loads = json.loads
+    seen: list[int] = []
+
+    def wrong_shape_on_the_strip(text: str, *args: object, **kwargs: object) -> object:
+        parsed = real_loads(text, *args, **kwargs)
+        if not isinstance(parsed, dict):
+            return parsed
+        seen.append(1)
+        # The two prevalidation reads pass; the strip's own read gets a list.
+        return [] if len(seen) == 3 else parsed
+
+    monkeypatch.setattr(wiring.json, "loads", wrong_shape_on_the_strip)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3, "a strip that cannot see the document may not publish over it"
+    assert metrics.read_text(encoding="utf-8") == before
+    published = json.loads(metrics.read_text(encoding="utf-8"))
+    gauges = [e for e in published["metrics"] if e.get("name") == RECALL_METRIC]
+    assert len(gauges) == 1 and gauges[0]["samples"][0]["value"] == 0.10, (
+        "the stale gauge is still the only one: no second gauge was appended beside it"
+    )
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")] == []
+
+
+def test_a_resolve_result_whose_fspath_exits_is_a_typed_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-9 (5): resolve() is work and a real interrupt of it must propagate, but the
+    object it RETURNS is not ours -- os.fspath on that result runs the returned object's
+    __fspath__. Sharing one clause let a SystemExit from there escape as though the
+    filesystem call had been interrupted."""
+    out, metrics = _seed_documents(tmp_path)
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+
+    class _ExitingFspath:
+        def __fspath__(self) -> str:
+            raise SystemExit(191)
+
+    real_resolve = Path.resolve
+
+    def resolve_to_hostile(self: Path, *args: object, **kwargs: object) -> object:
+        if self.name in ("calibration.json", "metrics.json"):
+            return _ExitingFspath()
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_to_hostile)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3, "normalizing a hostile result is a refusal, not an exit"
+    assert not called
+
+
+def test_an_established_refusal_survives_an_interrupted_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-9 (6): a non-zero outcome IS a primary -- the stage already decided, in a
+    typed refusal the caller is entitled to. Re-raising a cleanup interrupt over it
+    replaced that verdict with an interrupt raised by the cleanup OF it, which is the
+    round-8 mistake in the opposite direction. Only a SUCCESSFUL publication leaves the
+    interrupt as the sole event."""
+    out, metrics = _seed_documents(tmp_path)
+
+    def refusing_worker(*args: object, **kwargs: object) -> dict[str, object]:
+        raise RecallStageError("the worker refused")
+
+    monkeypatch.setattr(wiring, "run_recall", refusing_worker)
+    real_unlink = os.unlink
+
+    def interrupted_unlink(target: object, *args: object, **kwargs: object) -> None:
+        if str(target).endswith(".c13.lock"):
+            raise KeyboardInterrupt("interrupted releasing the lock")
+        return real_unlink(target, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "unlink", interrupted_unlink)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3, "the stage's own refusal stands; the cleanup's interrupt does not"
