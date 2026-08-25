@@ -10,6 +10,7 @@ from okto_grafx.adapters.storage_memory import MemoryStorageDevice
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
+    GrafxIndexError,
     GrafxRecoveryRefused,
     GrafxSchemaVersionMismatch,
 )
@@ -38,7 +39,9 @@ from okto_grafx.engine.recovery_manager import (
     RECOVERY_REPLAYS_TOTAL,
     RecoveryManager,
 )
+from okto_grafx.engine.vector_engine import VectorHnswIndex
 from okto_grafx.engine.wal_manager import WalManager
+from tests.vector.conftest import SnapshotDouble, VectorFixture
 
 from .conftest import (
     DESCRIPTOR,
@@ -72,6 +75,17 @@ def _commit(stack: Stack, page_index: int, payload: bytes, *, txn_id: int = 1) -
         ],
         txn_id=txn_id,
     )
+
+
+def _poisonable_vector(stack: Stack) -> tuple[VectorFixture, VectorHnswIndex]:
+    """Return a real vector registry with a published graph over its own device."""
+    database = VectorFixture(metrics=stack.metrics, clock=stack.clock)
+    space = database.create_space("poison", 4)
+    table = database.create_table("Chunk", space.name)
+    database.insert_row(table, 1, 0, space, (1.0, 0.0, 0.0, 0.0), csn=1)
+    index = database.engine.index(space.name)
+    index.snapshot()
+    return database, index
 
 
 def _segment(stack: Stack) -> str:
@@ -213,6 +227,31 @@ def test_recovery_never_publishes_when_its_wal_barrier_escapes(
 
     assert escaped.value is failure
     assert _stored_bytes(stack) == before
+
+
+def test_failed_recovery_poisoning_reaches_vector_indexes_and_preserves_the_primary_failure(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A secondary poison failure must not replace recovery's error or leave vector reads open."""
+    vectors, index = _poisonable_vector(stack)
+    primary = RuntimeError("recovery stopped after applying a prefix")
+
+    def fail_after_prefix(
+        _manager: RecoveryManager, _permit: object
+    ) -> RecoveryReport:
+        raise primary
+
+    monkeypatch.setattr(RecoveryManager, "_run_fenced", fail_after_prefix)
+
+    with pytest.raises(RuntimeError) as escaped:
+        stack.recovery(index_manager=vectors.registry).run()
+
+    assert escaped.value is primary
+    assert index.stale
+    assert index._snapshot is None  # noqa: SLF001 - proves the derived graph was retired
+    with pytest.raises(GrafxIndexError) as refused:
+        index.search((1.0, 0.0, 0.0, 0.0), 1, SnapshotDouble(10))
+    assert refused.value.details["field"] == "stale"
 
 
 def test_the_read_only_consistency_proof_never_barriers_wal(

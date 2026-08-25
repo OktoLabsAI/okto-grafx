@@ -51,6 +51,14 @@ def _index(database: VectorFixture) -> VectorHnswIndex:
     return database.engine.index("space")
 
 
+def _cold_index_bytes(database: VectorFixture, index: VectorHnswIndex) -> bytes:
+    """Read one index straight from the device, bypassing the pool that owns it."""
+    return b"".join(
+        database.device.read_page(index.file, page_index)
+        for page_index in range(database.device.page_count(index.file))
+    )
+
+
 def test_the_vector_index_is_built_on_the_frameworks_store(
     database: VectorFixture,
 ) -> None:
@@ -59,6 +67,38 @@ def test_the_vector_index_is_built_on_the_frameworks_store(
     assert isinstance(index, ProximityIndex)
     assert isinstance(index, IndexStore)
     assert isinstance(index, SecondaryIndex)
+
+
+def test_registry_poisoning_can_exclude_a_vector_index_without_persisting(
+    database: VectorFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed read-only redo poisons every accelerator without creating another write.
+
+    ``IndexManager.mark_all_stale`` calls the concrete indexes with ``persist=False``.  The
+    vector override must preserve that keyword: losing it either raises ``TypeError`` before the
+    vector is excluded or takes the base method's persistent default and writes the stale bit.
+    A cold device reading proves the latter did not happen, while a published graph makes its
+    invalidation independently observable.
+    """
+    index = _index(database)
+    published = index.snapshot()
+    assert index._snapshot is published  # noqa: SLF001 - proves a graph exists to invalidate
+    before = _cold_index_bytes(database, index)
+
+    def forbidden_flush(_pool: object, _file: str | None = None) -> int:
+        raise AssertionError("persist=False reached the buffer-pool write path")
+
+    monkeypatch.setattr(type(database.pool), "flush", forbidden_flush)
+
+    database.registry.mark_all_stale("committed redo did not complete", persist=False)
+
+    assert _cold_index_bytes(database, index) == before
+    assert index.stale
+    assert index.stale_reason == "committed redo did not complete"
+    assert index._snapshot is None  # noqa: SLF001 - the graph invalidation is the contract here
+    with pytest.raises(GrafxIndexError) as refused:
+        index.search((1.0, 0.0, 0.0, 0.0), 1, SnapshotDouble(1_000))
+    assert refused.value.details["field"] == "stale"
 
 
 def test_the_index_answers_every_member_the_registry_demands(

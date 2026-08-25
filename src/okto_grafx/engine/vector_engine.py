@@ -1005,9 +1005,9 @@ class VectorHnswIndex(ProximityIndex):
         if self._note(picture, change):
             self._certify(picture, self.built_through_lsn)
 
-    def mark_stale(self, reason: str) -> None:
-        """Record staleness durably, and drop the graph derived from the entries it doubts."""
-        super().mark_stale(reason)
+    def mark_stale(self, reason: str, *, persist: bool = True) -> None:
+        """Record staleness as requested, and drop the graph derived from doubtful entries."""
+        super().mark_stale(reason, persist=persist)
         self.invalidate_graph()
 
     def clear_stale(self, built_through: Lsn) -> None:
