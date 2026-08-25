@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, MutableSequence, MutableSet
 from contextlib import contextmanager
-from dataclasses import FrozenInstanceError, fields, is_dataclass
+from dataclasses import FrozenInstanceError, fields, is_dataclass, replace
 from enum import Enum
 import threading
 from typing import Iterator
@@ -1906,17 +1906,81 @@ def test_legacy_quarantine_view_refuses_to_invent_an_empty_inventory() -> None:
     }
 
 
-def test_quarantine_view_refuses_an_incoherent_complete_inventory_item() -> None:
-    """A store cannot label missing manifest/payload evidence as a legacy-complete entry."""
-    incoherent = QuarantineInventoryItem(
+@pytest.mark.parametrize(
+    "contradiction",
+    (
+        "missing_manifest",
+        "empty_files",
+        "missing_payload_file",
+        "manifest_entry_name",
+        "manifest_payload_file",
+        "crossed_manifest_directory",
+        "crossed_payload_directory",
+    ),
+)
+def test_quarantine_view_refuses_an_incoherent_complete_inventory_item(
+    contradiction: str,
+) -> None:
+    """A store cannot label contradictory physical evidence as legacy-complete."""
+    manifest = QuarantineManifest(
+        origin="wal/000000000001.wal",
+        offset=1,
+        length=2,
+        reason="checksum_failure",
+        detail="bad checksum",
+        captured_at_wall=3.5,
+        digest="0" * 64,
+        payload_file="quarantine/hollow/payload.wal",
+        entry_name="hollow",
+    )
+    complete = QuarantineInventoryItem(
         name="hollow",
         state="complete",
-        files=("quarantine/hollow/manifest.json",),
+        files=(
+            "quarantine/hollow/manifest.json",
+            "quarantine/hollow/payload.wal",
+        ),
         manifest_file="quarantine/hollow/manifest.json",
+        payload_file="quarantine/hollow/payload.wal",
+        manifest=manifest,
     )
+    if contradiction == "missing_manifest":
+        incoherent = replace(complete, manifest=None)
+    elif contradiction == "empty_files":
+        incoherent = replace(complete, files=())
+    elif contradiction == "missing_payload_file":
+        incoherent = replace(complete, files=(complete.manifest_file,))
+    elif contradiction == "manifest_entry_name":
+        incoherent = replace(
+            complete, manifest=replace(manifest, entry_name="another-entry")
+        )
+    elif contradiction == "manifest_payload_file":
+        incoherent = replace(
+            complete,
+            manifest=replace(
+                manifest, payload_file="quarantine/hollow/another-payload.wal"
+            ),
+        )
+    elif contradiction == "crossed_manifest_directory":
+        crossed = "quarantine/another-entry/manifest.json"
+        incoherent = replace(
+            complete,
+            manifest_file=crossed,
+            files=(crossed, complete.payload_file),
+        )
+    else:
+        crossed = "quarantine/another-entry/payload.wal"
+        incoherent = replace(
+            complete,
+            payload_file=crossed,
+            manifest=replace(manifest, payload_file=crossed),
+            files=(complete.manifest_file, crossed),
+        )
 
     with pytest.raises(GrafxConfigurationError) as raised:
-        public_views_module._quarantine_inventory_item(incoherent)
+        public_views_module._quarantine_inventory_item(
+            incoherent, directory="quarantine"
+        )
 
     assert raised.value.details == {
         "field": "quarantine.inventory.item",

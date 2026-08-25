@@ -117,7 +117,7 @@ from okto_grafx.domain.query.plan import (
     VectorSearch,
     validate_plan,
 )
-from okto_grafx.domain.recovery.manifest import QuarantineManifest
+from okto_grafx.domain.recovery.manifest import MANIFEST_FILE_NAME, QuarantineManifest
 from okto_grafx.domain.recovery.report import RecoveryFinding, RecoveryReport
 from okto_grafx.domain.txn.commit_state import CommitState
 from okto_grafx.domain.txn.partitions import partition_of
@@ -1223,7 +1223,9 @@ _QUARANTINE_INVENTORY_STATES: tuple[str, ...] = (
 """Closed public spelling of every conclusive quarantine inventory state."""
 
 
-def _quarantine_inventory_item(value: Any) -> QuarantineInventoryItem:
+def _quarantine_inventory_item(
+    value: Any, *, directory: str | None = None
+) -> QuarantineInventoryItem:
     """Rebuild one full inventory item without retaining or dispatching its source."""
     value = _domain_value(
         value, QuarantineInventoryItem, field="quarantine.inventory.item"
@@ -1274,12 +1276,44 @@ def _quarantine_inventory_item(value: Any) -> QuarantineInventoryItem:
             field="quarantine.inventory.detail",
         ),
     )
-    if item.state == "complete" and item.entry is None:
-        raise GrafxConfigurationError(
-            "A complete quarantine inventory item must carry its manifest and both files.",
-            field="quarantine.inventory.item",
-            value="incomplete_complete_item",
+    if item.state == "complete":
+        manifest = item.manifest
+        manifest_file = item.manifest_file
+        payload_file = item.payload_file
+        coherent = (
+            manifest is not None
+            and manifest_file is not None
+            and payload_file is not None
         )
+        if coherent:
+            manifest_parent, manifest_separator, manifest_leaf = manifest_file.rpartition(
+                "/"
+            )
+            payload_parent, payload_separator, payload_leaf = payload_file.rpartition("/")
+            expected_parent = (
+                f"{directory}/{item.name}" if directory is not None else manifest_parent
+            )
+            coherent = (
+                bool(manifest_separator)
+                and bool(payload_separator)
+                and manifest_leaf == MANIFEST_FILE_NAME
+                and bool(payload_leaf)
+                and payload_leaf != MANIFEST_FILE_NAME
+                and manifest_parent == expected_parent
+                and payload_parent == expected_parent
+                and manifest_parent.rpartition("/")[2] == item.name
+                and manifest_file in item.files
+                and payload_file in item.files
+                and manifest.entry_name == item.name
+                and manifest.payload_file == payload_file
+            )
+        if not coherent:
+            raise GrafxConfigurationError(
+                "A complete quarantine inventory item must carry a self-consistent "
+                "manifest and both observed canonical files.",
+                field="quarantine.inventory.item",
+                value="incomplete_complete_item",
+            )
     return item
 
 
@@ -3184,8 +3218,11 @@ def _ledger_view(ledger: Any) -> LedgerView:
 
 def _quarantine_view(quarantine: Any) -> QuarantineView:
     """Snapshot one complete inventory and derive the legacy view from that same instant."""
+    directory = _builtin_text(
+        quarantine.directory, field="quarantine.directory", empty=False
+    )
     captured_inventory = tuple(
-        _quarantine_inventory_item(item)
+        _quarantine_inventory_item(item, directory=directory)
         for item in _tuple_items(quarantine.inventory(), field="quarantine.inventory")
     )
     captured_entries: list[QuarantineEntry] = []
@@ -3194,7 +3231,7 @@ def _quarantine_view(quarantine: Any) -> QuarantineView:
         if entry is not None:
             captured_entries.append(_quarantine_entry(entry))
     return QuarantineView(
-        _builtin_text(quarantine.directory, field="quarantine.directory", empty=False),
+        directory,
         tuple(captured_entries),
         captured_inventory,
     )
