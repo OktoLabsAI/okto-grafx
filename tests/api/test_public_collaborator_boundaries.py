@@ -1915,6 +1915,37 @@ def test_legacy_quarantine_view_refuses_to_invent_an_empty_inventory() -> None:
     }
 
 
+def _complete_quarantine_inventory_item(
+    root: str = "quarantine", *, extra_files: tuple[str, ...] = ()
+) -> QuarantineInventoryItem:
+    """Build one physically coherent complete item below an arbitrary candidate root."""
+    origin = "wal/000000000001.wal"
+    captured_at_wall = 3.5
+    name = f"{stamp_of(captured_at_wall)}-{entry_suffix(origin, 1, 2)}"
+    item_directory = f"{root}/{name}"
+    manifest_file = f"{item_directory}/manifest.json"
+    payload_file = f"{item_directory}/000000000001.wal"
+    manifest = QuarantineManifest(
+        origin=origin,
+        offset=1,
+        length=2,
+        reason="checksum_failure",
+        detail="bad checksum",
+        captured_at_wall=captured_at_wall,
+        digest="0" * 64,
+        payload_file=payload_file,
+        entry_name=name,
+    )
+    return QuarantineInventoryItem(
+        name=name,
+        state="complete",
+        files=(manifest_file, payload_file, *extra_files),
+        manifest_file=manifest_file,
+        payload_file=payload_file,
+        manifest=manifest,
+    )
+
+
 @pytest.mark.parametrize(
     "contradiction",
     (
@@ -2067,43 +2098,160 @@ def test_quarantine_view_refuses_an_incoherent_complete_inventory_item(
     }
 
 
-def test_quarantine_view_accepts_only_canonical_restore_receipts_as_extra_files() -> (
-    None
-):
+@pytest.mark.parametrize(
+    "mode", ("explicit", "derived"), ids=("known-root", "derived-root")
+)
+@pytest.mark.parametrize("root", ("quarantine", "forensics/quarantine"))
+def test_quarantine_view_accepts_only_canonical_restore_receipts_as_extra_files(
+    mode: str, root: str
+) -> None:
     """A numbered receipt is part of a complete layout; arbitrary neighbours are not."""
-    origin = "wal/000000000001.wal"
-    captured_at_wall = 3.5
-    name = f"{stamp_of(captured_at_wall)}-{entry_suffix(origin, 1, 2)}"
-    directory = f"quarantine/{name}"
-    manifest_file = f"{directory}/manifest.json"
-    payload_file = f"{directory}/000000000001.wal"
-    receipt = f"{directory}/restore-1.json"
-    manifest = QuarantineManifest(
-        origin=origin,
-        offset=1,
-        length=2,
-        reason="checksum_failure",
-        detail="bad checksum",
-        captured_at_wall=captured_at_wall,
-        digest="0" * 64,
-        payload_file=payload_file,
-        entry_name=name,
+    plain = _complete_quarantine_inventory_item(root)
+    receipt = f"{root}/{plain.name}/restore-1.json"
+    complete = replace(
+        plain,
+        files=(*plain.files, receipt),
     )
-    complete = QuarantineInventoryItem(
-        name=name,
-        state="complete",
-        files=(manifest_file, payload_file, receipt),
-        manifest_file=manifest_file,
-        payload_file=payload_file,
-        manifest=manifest,
-    )
+    captured_directory = root if mode == "explicit" else None
 
     observed = public_views_module._quarantine_inventory_item(
-        complete, directory="quarantine"
+        complete, directory=captured_directory
     )
 
     assert observed == complete
     assert observed.entry is not None
+
+
+@pytest.mark.parametrize(
+    "root",
+    (
+        "",
+        ".",
+        "..",
+        "nested/./quarantine",
+        "nested/../quarantine",
+        "quarantine//nested",
+        "nested\\quarantine",
+        "nul\x00root",
+        "/absolute",
+        "C:/quarantine",
+        "quarantine/",
+        " padded",
+        "quarantine.",
+        "CON",
+        "quarantine/NUL",
+    ),
+)
+@pytest.mark.parametrize(
+    "captured_directory", ("explicit", "derived"), ids=("known-root", "derived-root")
+)
+def test_quarantine_view_refuses_noncanonical_inventory_roots(
+    root: str, captured_directory: str
+) -> None:
+    """Neither a supplied nor path-derived root may escape the storage namespace grammar."""
+    item = _complete_quarantine_inventory_item(root)
+    directory = root if captured_directory == "explicit" else None
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        public_views_module._quarantine_inventory_item(item, directory=directory)
+
+    assert raised.value.details == {
+        "field": "quarantine.inventory.item",
+        "value": "incomplete_complete_item",
+    }
+
+
+@pytest.mark.parametrize(
+    "captured_directory", ("quarantine", None), ids=("known-root", "derived-root")
+)
+def test_quarantine_view_translates_an_oversized_restore_receipt(
+    captured_directory: str | None,
+) -> None:
+    """A hostile decimal envelope remains an incoherent item, never a raw int failure."""
+    plain = _complete_quarantine_inventory_item()
+    receipt = f"quarantine/{plain.name}/restore-{'9' * 4_301}.json"
+    item = replace(plain, files=(*plain.files, receipt))
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        public_views_module._quarantine_inventory_item(
+            item, directory=captured_directory
+        )
+
+    assert raised.value.details == {
+        "field": "quarantine.inventory.item",
+        "value": "incomplete_complete_item",
+    }
+
+
+@pytest.mark.parametrize("failure_type", (ValueError, OverflowError))
+def test_quarantine_view_translates_restore_receipt_classifier_failures(
+    monkeypatch: pytest.MonkeyPatch, failure_type: type[Exception]
+) -> None:
+    """Numeric classifier failures are closed into the public incoherence taxonomy."""
+    plain = _complete_quarantine_inventory_item()
+    receipt = f"quarantine/{plain.name}/restore-1.json"
+    item = replace(plain, files=(*plain.files, receipt))
+
+    def fail(_file: str, _directory: str) -> bool:
+        raise failure_type("hostile numeric envelope")
+
+    monkeypatch.setattr(public_views_module, "_is_restore_receipt", fail)
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        public_views_module._quarantine_inventory_item(item, directory="quarantine")
+
+    assert raised.value.details == {
+        "field": "quarantine.inventory.item",
+        "value": "incomplete_complete_item",
+    }
+
+
+@pytest.mark.parametrize("failure_type", (KeyboardInterrupt, SystemExit))
+def test_quarantine_view_preserves_base_exceptions_from_receipt_classifier(
+    monkeypatch: pytest.MonkeyPatch, failure_type: type[BaseException]
+) -> None:
+    """Process-control failures retain their identity at the receipt classifier boundary."""
+    plain = _complete_quarantine_inventory_item()
+    receipt = f"quarantine/{plain.name}/restore-1.json"
+    item = replace(plain, files=(*plain.files, receipt))
+    primary = failure_type()
+
+    def fail(_file: str, _directory: str) -> bool:
+        raise primary
+
+    monkeypatch.setattr(public_views_module, "_is_restore_receipt", fail)
+
+    with pytest.raises(failure_type) as raised:
+        public_views_module._quarantine_inventory_item(item, directory="quarantine")
+
+    assert raised.value is primary
+
+
+@pytest.mark.parametrize(
+    "directory", (".", "../quarantine", "C:/quarantine", "nested\\quarantine")
+)
+def test_quarantine_view_refuses_a_noncanonical_captured_directory_before_inventory(
+    directory: str,
+) -> None:
+    """Even an empty snapshot cannot publish an invalid namespace root."""
+    calls: list[str] = []
+
+    class Candidate:
+        def __init__(self) -> None:
+            self.directory = directory
+
+        def inventory(self) -> tuple[()]:
+            calls.append("inventory")
+            return ()
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        public_views_module._quarantine_view(Candidate())
+
+    assert raised.value.details == {
+        "field": "quarantine.directory",
+        "value": "noncanonical",
+    }
+    assert calls == []
 
 
 def test_database_quarantine_view_captures_inventory_once_and_derives_legacy_entries(
