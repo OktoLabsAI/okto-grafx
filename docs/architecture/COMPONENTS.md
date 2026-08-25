@@ -396,8 +396,9 @@ allocates `RecordId`; nobody applies staged index work at the commit number) -- 
 The **error taxonomy composes**, verified by **identity** rather than type: a `GrafxCorruptionDetected`
 and a `GrafxStorageError` planted in `StorageDevice.read_page` arrive at `Database.execute()`
 unchanged through QueryEngine -> HeapStore -> BufferPool; a `GrafxDurabilityBarrierFailed` arrives at
-`Transaction.commit()` with `details["retryable"]` intact. The one conversion is a **foreign**
-(non-`Grafx`) exception from a caller-supplied adapter, chained with `from`.
+`Transaction.commit()` with `details["retryable"]` intact. This assembly path converts a **foreign**
+(non-`Grafx`) exception from a caller-supplied adapter and chains it with `from`; it is an open-time
+cleanup decision, not a universal runtime boundary for custom adapters.
 
 ### Residual contract gap — §6.2's `page_size` cannot diagnose what it exists for
 
@@ -742,6 +743,19 @@ Each hostname or non-loopback publisher admitted by the override emits one `Runt
 starts. The override alters only bind consent and adds no authentication, authorization, TLS or
 firewall. `[::1]:port` is parsed as IPv6, bound to `::1` with `AF_INET6`, and exposed as the bracketed
 `http://[::1]:<bound-port>/metrics` URL.
+
+### Fase 1.5 / P2.4/P2.7 — executable custom-adapter contract (C0; CLOSED)
+
+`PortRegistry.bind()` validates only structural presence and method callability without executing
+adapter code. It mutates one named slot in place; `require_complete()` reports every unbound name in
+`details["missing"]`. Signatures, results and runtime behaviour remain the responsibility of the
+caller, so a custom adapter is trusted host code and an exception it raises may propagate unchanged.
+The engine and adapters shipped by Okto Grafx continue to use the `GrafxError` taxonomy.
+
+The public examples now use the real `bind()`/`require_complete()` surface, include every required
+`MetricsSink` member and release caller-owned registries explicitly. Marked snippets in `README.md`
+and `docs/PORTS.md` execute in `tests/foundation/test_public_adapter_docs.py`; the existing
+`test_port_signatures.py` remains the independent authority for all 53 frozen signatures.
 
 ### D5 durable_commit — MEASURED. Do not amend the ceiling. (coordinator-commissioned profile)
 

@@ -9,6 +9,12 @@ including the on-disk format.
 
 ### Changed
 
+- **The custom-adapter contract and every public example now match the executable registry.**
+  Examples use `PortRegistry.bind()` and `require_complete()`, release caller-owned registries,
+  and are executed from `README.md` and `docs/PORTS.md` by the test suite. Registry validation is
+  explicitly structural only: custom adapters are trusted host code, so their runtime exceptions
+  may propagate unchanged; the engine and shipped adapters continue to use the `GrafxError`
+  taxonomy.
 - **Configuration is now canonical and enforced at the first public boundary.** Every accepted
   scalar is copied to an exact built-in value before it can reach persisted identity/WAL metadata
   or an adapter. Buffer budgets must hold both store working sets; WAL segments are constrained to

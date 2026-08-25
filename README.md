@@ -457,21 +457,33 @@ Supplying a custom registry replaces the seven ports, but does not disable this 
 Anything that satisfies the protocol is acceptable — the registry checks structurally, so you do not
 inherit from anything.
 
+<!-- okto-grafx-doc-test -->
+
 ```python
-from okto_grafx import DatabaseConfig, PortRegistry, connect
-from okto_grafx.runtime.bootstrap import build_default_registry
+from contextlib import nullcontext
+
+from okto_grafx import DatabaseConfig, connect
+from okto_grafx.runtime.bootstrap import build_default_registry, release_ports
 
 class CountingMetrics:
     """Any object with the MetricsSink members is a MetricsSink."""
     enabled = True
+    def register(self, descriptor): ...
     def increment(self, name, value=1.0, labels=None): ...
     def observe(self, name, value, labels=None): ...
     def set_gauge(self, name, value, labels=None): ...
-    # ... the rest of the protocol
+    def time(self, name, labels=None): return nullcontext()
+    def snapshot(self): return {}
 
-config = DatabaseConfig(path="./mydb", metrics="noop")
-registry = build_default_registry(config).replace(metrics=CountingMetrics())
-db = connect("./mydb", registry=registry)
+config = DatabaseConfig(path=":memory:", metrics="noop")
+registry = build_default_registry(config)
+registry.bind("metrics", CountingMetrics())
+try:
+    with connect(":memory:", registry=registry) as db:
+        assert db.metrics.enabled
+finally:
+    # A caller-supplied registry stays caller-owned after Database.close().
+    release_ports(registry)
 ```
 
 A device is the interesting one to substitute: `FaultInjectingStorageDevice` is how the suite
@@ -553,8 +565,10 @@ or states before their first yield; the memory of those payloads and structures 
 
 ## Errors
 
-Every failure is a `GrafxError` subclass carrying a machine-readable `code`, a `retryable` flag and
-located `details`. Nothing else escapes a public door.
+Failures produced by the engine and the adapters shipped with Okto Grafx are `GrafxError`
+subclasses carrying a machine-readable `code`, a `retryable` flag and located `details`. A custom
+adapter is trusted host code: the registry validates its shape without executing it, but does not
+translate exceptions it raises later. Such an exception can therefore propagate unchanged.
 
 | Error | `retryable` | Means |
 |---|---|---|

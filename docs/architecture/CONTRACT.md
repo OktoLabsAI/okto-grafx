@@ -103,7 +103,7 @@ report the needed change instead.
 
 ```python
 class GrafxError(Exception):
-    """Base class for every error raised by Okto Grafx. Never let an adapter kill the host process."""
+    """Base class for failures raised by the engine and its shipped adapters."""
     code: str = "grafx_error"
     retryable: bool = False
 
@@ -148,6 +148,13 @@ Concrete classes (`code`, `retryable`) — **exact names, en-US messages**:
 
 `GrafxQueryError` gets subclasses `GrafxQueryBudgetExceeded` (`query_budget_exceeded`),
 `GrafxParseError` (`parse_error`) and `GrafxPlanError` (`plan_error`).
+
+This taxonomy covers failures produced by the engine and the adapters shipped with Okto Grafx.
+Caller-supplied adapters are trusted host code: the registry validates their shape without calling
+them, but there is no universal wrapper around every later port call. A custom adapter's exception
+may therefore propagate unchanged unless a particular operation documents a translation. Local
+translations such as assembly cleanup or post-durability outcome classification do not create a
+blanket guarantee, and no boundary catches `BaseException` as an ordinary adapter failure.
 
 ---
 
@@ -418,6 +425,14 @@ class PortRegistry:
     def get(self, slot: str) -> object:  # GrafxPortNotConfigured when empty
     def require_complete(self) -> None:  # GrafxPortNotConfigured listing every missing slot
 ```
+
+**P2.4/P2.7 / Fase 1.5 — custom adapter contract (CLOSED).** `bind()` uses static lookup to verify
+that required members exist and declared methods are callable; it does not execute adapter code or
+validate signatures, return values or runtime behaviour. A later bind replaces the named slot
+in-place. A registry passed by the caller stays caller-owned after `Database.close()` and must be
+released by that caller. Marked Python examples in `README.md` and `docs/PORTS.md` are executed by
+`tests/foundation/test_public_adapter_docs.py`, while the 53 frozen port signatures remain pinned by
+`tests/foundation/test_port_signatures.py`.
 
 **P1.15 / Fase 1.4 — OpenMetrics bind contract (CLOSED).** `allow_remote_metrics` is an exact
 built-in `bool`, defaults to `False`, and may be `True` only when `metrics == "openmetrics"`.

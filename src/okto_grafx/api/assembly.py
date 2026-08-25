@@ -519,10 +519,11 @@ def assemble_database(
     except Exception as failure:
         # A port implementation the CALLER supplied may do anything, including returning a value
         # its Protocol does not describe -- the registry refuses a wrong SHAPE statically and
-        # deliberately runs no adapter code, so a wrong BEHAVIOUR can only be met here. Section 2
-        # and DoD item 5 say only Grafx types leave a public door, so a foreign exception is
-        # brought into the taxonomy rather than allowed to escape. Nothing is hidden: the
-        # original is chained, so its type, message and traceback all survive.
+        # deliberately runs no adapter code, so a wrong BEHAVIOUR can only be met here. Although
+        # custom adapters are trusted host code after open, this assembly boundary can still
+        # classify an ordinary failure as invalid composition while releasing everything already
+        # acquired. Nothing is hidden: the original is chained, so its type, message and traceback
+        # all survive.
         _release(closers)
         cause = _builtin_type_name(failure)
         raise GrafxConfigurationError(

@@ -1,9 +1,10 @@
 """Error taxonomy for Okto Grafx (CONTRACT.md section 2, SPEC-M1 TR-6, SPEC-VEC TR-5).
 
-Every failure that leaves the engine is a :class:`GrafxError`. Adapters translate the raw
-platform failure they observe into one of the concrete types declared here, so no adapter
-failure can kill the host process and every caller can branch on a stable ``code`` and on an
-explicit ``retryable`` flag instead of on a message.
+Failures produced by the engine and the adapters shipped with Okto Grafx use
+:class:`GrafxError`. Shipped adapters translate raw platform failures into the concrete types
+declared here, so callers can branch on a stable ``code`` and an explicit ``retryable`` flag.
+Caller-supplied adapters are trusted host code and are not covered by that blanket: an exception
+they raise may propagate unchanged unless a particular boundary documents a translation.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ __all__ = [
 
 
 class GrafxError(Exception):
-    """Base class for every error raised by Okto Grafx. Never let an adapter kill the host process."""
+    """Base class for failures raised by the engine and its shipped adapters."""
 
     code: str = "grafx_error"
     retryable: bool = False

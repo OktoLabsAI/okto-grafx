@@ -1311,3 +1311,15 @@ option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`
   starts. This is bind consent only and supplies no authentication, authorization, TLS or firewall.
 - **CLOSED** — IPv6 loopback is configured as `[::1]:port`; the publisher binds `::1` with
   `AF_INET6` and reports the bracketed `http://[::1]:<bound-port>/metrics` URL.
+
+## P2.4/P2.7 / Fase 1.5 — custom adapter contract and examples (CLOSED, 2026-08-25)
+
+- **CLOSED** — custom adapters are trusted host code. `PortRegistry.bind()` checks structural
+  presence and method callability without executing the adapter; it does not promise signature,
+  return-value or runtime-behaviour validation. Ordinary exceptions from custom runtime adapters
+  may propagate unchanged, while shipped adapters use the `GrafxError` taxonomy.
+- **CLOSED** — public examples use the real `bind()` and `require_complete()` APIs, read missing
+  slots from `details["missing"]`, include the complete `MetricsSink` shape and release caller-owned
+  registries explicitly.
+- **CLOSED** — marked Python fences in `README.md` and `docs/PORTS.md` execute in the test suite;
+  the 53 protocol signatures stay pinned independently by `test_port_signatures.py`.

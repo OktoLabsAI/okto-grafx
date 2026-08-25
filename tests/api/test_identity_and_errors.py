@@ -444,12 +444,13 @@ def test_a_component_that_is_absent_is_named_rather_than_guessed(tmp_path: Path)
 def test_an_adapter_that_does_not_honour_its_port_is_refused_in_the_taxonomy(
     tmp_path: Path,
 ) -> None:
-    """A foreign exception may not escape a public door (section 2, DoD item 5).
+    """Assembly classifies a bad adapter result while preserving its original cause.
 
     The registry refuses a wrong SHAPE statically and deliberately runs no adapter code, so an
     adapter that answers with a value its Protocol does not describe can only be met while the
-    engines are being built. The refusal names the port layer and chains the original, so a real
-    defect is still diagnosable rather than hidden behind a friendly message.
+    engines are being built. This open-time conversion is not a universal runtime boundary for
+    trusted custom adapters. It names the port layer and chains the original, so the defect stays
+    diagnosable rather than hidden behind a friendly message.
     """
     registry = build_default_registry(DatabaseConfig(path=str(tmp_path / "db")))
     codec = registry.get("codec")

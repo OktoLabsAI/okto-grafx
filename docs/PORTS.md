@@ -31,10 +31,12 @@ to substitute your own.
 
 The check is **structural**, not nominal. The registry compares the attributes an object exposes
 against the protocol's members, so you do not inherit from anything and you do not register
-anywhere — an object that has the members *is* the adapter.
+anywhere — an object that has the members *is* the adapter. Binding checks only that every required
+member is present and that methods are callable. It does not execute the adapter or validate its
+signatures, return values or runtime behaviour.
 
-`build_default_registry(config)` produces the registry the defaults describe; `registry.replace(...)`
-returns a new one with a slot swapped.
+`build_default_registry(config)` produces the registry the defaults describe. A later
+`registry.bind(slot, instance)` mutates that registry by replacing the adapter in the named slot.
 
 | Slot | Protocol | Default adapter |
 |---|---|---|
@@ -56,12 +58,16 @@ Everything that is a file. Paged random access for the data files, append-only a
 plus the two operations that carry the durability and atomicity guarantees.
 
 ```
-name              page_size         exists(file)        create(file)       remove(file)
-page_count(file)  file_size(file)   list_files()        allocate(file, n)
-read_page(file, index)              write_page(file, index, image)
-truncate_log(...)                   append_log(...)     read_log(...)      log_size(...)
-recycle(...)                        atomic_replace(source, destination)
-durable_barrier(file | None)
+name                                  page_size
+exists(file)                          create(file, *, exclusive=True)
+remove(file)                          list_files(prefix="")
+file_size(file)                       atomic_replace(source, target)
+recycle(file)                         page_count(file)
+allocate(file, count=1)               read_page(file, page_index)
+write_page(file, page_index, data)    append_log(file, payload)
+read_log(file, offset, length)        log_size(file)
+truncate_log(file, size)
+durable_barrier(file=None)
 ```
 
 Two members deserve their own note, because the engine's guarantees rest on them.
@@ -112,11 +118,12 @@ The multi-process substrate: who may write, under what epoch, and which readers 
 down.
 
 ```
-owner_id                                current_epoch()
-acquire_writer_lease(...)  renew_lease(...)  release_lease(...)
-validate_epoch(...)        detect_dead_owner()  takeover(...)
-exclusive(name, timeout)                # an exclusive section, across processes
-register_reader(...)  refresh_reader(...)  unregister_reader(...)  reader_horizon()
+owner_id()                              current_epoch()
+acquire_writer_lease(*, timeout)        renew_lease(lease)       release_lease(lease)
+validate_epoch(epoch)                   detect_dead_owner(*, stall_threshold)
+takeover()                              exclusive(name, *, timeout)
+register_reader(snapshot_lsn)           refresh_reader(handle)
+unregister_reader(handle)               reader_horizon()
 ```
 
 **The epoch is the whole safety argument.** A lease is granted with an epoch; every byte a writer
@@ -137,8 +144,8 @@ that took over.
 ### `codec` — `PageCodec`
 
 ```
-format_version                          checksum(data)
-encode_page(page) -> bytes              decode_page(raw, verify=True) -> Page
+format_version                          checksum(payload)
+encode_page(page) -> bytes              decode_page(raw, *, verify=True) -> Page
 ```
 
 The codec owns the on-disk representation of one page, checksum included. `decode_page(verify=True)`
@@ -155,8 +162,8 @@ a best-effort page would turn detected damage into a wrong answer.
 
 ```
 enabled                                 register(descriptor)
-increment(name, value, labels)          set_gauge(name, value, labels)
-observe(name, value, labels)            time(name, labels)      # a context manager
+increment(name, value=1.0, labels=None) set_gauge(name, value, labels=None)
+observe(name, value, labels=None)       time(name, labels=None)  # a context manager
 snapshot()
 ```
 
@@ -190,7 +197,7 @@ are removed for the `::1`/`AF_INET6` bind and restored in the advertised URL, su
 ### `events` — `EventSink`
 
 ```
-emit(event)
+emit(event, payload)
 ```
 
 Structured, **sanitised** and **bounded** records: an event carries a code, a severity and located
@@ -207,9 +214,9 @@ way to fill a disk from a query.
 ### `vector_math` — `VectorMath`
 
 ```
-name                                    normalize(v)      norm(v)
+name                                    normalize(a)      norm(a)
 cosine(a, b)     dot(a, b)     euclidean(a, b)
-score(metric, a, b)                     top_k(query, candidates, k, metric)
+score(a, b, metric)                     top_k(query, candidates, k, metric)
 ```
 
 | Adapter | Module | Use |
@@ -255,6 +262,8 @@ but `crc32c_implementation()` reports the installed name, not the requested one.
 
 Satisfy the protocol. That is all there is: no base class, no registration, no decorator.
 
+<!-- okto-grafx-doc-test -->
+
 ```python
 class CountingMetrics:
     """A metrics sink that counts calls. Structural typing: no import from Okto Grafx needed."""
@@ -288,9 +297,12 @@ class CountingMetrics:
 
 ### Rules an adapter must honour
 
-1. **Raise the taxonomy, not your own exceptions.** Everything that escapes must be a `GrafxError`
-   subclass with the right `code` and `retryable` flag. A `PermissionError` reaching the engine is a
-   defect in the adapter, not a case the engine handles.
+1. **Treat custom adapters as trusted host code.** The registry validates shape without executing
+   adapter code; it does not validate signatures or results and the engine does not translate every
+   exception at every port call. An exception raised by a custom adapter may propagate unchanged.
+   Adapters shipped with Okto Grafx use the `GrafxError` taxonomy. A custom adapter that wants the
+   same integration should translate its host failures to an appropriate `GrafxError`, preserve the
+   cause and never catch `BaseException`.
 2. **Be honest about `retryable`.** A caller retries on it. Marking a permanent failure retryable
    turns a clear error into a livelock.
 3. **Never partially apply.** `write_page` either writes the whole image or fails. The engine's
@@ -308,27 +320,36 @@ class CountingMetrics:
 
 ## Composing a custom registry
 
+<!-- okto-grafx-doc-test -->
+
 ```python
 from okto_grafx import DatabaseConfig, connect
-from okto_grafx.runtime.bootstrap import build_default_registry
+from okto_grafx.runtime.bootstrap import build_default_registry, release_ports
 
-config = DatabaseConfig(path="./mydb", page_size=8192)
-registry = build_default_registry(config).replace(metrics=CountingMetrics())
-
-db = connect("./mydb", registry=registry)
+config = DatabaseConfig(path=":memory:", page_size=8192)
+registry = build_default_registry(config)
+registry.bind("metrics", CountingMetrics())
+try:
+    with connect(":memory:", registry=registry) as db:
+        assert db.metrics.enabled
+finally:
+    # Database.close() does not release a caller-owned registry.
+    release_ports(registry)
 ```
 
 Building one from nothing is also supported, and the fail-closed rule is what makes it safe to try:
 
+<!-- okto-grafx-doc-test -->
+
 ```python
 from okto_grafx import PortRegistry
-from okto_grafx.domain.errors import GrafxPortNotConfigured
+from okto_grafx.errors import GrafxPortNotConfigured
 
+registry = PortRegistry()
 try:
-    PortRegistry(storage=my_device, clock=my_clock).require()
+    registry.require_complete()
 except GrafxPortNotConfigured as refused:
-    print(refused.details["slots"])
-    # ('codec', 'coordinator', 'events', 'metrics', 'vector_math')
+    assert tuple(refused.details["missing"]) == PortRegistry.REQUIRED
 ```
 
 Every missing slot is named in **one** error, so the composition is fixed once rather than one
@@ -341,19 +362,23 @@ registry. `Database` deliberately does not publish those live objects back: a st
 coordinator would expose write, truncate, lease and takeover doors outside the WAL and fencing
 protocols. Its properties are detached immutable observations instead:
 
-```python
-db = connect("./mydb")
-db.storage        # name, page size and a captured file inventory
-db.clock          # clock implementation identity; property access advances no clock
-db.codec          # format and page-size metadata
-db.metrics        # whether collection is enabled
-db.events         # event destination identity
-db.vector_math    # implementation name
-db.coordinator    # participant identity; no lease, epoch or reader-retirement reads
+<!-- okto-grafx-doc-test -->
 
-# The caller-owned live adapter remains where the caller put it:
-storage = registry.get("storage")
+```python
+from okto_grafx import connect
+
+with connect(":memory:") as db:
+    db.storage        # name, page size and a captured file inventory
+    db.clock          # clock implementation identity; property access advances no clock
+    db.codec          # format and page-size metadata
+    db.metrics        # whether collection is enabled
+    db.events         # event destination identity
+    db.vector_math    # implementation name
+    db.coordinator    # participant identity; no lease, epoch or reader-retirement reads
 ```
+
+If the caller supplied a registry, its live adapter remains available there through, for example,
+`registry.get("storage")`.
 
 The same rule covers engine collaborators: `db.catalog`, `db.indexes`, `db.wal`, `db.ledger`,
 `db.quarantine`, `db.vectors` and `db.queries` provide immutable inventories or diagnostics. Safe
