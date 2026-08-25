@@ -17,14 +17,14 @@
     "C:\\Users\\jpamb\\AppData\\Local\\Temp\\claude\\D--Projetos-Techridy-okto-grafx\\9699f9ef-9534-43db-9888-7031689e86f5\\scratchpad\\coord\\evidence2\\recall-full-ef320.verdict.json"
   ],
   "cwd": "the C13 worktree",
-  "duration_seconds": 3834.4580855999957,
+  "duration_seconds": 3441.396442600002,
   "engine": {
     "blob": "6bc68bcfa81e6203a1fa2bc0f75af2d84f68cef9",
     "blob_sha256": "7dd4351c03d9c4c8e01ce459ec976d1f8a75600b5ccc0c77d12d235e6340b027",
     "commit": "5e2fa294e144c4ebf4dfb3e3723af455ddc5d422",
     "path": "src/okto_grafx/domain/vector/hnsw.py"
   },
-  "engine_relationship": "5e2fa294e144c4ebf4dfb3e3723af455ddc5d422 is NOT an ancestor of the C13 branch. It is a SEPARATE INTEGRATION DEPENDENCY: the calibrated HNSW search beam must land in the release lineage for this measurement to describe production. It is recorded here as a dependency, never as an ancestor.",
+  "engine_relationship": "5e2fa294e144c4ebf4dfb3e3723af455ddc5d422 IS an ancestor of runner commit b707fbaeb5bee620541611f75700e8600b20d554. The capture nevertheless loaded hnsw.py from the separately checked-out HNSW worktree through PYTHONPATH and proved its LF-normalized bytes equal the recorded engine blob.",
   "exit_code": 0,
   "loaded_modules": {
     "hnsw": "hnsw.py",
@@ -41,9 +41,9 @@
   "raw_verdict_sha256": "b4c020f9624b104df7ce9bff72bc4497ffbd4cd28355b7d126338e6ca7f58b59",
   "what": "C13 full-profile vector recall measurement, re-taken from clean trees",
   "worker": {
-    "blob": "8e22e692ad535f0260b6ec04fba820c12adbcade",
-    "blob_sha256": "de67be3315c08837b673223b7d2357da951a5cc60ee22485884cf213bccecd0e",
-    "commit": "b7d56ec07e896d99753ffe48c21e49d5edefaeab",
+    "blob": "07c37ab27ff2fad7b6c0856262734f1e4b26ed88",
+    "blob_sha256": "191c189c37e97af31bd3fcdffc9702b2bea855ea24e853c6ff0b2c78ad025b90",
+    "commit": "b707fbaeb5bee620541611f75700e8600b20d554",
     "path": "bench/harness/recall_worker.py"
   },
   "worker_stderr_tail": "",

@@ -700,22 +700,17 @@ def test_a_wrong_engine_blob_is_rejected_even_when_the_commit_exists(
         )
 
 
-def test_the_engine_is_a_dependency_and_never_an_ancestor_of_the_runner(
+def test_the_engine_dependency_is_an_ancestor_of_the_runner(
     frozen_from: dict[str, object],
 ) -> None:
-    """The measurement needed a vector engine that is NOT in the runner's history.
+    """The integrated runner contains the calibrated engine in its recorded history.
 
-    Pretending otherwise is what made the first freeze unauditable. Two details decide
-    whether this test stays true:
+    The capture still loaded the separately checked-out HNSW worktree through PYTHONPATH and
+    proved those bytes against the recorded engine blob. Ancestry is a second, independent
+    fact and is recomputed rather than copied from the artifact.
 
-    The claim is stated and verified against the RUNNER COMMIT, never against HEAD. After
-    the branch is integrated, the engine commit becomes an ancestor of HEAD through the
-    other parent -- so a check phrased against HEAD would flip from passing to failing on a
-    merge, reporting a defect where nothing had changed about the measurement.
-
-    Both objects are mandatory. A missing object, invalid revision, wrong path, wrong blob or
-    wrong content hash is a provenance failure; Git return code 128 is never treated as a
-    reason to skip the relationship check.
+    Both objects remain mandatory. A missing object, invalid revision, wrong path, wrong blob
+    or wrong content hash is a provenance failure; only Git return code zero proves ancestry.
     """
     engine = frozen_from["engine_dependency_source"]
     runner = frozen_from["runner_source"]
@@ -745,10 +740,10 @@ def test_the_engine_is_a_dependency_and_never_an_ancestor_of_the_runner(
         "the module that loaded is not the module the artifact names"
     )
     assert engine["loaded_module_basename"] == Path(ENGINE_RELATIVE).name
-    assert frozen_from["engine_is_ancestor_of_runner_commit"] is False, (
-        "the engine commit is a separate integration dependency, never an ancestor"
+    assert frozen_from["engine_is_ancestor_of_runner_commit"] is True, (
+        "the integrated runner must contain the calibrated engine commit"
     )
-    assert "not an ancestor" in str(frozen_from["engine_relationship"]).lower()
+    assert "is an ancestor" in str(frozen_from["engine_relationship"]).lower()
 
     probe = subprocess.run(
         [
@@ -761,8 +756,8 @@ def test_the_engine_is_a_dependency_and_never_an_ancestor_of_the_runner(
         cwd=str(PROJECT_ROOT),
         capture_output=True,
     )
-    assert probe.returncode == 1, (
-        "the engine relationship is not the recorded non-ancestry: "
+    assert probe.returncode == 0, (
+        "the engine relationship is not the recorded ancestry: "
         f"git returned {probe.returncode}; stderr={probe.stderr.decode('utf-8', errors='replace')!r}"
     )
 
@@ -969,9 +964,10 @@ def test_every_metadata_field_is_parsed_and_cross_checked(
 
     relationship = str(raw_metadata["engine_relationship"])
     assert str(engine["commit"]) in relationship
-    assert "NOT an ancestor" in relationship
-    assert "SEPARATE INTEGRATION DEPENDENCY" in relationship
-    assert "not an ancestor" in str(frozen_from["engine_relationship"]).lower()
+    assert str(runner["commit"]) in relationship
+    assert "IS an ancestor" in relationship
+    assert "separately checked-out HNSW worktree" in relationship
+    assert "is an ancestor" in str(frozen_from["engine_relationship"]).lower()
 
 
 def test_every_frozen_provenance_field_is_governed(
@@ -1154,18 +1150,17 @@ def test_the_exit_code_and_duration_come_from_the_run(
     assert duration == raw_metadata["duration_seconds"]
 
 
-def test_the_contended_timing_is_published_as_non_authoritative(
+def test_the_recall_timing_is_published_as_non_authoritative(
     frozen_from: dict[str, object],
 ) -> None:
-    """Other test suites shared this host while the measurement ran, and it is recorded.
+    """Recall calibration duration is operational evidence, not a performance baseline.
 
-    Recall is unaffected -- corpus, query set, index seed and search are deterministic, so
-    the numbers are identical under any load. Wall-clock is not, and the honest move is to
-    publish the duration flagged rather than let a contended figure be read later as a
-    performance baseline. A disclosure that only lives in a chat log is not provenance.
+    Corpus, query set, index seed and search are deterministic. Wall-clock is not part of
+    the recall acceptance result, so the honest record keeps the measured duration while
+    refusing to present it as a performance figure.
     """
     assert frozen_from["duration_is_authoritative"] is False, (
-        "the run shared the host, so its duration is not a benchmark"
+        "a recall capture duration is not a performance benchmark"
     )
     load = frozen_from["concurrent_load"]
     assert "none" in str(load["effect_on_recall"]).lower(), (  # type: ignore[index]
@@ -1173,17 +1168,12 @@ def test_the_contended_timing_is_published_as_non_authoritative(
     )
 
 
-def test_every_contended_window_is_recorded_in_order() -> None:
-    """BOTH windows, and the count is asserted rather than the presence of one.
+def test_the_capture_records_the_absence_of_concurrent_load() -> None:
+    """The replacement capture ran without another Grafx test or benchmark workload.
 
-    The audited commit recorded only the first. The second was disclosed after the inbox
-    pull that preceded it, and a fact that existed did not reach the artifact -- which is the
-    same failure mode as the provenance blockers, one layer up: the record has to be complete
-    or it is not a record.
-
-    Asserting the exact count is what makes this a guard. "At least one window" would have
-    passed the commit that was blocked, and "contains 05:10" would pass a list that dropped
-    the first. Order is asserted too, because a chronology that does not increase is not one.
+    The exact zero is the guard: retaining windows from the superseded capture would attach
+    true historical facts to the wrong run, while omitting a real window would make the new
+    provenance incomplete.
     """
     document = json.loads(CALIBRATION.read_text(encoding="utf-8"))
     home = next(iter(document["vector_recall"]["provenance"]))
@@ -1193,30 +1183,11 @@ def test_every_contended_window_is_recorded_in_order() -> None:
 
     windows = load["windows"]
     assert type(windows) is list, "the windows are a list, in chronological order"
-    assert len(windows) == 2, (
-        f"exactly two windows were disclosed; found {len(windows)}"
-    )
+    assert windows == [], f"the isolated capture recorded unexpected windows: {windows!r}"
     assert load["count"] == len(windows), "the count and the list must agree"
-
-    starts = [str(window["window_utc"]).split("/")[0] for window in windows]
-    assert starts == sorted(starts), (
-        f"the windows are out of chronological order: {starts}"
-    )
-
-    assert windows[0]["window_utc"] == "2026-08-25T05:00Z/2026-08-25T05:04Z"
-    assert windows[1]["window_utc"] == "2026-08-25T05:10Z/2026-08-25T05:15Z"
     assert type(load["count"]) is int
-    assert type(windows[1]["test_count"]) is int
-    assert windows[1]["test_count"] == 147
-
-    for index, window in enumerate(windows):
-        assert window["disclosed_by"], f"window {index} names who reported it"
-        assert "none" in str(window["effect_on_recall"]).lower(), (
-            f"window {index} must state plainly that recall is unaffected"
-        )
-        assert "not authoritative" in str(window["effect_on_timing"]).lower(), (
-            f"window {index} must state that timing is contended"
-        )
+    assert load["count"] == 0
+    assert "not authoritative" in str(load["effect_on_timing"]).lower()
 
 
 def test_the_command_template_names_no_machine(
