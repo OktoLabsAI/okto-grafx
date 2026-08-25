@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import ast
 import base64
+import copy
 import hashlib
 import json
+import re
 import shlex
 import subprocess
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -64,11 +66,30 @@ RAW_B64: Path = EVIDENCE / "recall-full-ef320.verdict.json.b64"
 RAW_METADATA: Path = EVIDENCE / "recall-full-ef320.metadata.json"
 
 WORKER_RELATIVE: str = "bench/harness/recall_worker.py"
+ENGINE_RELATIVE: str = "src/okto_grafx/domain/vector/hnsw.py"
 MEASURED_EF_SEARCH: int = 320
 """Named by number on purpose: a silent revert to the pre-calibration 64 must fail loudly."""
 
 RECALL_METRIC: str = "oktografx_vector_recall_ratio"
 HEX64 = frozenset("0123456789abcdef")
+
+RUNNER_ROLE: str = "the bench worker that produced the measurement"
+ENGINE_ROLE: str = "the vector engine imported by the measurement"
+
+EXPECTED_GATE_ARGV: tuple[str, ...] = (
+    "python",
+    "-m",
+    "bench.harness.gate",
+    "--metrics",
+    "metrics-${{ matrix.family }}.json",
+    "--require-recall",
+    "--calibration",
+    "bench/calibration.json",
+)
+
+PORTABLE_PLACEHOLDER_PATH = re.compile(
+    r"<[A-Z][A-Z0-9_]*>(?:[\\/][A-Za-z0-9_.-]+)*\Z"
+)
 
 LEGACY_KEYS: frozenset[str] = frozenset(
     {
@@ -122,13 +143,27 @@ def _canonical_blob_sha256(path: Path) -> str:
     return hashlib.sha256(_canonical_bytes(path)).hexdigest()
 
 
-def _object_format() -> str:
-    return subprocess.run(
-        ["git", "rev-parse", "--show-object-format"],
+def _git_bytes(*args: str) -> bytes:
+    """Run git without a shell and require a successful, byte-exact result."""
+    completed = subprocess.run(
+        ["git", *args],
         cwd=str(PROJECT_ROOT),
         capture_output=True,
-        text=True,
-    ).stdout.strip()
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"git {' '.join(args)} failed with {completed.returncode}: "
+        f"{completed.stderr.decode('utf-8', errors='replace').strip()}"
+    )
+    return completed.stdout
+
+
+def _git_text(*args: str) -> str:
+    return _git_bytes(*args).decode("utf-8").strip()
+
+
+def _object_format() -> str:
+    return _git_text("rev-parse", "--show-object-format")
 
 
 def _git_blob(path: Path) -> str:
@@ -163,6 +198,56 @@ def _require_hex64(value: object, what: str) -> str:
     return value
 
 
+def _require_sha1_oid(value: object, what: str) -> str:
+    """A sha1 object id is exactly 40 lowercase hexadecimal characters."""
+    assert type(value) is str, f"{what} must be a plain string; got {value!r}"
+    assert len(value) == 40, f"{what} must be 40 characters; got {len(value)}"
+    assert set(value) <= HEX64, f"{what} must be lowercase hex; got {value!r}"
+    return value
+
+
+def _assert_committed_source(
+    recorded: dict[str, object],
+    *,
+    expected_path: str,
+    expected_role: str,
+    extra_keys: frozenset[str] = frozenset(),
+) -> tuple[str, str, str]:
+    """Prove commit:path -> blob -> SHA256, instead of trusting adjacent strings."""
+    common = {
+        "canonical_blob_sha256",
+        "commit",
+        "git_blob",
+        "path",
+        "role",
+    }
+    expected_keys = common | set(extra_keys)
+    assert set(recorded) == expected_keys, (
+        f"unexpected source identity fields: {sorted(set(recorded) - common - set(extra_keys))}; "
+        f"missing: {sorted(expected_keys - set(recorded))}"
+    )
+    assert recorded["path"] == expected_path
+    assert recorded["role"] == expected_role
+    commit = _require_sha1_oid(recorded["commit"], f"the commit for {expected_path}")
+    blob = _require_sha1_oid(recorded["git_blob"], f"the blob for {expected_path}")
+    content_sha256 = _require_hex64(
+        recorded["canonical_blob_sha256"], f"the content hash for {expected_path}"
+    )
+
+    resolved = _git_text("rev-parse", "--verify", f"{commit}^{{commit}}")
+    assert resolved == commit, f"{commit} does not resolve to the recorded commit"
+    committed_blob = _git_text("rev-parse", "--verify", f"{commit}:{expected_path}")
+    assert committed_blob == blob, (
+        f"{commit}:{expected_path} is blob {committed_blob}, not recorded blob {blob}"
+    )
+    committed_bytes = _git_bytes("show", f"{commit}:{expected_path}")
+    computed_sha256 = hashlib.sha256(committed_bytes).hexdigest()
+    assert computed_sha256 == content_sha256, (
+        f"{commit}:{expected_path} hashes to {computed_sha256}, not {content_sha256}"
+    )
+    return commit, blob, content_sha256
+
+
 def _walk_strings(value: object, trail: str):
     """Yield every (trail, string) in a nested structure."""
     if isinstance(value, dict):
@@ -183,9 +268,75 @@ def _is_absolute_anywhere(value: str) -> bool:
     while PurePosixPath knows "/artifact" and does not know drives. The audited regex
     implemented half of one of them.
     """
-    if not value:
+    if not value or PORTABLE_PLACEHOLDER_PATH.fullmatch(value):
         return False
-    return PureWindowsPath(value).is_absolute() or PurePosixPath(value).is_absolute()
+    # Inspect whitespace-separated pieces too: wrappers such as ``<C:\\Users\\...>`` and
+    # prefixes such as ``path=C:\\...`` must not hide a machine path from pathlib.
+    candidates = {value}
+    candidates.update(value.split())
+    for candidate in candidates:
+        cleaned = candidate.strip("\"'`()[]{}<>,;:")
+        if not cleaned or PORTABLE_PLACEHOLDER_PATH.fullmatch(cleaned):
+            continue
+        # Remove a prose label without removing the drive colon in ``C:\\...``.
+        if "=" in cleaned:
+            cleaned = cleaned.rsplit("=", 1)[-1]
+        windows = PureWindowsPath(cleaned)
+        posix = PurePosixPath(cleaned)
+        if cleaned not in {"/", "\\"} and (windows.root or posix.root):
+            return True
+    # The token walk handles normal values. These searches close embedded/wrapped forms
+    # where punctuation remains attached (including an angle-bracket bypass).
+    return bool(
+        re.search(r"(?i)[a-z]:[\\/]", value)
+        or re.search(r"\\\\[^\\\s]+[\\/]", value)
+        or re.search(r"(?:^|[\s=<'\"])[\\/](?![\\/])[^\s]", value)
+    )
+
+
+def _call_name(node: ast.Call) -> str | None:
+    return node.func.id if isinstance(node.func, ast.Name) else None
+
+
+def _knob_execution_offenders(tree: ast.AST) -> list[ast.AST]:
+    """Return references outside the declaration and its two validation calls."""
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    allowed_calls: set[ast.Call] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node)
+        if name not in {"_require_positive_number", "_reject"} or len(node.args) < 2:
+            continue
+        label, value = node.args[:2]
+        if (
+            isinstance(label, ast.Constant)
+            and label.value == KNOB
+            and isinstance(value, ast.Attribute)
+            and value.attr == KNOB
+        ):
+            allowed_calls.add(node)
+
+    offenders: list[ast.AST] = []
+    for occurrence in _knob_occurrences(tree):
+        parent = parents.get(occurrence)
+        if (
+            isinstance(parent, ast.AnnAssign)
+            and parent.target is occurrence
+            and isinstance(occurrence, ast.Name)
+        ):
+            continue
+        cursor: ast.AST | None = occurrence
+        while cursor is not None and not isinstance(cursor, ast.Call):
+            cursor = parents.get(cursor)
+        if isinstance(cursor, ast.Call) and cursor in allowed_calls:
+            continue
+        offenders.append(occurrence)
+    return offenders
 
 
 def _knob_occurrences(tree: ast.AST) -> list[ast.AST]:
@@ -249,7 +400,21 @@ def _gate_command() -> list[str]:
             script = script[:-1] + lines[index].strip()
         # A trailing comment is not part of the command.
         script = script.split(" #", 1)[0]
-        return shlex.split(script, posix=False)
+        expressions: dict[str, str] = {}
+
+        def protect_expression(match: re.Match[str]) -> str:
+            marker = f"__GITHUB_EXPRESSION_{len(expressions)}__"
+            expressions[marker] = match.group(0)
+            return marker
+
+        protected = re.sub(r"\$\{\{[^{}]*\}\}", protect_expression, script)
+        argv = shlex.split(protected, posix=True)
+        restored: list[str] = []
+        for token in argv:
+            for marker, expression in expressions.items():
+                token = token.replace(marker, expression)
+            restored.append(token)
+        return restored
     pytest.fail("the workflow no longer invokes bench.harness.gate")
     raise AssertionError("unreachable")
 
@@ -290,41 +455,21 @@ def raw_verdict() -> dict[str, object]:
     return json.loads(RAW_VERDICT.read_text(encoding="utf-8"))
 
 
-def _verdict_from(section: dict[str, object], home: str) -> dict[str, object]:
-    """Rebuild the worker verdict the committed section was projected from.
+@pytest.fixture(scope="module")
+def raw_metadata() -> dict[str, object]:
+    return json.loads(RAW_METADATA.read_text(encoding="utf-8"))
 
-    Nothing is invented here. ``exit_code`` and ``duration_seconds`` come from provenance,
-    which is the whole point: the audited version wrote ``"exit_code": 0`` as a literal, so
-    the field under test was authored by the test and the artifact never carried it.
-    """
-    frozen = section["frozen"]
-    observed = section["observed"][home]  # type: ignore[index]
-    provenance = section["provenance"][home]  # type: ignore[index]
-    return {
-        "ok": True,
-        "failure": "",
-        "profile": provenance["profile"],
-        "generator": frozen["corpus"]["generator"],  # type: ignore[index]
-        "oracle": frozen["gt"]["oracle"],  # type: ignore[index]
-        "gt_path_used": provenance["gt_path_used"],
-        "numpy": provenance["numpy"],
-        "k": frozen["k"],  # type: ignore[index]
-        "queries": frozen["queries"],  # type: ignore[index]
-        "corpus_size": frozen["corpus"]["size"],  # type: ignore[index]
-        "dimension": frozen["dimension"],  # type: ignore[index]
-        "hashes": {
-            "corpus_sha256_f64": frozen["corpus"]["sha256_f64"],  # type: ignore[index]
-            "corpus_sha256_f32": frozen["corpus"]["sha256_f32"],  # type: ignore[index]
-            "query_sha256_f64": frozen["query_set"]["sha256_f64"],  # type: ignore[index]
-            "query_sha256_f32": frozen["query_set"]["sha256_f32"],  # type: ignore[index]
-        },
-        "gauge": observed["mean_recall_at_k"],
-        "observed": dict(observed),
-        "blas_environment": dict(provenance["blas_environment"]),
-        "hnsw": dict(frozen["hnsw"]),  # type: ignore[index]
-        "duration_seconds": provenance["frozen_from"]["duration_seconds"],
-        "exit_code": provenance["frozen_from"]["exit_code"],
-    }
+
+def _captured_verdict(
+    raw_verdict: dict[str, object], raw_metadata: dict[str, object]
+) -> dict[str, object]:
+    """Join the worker bytes to the wrapper facts, never to the calibration under test."""
+    captured = copy.deepcopy(raw_verdict)
+    assert "duration_seconds" not in captured
+    assert "exit_code" not in captured
+    captured["duration_seconds"] = raw_metadata["duration_seconds"]
+    captured["exit_code"] = raw_metadata["exit_code"]
+    return captured
 
 
 # =====================================================================================
@@ -344,17 +489,65 @@ def test_the_provenance_names_the_worker_blob_that_is_committed_here(
     turns the evidence red.
     """
     recorded = frozen_from["runner_source"]
-    assert recorded["path"] == WORKER_RELATIVE  # type: ignore[index]
-    computed = _git_blob(PROJECT_ROOT / WORKER_RELATIVE)
-    assert recorded["git_blob"] == computed, (  # type: ignore[index]
-        "the worker recorded in provenance is not the worker in this tree: "
-        f"{recorded['git_blob']} vs {computed}"  # type: ignore[index]
+    assert isinstance(recorded, dict)
+    _, blob, _ = _assert_committed_source(
+        recorded,
+        expected_path=WORKER_RELATIVE,
+        expected_role=RUNNER_ROLE,
     )
-    _require_hex64(recorded["canonical_blob_sha256"], "the worker content hash")  # type: ignore[index]
+    computed = _git_blob(PROJECT_ROOT / WORKER_RELATIVE)
+    assert blob == computed, (
+        "the worker recorded in provenance is not the worker in this tree: "
+        f"{blob} vs {computed}"
+    )
     assert recorded["canonical_blob_sha256"] == _canonical_blob_sha256(  # type: ignore[index]
         PROJECT_ROOT / WORKER_RELATIVE
     )
-    assert len(recorded["commit"]) == 40  # type: ignore[index,arg-type]
+
+
+def test_the_recorded_object_format_is_the_repository_format(
+    frozen_from: dict[str, object],
+) -> None:
+    """OID widths and blob arithmetic are meaningful only under the named format."""
+    assert frozen_from["object_format"] == "sha1"
+    assert frozen_from["object_format"] == _object_format()
+
+
+def test_a_well_shaped_but_nonexistent_runner_commit_is_rejected(
+    frozen_from: dict[str, object],
+) -> None:
+    """Forty hex characters are not proof that an object exists."""
+    mutated = copy.deepcopy(frozen_from["runner_source"])
+    assert isinstance(mutated, dict)
+    mutated["commit"] = "0" * 40
+    with pytest.raises(AssertionError, match=r"git rev-parse .* failed"):
+        _assert_committed_source(
+            mutated,
+            expected_path=WORKER_RELATIVE,
+            expected_role=RUNNER_ROLE,
+        )
+
+
+def test_a_wrong_engine_blob_is_rejected_even_when_the_commit_exists(
+    frozen_from: dict[str, object],
+) -> None:
+    """The commit, path and blob are one identity chain, not independent labels."""
+    mutated = copy.deepcopy(frozen_from["engine_dependency_source"])
+    assert isinstance(mutated, dict)
+    mutated["git_blob"] = "0" * 40
+    with pytest.raises(AssertionError, match="not recorded blob"):
+        _assert_committed_source(
+            mutated,
+            expected_path=ENGINE_RELATIVE,
+            expected_role=ENGINE_ROLE,
+            extra_keys=frozenset(
+                {
+                    "loaded_canonical_sha256",
+                    "loaded_module_basename",
+                    "proven_against_committed_blob",
+                }
+            ),
+        )
 
 
 def test_the_engine_is_a_dependency_and_never_an_ancestor_of_the_runner(
@@ -370,20 +563,38 @@ def test_the_engine_is_a_dependency_and_never_an_ancestor_of_the_runner(
     other parent -- so a check phrased against HEAD would flip from passing to failing on a
     merge, reporting a defect where nothing had changed about the measurement.
 
-    And the declared field is asserted unconditionally while the git check only strengthens
-    it: a fresh CI clone may not carry that object, and a test that silently skipped there
-    would be a guard that never fires where it matters.
+    Both objects are mandatory. A missing object, invalid revision, wrong path, wrong blob or
+    wrong content hash is a provenance failure; Git return code 128 is never treated as a
+    reason to skip the relationship check.
     """
     engine = frozen_from["engine_dependency_source"]
     runner = frozen_from["runner_source"]
-    assert str(engine["path"]).endswith("hnsw.py")  # type: ignore[index]
-    _require_hex64(engine["canonical_blob_sha256"], "the engine content hash")  # type: ignore[index]
+    assert isinstance(engine, dict)
+    assert isinstance(runner, dict)
+    engine_commit, _, engine_sha256 = _assert_committed_source(
+        engine,
+        expected_path=ENGINE_RELATIVE,
+        expected_role=ENGINE_ROLE,
+        extra_keys=frozenset(
+            {
+                "loaded_canonical_sha256",
+                "loaded_module_basename",
+                "proven_against_committed_blob",
+            }
+        ),
+    )
+    runner_commit, _, _ = _assert_committed_source(
+        runner,
+        expected_path=WORKER_RELATIVE,
+        expected_role=RUNNER_ROLE,
+    )
     assert engine["proven_against_committed_blob"] is True, (  # type: ignore[index]
         "the engine that loaded was never proven against the committed blob"
     )
-    assert engine["loaded_canonical_sha256"] == engine["canonical_blob_sha256"], (  # type: ignore[index]
+    assert engine["loaded_canonical_sha256"] == engine_sha256, (  # type: ignore[index]
         "the module that loaded is not the module the artifact names"
     )
+    assert engine["loaded_module_basename"] == Path(ENGINE_RELATIVE).name
     assert frozen_from["engine_is_ancestor_of_runner_commit"] is False, (
         "the engine commit is a separate integration dependency, never an ancestor"
     )
@@ -394,16 +605,16 @@ def test_the_engine_is_a_dependency_and_never_an_ancestor_of_the_runner(
             "git",
             "merge-base",
             "--is-ancestor",
-            str(engine["commit"]),  # type: ignore[index]
-            str(runner["commit"]),  # type: ignore[index]
+            engine_commit,
+            runner_commit,
         ],
         cwd=str(PROJECT_ROOT),
         capture_output=True,
     )
-    if probe.returncode in (0, 1):
-        assert probe.returncode == 1, (
-            "the engine commit IS an ancestor of the runner commit, so the artifact lies"
-        )
+    assert probe.returncode == 1, (
+        "the engine relationship is not the recorded non-ancestry: "
+        f"git returned {probe.returncode}; stderr={probe.stderr.decode('utf-8', errors='replace')!r}"
+    )
 
 
 def test_the_frozen_search_width_is_the_measured_320(
@@ -423,7 +634,7 @@ def test_the_committed_hnsw_block_is_the_constant_the_worker_runs(
 
 
 def test_the_recorded_evidence_stops_validating_when_the_width_drifts(
-    section: dict[str, object], home: str
+    raw_verdict: dict[str, object], raw_metadata: dict[str, object]
 ) -> None:
     """The guard that does not rely on anyone remembering to compare two literals.
 
@@ -433,11 +644,11 @@ def test_the_recorded_evidence_stops_validating_when_the_width_drifts(
     verdict is complete, so the refusal below is earned by the width and not by a field the
     rebuild forgot.
     """
-    verdict = _verdict_from(section, home)
+    verdict = _captured_verdict(raw_verdict, raw_metadata)
     assert _validate_verdict(verdict, verdict["profile"]) is None  # type: ignore[arg-type]
 
-    drifted = _verdict_from(section, home)
-    drifted["hnsw"] = {**dict(section["frozen"]["hnsw"]), "ef_search": 64}  # type: ignore[index]
+    drifted = copy.deepcopy(verdict)
+    drifted["hnsw"] = {**dict(verdict["hnsw"]), "ef_search": 64}  # type: ignore[arg-type]
     reason = _validate_verdict(drifted, verdict["profile"])  # type: ignore[arg-type]
     assert reason is not None, (
         "a verdict measured at another width is not this calibration"
@@ -471,6 +682,209 @@ def test_the_versioned_evidence_hashes_to_what_provenance_records(
             f"{what} does not hash to what provenance records"
         )
     assert evidence["verdict_bytes"] == len(_raw_bytes(RAW_VERDICT))  # type: ignore[index]
+
+
+def test_every_metadata_field_is_parsed_and_cross_checked(
+    section: dict[str, object],
+    home: str,
+    frozen_from: dict[str, object],
+    raw_verdict: dict[str, object],
+    raw_metadata: dict[str, object],
+) -> None:
+    """Authenticated metadata is useful only if every field reaches an independent fact."""
+    assert set(raw_metadata) == {
+        "blas_environment",
+        "command",
+        "cwd",
+        "duration_seconds",
+        "engine",
+        "engine_relationship",
+        "exit_code",
+        "loaded_modules",
+        "numpy",
+        "platform",
+        "python",
+        "python_full",
+        "pythonpath_note",
+        "raw_verdict_bytes",
+        "raw_verdict_sha256",
+        "what",
+        "worker",
+        "worker_stderr_tail",
+        "worker_stdout_tail",
+    }
+
+    evidence = frozen_from["evidence"]
+    runner = frozen_from["runner_source"]
+    engine = frozen_from["engine_dependency_source"]
+    assert isinstance(evidence, dict)
+    assert isinstance(runner, dict)
+    assert isinstance(engine, dict)
+    assert set(evidence) == {
+        "capture_script",
+        "capture_script_canonical_blob_sha256",
+        "metadata",
+        "metadata_raw_sha256",
+        "raw_sha256",
+        "verdict",
+        "verdict_base64",
+        "verdict_bytes",
+    }
+    assert evidence["metadata"] == RAW_METADATA.relative_to(PROJECT_ROOT).as_posix()
+    assert evidence["verdict"] == RAW_VERDICT.relative_to(PROJECT_ROOT).as_posix()
+    assert evidence["verdict_base64"] == RAW_B64.relative_to(PROJECT_ROOT).as_posix()
+
+    def metadata_identity(source: dict[str, object]) -> dict[str, object]:
+        return {
+            "blob": source["git_blob"],
+            "blob_sha256": source["canonical_blob_sha256"],
+            "commit": source["commit"],
+            "path": source["path"],
+        }
+
+    assert raw_metadata["worker"] == metadata_identity(runner)
+    assert raw_metadata["engine"] == metadata_identity(engine)
+    assert raw_metadata["raw_verdict_sha256"] == evidence["raw_sha256"]
+    assert raw_metadata["raw_verdict_sha256"] == _raw_sha256(RAW_VERDICT)
+    assert raw_metadata["raw_verdict_bytes"] == evidence["verdict_bytes"]
+    assert raw_metadata["raw_verdict_bytes"] == len(_raw_bytes(RAW_VERDICT))
+
+    provenance = section["provenance"][home]  # type: ignore[index]
+    for field in ("blas_environment", "numpy", "platform", "python"):
+        assert raw_metadata[field] == frozen_from[field]
+    assert raw_metadata["blas_environment"] == raw_verdict["blas_environment"]
+    assert raw_metadata["blas_environment"] == provenance["blas_environment"]
+    assert raw_metadata["numpy"] == raw_verdict["numpy"] == provenance["numpy"]
+    assert raw_metadata["duration_seconds"] == frozen_from["duration_seconds"]
+    assert raw_metadata["duration_seconds"] == provenance["duration_seconds"]
+    assert raw_metadata["exit_code"] == frozen_from["exit_code"]
+
+    loaded = raw_metadata["loaded_modules"]
+    assert isinstance(loaded, dict)
+    assert set(loaded) == {
+        "hnsw",
+        "hnsw_lf_sha256",
+        "matches_committed_blob",
+        "okto_grafx",
+    }
+    assert loaded["hnsw"] == engine["loaded_module_basename"]
+    assert loaded["hnsw_lf_sha256"] == engine["loaded_canonical_sha256"]
+    assert loaded["matches_committed_blob"] is True
+    assert loaded["matches_committed_blob"] is engine["proven_against_committed_blob"]
+    assert loaded["okto_grafx"] == "__init__.py"
+
+    template = frozen_from["command_template"]
+    command = raw_metadata["command"]
+    assert isinstance(template, dict)
+    assert isinstance(command, list) and all(type(item) is str for item in command)
+    assert command[1:-1] == [
+        "-m",
+        "bench.harness.recall_worker",
+        "--profile",
+        "full",
+        "--gt",
+        "auto",
+        "--out",
+    ]
+    assert _is_absolute_anywhere(command[0]), "the exact interpreter that ran is recorded"
+    assert _is_absolute_anywhere(command[-1]), "the exact output path is recorded"
+    assert template["argv"] == ["<PYTHON>", *command[1:-1], "<VERDICT_OUTPUT_PATH>"]
+    assert template["cwd"] == "<RUNNER_WORKTREE>"
+    assert template["pythonpath"] == "<ENGINE_WORKTREE>/src"
+    assert template["environment"] == raw_metadata["blas_environment"]
+
+    assert raw_metadata["cwd"] == "the C13 worktree"
+    assert raw_metadata["what"] == (
+        "C13 full-profile vector recall measurement, re-taken from clean trees"
+    )
+    assert str(raw_metadata["python_full"]).split()[0] == raw_metadata["python"]
+    assert "PYTHONPATH" in str(raw_metadata["pythonpath_note"])
+    assert "verified against the committed blob" in str(raw_metadata["pythonpath_note"])
+    assert raw_metadata["worker_stderr_tail"] == ""
+    assert raw_metadata["worker_stdout_tail"] == (
+        f"recall worker: profile {raw_verdict['profile']} mean recall@k "
+        f"{raw_verdict['gauge']:.4f} via {raw_verdict['gt_path_used']}\n"
+    )
+
+    relationship = str(raw_metadata["engine_relationship"])
+    assert str(engine["commit"]) in relationship
+    assert "NOT an ancestor" in relationship
+    assert "SEPARATE INTEGRATION DEPENDENCY" in relationship
+    assert "not an ancestor" in str(frozen_from["engine_relationship"]).lower()
+
+
+def test_every_frozen_provenance_field_is_governed(
+    section: dict[str, object], home: str, frozen_from: dict[str, object]
+) -> None:
+    """A new provenance field cannot arrive without a test deciding what proves it."""
+    assert set(section["provenance"][home]) == {  # type: ignore[index]
+        "blas_environment",
+        "duration_seconds",
+        "frozen_from",
+        "gt_path_used",
+        "numpy",
+        "profile",
+        "python",
+    }
+    assert set(frozen_from) == {
+        "blas_environment",
+        "command_template",
+        "concurrent_load",
+        "duration_is_authoritative",
+        "duration_seconds",
+        "engine_dependency_source",
+        "engine_is_ancestor_of_runner_commit",
+        "engine_relationship",
+        "evidence",
+        "exit_code",
+        "hash_convention",
+        "machine_local_paths",
+        "measured_ef_search",
+        "numpy",
+        "object_format",
+        "platform",
+        "python",
+        "runner_source",
+    }
+    convention = str(frozen_from["hash_convention"])
+    for required in ("raw_sha256", "EXACT bytes", "-text", "canonical_blob_sha256", "LF"):
+        assert required in convention
+    assert "never interchanged" in convention
+
+
+def test_the_frozen_projection_comes_from_the_raw_verdict_not_itself(
+    section: dict[str, object],
+    home: str,
+    raw_verdict: dict[str, object],
+    raw_metadata: dict[str, object],
+) -> None:
+    """The raw worker document and harness constants independently rebuild the freeze."""
+    assert set(raw_verdict) == {
+        "blas_environment",
+        "corpus_size",
+        "dimension",
+        "failure",
+        "gauge",
+        "generator",
+        "gt_path_used",
+        "hashes",
+        "hnsw",
+        "k",
+        "numpy",
+        "observed",
+        "ok",
+        "oracle",
+        "profile",
+        "queries",
+    }
+    captured = _captured_verdict(raw_verdict, raw_metadata)
+    assert _validate_verdict(captured, str(captured["profile"])) is None
+
+    rebuilt = build_section(captured, target=DEFAULT_TARGET)
+    assert rebuilt["frozen"] == section["frozen"]
+    rebuilt_home = next(iter(rebuilt["observed"]))  # type: ignore[arg-type]
+    assert rebuilt["observed"][rebuilt_home] == raw_verdict["observed"]  # type: ignore[index]
+    assert raw_verdict["observed"] == section["observed"][home]  # type: ignore[index]
 
 
 def test_the_base64_envelope_reproduces_the_verdict_byte_for_byte() -> None:
@@ -527,7 +941,15 @@ def test_the_evidence_directory_refuses_newline_translation() -> None:
     """
     attributes = EVIDENCE / ".gitattributes"
     assert attributes.exists(), "bench/evidence needs its own .gitattributes"
-    assert "-text" in attributes.read_text(encoding="utf-8")
+    relative = RAW_METADATA.relative_to(PROJECT_ROOT).as_posix()
+    reported: dict[str, str] = {}
+    for line in _git_text("check-attr", "text", "diff", "--", relative).splitlines():
+        _, attribute, value = line.split(": ", 2)
+        reported[attribute] = value
+    assert reported == {"text": "unset", "diff": "unset"}, (
+        "the evidence must be byte-stable and binary to diff machinery; comments do not "
+        f"set attributes, and git reports {reported}"
+    )
 
 
 def test_the_published_numbers_are_the_measured_numbers(
@@ -550,7 +972,7 @@ def test_the_published_numbers_are_the_measured_numbers(
 
 
 def test_the_exit_code_and_duration_come_from_the_run(
-    frozen_from: dict[str, object],
+    frozen_from: dict[str, object], raw_metadata: dict[str, object]
 ) -> None:
     """Both were absent from the first freeze; one was invented by the test itself.
 
@@ -560,10 +982,12 @@ def test_the_exit_code_and_duration_come_from_the_run(
     exit_code = frozen_from["exit_code"]
     assert type(exit_code) is int, f"exit_code must be an exact int; got {exit_code!r}"
     assert exit_code == 0, f"the measurement must have succeeded; exit code {exit_code}"
+    assert exit_code == raw_metadata["exit_code"]
 
     duration = frozen_from["duration_seconds"]
     assert type(duration) is float, f"duration must be an exact float; got {duration!r}"
     assert duration > 0.0, "a measurement takes time"
+    assert duration == raw_metadata["duration_seconds"]
 
 
 def test_the_contended_timing_is_published_as_non_authoritative(
@@ -640,16 +1064,26 @@ def test_the_command_template_names_no_machine(
     machine-local position is a placeholder, and this proves it rather than trusting it.
     """
     template = frozen_from["command_template"]
+    assert isinstance(template, dict)
+    assert set(template) == {"argv", "cwd", "environment", "note", "pythonpath"}
     for trail, value in _walk_strings(template, "command_template"):
         assert not _is_absolute_anywhere(value), (
             f"{trail} carries a machine-local path: {value!r}"
         )
     argv = template["argv"]  # type: ignore[index]
-    assert argv[0].startswith("<") and argv[0].endswith(">"), (
-        f"the interpreter is a placeholder, not this machine's python: {argv[0]!r}"
-    )
-    assert "bench.harness.recall_worker" in argv, "and it still names the real worker"
-    assert argv[argv.index("--profile") + 1] == "full"
+    assert argv == [
+        "<PYTHON>",
+        "-m",
+        "bench.harness.recall_worker",
+        "--profile",
+        "full",
+        "--gt",
+        "auto",
+        "--out",
+        "<VERDICT_OUTPUT_PATH>",
+    ]
+    assert template["cwd"] == "<RUNNER_WORKTREE>"
+    assert template["pythonpath"] == "<ENGINE_WORKTREE>/src"
     assert set(template["environment"]) == {  # type: ignore[index]
         "OMP_NUM_THREADS",
         "OPENBLAS_NUM_THREADS",
@@ -682,12 +1116,14 @@ def test_every_hash_in_the_frozen_block_is_lowercase_hex(
 
 
 def test_the_committed_frozen_block_is_exactly_what_the_builder_produces(
-    section: dict[str, object], home: str
+    section: dict[str, object],
+    raw_verdict: dict[str, object],
+    raw_metadata: dict[str, object],
 ) -> None:
-    """Feed the committed values back through the builder and demand equality."""
+    """Feed the authenticated raw capture through the builder and demand equality."""
     rebuilt = build_section(
-        _verdict_from(section, home),
-        target=section["frozen"]["target"],  # type: ignore[index]
+        _captured_verdict(raw_verdict, raw_metadata),
+        target=DEFAULT_TARGET,
     )
     assert rebuilt["frozen"] == section["frozen"]
 
@@ -771,7 +1207,7 @@ def test_machine_local_paths_are_confined_to_the_evidence_directory() -> None:
             path.read_text(encoding="utf-8", errors="replace").splitlines(), 1
         ):
             for token in line.replace('"', " ").replace("'", " ").split():
-                if len(token) > 3 and "<" not in token and _is_absolute_anywhere(token):
+                if len(token) > 3 and _is_absolute_anywhere(token):
                     offenders.append(
                         f"{path.relative_to(PROJECT_ROOT).as_posix()}:{number} {token}"
                     )
@@ -822,11 +1258,23 @@ def test_the_evidence_directory_declares_why_it_may_hold_them(
     [
         "C:\\Projetos\\okto_grafx\\bench\\harness\\recall_worker.py",
         "\\\\build-server\\share\\evidence.json",
+        "\\Users\\builder\\evidence.json",
         "/artifact",
         "/home/runner/work/okto_grafx/bench",
         "D:/Projetos/Techridy/okto_grafx-c13",
+        "<C:\\Users\\builder\\evidence.json>",
+        "<PLACEHOLDER>C:\\Users\\builder\\evidence.json",
     ],
-    ids=["drive", "unc", "single-segment", "posix", "forward-drive"],
+    ids=[
+        "drive",
+        "unc",
+        "windows-root-relative",
+        "single-segment",
+        "posix",
+        "forward-drive",
+        "angle-wrapped-drive",
+        "angle-prefixed-drive",
+    ],
 )
 def test_the_path_detector_recognizes_every_rooted_form(hostile: str) -> None:
     """The detector is itself under test, because the audited one looked correct.
@@ -839,7 +1287,15 @@ def test_the_path_detector_recognizes_every_rooted_form(hostile: str) -> None:
 
 @pytest.mark.parametrize(
     "benign",
-    ["bench/harness/recall_worker.py", "uniform-int53-v1", "3.13.1", "cosine", ""],
+    [
+        "bench/harness/recall_worker.py",
+        "uniform-int53-v1",
+        "3.13.1",
+        "cosine",
+        "<PYTHON>",
+        "<ENGINE_WORKTREE>/src",
+        "",
+    ],
 )
 def test_the_path_detector_leaves_relative_values_alone(benign: str) -> None:
     """The control: a detector that fires on everything would just be a broken build."""
@@ -913,12 +1369,10 @@ def test_the_workflow_command_lets_the_versioned_artifact_govern() -> None:
     it entirely. Tokenizing the effective run scalar closes both.
     """
     argv = _gate_command()
-    assert "--require-recall" in argv, f"the stage stays fail-closed; got {argv}"
-    assert "--calibration" in argv, f"the artifact is named explicitly; got {argv}"
-    assert "--recall-target" not in argv, (
-        f"the floor comes from the artifact, not from a flag; got {argv}"
+    assert tuple(argv) == EXPECTED_GATE_ARGV, (
+        "the effective gate command changed; review every token rather than allowing an "
+        f"implicit flag or shell operator: {argv}"
     )
-    assert argv[argv.index("--calibration") + 1] == "bench/calibration.json"
 
 
 def test_no_gate_flag_can_arrive_through_a_shell_variable() -> None:
@@ -930,11 +1384,23 @@ def test_no_gate_flag_can_arrive_through_a_shell_variable() -> None:
     argv = _gate_command()
     metrics_value = argv[argv.index("--metrics") + 1]
     for token in argv:
-        assert not token.startswith("$"), f"{token!r} expands at run time"
+        without_matrix = token.replace("${{ matrix.family }}", "")
+        assert "$" not in without_matrix, f"{token!r} expands at run time"
+        assert "`" not in without_matrix, f"{token!r} executes a command substitution"
         if "${{" in token:
             assert token == metrics_value, (
                 f"only the metrics filename may interpolate; {token!r} does too"
             )
+
+
+def test_quoted_shell_variables_are_still_visible_after_tokenization() -> None:
+    """The old posix=False split left the quote ahead of '$' and hid the expansion."""
+    argv = shlex.split(
+        'python -m bench.harness.gate "$GATE_FLAGS" --require-recall',
+        posix=True,
+    )
+    assert "$GATE_FLAGS" in argv
+    assert any("$" in token for token in argv)
 
 
 # =====================================================================================
@@ -1001,11 +1467,19 @@ def test_the_surviving_knob_carries_no_execution_load() -> None:
         "wiring the target to the algorithm would take"
     )
 
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.BinOp, ast.Return)):
-            for inner in ast.walk(node):
-                if isinstance(inner, ast.Attribute) and inner.attr == KNOB:
-                    pytest.fail(
-                        "the recall target reaches arithmetic or a return value; it is an "
-                        "SLO the harness verifies, never an input to a computation"
-                    )
+    offenders = _knob_execution_offenders(tree)
+    assert offenders == [], (
+        "the recall target escaped its declaration or exact validation calls at lines "
+        f"{sorted({getattr(node, 'lineno', 0) for node in offenders})}"
+    )
+
+
+def test_a_call_cannot_turn_the_surviving_knob_into_an_execution_input() -> None:
+    """Regression for the AST hole: calls are neither BinOp nor Return nodes."""
+    hostile = ast.parse(
+        "def mutate(self):\n"
+        "    apply_search_beam(self.vector_recall_target)\n"
+    )
+    assert _knob_execution_offenders(hostile), (
+        "apply_search_beam(self.vector_recall_target) must fail the structural gate"
+    )

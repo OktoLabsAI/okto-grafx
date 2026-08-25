@@ -2,3 +2,5 @@
 # calibration covers exactly what the worker subprocess wrote, and a checkout that
 # rewrote line endings would break that hash on the platform CI runs on.
 * -text
+*.json -diff
+*.b64 -diff
