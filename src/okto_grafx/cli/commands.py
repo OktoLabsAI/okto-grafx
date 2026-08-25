@@ -42,6 +42,7 @@ from okto_grafx import Database, connect
 from okto_grafx.cli.exits import (
     FINDINGS,
     INCONCLUSIVE,
+    INTERNAL,
     OK,
     exit_code_for,
     is_inconclusive,
@@ -49,8 +50,10 @@ from okto_grafx.cli.exits import (
 )
 from okto_grafx.cli.output import describe, render_table
 from okto_grafx.cli.parser import CONNECTION_OPTIONS, Invocation
+from okto_grafx.domain import errors as grafx_errors
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
+    GrafxCorruptionDetected,
     GrafxError,
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
@@ -103,6 +106,62 @@ MAX_PREVIEW_BYTES: int = 64
 Evidence is read with ``--output``, which writes the whole range to a file. The inline preview is
 there to let an operator recognise what they are looking at, not to carry it.
 """
+
+_QUARANTINE_INVENTORY_STATES: tuple[str, ...] = (
+    "complete",
+    "incomplete",
+    "corrupt_manifest",
+    "unreadable_manifest",
+    "missing_payload",
+    "manifest_mismatch",
+    "unexpected_layout",
+)
+"""Every state the conclusive public quarantine inventory can contain."""
+
+_DECLARED_GRAFX_ERROR_TYPES: tuple[type[GrafxError], ...] = tuple(
+    error_type
+    for name in grafx_errors.__all__
+    if isinstance((error_type := getattr(grafx_errors, name)), type)
+    and issubclass(error_type, GrafxError)
+)
+"""Engine-owned failures whose plain message field is safe to copy during cleanup."""
+
+_DetachedGrafxOutcome = tuple[str, str, str, bool, dict[str, object]]
+
+
+def _initialize_detached_grafx_failure(
+    failure: GrafxError, outcome: _DetachedGrafxOutcome
+) -> None:
+    """Install only canonical builtins without calling a possibly patched Grafx constructor."""
+    error_type, code, message, retryable, details = outcome
+    Exception.__init__(failure, message)
+    failure.message = message
+    failure.code = code
+    failure.retryable = retryable
+    failure.details = dict(details)
+    failure.error_type = error_type  # type: ignore[attr-defined]
+    failure.inconclusive = details.get("inconclusive") is True  # type: ignore[attr-defined]
+
+
+class _DetachedCliGrafxFailure(GrafxError):
+    """A trusted copy of one exact declared failure, with no source capability attached."""
+
+    def __init__(self, outcome: _DetachedGrafxOutcome) -> None:
+        _initialize_detached_grafx_failure(self, outcome)
+
+
+class _DetachedCliCorruptionFailure(GrafxCorruptionDetected):
+    """Detached damage that retains the taxonomy's isinstance-based precedence."""
+
+    def __init__(self, outcome: _DetachedGrafxOutcome) -> None:
+        _initialize_detached_grafx_failure(self, outcome)
+
+
+class _DetachedCliTransactionStateFailure(GrafxTransactionStateError):
+    """Detached transaction refusal that retains the CLI's write-door hint routing."""
+
+    def __init__(self, outcome: _DetachedGrafxOutcome) -> None:
+        _initialize_detached_grafx_failure(self, outcome)
 
 _CONNECT_KEYS: tuple[str, ...] = tuple(
     option.key
@@ -165,7 +224,9 @@ def status_reasons(
     if ledger_total:
         reasons.append(f"the ledger holds {ledger_total} entry(ies) of unapplied work")
     if quarantined:
-        reasons.append(f"quarantine holds {quarantined} entry(ies) of preserved evidence")
+        reasons.append(
+            f"quarantine holds {quarantined} physical inventory item(s) of preserved evidence"
+        )
     if damaged_ledger_tail:
         reasons.append("the ledger itself has an unreadable tail")
     return reasons
@@ -215,7 +276,10 @@ def run(invocation: Invocation) -> Report:
     try:
         return handler(invocation)
     except GrafxError as failure:
-        return _refusal(invocation, failure)
+        detached = _detach_declared_grafx_failure(failure)
+        if detached is None:
+            return _foreign_grafx_report(invocation)
+        return _refusal(invocation, detached)
 
 
 # --- opening ----------------------------------------------------------------------------------
@@ -281,7 +345,10 @@ def _on_database(invocation: Invocation, body: Callable[[Database], Report]) -> 
         report = body(database)
     except GrafxError as failure:
         note = _close_quietly(database)
-        refusal = _refusal(invocation, failure)
+        detached = _detach_declared_grafx_failure(failure)
+        if detached is None:
+            return _foreign_grafx_report(invocation, close_problem=note)
+        refusal = _refusal(invocation, detached)
         return (
             refusal
             if note is None
@@ -297,16 +364,35 @@ def _on_database(invocation: Invocation, body: Callable[[Database], Report]) -> 
         raise
     try:
         database.close()
-    except GrafxError as failure:
-        closing = _refusal(invocation, failure)
-        payload = {**report.payload, **closing.payload, "close_problem": failure.message}
-        # The report already carries the shared keys, so the merge only adds the error envelope.
-        return Report(
-            exit_code=closing.exit_code if report.exit_code == OK else report.exit_code,
-            payload=payload,
-            lines=report.lines,
-            problems=(*report.problems, *closing.problems),
-        )
+    except BaseException as failure:
+        description = _close_failure_description(failure)
+        note = f"The database could not be closed: {description}"
+        if report.exit_code != OK:
+            # A completed non-clean observation is the primary answer.  Cleanup remains visible,
+            # but must not inject a contradictory refusal envelope or erase evidence -- even when
+            # cleanup raised process-control rather than an ordinary Exception.
+            return Report(
+                exit_code=report.exit_code,
+                payload={**report.payload, "close_problem": description},
+                lines=report.lines,
+                problems=(*report.problems, note),
+            )
+        if isinstance(failure, GrafxError):
+            detached = _detach_declared_grafx_failure(failure)
+            if detached is None:
+                return _foreign_grafx_report(invocation)
+            closing = _refusal(invocation, detached)
+            return Report(
+                exit_code=closing.exit_code,
+                payload={
+                    **report.payload,
+                    **closing.payload,
+                    "close_problem": description,
+                },
+                lines=report.lines,
+                problems=(*report.problems, *closing.problems),
+            )
+        raise
     return report
 
 
@@ -318,9 +404,122 @@ def _close_quietly(database: Database) -> str | None:
     """
     try:
         database.close()
-    except Exception as failure:  # noqa: BLE001 - see the docstring: the first failure wins
-        return f"The database could not be closed: {describe(failure)}"
+    except BaseException as failure:
+        return f"The database could not be closed: {_close_failure_description(failure)}"
     return None
+
+
+def _close_failure_description(failure: BaseException) -> str:
+    """Copy a trusted Grafx message without dispatching code on a foreign cleanup failure."""
+    if isinstance(failure, GrafxError):
+        detached = _detach_declared_grafx_failure(failure)
+        if detached is not None:
+            return detached.message
+    return "a secondary close failure"
+
+
+def _detach_declared_grafx_failure(failure: GrafxError) -> GrafxError | None:
+    """Return a capability-free copy only for an exact engine-declared error class."""
+    failure_type = type(failure)
+    if not any(failure_type is declared for declared in _DECLARED_GRAFX_ERROR_TYPES):
+        return None
+    try:
+        captured_message = object.__getattribute__(failure, "message")
+    except BaseException:
+        captured_message = None
+    message = (
+        captured_message
+        if type(captured_message) is str
+        else "A Grafx failure had no safe text message."
+    )
+    try:
+        captured_retryable = object.__getattribute__(failure, "retryable")
+    except BaseException:
+        captured_retryable = False
+    retryable = captured_retryable is True
+    try:
+        captured_details = object.__getattribute__(failure, "details")
+    except BaseException:
+        captured_details = None
+    details = _detached_error_details(captured_details)
+    try:
+        captured_inconclusive = object.__getattribute__(failure, "inconclusive")
+    except BaseException:
+        captured_inconclusive = False
+    if captured_inconclusive is True:
+        details["inconclusive"] = True
+    error_type = failure_type.__name__
+    code = failure_type.code
+    outcome: _DetachedGrafxOutcome = (
+        error_type if type(error_type) is str else "GrafxError",
+        code if type(code) is str else "grafx_error",
+        message,
+        retryable,
+        details,
+    )
+    if failure_type is GrafxCorruptionDetected:
+        return _DetachedCliCorruptionFailure(outcome)
+    if failure_type is GrafxTransactionStateError:
+        return _DetachedCliTransactionStateFailure(outcome)
+    return _DetachedCliGrafxFailure(outcome)
+
+
+def _detached_error_details(value: object, *, depth: int = 0) -> dict[str, object]:
+    """Copy a bounded exact-dict error envelope without invoking stored collaborators."""
+    if type(value) is not dict or depth >= 8:
+        return {}
+    copied: dict[str, object] = {}
+    for position, (key, item) in enumerate(dict.items(value)):
+        if position >= 64:
+            break
+        if type(key) is str and key != "retryable":
+            copied[key] = _detached_error_detail(item, depth=depth + 1)
+    return copied
+
+
+def _detached_error_detail(value: object, *, depth: int) -> object:
+    """Return a JSON-safe builtin projection of one error detail without foreign dispatch."""
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    if depth >= 8:
+        return "<detail depth exceeded>"
+    if type(value) is list:
+        return [
+            _detached_error_detail(item, depth=depth + 1) for item in value[:64]
+        ]
+    if type(value) is tuple:
+        return tuple(
+            _detached_error_detail(item, depth=depth + 1) for item in value[:64]
+        )
+    if type(value) is dict:
+        return _detached_error_details(value, depth=depth)
+    return "<unsafe detail omitted>"
+
+
+def _foreign_grafx_report(
+    invocation: Invocation, *, close_problem: str | None = None
+) -> Report:
+    """Contain an undeclared Grafx subclass without reading or rendering the foreign object."""
+    message = (
+        "An undeclared Grafx error subclass crossed the CLI boundary and was contained without "
+        "dispatching its attributes."
+    )
+    payload: dict[str, object] = {
+        **_head(invocation),
+        "error": {
+            "type": "UndeclaredGrafxError",
+            "code": "internal",
+            "message": message,
+            "retryable": False,
+            "inconclusive": False,
+            "details": {},
+        },
+    }
+    problems = (message,)
+    if close_problem is not None:
+        payload["close_problem"] = close_problem
+        problems = (*problems, close_problem)
+    return Report(exit_code=INTERNAL, payload=payload, problems=problems)
 
 
 # --- shared rendering ---------------------------------------------------------------------------
@@ -488,11 +687,16 @@ def _status_body(invocation: Invocation, database: Database) -> Report:
     identity = database.identity
     recovery = database.recovery_report
     ledger = _optional_component(database, "ledger")
-    quarantine = _optional_component(database, "quarantine")
+    quarantine = _require_quarantine(database)
 
     depth = dict(ledger.depth()) if ledger is not None else {}
     ledger_total = sum(depth.values())
-    quarantined = quarantine.count() if quarantine is not None else 0
+    inventory = quarantine.inventory()  # type: ignore[attr-defined]
+    quarantine_states = {state: 0 for state in _QUARANTINE_INVENTORY_STATES}
+    for item in inventory:
+        quarantine_states[item.state] += 1
+    quarantined = len(inventory)
+    complete_entries = quarantine_states["complete"]
     damage = getattr(ledger, "damage", None) if ledger is not None else None
 
     reasons = status_reasons(
@@ -521,7 +725,14 @@ def _status_body(invocation: Invocation, database: Database) -> Report:
         "read_only": database.read_only,
         "recovery": _recovery_payload(recovery),
         "ledger": {"depth": depth, "total": ledger_total, "damaged_tail": damage is not None},
-        "quarantine": {"entries": quarantined},
+        "quarantine": {
+            "entries": complete_entries,
+            "inventory": {
+                "conclusive": True,
+                "count": quarantined,
+                "states": quarantine_states,
+            },
+        },
         "metrics_endpoint": database.metrics_endpoint,
         "reasons": reasons,
     }
@@ -538,7 +749,17 @@ def _status_body(invocation: Invocation, database: Database) -> Report:
                 ("read-only", "yes" if database.read_only else "no"),
                 ("recovery", _recovery_summary(recovery)),
                 ("ledger", _ledger_summary(depth, ledger_total, damage)),
-                ("quarantine", f"{quarantined} entry(ies)"),
+                (
+                    "quarantine",
+                    f"{quarantined} physical item(s), {complete_entries} complete entry(ies)",
+                ),
+                (
+                    "quarantine states",
+                    ", ".join(
+                        f"{state}={quarantine_states[state]}"
+                        for state in _QUARANTINE_INVENTORY_STATES
+                    ),
+                ),
                 ("metrics", database.metrics_endpoint or "no endpoint is exposed"),
             ]
         ),
