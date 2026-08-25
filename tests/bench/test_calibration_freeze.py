@@ -139,6 +139,7 @@ LEGACY_KEYS: frozenset[str] = frozenset(
 """What the calibration held BEFORE the freeze. ``vector_recall`` is purely additive."""
 
 CONFIG_RELATIVE: str = "src/okto_grafx/runtime/config.py"
+MIGRATION_RELATIVE: str = "src/okto_grafx/api/__init__.py"
 KNOB: str = "vector_recall_target"
 
 
@@ -1766,9 +1767,9 @@ def test_quoted_shell_variables_are_still_visible_after_tokenization() -> None:
 def test_the_configured_target_is_never_wired_to_a_search_width() -> None:
     """A transition rule, asserted over parses rather than over text.
 
-    Zero occurrences in ``src`` is the preferred FINAL state and passes outright: M1 already
-    carries the commit that removes the field, and a test demanding the legacy declaration
-    forever would go red on the merge that finishes the job.
+    Zero occurrences in ``src`` passes outright.  The FINAL M1 contract may instead retain the
+    former option's spelling solely in the public typed migration refusal; the next test pins
+    that shim to constants and an exact control-flow shape, so it cannot become runtime input.
 
     While the freeze sits on the pre-M1 base, the only tolerated home is
     ``runtime/config.py``. Confining it to ONE file is what kills wiring split across two --
@@ -1793,10 +1794,75 @@ def test_the_configured_target_is_never_wired_to_a_search_width() -> None:
     if not offenders:
         return  # the final state: the knob is gone from src entirely
 
-    assert set(offenders) == {CONFIG_RELATIVE}, (
-        "while the knob still exists it may live only in the config declaration; "
+    assert set(offenders) in ({CONFIG_RELATIVE}, {MIGRATION_RELATIVE}), (
+        "while the knob spelling still exists it may live only in the legacy config declaration "
+        "or the final typed migration refusal, never both and nowhere else; "
         f"found it in {sorted(offenders)}"
     )
+
+
+def test_the_final_knob_spelling_is_only_a_typed_migration_refusal() -> None:
+    """The accepted M1 compatibility door names the old option but can never execute it."""
+    facade = PROJECT_ROOT / MIGRATION_RELATIVE
+    tree = ast.parse(facade.read_text(encoding="utf-8"))
+    occurrences = _knob_occurrences(tree)
+    if not occurrences:
+        return
+
+    assert len(occurrences) == 2
+    assert all(isinstance(node, ast.Constant) for node in occurrences), (
+        "the removed option may survive only as inert string labels, never as a name, argument, "
+        "keyword or attribute carrying a runtime value"
+    )
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    owners = {
+        name: len(_knob_occurrences(function))
+        for name, function in functions.items()
+        if _knob_occurrences(function)
+    }
+    assert owners == {"_configure": 1, "_removed_recall_target": 1}
+
+    configure = functions["_configure"]
+    refusals = [
+        node
+        for node in ast.walk(configure)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Constant)
+        and node.test.left.value == KNOB
+        and len(node.test.ops) == 1
+        and isinstance(node.test.ops[0], ast.In)
+        and len(node.test.comparators) == 1
+        and isinstance(node.test.comparators[0], ast.Name)
+        and node.test.comparators[0].id == "options"
+    ]
+    assert len(refusals) == 1
+    refusal = refusals[0]
+    assert len(refusal.body) == 1 and isinstance(refusal.body[0], ast.Raise)
+    raised = refusal.body[0].exc
+    assert (
+        isinstance(raised, ast.Call)
+        and isinstance(raised.func, ast.Name)
+        and raised.func.id == "_removed_recall_target"
+        and not raised.args
+        and not raised.keywords
+    )
+
+    migration = functions["_removed_recall_target"]
+    returns = [node for node in ast.walk(migration) if isinstance(node, ast.Return)]
+    assert len(returns) == 1 and isinstance(returns[0].value, ast.Call)
+    error = returns[0].value
+    assert isinstance(error.func, ast.Name) and error.func.id == "GrafxConfigurationError"
+    keywords = {keyword.arg: keyword.value for keyword in error.keywords}
+    assert set(keywords) == {"field", "replacement"}
+    assert isinstance(keywords["field"], ast.Constant)
+    assert keywords["field"].value == KNOB
+    assert isinstance(keywords["replacement"], ast.Constant)
+    assert keywords["replacement"].value == "bench.harness.gate --recall-target"
 
 
 def test_the_surviving_knob_carries_no_execution_load() -> None:
