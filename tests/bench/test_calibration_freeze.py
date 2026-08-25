@@ -310,7 +310,12 @@ def _knob_execution_offenders(tree: ast.AST) -> list[ast.AST]:
         if not isinstance(node, ast.Call):
             continue
         name = _call_name(node)
-        if name not in {"_require_positive_number", "_reject"} or len(node.args) < 2:
+        expected_arity = {"_require_positive_number": 2, "_reject": 3}.get(name)
+        if (
+            expected_arity is None
+            or len(node.args) != expected_arity
+            or node.keywords
+        ):
             continue
         label, value = node.args[:2]
         if (
@@ -954,15 +959,18 @@ def test_the_evidence_directory_refuses_newline_translation() -> None:
     """
     attributes = EVIDENCE / ".gitattributes"
     assert attributes.exists(), "bench/evidence needs its own .gitattributes"
-    relative = RAW_METADATA.relative_to(PROJECT_ROOT).as_posix()
-    reported: dict[str, str] = {}
-    for line in _git_text("check-attr", "text", "diff", "--", relative).splitlines():
-        _, attribute, value = line.split(": ", 2)
-        reported[attribute] = value
-    assert reported == {"text": "unset", "diff": "unset"}, (
-        "the evidence must be byte-stable and binary to diff machinery; comments do not "
-        f"set attributes, and git reports {reported}"
-    )
+    for path in (RAW_METADATA, RAW_VERDICT, RAW_B64):
+        relative = path.relative_to(PROJECT_ROOT).as_posix()
+        reported: dict[str, str] = {}
+        for line in _git_text(
+            "check-attr", "text", "diff", "--", relative
+        ).splitlines():
+            _, attribute, value = line.split(": ", 2)
+            reported[attribute] = value
+        assert reported == {"text": "unset", "diff": "unset"}, (
+            f"{relative} must be byte-stable and binary to diff machinery; comments do not "
+            f"set attributes, and git reports {reported}"
+        )
 
 
 def test_the_published_numbers_are_the_measured_numbers(
@@ -1495,4 +1503,14 @@ def test_a_call_cannot_turn_the_surviving_knob_into_an_execution_input() -> None
     )
     assert _knob_execution_offenders(hostile), (
         "apply_search_beam(self.vector_recall_target) must fail the structural gate"
+    )
+    smuggled = ast.parse(
+        "def mutate(self):\n"
+        "    _require_positive_number(\n"
+        "        'vector_recall_target', self.vector_recall_target,\n"
+        "        self.vector_recall_target,\n"
+        "    )\n"
+    )
+    assert _knob_execution_offenders(smuggled), (
+        "the validation-call whitelist must not authorize extra execution arguments"
     )
