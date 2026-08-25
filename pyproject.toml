@@ -78,6 +78,7 @@ bench = [
 dev = [
     "pytest>=8",
     "pytest-timeout",
+    "PyYAML>=6",
 ]
 
 [project.scripts]

@@ -38,7 +38,9 @@ CALIBRATION_FILE: Path = PROJECT_ROOT / "bench" / "calibration.json"
 """The frozen calibration artefact this component commits."""
 
 
-def _document(multiples: dict[str, float], gauges: dict[str, float] | None = None) -> str:
+def _document(
+    multiples: dict[str, float], gauges: dict[str, float] | None = None
+) -> str:
     """Return a published metrics document holding these multiples."""
     metrics: list[dict[str, object]] = [
         {
@@ -53,6 +55,21 @@ def _document(multiples: dict[str, float], gauges: dict[str, float] | None = Non
         }
     ]
     for name, value in sorted((gauges or {}).items()):
+        if name == RECALL_METRIC:
+            # The strict C13 matcher demands the DECLARED publication shape for the
+            # recall gauge -- exactly {name, kind, unit, samples} with one sample of
+            # exactly {"value"} -- which is what the wiring actually publishes. The
+            # legacy extras (a description on the entry, labels inside the sample)
+            # described a shape the pipeline never emits.
+            metrics.append(
+                {
+                    "name": name,
+                    "kind": "gauge",
+                    "unit": "ratio",
+                    "samples": [{"value": value}],
+                }
+            )
+            continue
         metrics.append(
             {
                 "name": name,
@@ -62,7 +79,9 @@ def _document(multiples: dict[str, float], gauges: dict[str, float] | None = Non
                 "samples": [{"labels": {}, "value": value}],
             }
         )
-    return json.dumps({"format": "okto-grafx-metrics", "version": 1, "metrics": metrics})
+    return json.dumps(
+        {"format": "okto-grafx-metrics", "version": 1, "metrics": metrics}
+    )
 
 
 def _run_gate(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -85,7 +104,9 @@ def _run_gate(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
 # --- the gate, proved able to fail on a forced overflow (TS-14) --------------------------------
 
 
-def test_a_forced_overflow_of_the_commit_ceiling_stops_the_pipeline(tmp_path: Path) -> None:
+def test_a_forced_overflow_of_the_commit_ceiling_stops_the_pipeline(
+    tmp_path: Path,
+) -> None:
     """FR-15: above 10x on durable commit the gate does not merely fail, it says consult JP."""
     document = tmp_path / "metrics.json"
     document.write_text(
@@ -166,7 +187,9 @@ def test_valid_json_that_is_not_an_object_is_unmeasured_and_not_a_ceiling_failur
 
 def test_a_ceiling_exactly_at_its_limit_is_met() -> None:
     """The boundary is inclusive, and it is pinned so nobody has to guess."""
-    document = _document({"durable_commit": 10.0, "point_read": 5.0, "open_replay": 3.0})
+    document = _document(
+        {"durable_commit": 10.0, "point_read": 5.0, "open_replay": 3.0}
+    )
     assert check(document).status == STATUS_MET
 
 
@@ -218,9 +241,24 @@ def test_a_published_multiple_carries_the_frozen_name_and_label(tmp_path: Path) 
     result = CalibrationResult(
         status=STATUS_MET,
         ratios=(
-            ratio("durable_commit", 10.0, from_samples("s", [0.010]), from_samples("b", [0.002])),
-            ratio("point_read", 5.0, from_samples("s", [0.001]), from_samples("b", [0.002])),
-            ratio("open_replay", 3.0, from_samples("s", [0.100]), from_samples("b", [0.050])),
+            ratio(
+                "durable_commit",
+                10.0,
+                from_samples("s", [0.010]),
+                from_samples("b", [0.002]),
+            ),
+            ratio(
+                "point_read",
+                5.0,
+                from_samples("s", [0.001]),
+                from_samples("b", [0.002]),
+            ),
+            ratio(
+                "open_replay",
+                3.0,
+                from_samples("s", [0.100]),
+                from_samples("b", [0.050]),
+            ),
         ),
         partitions_per_table=64,
         environment={},
@@ -234,7 +272,9 @@ def test_a_published_multiple_carries_the_frozen_name_and_label(tmp_path: Path) 
     assert (tmp_path / "metrics.json").is_file()
 
 
-def test_the_catalog_refuses_a_ceiling_label_the_contract_does_not_allow(tmp_path: Path) -> None:
+def test_the_catalog_refuses_a_ceiling_label_the_contract_does_not_allow(
+    tmp_path: Path,
+) -> None:
     """G7: the label domain is bounded at registration, so an invented ceiling cannot publish."""
     from okto_grafx.adapters.metrics_json import JsonMetricsSink
     from okto_grafx.domain.errors import GrafxError
@@ -289,7 +329,9 @@ def test_the_statistics_are_the_ones_the_report_claims() -> None:
 
 def test_a_ratio_with_an_unmeasured_side_reports_no_multiple() -> None:
     """A missing baseline must not become a ceiling that was met."""
-    unmeasured = Measurement(name="b", samples=(), warmup=(), unmeasured="the engine is absent")
+    unmeasured = Measurement(
+        name="b", samples=(), warmup=(), unmeasured="the engine is absent"
+    )
     item = ratio("durable_commit", 10.0, from_samples("s", [0.01]), unmeasured)
     assert not item.ok
     assert not item.met
