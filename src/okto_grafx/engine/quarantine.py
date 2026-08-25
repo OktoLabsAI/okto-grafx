@@ -55,6 +55,7 @@ from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.recovery.manifest import (
     MANIFEST_FILE_NAME,
     RESTORE_RECEIPT_PREFIX,
+    STAMP_DIGITS,
     QuarantineManifest,
     RestoreReceipt,
     entry_suffix,
@@ -116,6 +117,21 @@ QUARANTINE_ENTRIES: str = "oktografx_quarantine_entries"
 
 QUARANTINE_METRICS: tuple[MetricDescriptor, ...] = (metric(QUARANTINE_ENTRIES),)
 """Every metric this store emits, taken from the frozen catalogue by name and never invented."""
+
+
+def _identity_suffix_candidate(name: str) -> str | None:
+    """Return identity evidence only from the exact canonical entry-name envelope."""
+    stamp, separator, suffix = name.partition("-")
+    if (
+        separator != "-"
+        or len(stamp) != STAMP_DIGITS
+        or not stamp.isascii()
+        or not stamp.isdigit()
+        or not suffix
+    ):
+        return None
+    return suffix
+
 
 STORAGE_PORT_METHODS: tuple[str, ...] = (
     "exists",
@@ -542,7 +558,7 @@ class QuarantineStore:
                 directory=self._directory,
                 conclusive=False,
                 inconclusive=True,
-                observed=type(observed).__name__,
+                observed="non_builtin_tuple",
             )
         for file in observed:
             if type(file) is not str:
@@ -554,7 +570,7 @@ class QuarantineStore:
                     directory=self._directory,
                     conclusive=False,
                     inconclusive=True,
-                    observed=f"{type(file).__name__}: {file!r}",
+                    observed="non_builtin_string",
                 )
             if not file.startswith(prefix) or file == prefix:
                 raise GrafxQuarantineError(
@@ -591,6 +607,22 @@ class QuarantineStore:
     ) -> tuple[QuarantineInventoryItem, ...]:
         """Downgrade every item participating in a global identity or namespace collision."""
         problems: dict[int, set[str]] = {}
+
+        candidates: dict[str, list[int]] = {}
+        for index, item in enumerate(items):
+            suffix = _identity_suffix_candidate(item.name)
+            if suffix is not None:
+                candidates.setdefault(suffix, []).append(index)
+        for suffix, indexes in candidates.items():
+            if len(indexes) < 2:
+                continue
+            entries = tuple(sorted(items[index].name for index in indexes))
+            detail = (
+                f"Potential duplicate quarantine identity suffix {suffix!r} appears in "
+                f"entries {entries!r}."
+            )
+            for index in indexes:
+                problems.setdefault(index, set()).add(detail)
 
         identities: dict[tuple[str, int, int], list[int]] = {}
         for index, item in enumerate(items):
@@ -652,9 +684,9 @@ class QuarantineStore:
             if not found:
                 classified.append(item)
                 continue
-            details: list[str] = []
-            if item.state != "complete" and item.detail:
-                details.append(f"Initial {item.state}: {item.detail}")
+            details = [f"Initial state: {item.state}."]
+            if item.detail:
+                details.append(f"Initial detail: {item.detail}")
             details.extend(sorted(found))
             classified.append(
                 replace(
@@ -703,19 +735,19 @@ class QuarantineStore:
 
         try:
             manifest = QuarantineManifest.parse(raw)
-        except GrafxError as failure:
+        except (GrafxError, OverflowError, ValueError):
             return QuarantineInventoryItem(
                 name=name,
                 state="corrupt_manifest",
                 files=files,
                 manifest_file=manifest_file,
-                detail=f"{failure.code}: {failure.message}",
+                detail="The stored quarantine manifest could not be parsed safely.",
             )
 
         payload_file = f"{directory}/{_payload_file_name(manifest.origin)}"
         try:
             expected_name = f"{stamp_of(manifest.captured_at_wall)}-{manifest.suffix}"
-        except (GrafxError, OverflowError, ValueError) as failure:
+        except (GrafxError, OverflowError, ValueError):
             return QuarantineInventoryItem(
                 name=name,
                 state="corrupt_manifest",
@@ -723,7 +755,9 @@ class QuarantineStore:
                 manifest_file=manifest_file,
                 payload_file=payload_file,
                 manifest=manifest,
-                detail=f"The manifest cannot derive an entry identity: {failure!s}",
+                detail=(
+                    "The stored quarantine manifest cannot derive a safe entry identity."
+                ),
             )
         mismatch: list[str] = []
         if name != expected_name:

@@ -14,7 +14,7 @@ from okto_grafx.domain.errors import (
     GrafxQuarantineError,
     GrafxStorageError,
 )
-from okto_grafx.domain.recovery.manifest import stamp_of
+from okto_grafx.domain.recovery.manifest import STAMP_DIGITS, stamp_of
 from okto_grafx.engine.quarantine import (
     QuarantineEntry,
     QuarantineInventoryItem,
@@ -94,6 +94,15 @@ def _duplicate_identity(
     _put(device, payload_file, body)
     _put(device, manifest_file, manifest.serialize())
     return name, manifest.digest
+
+
+def _replace_manifest_number(raw: bytes, field: str, token: bytes) -> bytes:
+    """Replace one numeric JSON field without asking the production encoder to accept it."""
+    marker = f'"{field}":'.encode("ascii")
+    start = raw.index(marker) + len(marker)
+    end = raw.find(b",", start)
+    assert end >= 0
+    return raw[:start] + token + raw[end:]
 
 
 class _CaseSensitiveMemoryDevice(MemoryStorageDevice):
@@ -206,6 +215,51 @@ def test_inventory_distinguishes_corrupt_manifest_storage_from_unreadable_access
     assert stack.quarantine.list() == ()
 
 
+@pytest.mark.parametrize(
+    ("token", "expected_detail"),
+    (
+        (
+            b"9" * 401,
+            "The stored quarantine manifest could not be parsed safely.",
+        ),
+        (
+            b"1e309",
+            "The stored quarantine manifest cannot derive a safe entry identity.",
+        ),
+        (
+            b"-1e309",
+            "The stored quarantine manifest cannot derive a safe entry identity.",
+        ),
+    ),
+    ids=("huge-integer", "positive-nonfinite", "negative-nonfinite"),
+)
+def test_inventory_contains_ordinary_numeric_manifest_failures_without_writing(
+    stack: Stack, token: bytes, expected_detail: str
+) -> None:
+    entry = _capture(stack, 20)
+    device = _device(stack)
+    damaged = _replace_manifest_number(
+        entry.manifest.serialize(), "captured_at_wall", token
+    )
+    _rewrite(device, entry.manifest_file, damaged)
+    listed = device.list_files("quarantine/")
+    before = _tree(device)
+    read_only = QuarantineStore(
+        ReadOnlyStorageDevice(device), stack.clock, RecordingMetricsSink()
+    )
+
+    inventory = read_only.inventory()
+
+    assert len(inventory) == 1
+    assert inventory[0].state == "corrupt_manifest"
+    assert inventory[0].detail == expected_detail
+    assert tuple(sorted(_represented(inventory))) == listed
+    assert len(_represented(inventory)) == len(set(_represented(inventory)))
+    assert read_only.list() == ()
+    assert read_only.count() == 0
+    assert _tree(device) == before
+
+
 def test_inventory_reports_a_manifest_whose_entry_identity_does_not_match_its_directory(
     stack: Stack,
 ) -> None:
@@ -283,6 +337,123 @@ def test_inventory_downgrades_every_duplicate_origin_range_identity(
         assert all("different digests" in item.detail for item in first)
     assert stack.quarantine.list() == ()
     assert stack.quarantine.count() == 0
+
+
+@pytest.mark.parametrize(
+    ("damage", "initial_state"),
+    (
+        ("corrupt", "corrupt_manifest"),
+        ("unreadable", "unreadable_manifest"),
+        ("absent_manifest", "incomplete"),
+    ),
+)
+def test_inventory_downgrades_identity_candidates_even_without_a_readable_manifest(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+    initial_state: str,
+) -> None:
+    entry = _capture(stack, 21)
+    device = _device(stack)
+    original_body = device.read_log(
+        entry.payload_file, 0, device.log_size(entry.payload_file)
+    )
+    duplicate_name, _duplicate_digest = _duplicate_identity(
+        stack, entry, body=original_body
+    )
+    duplicate_manifest = f"quarantine/{duplicate_name}/manifest.json"
+    if damage == "corrupt":
+        _rewrite(device, duplicate_manifest, b"not a readable manifest")
+    elif damage == "absent_manifest":
+        device.remove(duplicate_manifest)
+
+    listed = device.list_files("quarantine/")
+    before = _tree(device)
+    original_read = device.read_log
+
+    def inaccessible(file: str, offset: int, length: int) -> bytes:
+        if damage == "unreadable" and file == duplicate_manifest:
+            raise GrafxStorageError(
+                "The candidate manifest is inaccessible.",
+                operation="read_log",
+                file=file,
+            )
+        return original_read(file, offset, length)
+
+    if damage == "unreadable":
+        monkeypatch.setattr(device, "read_log", inaccessible)
+
+    read_only = QuarantineStore(
+        ReadOnlyStorageDevice(device), stack.clock, RecordingMetricsSink()
+    )
+    inventory = read_only.inventory()
+    by_name = {item.name: item for item in inventory}
+
+    assert set(by_name) == {entry.name, duplicate_name}
+    assert {item.state for item in inventory} == {"unexpected_layout"}
+    assert "Initial state: complete." in by_name[entry.name].detail
+    assert f"Initial state: {initial_state}." in by_name[duplicate_name].detail
+    assert all("identity suffix" in item.detail for item in inventory)
+    assert tuple(sorted(_represented(inventory))) == listed
+    assert len(_represented(inventory)) == len(set(_represented(inventory)))
+    assert read_only.list() == ()
+    assert read_only.count() == 0
+    if damage == "unreadable":
+        monkeypatch.undo()
+    assert _tree(device) == before
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    (
+        "0" * (STAMP_DIGITS - 1),
+        "0" * (STAMP_DIGITS + 1),
+        "x" * STAMP_DIGITS,
+        "\uff10" * STAMP_DIGITS,
+    ),
+    ids=("short", "long", "non-digit", "non-ascii-digit"),
+)
+def test_inventory_does_not_invent_identity_from_a_noncanonical_name(
+    stack: Stack, stamp: str
+) -> None:
+    entry = _capture(stack, 22)
+    device = _device(stack)
+    noncanonical_name = f"{stamp}-{entry.manifest.suffix}"
+    orphan = f"quarantine/{noncanonical_name}/orphan.bin"
+    if stamp.isascii():
+        _put(device, orphan, b"unmanifested evidence")
+    else:
+        # The production adapters correctly refuse non-portable names on writes. A damaged or
+        # foreign namespace can still return one, so inject it below that write-side guard to
+        # exercise the inventory's independent ASCII certification rule.
+        device._files[orphan] = bytearray(b"unmanifested evidence")  # noqa: SLF001
+    listed = device.list_files("quarantine/")
+    before = tuple(
+        sorted(
+            (file, bytes(body))
+            for file, body in device._files.items()  # noqa: SLF001
+        )
+    )
+    read_only = QuarantineStore(
+        ReadOnlyStorageDevice(device), stack.clock, RecordingMetricsSink()
+    )
+
+    inventory = read_only.inventory()
+    by_name = {item.name: item for item in inventory}
+
+    assert by_name[entry.name].state == "complete"
+    assert by_name[noncanonical_name].state == "incomplete"
+    assert tuple(sorted(_represented(inventory))) == listed
+    assert len(_represented(inventory)) == len(set(_represented(inventory)))
+    assert read_only.list() == (entry,)
+    assert read_only.count() == 1
+    after = tuple(
+        sorted(
+            (file, bytes(body))
+            for file, body in device._files.items()  # noqa: SLF001
+        )
+    )
+    assert after == before
 
 
 def test_inventory_never_follows_a_payload_path_that_escapes_from_a_manifest(
@@ -447,8 +618,17 @@ def test_inventory_refuses_a_tuple_subclass_from_the_listing_port(
     _capture(stack, 17)
     device = _device(stack)
     original = device.list_files
+    before = _tree(device)
 
-    class Listing(tuple):
+    class HostileName(type):
+        """Make even diagnostic access to the rejected class name fail loudly."""
+
+        def __getattribute__(cls, name: str) -> object:
+            if name == "__name__":
+                raise AssertionError("the rejected tuple class was inspected")
+            return super().__getattribute__(name)
+
+    class Listing(tuple, metaclass=HostileName):
         """A tuple lookalike that violates the port's exact built-in contract."""
 
     def subclassed(prefix: str = "") -> tuple[str, ...]:
@@ -460,7 +640,10 @@ def test_inventory_refuses_a_tuple_subclass_from_the_listing_port(
         stack.quarantine.inventory()
 
     assert caught.value.details["conclusive"] is False
-    assert caught.value.details["observed"] == "Listing"
+    assert caught.value.details["inconclusive"] is True
+    assert caught.value.details["observed"] == "non_builtin_tuple"
+    monkeypatch.undo()
+    assert _tree(device) == before
 
 
 def test_inventory_refuses_a_string_subclass_inside_the_listing(
@@ -469,9 +652,13 @@ def test_inventory_refuses_a_string_subclass_inside_the_listing(
     _capture(stack, 18)
     device = _device(stack)
     original = device.list_files
+    before = _tree(device)
 
     class FileName(str):
         """A string lookalike that must not cross the exact scalar boundary."""
+
+        def __repr__(self) -> str:
+            raise AssertionError("the rejected string value was represented")
 
     def subclassed(prefix: str = "") -> tuple[str, ...]:
         return tuple(FileName(file) for file in original(prefix))
@@ -482,7 +669,44 @@ def test_inventory_refuses_a_string_subclass_inside_the_listing(
         stack.quarantine.inventory()
 
     assert caught.value.details["conclusive"] is False
-    assert "FileName" in str(caught.value.details["observed"])
+    assert caught.value.details["inconclusive"] is True
+    assert caught.value.details["observed"] == "non_builtin_string"
+    monkeypatch.undo()
+    assert _tree(device) == before
+
+
+def test_inventory_refuses_a_string_subclass_without_inspecting_its_hostile_class(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _capture(stack, 23)
+    device = _device(stack)
+    original = device.list_files
+    before = _tree(device)
+
+    class HostileName(type):
+        """Make diagnostic access to the rejected scalar class fail loudly."""
+
+        def __getattribute__(cls, name: str) -> object:
+            if name == "__name__":
+                raise AssertionError("the rejected string class was inspected")
+            return super().__getattribute__(name)
+
+    class FileName(str, metaclass=HostileName):
+        """A scalar lookalike whose metaclass may not be inspected."""
+
+    def subclassed(prefix: str = "") -> tuple[str, ...]:
+        return tuple(FileName(file) for file in original(prefix))
+
+    monkeypatch.setattr(device, "list_files", subclassed)
+
+    with pytest.raises(GrafxQuarantineError) as caught:
+        stack.quarantine.inventory()
+
+    assert caught.value.details["conclusive"] is False
+    assert caught.value.details["inconclusive"] is True
+    assert caught.value.details["observed"] == "non_builtin_string"
+    monkeypatch.undo()
+    assert _tree(device) == before
 
 
 def test_inventory_refuses_an_exact_duplicate_listing_instead_of_silently_deduplicating(
