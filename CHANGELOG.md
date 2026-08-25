@@ -17,13 +17,16 @@ including the on-disk format.
   registries, and forged/uninitialised configuration instances receive typed refusals before a
   database root is created. The process-global `checksum` selector remains effective with a
   caller-supplied registry.
-- **`checkpoint_interval_records` now drives automatic WAL maintenance.** After a durable write
-  commit and schema settlement, writable databases checkpoint when
-  `last_committed_lsn - checkpoint_lsn` reaches the configured threshold. The decision is
-  single-flight per handle; a refused or late-failing checkpoint remains pending for the next
-  write, while maintenance and diagnostic failures can never turn the already-durable commit into
-  an apparent transactional failure. Read transactions and empty write transactions do not run
-  maintenance, and explicit `Database.checkpoint()` remains available.
+- **Record and byte thresholds now drive automatic WAL maintenance.** After a durable write commit
+  and schema settlement, writable databases checkpoint when `last_committed_lsn - checkpoint_lsn`
+  reaches `checkpoint_interval_records` or when the optional `wal_max_bytes` high-water is crossed.
+  The byte setting is a soft post-commit trigger: reader pins, atomic batches and deferred recycling
+  may retain more without unsafe truncation, and a latch prevents futile checkpoint storms until the
+  WAL falls below the threshold. The decision remains single-flight; a refused or late-failing
+  checkpoint stays pending for the next write, while maintenance and diagnostic failures can never
+  turn the already-durable commit into an apparent transactional failure. Read transactions and
+  empty write transactions do not run maintenance, and explicit `Database.checkpoint()` remains
+  available.
 - **The calibrated HNSW search beam is now an operational database option.**
   `vector_ef_search` defaults to `320`, is bounded to `1..1_048_576`, reaches every vector index
   assembled or reattached by that database handle, and is exposed by the detached vector index

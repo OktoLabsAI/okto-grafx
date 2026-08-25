@@ -392,6 +392,7 @@ class DatabaseConfig:
     commit_lock_timeout_seconds: float = 30.0
     reader_stall_threshold_seconds: float = 15.0
     wal_segment_bytes: int = 4 * 1024 * 1024
+    wal_max_bytes: int | None = None          # optional soft checkpoint high-water
     checkpoint_interval_records: int = 512
     metrics: str = "noop"                  # "noop" | "openmetrics" | "json"
     vector_math: str = "auto"              # "auto" | "pure" | "numpy"

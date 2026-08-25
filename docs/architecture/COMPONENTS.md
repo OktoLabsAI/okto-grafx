@@ -678,15 +678,21 @@ The original C4 blind review found a real wiring gap: the recycle machinery exis
 database drove it. The first closure added `TransactionManager.checkpoint()` under the commit section
 and the explicit `Database.checkpoint()` door. M1 closes the operational half: after a durable write
 commit and schema settlement, `Database` reads the published state under its participant section and
-runs a checkpoint when `last_committed_lsn - checkpoint_lsn >= checkpoint_interval_records`.
+runs a checkpoint when `last_committed_lsn - checkpoint_lsn >= checkpoint_interval_records`. The F1
+maintenance slice adds the optional `wal_max_bytes` high-water to the same decision with OR semantics.
+It is a soft post-commit trigger, not a hard capacity limit: an atomic batch, a live reader horizon or
+a platform-deferred recycle may retain more bytes, and none authorizes truncation or turns an already
+durable commit into a failure. A retained level is latched until the WAL falls below the threshold,
+preventing one futile checkpoint per subsequent commit while a reader keeps reclaim pinned.
 
 The attempt is single-flight per handle. A failure cannot change the already-published commit report;
 ordinary maintenance failures emit `checkpoint.auto_failed`, remain pending even when checkpoint state
 was published before a later recycle/index-refresh failure, and retry after the next successful write.
 Read-only, read and empty-write commits never enter the policy. Regressions in
-`tests/api/test_auto_checkpoint.py` cover the exact threshold, concurrent/re-entrant attempts, failed
-and late-failed retry, hostile diagnostics/events, process-control identity, close re-entry, real WAL
-recycling, verification and reopen.
+`tests/api/test_auto_checkpoint.py` cover both exact thresholds, their OR combination,
+concurrent/re-entrant attempts, failed and late-failed retry, hostile diagnostics/events,
+process-control identity, close re-entry, pinned-reader latching, real WAL recycling, verification
+and reopen.
 
 Related, and to be decided with it: `QuarantineStore.restore`'s `PROTECTED_PREFIXES` covers `index/`
 but not `wal/`, so a whole-segment quarantine entry could be restored into a freed `wal/NNN.wal`.

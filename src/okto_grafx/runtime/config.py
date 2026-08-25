@@ -201,6 +201,7 @@ class DatabaseConfig:
     commit_lock_timeout_seconds: float = 30.0
     reader_stall_threshold_seconds: float = 15.0
     wal_segment_bytes: int = 4 * 1024 * 1024
+    wal_max_bytes: int | None = None
     checkpoint_interval_records: int = 512
     metrics: str = "noop"
     metrics_destination: str | None = None
@@ -264,6 +265,12 @@ class DatabaseConfig:
                 "wal_segment_bytes",
                 self.wal_segment_bytes,
                 f"a value between {MIN_SEGMENT_BYTES} and {MAX_SEGMENT_READ_BYTES} is required.",
+            )
+        if self.wal_max_bytes is not None:
+            object.__setattr__(
+                self,
+                "wal_max_bytes",
+                _require_positive_int("wal_max_bytes", self.wal_max_bytes),
             )
 
         threshold = _require_int(

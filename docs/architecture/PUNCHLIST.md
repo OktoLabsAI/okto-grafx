@@ -1247,11 +1247,15 @@ option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`
 
 ## M1 — honest configuration and automatic maintenance (2026-08-24)
 
-- **CLOSED** — `checkpoint_interval_records` is no longer inert. A durable write triggers a
-  single-flight checkpoint at the exact published WAL-distance threshold. Ordinary or late
+- **CLOSED** — `checkpoint_interval_records` is no longer inert, and the optional
+  `wal_max_bytes` now adds a byte high-water to the same policy. A durable write triggers a
+  single-flight checkpoint at either exact threshold. The byte threshold is deliberately soft:
+  reader pins, atomic batches and platform deferrals may retain more, while a latch prevents a
+  futile checkpoint storm until the live WAL falls below the configured level. Ordinary or late
   maintenance failures stay pending and cannot invalidate the commit; read/no-op commits do
-  nothing. Fifteen regressions in `tests/api/test_auto_checkpoint.py` include WAL recycle/reopen,
-  hostile diagnostics, broken/re-entrant EventSinks and process-control signals.
+  nothing. Regressions in `tests/api/test_auto_checkpoint.py` include both thresholds,
+  pinned-reader retention, retry, WAL recycle/reopen, hostile diagnostics, broken/re-entrant
+  EventSinks and process-control signals.
 - **CLOSED** — configuration scalars are canonical exact built-ins before they reach adapters or
   persisted descriptors. WAL segment configuration now matches the reader's `[256 B, 1 GiB]`
   domain, including oversized batches; the buffer minimum is rejected in `DatabaseConfig`;

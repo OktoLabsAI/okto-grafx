@@ -497,6 +497,7 @@ refused with the field name the caller actually wrote.
 | `commit_lock_timeout_seconds` | `30.0` | How long to wait at the commit section |
 | `reader_stall_threshold_seconds` | `15.0` | When a reader stops holding the horizon down |
 | `wal_segment_bytes` | `4 MiB` | Log segment target, from 256 B through the reader's 1 GiB ceiling; an exceptional batch that would cross the ceiling is refused before writing |
+| `wal_max_bytes` | `None` | Optional soft high-water trigger: after a durable write, checkpoint when live WAL bytes reach this value; reader pins, atomic batches and deferred recycling may retain more without data loss |
 | `checkpoint_interval_records` | `512` | After a durable write, checkpoint when the published WAL distance reaches this many records; a failed attempt is reported and retried after the next write |
 | `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
 | `metrics_destination` | `None` | Required for `"json"` |

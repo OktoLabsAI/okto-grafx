@@ -25,9 +25,11 @@ from okto_grafx.domain.errors import (
     GrafxError,
 )
 from okto_grafx.domain.txn.commit_state import CommitState
+from okto_grafx.domain.wal.replay import RecycleReport
 from okto_grafx.engine.database import Database
 from okto_grafx.engine.index_manager import IndexManager
 from okto_grafx.engine.txn_manager import TransactionManager
+from okto_grafx.engine.wal_manager import WalManager
 from okto_grafx.runtime.bootstrap import build_default_registry, release_ports
 from okto_grafx.runtime.config import DatabaseConfig
 
@@ -148,6 +150,18 @@ def _join(thread: threading.Thread) -> None:
     assert not thread.is_alive(), f"{thread.name} did not finish"
 
 
+def _recycle_report(*, reclaimed_bytes: int = 0) -> RecycleReport:
+    return RecycleReport(
+        horizon_lsn=0,
+        recycled=(),
+        deferred=(),
+        retained=(),
+        reclaimed_bytes=reclaimed_bytes,
+        lag_segments=0,
+        reader_present=False,
+    )
+
+
 @pytest.mark.parametrize(
     ("checkpoint_lsn", "expected_attempts"),
     [(93, 0), (92, 1)],
@@ -172,6 +186,13 @@ def test_auto_checkpoint_uses_a_greater_than_or_equal_threshold(
         lambda manager: state,
     )
     monkeypatch.setattr(
+        WalManager,
+        "total_bytes",
+        lambda manager: pytest.fail(
+            "wal_max_bytes=None must not inspect the WAL size"
+        ),
+    )
+    monkeypatch.setattr(
         Database,
         "checkpoint",
         lambda candidate: attempts.append(candidate.path) or object(),
@@ -179,6 +200,117 @@ def test_auto_checkpoint_uses_a_greater_than_or_equal_threshold(
     try:
         database._maybe_checkpoint()
         assert len(attempts) == expected_attempts
+        assert database._checkpoint_retry_pending is False
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_lsn", "wal_bytes", "expected_attempts"),
+    [
+        (93, 1023, 0),
+        (93, 1024, 1),
+        (92, 0, 1),
+    ],
+    ids=("below-both", "byte-threshold", "record-threshold"),
+)
+def test_auto_checkpoint_combines_record_and_wal_byte_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_lsn: int,
+    wal_bytes: int,
+    expected_attempts: int,
+) -> None:
+    database = connect(
+        ":memory:", checkpoint_interval_records=8, wal_max_bytes=1024
+    )
+    attempts: list[str] = []
+    state = CommitState(
+        last_committed_lsn=100,
+        last_csn=100,
+        checkpoint_lsn=checkpoint_lsn,
+    )
+
+    monkeypatch.setattr(
+        TransactionManager,
+        "_published_state_in_section",
+        lambda manager: state,
+    )
+    monkeypatch.setattr(WalManager, "total_bytes", lambda manager: wal_bytes)
+    monkeypatch.setattr(
+        Database,
+        "checkpoint",
+        lambda candidate: attempts.append(candidate.path) or _recycle_report(),
+    )
+    try:
+        database._maybe_checkpoint()
+        assert len(attempts) == expected_attempts
+        assert database._checkpoint_retry_pending is False
+    finally:
+        database.close()
+
+
+def test_wal_byte_threshold_is_rearmed_only_after_wal_falls_below_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = connect(
+        ":memory:", checkpoint_interval_records=1_000_000, wal_max_bytes=1024
+    )
+    attempts: list[str] = []
+    observed = iter((1024, 1024, 1023, 1024))
+    state = CommitState(last_committed_lsn=100, last_csn=100, checkpoint_lsn=99)
+
+    monkeypatch.setattr(
+        TransactionManager,
+        "_published_state_in_section",
+        lambda manager: state,
+    )
+    monkeypatch.setattr(WalManager, "total_bytes", lambda manager: next(observed))
+    monkeypatch.setattr(
+        Database,
+        "checkpoint",
+        lambda candidate: attempts.append(candidate.path) or _recycle_report(),
+    )
+    try:
+        for _ in range(4):
+            database._maybe_checkpoint()
+        assert attempts == [":memory:", ":memory:"]
+        assert database._checkpoint_retry_pending is False
+    finally:
+        database.close()
+
+
+def test_a_failed_wal_byte_checkpoint_is_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = connect(
+        ":memory:", checkpoint_interval_records=1_000_000, wal_max_bytes=1024
+    )
+    attempts = 0
+    state = CommitState(last_committed_lsn=100, last_csn=100, checkpoint_lsn=99)
+
+    monkeypatch.setattr(
+        TransactionManager,
+        "_published_state_in_section",
+        lambda manager: state,
+    )
+    monkeypatch.setattr(WalManager, "total_bytes", lambda manager: 1024)
+
+    def fail_once(candidate: Database) -> RecycleReport:
+        nonlocal attempts
+        del candidate
+        attempts += 1
+        if attempts == 1:
+            raise GrafxDeviceFull("The checkpoint has no working space.", free_bytes=0)
+        return _recycle_report(reclaimed_bytes=1024)
+
+    monkeypatch.setattr(Database, "checkpoint", fail_once)
+    try:
+        database._maybe_checkpoint()
+        assert attempts == 1
+        assert database._checkpoint_retry_pending is True
+
+        database._maybe_checkpoint()
+        assert attempts == 2
         assert database._checkpoint_retry_pending is False
     finally:
         database.close()
@@ -629,6 +761,129 @@ def test_auto_checkpoint_recycles_wal_and_the_database_reopens(tmp_path: Path) -
     try:
         assert _identities(reopened) == list(range(1, 21))
         assert reopened.transactions.published_state() == state_before_close
+        assert reopened.verify("all").findings == ()
+    finally:
+        reopened.close()
+
+
+def test_wal_byte_threshold_recycles_wal_and_the_database_reopens(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "database"
+    wal_max_bytes = 3 * WAL_SEGMENT_BYTES
+    options = {
+        "page_size": 512,
+        "wal_segment_bytes": WAL_SEGMENT_BYTES,
+        "wal_max_bytes": wal_max_bytes,
+        "checkpoint_interval_records": 1_000_000,
+    }
+    database = connect(root, **options)
+    inserted: list[int] = []
+    state_before_close: CommitState | None = None
+    try:
+        _schema(database)
+        for identity in range(1, 61):
+            _insert(database, identity)
+            inserted.append(identity)
+            wal_bytes = sum(file.stat().st_size for file in (root / "wal").glob("*.wal"))
+            assert wal_bytes <= wal_max_bytes
+            state = database.transactions.published_state()
+            segment_numbers = sorted(
+                int(segment.stem) for segment in (root / "wal").glob("*.wal")
+            )
+            if (
+                state.checkpoint_lsn == state.last_committed_lsn
+                and segment_numbers
+                and max(segment_numbers) > len(segment_numbers)
+            ):
+                state_before_close = state
+                break
+        assert state_before_close is not None, (
+            "the byte threshold never checkpointed and recycled an old WAL segment"
+        )
+    finally:
+        database.close()
+
+    reopened = connect(root, **options)
+    try:
+        assert _identities(reopened) == inserted
+        assert reopened.transactions.published_state() == state_before_close
+        assert reopened.verify("all").findings == ()
+    finally:
+        reopened.close()
+
+
+def test_a_pinned_reader_does_not_cause_a_wal_checkpoint_storm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "database"
+    wal_max_bytes = 3 * WAL_SEGMENT_BYTES
+    options = {
+        "page_size": 512,
+        "wal_segment_bytes": WAL_SEGMENT_BYTES,
+        "wal_max_bytes": wal_max_bytes,
+        "checkpoint_interval_records": 1_000_000,
+    }
+    database = connect(root, **options)
+    inserted: list[int] = []
+    reader = None
+    original_checkpoint = Database.checkpoint
+    automatic_attempts = 0
+
+    def observed_checkpoint(candidate: Database) -> RecycleReport:
+        nonlocal automatic_attempts
+        automatic_attempts += 1
+        return original_checkpoint(candidate)
+
+    try:
+        _schema(database)
+        reader = database.begin("read")
+        monkeypatch.setattr(Database, "checkpoint", observed_checkpoint)
+
+        next_identity = 1
+        for _ in range(60):
+            _insert(database, next_identity)
+            inserted.append(next_identity)
+            next_identity += 1
+            wal_bytes = sum(
+                file.stat().st_size for file in (root / "wal").glob("*.wal")
+            )
+            if automatic_attempts and wal_bytes >= wal_max_bytes:
+                break
+        else:
+            pytest.fail("the pinned-reader workload never latched above the byte threshold")
+
+        attempts_while_latched = automatic_attempts
+        for _ in range(4):
+            _insert(database, next_identity)
+            inserted.append(next_identity)
+            next_identity += 1
+        assert automatic_attempts == attempts_while_latched
+        assert reader.execute("MATCH (p:P) RETURN p.id").rows == ()
+
+        reader.rollback()
+        reader = None
+        original_checkpoint(database)
+        assert sum(
+            file.stat().st_size for file in (root / "wal").glob("*.wal")
+        ) < wal_max_bytes
+
+        attempts_before_rearm = automatic_attempts
+        for _ in range(60):
+            _insert(database, next_identity)
+            inserted.append(next_identity)
+            next_identity += 1
+            if automatic_attempts > attempts_before_rearm:
+                break
+        assert automatic_attempts == attempts_before_rearm + 1
+    finally:
+        if reader is not None:
+            reader.rollback()
+        database.close()
+
+    reopened = connect(root, **options)
+    try:
+        assert _identities(reopened) == inserted
         assert reopened.verify("all").findings == ()
     finally:
         reopened.close()

@@ -833,6 +833,8 @@ class Database:
         "_metrics_endpoint",
         "_read_only",
         "_checkpoint_interval_records",
+        "_wal_max_bytes",
+        "_wal_bytes_latched",
         "_checkpointing",
         "_checkpoint_retry_pending",
         "_closers",
@@ -873,6 +875,7 @@ class Database:
         path: str,
         label: str,
         checkpoint_interval_records: int = 512,
+        wal_max_bytes: int | None = None,
         read_only: bool = False,
         metrics_endpoint: str | None = None,
         indexes: object = None,
@@ -921,7 +924,19 @@ class Database:
                 field="checkpoint_interval_records",
                 value=self._checkpoint_interval_records,
             )
+        self._wal_max_bytes: int | None = None
+        if wal_max_bytes is not None:
+            self._wal_max_bytes = _builtin_int(
+                wal_max_bytes, field="wal_max_bytes"
+            )
+            if self._wal_max_bytes <= 0:
+                raise GrafxConfigurationError(
+                    "The WAL byte threshold must be a positive number of bytes.",
+                    field="wal_max_bytes",
+                    value=self._wal_max_bytes,
+                )
         self._checkpointing: bool = False
+        self._wal_bytes_latched: bool = False
         self._checkpoint_retry_pending: bool = False
         self._metrics_endpoint: str | None = _builtin_optional_text(
             metrics_endpoint, field="metrics_endpoint"
@@ -1612,7 +1627,10 @@ class Database:
         Every acknowledged commit is durable in the log whether or not a checkpoint runs, so a
         failed automatic attempt costs space and recovery time, never committed data. Writable
         databases also call this door after a commit whose published WAL distance reaches the
-        configured ``checkpoint_interval_records``; callers may still invoke it explicitly.
+        configured ``checkpoint_interval_records`` or whose live log reaches the optional soft
+        ``wal_max_bytes`` high-water; callers may still invoke it explicitly. A reader pin,
+        atomic batch or platform-deferred recycle may retain more bytes without authorizing an
+        unsafe truncation.
         """
         with self._public_operation("checkpoint"):
             self._require_open()
@@ -1647,13 +1665,16 @@ class Database:
         operation. ``_checkpoint_retry_pending`` remains set until the manager checkpoint AND
         the facade's index-refresh postlude both finish: checkpoint state is published before
         WAL recycling and before that postlude, so the numeric distance alone cannot detect a
-        late failure on the next commit.
+        late failure on the next commit. The byte threshold is edge-triggered: if safe recycling
+        leaves the log above it, the latch prevents a futile checkpoint on every later commit and
+        rearms only after the live WAL falls below the configured level.
         """
         if self._closed or self._read_only:
             return
         checkpoint_failure: Exception | None = None
         published_lsn = 0
         checkpoint_lsn = 0
+        bytes_due = False
         owns_attempt = False
         try:
             try:
@@ -1670,11 +1691,29 @@ class Database:
                         state.checkpoint_lsn, field="checkpoint.checkpoint_lsn"
                     )
                     distance = published_lsn - checkpoint_lsn
+                    records_due = distance >= self._checkpoint_interval_records
+                    need_bytes = self._wal_max_bytes is not None and (
+                        self._wal_bytes_latched
+                        or not (records_due or self._checkpoint_retry_pending)
+                    )
+                    if need_bytes and self._wal_max_bytes is not None:
+                        wal_bytes = self._wal.total_bytes()
+                        if wal_bytes < self._wal_max_bytes:
+                            self._wal_bytes_latched = False
+                        elif not self._wal_bytes_latched:
+                            bytes_due = True
                     if (
                         not self._checkpoint_retry_pending
-                        and distance < self._checkpoint_interval_records
+                        and not records_due
+                        and not bytes_due
                     ):
                         return
+                    if bytes_due:
+                        # A reader pin or a platform-deferred recycle can leave the WAL above
+                        # the threshold after a successful checkpoint. Treat bytes as an edge,
+                        # not a level, so every later commit does not repeat maintenance that
+                        # cannot yet reclaim anything. Falling below the threshold rearms it.
+                        self._wal_bytes_latched = True
                     self._checkpoint_retry_pending = True
                     try:
                         self.checkpoint()
