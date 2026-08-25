@@ -70,6 +70,7 @@ from okto_grafx.engine.public_views import (
     IndexRegistryView,
     IndexView,
     LedgerView,
+    MaintenanceStatus,
     QuarantineInventoryItem,
     QuarantineView,
     StorageFileView,
@@ -105,6 +106,9 @@ _SCALAR_DATABASE_PROPERTIES: frozenset[str] = frozenset(
     }
 )
 """Public database values that are already immutable scalars or frozen domain reports."""
+
+_OPERATIONAL_DATABASE_PROPERTIES: frozenset[str] = frozenset({"maintenance"})
+"""Public database properties that deliberately return a narrow operational facade."""
 
 _TRANSACTION_PROPERTIES: frozenset[str] = frozenset(
     {"active", "mode", "report", "snapshot", "txn_id"}
@@ -180,6 +184,7 @@ _EXACT_DATACLASS_TYPES: frozenset[type[object]] = frozenset(
         IndexView,
         LedgerEntry,
         LedgerPayload,
+        MaintenanceStatus,
         QuarantineEntry,
         QuarantineInventoryItem,
         QuarantineManifest,
@@ -774,10 +779,23 @@ def test_database_and_transaction_have_complete_static_public_property_allowlist
 ):
     """A newly added property cannot silently publish another mutable collaborator."""
     component_names = frozenset(name for name, _kind in PUBLIC_DATABASE_VIEW_ALLOWLIST)
-    assert _public_properties(Database) == _SCALAR_DATABASE_PROPERTIES | component_names
+    assert _public_properties(Database) == (
+        _SCALAR_DATABASE_PROPERTIES
+        | _OPERATIONAL_DATABASE_PROPERTIES
+        | component_names
+    )
     assert frozenset(name for name, _hook in _VIEW_BUILDER_HOOKS) == component_names
     assert _public_properties(Transaction) == _TRANSACTION_PROPERTIES
     assert not hasattr(Transaction, "context")
+
+
+def test_maintenance_status_is_an_allowlisted_immutable_value_graph() -> None:
+    """The operational facade returns a DTO, never the database capability it retains."""
+    with connect(":memory:") as database:
+        status = database.maintenance.status()
+
+    assert type(status) is MaintenanceStatus
+    _assert_capability_free(status, surface="maintenance.status")
 
 
 def test_scalar_canonicalizers_bypass_every_host_override_and_return_exact_builtins() -> (

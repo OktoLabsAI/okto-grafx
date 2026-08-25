@@ -89,6 +89,7 @@ from okto_grafx.engine.public_views import (
     HeapStoreView,
     IndexRegistryView,
     LedgerView,
+    MaintenanceStatus,
     MetricsSnapshotView,
     MetricsView,
     QuarantineView,
@@ -796,6 +797,48 @@ class Transaction:
         )
 
 
+class Maintenance:
+    """Thin operational facade over the database's existing public maintenance doors."""
+
+    __slots__ = ("_database",)
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def status(self) -> MaintenanceStatus:
+        """Return a last-observed status snapshot without claiming global linearizability."""
+        transactions = self._database.transactions
+        recovery_required = transactions.recovery_required
+        checkpoint_lag_lsn: int | None = None
+        if not recovery_required:
+            state = transactions.published_state()
+            checkpoint_lag_lsn = state.last_committed_lsn - state.checkpoint_lsn
+        return MaintenanceStatus(
+            wal_bytes=self._database.wal.total_bytes(),
+            checkpoint_lag_lsn=checkpoint_lag_lsn,
+            recovery_required=recovery_required,
+            stale_indexes=self._database.stale_indexes,
+            heap_bloat_bytes=None,
+            oldest_reader_age=None,
+        )
+
+    def checkpoint(self) -> RecycleReport:
+        """Delegate checkpointing to :meth:`Database.checkpoint`."""
+        return self._database.checkpoint()
+
+    def verify(self, scope: str = "all") -> VerificationReport:
+        """Delegate verification to :meth:`Database.verify`."""
+        return self._database.verify(scope)
+
+    def recover(self) -> RecoveryReport:
+        """Delegate recovery to :meth:`Database.recover`."""
+        return self._database.recover()
+
+    def publish_metrics(self) -> None:
+        """Delegate explicit metric publication to :meth:`Database.publish_metrics`."""
+        self._database.publish_metrics()
+
+
 class Database:
     """One open database: the object every public entry point of Okto Grafx hands back.
 
@@ -1063,6 +1106,13 @@ class Database:
     def recovery_report(self) -> RecoveryReport | None:
         """Return the report of the recovery that ran at open, or None when none did (FR-8)."""
         return self._recovery_report
+
+    @property
+    def maintenance(self) -> Maintenance:
+        """Return a thin facade over the database's existing operator operations."""
+        with self._public_transition():
+            self._require_open()
+            return Maintenance(self)
 
     # --- the composition ---------------------------------------------------------------------
 

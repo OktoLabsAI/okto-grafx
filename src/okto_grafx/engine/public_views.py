@@ -172,6 +172,7 @@ __all__ = [
     "IndexRegistryView",
     "IndexView",
     "LedgerView",
+    "MaintenanceStatus",
     "MetricsSnapshotView",
     "MetricsView",
     "QuarantineInventoryItem",
@@ -261,6 +262,18 @@ class MetricsView:
     """Immutable metric capability summary; values remain available on ``Database`` itself."""
 
     enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceStatus:
+    """Last-observed operational status without unavailable estimates or live capabilities."""
+
+    wal_bytes: int
+    checkpoint_lag_lsn: int | None
+    recovery_required: bool
+    stale_indexes: tuple[str, ...]
+    heap_bloat_bytes: int | None
+    oldest_reader_age: float | None
 
 
 @dataclass(frozen=True, slots=True, eq=False)
