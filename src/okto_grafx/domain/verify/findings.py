@@ -69,6 +69,7 @@ class FindingKind:
     FILE_HEADER: str = "file_header"
     FILE_UNREADABLE: str = "file_unreadable"
     RECORD_HEADER: str = "record_header"
+    RECORD_ID_COUNTER: str = "record_id_counter"
     RECORD_LENGTH: str = "record_length"
     RECORD_LIFETIME: str = "record_lifetime"
     VERSION_CHAIN: str = "version_chain"
@@ -94,6 +95,7 @@ VERIFICATION_FINDING_KINDS: frozenset[str] = frozenset(
         FindingKind.FILE_HEADER,
         FindingKind.FILE_UNREADABLE,
         FindingKind.RECORD_HEADER,
+        FindingKind.RECORD_ID_COUNTER,
         FindingKind.RECORD_LENGTH,
         FindingKind.RECORD_LIFETIME,
         FindingKind.VERSION_CHAIN,

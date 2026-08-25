@@ -721,6 +721,24 @@ class Verifier:
 Findings carry `kind`, `location` (`file`, `page`, `slot`, `lsn`, `index`), `detail` (en-US).
 A clean database returns an empty findings tuple.
 
+The records walk independently enforces the heap identity high-water invariant. It reads page 0
+and every heap record header directly from the storage device, never through the buffer pool,
+catalog reachability or snapshot visibility. For each table with a physically decodable header,
+`next_record_id` MUST be strictly greater than the greatest stored `record_id`; equality would hand
+an existing identity out again. Ended, deleted, provisional, no-CSN and orphaned headers all count.
+A counter ahead of the records is valid because allocation and range leasing may burn gaps.
+
+Ownership is fail-closed in the same physical walk. Every `PageType.HEAP` page MUST have a live,
+readable slot 0 of exactly `DESCRIPTOR_SIZE` bytes. A missing, freed, unreadable, short or long
+descriptor produces a located `page_descriptor_missing`; its bytes cannot contribute a table
+association or a record-id maximum. A trustworthy descriptor whose `table_id` has no decodable
+`TableExtent` on the device-resident heap page 0 produces one located `orphan_page` per physical
+page, even when its record headers are short. Duplicate extents produce `table_unreadable` and no
+counter is chosen between them. After the catalog snapshot is decoded, an extent with no matching
+table definition produces `table_unreadable`, and each physical page it purported to own produces
+`orphan_page`. If page 0 or the catalog is itself unreadable, the verifier reports that authority
+failure and does not guess ownership. These checks belong to `records` and `all`.
+
 ### 8.7 `engine/index_manager.py` (C7)
 ```python
 class IndexVisibility(str, Enum):
