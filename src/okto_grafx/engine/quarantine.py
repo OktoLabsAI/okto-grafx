@@ -386,16 +386,20 @@ class QuarantineStore:
         try:
             observed = self._storage.list_files(prefix)
         except GrafxError as failure:
+            try:
+                retryable = is_retryable(failure)
+            except BaseException:
+                retryable = False
             raise GrafxQuarantineError(
                 f"The quarantine inventory is inconclusive because {self._directory!r} could "
                 "not be listed.",
-                retryable=failure.retryable,
+                retryable=retryable,
                 field="inventory",
                 operation="list_files",
                 directory=self._directory,
                 conclusive=False,
                 inconclusive=True,
-                cause=failure.code,
+                cause="storage_failure",
             ) from failure
 
         files = self._require_inventory_listing(observed, prefix)
@@ -716,21 +720,21 @@ class QuarantineStore:
             raw = self._storage.read_log(
                 manifest_file, 0, self._storage.log_size(manifest_file)
             )
-        except GrafxCorruptionDetected as failure:
+        except GrafxCorruptionDetected:
             return QuarantineInventoryItem(
                 name=name,
                 state="corrupt_manifest",
                 files=files,
                 manifest_file=manifest_file,
-                detail=f"{failure.code}: {failure.message}",
+                detail="The storage port reported corruption while reading the manifest.",
             )
-        except GrafxError as failure:
+        except GrafxError:
             return QuarantineInventoryItem(
                 name=name,
                 state="unreadable_manifest",
                 files=files,
                 manifest_file=manifest_file,
-                detail=f"{failure.code}: {failure.message}",
+                detail="The storage port could not read the quarantine manifest.",
             )
 
         try:

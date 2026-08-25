@@ -215,6 +215,119 @@ def test_inventory_distinguishes_corrupt_manifest_storage_from_unreadable_access
     assert stack.quarantine.list() == ()
 
 
+def test_inventory_does_not_inspect_a_caught_corruption_failure(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry = _capture(stack, 24)
+    device = _device(stack)
+    original_read = device.read_log
+    before = _tree(device)
+    read_only = QuarantineStore(
+        ReadOnlyStorageDevice(device), stack.clock, RecordingMetricsSink()
+    )
+
+    class HostileFailureName(type):
+        """Turn diagnostic access to the caught failure's type name into the same signal."""
+
+        def __getattribute__(cls, name: str) -> object:
+            if name == "__name__":
+                raise SystemExit(212)
+            return super().__getattribute__(name)
+
+    class HostileCorruption(GrafxCorruptionDetected, metaclass=HostileFailureName):
+        """Turn diagnostic inspection of the caught failure into a process signal."""
+
+        def __getattribute__(self, name: str) -> object:
+            if name in {"code", "message", "retryable", "details", "__class__"}:
+                raise SystemExit(212)
+            return super().__getattribute__(name)
+
+    failure = HostileCorruption("The manifest read reported corruption.")
+
+    def hostile_read(file: str, offset: int, length: int) -> bytes:
+        if file == entry.manifest_file:
+            raise failure
+        return original_read(file, offset, length)
+
+    monkeypatch.setattr(device, "read_log", hostile_read)
+
+    item = read_only.inventory()[0]
+
+    assert item.state == "corrupt_manifest"
+    assert item.detail == (
+        "The storage port reported corruption while reading the manifest."
+    )
+    monkeypatch.undo()
+    assert _tree(device) == before
+
+
+def test_inventory_does_not_format_a_caught_failure_message(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry = _capture(stack, 25)
+    device = _device(stack)
+    original_read = device.read_log
+    before = _tree(device)
+    read_only = QuarantineStore(
+        ReadOnlyStorageDevice(device), stack.clock, RecordingMetricsSink()
+    )
+
+    class HostileMessage(str):
+        """Turn every textual rendering of the stored message into a process signal."""
+
+        def __str__(self) -> str:
+            raise SystemExit(215)
+
+        def __repr__(self) -> str:
+            raise SystemExit(215)
+
+        def __format__(self, format_spec: str) -> str:
+            raise SystemExit(215)
+
+    failure = GrafxStorageError("The manifest is temporarily unreadable.")
+    failure.message = HostileMessage("hostile stored message")
+
+    def hostile_read(file: str, offset: int, length: int) -> bytes:
+        if file == entry.manifest_file:
+            raise failure
+        return original_read(file, offset, length)
+
+    monkeypatch.setattr(device, "read_log", hostile_read)
+
+    item = read_only.inventory()[0]
+
+    assert item.state == "unreadable_manifest"
+    assert item.detail == "The storage port could not read the quarantine manifest."
+    monkeypatch.undo()
+    assert _tree(device) == before
+
+
+def test_inventory_preserves_a_direct_manifest_read_signal(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry = _capture(stack, 26)
+    device = _device(stack)
+    original_read = device.read_log
+    before = _tree(device)
+    read_only = QuarantineStore(
+        ReadOnlyStorageDevice(device), stack.clock, RecordingMetricsSink()
+    )
+
+    def interrupted_read(file: str, offset: int, length: int) -> bytes:
+        if file == entry.manifest_file:
+            raise SystemExit(214)
+        return original_read(file, offset, length)
+
+    monkeypatch.setattr(device, "read_log", interrupted_read)
+
+    with pytest.raises(SystemExit) as caught:
+        read_only.inventory()
+
+    assert caught.value.code == 214
+    monkeypatch.undo()
+    assert _tree(device) == before
+
+
 @pytest.mark.parametrize(
     ("token", "expected_detail"),
     (
@@ -753,5 +866,76 @@ def test_an_inventory_whose_namespace_listing_fails_is_typed_and_inconclusive(
     assert caught.value.details["field"] == "inventory"
     assert caught.value.details["conclusive"] is False
     assert caught.value.details["inconclusive"] is True
+    monkeypatch.undo()
+    assert _tree(device) == before
+
+
+def test_inventory_contains_hostile_diagnostics_from_a_caught_listing_failure(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _capture(stack, 27)
+    device = _device(stack)
+    before = _tree(device)
+    read_only = QuarantineStore(
+        ReadOnlyStorageDevice(device), stack.clock, RecordingMetricsSink()
+    )
+
+    class HostileFailureName(type):
+        """Turn diagnostic access to the caught failure's type name into the same signal."""
+
+        def __getattribute__(cls, name: str) -> object:
+            if name == "__name__":
+                raise SystemExit(211)
+            return super().__getattribute__(name)
+
+    class HostileStorage(GrafxStorageError, metaclass=HostileFailureName):
+        """Turn every diagnostic attribute read into a process signal."""
+
+        def __getattribute__(self, name: str) -> object:
+            if name in {"code", "message", "retryable", "details", "__class__"}:
+                raise SystemExit(211)
+            return super().__getattribute__(name)
+
+        def __repr__(self) -> str:
+            raise SystemExit(211)
+
+    failure = HostileStorage("The quarantine directory could not be listed.")
+
+    def unavailable(_prefix: str = "") -> tuple[str, ...]:
+        raise failure
+
+    monkeypatch.setattr(device, "list_files", unavailable)
+
+    with pytest.raises(GrafxQuarantineError) as caught:
+        read_only.inventory()
+
+    assert caught.value.__cause__ is failure
+    assert caught.value.retryable is False
+    assert caught.value.details["cause"] == "storage_failure"
+    assert caught.value.details["conclusive"] is False
+    assert caught.value.details["inconclusive"] is True
+    monkeypatch.undo()
+    assert _tree(device) == before
+
+
+def test_inventory_preserves_a_direct_namespace_listing_signal(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _capture(stack, 28)
+    device = _device(stack)
+    before = _tree(device)
+    read_only = QuarantineStore(
+        ReadOnlyStorageDevice(device), stack.clock, RecordingMetricsSink()
+    )
+
+    def interrupted_listing(_prefix: str = "") -> tuple[str, ...]:
+        raise SystemExit(213)
+
+    monkeypatch.setattr(device, "list_files", interrupted_listing)
+
+    with pytest.raises(SystemExit) as caught:
+        read_only.inventory()
+
+    assert caught.value.code == 213
     monkeypatch.undo()
     assert _tree(device) == before
