@@ -381,16 +381,23 @@ def _knob_occurrences(tree: ast.AST) -> list[ast.AST]:
     return found
 
 
-def _gate_command() -> list[str]:
-    """The EFFECTIVE argv of the workflow's gate step, tokenized.
+def _gate_commands(workflow_text: str | None = None) -> list[list[str]]:
+    """Every EFFECTIVE argv that invokes the workflow gate, tokenized.
 
     Reading lines was the audited mistake: it could not tell a flag from a flag inside a
     trailing comment, and it could not see flags arriving through a shell variable at all.
-    This finds the step's run scalar, drops comment lines, joins continuations and hands the
-    result to shlex, so what is asserted is the command the runner executes.
+    Returning from the first match was another version of that mistake: a second step could
+    run a weaker gate while every assertion inspected only the first. This collects every
+    matching run scalar, drops comments, joins continuations and hands each result to shlex,
+    so cardinality and the argv the runner executes are both governed.
     """
-    text = WORKFLOW.read_text(encoding="utf-8")
+    text = (
+        WORKFLOW.read_text(encoding="utf-8")
+        if workflow_text is None
+        else workflow_text
+    )
     lines = text.splitlines()
+    commands: list[list[str]] = []
     for index, line in enumerate(lines):
         if "bench.harness.gate" not in line:
             continue
@@ -405,6 +412,8 @@ def _gate_command() -> list[str]:
             script = script[:-1] + lines[index].strip()
         # A trailing comment is not part of the command.
         script = script.split(" #", 1)[0]
+        if "bench.harness.gate" not in script:
+            continue
         expressions: dict[str, str] = {}
 
         def protect_expression(match: re.Match[str]) -> str:
@@ -419,9 +428,18 @@ def _gate_command() -> list[str]:
             for marker, expression in expressions.items():
                 token = token.replace(marker, expression)
             restored.append(token)
-        return restored
-    pytest.fail("the workflow no longer invokes bench.harness.gate")
-    raise AssertionError("unreachable")
+        commands.append(restored)
+    return commands
+
+
+def _gate_command(workflow_text: str | None = None) -> list[str]:
+    """The sole workflow gate command; absence and duplication both fail closed."""
+    commands = _gate_commands(workflow_text)
+    assert len(commands) == 1, (
+        "the workflow must invoke bench.harness.gate exactly once; "
+        f"found {len(commands)} invocations: {commands}"
+    )
+    return commands[0]
 
 
 # ------------------------------------------------------------------------------------
@@ -773,6 +791,17 @@ def test_every_metadata_field_is_parsed_and_cross_checked(
     assert raw_metadata["blas_environment"] == raw_verdict["blas_environment"]
     assert raw_metadata["blas_environment"] == provenance["blas_environment"]
     assert raw_metadata["numpy"] == raw_verdict["numpy"] == provenance["numpy"]
+    for field in ("profile", "gt_path_used"):
+        assert type(raw_verdict[field]) is str
+        assert type(provenance[field]) is str
+        assert provenance[field] == raw_verdict[field], (
+            f"provenance.{field} must come from the authenticated worker verdict"
+        )
+    assert type(raw_metadata["python"]) is str
+    assert type(provenance["python"]) is str
+    assert provenance["python"] == raw_metadata["python"], (
+        "provenance.python must come from the authenticated capture metadata"
+    )
     assert raw_metadata["duration_seconds"] == frozen_from["duration_seconds"]
     assert raw_metadata["duration_seconds"] == provenance["duration_seconds"]
     assert raw_metadata["exit_code"] == frozen_from["exit_code"]
@@ -1062,6 +1091,8 @@ def test_every_contended_window_is_recorded_in_order() -> None:
 
     assert windows[0]["window_utc"] == "2026-08-25T05:00Z/2026-08-25T05:04Z"
     assert windows[1]["window_utc"] == "2026-08-25T05:10Z/2026-08-25T05:15Z"
+    assert type(load["count"]) is int
+    assert type(windows[1]["test_count"]) is int
     assert windows[1]["test_count"] == 147
 
     for index, window in enumerate(windows):
@@ -1394,6 +1425,22 @@ def test_the_workflow_command_lets_the_versioned_artifact_govern() -> None:
         "the effective gate command changed; review every token rather than allowing an "
         f"implicit flag or shell operator: {argv}"
     )
+
+
+def test_a_second_workflow_gate_cannot_hide_after_the_governed_one() -> None:
+    """The first matching step is not authority over a second executable gate."""
+    command = " ".join(EXPECTED_GATE_ARGV)
+    smuggled = "\n".join(
+        (
+            "steps:",
+            "  - name: Governed gate",
+            f"    run: {command}",
+            "  - name: Second gate (smuggled)",
+            f"    run: {command} --recall-target 0.10",
+        )
+    )
+    with pytest.raises(AssertionError, match="exactly once"):
+        _gate_command(smuggled)
 
 
 def test_no_gate_flag_can_arrive_through_a_shell_variable() -> None:
