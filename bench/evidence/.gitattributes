@@ -1,0 +1,6 @@
+# Evidence is bytes, not text: no newline translation, ever. raw_sha256 in the
+# calibration covers exactly what the worker subprocess wrote, and a checkout that
+# rewrote line endings would break that hash on the platform CI runs on.
+* -text
+*.json -diff
+*.b64 -diff
