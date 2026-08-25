@@ -48,6 +48,14 @@ SPACE_DIMENSION: int = 4
 VECTOR_INDEX_PREFIX: str = "vector_"
 """The prefix the vector subsystem gives the index it attaches to a (table, space) pair."""
 
+FIXTURE_READ_LSN: int = 1000
+"""The closed-world log ceiling maintained by this direct-construction fixture.
+
+Every heap mutation exposed by :class:`QueryStack` updates all of its maintained indexes in the
+same helper call.  There is no independent WAL producer between those calls, so declaring this
+synthetic ceiling is truthful: the fixture has installed every row that exists in its world.
+"""
+
 
 class MemoryDevice:
     """An in-memory StorageDevice with the paged and append-only semantics of the port."""
@@ -376,11 +384,11 @@ class QueryStack:
         """Return one table of this stack by name."""
         return self.catalog_store.catalog.table(name)
 
-    def snapshot(self, read_lsn: int = 1000) -> SnapshotDouble:
+    def snapshot(self, read_lsn: int = FIXTURE_READ_LSN) -> SnapshotDouble:
         """Return a snapshot at that log position."""
         return SnapshotDouble(read_lsn=read_lsn)
 
-    def transaction(self, read_lsn: int = 1000) -> TransactionDouble:
+    def transaction(self, read_lsn: int = FIXTURE_READ_LSN) -> TransactionDouble:
         """Return a transaction reading at that log position."""
         return TransactionDouble(snapshot=self.snapshot(read_lsn))
 
@@ -573,6 +581,10 @@ def build_query_stack(*, budget_pages: int = 64, with_indexes: bool = True) -> Q
     # column rather than when the space is declared. The fixture builds its tables directly on
     # the catalog, so it does the attaching directly too.
     vectors.attach(catalog.table("Chunk"), SPACE_NAME)
+    # ``SnapshotDouble`` uses a synthetic closed-world ceiling rather than a live WAL frontier.
+    # The fixture's mutation helpers keep heap and indexes coupled, so every registered index is
+    # genuinely complete for everything this fixture can have installed at that ceiling.
+    indexes.mark_built_through(FIXTURE_READ_LSN)
     engine = QueryEngine(
         catalog=catalog_store,
         heap=heap,

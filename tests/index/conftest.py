@@ -278,6 +278,7 @@ def make_pool(
         metrics,
         budget_bytes=device.page_size * budget_pages,
         db_label=db_label,
+        page_sequence_fence=lambda file, _page_index: file.startswith("index/"),
     )
 
 

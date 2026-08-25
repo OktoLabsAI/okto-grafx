@@ -364,12 +364,33 @@ def test_replaying_a_reconciliation_restores_its_horizon(database: Database) -> 
 
 
 def test_a_reset_carries_no_key_and_declares_a_position() -> None:
-    change = IndexChange(index="by_name", operation=IndexOperation.RESET, csn=42)
+    change = IndexChange(
+        index="by_name",
+        operation=IndexOperation.RESET,
+        ref=RecordRef(18, 0),
+        csn=42,
+    )
 
     assert change_of(wal_record_for(change)) == change
     with pytest.raises(GrafxIndexError) as refused:
         IndexChange(index="by_name", operation=IndexOperation.RESET, key=b"k", csn=42)
     assert refused.value.details["field"] == "key"
+    for invalid in (RecordRef(17, 0), RecordRef(18, 1)):
+        with pytest.raises(GrafxIndexError) as token_refused:
+            IndexChange(
+                index="by_name",
+                operation=IndexOperation.RESET,
+                ref=invalid,
+                csn=42,
+            )
+        assert token_refused.value.details["field"] == "rebuild_token"
+
+
+def test_a_legacy_reset_with_a_zero_token_remains_decodable() -> None:
+    legacy = IndexChange(index="by_name", operation=IndexOperation.RESET, csn=42)
+
+    assert change_of(wal_record_for(legacy)) == legacy
+    assert legacy.ref == RecordRef(0, 0)
 
 
 def test_a_payload_that_decodes_into_an_illegal_change_is_damage() -> None:

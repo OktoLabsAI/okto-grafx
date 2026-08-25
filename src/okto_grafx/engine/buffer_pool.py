@@ -154,12 +154,27 @@ def next_seq(seq: int) -> int:
 class _Frame:
     """One resident page together with how many callers currently hold it pinned."""
 
-    __slots__ = ("page", "pins", "doomed")
+    __slots__ = (
+        "page",
+        "pins",
+        "doomed",
+        "discard_unwritten",
+        "device_base_seq",
+    )
 
-    def __init__(self, page: Page) -> None:
+    def __init__(self, page: Page, *, device_base_seq: int | None = None) -> None:
         self.page: Page = page
         self.pins: int = 0
         self.doomed: bool = False
+        # A foreign refresh can retire a clean frame while its reader still holds the Page
+        # object. That holder must be able to release its exact object, but it must never be
+        # able to publish the now-stale bytes on the way out -- even if it mutates the object
+        # after the refresh observed it as clean.
+        self.discard_unwritten: bool = False
+        # The sequence observed on the device when this frame was admitted (or after its last
+        # successful write-back). It is separate from ``page.seq`` because redo may replace the
+        # mutable page with a newer logged image before publishing it.
+        self.device_base_seq: int = page.seq if device_base_seq is None else device_base_seq
 
 
 def _guarded(method: Callable[..., object]) -> Callable[..., object]:
@@ -199,6 +214,8 @@ class BufferPool:
         "_budget_bytes",
         "_db_label",
         "_guard",
+        "_page_write_section",
+        "_page_sequence_fence",
         "_doomed",
         "_page_size",
         "_frames",
@@ -223,6 +240,11 @@ class BufferPool:
         budget_bytes: int,
         db_label: str,
         guard: AbstractContextManager[object] | None = None,
+        page_write_section: Callable[
+            [str, PageIndex], AbstractContextManager[object]
+        ]
+        | None = None,
+        page_sequence_fence: Callable[[str, PageIndex], bool] | None = None,
     ) -> None:
         """Build a pool over one device, with its own budget and its own metric label."""
         self._storage: StorageDevice = storage
@@ -231,6 +253,18 @@ class BufferPool:
         self._page_size: int = validate_page_size(storage.page_size)
         self._guard: AbstractContextManager[object] = (
             nullcontext() if guard is None else guard
+        )
+        self._page_write_section: Callable[
+            [str, PageIndex], AbstractContextManager[object]
+        ] = (
+            (lambda _file, _page_index: nullcontext())
+            if page_write_section is None
+            else page_write_section
+        )
+        self._page_sequence_fence: Callable[[str, PageIndex], bool] = (
+            (lambda _file, _page_index: False)
+            if page_sequence_fence is None
+            else page_sequence_fence
         )
         self._doomed: dict[tuple[str, PageIndex], list[_Frame]] = {}
         # Pages this pool has grown a file for and not yet written back, and the subset of them
@@ -396,6 +430,19 @@ class BufferPool:
         return page
 
     @_guarded
+    def read_fresh_page(self, file: str, page_index: PageIndex) -> Page:
+        """Read one detached page from the device, bypassing every resident frame.
+
+        This is the observation door for optimistic cross-process certificates.  Returning a
+        detached page is load-bearing: replacing a resident object behind a holder would make
+        that holder release or mutate a page the frame table no longer owns.  The ordinary
+        torn-read/checksum protocol still applies through :meth:`_read_page`, and this door never
+        writes, evicts, or changes a cache epoch.
+        """
+        _require_page_index("page_index", page_index)
+        return self._read_page(file, page_index)
+
+    @_guarded
     def unpin(
         self, file: str, page_index: PageIndex, *, dirty: bool = False, page: Page | None = None
     ) -> None:
@@ -418,9 +465,11 @@ class BufferPool:
             doomed = self._doomed.get(key, [])
             for position, candidate in enumerate(doomed):
                 if candidate.page is page:
+                    if dirty:
+                        candidate.page.dirty = True
                     candidate.pins -= 1
                     if candidate.pins <= 0:
-                        if candidate.page.dirty:
+                        if candidate.page.dirty and not candidate.discard_unwritten:
                             self._write_back(file, page_index, candidate.page)
                         del doomed[position]
                         if not doomed:
@@ -446,6 +495,25 @@ class BufferPool:
     def pinned(self, file: str, page_index: PageIndex) -> AbstractContextManager[Page]:
         """Return a context manager that pins the page and always unpins it again."""
         return self._pinned(file, page_index)
+
+    @contextmanager
+    def page_write_fence(self, file: str, page_index: PageIndex) -> Iterator[None]:
+        """Hold the local pool guard and the injected page section in canonical order.
+
+        A multi-page operation whose page-0 certificate covers the whole operation (an index
+        rebuild, for example) uses this door instead of taking the injected section directly.
+        Every ordinary pool write already enters the local guard before its page section, so
+        this order prevents a section->guard inversion. Production injects re-entrant
+        mechanisms: nested pool doors re-enter the guard, and a nested page-0 write-back
+        re-enters the same cross-process section.
+
+        The default mechanisms remain no-ops, preserving the pure-core construction used by
+        adapters that do not need cross-process page fencing.
+        """
+        _require_page_index("page_index", page_index)
+        with self._guard:
+            with self._page_write_section(file, page_index):
+                yield
 
     @contextmanager
     def _pinned(self, file: str, page_index: PageIndex) -> Iterator[Page]:
@@ -477,10 +545,22 @@ class BufferPool:
             if frame is not None and frame.pins:
                 continue
             del waiting[position]
+            if not self._claim_is_unwritten(file, candidate):
+                # A foreign refresh may have occurred since this process abandoned the index.
+                # A real device image retires the local claim; it is never blanked or reused.
+                self._grown.discard((file, candidate))
+                continue
             if not waiting:
                 del self._abandoned[file]
             return candidate
+        if not waiting:
+            del self._abandoned[file]
         return None
+
+    def _claim_is_unwritten(self, file: str, page_index: PageIndex) -> bool:
+        """Say whether an allocation claim still names the device's untouched zero image."""
+        raw = self._storage.read_page(file, page_index)
+        return is_unwritten_image(raw, self._page_size)
 
     @_guarded
     def allocate(self, file: str, page_type: int, *, reuse: bool = True) -> Page:
@@ -537,7 +617,9 @@ class BufferPool:
             del self._frames[key]
         page = Page(page_type, page_size=self._page_size, page_index=page_index)
         page.dirty = True
-        frame = _Frame(page)
+        # The device image for a page allocated here is all-zero. Its mutable Page may later be
+        # replaced by redo, but the CAS base remains the image this frame took ownership of.
+        frame = _Frame(page, device_base_seq=0)
         frame.pins = 1
         self._frames[key] = frame
         self._report_usage()
@@ -658,6 +740,11 @@ class BufferPool:
         written = 0
         for name in names:
             for page_index in list(self._abandoned.pop(name, ())):
+                if not self._claim_is_unwritten(name, page_index):
+                    # Another participant acquired meaning for this physical page after the
+                    # local attempt abandoned it. Retire the claim without touching that image.
+                    self._grown.discard((name, page_index))
+                    continue
                 blank = Page(
                     int(PageType.FREE), page_size=self._page_size, page_index=page_index
                 )
@@ -757,6 +844,108 @@ class BufferPool:
         self._bump_drop_epoch(file)
         self._report_usage()
         return True
+
+    @_guarded
+    def discard_clean_file(self, file: str) -> int:
+        """Forget every clean frame of ``file`` without writing a byte.
+
+        A foreign freshness certificate says the device moved underneath this cache.  Calling
+        :meth:`invalidate` in response would be unsafe: invalidate writes dirty frames first,
+        and a stale local frame can therefore overwrite the very foreign state that caused the
+        refresh. This narrower door first proves that *all* resident and doomed frames of the
+        file are clean, then drops unpinned frames and dooms pinned ones atomically. A holder
+        keeps its exact Page object and releases it through ``unpin(page=...)``; the last release
+        discards those stale bytes without write-back. Any dirty frame refuses before a frame,
+        allocation claim, reuse claim, or epoch moves.
+        """
+        targets = [
+            (key, frame) for key, frame in self._frames.items() if key[0] == file
+        ]
+        doomed = [
+            (key, frame)
+            for key, frames in self._doomed.items()
+            if key[0] == file
+            for frame in frames
+        ]
+        for (name, page_index), frame in (*targets, *doomed):
+            if frame.page.dirty:
+                raise GrafxUnsupportedOperation(
+                    f"Page {page_index} of {name!r} is dirty and cannot be discarded for a "
+                    "foreign refresh without losing or writing local work.",
+                    field="dirty",
+                    file=name,
+                    page=page_index,
+                )
+        for key, frame in targets:
+            if frame.pins:
+                frame.doomed = True
+                frame.discard_unwritten = True
+                self._doomed.setdefault(key, []).append(frame)
+            del self._frames[key]
+        for key, frame in doomed:
+            frames = self._doomed.get(key)
+            if frames is not None:
+                if frame.pins:
+                    frame.discard_unwritten = True
+                else:
+                    frames.remove(frame)
+                    if not frames:
+                        del self._doomed[key]
+        # Allocation claims survive the cache drop. Clearing them here strands their all-zero
+        # device pages so close can no longer settle them. Reuse and settlement each re-read the
+        # device first, retiring a claim if a foreign participant gave that page meaning.
+        self._bump_drop_epoch(file)
+        self._report_usage()
+        return len(targets)
+
+    @_guarded
+    def discard_clean_page(self, file: str, page_index: PageIndex) -> bool:
+        """Forget clean frames for one page without write-back, atomically or not at all.
+
+        Header transitions use this after a fresh device observation so a cached page 0 cannot
+        overwrite a foreign flag. The whole-file variant rebases readers; this narrow variant
+        permits a writer to retain unrelated dirty bucket pages. A clean pinned frame is doomed
+        rather than refused: its holder keeps the Page object until ``unpin(page=...)``, while
+        the stale bytes can no longer be found by a new pin or written on release.
+        """
+        _require_page_index("page_index", page_index)
+        key = (file, page_index)
+        frames: list[_Frame] = []
+        resident = self._frames.get(key)
+        if resident is not None:
+            frames.append(resident)
+        doomed = list(self._doomed.get(key, ()))
+        frames.extend(doomed)
+        for frame in frames:
+            if frame.page.dirty:
+                raise GrafxUnsupportedOperation(
+                    f"Page {page_index} of {file!r} is dirty and cannot be discarded for a "
+                    "foreign refresh without losing or writing local work.",
+                    field="dirty",
+                    file=file,
+                    page=page_index,
+                )
+        dropped = resident is not None
+        if resident is not None:
+            if resident.pins:
+                resident.doomed = True
+                resident.discard_unwritten = True
+                self._doomed.setdefault(key, []).append(resident)
+            del self._frames[key]
+        retained = self._doomed.get(key)
+        if retained is not None:
+            for frame in doomed:
+                if frame.pins:
+                    frame.discard_unwritten = True
+                else:
+                    retained.remove(frame)
+            if not retained:
+                del self._doomed[key]
+        # Keep any allocation claim until reuse or close revalidates the device image. Dropping
+        # it here would leave an abandoned all-zero page permanently unverifiable.
+        self._bump_drop_epoch(file)
+        self._report_usage()
+        return dropped
 
     @_guarded
     def invalidate(self, file: str | None = None) -> None:
@@ -926,6 +1115,19 @@ class BufferPool:
             return
         self._abandoned.setdefault(file, []).append(page_index)
 
+    def _owning_frame(
+        self, file: str, page_index: PageIndex, page: Page
+    ) -> _Frame | None:
+        """Return the live/doomed frame that owns ``page``, if this is a framed write."""
+        key = (file, page_index)
+        resident = self._frames.get(key)
+        if resident is not None and resident.page is page:
+            return resident
+        for frame in self._doomed.get(key, ()):
+            if frame.page is page:
+                return frame
+        return None
+
     def _write_back(self, file: str, page_index: PageIndex, page: Page) -> None:
         """Encode the page and hand it to the device, advancing its sequence counter.
 
@@ -935,9 +1137,68 @@ class BufferPool:
         amendment A21 says a durable image carries an even counter without exception.
         """
         page.page_index = page_index
-        page.seq = next_seq(page.seq)
-        image = self._codec.encode_page(page)
-        self._storage.write_page(file, page_index, image)
+        frame = self._owning_frame(file, page_index, page)
+        fenced = page_index == HEADER_PAGE_INDEX and self._page_sequence_fence(
+            file, page_index
+        )
+        section = (
+            self._page_write_section(file, page_index)
+            if fenced
+            else nullcontext()
+        )
+        with section:
+            publish_base = page.seq
+            if fenced:
+                # Page 0 is the cross-process freshness clock.  The section makes this a real
+                # compare-and-swap rather than two racing reads, and the frame's admission base
+                # distinguishes a legitimate newer redo image from a stale cached writer.
+                if frame is None:
+                    raise GrafxUnsupportedOperation(
+                        f"Page 0 of {file!r} has no owning frame, so its device base is unknown.",
+                        field="page_sequence_base",
+                        file=file,
+                        page=page_index,
+                        retryable=False,
+                    )
+                fresh = self._read_page(file, page_index)
+                if fresh.seq != frame.device_base_seq:
+                    raise GrafxUnsupportedOperation(
+                        f"Page 0 of {file!r} changed from sequence "
+                        f"{frame.device_base_seq} to {fresh.seq} in another participant.",
+                        field="page_sequence_conflict",
+                        file=file,
+                        page=page_index,
+                        cached_seq=frame.device_base_seq,
+                        device_seq=fresh.seq,
+                        retryable=True,
+                    )
+                # Redo may install a logged image whose seq is ahead of the current device.  It
+                # is legitimate and supplies the publishing base; a lower image must still move
+                # strictly beyond the device clock, hence max().
+                publish_base = max(page.seq, fresh.seq)
+                if publish_base >= MAX_SEQ - 1:
+                    raise GrafxUnsupportedOperation(
+                        f"Page 0 of {file!r} exhausted its non-wrapping sequence clock at "
+                        f"{publish_base}.",
+                        field="page_sequence_exhausted",
+                        file=file,
+                        page=page_index,
+                        seq=publish_base,
+                        retryable=False,
+                    )
+            previous_seq = page.seq
+            page.seq = next_seq(publish_base)
+            try:
+                image = self._codec.encode_page(page)
+                self._storage.write_page(file, page_index, image)
+            except BaseException:
+                # If the device completed and then raised, the next CAS observes the advanced
+                # sequence and fails closed.  Restoring the object prevents an unconfirmed write
+                # from becoming the base of another publication.
+                page.seq = previous_seq
+                raise
+            if frame is not None:
+                frame.device_base_seq = page.seq
         page.dirty = False
         # Remembered, not forgotten. Clearing the dirty flag is what used to take an evicted
         # page out of modified_pages() and out of the log with it; see that method.

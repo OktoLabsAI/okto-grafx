@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
-from okto_grafx.engine.index_manager import edge_from_index_name, edge_to_index_name
+from okto_grafx.engine.index_manager import IndexManager, edge_from_index_name, edge_to_index_name
 
 
 @pytest.fixture()
@@ -78,6 +78,24 @@ def test_traversal_answers_the_same_rows_by_index_and_by_scan(database) -> None:
     assert indexed == scanned
     assert indexed[0] == [(1,), (2,)]
     assert indexed[1] == [(1,), (2,), (4,)]
+
+
+def test_endpoint_acceleration_crosses_the_central_exact_view_fence(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _small_graph(database)
+    crossed: list[str] = []
+    original = IndexManager.validated
+
+    def recording(self, index, key, snapshot):
+        crossed.append(index.name)
+        return original(self, index, key, snapshot)
+
+    monkeypatch.setattr(IndexManager, "validated", recording)
+    assert sorted(
+        database.execute("MATCH (a:A {id: 1})-[:E]->(b:B) RETURN b.id").rows
+    ) == [(1,), (2,)]
+    assert edge_from_index_name("E") in crossed
 
 
 def test_the_hybrid_switches_past_the_fan_limit_and_the_answer_does_not_change(

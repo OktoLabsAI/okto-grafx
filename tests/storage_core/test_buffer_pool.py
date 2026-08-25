@@ -15,9 +15,9 @@ sleeping, and then declares the page corrupt with its location.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
-
 import struct
+import threading
+from collections.abc import Iterator
 
 import pytest
 
@@ -31,7 +31,13 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import PageIndex
-from okto_grafx.domain.page import PAGE_HEADER_SIZE, Page, PageType, crc32c
+from okto_grafx.domain.page import (
+    PAGE_HEADER_SIZE,
+    Page,
+    PageType,
+    crc32c,
+    is_unwritten_image,
+)
 from okto_grafx.engine import buffer_pool as pool_module
 from okto_grafx.engine.buffer_pool import (
     BUFFER_BUDGET_EXCEEDED_TOTAL,
@@ -339,6 +345,329 @@ def test_invalidate_forces_a_re_read_and_keeps_what_was_written() -> None:
     assert pool.used_bytes() == 0
     with pool.pinned(FILE, 0) as page:
         assert page.read_slot(1) == b"kept"
+
+
+def test_a_fresh_page_observation_bypasses_a_resident_frame_without_replacing_it() -> None:
+    """A cross-process certificate must come from the device, not from the cache it certifies."""
+    device = MemoryDevice()
+    reader = make_pool(device, RecordingMetrics())
+    writer = make_pool(device, RecordingMetrics())
+    seed_pages(reader, 1)
+
+    with reader.pinned(FILE, 0) as cached:
+        original = cached.read_slot(0)
+    with writer.pinned(FILE, 0) as changed:
+        changed.update_slot(0, b"foreign")
+    writer.flush(FILE)
+
+    writes_before = tuple(device.write_calls)
+    observed = reader.read_fresh_page(FILE, 0)
+
+    assert observed.read_slot(0) == b"foreign"
+    assert tuple(device.write_calls) == writes_before, "a read-only observation wrote a page"
+    with reader.pinned(FILE, 0) as still_cached:
+        assert still_cached.read_slot(0) == original, (
+            "observing the device silently replaced a frame another caller may still rely on"
+        )
+
+
+def test_discard_clean_file_forgets_clean_frames_without_writing_them_back() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 3)
+    for page_index in range(3):
+        with pool.pinned(FILE, page_index):
+            pass
+    writes_before = tuple(device.write_calls)
+    epoch_before = pool.cache_drop_epoch(FILE)
+
+    assert pool.discard_clean_file(FILE) == 3
+
+    assert tuple(device.write_calls) == writes_before
+    assert all(not pool.is_resident(FILE, page_index) for page_index in range(3))
+    assert pool.cache_drop_epoch(FILE) == epoch_before + 1
+
+
+def test_discard_clean_file_refuses_dirty_frames_atomically_and_without_writeback() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 2)
+    with pool.pinned(FILE, 0) as dirty:
+        dirty.update_slot(0, b"local-uncommitted")
+    held_clean = pool.pin(FILE, 1)
+    writes_before = tuple(device.write_calls)
+    epoch_before = pool.cache_drop_epoch(FILE)
+
+    try:
+        with pytest.raises(GrafxUnsupportedOperation) as refused:
+            pool.discard_clean_file(FILE)
+
+        assert refused.value.details["field"] == "dirty"
+        assert tuple(device.write_calls) == writes_before
+        assert pool.cache_drop_epoch(FILE) == epoch_before
+        assert pool.is_resident(FILE, 0)
+        assert pool.is_resident(FILE, 1), (
+            "the clean pinned sibling was doomed before the dirty refusal"
+        )
+        assert (FILE, 1) not in pool._doomed
+    finally:
+        pool.unpin(FILE, 1, page=held_clean)
+
+
+def test_discard_clean_file_dooms_clean_pins_and_releases_the_exact_object_unwritten() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 2)
+    held = pool.pin(FILE, 1)
+    writes_before = tuple(device.write_calls)
+    epoch_before = pool.cache_drop_epoch(FILE)
+
+    assert pool.discard_clean_file(FILE) == 2
+
+    assert tuple(device.write_calls) == writes_before
+    assert pool.cache_drop_epoch(FILE) == epoch_before + 1
+    assert not pool.is_resident(FILE, 0)
+    assert not pool.is_resident(FILE, 1)
+    assert pool._doomed[(FILE, 1)][0].page is held
+
+    # Even a late mutation of the retired object cannot publish stale bytes over the foreign
+    # certificate that caused the refresh. A new pin owns a different, device-backed object.
+    held.update_slot(0, b"stale-holder")
+    fresh = pool.pin(FILE, 1)
+    assert fresh is not held
+    assert fresh.read_slot(0) == b"page-1"
+    pool.unpin(FILE, 1, dirty=True, page=held)
+    assert tuple(device.write_calls) == writes_before
+    assert pool.pin_count(FILE, 1) == 1
+    assert (FILE, 1) not in pool._doomed
+    pool.unpin(FILE, 1, page=fresh)
+
+
+def test_discard_clean_file_keeps_existing_pinned_doomed_frames_only() -> None:
+    """A second refresh retires orphaned doomed frames but preserves a live holder."""
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    held = pool.pin(FILE, 0)
+    assert pool.begin_read_view("foreign-1") is True
+    existing = pool._doomed[(FILE, 0)][0]
+    orphan = pool_module._Frame(pool.read_fresh_page(FILE, 0))
+    orphan.doomed = True
+    pool._doomed[(FILE, 0)].append(orphan)
+    writes_before = tuple(device.write_calls)
+
+    assert pool.discard_clean_file(FILE) == 0
+
+    assert pool._doomed[(FILE, 0)] == [existing]
+    assert existing.discard_unwritten is True
+    pool.unpin(FILE, 0, page=held)
+    assert (FILE, 0) not in pool._doomed
+    assert tuple(device.write_calls) == writes_before
+
+
+def test_discard_clean_file_forgets_local_reuse_claims_over_foreign_pages() -> None:
+    """A page reclaimed locally may have acquired meaning in another participant meanwhile."""
+    device = MemoryDevice()
+    reader = make_pool(device, RecordingMetrics())
+    writer = make_pool(device, RecordingMetrics())
+    reserve_header(reader)
+    reader.flush(FILE)
+    abandoned = reader.allocate(FILE, int(PageType.HEAP))
+    abandoned_index = abandoned.page_index
+    reader.unpin(FILE, abandoned_index, page=abandoned)
+    assert reader.discard(FILE, abandoned_index)
+
+    with writer.pinned(FILE, abandoned_index) as adopted:
+        adopted.page_type = int(PageType.HEAP)
+        adopted.insert_slot(b"foreign-owner")
+    writer.flush(FILE)
+
+    reader.discard_clean_file(FILE)
+    replacement = reader.allocate(FILE, int(PageType.HEAP))
+    try:
+        assert replacement.page_index != abandoned_index
+    finally:
+        reader.unpin(FILE, replacement.page_index, page=replacement)
+
+
+def test_discard_clean_file_keeps_an_unwritten_claim_settleable() -> None:
+    """A foreign cache rebase must not strand an abandoned zero page at close."""
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    reserve_header(pool)
+    pool.flush(FILE)
+    abandoned = pool.allocate(FILE, int(PageType.HEAP))
+    page_index = abandoned.page_index
+    pool.unpin(FILE, page_index, page=abandoned)
+    assert pool.discard(FILE, page_index)
+    assert is_unwritten_image(device.raw_page(FILE, page_index), device.page_size)
+
+    pool.discard_clean_file(FILE)
+
+    assert pool.settle_abandoned(FILE) == 1
+    assert not is_unwritten_image(device.raw_page(FILE, page_index), device.page_size)
+
+
+def test_discard_clean_page_dooms_a_clean_pin_and_never_writes_it_on_release() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 2)
+    held = pool.pin(FILE, 0)
+    writes_before = tuple(device.write_calls)
+    epoch_before = pool.cache_drop_epoch(FILE)
+
+    assert pool.discard_clean_page(FILE, 0) is True
+
+    assert not pool.is_resident(FILE, 0)
+    assert pool.is_resident(FILE, 1), "the page-scoped refresh dropped an unrelated frame"
+    assert pool.cache_drop_epoch(FILE) == epoch_before + 1
+    assert pool._doomed[(FILE, 0)][0].page is held
+    held.update_slot(0, b"stale-header")
+    fresh = pool.pin(FILE, 0)
+    assert fresh is not held
+    pool.unpin(FILE, 0, dirty=True, page=held)
+    assert tuple(device.write_calls) == writes_before
+    assert pool.pin_count(FILE, 0) == 1
+    pool.unpin(FILE, 0, page=fresh)
+
+
+def test_discard_clean_page_refuses_dirty_among_doomed_and_resident_atomically() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    held_clean = pool.pin(FILE, 0)
+    assert pool.begin_read_view("foreign-1") is True
+    fresh_dirty = pool.pin(FILE, 0)
+    fresh_dirty.update_slot(0, b"local-uncommitted")
+    writes_before = tuple(device.write_calls)
+    epoch_before = pool.cache_drop_epoch(FILE)
+
+    try:
+        with pytest.raises(GrafxUnsupportedOperation) as refused:
+            pool.discard_clean_page(FILE, 0)
+
+        assert refused.value.details["field"] == "dirty"
+        assert tuple(device.write_calls) == writes_before
+        assert pool.cache_drop_epoch(FILE) == epoch_before
+        assert pool.is_resident(FILE, 0)
+        assert pool._doomed[(FILE, 0)][0].page is held_clean
+        assert pool._doomed[(FILE, 0)][0].discard_unwritten is False
+    finally:
+        pool.unpin(FILE, 0, page=held_clean)
+        pool.unpin(FILE, 0, page=fresh_dirty)
+
+
+def test_discarded_header_page_is_never_settled_as_detached_abandoned_space() -> None:
+    """The reserved page is withdrawn from growth tracking, never queued for settling."""
+    device = MemoryDevice()
+    pool = make_pool(
+        device,
+        RecordingMetrics(),
+        page_sequence_fence=lambda _file, page_index: page_index == 0,
+    )
+    device.create(FILE)
+    header = pool.allocate(FILE, int(PageType.META))
+    pool.unpin(FILE, header.page_index, page=header)
+    writes_before = tuple(device.write_calls)
+
+    assert pool.discard(FILE, 0)
+    assert pool.settle_abandoned(FILE) == 0
+    assert tuple(device.write_calls) == writes_before
+
+
+def test_detached_fenced_header_settlement_fails_before_device_io() -> None:
+    """Even corrupted reuse bookkeeping cannot publish page 0 without its CAS base."""
+    device = MemoryDevice()
+    pool = make_pool(
+        device,
+        RecordingMetrics(),
+        page_sequence_fence=lambda _file, page_index: page_index == 0,
+    )
+    device.create(FILE)
+    device.allocate(FILE, 1)
+    pool._abandoned[FILE] = [0]
+    writes_before = tuple(device.write_calls)
+
+    with pytest.raises(GrafxUnsupportedOperation) as refused:
+        pool.settle_abandoned(FILE)
+
+    assert refused.value.details["field"] == "page_sequence_base"
+    assert tuple(device.write_calls) == writes_before
+
+
+def test_a_stale_page_zero_writer_is_refused_without_overwriting_the_device() -> None:
+    device = MemoryDevice()
+
+    def fenced(_file: str, page_index: int) -> bool:
+        return page_index == 0
+
+    first = make_pool(device, RecordingMetrics(), page_sequence_fence=fenced)
+    stale = make_pool(device, RecordingMetrics(), page_sequence_fence=fenced)
+    reserve_header(first)
+    first.flush(FILE)
+    with stale.pinned(FILE, 0):
+        pass
+
+    with first.pinned(FILE, 0) as current:
+        current.update_slot(0, b"foreign-newer")
+    first.flush(FILE)
+    foreign_image = device.raw_page(FILE, 0)
+
+    with stale.pinned(FILE, 0) as cached:
+        cached.update_slot(0, b"stale-overwrite")
+    with pytest.raises(GrafxUnsupportedOperation) as refused:
+        stale.flush(FILE)
+
+    assert refused.value.details["field"] == "page_sequence_conflict"
+    assert device.raw_page(FILE, 0) == foreign_image
+
+
+def test_page_zero_redo_may_publish_an_image_ahead_of_its_device_base() -> None:
+    device = MemoryDevice()
+    pool = make_pool(
+        device,
+        RecordingMetrics(),
+        page_sequence_fence=lambda _file, page_index: page_index == 0,
+    )
+    reserve_header(pool)
+    pool.flush(FILE)
+    base_seq = pool.read_fresh_page(FILE, 0).seq
+    logged = pool.read_fresh_page(FILE, 0)
+    logged.update_slot(0, b"redo-newer")
+    logged.page_lsn = 9
+    logged.seq = base_seq + 8
+    image = pool.codec.encode_page(logged)
+
+    assert apply_page_image(pool, FILE, 0, image)
+    pool.flush(FILE)
+
+    published = pool.read_fresh_page(FILE, 0)
+    assert published.read_slot(0) == b"redo-newer"
+    assert published.seq > logged.seq
+
+
+def test_page_zero_sequence_exhaustion_refuses_before_wrap_or_write() -> None:
+    device = MemoryDevice()
+    device.create(FILE)
+    assert device.allocate(FILE, 1) == 0
+    page = Page(int(PageType.META), page_size=device.page_size, page_index=0)
+    page.insert_slot(b"near-wrap")
+    page.seq = pool_module.MAX_SEQ - 1
+    device.write_page(FILE, 0, PageCodecV1(device.page_size).encode_page(page))
+    pool = make_pool(
+        device,
+        RecordingMetrics(),
+        page_sequence_fence=lambda _file, page_index: page_index == 0,
+    )
+    with pool.pinned(FILE, 0) as cached:
+        cached.update_slot(0, b"must-not-wrap")
+    before = device.raw_page(FILE, 0)
+
+    with pytest.raises(GrafxUnsupportedOperation) as refused:
+        pool.flush(FILE)
+
+    assert refused.value.details["field"] == "page_sequence_exhausted"
+    assert device.raw_page(FILE, 0) == before
 
 
 def test_invalidating_a_pinned_page_is_refused() -> None:
@@ -1365,6 +1694,97 @@ def test_an_empty_payload_still_gets_one_image() -> None:
 
 
 # --- threads of one participant: the guard, and frames doomed by a read view ---------------------
+
+
+def test_page_write_fence_orders_guard_then_section_and_allows_nested_write_back() -> None:
+    """A rebuild can hold one page section while a nested page-0 CAS re-enters both locks."""
+    entered: list[str] = []
+
+    class RecordingReentrantLock:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.depth = 0
+            self.lock = threading.RLock()
+
+        def __enter__(self) -> None:
+            self.lock.acquire()
+            self.depth += 1
+            entered.append(f"{self.name}+{self.depth}")
+
+        def __exit__(self, *exc: object) -> None:
+            entered.append(f"{self.name}-{self.depth}")
+            self.depth -= 1
+            self.lock.release()
+
+    guard = RecordingReentrantLock("guard")
+    section = RecordingReentrantLock("section")
+
+    def page_section(_file: str, _page_index: PageIndex) -> RecordingReentrantLock:
+        assert guard.depth > 0, "the cross-process section was requested before the local guard"
+        return section
+
+    device = MemoryDevice()
+    pool = BufferPool(
+        device,
+        PageCodecV1(device.page_size),
+        RecordingMetrics(),
+        budget_bytes=device.page_size * 2,
+        db_label="fenced",
+        guard=guard,
+        page_write_section=page_section,
+        page_sequence_fence=lambda _file, page_index: page_index == 0,
+    )
+    device.create(FILE)
+    header = pool.allocate(FILE, int(PageType.META))
+    pool.unpin(FILE, 0, dirty=True, page=header)
+    entered.clear()
+
+    with pool.page_write_fence(FILE, 0):
+        entered.append("body")
+        assert pool.write_back(FILE, 0) is True
+
+    assert entered == [
+        "guard+1",
+        "section+1",
+        "body",
+        "guard+2",
+        "section+2",
+        "section-2",
+        "guard-2",
+        "section-1",
+        "guard-1",
+    ]
+
+
+def test_page_write_fence_validates_the_index_before_acquiring_either_lock() -> None:
+    entered: list[str] = []
+
+    @contextlib.contextmanager
+    def guard() -> Iterator[None]:
+        entered.append("guard")
+        yield
+
+    @contextlib.contextmanager
+    def section(_file: str, _page_index: PageIndex) -> Iterator[None]:
+        entered.append("section")
+        yield
+
+    device = MemoryDevice()
+    pool = BufferPool(
+        device,
+        PageCodecV1(device.page_size),
+        RecordingMetrics(),
+        budget_bytes=device.page_size,
+        db_label="validated",
+        guard=guard(),
+        page_write_section=section,
+    )
+
+    with pytest.raises(GrafxCorruptionDetected):
+        with pool.page_write_fence(FILE, True):
+            raise AssertionError("an invalid page index entered the fenced body")
+
+    assert entered == []
 
 
 def test_every_door_of_the_pool_runs_under_the_injected_guard() -> None:

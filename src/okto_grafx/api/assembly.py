@@ -69,6 +69,7 @@ from okto_grafx.engine.catalog_store import CATALOG_FILE, CatalogStore
 from okto_grafx.engine.database import META_FILE, Database, DatabaseIdentity, MetaStore
 from okto_grafx.engine.heap_store import HEAP_FILE, HeapStore
 from okto_grafx.engine.index_manager import (
+    INDEX_DIRECTORY,
     IndexManager,
     edge_from_index_name,
     edge_to_index_name,
@@ -317,6 +318,17 @@ def assemble_database(
             # rather than imported by the pool (the pure core imports none), and it is
             # re-entrant because a checkpoint flushes and an invalidation writes back.
             guard=threading.RLock(),
+            # Page 0 is a non-wrapping cross-process freshness clock. BufferPool owns the CAS,
+            # while the composition root supplies its mechanism: one deterministic section per
+            # index file in this database. Readers never take it; unrelated page-0 protocols are
+            # deliberately outside this index-specific fence.
+            page_write_section=lambda file, _page_index: coordinator.exclusive(
+                f"page0-{crc32c(file.encode('utf-8')):08x}",
+                timeout=config.commit_lock_timeout_seconds,
+            ),
+            page_sequence_fence=lambda file, _page_index: file.startswith(
+                f"{INDEX_DIRECTORY}/"
+            ),
         )
         identity = _open_identity(config, pool, clock, storage, coordinator)
 

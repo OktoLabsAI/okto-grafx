@@ -426,6 +426,9 @@ class _SeesEveryLiveVersion:
     (see the commit-storm test). A transaction's fixed snapshot cannot tell the difference.
     """
 
+    read_lsn: int = 0
+    """Coverage floor; the permissive predicate deliberately linearizes above a fixed view."""
+
     def visible(self, xmin: int, xmax: int) -> bool:
         return xmin != 0 and xmax == 0
 
@@ -671,18 +674,17 @@ def test_an_entry_reconciled_away_during_the_catch_up_pass_is_not_in_the_publish
         release_ports(registry)
 
 
-def test_a_commit_storm_through_every_pass_leaves_the_mark_behind_and_the_next_search_complete(
+def test_a_commit_storm_through_every_pass_returns_one_certified_complete_view(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Liveness and honesty under a commit storm: the cap holds and nothing is over-promised.
 
     A commit lands after the walk of the build and after the walk of each of the three catch-up
     passes (the builder is parked on the first resolve of each: cumulative resolves 1, 8, 16
-    and 25 over seven, eight, nine and ten entries). The build cannot chase the store for ever,
-    so it publishes after the last pass with the mark honestly BEHIND the header: the search that
-    built answers the ten rows its last walk saw, not the eleventh; the next search finds the
-    mark behind, rebuilds, and answers all eleven. The third outcome is the one never allowed:
-    a snapshot certified for a position it did not verify.
+    and 25 over seven, eight, nine and ten entries). The graph builder still stops after its
+    bounded catch-up passes. The durable read fence then notices that the eleventh commit changed
+    page 0 during the attempted answer and retries against that generation, so the public search
+    returns all eleven rather than certifying the older ten-row picture.
     """
     from okto_grafx.engine import vector_engine as engine_module
 
@@ -728,14 +730,11 @@ def test_a_commit_storm_through_every_pass_leaves_the_mark_behind_and_the_next_s
                 _insert(txn, record_id)
             released.set()
         _finish(first)
-        ten = tuple(range(1, ROWS + 3))
         eleven = tuple(range(1, ROWS + 4))
-        # The last pass walked ten rows; the eleventh landed after that walk.
-        assert outcomes["first"] == (ROWS + 2, "approximate", ten), outcomes
+        assert outcomes["first"] == (ROWS + 3, "approximate", eleven), outcomes
         published = index._snapshot  # noqa: SLF001 - the honesty of the mark is the property
         assert published is not None
-        assert published.mark != index.built_through_lsn, "certified past its walk"
-        # The next search sees the mark behind, rebuilds, and answers everything.
+        assert published.mark == index.built_through_lsn
         assert _search_permissive(database) == (ROWS + 3, "approximate", eleven)
         assert _search(database, k=ROWS + 3) == (ROWS + 3, "approximate", eleven)
     finally:

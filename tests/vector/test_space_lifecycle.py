@@ -53,8 +53,8 @@ def _two_space_table(database: VectorFixture) -> TableDef:
     )
     database.catalog_store.catalog.add_table(table)
     database.catalog_store.save()
-    database.engine.attach(table, 'minilm')
-    database.engine.attach(table, 'bge')
+    database.attach(table, "minilm")
+    database.attach(table, "bge")
     return table
 
 
