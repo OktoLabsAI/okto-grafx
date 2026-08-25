@@ -64,6 +64,7 @@ from okto_grafx.domain.ports.metrics import MetricsSink
 from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.ports.vectormath import VectorMath
 from okto_grafx.domain.query.plan import PlanNode
+from okto_grafx.domain.recovery.report import RecoveryReport
 from okto_grafx.domain.txn.context import (
     CommitReport,
     TransactionContext,
@@ -88,6 +89,7 @@ from okto_grafx.engine.public_views import (
     HeapStoreView,
     IndexRegistryView,
     LedgerView,
+    MetricsSnapshotView,
     MetricsView,
     QuarantineView,
     QueryEngineView,
@@ -954,7 +956,9 @@ class Database:
         self._close_failure: BaseException | None = None
         self._release_failure: BaseException | None = None
         self._release_failure_pending: bool = False
-        self._recovery_report: object = _recovery_report_view(recovery_report)
+        self._recovery_report: RecoveryReport | None = _recovery_report_view(
+            recovery_report
+        )
         self._attached_indexes: tuple[str, ...] = tuple(
             _builtin_text(name, field="attached_index", empty=False)
             for name in attached_indexes
@@ -1056,7 +1060,7 @@ class Database:
         return self._stale_indexes
 
     @property
-    def recovery_report(self) -> object:
+    def recovery_report(self) -> RecoveryReport | None:
         """Return the report of the recovery that ran at open, or None when none did (FR-8)."""
         return self._recovery_report
 
@@ -1552,7 +1556,7 @@ class Database:
                 report = verifier.verify(wanted_scope)  # type: ignore[attr-defined]
                 return _verification_report_view(report, requested_scope=wanted_scope)
 
-    def recover(self) -> object:
+    def recover(self) -> RecoveryReport:
         """Run a recovery pass and return its report (SPEC-M1 FR-8).
 
         The open sequence already ran one; this door exists so an operator can run another after
@@ -1568,7 +1572,7 @@ class Database:
         with self._public_transition():
             return self._recover_in_transition()
 
-    def _recover_in_transition(self) -> object:
+    def _recover_in_transition(self) -> RecoveryReport:
         """Run recovery while one facade outcome keeps callback-requested close resumable."""
         self._require_open()
         self._require_writable("run recovery")
@@ -1584,6 +1588,12 @@ class Database:
                 report = manager.run()  # type: ignore[attr-defined]
             self._transactions.recovery_completed()
         public_report = _recovery_report_view(report)
+        if public_report is None:
+            raise GrafxConfigurationError(
+                "Recovery did not return its required report.",
+                field="recovery.report",
+                value=None,
+            )
         self._recovery_report = public_report
         indexes = self._indexes
         if indexes is not None:
@@ -1756,7 +1766,7 @@ class Database:
             if owns_attempt:
                 self._checkpointing = False
 
-    def snapshot_metrics(self) -> Mapping[str, object]:
+    def snapshot_metrics(self) -> MetricsSnapshotView:
         """Return the machine-readable current value of every metric this database emitted."""
         with self._public_operation("snapshot_metrics"):
             self._require_open()

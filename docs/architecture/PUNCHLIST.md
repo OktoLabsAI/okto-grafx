@@ -1323,3 +1323,15 @@ option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`
   registries explicitly.
 - **CLOSED** — marked Python fences in `README.md` and `docs/PORTS.md` execute in the test suite;
   the 53 protocol signatures stay pinned independently by `test_port_signatures.py`.
+
+## P2.5 / Fase 1.6 — concrete public facade typing (CLOSED, 2026-08-25)
+
+- **CLOSED** — `Database.recovery_report` now declares `RecoveryReport | None`, and
+  `Database.recover()` declares `RecoveryReport`; the recovery path refuses an impossible missing
+  report instead of publishing a false non-optional annotation.
+- **CLOSED** — `Database.snapshot_metrics()` and its canonicalizing helper now declare
+  `MetricsSnapshotView`, the exact immutable mapping already returned at runtime.
+- **CLOSED** — evaluated type-hint tests pin these three refinements, and a strict consumer probe
+  passes over the same surface.
+  Root-package re-exports, generic `connect(**options)` typing and registry overloads remain outside
+  this item.

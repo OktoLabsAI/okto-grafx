@@ -757,6 +757,18 @@ The public examples now use the real `bind()`/`require_complete()` surface, incl
 and `docs/PORTS.md` execute in `tests/foundation/test_public_adapter_docs.py`; the existing
 `test_port_signatures.py` remains the independent authority for all 53 frozen signatures.
 
+### Fase 1.6 / P2.5 — concrete public facade typing (C11; CLOSED)
+
+Three public annotations still hid already-detached DTOs behind `object` or a broad mapping. They
+now name the values the runtime already returned: `recovery_report` is `RecoveryReport | None`,
+`recover()` is `RecoveryReport`, and `snapshot_metrics()` is `MetricsSnapshotView`. The recovery
+path explicitly refuses an internal missing report rather than claiming a non-optional return while
+allowing `None` through.
+
+`test_public_operation_outputs.py` pins the evaluated runtime type hints; a strict consumer probe
+also passed over the same three expressions. No root re-export, DTO shape or operational behaviour
+was added.
+
 ### D5 durable_commit — MEASURED. Do not amend the ceiling. (coordinator-commissioned profile)
 
 **The 234 ms is not fsync.** A bare `os.fsync` on this volume is 0.29 ms; the one barrier §8.5 step 3.5

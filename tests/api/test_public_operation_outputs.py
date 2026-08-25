@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
+from typing import get_type_hints
 
 import pytest
 
-from okto_grafx import connect
+from okto_grafx import Database, connect
 from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -17,6 +18,7 @@ from okto_grafx.domain.ids import MAX_PAGE_INDEX, MAX_SLOT_ID, NULL_REF, RecordR
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.model.value import VectorValue
 from okto_grafx.domain.page.layout import MAX_U64
+from okto_grafx.domain.recovery.report import RecoveryReport
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.domain.verify.findings import (
     FindingKind,
@@ -30,6 +32,14 @@ from okto_grafx.engine.public_views import MetricsSnapshotView
 from okto_grafx.engine.txn_manager import TransactionManager
 from okto_grafx.engine.vector_engine import VectorEngine, VectorHit, VectorSearchResult
 from okto_grafx.engine.verifier import Verifier
+
+
+def test_public_operation_annotations_name_the_exact_detached_results() -> None:
+    recovery_report = Database.recovery_report.fget
+    assert recovery_report is not None
+    assert get_type_hints(recovery_report)["return"] == RecoveryReport | None
+    assert get_type_hints(Database.recover)["return"] is RecoveryReport
+    assert get_type_hints(Database.snapshot_metrics)["return"] is MetricsSnapshotView
 
 
 def _calls() -> dict[str, int]:

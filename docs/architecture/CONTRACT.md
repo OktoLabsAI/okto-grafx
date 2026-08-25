@@ -963,6 +963,14 @@ db.close()
 `Database` is a context manager. `close()` releases the lease and the reader registration; closing
 with an open transaction aborts it and never corrupts. Every public method has an en-US docstring.
 
+**P2.5 / Fase 1.6 — concrete facade result types (CLOSED).** The detached objects returned at the
+public boundary are named exactly: `Database.recovery_report -> RecoveryReport | None`,
+`Database.recover() -> RecoveryReport`, and
+`Database.snapshot_metrics() -> MetricsSnapshotView`. `RecoveryReport` remains owned by
+`okto_grafx.domain.recovery`; `MetricsSnapshotView` remains owned and exported by
+`okto_grafx.engine.public_views`. This refinement adds no root-package re-export and changes no
+runtime result shape.
+
 ---
 
 ## 11. Definition of Done (applies to every component)
@@ -972,7 +980,9 @@ with an open transaction aborts it and never corrupts. Every public method has a
    `pytest -q` green. Deterministic (seeded), no `sleep` longer than 50 ms, no network.
 3. **Type annotations on every public symbol**; `from __future__ import annotations` at the top.
 4. **No mechanism in `domain/` or `engine/`** — the import-boundary test must stay at zero.
-5. **Errors**: only `Grafx*` types escape; never a bare `Exception`, never `assert` for control flow.
+5. **Errors**: the engine and shipped adapters use `Grafx*`; trusted custom-adapter exceptions may
+   propagate unless a specific boundary documents translation. Never catch `BaseException` as an
+   ordinary failure, and never use `assert` for control flow.
 6. **Metrics**: every operational behaviour the component owns emits through `MetricsSink`,
    guarded by `if metrics.enabled:` on hot paths.
 7. **en-US** for every identifier, docstring and message.

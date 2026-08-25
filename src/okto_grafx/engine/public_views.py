@@ -1485,7 +1485,7 @@ def _recovery_report_view(value: object) -> RecoveryReport | None:
     )
 
 
-def _metrics_snapshot_view(value: object) -> Mapping[str, object]:
+def _metrics_snapshot_view(value: object) -> MetricsSnapshotView:
     """Detach and deeply freeze the JSON-like value returned by a metrics sink.
 
     ``MetricsSink.snapshot`` is a port and a caller-supplied implementation may return a live

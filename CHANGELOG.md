@@ -9,6 +9,10 @@ including the on-disk format.
 
 ### Changed
 
+- **Public recovery and metrics facades now expose their concrete detached result types.**
+  `Database.recovery_report` is `RecoveryReport | None`, `Database.recover()` returns
+  `RecoveryReport`, and `Database.snapshot_metrics()` returns `MetricsSnapshotView`; runtime
+  type-hint tests pin all three and a strict consumer probe verifies them.
 - **The custom-adapter contract and every public example now match the executable registry.**
   Examples use `PortRegistry.bind()` and `require_complete()`, release caller-owned registries,
   and are executed from `README.md` and `docs/PORTS.md` by the test suite. Registry validation is
