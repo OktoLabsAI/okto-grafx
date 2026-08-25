@@ -10,8 +10,6 @@ from different call sites than the grant.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from conftest import CoordinatorFactory

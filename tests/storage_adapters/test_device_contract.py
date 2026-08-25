@@ -15,8 +15,6 @@ import pytest
 
 from okto_grafx.adapters import storage_local
 from okto_grafx.adapters.storage_local import (
-    IS_WINDOWS,
-    SHARE_DELETE_AVAILABLE,
     MAX_ALLOCATION_PAGES,
     PENDING_DELETE_MARKER,
     LocalStorageDevice,
@@ -28,7 +26,6 @@ from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
     GrafxDeviceFull,
-    GrafxDurabilityBarrierFailed,
     GrafxDurabilityBarrierFailed,
     GrafxError,
     GrafxUnsupportedOperation,

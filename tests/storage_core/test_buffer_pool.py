@@ -34,10 +34,8 @@ from okto_grafx.domain.ids import PageIndex
 from okto_grafx.domain.page import PAGE_HEADER_SIZE, Page, PageType, crc32c
 from okto_grafx.engine import buffer_pool as pool_module
 from okto_grafx.engine.buffer_pool import (
-    BARRIER_FAILURES_TOTAL,
     BUFFER_BUDGET_EXCEEDED_TOTAL,
     BUFFER_BUDGET_USED_BYTES,
-    BUFFER_POOL_METRICS,
     FSYNC_DURATION_SECONDS,
     CHECKSUM_FAILURES_TOTAL,
     CHECKSUM_VERIFICATIONS_TOTAL,

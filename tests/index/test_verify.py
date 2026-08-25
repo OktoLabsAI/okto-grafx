@@ -13,8 +13,6 @@ index left it out.
 
 from __future__ import annotations
 
-import pytest
-
 from okto_grafx.domain.ids import RecordRef
 from okto_grafx.domain.index import IndexDefinition, IndexVisibility
 from okto_grafx.domain.model.schema import ColumnDef, TableDef

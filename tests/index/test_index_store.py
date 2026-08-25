@@ -32,7 +32,7 @@ from okto_grafx.domain.page import (
     PageType,
 )
 from okto_grafx.engine import index_manager as index_module
-from okto_grafx.engine.index_manager import HashIndex, IndexManager
+from okto_grafx.engine.index_manager import HashIndex
 
 from .conftest import (
     TEST_BUCKET_COUNT,

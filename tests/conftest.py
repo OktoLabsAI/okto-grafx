@@ -845,57 +845,6 @@ def _module_file(module_name: str) -> pathlib.Path | None:
     return pathlib.Path(spec.origin)
 
 
-def _resolve_family_name(
-    name: str, path: str, depth: int = 0, source: str | None = None
-) -> bool:
-    """Return True when a name is bound, here or where it was imported from, to a real
-    comparison against a platform value.
-
-    The tests in this repository write ``WINDOWS = os.name == "nt"`` and import ``IS_WINDOWS``
-    from an adapter, so the closed-set check has to follow the binding rather than demand the
-    comparison be inline. It follows it once across modules, which is as far as any honest
-    spelling here reaches.
-    """
-    if depth > 8:
-        return False
-    if source is not None:
-        try:
-            tree: ast.Module | None = ast.parse(source)
-        except SyntaxError:
-            tree = None
-    else:
-        tree = _parse(path)
-    if tree is None:
-        return False
-    for node in tree.body:
-        targets: list[ast.expr] = []
-        if isinstance(node, ast.Assign):
-            targets = list(node.targets)
-        elif isinstance(node, ast.AnnAssign):
-            targets = [node.target]
-        else:
-            continue
-        if node.value is None:
-            continue
-        if any(isinstance(t, ast.Name) and t.id == name for t in targets):
-            if _compares_to_a_real_platform(node.value):
-                return True
-            for element in ast.walk(node.value):
-                if isinstance(element, ast.Name):
-                    if _resolve_family_name(element.id, path, depth + 1, source):
-                        return True
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ImportFrom) or not node.module:
-            continue
-        for alias in node.names:
-            if (alias.asname or alias.name) != name:
-                continue
-            origin = _module_file(node.module)
-            if origin is not None:
-                return _resolve_family_name(alias.name, str(origin), depth + 1)
-    return False
-
-
 def _condition_names_a_family(
     node: ast.expr, path: str, source: str | None = None
 ) -> bool:

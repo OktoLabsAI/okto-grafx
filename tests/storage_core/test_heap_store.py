@@ -27,7 +27,7 @@ from okto_grafx.domain.errors import (
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
 )
-from okto_grafx.domain.ids import NO_PAGE, RecordRef
+from okto_grafx.domain.ids import NO_PAGE, PageIndex, RecordRef
 from okto_grafx.domain.model.errors import SchemaMismatchError
 from okto_grafx.domain.model.record import (
     NO_PREVIOUS_VERSION,
@@ -1072,7 +1072,6 @@ def test_a_hop_that_leaves_the_table_refuses_the_write(
 ) -> None:
     # The same question one hop in: every page of the walk is checked, not only the first.
     targets = foreign_pages(pool, heap_store, catalog_store, person_table)
-    filler = "f" * 200
     grow_to_pages(pool, heap_store, person_table, 2)
     chain = heap_store.pages_of(person_table)
     with pool.pinned(heap_store.file, chain[-1]) as page:
@@ -1169,7 +1168,6 @@ def test_a_hint_that_is_unreachable_from_the_first_page_is_repaired(
     that nothing in the chain points at it, and an append that lands there leaves a row that is
     readable by reference and absent from every scan.
     """
-    filler = "f" * 200
     grow_to_pages(pool, heap_store, person_table, 2)
     chain = heap_store.pages_of(person_table)
     orphan = pool.allocate(heap_store.file, int(PageType.HEAP))
@@ -1300,7 +1298,6 @@ def test_a_page_that_left_its_table_mid_chain_stops_the_scan(
 ) -> None:
     # The ownership check inside the walk: without it a page whose descriptor names another
     # table is read as if its rows belonged to this one.
-    filler = "f" * 200
     grow_to_pages(pool, heap_store, person_table, 3)
     middle = heap_store.pages_of(person_table)[1]
     with pool.pinned(heap_store.file, middle) as page:
@@ -1462,7 +1459,6 @@ def test_a_damaged_page_count_never_escapes_as_a_raw_struct_error(
 
 def plant_cycle(pool: BufferPool, store: HeapStore, table: TableDef, shape: str) -> None:
     """Close the page chain of a table into the requested shape."""
-    filler = "f" * 200
     grow_to_pages(pool, store, table, 4)
     chain = store.pages_of(table)
     if shape == "self loop":
@@ -1604,7 +1600,6 @@ def test_a_walk_that_does_not_end_fails_rather_than_running_forever(
     never refuse a real walk and it always ends one. The mutation battery is what proves the two
     are independent; this pins the bound itself and the refusal every walker gives.
     """
-    filler = "f" * 200
     grow_to_pages(pool, heap_store, person_table, 3)
     limit = heap_store._chain_limit()
     assert limit == pool.storage.page_count(heap_store.file) + 1
@@ -1648,7 +1643,6 @@ def test_every_heap_walker_still_ends_when_the_visited_set_fails(
     the set does not work, so the set is defeated deliberately and the walk must still end, with
     a typed refusal naming the length rather than with a hang.
     """
-    filler = "f" * 200
     grow_to_pages(pool, heap_store, person_table, 4)
     chain = heap_store.pages_of(person_table)
     with pool.pinned(heap_store.file, chain[-1]) as page:
@@ -1699,7 +1693,6 @@ def test_a_refusing_walker_leaves_no_page_pinned(
     pins inside a context manager, so the release happens on the exception path too; this pins
     that as a property rather than as a reading of the code.
     """
-    filler = "f" * 200
     grow_to_pages(pool, heap_store, person_table, 4)
     chain = heap_store.pages_of(person_table)
     with pool.pinned(heap_store.file, chain[-1]) as page:
@@ -1812,7 +1805,6 @@ def test_a_warm_cache_still_refuses_a_chain_that_leads_out_of_the_table(
     tell that the chain no longer belongs to this table.
     """
     targets = foreign_pages(pool, heap_store, catalog_store, person_table)
-    filler = "f" * 200
     grow_to_pages(pool, heap_store, person_table, 2)
     warm = heap_store._tail_cache[person_table.table_id]
     real_tail = heap_store.pages_of(person_table)[-1]
@@ -1870,7 +1862,6 @@ def test_a_cache_is_not_trusted_across_a_pool_invalidation(
     -- right owner, still a tail -- so only the epoch can say that the walk which reached it no
     longer holds.
     """
-    filler = "f" * 200
     grow_to_pages(pool, heap_store, person_table, 3)
     chain = heap_store.pages_of(person_table)
     assert heap_store._tail_cache[person_table.table_id][0] == chain[-1]

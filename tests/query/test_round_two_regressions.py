@@ -7,7 +7,6 @@ through the statement's own report (LESSONS L16, L23). The shapes are the critic
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest

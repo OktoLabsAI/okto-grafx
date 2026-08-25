@@ -27,6 +27,7 @@ from okto_grafx.domain.ids import RecordRef
 from .conftest import (
     RecordingMetrics,
     SnapshotDouble,
+    StepClock,
     TransactionDouble,
     VectorFixture,
 )

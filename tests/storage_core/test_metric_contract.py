@@ -24,7 +24,7 @@ from okto_grafx.engine.buffer_pool import (
     CHECKSUM_VERIFICATIONS_TOTAL,
     FSYNC_DURATION_SECONDS,
 )
-from okto_grafx.engine.metrics_catalog import metric, metric_names, register_catalog
+from okto_grafx.engine.metrics_catalog import metric_names, register_catalog
 
 from .conftest import MemoryDevice, RecordingMetrics, make_pool
 

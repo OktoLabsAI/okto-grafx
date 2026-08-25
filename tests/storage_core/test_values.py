@@ -62,7 +62,7 @@ ROUND_TRIP_CASES: tuple[tuple[str, object], ...] = (
     ("empty map", {}),
     ("map", {"a": 1, "b": "two"}),
     ("nested map", {"outer": {"inner": (1, 2, 3)}, "n": None}),
-    ("map with non string keys", {1: "one", (2, 3): "pair", True: "yes"}),
+    ("map with non string keys", {1: "one", (2, 3): "pair", False: "no"}),
     ("timestamp", Timestamp(1_700_000_000_000_000)),
     ("timestamp zero", Timestamp(0)),
     ("timestamp negative", Timestamp(-1)),

@@ -14,11 +14,9 @@ import pytest
 
 from okto_grafx.adapters.storage_fault import (
     WRITE_POINT_METHODS,
-    CallRecord,
     FaultInjectingStorageDevice,
     FaultPlan,
     SimulatedCrash,
-    WritePoint,
 )
 from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
