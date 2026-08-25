@@ -122,6 +122,28 @@ def _canonical_json(node: object) -> object:
         return _UNCANONICAL
 
 
+_NATIVE_PATH = type(Path("."))
+"""This platform's concrete Path class, captured at import (mirrors recall.py)."""
+
+
+def _exact_str(value: object, what: str) -> str:
+    """Return value when it is an EXACT str; otherwise refuse. Mirrors recall._exact_str."""
+    if type(value) is not str:
+        raise RuntimeError(f"{what} is not a plain string; refusing to use it")
+    return value
+
+
+def _trusted_path(name: object) -> Path:
+    """Build a Path from an exact name and prove the constructor honoured it."""
+    exact = _exact_str(name, "a path name")
+    candidate = Path(exact)  # WORK: a genuine interrupt here propagates.
+    if type(candidate) is not _NATIVE_PATH:
+        raise RuntimeError(
+            f"the path constructor did not yield a native path for {exact!r}"
+        )
+    return candidate
+
+
 def _is_a(value: object, kind: object) -> bool:
     """isinstance(), guarded: the check itself runs the INSPECTED object's code.
 
@@ -230,7 +252,7 @@ _UNREADABLE = object()
 """Sentinel: the PARSE failed. Distinct from _UNCANONICAL, which means it parsed."""
 
 
-def _snapshot(document: str) -> tuple[object, str]:
+def _snapshot(document: object) -> tuple[object, str]:
     """Parse and canonicalize ONCE; return (snapshot, parse-error text).
 
     Round-10 (A). `check` used to hand the same TEXT to two readers, each of which
@@ -245,7 +267,12 @@ def _snapshot(document: str) -> tuple[object, str]:
     means it was JSON that cannot be trusted.
     """
     try:
-        parsed = json.loads(document)
+        # Round-11 (5): `check` is public and takes text from callers this module does
+        # not control. A str subclass reaching json.loads, the slices in the messages or
+        # the caller's own formatting is data nobody proved, so the exactness test comes
+        # first -- and it touches none of the object's methods, so a document that is
+        # not a plain string becomes UNMEASURED without ever being executed.
+        parsed = json.loads(_exact_str(document, "the metrics document"))
     except Exception as error:  # noqa: BLE001 -- "never raises" is absolute here
         # ValueError is the documented shape, RecursionError arrives from thousands of
         # nesting levels, and the promise covers whatever else an ordinary parse can
@@ -595,7 +622,12 @@ def _resolve_recall_target(
         return coerced, "explicit flag"
     if calibration:
         try:
-            parsed = json.loads(Path(calibration).read_text(encoding="utf-8"))
+            parsed = json.loads(
+                _exact_str(
+                    _trusted_path(calibration).read_text(encoding="utf-8"),
+                    "the calibration document",
+                )
+            )
         except Exception as error:  # noqa: BLE001 -- KI/SE propagate; this is I/O
             # Round-9: the tuple missed RecursionError, which a deeply nested
             # calibration file raises from json.loads itself. A file that cannot be read
@@ -669,7 +701,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     arguments = parser.parse_args(argv)
     try:
-        document = Path(arguments.metrics).read_text(encoding="utf-8")
+        document = _exact_str(
+            _trusted_path(arguments.metrics).read_text(encoding="utf-8"),
+            "the metrics document",
+        )
     except Exception as error:  # noqa: BLE001 -- KI/SE propagate; reading is WORK
         # ValueError covers UnicodeDecodeError: a metrics file that is not valid UTF-8 is
         # UNREADABLE, and before this clause it escaped as a traceback whose exit status 1

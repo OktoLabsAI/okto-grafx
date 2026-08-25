@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 
 import bench.harness.calibrate as calibrate_module
+import bench.harness.recall as recall_module_for_paths
 import bench.harness.recall_wiring as wiring
 from bench.harness.recall import RECALL_METRIC, RecallStageError
 from bench.harness.recall_wiring import append_vector_recall
@@ -2265,7 +2266,7 @@ def test_a_second_lock_name_that_cannot_be_built_orphans_nothing(
     monkeypatch.setattr(
         wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
     )
-    real_path = wiring.Path
+    real_path = recall_module_for_paths.Path
     built: list[int] = []
 
     class _RefusingSecondPath:
@@ -2276,7 +2277,7 @@ def test_a_second_lock_name_that_cannot_be_built_orphans_nothing(
                     raise RuntimeError("the second lock name cannot be built")
             return real_path(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(wiring, "Path", _RefusingSecondPath)
+    monkeypatch.setattr(recall_module_for_paths, "Path", _RefusingSecondPath)
     code = append_vector_recall(
         profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
     )
@@ -2450,7 +2451,7 @@ def test_a_path_that_refuses_its_second_construction_is_a_typed_refusal(
     monkeypatch.setattr(
         wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
     )
-    real_path = wiring.Path
+    real_path = recall_module_for_paths.Path
     built: list[int] = []
 
     class _RefusingSecondConstruction:
@@ -2461,7 +2462,7 @@ def test_a_path_that_refuses_its_second_construction_is_a_typed_refusal(
                     raise RuntimeError("this path cannot be constructed twice")
             return real_path(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(wiring, "Path", _RefusingSecondConstruction)
+    monkeypatch.setattr(recall_module_for_paths, "Path", _RefusingSecondConstruction)
     code = append_vector_recall(
         profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
     )
@@ -2712,7 +2713,7 @@ def test_a_hostile_second_path_never_reaches_the_identity_comparison(
     monkeypatch.setattr(
         wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
     )
-    real_path = wiring.Path
+    real_path = recall_module_for_paths.Path
     built: dict[str, int] = {}
 
     def alternating(*args: object, **kwargs: object):
@@ -2723,7 +2724,7 @@ def test_a_hostile_second_path_never_reaches_the_identity_comparison(
                 return _HostileEquality(key)
         return real_path(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(wiring, "Path", alternating)
+    monkeypatch.setattr(recall_module_for_paths, "Path", alternating)
     code = append_vector_recall(
         profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
     )
@@ -2800,3 +2801,291 @@ def test_a_mutation_that_does_not_declare_its_outcome_is_refused(
     with pytest.raises(RecallStageError, match="declare"):
         wiring._replace_json(document, lambda doc: None)
     assert document.read_bytes() == before
+
+
+# =====================================================================================
+# Round-11: an external call is work; what it RETURNED is data, and must be proved
+# =====================================================================================
+
+
+class _RoundTrippingHostilePath:
+    """The shape round-10's behaviour proof accepted: __fspath__ answers correctly, and
+    everything else is hostile. Proving a result by behaviour buys exactly the behaviour
+    you tested; proving it by class buys the class."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __fspath__(self) -> str:
+        return self._name
+
+    def read_text(self, *args: object, **kwargs: object) -> str:
+        raise SystemExit(212)
+
+    def __eq__(self, other: object) -> bool:
+        raise SystemExit(212)
+
+    def __hash__(self) -> int:
+        return 0
+
+
+def test_a_result_that_only_round_trips_is_not_a_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-11 (1): round-10 accepted any object whose __fspath__ returned the name it
+    was built from -- which a hostile object supplies for free while keeping a read_text
+    that exits. The class is what is checked now, before any attribute is touched."""
+    out, metrics = _seed_documents(tmp_path)
+    called: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: called.append(1) or _verdict_stub()
+    )
+    real_path = recall_module_for_paths.Path
+    built: dict[str, int] = {}
+
+    def alternating(*args: object, **kwargs: object):
+        if args and str(args[0]).endswith(".json"):
+            key = str(args[0])
+            built[key] = built.get(key, 0) + 1
+            if built[key] == 2:
+                return _RoundTrippingHostilePath(key)
+        return real_path(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(recall_module_for_paths, "Path", alternating)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert not called
+
+
+def test_a_real_interrupt_building_a_path_still_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for (1): round-10's helper absorbed every shape, including a genuine
+    interrupt of the constructor. Building a Path is work."""
+    out, metrics = _seed_documents(tmp_path)
+    monkeypatch.setattr(wiring, "run_recall", lambda *a, **kw: _verdict_stub())
+    real_path = recall_module_for_paths.Path
+
+    def interrupted(*args: object, **kwargs: object):
+        if args and str(args[0]).endswith(".c13.lock"):
+            raise KeyboardInterrupt("interrupted building a lock name")
+        return real_path(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(recall_module_for_paths, "Path", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        append_vector_recall(
+            profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+        )
+    monkeypatch.undo()
+
+
+@pytest.mark.parametrize(
+    ("call", "answer"),
+    [("open", True), ("write", True), ("write", 0)],
+    ids=["open-True", "write-True", "write-zero"],
+)
+def test_a_lock_that_was_never_stamped_is_never_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, call: str, answer: object
+) -> None:
+    """Round-11 (2): os.open answering True and os.write answering True or 0 both
+    certified a lock with an empty file behind it -- a lock that guarantees nothing while
+    the stage believes the field is its own."""
+    out, metrics = _seed_documents(tmp_path)
+    ran: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: ran.append(1) or _verdict_stub()
+    )
+    real_open, real_write = os.open, os.write
+    descriptors: list[int] = []
+
+    def spy_open(path: object, *a: object, **kw: object):
+        if str(path).endswith(".c13.lock"):
+            if call == "open":
+                return answer
+            descriptor = real_open(path, *a, **kw)  # type: ignore[arg-type]
+            descriptors.append(descriptor)
+            return descriptor
+        return real_open(path, *a, **kw)  # type: ignore[arg-type]
+
+    def spy_write(descriptor: object, data: bytes):
+        if call == "write" and descriptor in descriptors:
+            return answer
+        if call == "open" and descriptor is answer:
+            # The fake descriptor must not reach the real syscall, or the probe would
+            # pass on the side effect of writing to fd 1 rather than on the guard.
+            return len(data)
+        return real_write(descriptor, data)  # type: ignore[arg-type]
+
+    real_close = os.close
+
+    def spy_close(descriptor: object):
+        if call == "open" and descriptor is answer:
+            return None
+        return real_close(descriptor)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "write", spy_write)
+    monkeypatch.setattr(os, "close", spy_close)
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert not ran, "no worker runs behind a lock that was never really taken"
+
+
+@pytest.mark.parametrize(
+    "field", ["returncode", "stdout"], ids=["returncode-221", "stdout-222"]
+)
+def test_a_worker_result_that_cannot_be_read_fails_the_stage_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    """Round-11 (3): returncode went into comparisons and stdout/stderr into slices and
+    f-strings without being proved -- and every one of those reads happens on a FAILURE
+    path, where a second failure is hardest to see."""
+    from bench.harness.recall import run_recall
+
+    class _HostileCompleted:
+        stdout = ""
+        stderr = ""
+        returncode = 0
+
+    class _ExitingInt:
+        def __eq__(self, other: object) -> bool:
+            raise SystemExit(221)
+
+        def __hash__(self) -> int:
+            return 0
+
+    class _ExitingText:
+        def __getitem__(self, item: object) -> str:
+            raise SystemExit(222)
+
+    hostile = _HostileCompleted()
+    setattr(hostile, field, _ExitingInt() if field == "returncode" else _ExitingText())
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", lambda *a, **kw: hostile)
+    scratch = tmp_path / "scratch"
+    with pytest.raises(RecallStageError, match="could not be read"):
+        run_recall("tiny", scratch=scratch, timeout_seconds=30)
+    monkeypatch.undo()
+    assert list(scratch.iterdir()) == [], "and the fresh file is still removed"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [("only-one",), (True, "name"), (3, b"bytes")],
+    ids=["short-tuple", "bool-descriptor", "bytes-name"],
+)
+def test_a_mkstemp_result_that_is_not_a_pair_of_builtins_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: object
+) -> None:
+    """Round-11 (4): the pair was unpacked and both halves used -- one as a descriptor
+    for os.close and os.unlink, one as a command-line argument -- without either being
+    shown to be an int and a str."""
+    import tempfile as tempfile_module
+
+    from bench.harness.recall import run_recall
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("subprocess.run must not be reached")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", forbidden)
+    monkeypatch.setattr(tempfile_module, "mkstemp", lambda *a, **kw: answer)
+    with pytest.raises(RecallStageError, match="could not be prepared"):
+        run_recall("tiny", scratch=tmp_path / "scratch", timeout_seconds=30)
+    monkeypatch.undo()
+
+
+def test_a_hostile_environment_never_reaches_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-11 (6): copying os.environ iterates a mapping this module does not own, and
+    the copy went straight into a subprocess. Only exact string pairs travel."""
+    from bench.harness.recall import run_recall
+
+    class _HostileValue(str):
+        def __hash__(self) -> int:
+            return 0
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("subprocess.run must not be reached")
+
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", forbidden)
+    monkeypatch.setattr(
+        os.environ, "items", lambda: [("OKTO_PROBE", _HostileValue("x"))]
+    )
+    with pytest.raises(RecallStageError, match="environment"):
+        run_recall("tiny", scratch=tmp_path / "scratch", timeout_seconds=30)
+    monkeypatch.undo()
+
+
+@pytest.mark.parametrize(
+    "reading", ["not-a-float", float("inf")], ids=["not-float", "not-finite"]
+)
+def test_a_clock_that_does_not_answer_with_a_finite_float_fails_the_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reading: object
+) -> None:
+    """Round-11 (8): the duration went into the verdict as a measurement, so a clock
+    answering with anything else put a fiction where a number belongs."""
+    from bench.harness import recall as recall_module
+    from bench.harness.recall import run_recall
+
+    monkeypatch.setattr(recall_module.time, "monotonic", lambda: reading)
+    scratch = tmp_path / "scratch"
+    with pytest.raises(RecallStageError, match="clock"):
+        run_recall("tiny", scratch=scratch, timeout_seconds=30)
+    monkeypatch.undo()
+    assert list(scratch.iterdir()) == []
+
+
+def test_a_clock_that_goes_backwards_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-11 (8): end >= start is checked BEFORE the subtraction, so a negative
+    duration never reaches the verdict."""
+    import subprocess as subprocess_module
+
+    from bench.harness import recall as recall_module
+    from bench.harness.recall import run_recall
+
+    def writes_verdict(command: list[str], **kwargs: object):
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.write_text(json.dumps(_verdict_stub()), encoding="utf-8")
+        return subprocess_module.CompletedProcess(command, 0, stdout="", stderr="")
+
+    readings = iter([100.0, 1.0])
+    monkeypatch.setattr("bench.harness.recall.subprocess.run", writes_verdict)
+    monkeypatch.setattr(recall_module.time, "monotonic", lambda: next(readings))
+    with pytest.raises(RecallStageError, match="backwards"):
+        run_recall("tiny", scratch=tmp_path / "scratch")
+    monkeypatch.undo()
+
+
+def test_a_document_with_no_metric_list_is_refused_before_anything_happens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-11, ratified: schema v1 always carries the metric list and this stage only
+    ever appends to one. The refusal happens in the prevalidation, so the worker never
+    runs, no lock or scratch is created, and both documents keep their bytes AND their
+    mtime -- the file is not touched, not even rewritten identically."""
+    out, metrics = _seed_documents(tmp_path)
+    metrics.write_text(json.dumps({"other": 1}), encoding="utf-8")
+    before = (out.read_bytes(), metrics.read_bytes())
+    stamps = (out.stat().st_mtime_ns, metrics.stat().st_mtime_ns)
+    ran: list[int] = []
+    monkeypatch.setattr(
+        wiring, "run_recall", lambda *a, **kw: ran.append(1) or _verdict_stub()
+    )
+    code = append_vector_recall(
+        profile="tiny", gt_mode="auto", out=out, metrics=metrics, workspace=tmp_path
+    )
+    monkeypatch.undo()
+    assert code == 3
+    assert not ran
+    assert (out.read_bytes(), metrics.read_bytes()) == before
+    assert (out.stat().st_mtime_ns, metrics.stat().st_mtime_ns) == stamps
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".c13.lock")] == []
+    assert [p.name for p in tmp_path.iterdir() if ".c13-" in p.name] == []

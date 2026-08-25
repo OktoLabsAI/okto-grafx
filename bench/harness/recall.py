@@ -96,6 +96,70 @@ def _is_a(value: object, kind: object) -> bool:
         return False
 
 
+_NATIVE_PATH = type(Path("."))
+"""This platform's concrete Path class, captured at import.
+
+Round-11 (1): a Path is only a Path if the constructor gave us the class this module was
+written against. Captured here, before anything in a test or an environment can replace
+the name, and compared with `type(...) is` so that deciding whether an object is
+trustworthy never touches one of its methods.
+"""
+
+
+def _exact_str(value: object, what: str) -> str:
+    """Return value when it is an EXACT str; otherwise refuse.
+
+    Round-11: a str subclass survives every honest check and then answers __getitem__,
+    __format__ or __eq__ however it likes, one step later and in someone else's frame.
+    Type-exactness is checked with `type(...) is`, which runs none of its code.
+    """
+    if type(value) is not str:
+        raise RuntimeError(f"{what} is not a plain string; refusing to use it")
+    return value
+
+
+def _exact_int(value: object, what: str, minimum: int) -> int:
+    """Return value when it is an EXACT int at or above minimum; otherwise refuse.
+
+    bool is excluded by the type-exact test, which matters: True passes every
+    `isinstance(x, int)` and every `x > 0`, and has certified a lock that was never
+    written and a write that never happened.
+    """
+    if type(value) is not int:
+        raise RuntimeError(f"{what} is not a plain integer; refusing to use it")
+    if value < minimum:
+        raise RuntimeError(f"{what} is below {minimum}; refusing to use it")
+    return value
+
+
+def _trusted_path(name: object) -> Path:
+    """Build a Path from an exact name and prove the constructor honoured it.
+
+    Round-11 (1) corrects round-10 twice over. The CALL is work: a real interrupt of it
+    must propagate, and the round-10 version absorbed every shape including KI/SE. And
+    the RESULT is not proved by behaviour: round-10 accepted anything whose __fspath__
+    round-tripped, which a hostile object supplies for free while keeping a read_text
+    that exits. The class is what is checked, with `type(...) is`, before any attribute
+    of the object is touched.
+    """
+    exact = _exact_str(name, "a path name")
+    candidate = Path(exact)  # WORK: a genuine interrupt here propagates.
+    if type(candidate) is not _NATIVE_PATH:
+        raise RuntimeError(
+            f"the path constructor did not yield a native path for {exact!r}"
+        )
+    return candidate
+
+
+def _exact_clock(reading: object) -> float:
+    """Prove a monotonic reading is an exact finite float before it is used."""
+    if type(reading) is not float or not math.isfinite(reading):
+        raise RecallStageError(
+            "the monotonic clock did not return a finite float; the run cannot be timed."
+        )
+    return reading
+
+
 def _describe(value: object) -> str:
     """repr(), guarded and bounded: ``repr(10**10000)`` raises past CPython's digit
     limit, and the refusal message must not crash the refusal (mirrors gate._describe).
@@ -194,15 +258,40 @@ def run_recall(
             "-- refused before any directory or process exists."
         )
     timeout_seconds = as_float
+    # Round-11 (9): `scratch` is the caller's object, and every use of it -- the join in
+    # the caller, the mkdir here, the mkstemp below -- ran its code. It is reduced to a
+    # trusted native path first, so nothing hostile survives into the filesystem calls.
+    try:
+        scratch = _trusted_path(os.fspath(scratch))
+    except BaseException as failure:  # noqa: BLE001 -- the ARGUMENT chose the shape
+        raise RecallStageError(
+            f"the scratch directory is not a usable path ({_describe(failure)}); "
+            "nothing was created and nothing was spawned."
+        ) from None
     scratch.mkdir(parents=True, exist_ok=True)
     # Reaudit HIGH-2: a DETERMINISTIC verdict path let a worker that exited 0 without
     # writing hand back a PREVIOUS run's file as this run's result. Every run now gets a
     # unique fresh file (mkstemp; the handle closes at once so the Windows child can open
     # it), an empty fresh file is a typed refusal -- absence is never acceptance -- and
     # the cleanup in the finally below is outcome-neutral.
-    descriptor, temp_name = tempfile.mkstemp(
+    made = tempfile.mkstemp(  # WORK: a genuine interrupt propagates.
         prefix=f"recall-{profile}-", suffix=".json", dir=str(scratch)
     )
+    try:
+        # Round-11 (4): the RESULT is snapshotted once and proved. Unpacking it ran the
+        # returned object's __iter__, and the two halves went straight into os.close,
+        # os.unlink and a command line without ever being shown to be an int and a str.
+        if type(made) is not tuple or len(made) != 2:
+            raise RuntimeError("mkstemp did not return a pair")
+        descriptor = _exact_int(made[0], "the temp file descriptor", 0)
+        temp_name = _exact_str(made[1], "the temp file name")
+        if not temp_name:
+            raise RuntimeError("mkstemp returned an empty name")
+    except BaseException as failure:  # noqa: BLE001 -- the RESULT chose the shape
+        raise RecallStageError(
+            "the fresh per-run verdict file could not be prepared "
+            f"({_describe(failure)}); nothing was spawned."
+        ) from None
     try:
         os.close(descriptor)
     except BaseException as failure:  # noqa: BLE001 -- ONE attempt, every shape
@@ -236,8 +325,23 @@ def run_recall(
     # is now inside the same state machine that removes it.
     cleanup_interrupt: BaseException | None = None
     try:
-        verdict_path = Path(temp_name)
-        environment = dict(os.environ)
+        verdict_path = _trusted_path(temp_name)
+        # Round-11 (6): os.environ is a mapping this module does not own, and copying
+        # it iterates it. Only exact string pairs are carried into the child; anything
+        # else is a hostile shape and the stage refuses BEFORE the spawn rather than
+        # handing it to a subprocess.
+        try:
+            environment = {
+                _exact_str(key, "an environment name"): _exact_str(
+                    value, "an environment value"
+                )
+                for key, value in os.environ.items()
+            }
+        except BaseException as failure:  # noqa: BLE001 -- the MAPPING chose the shape
+            raise RecallStageError(
+                f"the process environment could not be copied ({_describe(failure)}); "
+                "nothing was spawned."
+            ) from None
         for name in _BLAS_THREAD_VARIABLES:
             environment[name] = "1"
         command = [
@@ -251,7 +355,7 @@ def run_recall(
             "--out",
             temp_name,
         ]
-        started = time.monotonic()
+        started = _exact_clock(time.monotonic())
         try:
             completed = subprocess.run(
                 command,
@@ -266,24 +370,52 @@ def run_recall(
                 f"the recall worker exceeded {timeout_seconds:g}s on profile "
                 f"{profile!r}; nothing was published."
             ) from failure
-        duration = time.monotonic() - started
+        # Round-11 (8): both readings are proved exact and finite, and the ordering
+        # is checked, BEFORE the subtraction -- a clock that goes backwards or answers
+        # with something that is not a float produced a duration the verdict then
+        # carried as measurement.
         try:
-            raw = verdict_path.read_text(encoding="utf-8")
+            # Round-11 (3): the CompletedProcess is snapshotted ONCE, here, and proved.
+            # returncode went into comparisons and stdout/stderr into slices and
+            # f-strings without ever being shown to be an int and a str -- and every one
+            # of those reads happens on a failure path, where a second failure is
+            # hardest to see.
+            returncode = _exact_int(
+                completed.returncode, "the worker exit code", -(2**31)
+            )
+            stdout = _exact_str(completed.stdout, "the worker stdout")
+            stderr = _exact_str(completed.stderr, "the worker stderr")
+        except BaseException as failure:  # noqa: BLE001 -- the RESULT chose the shape
+            raise RecallStageError(
+                f"the recall worker's result could not be read ({_describe(failure)}); "
+                "nothing was published."
+            ) from None
+        ended = _exact_clock(time.monotonic())
+        if ended < started:
+            raise RecallStageError(
+                "the monotonic clock went backwards during the run; the duration "
+                "cannot be measured and the verdict would carry a fiction."
+            )
+        duration = ended - started
+        try:
+            raw = _exact_str(
+                verdict_path.read_text(encoding="utf-8"), "the verdict text"
+            )
         except (OSError, UnicodeError) as failure:
             # UnicodeError: a verdict file that is not valid UTF-8 is unreadable, and
             # before this clause it escaped run_recall as UnicodeDecodeError instead
             # of the typed RecallStageError; the finally still cleans the fresh file.
             raise RecallStageError(
                 f"the recall worker left no readable verdict "
-                f"(exit {completed.returncode}); stdout: {completed.stdout[-400:]!r} "
-                f"stderr: {completed.stderr[-400:]!r}"
+                f"(exit {returncode}); stdout: {stdout[-400:]!r} "
+                f"stderr: {stderr[-400:]!r}"
             ) from failure
         if not raw.strip():
             raise RecallStageError(
                 "the recall worker wrote nothing into its fresh per-run file "
-                f"(exit {completed.returncode}); a stale file can never be mistaken "
-                f"for this run's result. stdout: {completed.stdout[-400:]!r} "
-                f"stderr: {completed.stderr[-400:]!r}"
+                f"(exit {returncode}); a stale file can never be mistaken "
+                f"for this run's result. stdout: {stdout[-400:]!r} "
+                f"stderr: {stderr[-400:]!r}"
             )
         try:
             verdict = json.loads(raw)
@@ -295,7 +427,7 @@ def run_recall(
             # and the stage says so through the guarded describer.
             raise RecallStageError(
                 f"the recall worker's verdict is not readable JSON "
-                f"(exit {completed.returncode}): {_describe(failure)}"
+                f"(exit {returncode}): {_describe(failure)}"
             ) from failure
         # Round-8 (A): requiring an exact dict at the TOP was not enough -- the
         # values inside it are still whatever the parse produced, so verdict["ok"]
@@ -312,7 +444,7 @@ def run_recall(
         except Exception as failure:  # noqa: BLE001 -- KI/SE still propagate
             raise RecallStageError(
                 "the recall worker's verdict could not be rebuilt as plain JSON-native "
-                f"data (exit {completed.returncode}): {_describe(failure)}"
+                f"data (exit {returncode}): {_describe(failure)}"
             ) from failure
         if type(verdict) is not dict:
             raise RecallStageError(
@@ -372,15 +504,15 @@ def run_recall(
                 "removed; refusing to report success over residue."
             )
     verdict["duration_seconds"] = duration
-    verdict["exit_code"] = completed.returncode
-    if completed.returncode != 0 or verdict.get("ok") is not True:
+    verdict["exit_code"] = returncode
+    if returncode != 0 or verdict.get("ok") is not True:
         # Round-8 (A): identity, not truthiness. The verdict is canonical by now, so
         # this is belt and braces -- but "ok" means the worker said True, and any other
         # value, however truthy, is not that. The failure text is described rather than
         # interpolated for the same reason.
         raise RecallStageError(
             f"recall stage failed closed on profile {profile!r}: "
-            f"{_describe(verdict.get('failure', f'worker exit {completed.returncode}'))}"
+            f"{_describe(verdict.get('failure', f'worker exit {returncode}'))}"
         )
     return verdict
 

@@ -958,3 +958,53 @@ def test_a_divergent_second_parse_cannot_produce_a_passing_gate(
     assert len(calls) == 1
     # 0.10 is below the 0.90 floor in the ONE snapshot, so the gate refuses.
     assert verdict.exit_code != 0
+
+
+def test_a_document_that_is_not_a_plain_string_is_unmeasured(
+    tmp_path: Path,
+) -> None:
+    """Round-11 (5): `check` is public and takes text from callers this module does not
+    control. A str subclass reaching json.loads, the slices in the messages, or the
+    caller's own formatting is data nobody proved -- so exactness is tested first, and
+    it touches none of the object's methods."""
+
+    class _ExitingText(str):
+        def __getitem__(self, item: object) -> str:
+            raise SystemExit(231)
+
+        def encode(self, *args: object, **kwargs: object) -> bytes:
+            raise SystemExit(231)
+
+    verdict = check(_ExitingText('{"metrics": []}'), require_recall=True)
+    assert verdict.status == STATUS_UNMEASURED
+    assert verdict.exit_code == 2
+    # The status alone does not distinguish the versions -- an empty metrics document is
+    # UNMEASURED either way. What must be true is that the document was refused FOR NOT
+    # BEING A PLAIN STRING, before any of its methods ran.
+    assert any("not a plain string" in line for line in verdict.lines), verdict.lines
+
+
+def test_a_metrics_file_whose_text_is_not_exact_reads_as_unmeasured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round-11 (5): the read is work and keeps its interrupts, but the TEXT it returned
+    is data. A read_text answering with a str subclass used to flow into the parse and
+    the messages."""
+
+    class _HostileText(str):
+        def __getitem__(self, item: object) -> str:
+            raise SystemExit(232)
+
+    metrics = tmp_path / "metrics.json"
+    metrics.write_text('{"metrics": []}', encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def hostile(self: Path, *args: object, **kwargs: object):
+        if self.name == "metrics.json":
+            return _HostileText(real_read_text(self, *args, **kwargs))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", hostile)
+    assert main(["--metrics", str(metrics)]) == 2
+    monkeypatch.undo()
+    assert "UNMEASURED" in capsys.readouterr().out

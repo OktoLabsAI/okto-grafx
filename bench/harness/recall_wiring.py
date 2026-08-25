@@ -28,8 +28,11 @@ from bench.harness.recall import (
     _canonical_json,
     _canonical_verdict,
     _describe,
+    _exact_int,
+    _exact_str,
     _emit,
     _is_a,
+    _trusted_path,
     _validate_verdict,
     build_section,
     run_recall,
@@ -51,7 +54,7 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], bool]) -> No
     # invariant this module exists to hold. Guarding the call sites would not have
     # helped, because nothing raised. The document is rebuilt into exact builtins and
     # ONLY that copy is mutated and serialized, so a mutation cannot be intercepted.
-    parsed = json.loads(path.read_text(encoding="utf-8"))
+    parsed = json.loads(_exact_str(path.read_text(encoding="utf-8"), "a document"))
     document = _canonical_json(parsed)
     if type(document) is not dict:
         raise RecallStageError(
@@ -77,16 +80,29 @@ def _replace_json(path: Path, mutate: Callable[[dict[str, object]], bool]) -> No
     # that made the document unserializable (or a RecursionError on a deep one) leaked
     # the live descriptor AND the scratch file with nothing to clean either up. Now
     # nothing is acquired until there is something to write.
-    payload = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    descriptor, scratch_name = tempfile.mkstemp(
+    # Round-11 (7): json.dumps is a call whose RESULT is concatenated and encoded; a
+    # str subclass survives both and reaches os.write as bytes nobody vouched for.
+    serialized = _exact_str(
+        json.dumps(document, indent=2, sort_keys=True), "the serialized document"
+    )
+    payload = (serialized + "\n").encode("utf-8")
+    made = tempfile.mkstemp(  # WORK: a genuine interrupt propagates.
         prefix=path.name + ".c13-", suffix=".tmp", dir=str(path.parent)
     )
+    # Round-11 (4): the pair is proved before either half is used; the descriptor goes
+    # to os.write and os.close and the name to os.replace and os.unlink.
+    if type(made) is not tuple or len(made) != 2:
+        raise RecallStageError("mkstemp did not return a pair; nothing was written.")
+    descriptor = _exact_int(made[0], "the scratch descriptor", 0)
+    scratch_name = _exact_str(made[1], "the scratch name")
+    if not scratch_name:
+        raise RecallStageError("mkstemp returned an empty name; nothing was written.")
     closed = False
     try:
         written = 0
         while written < len(payload):
             remaining = len(payload) - written
-            progress = os.write(descriptor, payload[written:])
+            progress = os.write(descriptor, payload[written:])  # WORK
             # Round-5 blocker 1a: `isinstance(progress, int) and progress > 0` accepted
             # True -- bool IS an int and True > 0 -- and accepted any count LARGER than
             # what remained. Either one satisfied the loop while ZERO bytes reached the
@@ -252,32 +268,6 @@ def _release_publication_locks(
     return residue, interrupted
 
 
-def _trusted_path(name: str) -> Path:
-    """Build a Path from a builtin name and prove it is the path we asked for.
-
-    Round-10 (B): reducing the caller's object to a builtin string is only worth
-    anything if the string is what SURVIVES. Rebuilding a Path from it and carrying that
-    object between steps hands the environment a fresh chance to return something else
-    -- and it did: a factory answering with a real Path first and an object whose __eq__
-    raises second escaped through the identity comparison, with no lock ever taken.
-
-    So the object is never trusted on type. It is proved by BEHAVIOUR: whatever comes
-    back must reduce to exactly the builtin name we passed in, compared as strings.
-    Anything else is an ordinary failure, which the caller turns into a typed refusal.
-    """
-    try:
-        candidate = Path(name)
-    except BaseException as failure:  # noqa: BLE001 -- the CONSTRUCTOR chose the shape
-        raise RuntimeError(
-            f"a path object could not be built from {name!r} ({_describe(failure)})"
-        ) from None
-    if _normalized_name(candidate) != name:
-        raise RuntimeError(
-            f"the path constructor did not yield {name!r}; refusing to use it"
-        )
-    return candidate
-
-
 def _normalized_name(resolved: object) -> str:
     """Reduce what resolve() RETURNED to a builtin string; never raise a foreign shape.
 
@@ -359,7 +349,6 @@ def _acquire_publication_locks(
         # after the first lock was already held, and the failure path for a name that
         # does not exist yet had nothing to release it with -- an orphaned lock left on
         # disk by a stage that never ran. Nothing is acquired until every name is known.
-        lock_paths = [Path(target + ".c13.lock") for target in ordered]
     except BaseException as failure:  # noqa: BLE001 -- naming runs ONLY caller code
         # Round-7 (C): this used to re-raise anything that was not an ordinary
         # Exception, which handed the caller a SystemExit the DATA had fabricated --
@@ -368,6 +357,23 @@ def _acquire_publication_locks(
         # below keep the ordinary-vs-KI/SE distinction, because they do actual work.
         return [], (
             "a document could not be named for locking "
+            f"({_describe(failure)}); nothing was locked and nothing was run"
+        )
+    # Round-11 (1), found while probing: building the lock names is OUR work, and it sat
+    # inside the region above -- which absorbs every shape precisely because `str()` on a
+    # caller's object is the caller's code. So a genuine interrupt of Path() was being
+    # converted into a typed refusal by a rule written for a different reason. The two
+    # halves are separated the same way resolve and stat were: naming from the caller's
+    # objects absorbs, constructing our own paths does not.
+    try:
+        lock_paths = [_trusted_path(target + ".c13.lock") for target in ordered]
+    except Exception as failure:  # noqa: BLE001 -- KI/SE propagate; this is OUR work
+        # An ordinary failure building our own names is a typed refusal, exactly like a
+        # failure of any other call this module makes. What must NOT happen here is the
+        # round-9 behaviour of absorbing every shape: a real interrupt of the
+        # constructor is an interrupt of work and belongs to the caller.
+        return [], (
+            "the publication lock names could not be built "
             f"({_describe(failure)}); nothing was locked and nothing was run"
         )
     held: list[Path] = []
@@ -379,7 +385,11 @@ def _acquire_publication_locks(
         # told the operator to delete a file this process had just made, and it left the
         # descriptor open, since the contention path has no descriptor to close.
         try:
-            descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            descriptor = _exact_int(
+                os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY),
+                "the lock descriptor",
+                0,
+            )
         except FileExistsError:
             # ONLY the open can conclude contention, and only here does no descriptor
             # of ours exist.
@@ -409,7 +419,15 @@ def _acquire_publication_locks(
         # account for it.
         held.append(lock_path)
         try:
-            os.write(descriptor, str(os.getpid()).encode("ascii"))
+            # Round-11 (2): a lock whose stamp was never written is a lock that
+            # certifies nothing. The pid is proved an exact positive int, and the write
+            # must report an exact count covering the whole stamp -- os.open answering
+            # True and os.write answering True or 0 both produced a "held" lock with an
+            # empty file behind it.
+            stamp = str(_exact_int(os.getpid(), "the process id", 1)).encode("ascii")
+            stamped = _exact_int(os.write(descriptor, stamp), "the stamp byte count", 1)
+            if stamped != len(stamp):
+                raise RuntimeError("the lock stamp was only partially written")
         except BaseException as failure:  # noqa: BLE001 -- ONE unwind for every shape
             # Round-5 blocker 2: the ordinary and the KI/SE paths each carried their
             # OWN copy of the unwind, and both closed the descriptor under an
@@ -605,12 +623,14 @@ def append_vector_recall(
             # genuine KeyboardInterrupt or SystemExit here is an interrupt of work and
             # keeps propagating; an ordinary failure, RuntimeError included, is a typed
             # refusal with no fallback.
-            resolved_object = Path(alias_name).resolve(strict=True)
+            resolved_object = _trusted_path(alias_name).resolve(strict=True)
             # Round-9: this construction sat OUTSIDE every boundary. A Path replacement
             # that allows the first construction and refuses the second escaped as a raw
             # RuntimeError instead of the typed exit 3 -- and it is the same kind of
             # call as the resolve above, so it belongs under the same clause.
-            canonical_name = _normalized_name(resolved_object)
+            canonical_name = _exact_str(
+                _normalized_name(resolved_object), "the canonical name"
+            )
         except Exception as failure:  # noqa: BLE001 -- KI/SE propagate; this is I/O
             _emit(
                 f"vector recall stage: REFUSED -- {alias_label} "
@@ -691,7 +711,9 @@ def append_vector_recall(
             # while the commit claimed every parse is canonicalized. It agrees with the
             # later reads now -- though each read still validates its OWN snapshot,
             # because agreement here is not evidence about a later one.
-            document = _canonical_json(json.loads(path.read_text(encoding="utf-8")))
+            document = _canonical_json(
+                json.loads(_exact_str(path.read_text(encoding="utf-8"), "a document"))
+            )
         except Exception as failure:  # noqa: BLE001 -- absolute boundary; KI/SE propagate
             _emit(
                 f"vector recall stage: REFUSED -- {label} {_describe(path)} is not "
@@ -703,6 +725,18 @@ def append_vector_recall(
             _emit(
                 f"vector recall stage: REFUSED -- {label} {_describe(path)} holds "
                 f"{_describe(document)}, not an object; nothing was run."
+            )
+            return 3
+        if label == "--metrics" and "metrics" not in document:
+            # Round-11, ratified: schema v1 always carries the metric list, and this
+            # module only ever ADDS. A metrics document without one is not a document
+            # this stage can append to, and refusing HERE means the worker never runs,
+            # no lock or scratch is created, and both files keep their bytes and mtime.
+            # The late check inside the append stays as the TOCTOU guard: agreement
+            # here is not evidence about the snapshot that will actually be written.
+            _emit(
+                f"vector recall stage: REFUSED -- {label} {_describe(path)} carries no "
+                "'metrics' list; this stage only appends to one. Nothing was run."
             )
             return 3
         try:
@@ -826,9 +860,9 @@ def main(argv: list[str] | None = None) -> int:
     return append_vector_recall(
         profile=arguments.profile,
         gt_mode=arguments.gt,
-        out=Path(arguments.out) if arguments.out else None,
-        metrics=Path(arguments.metrics) if arguments.metrics else None,
-        workspace=Path(arguments.workspace),
+        out=_trusted_path(arguments.out) if arguments.out else None,
+        metrics=_trusted_path(arguments.metrics) if arguments.metrics else None,
+        workspace=_trusted_path(arguments.workspace),
         timeout_seconds=arguments.timeout_seconds,
     )
 
