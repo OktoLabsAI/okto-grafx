@@ -19,7 +19,7 @@ from dataclasses import dataclass, fields
 from enum import Enum
 from functools import lru_cache
 from math import isfinite
-from typing import TYPE_CHECKING, Any, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Any, cast, get_args, get_origin, get_type_hints
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -139,7 +139,11 @@ from okto_grafx.domain.wal.codec import FailureReason
 from okto_grafx.domain.wal.replay import RecycleReport, ScanFailure
 from okto_grafx.domain.wal.segment import SegmentInfo
 from okto_grafx.engine.ledger_store import DamagedTail
-from okto_grafx.engine.quarantine import QuarantineEntry
+from okto_grafx.engine.quarantine import (
+    QuarantineEntry,
+    QuarantineInventoryItem,
+    QuarantineInventoryState,
+)
 from okto_grafx.engine.vector_engine import VectorHit, VectorSearchResult
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
@@ -163,6 +167,8 @@ __all__ = [
     "LedgerView",
     "MetricsSnapshotView",
     "MetricsView",
+    "QuarantineInventoryItem",
+    "QuarantineInventoryState",
     "QuarantineView",
     "QueryEngineView",
     "StorageFileView",
@@ -616,6 +622,7 @@ class QuarantineView:
 
     directory: str
     captured_entries: tuple[QuarantineEntry, ...]
+    captured_inventory: tuple[QuarantineInventoryItem, ...] | None = None
 
     def list(self) -> tuple[QuarantineEntry, ...]:
         """Return every quarantine entry captured with this view."""
@@ -624,6 +631,24 @@ class QuarantineView:
     def count(self) -> int:
         """Return how many quarantine entries were captured with this view."""
         return len(self.captured_entries)
+
+    def inventory(self) -> tuple[QuarantineInventoryItem, ...]:
+        """Return the complete evidence inventory captured with this view.
+
+        ``None`` is reserved for views built by older callers that supplied only the legacy
+        complete-entry list.  Treating that state as an empty inventory would erase the
+        distinction between "proved empty" and "not observed", so it refuses explicitly.
+        """
+        if self.captured_inventory is None:
+            raise GrafxQuarantineError(
+                "The quarantine inventory was not captured with this view, so absence cannot "
+                "be concluded.",
+                field="inventory",
+                cause="not_captured",
+                conclusive=False,
+                inconclusive=True,
+            )
+        return self.captured_inventory
 
     def inspect(self, name: str) -> QuarantineEntry:
         """Return one captured quarantine entry by name."""
@@ -1184,6 +1209,78 @@ def _quarantine_entry(value: Any) -> QuarantineEntry:
             empty=False,
         ),
     )
+
+
+_QUARANTINE_INVENTORY_STATES: tuple[str, ...] = (
+    "complete",
+    "incomplete",
+    "corrupt_manifest",
+    "unreadable_manifest",
+    "missing_payload",
+    "manifest_mismatch",
+    "unexpected_layout",
+)
+"""Closed public spelling of every conclusive quarantine inventory state."""
+
+
+def _quarantine_inventory_item(value: Any) -> QuarantineInventoryItem:
+    """Rebuild one full inventory item without retaining or dispatching its source."""
+    value = _domain_value(
+        value, QuarantineInventoryItem, field="quarantine.inventory.item"
+    )
+    state_text = _builtin_text(
+        _domain_field(value, QuarantineInventoryItem, "state"),
+        field="quarantine.inventory.state",
+        empty=False,
+    )
+    if state_text not in _QUARANTINE_INVENTORY_STATES:
+        raise GrafxConfigurationError(
+            f"The quarantine inventory state {state_text!r} is not supported.",
+            field="quarantine.inventory.state",
+            value=state_text,
+        )
+    manifest_value = _domain_field(value, QuarantineInventoryItem, "manifest")
+    item = QuarantineInventoryItem(
+        name=_builtin_text(
+            _domain_field(value, QuarantineInventoryItem, "name"),
+            field="quarantine.inventory.name",
+            empty=False,
+        ),
+        state=cast(QuarantineInventoryState, state_text),
+        files=tuple(
+            _builtin_text(
+                file,
+                field="quarantine.inventory.file",
+                empty=False,
+            )
+            for file in _tuple_items(
+                _domain_field(value, QuarantineInventoryItem, "files"),
+                field="quarantine.inventory.files",
+            )
+        ),
+        manifest_file=_builtin_optional_text(
+            _domain_field(value, QuarantineInventoryItem, "manifest_file"),
+            field="quarantine.inventory.manifest_file",
+        ),
+        payload_file=_builtin_optional_text(
+            _domain_field(value, QuarantineInventoryItem, "payload_file"),
+            field="quarantine.inventory.payload_file",
+        ),
+        manifest=(
+            None if manifest_value is None else _quarantine_manifest(manifest_value)
+        ),
+        detail=_builtin_text(
+            _domain_field(value, QuarantineInventoryItem, "detail"),
+            field="quarantine.inventory.detail",
+        ),
+    )
+    if item.state == "complete" and item.entry is None:
+        raise GrafxConfigurationError(
+            "A complete quarantine inventory item must carry its manifest and both files.",
+            field="quarantine.inventory.item",
+            value="incomplete_complete_item",
+        )
+    return item
 
 
 def _recovery_finding(value: Any) -> RecoveryFinding:
@@ -3086,10 +3183,20 @@ def _ledger_view(ledger: Any) -> LedgerView:
 
 
 def _quarantine_view(quarantine: Any) -> QuarantineView:
-    """Snapshot quarantine inventory without exposing payload or restore doors."""
+    """Snapshot one complete inventory and derive the legacy view from that same instant."""
+    captured_inventory = tuple(
+        _quarantine_inventory_item(item)
+        for item in _tuple_items(quarantine.inventory(), field="quarantine.inventory")
+    )
+    captured_entries: list[QuarantineEntry] = []
+    for item in captured_inventory:
+        entry = item.entry
+        if entry is not None:
+            captured_entries.append(_quarantine_entry(entry))
     return QuarantineView(
         _builtin_text(quarantine.directory, field="quarantine.directory", empty=False),
-        tuple(_quarantine_entry(entry) for entry in quarantine.list()),
+        tuple(captured_entries),
+        captured_inventory,
     )
 
 

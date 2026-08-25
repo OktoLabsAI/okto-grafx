@@ -66,6 +66,7 @@ from okto_grafx.engine.public_views import (
     IndexRegistryView,
     IndexView,
     LedgerView,
+    QuarantineInventoryItem,
     QuarantineView,
     StorageFileView,
     StorageView,
@@ -176,6 +177,7 @@ _EXACT_DATACLASS_TYPES: frozenset[type[object]] = frozenset(
         LedgerEntry,
         LedgerPayload,
         QuarantineEntry,
+        QuarantineInventoryItem,
         QuarantineManifest,
         RecoveryFinding,
         RecoveryReport,
@@ -652,6 +654,32 @@ def _hostile_quarantine_entry(counts: dict[str, int]) -> QuarantineEntry:
     return entry
 
 
+def _hostile_quarantine_inventory_item(
+    counts: dict[str, int],
+) -> QuarantineInventoryItem:
+    """Build one inventory DTO whose tuple and every nested leaf are host subclasses."""
+    entry = _hostile_quarantine_entry(counts)
+    item = QuarantineInventoryItem(
+        name="evidence",
+        state="complete",
+        files=(entry.manifest_file, entry.payload_file),
+        manifest_file=entry.manifest_file,
+        payload_file=entry.payload_file,
+        manifest=entry.manifest,
+        detail="",
+    )
+    _replace_leaves(
+        item,
+        name=entry.name,
+        state=_CapabilityText("complete", counts),
+        files=_CapabilityTuple(item.files, counts),
+        manifest_file=entry.manifest_file,
+        payload_file=entry.payload_file,
+        detail=_CapabilityText("", counts),
+    )
+    return item
+
+
 @contextmanager
 def _hostile_class_names(
     components: tuple[object, ...], counts: dict[str, int]
@@ -973,6 +1001,7 @@ def test_transaction_partition_helper_canonicalizes_numeric_and_byte_subclasses(
         "_ledger_entry",
         "_quarantine_manifest",
         "_quarantine_entry",
+        "_quarantine_inventory_item",
         "_recovery_finding",
         "_recovery_report_view",
     ),
@@ -1148,7 +1177,7 @@ def test_hostile_registry_and_deep_builder_outputs_publish_only_exact_values(
         catalog_spaces = tuple(dict.values(catalog._spaces_by_id))
         table, space = _hostile_catalog_values(source_table, source_space, calls)
         damage, ledger_entry = _hostile_ledger_values(calls)
-        quarantine_entry = _hostile_quarantine_entry(calls)
+        quarantine_inventory_item = _hostile_quarantine_inventory_item(calls)
         state = CommitState(1, 2, 3)
         _replace_leaves(
             state,
@@ -1178,7 +1207,7 @@ def test_hostile_registry_and_deep_builder_outputs_publish_only_exact_values(
         original_damage = LedgerStore.damage
         original_entries = LedgerStore.entries
         original_depth = LedgerStore.depth
-        original_quarantine_list = QuarantineStore.list
+        original_quarantine_inventory = QuarantineStore.inventory
         original_quarantine_read = QuarantineStore.read
         original_state = TransactionManager._published_state_in_section
         original_view_epoch = CatalogStore._view_epoch
@@ -1202,12 +1231,12 @@ def test_hostile_registry_and_deep_builder_outputs_publish_only_exact_values(
                 }
             return original_depth(candidate)
 
-        def quarantine_entries(
+        def quarantine_inventory(
             candidate: QuarantineStore,
-        ) -> tuple[QuarantineEntry, ...]:
+        ) -> tuple[QuarantineInventoryItem, ...]:
             if candidate is database._quarantine:
-                return (quarantine_entry,)
-            return original_quarantine_list(candidate)
+                return (quarantine_inventory_item,)
+            return original_quarantine_inventory(candidate)
 
         def quarantine_payload(candidate: QuarantineStore, name: str) -> bytes:
             if candidate is database._quarantine:
@@ -1418,7 +1447,7 @@ def test_hostile_registry_and_deep_builder_outputs_publish_only_exact_values(
             boundary.setattr(LedgerStore, "damage", property(ledger_damage))
             boundary.setattr(LedgerStore, "entries", ledger_entries)
             boundary.setattr(LedgerStore, "depth", ledger_depth)
-            boundary.setattr(QuarantineStore, "list", quarantine_entries)
+            boundary.setattr(QuarantineStore, "inventory", quarantine_inventory)
             boundary.setattr(QuarantineStore, "read", quarantine_payload)
             boundary.setattr(
                 database._ledger,
@@ -1486,6 +1515,8 @@ def test_hostile_registry_and_deep_builder_outputs_publish_only_exact_values(
                 assert type(database.wal.segment_inventory[0].name) is str
                 assert database.quarantine.captured_entries
                 assert type(database.quarantine.captured_entries[0].name) is str
+                assert database.quarantine.captured_inventory
+                assert type(database.quarantine.captured_inventory[0].name) is str
                 payload = database.read_quarantine(_CapabilityText("evidence", calls))
                 assert type(payload) is bytes
                 assert payload == b"verified evidence"
@@ -1857,6 +1888,112 @@ def test_quarantine_view_count_is_an_exact_observational_integer() -> None:
     assert type(observed) is int
     assert observed == 1
     assert calls == {}
+
+
+def test_legacy_quarantine_view_refuses_to_invent_an_empty_inventory() -> None:
+    """A legacy two-field view means "not captured", never "proved empty"."""
+    view = QuarantineView("quarantine", ())
+
+    with pytest.raises(GrafxQuarantineError) as raised:
+        view.inventory()
+
+    assert view.captured_inventory is None
+    assert raised.value.details == {
+        "field": "inventory",
+        "cause": "not_captured",
+        "conclusive": False,
+        "inconclusive": True,
+    }
+
+
+def test_quarantine_view_refuses_an_incoherent_complete_inventory_item() -> None:
+    """A store cannot label missing manifest/payload evidence as a legacy-complete entry."""
+    incoherent = QuarantineInventoryItem(
+        name="hollow",
+        state="complete",
+        files=("quarantine/hollow/manifest.json",),
+        manifest_file="quarantine/hollow/manifest.json",
+    )
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        public_views_module._quarantine_inventory_item(incoherent)
+
+    assert raised.value.details == {
+        "field": "quarantine.inventory.item",
+        "value": "incomplete_complete_item",
+    }
+
+
+def test_database_quarantine_view_captures_inventory_once_and_derives_legacy_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Incomplete evidence is public while the legacy list comes from the same snapshot."""
+    capability_calls = _hook_counts()
+    complete = _hostile_quarantine_inventory_item(capability_calls)
+    incomplete = QuarantineInventoryItem(
+        name="orphan",
+        state="incomplete",
+        files=("quarantine/orphan/manifest.json",),
+        manifest_file="quarantine/orphan/manifest.json",
+        detail="The payload has not been published.",
+    )
+    inventory_calls: list[int] = []
+
+    with connect(":memory:") as database:
+        quarantine = database._quarantine
+        original_inventory = QuarantineStore.inventory
+
+        def captured_once(
+            candidate: QuarantineStore,
+        ) -> tuple[QuarantineInventoryItem, ...]:
+            if candidate is quarantine:
+                inventory_calls.append(1)
+                return _CapabilityTuple((complete, incomplete), capability_calls)
+            return original_inventory(candidate)
+
+        def legacy_scan_forbidden(
+            _candidate: QuarantineStore,
+        ) -> tuple[QuarantineEntry, ...]:
+            raise AssertionError("the public view must derive entries from inventory")
+
+        monkeypatch.setattr(QuarantineStore, "inventory", captured_once)
+        monkeypatch.setattr(QuarantineStore, "list", legacy_scan_forbidden)
+        view = database.quarantine
+
+    observed = view.inventory()
+    assert inventory_calls == [1]
+    assert [item.state for item in observed] == ["complete", "incomplete"]
+    assert [item.name for item in observed] == ["evidence", "orphan"]
+    assert all(type(item.name) is str for item in observed)
+    assert type(observed[0].files) is tuple
+    assert all(type(file) is str for item in observed for file in item.files)
+    assert view.count() == 1
+    assert view.list() == (observed[0].entry,)
+    _assert_capability_free(view, surface="database.quarantine")
+    assert capability_calls == _hook_counts()
+
+
+def test_database_quarantine_view_distinguishes_a_captured_empty_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The factory always supplies a tuple, including a conclusively empty one."""
+    with connect(":memory:") as database:
+        quarantine = database._quarantine
+        calls: list[int] = []
+
+        def empty(candidate: QuarantineStore) -> tuple[QuarantineInventoryItem, ...]:
+            if candidate is quarantine:
+                calls.append(1)
+                return ()
+            raise AssertionError("an unrelated quarantine store was inspected")
+
+        monkeypatch.setattr(QuarantineStore, "inventory", empty)
+        view = database.quarantine
+
+    assert calls == [1]
+    assert view.captured_inventory == ()
+    assert view.inventory() == ()
+    assert view.list() == ()
 
 
 def test_database_quarantine_receipts_cross_as_exact_immutable_names(
