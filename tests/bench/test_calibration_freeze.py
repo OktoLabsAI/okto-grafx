@@ -580,11 +580,82 @@ def test_the_contended_timing_is_published_as_non_authoritative(
         "the run shared the host, so its duration is not a benchmark"
     )
     load = frozen_from["concurrent_load"]
-    assert load["disclosed_by"], "the disclosure names who reported it"  # type: ignore[index]
-    assert "Z/" in str(load["window_utc"]), "and when it happened"  # type: ignore[index]
     assert "none" in str(load["effect_on_recall"]).lower(), (  # type: ignore[index]
         "the recall numbers are deterministic and the record must say so plainly"
     )
+
+
+def test_every_contended_window_is_recorded_in_order() -> None:
+    """BOTH windows, and the count is asserted rather than the presence of one.
+
+    The audited commit recorded only the first. The second was disclosed after the inbox
+    pull that preceded it, and a fact that existed did not reach the artifact -- which is the
+    same failure mode as the provenance blockers, one layer up: the record has to be complete
+    or it is not a record.
+
+    Asserting the exact count is what makes this a guard. "At least one window" would have
+    passed the commit that was blocked, and "contains 05:10" would pass a list that dropped
+    the first. Order is asserted too, because a chronology that does not increase is not one.
+    """
+    document = json.loads(CALIBRATION.read_text(encoding="utf-8"))
+    home = next(iter(document["vector_recall"]["provenance"]))
+    load = document["vector_recall"]["provenance"][home]["frozen_from"][
+        "concurrent_load"
+    ]
+
+    windows = load["windows"]
+    assert type(windows) is list, "the windows are a list, in chronological order"
+    assert len(windows) == 2, (
+        f"exactly two windows were disclosed; found {len(windows)}"
+    )
+    assert load["count"] == len(windows), "the count and the list must agree"
+
+    starts = [str(window["window_utc"]).split("/")[0] for window in windows]
+    assert starts == sorted(starts), (
+        f"the windows are out of chronological order: {starts}"
+    )
+
+    assert windows[0]["window_utc"] == "2026-08-25T05:00Z/2026-08-25T05:04Z"
+    assert windows[1]["window_utc"] == "2026-08-25T05:10Z/2026-08-25T05:15Z"
+    assert windows[1]["test_count"] == 147
+
+    for index, window in enumerate(windows):
+        assert window["disclosed_by"], f"window {index} names who reported it"
+        assert "none" in str(window["effect_on_recall"]).lower(), (
+            f"window {index} must state plainly that recall is unaffected"
+        )
+        assert "not authoritative" in str(window["effect_on_timing"]).lower(), (
+            f"window {index} must state that timing is contended"
+        )
+
+
+def test_the_command_template_names_no_machine(
+    frozen_from: dict[str, object],
+) -> None:
+    """A portable projection of the command lives beside the exact one.
+
+    The exact argv is preserved unredacted in the evidence metadata, because a redacted
+    command would be a command nobody ran. But a reader on another host needs something they
+    can actually follow, and that copy must carry no filesystem but their own -- so every
+    machine-local position is a placeholder, and this proves it rather than trusting it.
+    """
+    template = frozen_from["command_template"]
+    for trail, value in _walk_strings(template, "command_template"):
+        assert not _is_absolute_anywhere(value), (
+            f"{trail} carries a machine-local path: {value!r}"
+        )
+    argv = template["argv"]  # type: ignore[index]
+    assert argv[0].startswith("<") and argv[0].endswith(">"), (
+        f"the interpreter is a placeholder, not this machine's python: {argv[0]!r}"
+    )
+    assert "bench.harness.recall_worker" in argv, "and it still names the real worker"
+    assert argv[argv.index("--profile") + 1] == "full"
+    assert set(template["environment"]) == {  # type: ignore[index]
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    }, "the BLAS pin is part of the procedure, not an incidental detail"
 
 
 def test_the_measurement_clears_the_floor_it_freezes(

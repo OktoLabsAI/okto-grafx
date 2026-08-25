@@ -859,12 +859,50 @@
             "OMP_NUM_THREADS": "1",
             "OPENBLAS_NUM_THREADS": "1"
           },
+          "command_template": {
+            "argv": [
+              "<PYTHON>",
+              "-m",
+              "bench.harness.recall_worker",
+              "--profile",
+              "full",
+              "--gt",
+              "auto",
+              "--out",
+              "<VERDICT_OUTPUT_PATH>"
+            ],
+            "cwd": "<RUNNER_WORKTREE>",
+            "environment": {
+              "MKL_NUM_THREADS": "1",
+              "NUMEXPR_NUM_THREADS": "1",
+              "OMP_NUM_THREADS": "1",
+              "OPENBLAS_NUM_THREADS": "1"
+            },
+            "note": "portable projection of the executed command: placeholders stand where machine-local paths were, so this reproduces the procedure without carrying anyone's filesystem. The exact argv that ran is preserved unredacted in the evidence metadata",
+            "pythonpath": "<ENGINE_WORKTREE>/src"
+          },
           "concurrent_load": {
-            "disclosed_by": "codex",
+            "count": 2,
             "effect_on_recall": "none: the corpus, the query set, the index seed and the search are deterministic, so the recall numbers are identical under any load",
             "effect_on_timing": "duration_seconds is CONTENDED and therefore NOT authoritative as a performance figure; it is recorded as an operational fact of this run, not as a benchmark",
-            "what": "Grafx pytest gates in another worktree on the same host (one CLI process and one focused vector/recovery/txn process) overlapped this measurement",
-            "window_utc": "2026-08-25T05:00Z/2026-08-25T05:04Z"
+            "note": "every window in which this host was shared during the measurement, in chronological order. The list is exhaustive by intent: a window that happened and is not here is a defect in the record, not a detail",
+            "windows": [
+              {
+                "disclosed_by": "codex",
+                "effect_on_recall": "none: the corpus, the query set, the index seed and the search are deterministic, so the recall numbers are identical under any load",
+                "effect_on_timing": "duration_seconds is CONTENDED and therefore NOT authoritative as a performance figure; it is recorded as an operational fact of this run, not as a benchmark",
+                "what": "Grafx pytest gates in another worktree on the same host: one CLI process and one focused vector/recovery/txn process",
+                "window_utc": "2026-08-25T05:00Z/2026-08-25T05:04Z"
+              },
+              {
+                "disclosed_by": "codex",
+                "effect_on_recall": "none: the corpus, the query set, the index seed and the search are deterministic, so the recall numbers are identical under any load",
+                "effect_on_timing": "duration_seconds is CONTENDED and therefore NOT authoritative as a performance figure; it is recorded as an operational fact of this run, not as a benchmark",
+                "test_count": 147,
+                "what": "a read-only integration auditor ran 147 focused verifier/public-output tests on the same host",
+                "window_utc": "2026-08-25T05:10Z/2026-08-25T05:15Z"
+              }
+            ]
           },
           "duration_is_authoritative": false,
           "duration_seconds": 3834.4580855999957,
