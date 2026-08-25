@@ -75,6 +75,11 @@ jobs:
             extras: "accel,bench"
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The C13 freeze proves both measured sources as commit:path -> blob -> SHA-256.
+          # A depth-1 checkout contains the integration tree but not those historical objects,
+          # which would turn an honest provenance gate into a CI-only rev-parse failure.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:

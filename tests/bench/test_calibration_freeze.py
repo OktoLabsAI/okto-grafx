@@ -513,6 +513,19 @@ def test_the_recorded_object_format_is_the_repository_format(
     assert frozen_from["object_format"] == _object_format()
 
 
+def test_the_suite_checkout_carries_the_commits_provenance_names() -> None:
+    """The commit:path proof cannot run in actions/checkout's depth-1 default clone."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    suite = workflow.split("\n  suite:\n", 1)[1].split("\n  coverage:\n", 1)[0]
+    assert re.search(
+        r"(?m)^      - uses: actions/checkout@v4\n"
+        r"        with:\n"
+        r"(?:          #.*\n)*"
+        r"          fetch-depth: 0$",
+        suite,
+    ), "the suite needs full Git history to certify both recorded source commits"
+
+
 def test_a_well_shaped_but_nonexistent_runner_commit_is_rejected(
     frozen_from: dict[str, object],
 ) -> None:
