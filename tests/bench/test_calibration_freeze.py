@@ -97,7 +97,7 @@ EXPECTED_GATE_MATRIX: dict[str, list[dict[str, str]]] = {
 
 FORBIDDEN_WORKFLOW_GATE_CONTROLS: frozenset[str] = frozenset({"defaults", "env"})
 FORBIDDEN_GATE_JOB_CONTROLS: frozenset[str] = frozenset(
-    {"continue-on-error", "defaults", "env", "if", "needs"}
+    {"container", "continue-on-error", "defaults", "env", "if", "needs"}
 )
 FORBIDDEN_GATE_STEP_CONTROLS: frozenset[str] = frozenset(
     {"continue-on-error", "env", "if", "working-directory"}
@@ -492,7 +492,12 @@ def _gate_command(workflow_text: str | None = None) -> list[str]:
         "the calibration gate matrix must remain exactly Windows plus POSIX; "
         f"found {strategy.get('matrix')!r}"
     )
-    return _tokenize_gate_script(script)
+    argv = _tokenize_gate_script(script)
+    assert tuple(argv) == EXPECTED_GATE_ARGV, (
+        "the effective gate command changed; review every token rather than allowing an "
+        f"implicit flag or shell operator: {argv}"
+    )
+    return argv
 
 
 # ------------------------------------------------------------------------------------
@@ -1473,11 +1478,7 @@ def test_the_workflow_command_lets_the_versioned_artifact_govern() -> None:
     have satisfied it and a ``$GATE_FLAGS`` carrying ``--recall-target`` would have escaped
     it entirely. Tokenizing the effective run scalar closes both.
     """
-    argv = _gate_command()
-    assert tuple(argv) == EXPECTED_GATE_ARGV, (
-        "the effective gate command changed; review every token rather than allowing an "
-        f"implicit flag or shell operator: {argv}"
-    )
+    assert tuple(_gate_command()) == EXPECTED_GATE_ARGV
 
 
 def test_a_second_workflow_gate_cannot_hide_after_the_governed_one() -> None:
@@ -1496,6 +1497,58 @@ def test_a_second_workflow_gate_cannot_hide_after_the_governed_one() -> None:
     )
     with pytest.raises(AssertionError, match="exactly once"):
         _gate_command(smuggled)
+
+
+def test_a_conditional_decoy_cannot_capture_the_check_for_a_weaker_real_gate() -> None:
+    """A documented but skipped command is not authority over the executable command."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    real_line = f"        run: {' '.join(EXPECTED_GATE_ARGV)}"
+    assert workflow.count(real_line) == 1
+    decoy = "\n".join(
+        (
+            "      - name: Gate contract decoy",
+            "        if: false",
+            "        shell: bash",
+            real_line,
+        )
+    )
+    weaker = real_line.replace(
+        " --require-recall",
+        " --recall-target 0.10",
+    )
+    governed_step = "      - name: Apply the D5 ceilings to the PUBLISHED metric"
+    assert workflow.count(governed_step) == 1
+    mutated = workflow.replace(real_line, weaker)
+    mutated = mutated.replace(governed_step, f"{decoy}\n\n{governed_step}")
+    with pytest.raises(AssertionError, match="exactly once"):
+        _gate_command(mutated)
+
+
+@pytest.mark.parametrize(
+    "mutant_command",
+    (
+        f"{' '.join(EXPECTED_GATE_ARGV)} || true",
+        " ".join(EXPECTED_GATE_ARGV).replace(
+            "--require-recall",
+            "--require-recall --recall-target=0.10",
+        ),
+        " ".join(EXPECTED_GATE_ARGV).replace(
+            "--require-recall",
+            "--require-recall --recall-tar 0.10",
+        ),
+        f"{' '.join(EXPECTED_GATE_ARGV)} --calibration bench/calibration-relaxed.json",
+    ),
+)
+def test_every_effective_argv_variant_from_the_adversarial_probe_is_rejected(
+    mutant_command: str,
+) -> None:
+    """Shell forgiveness and argparse-equivalent overrides must all fail the same freeze."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    real_line = f"        run: {' '.join(EXPECTED_GATE_ARGV)}"
+    assert workflow.count(real_line) == 1
+    mutated = workflow.replace(real_line, f"        run: {mutant_command}")
+    with pytest.raises(AssertionError, match="effective gate command changed"):
+        _gate_command(mutated)
 
 
 @pytest.mark.parametrize(
@@ -1521,17 +1574,44 @@ def test_the_governed_gate_step_cannot_be_skipped_forgiven_or_redirected(
         _gate_command(mutated)
 
 
-@pytest.mark.parametrize(("control", "value"), (("if", "false"), ("continue-on-error", "true")))
-def test_the_calibration_job_cannot_skip_or_forgive_the_gate(
+@pytest.mark.parametrize(
+    ("control", "value"),
+    (
+        ("if", "false"),
+        ("continue-on-error", "true"),
+        ("container", "python:3.13"),
+        ("env", "{PYTHONPATH: .untrusted}"),
+        ("defaults", '{run: {shell: "bash {0} || true"}}'),
+        ("needs", "decoy-job"),
+    ),
+)
+def test_the_calibration_job_cannot_skip_forgive_or_redirect_the_gate(
     control: str,
     value: str,
 ) -> None:
-    """A fail-closed step also requires an unconditional, fatal parent job."""
+    """A fail-closed step also requires an unconditional, trusted parent job."""
     workflow = WORKFLOW.read_text(encoding="utf-8")
     job_line = "  calibration:"
     assert workflow.count(job_line) == 1
     mutated = workflow.replace(job_line, f"{job_line}\n    {control}: {value}")
     with pytest.raises(AssertionError, match=rf"calibration job.*{re.escape(control)}"):
+        _gate_command(mutated)
+
+
+@pytest.mark.parametrize(
+    ("control", "value"),
+    (
+        ("env", "{PYTHONPATH: .untrusted}"),
+        ("defaults", '{run: {shell: "bash {0} || true"}}'),
+    ),
+)
+def test_workflow_wide_context_cannot_redirect_the_gate(control: str, value: str) -> None:
+    """Global defaults and environment are inherited by the governed step."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    name_line = "name: ci"
+    assert workflow.count(name_line) == 1
+    mutated = workflow.replace(name_line, f"{name_line}\n\n{control}: {value}")
+    with pytest.raises(AssertionError, match=rf"workflow-wide.*{re.escape(control)}"):
         _gate_command(mutated)
 
 
