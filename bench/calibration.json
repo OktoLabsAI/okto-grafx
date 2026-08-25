@@ -787,5 +787,170 @@
   ],
   "partitions_per_table": 64,
   "status": "consult_jp",
+  "vector_recall": {
+    "frozen": {
+      "corpus": {
+        "generator": "uniform-int53-v1",
+        "seed": 1337,
+        "sha256_f32": "a17bd95c6bada8e5bdb8185d695d9391a79fb5c572e23aee50dba5146a7a1468",
+        "sha256_f64": "654adaa7b189618c7698da9108c9e69a378ff7256f114409622a48b43cdcc1ed",
+        "size": 8192
+      },
+      "dimension": 384,
+      "dtype_check": {
+        "mean_overlap_min": 0.99,
+        "per_query_overlap_min": 0.9
+      },
+      "gate_required": true,
+      "gt": {
+        "accel_equivalence_eps_rel": 1e-09,
+        "canonical": "pure-python math.fsum",
+        "differential": {
+          "corpus_slice": 1024,
+          "queries": 16,
+          "selection": "deterministic by seed"
+        },
+        "oracle": "numpy-bruteforce-v1 (differential pure-fsum 16x1024)"
+      },
+      "hnsw": {
+        "ef_construction": 200,
+        "ef_search": 320,
+        "index_seed": "0x0C701A11F0C0FFEE",
+        "neighbours": 16
+      },
+      "k": 10,
+      "metric": "cosine",
+      "queries": 256,
+      "query_set": {
+        "held_out": true,
+        "seed": 4242,
+        "sha256_f32": "1995f66674d68f34062a495a6b92cd38c28f6b653ce7ea12898da544938521c5",
+        "sha256_f64": "5207fa9897934bc4400549476e9ece7334bdc84c9855ba845d3b7f04b278af87"
+      },
+      "regime_threshold": 4096,
+      "storage_dtype": "float32",
+      "target": 0.9,
+      "ties": "generous: GT admits every record at or under the k-th distance"
+    },
+    "observed": {
+      "windows": {
+        "dtype_check": {
+          "mean_overlap": 1.0,
+          "min_overlap": 1.0
+        },
+        "mean_recall_at_k": 0.9546875,
+        "min_recall_at_k": 0.7,
+        "queries_below_perfect": 92
+      }
+    },
+    "provenance": {
+      "windows": {
+        "blas_environment": {
+          "MKL_NUM_THREADS": "1",
+          "NUMEXPR_NUM_THREADS": "1",
+          "OMP_NUM_THREADS": "1",
+          "OPENBLAS_NUM_THREADS": "1"
+        },
+        "duration_seconds": 3834.4580855999957,
+        "frozen_from": {
+          "blas_environment": {
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1"
+          },
+          "command_template": {
+            "argv": [
+              "<PYTHON>",
+              "-m",
+              "bench.harness.recall_worker",
+              "--profile",
+              "full",
+              "--gt",
+              "auto",
+              "--out",
+              "<VERDICT_OUTPUT_PATH>"
+            ],
+            "cwd": "<RUNNER_WORKTREE>",
+            "environment": {
+              "MKL_NUM_THREADS": "1",
+              "NUMEXPR_NUM_THREADS": "1",
+              "OMP_NUM_THREADS": "1",
+              "OPENBLAS_NUM_THREADS": "1"
+            },
+            "note": "portable projection of the executed command: placeholders stand where machine-local paths were, so this reproduces the procedure without carrying anyone's filesystem. The exact argv that ran is preserved unredacted in the evidence metadata",
+            "pythonpath": "<ENGINE_WORKTREE>/src"
+          },
+          "concurrent_load": {
+            "count": 2,
+            "effect_on_recall": "none: the corpus, the query set, the index seed and the search are deterministic, so the recall numbers are identical under any load",
+            "effect_on_timing": "duration_seconds is CONTENDED and therefore NOT authoritative as a performance figure; it is recorded as an operational fact of this run, not as a benchmark",
+            "note": "every window in which this host was shared during the measurement, in chronological order. The list is exhaustive by intent: a window that happened and is not here is a defect in the record, not a detail",
+            "windows": [
+              {
+                "disclosed_by": "codex",
+                "effect_on_recall": "none: the corpus, the query set, the index seed and the search are deterministic, so the recall numbers are identical under any load",
+                "effect_on_timing": "duration_seconds is CONTENDED and therefore NOT authoritative as a performance figure; it is recorded as an operational fact of this run, not as a benchmark",
+                "what": "Grafx pytest gates in another worktree on the same host: one CLI process and one focused vector/recovery/txn process",
+                "window_utc": "2026-08-25T05:00Z/2026-08-25T05:04Z"
+              },
+              {
+                "disclosed_by": "codex",
+                "effect_on_recall": "none: the corpus, the query set, the index seed and the search are deterministic, so the recall numbers are identical under any load",
+                "effect_on_timing": "duration_seconds is CONTENDED and therefore NOT authoritative as a performance figure; it is recorded as an operational fact of this run, not as a benchmark",
+                "test_count": 147,
+                "what": "a read-only integration auditor ran 147 focused verifier/public-output tests on the same host",
+                "window_utc": "2026-08-25T05:10Z/2026-08-25T05:15Z"
+              }
+            ]
+          },
+          "duration_is_authoritative": false,
+          "duration_seconds": 3834.4580855999957,
+          "engine_dependency_source": {
+            "canonical_blob_sha256": "7dd4351c03d9c4c8e01ce459ec976d1f8a75600b5ccc0c77d12d235e6340b027",
+            "commit": "5e2fa294e144c4ebf4dfb3e3723af455ddc5d422",
+            "git_blob": "6bc68bcfa81e6203a1fa2bc0f75af2d84f68cef9",
+            "loaded_canonical_sha256": "7dd4351c03d9c4c8e01ce459ec976d1f8a75600b5ccc0c77d12d235e6340b027",
+            "loaded_module_basename": "hnsw.py",
+            "path": "src/okto_grafx/domain/vector/hnsw.py",
+            "proven_against_committed_blob": true,
+            "role": "the vector engine imported by the measurement"
+          },
+          "engine_is_ancestor_of_runner_commit": false,
+          "engine_relationship": "the calibrated HNSW search beam is not an ancestor of the runner commit; it is a separate integration dependency that must reach the release lineage for this measurement to describe production. Stated against the runner commit and never against HEAD, because after integration it becomes an ancestor of HEAD through the other parent and the same sentence would flip meaning",
+          "evidence": {
+            "capture_script": "bench/evidence/capture_c13_evidence.py",
+            "capture_script_canonical_blob_sha256": "250b1e99a1cc42e0a9e545d369ced07b09d16e4e7ac8be30107896715ae1ea92",
+            "metadata": "bench/evidence/recall-full-ef320.metadata.json",
+            "metadata_raw_sha256": "905d6b20cbb5d47a6a6cc85517bad18459e3891601afb90cc53b55596a5a5b6f",
+            "raw_sha256": "b4c020f9624b104df7ce9bff72bc4497ffbd4cd28355b7d126338e6ca7f58b59",
+            "verdict": "bench/evidence/recall-full-ef320.verdict.json",
+            "verdict_base64": "bench/evidence/recall-full-ef320.verdict.json.b64",
+            "verdict_bytes": 965
+          },
+          "exit_code": 0,
+          "hash_convention": "raw_sha256 covers the EXACT bytes the worker wrote, unnormalized, and the directory is marked -text so a checkout cannot rewrite them; canonical_blob_sha256 covers LF-normalized SOURCE content, which is what git stores and what makes a blob id reproducible across platforms. The two are never interchanged",
+          "machine_local_paths": "CONFINED to bench/evidence/. The handoff forbids absolute paths in the commit, and the audit requires the capture launcher to be versioned and the effective command and environment recorded -- but a command that spawns an interpreter names that interpreter, and a launcher that certifies two worktrees names them. Rather than redact evidence into something whose hash would authenticate a file nobody ran, the machine-local strings stay inside bench/evidence/ as evidence of a procedure, and a test proves they reach no project content -- not the harness, the tests, the workflow or the calibration",
+          "measured_ef_search": 320,
+          "numpy": "2.5.1",
+          "object_format": "sha1",
+          "platform": "win32",
+          "python": "3.13.1",
+          "runner_source": {
+            "canonical_blob_sha256": "de67be3315c08837b673223b7d2357da951a5cc60ee22485884cf213bccecd0e",
+            "commit": "b7d56ec07e896d99753ffe48c21e49d5edefaeab",
+            "git_blob": "8e22e692ad535f0260b6ec04fba820c12adbcade",
+            "path": "bench/harness/recall_worker.py",
+            "role": "the bench worker that produced the measurement"
+          }
+        },
+        "gt_path_used": "numpy",
+        "numpy": "2.5.1",
+        "profile": "full",
+        "python": "3.13.1"
+      }
+    },
+    "schema_version": 1
+  },
   "version": 1
 }
