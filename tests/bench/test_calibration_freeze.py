@@ -44,6 +44,7 @@ import subprocess
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
+import yaml
 
 from bench.harness.gate import (
     DEFAULT_RECALL_TARGET,
@@ -85,6 +86,21 @@ EXPECTED_GATE_ARGV: tuple[str, ...] = (
     "--require-recall",
     "--calibration",
     "bench/calibration.json",
+)
+
+EXPECTED_GATE_MATRIX: dict[str, list[dict[str, str]]] = {
+    "include": [
+        {"os": "windows-latest", "family": "windows"},
+        {"os": "ubuntu-latest", "family": "posix"},
+    ]
+}
+
+FORBIDDEN_WORKFLOW_GATE_CONTROLS: frozenset[str] = frozenset({"defaults", "env"})
+FORBIDDEN_GATE_JOB_CONTROLS: frozenset[str] = frozenset(
+    {"continue-on-error", "defaults", "env", "if", "needs"}
+)
+FORBIDDEN_GATE_STEP_CONTROLS: frozenset[str] = frozenset(
+    {"continue-on-error", "env", "if", "working-directory"}
 )
 
 PORTABLE_PLACEHOLDER_PATH = re.compile(
@@ -381,65 +397,102 @@ def _knob_occurrences(tree: ast.AST) -> list[ast.AST]:
     return found
 
 
-def _gate_commands(workflow_text: str | None = None) -> list[list[str]]:
-    """Every EFFECTIVE argv that invokes the workflow gate, tokenized.
+def _gate_invocations(
+    workflow_text: str | None = None,
+) -> tuple[dict[object, object], list[tuple[str, dict[object, object], dict[object, object], str]]]:
+    """Parse every workflow step that can invoke the calibration gate.
 
-    Reading lines was the audited mistake: it could not tell a flag from a flag inside a
-    trailing comment, and it could not see flags arriving through a shell variable at all.
-    Returning from the first match was another version of that mistake: a second step could
-    run a weaker gate while every assertion inspected only the first. This collects every
-    matching run scalar, drops comments, joins continuations and hands each result to shlex,
-    so cardinality and the argv the runner executes are both governed.
+    Governing a command without governing the step and job that carry it is not fail-closed:
+    ``if: false`` can skip the command and ``continue-on-error: true`` can forgive its failure.
+    Parsing the YAML also finds folded/block run scalars and merged mappings structurally.
     """
     text = (
         WORKFLOW.read_text(encoding="utf-8")
         if workflow_text is None
         else workflow_text
     )
-    lines = text.splitlines()
-    commands: list[list[str]] = []
-    for index, line in enumerate(lines):
-        if "bench.harness.gate" not in line:
-            continue
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
-        if not stripped.startswith("run:"):
-            pytest.fail(f"the gate invocation is not a run: scalar -- {stripped!r}")
-        script = stripped[len("run:") :].strip()
-        while script.endswith("\\") and index + 1 < len(lines):
-            index += 1
-            script = script[:-1] + lines[index].strip()
-        # A trailing comment is not part of the command.
-        script = script.split(" #", 1)[0]
-        if "bench.harness.gate" not in script:
-            continue
-        expressions: dict[str, str] = {}
+    document = yaml.safe_load(text)
+    assert isinstance(document, dict), "the workflow must decode to a YAML mapping"
+    jobs = document.get("jobs")
+    assert isinstance(jobs, dict), "the workflow must contain a jobs mapping"
 
-        def protect_expression(match: re.Match[str]) -> str:
-            marker = f"__GITHUB_EXPRESSION_{len(expressions)}__"
-            expressions[marker] = match.group(0)
-            return marker
+    hits: list[tuple[str, dict[object, object], dict[object, object], str]] = []
+    for job_name, raw_job in jobs.items():
+        if not isinstance(job_name, str) or not isinstance(raw_job, dict):
+            continue
+        raw_steps = raw_job.get("steps", ())
+        if not isinstance(raw_steps, list):
+            continue
+        for raw_step in raw_steps:
+            if not isinstance(raw_step, dict):
+                continue
+            script = raw_step.get("run")
+            if isinstance(script, str) and "bench.harness.gate" in script:
+                hits.append((job_name, raw_job, raw_step, script))
+    return document, hits
 
-        protected = re.sub(r"\$\{\{[^{}]*\}\}", protect_expression, script)
-        argv = shlex.split(protected, posix=True)
-        restored: list[str] = []
-        for token in argv:
-            for marker, expression in expressions.items():
-                token = token.replace(marker, expression)
-            restored.append(token)
-        commands.append(restored)
-    return commands
+
+def _tokenize_gate_script(script: str) -> list[str]:
+    """Return the effective gate argv after shell comments and continuations."""
+    script = re.sub(r"\\\r?\n[ \t]*", " ", script)
+    expressions: dict[str, str] = {}
+
+    def protect_expression(match: re.Match[str]) -> str:
+        marker = f"__GITHUB_EXPRESSION_{len(expressions)}__"
+        expressions[marker] = match.group(0)
+        return marker
+
+    protected = re.sub(r"\$\{\{[^{}]*\}\}", protect_expression, script)
+    argv = shlex.split(protected, comments=True, posix=True)
+    restored: list[str] = []
+    for token in argv:
+        for marker, expression in expressions.items():
+            token = token.replace(marker, expression)
+        restored.append(token)
+    return restored
 
 
 def _gate_command(workflow_text: str | None = None) -> list[str]:
-    """The sole workflow gate command; absence and duplication both fail closed."""
-    commands = _gate_commands(workflow_text)
-    assert len(commands) == 1, (
+    """The sole unconditional, fatal workflow gate command and its exact argv."""
+    document, invocations = _gate_invocations(workflow_text)
+    assert len(invocations) == 1, (
         "the workflow must invoke bench.harness.gate exactly once; "
-        f"found {len(commands)} invocations: {commands}"
+        f"found {len(invocations)} invocations"
     )
-    return commands[0]
+    job_name, job, step, script = invocations[0]
+    assert job_name == "calibration", (
+        "the sole gate invocation must remain in the calibration job; "
+        f"found it in {job_name!r}"
+    )
+
+    workflow_controls = sorted(FORBIDDEN_WORKFLOW_GATE_CONTROLS.intersection(document))
+    assert not workflow_controls, (
+        "workflow-wide execution controls can replace the gate environment or shell: "
+        f"{workflow_controls}"
+    )
+    job_controls = sorted(FORBIDDEN_GATE_JOB_CONTROLS.intersection(job))
+    assert not job_controls, (
+        "the calibration job must be unconditional, fatal and self-contained; "
+        f"remove controls {job_controls}"
+    )
+    step_controls = sorted(FORBIDDEN_GATE_STEP_CONTROLS.intersection(step))
+    assert not step_controls, (
+        "the governed gate step must be unconditional, fatal and isolated from injected "
+        f"state; remove controls {step_controls}"
+    )
+    assert step.get("shell") == "bash", (
+        "the governed gate step shell must remain exactly 'bash'; "
+        f"found {step.get('shell')!r}"
+    )
+
+    assert job.get("runs-on") == "${{ matrix.os }}", "the gate must run on each governed OS"
+    strategy = job.get("strategy")
+    assert isinstance(strategy, dict), "the calibration job must declare its platform matrix"
+    assert strategy.get("matrix") == EXPECTED_GATE_MATRIX, (
+        "the calibration gate matrix must remain exactly Windows plus POSIX; "
+        f"found {strategy.get('matrix')!r}"
+    )
+    return _tokenize_gate_script(script)
 
 
 # ------------------------------------------------------------------------------------
@@ -1432,15 +1485,54 @@ def test_a_second_workflow_gate_cannot_hide_after_the_governed_one() -> None:
     command = " ".join(EXPECTED_GATE_ARGV)
     smuggled = "\n".join(
         (
-            "steps:",
-            "  - name: Governed gate",
-            f"    run: {command}",
-            "  - name: Second gate (smuggled)",
-            f"    run: {command} --recall-target 0.10",
+            "jobs:",
+            "  calibration:",
+            "    steps:",
+            "      - name: Governed gate",
+            f"        run: {command}",
+            "      - name: Second gate (smuggled)",
+            f"        run: {command} --recall-target 0.10",
         )
     )
     with pytest.raises(AssertionError, match="exactly once"):
         _gate_command(smuggled)
+
+
+@pytest.mark.parametrize(
+    ("control", "value"),
+    (
+        ("if", "false"),
+        ("continue-on-error", "true"),
+        ("shell", '"bash {0} || true"'),
+        ("env", "{PYTHONPATH: .untrusted}"),
+        ("working-directory", ".untrusted"),
+    ),
+)
+def test_the_governed_gate_step_cannot_be_skipped_forgiven_or_redirected(
+    control: str,
+    value: str,
+) -> None:
+    """The exact argv is powerless if its containing step can evade that argv's result."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    gate_line = f"        run: {' '.join(EXPECTED_GATE_ARGV)}"
+    assert workflow.count(gate_line) == 1
+    mutated = workflow.replace(gate_line, f"        {control}: {value}\n{gate_line}")
+    with pytest.raises(AssertionError, match=rf"gate step.*{re.escape(control)}"):
+        _gate_command(mutated)
+
+
+@pytest.mark.parametrize(("control", "value"), (("if", "false"), ("continue-on-error", "true")))
+def test_the_calibration_job_cannot_skip_or_forgive_the_gate(
+    control: str,
+    value: str,
+) -> None:
+    """A fail-closed step also requires an unconditional, fatal parent job."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    job_line = "  calibration:"
+    assert workflow.count(job_line) == 1
+    mutated = workflow.replace(job_line, f"{job_line}\n    {control}: {value}")
+    with pytest.raises(AssertionError, match=rf"calibration job.*{re.escape(control)}"):
+        _gate_command(mutated)
 
 
 def test_no_gate_flag_can_arrive_through_a_shell_variable() -> None:
