@@ -17,6 +17,15 @@ including the on-disk format.
   registries, and forged/uninitialised configuration instances receive typed refusals before a
   database root is created. The process-global `checksum` selector remains effective with a
   caller-supplied registry.
+- **Transactions now have four opt-in hard admission budgets, all defaulting to `None`.**
+  `max_statement_writes` counts logical writes held by one statement; `max_transaction_rows`
+  counts retained `row_intents`; `max_transaction_bytes` charges encoded row tuples, staged
+  logical-record `encoded_length()` values and retained page-image generations. Ordinary page
+  replacement charges by delta; a rollback preimage remains charged while its statement mark is
+  live. `max_wal_batch_bytes` sums the complete record batch including
+  `COMMIT` and excluding `SEGMENT_HEADER`, and is checked before WAL append. Overruns raise the
+  non-retryable `GrafxTransactionBudgetExceeded`; refusal neither truncates the WAL nor persists a
+  partial statement.
 - **Record and byte thresholds now drive automatic WAL maintenance.** After a durable write commit
   and schema settlement, writable databases checkpoint when `last_committed_lsn - checkpoint_lsn`
   reaches `checkpoint_interval_records` or when the optional `wal_max_bytes` high-water is crossed.
@@ -46,6 +55,12 @@ including the on-disk format.
 
 ### Fixed
 
+- **Statement rollback now restores exact page staging.** `staging_mark()` retains its
+  `tuple[int, int, int]` signature while sealing exact internal snapshots of page images, their
+  provenance proofs, write partitions and charged bytes. Marks are matched by exact object
+  identity and released on successful handover. `discard_since()` restores a replaced image and
+  additions whose key sorts before an older key, closing both count-based rollback gaps without
+  persisting part of a refused statement.
 - **The test tree now has a zero-diagnostic Ruff baseline enforced in CI.** The cleanup exposed
   and repaired a non-string map fixture where Python collapsed the distinct-looking keys `1` and
   `True`, removed a dead platform-family resolver that referenced a nonexistent helper, and made

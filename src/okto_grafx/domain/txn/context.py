@@ -21,9 +21,11 @@ from enum import Enum
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
+    GrafxTransactionBudgetExceeded,
     GrafxTransactionStateError,
 )
 from okto_grafx.domain.ids import NO_CSN, Csn, Epoch, PageIndex, TxnId
+from okto_grafx.domain.model.schema import encode_tuple
 from okto_grafx.domain.txn.partitions import page_partition
 from okto_grafx.domain.txn.records import (
     WalRecordLike,
@@ -178,6 +180,10 @@ class TransactionContext:
         "page_images",
         "_page_image_proofs",
         "_page_staging_capability",
+        "_max_transaction_rows",
+        "_max_transaction_bytes",
+        "_staged_payload_bytes",
+        "_staging_marks",
         "row_intents",
         "row_refs",
     )
@@ -191,6 +197,8 @@ class TransactionContext:
         epoch: Epoch,
         owner: object,
         page_staging_capability: object,
+        max_transaction_rows: int | None = None,
+        max_transaction_bytes: int | None = None,
     ) -> None:
         """Open a transaction bound to the manager that created it.
 
@@ -218,6 +226,22 @@ class TransactionContext:
         # replacing or deleting an entry directly makes the whole attempt fail closed.
         self._page_image_proofs: dict[tuple[str, PageIndex], bytes] = {}
         self._page_staging_capability: object = page_staging_capability
+        self._max_transaction_rows = _require_optional_positive_limit(
+            "max_transaction_rows", max_transaction_rows
+        )
+        self._max_transaction_bytes = _require_optional_positive_limit(
+            "max_transaction_bytes", max_transaction_bytes
+        )
+        self._staged_payload_bytes: int = 0
+        self._staging_marks: list[
+            tuple[
+                tuple[int, int, int],
+                dict[tuple[str, PageIndex], bytes],
+                dict[tuple[str, PageIndex], bytes],
+                set[int],
+                int,
+            ]
+        ] = []
         self.row_intents: list[RowIntent] = []
         self.row_refs: list[object] = []
 
@@ -342,7 +366,10 @@ class TransactionContext:
                 value=record_txn_id,
                 txn_id=self.txn_id,
             )
+        record_bytes = self._record_payload_bytes(record)
+        self._require_payload_capacity(record_bytes)
         self.pending_records.append(record)
+        self._staged_payload_bytes += record_bytes
 
     def stage_page_image(self, file: str, page_index: PageIndex, image: bytes) -> None:
         """Refuse caller-authored physical pages.
@@ -407,8 +434,19 @@ class TransactionContext:
             )
         key = (file, page_index)
         accepted = bytes(image)
+        previous = self.page_images.get(key)
+        if previous is accepted:
+            delta = 0
+        elif previous is not None and self._image_is_retained_by_mark(key, previous):
+            # A live statement mark owns the rollback preimage. Replacing the current map does
+            # not release those bytes, so the new image is additional memory, not a delta.
+            delta = len(accepted)
+        else:
+            delta = len(accepted) - (0 if previous is None else len(previous))
+        self._require_payload_capacity(delta)
         self.page_images[key] = accepted
         self._page_image_proofs[key] = hashlib.sha256(accepted).digest()
+        self._staged_payload_bytes += delta
         # Staging a page IS declaring interest in it. A commit that wrote a whole page image and
         # declared interest in nothing could never be refused by optimistic validation -- the
         # predicate short-circuits on an empty set -- so two participants writing the same page
@@ -465,9 +503,15 @@ class TransactionContext:
                 field="record_id",
                 value=repr(record_id),
             )
+        self._require_row_count_capacity()
+        accepted_table = _require_table(table)
+        accepted_values = tuple(values)
+        payload_bytes = self._row_payload_bytes(accepted_table, accepted_values)
+        self._require_payload_capacity(payload_bytes)
         self.row_intents.append(
-            RowIntent(table=_require_table(table), values=tuple(values), record_id=record_id)
+            RowIntent(table=accepted_table, values=accepted_values, record_id=record_id)
         )
+        self._staged_payload_bytes += payload_bytes
 
     def stage_row_update(
         self, table: object, reference: object, values: Iterable[object]
@@ -482,14 +526,21 @@ class TransactionContext:
         """
         self._require_active()
         self._require_write_mode("stage a row update")
+        accepted_table = _require_table(table)
+        accepted_reference = _require_reference(reference)
+        self._require_row_count_capacity()
+        accepted_values = tuple(values)
+        payload_bytes = self._row_payload_bytes(accepted_table, accepted_values)
+        self._require_payload_capacity(payload_bytes)
         self.row_intents.append(
             RowIntent(
-                table=_require_table(table),
-                values=tuple(values),
+                table=accepted_table,
+                values=accepted_values,
                 operation=RowOperation.UPDATE,
-                reference=_require_reference(reference),
+                reference=accepted_reference,
             )
         )
+        self._staged_payload_bytes += payload_bytes
 
     def stage_row_delete(self, table: object, reference: object) -> None:
         """Stage the end of an existing row, to be written at the commit number.
@@ -500,11 +551,14 @@ class TransactionContext:
         """
         self._require_active()
         self._require_write_mode("stage a row delete")
+        accepted_table = _require_table(table)
+        accepted_reference = _require_reference(reference)
+        self._require_row_count_capacity()
         self.row_intents.append(
             RowIntent(
-                table=_require_table(table),
+                table=accepted_table,
                 operation=RowOperation.DELETE,
-                reference=_require_reference(reference),
+                reference=accepted_reference,
             )
         )
 
@@ -514,17 +568,28 @@ class TransactionContext:
         The unit a caller discards is the STATEMENT, not the whole transaction: a statement that
         refuses halfway through must leave nothing of itself behind, or a caller that catches the
         refusal and commits makes half a statement durable. A caller takes a mark before a
-        statement and discards back to it if the statement refuses.
+        statement and discards back to it if the statement refuses. The returned tuple keeps its
+        established shape, while its exact object identity authenticates the internal snapshot.
         """
-        return (len(self.row_intents), len(self.pending_records), len(self.page_images))
+        mark = (len(self.row_intents), len(self.pending_records), len(self.page_images))
+        self._staging_marks.append(
+            (
+                mark,
+                dict(self.page_images),
+                dict(self._page_image_proofs),
+                set(self.write_partitions),
+                self._staged_payload_bytes,
+            )
+        )
+        return mark
 
     def discard_since(self, mark: tuple[int, int, int]) -> None:
         """Drop everything staged after the mark, leaving what was staged before it untouched.
 
-        Page images are keyed by location rather than ordered, so a statement that REPLACED an
-        image staged by an earlier statement cannot be unwound by count alone; discarding is
-        therefore refused when the map has not grown, and the caller rolls the transaction back
-        instead. A refusal here is honest where a partial unwind would be silent.
+        Page images are keyed by location rather than ordered, so the mark seals an internal
+        shallow snapshot of the exact map, its proofs and write partitions. Bytes are immutable:
+        restoring that state restores both a replaced image and additions whose key sorts before
+        an older key, without copying page payloads or guessing insertion order from a count.
         """
         rows, records, pages = mark
         if (
@@ -541,12 +606,170 @@ class TransactionContext:
                 field="mark",
                 value=repr(mark),
             )
+        if not self._staging_marks or self._staging_marks[-1][0] is not mark:
+            raise GrafxTransactionStateError(
+                "That mark is not the most recent unsettled point of this transaction.",
+                txn_id=self._txn_id,
+                field="mark",
+                value=repr(mark),
+            )
+        (
+            _issued,
+            page_images,
+            page_proofs,
+            write_partitions,
+            payload_bytes,
+        ) = self._staging_marks.pop()
         del self.row_intents[rows:]
         del self.pending_records[records:]
-        if len(self.page_images) != pages:
-            for key in sorted(self.page_images)[pages:]:
-                del self.page_images[key]
-                self._page_image_proofs.pop(key, None)
+        self.page_images.clear()
+        self.page_images.update(page_images)
+        self._page_image_proofs.clear()
+        self._page_image_proofs.update(page_proofs)
+        self.write_partitions.clear()
+        self.write_partitions.update(write_partitions)
+        self._staged_payload_bytes = payload_bytes
+
+    def settle_staging_mark(self, mark: tuple[int, int, int]) -> None:
+        """Forget the exact snapshot after its statement transferred successfully."""
+        if not self._staging_marks or self._staging_marks[-1][0] is not mark:
+            raise GrafxTransactionStateError(
+                "That mark is not the most recent unsettled point of this transaction.",
+                txn_id=self._txn_id,
+                field="mark",
+                value=repr(mark),
+            )
+        snapshot = self._staging_marks.pop()
+        try:
+            self._reconcile_staged_payload_bytes()
+        except BaseException:
+            # Settlement is part of the statement's atomic handover.  Keep its snapshot live
+            # when reconciliation refuses (or detects hostile direct mutation), so the caller's
+            # failure path can still discard the whole statement rather than commit its rows.
+            self._staging_marks.append(snapshot)
+            raise
+
+    def validate_budgets(self) -> None:
+        """Recompute enabled budgets so direct mutation cannot bypass admission checks."""
+        self._require_active()
+        if self._max_transaction_rows is not None:
+            self._raise_if_over_budget(
+                "max_transaction_rows",
+                len(self.row_intents),
+                self._max_transaction_rows,
+            )
+        self._reconcile_staged_payload_bytes()
+
+    def _reconcile_staged_payload_bytes(self) -> None:
+        """Rebuild retained-payload accounting after an unwind or hostile direct mutation."""
+        if self._max_transaction_bytes is None:
+            return
+        observed = sum(self._intent_payload_bytes(intent) for intent in self.row_intents)
+        observed += sum(self._record_payload_bytes(record) for record in self.pending_records)
+        observed += self._retained_page_payload_bytes()
+        self._raise_if_over_budget(
+            "max_transaction_bytes", observed, self._max_transaction_bytes
+        )
+        self._staged_payload_bytes = observed
+
+    def _retained_page_payload_bytes(self) -> int:
+        """Count current images and distinct rollback preimages still held by live marks."""
+        seen: set[tuple[tuple[str, PageIndex], int]] = set()
+        total = 0
+        for location, image in self.page_images.items():
+            seen.add((location, id(image)))
+            total += len(image)
+        for _mark, images, _proofs, _partitions, _payload_bytes in self._staging_marks:
+            for location, image in images.items():
+                identity = (location, id(image))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                total += len(image)
+        return total
+
+    def _image_is_retained_by_mark(
+        self, location: tuple[str, PageIndex], image: bytes
+    ) -> bool:
+        """Return whether a live mark keeps this exact page generation as a preimage."""
+        return any(
+            images.get(location) is image
+            for _mark, images, _proofs, _partitions, _size in self._staging_marks
+        )
+
+    def _require_row_count_capacity(self) -> None:
+        """Refuse the next row before consuming or retaining its values."""
+        if self._max_transaction_rows is not None:
+            self._raise_if_over_budget(
+                "max_transaction_rows",
+                len(self.row_intents) + 1,
+                self._max_transaction_rows,
+            )
+
+    def _require_payload_capacity(self, additional_bytes: int) -> None:
+        """Refuse an addition that would cross the configured retained-payload budget."""
+        if self._max_transaction_bytes is None:
+            return
+        self._raise_if_over_budget(
+            "max_transaction_bytes",
+            self._staged_payload_bytes + additional_bytes,
+            self._max_transaction_bytes,
+        )
+
+    def _raise_if_over_budget(self, field: str, observed: int, limit: int) -> None:
+        """Raise the stable transaction-budget refusal for one exceeded limit."""
+        if observed <= limit:
+            return
+        raise GrafxTransactionBudgetExceeded(
+            f"Transaction {self._txn_id} would exceed {field}: limit {limit}, "
+            f"observed {observed}.",
+            field=field,
+            limit=limit,
+            observed=observed,
+            txn_id=self._txn_id,
+        )
+
+    def _row_payload_bytes(self, table: object, values: tuple[object, ...]) -> int:
+        """Return the canonical encoded payload size of one inserted or updated row."""
+        if self._max_transaction_bytes is None:
+            return 0
+        return len(encode_tuple(table, values))  # type: ignore[arg-type]
+
+    def _intent_payload_bytes(self, intent: RowIntent) -> int:
+        """Return retained payload bytes for one validated row intent."""
+        if not isinstance(intent, RowIntent):
+            raise GrafxConfigurationError(
+                "A transaction row budget can account only for RowIntent values.",
+                field="row_intents",
+                value=type(intent).__name__,
+                txn_id=self._txn_id,
+            )
+        if intent.operation is RowOperation.DELETE:
+            return 0
+        return self._row_payload_bytes(intent.table, intent.values)
+
+    def _record_payload_bytes(self, record: WalRecordLike) -> int:
+        """Return the exact encoded size retained by one staged logical WAL record."""
+        if self._max_transaction_bytes is None:
+            return 0
+        encoded_length = getattr(record, "encoded_length", None)
+        if not callable(encoded_length):
+            raise GrafxConfigurationError(
+                "A staged logical record needs encoded_length() when a transaction byte "
+                "budget is configured.",
+                field="pending_records",
+                value=type(record).__name__,
+                txn_id=self._txn_id,
+            )
+        observed = encoded_length()
+        if isinstance(observed, bool) or not isinstance(observed, int) or observed < 0:
+            raise GrafxConfigurationError(
+                "A staged logical record reported an invalid encoded length.",
+                field="pending_records",
+                value=repr(observed),
+                txn_id=self._txn_id,
+            )
+        return observed
 
     def staged_pages(self) -> Sequence[tuple[str, PageIndex]]:
         """Return the staged page locations in a fixed order, so a commit is reproducible."""
@@ -617,6 +840,8 @@ class TransactionContext:
         self._page_image_proofs.clear()
         self.row_intents.clear()
         self.row_refs.clear()
+        self._staged_payload_bytes = 0
+        self._staging_marks.clear()
 
     def _require_active(self) -> None:
         """Refuse any use of a transaction that has already ended."""
@@ -659,6 +884,19 @@ def _require_partition(partition: int) -> int:
             value=partition,
         )
     return partition
+
+
+def _require_optional_positive_limit(field: str, value: int | None) -> int | None:
+    """Return an exact optional positive limit for direct context composition."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise GrafxConfigurationError(
+            f"{field} must be a positive integer or None; got {value!r}.",
+            field=field,
+            value=repr(value),
+        )
+    return int(value)
 
 
 def _require_table(table: object) -> object:

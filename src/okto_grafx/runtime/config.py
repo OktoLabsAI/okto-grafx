@@ -203,6 +203,10 @@ class DatabaseConfig:
     wal_segment_bytes: int = 4 * 1024 * 1024
     wal_max_bytes: int | None = None
     checkpoint_interval_records: int = 512
+    max_statement_writes: int | None = None
+    max_transaction_rows: int | None = None
+    max_transaction_bytes: int | None = None
+    max_wal_batch_bytes: int | None = None
     metrics: str = "noop"
     metrics_destination: str | None = None
     vector_math: str = "auto"
@@ -266,12 +270,16 @@ class DatabaseConfig:
                 self.wal_segment_bytes,
                 f"a value between {MIN_SEGMENT_BYTES} and {MAX_SEGMENT_READ_BYTES} is required.",
             )
-        if self.wal_max_bytes is not None:
-            object.__setattr__(
-                self,
-                "wal_max_bytes",
-                _require_positive_int("wal_max_bytes", self.wal_max_bytes),
-            )
+        for field in (
+            "wal_max_bytes",
+            "max_statement_writes",
+            "max_transaction_rows",
+            "max_transaction_bytes",
+            "max_wal_batch_bytes",
+        ):
+            value = getattr(self, field)
+            if value is not None:
+                object.__setattr__(self, field, _require_positive_int(field, value))
 
         threshold = _require_int(
             "vector_exact_scan_threshold", self.vector_exact_scan_threshold

@@ -178,6 +178,7 @@ _ERROR_CODE = LabelSpec(
             "durability_barrier_failed",
             "recovery_refused",
             "buffer_budget_exceeded",
+            "transaction_budget_exceeded",
             "schema_version_mismatch",
             "port_not_configured",
             "transaction_state",

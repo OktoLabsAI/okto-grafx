@@ -131,6 +131,7 @@ Concrete classes (`code`, `retryable`) — **exact names, en-US messages**:
 | `GrafxDurabilityBarrierFailed` | `durability_barrier_failed` | False |
 | `GrafxRecoveryRefused` | `recovery_refused` | False |
 | `GrafxBufferBudgetExceeded` | `buffer_budget_exceeded` | **True** |
+| `GrafxTransactionBudgetExceeded` | `transaction_budget_exceeded` | False |
 | `GrafxSchemaVersionMismatch` | `schema_version_mismatch` | False |
 | `GrafxPortNotConfigured` | `port_not_configured` | False |
 | `GrafxTransactionStateError` | `transaction_state` | False |
@@ -394,6 +395,10 @@ class DatabaseConfig:
     wal_segment_bytes: int = 4 * 1024 * 1024
     wal_max_bytes: int | None = None          # optional soft checkpoint high-water
     checkpoint_interval_records: int = 512
+    max_statement_writes: int | None = None
+    max_transaction_rows: int | None = None
+    max_transaction_bytes: int | None = None
+    max_wal_batch_bytes: int | None = None
     metrics: str = "noop"                  # "noop" | "openmetrics" | "json"
     vector_math: str = "auto"              # "auto" | "pure" | "numpy"
     vector_exact_scan_threshold: int = 4096   # calibrated (SPEC-VEC FR-5/FR-8)
@@ -407,6 +412,21 @@ class PortRegistry:
     def get(self, slot: str) -> object:  # GrafxPortNotConfigured when empty
     def require_complete(self) -> None:  # GrafxPortNotConfigured listing every missing slot
 ```
+
+The four transaction limits are operational, positive integers when set, and disabled by `None`:
+
+* `max_statement_writes` counts logical inserts, updates and deletes held by one statement.
+* `max_transaction_rows` counts the `row_intents` retained by one transaction.
+* `max_transaction_bytes` is the sum of encoded insert/update tuples, each staged logical record's
+  `encoded_length()`, and retained page-image generations. An ordinary replacement charges its
+  length delta. When a live statement mark must retain the old generation for rollback, that
+  preimage remains charged until the mark is settled or discarded.
+* `max_wal_batch_bytes` is the sum of `record.encoded_length()` for the complete batch, including
+  its `COMMIT` and excluding a segment's `SEGMENT_HEADER`.
+
+An exceeded limit raises non-retryable `GrafxTransactionBudgetExceeded`. Statement handover is
+restored to its exact pre-statement staging on refusal. The final WAL-batch limit is checked before
+`append_many`; no budget refusal truncates the WAL or persists a partial statement.
 
 Recall has no runtime configuration field. Its floor belongs to the offline calibration gate,
 `bench.harness.gate --recall-target`; it cannot honestly promise recall for an individual query
@@ -645,7 +665,10 @@ class Snapshot:
 
 class TransactionManager:
     def __init__(self, wal, pool, heap, catalog, coordinator, clock, metrics, index_manager,
-                 *, partitions_per_table: int, commit_lock_timeout: float)
+                 *, partitions_per_table: int, commit_lock_timeout: float,
+                 max_transaction_rows: int | None = None,
+                 max_transaction_bytes: int | None = None,
+                 max_wal_batch_bytes: int | None = None)
     def begin(self, mode: str) -> "TransactionContext"      # "read" | "write"
     def commit(self, txn: "TransactionContext") -> "CommitReport"
     def rollback(self, txn: "TransactionContext") -> None
@@ -653,7 +676,14 @@ class TransactionManager:
     def partition_of(self, table_id: int, key: bytes) -> int
 ```
 `TransactionContext` accumulates `read_partitions: set[int]`, `write_partitions: set[int]`,
-`pending_records: list[WalRecord]`, `page_images: dict[(file, page), bytes]`.
+`row_intents`, `pending_records: list[WalRecord]` and
+`page_images: dict[(file, page), bytes]`. Its public/internal `staging_mark()` signature remains
+`tuple[int, int, int]`; internally the mark also seals exact snapshots of `page_images`, their
+provenance proofs, write partitions and the charged payload bytes. The exact tuple object is the
+mark capability: a reconstructed or stale equal tuple is refused, and successful statement
+handover explicitly settles it. `discard_since(mark)` therefore restores a page that was replaced
+after the mark and an added key that sorts before an older key, without relying on dictionary
+growth or ordering.
 
 **Commit protocol (FROZEN — implement exactly):**
 1. read-only txn → unregister reader, return `CommitReport(csn=snapshot.read_lsn, durable=True, wrote=False)`.
@@ -665,7 +695,8 @@ class TransactionManager:
       `record.write_partitions ∩ (txn.read_partitions | txn.write_partitions) != ∅`
       → raise `GrafxWriteConflict` (retryable), metrics `oktografx_write_conflicts_total`.
       Nothing has been written to the device at this point.
-   4. `lsn = wal.append_many([...WRITE_PAGE..., COMMIT])`.
+   4. Form `[..., WRITE_PAGE..., COMMIT]`; enforce `max_wal_batch_bytes` over those records' exact
+      encoded lengths, excluding any `SEGMENT_HEADER`; then call `wal.append_many(...)`.
    5. `wal.barrier()` — **BR-4: no acknowledgement before this returns**.
    6. apply page images: for each, `if page.page_lsn < lsn: write with page_lsn = lsn`.
       (Data files are NOT fsynced here; the WAL is the authority, redo is idempotent.)
@@ -802,6 +833,7 @@ class VectorEngine:
 ### 8.9 `engine/query_engine.py` (C10)
 ```python
 class QueryEngine:
+    def __init__(..., *, max_statement_writes: int | None = None)
     def parse(self, text: str) -> "Statement"
     def plan(self, statement: "Statement", snapshot: Snapshot) -> "PlanNode"
     def execute(self, text: str, txn, parameters: Mapping[str, object] | None = None) -> "QueryResult"

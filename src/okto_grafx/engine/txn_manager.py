@@ -72,6 +72,7 @@ from okto_grafx.domain.errors import (
     GrafxLeaseStolen,
     GrafxLeaseTimeout,
     GrafxRecoveryRefused,
+    GrafxTransactionBudgetExceeded,
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
     GrafxWriteConflict,
@@ -239,6 +240,9 @@ class TransactionManager:
         "_recovery_required",
         "_page_staging_capability",
         "_mode_counts",
+        "_max_transaction_rows",
+        "_max_transaction_bytes",
+        "_max_wal_batch_bytes",
         "_writable",
         "_closed",
         "_close_quiesced",
@@ -265,6 +269,9 @@ class TransactionManager:
         retain_lease: bool = False,
         index_sync: Callable[[], object] | None = None,
         writable: bool = True,
+        max_transaction_rows: int | None = None,
+        max_transaction_bytes: int | None = None,
+        max_wal_batch_bytes: int | None = None,
     ) -> None:
         """Build a manager over one database.
 
@@ -284,6 +291,8 @@ class TransactionManager:
         * ``writable`` -- the capability to open write transactions or checkpoint. Read-only
           composition passes ``False`` so both doors refuse before coordination, WAL or storage;
           the compatible default remains ``True`` for existing composition roots.
+        * the three ``max_*`` values -- opt-in transaction admission limits. ``None`` preserves
+          existing behaviour; direct composition must provide exact positive integers.
         """
         if not isinstance(writable, bool):
             raise GrafxConfigurationError(
@@ -344,6 +353,15 @@ class TransactionManager:
                 value=type(retain_lease).__name__,
             )
         self._retain_lease: bool = retain_lease
+        self._max_transaction_rows = _require_optional_positive_limit(
+            "max_transaction_rows", max_transaction_rows
+        )
+        self._max_transaction_bytes = _require_optional_positive_limit(
+            "max_transaction_bytes", max_transaction_bytes
+        )
+        self._max_wal_batch_bytes = _require_optional_positive_limit(
+            "max_wal_batch_bytes", max_wal_batch_bytes
+        )
         self._lease_guard: LeaseGuard | None = None
         self._participant_section_name: str = (
             f"{PARTICIPANT_SECTION_PREFIX}"
@@ -730,6 +748,8 @@ class TransactionManager:
                 epoch=_NO_EPOCH,
                 owner=self,
                 page_staging_capability=self._page_staging_capability,
+                max_transaction_rows=self._max_transaction_rows,
+                max_transaction_bytes=self._max_transaction_bytes,
             )
             opened_at = self._monotonic()
             self._require_not_closed("begin a transaction")
@@ -941,6 +961,8 @@ class TransactionManager:
                 txn._page_image_proofs.clear()
                 txn.row_intents.clear()
                 txn.row_refs.clear()
+                txn._staged_payload_bytes = 0
+                txn._staging_marks.clear()
         reader_failure = self._release_reader(txn)
         failure = _accumulate_failure(failure, reader_failure)
         self._open.pop(txn.txn_id, None)
@@ -1301,6 +1323,8 @@ class TransactionManager:
                                         txn._page_image_proofs.clear()
                                         txn.row_intents.clear()
                                         txn.row_refs.clear()
+                                        txn._staged_payload_bytes = 0
+                                        txn._staging_marks.clear()
                                 self._open.pop(txn.txn_id, None)
                                 pin = self._pins.pop(txn.txn_id, None)
                                 if pin is not None:
@@ -1419,6 +1443,7 @@ class TransactionManager:
             self._require_writable("commit a write transaction")
             self._require_recovery_complete()
             self._validate_staged_inputs(txn)
+            txn.validate_budgets()
             self._refresh_due_readers(skip=txn.txn_id)
             lease = self._hold_lease()
             try:
@@ -1477,6 +1502,8 @@ class TransactionManager:
                                 records, images, materialized_csn = self._build_records(
                                     txn, lease.epoch, rows
                                 )
+                            txn.validate_budgets()
+                            self._validate_wal_batch_budget(txn, records)
                             with self._close_wait_hazard():
                                 planned_csn = self._wal.planned_terminal_lsn(records)
                             if planned_csn != materialized_csn:
@@ -1490,6 +1517,7 @@ class TransactionManager:
                                         new_csn=planned_csn,
                                         epoch=lease.epoch,
                                     )
+                                self._validate_wal_batch_budget(txn, records)
                             with self._close_wait_hazard():
                                 committed = self._wal.append_many(
                                     records,
@@ -1785,6 +1813,25 @@ class TransactionManager:
                 snapshot_lsn=start - 1,
                 lowest_retained_lsn=lowest,
             )
+
+    def _validate_wal_batch_budget(
+        self, txn: TransactionContext, records: Sequence[WalRecordLike]
+    ) -> None:
+        """Refuse an oversized final commit batch before the WAL builds its byte blob."""
+        limit = self._max_wal_batch_bytes
+        if limit is None:
+            return
+        observed = sum(record.encoded_length() for record in records)  # type: ignore[attr-defined]
+        if observed <= limit:
+            return
+        raise GrafxTransactionBudgetExceeded(
+            f"Transaction {txn.txn_id} would exceed max_wal_batch_bytes: limit {limit}, "
+            f"observed {observed}.",
+            field="max_wal_batch_bytes",
+            limit=limit,
+            observed=observed,
+            txn_id=txn.txn_id,
+        )
 
     def _build_records(
         self,
@@ -2260,11 +2307,16 @@ class TransactionManager:
         apply live index entries for versions that were abandoned (C5 round-2 B3).
         """
         del txn.pending_records[mark:]
+        failure: BaseException | None = None
+        try:
+            txn._reconcile_staged_payload_bytes()
+        except BaseException as budget_failure:
+            failure = budget_failure
         try:
             self._drop_index_changes(txn)
-        except BaseException as failure:
-            return failure
-        return None
+        except BaseException as index_failure:
+            failure = _first_failure(failure, index_failure)
+        return failure
 
     def _abandon_rows(self, rows: Sequence[_RowWrite]) -> BaseException | None:
         """Make rows written by a commit that then failed unreachable to every snapshot.
@@ -2879,6 +2931,19 @@ def _settled_intents(intents: Sequence[RowIntent]) -> tuple[RowIntent, ...]:
         placed.append((first_seen[key], settled[key]))
     placed.sort(key=lambda item: item[0])
     return tuple(intent for _position, intent in placed)
+
+
+def _require_optional_positive_limit(field: str, value: int | None) -> int | None:
+    """Return an exact optional positive limit for direct manager composition."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise GrafxConfigurationError(
+            f"{field} must be a positive integer or None; got {value!r}.",
+            field=field,
+            value=repr(value),
+        )
+    return int(value)
 
 
 def _require_timeout(label: str, value: float) -> float:

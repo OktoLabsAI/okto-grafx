@@ -20,6 +20,7 @@ __all__ = [
     "GrafxDurabilityBarrierFailed",
     "GrafxRecoveryRefused",
     "GrafxBufferBudgetExceeded",
+    "GrafxTransactionBudgetExceeded",
     "GrafxSchemaVersionMismatch",
     "GrafxPortNotConfigured",
     "GrafxTransactionStateError",
@@ -173,6 +174,13 @@ class GrafxBufferBudgetExceeded(GrafxError):
 
     code: str = "buffer_budget_exceeded"
     retryable: bool = True
+
+
+class GrafxTransactionBudgetExceeded(GrafxError):
+    """A statement or transaction exceeded one of its configured resource budgets."""
+
+    code: str = "transaction_budget_exceeded"
+    retryable: bool = False
 
 
 class GrafxSchemaVersionMismatch(GrafxError):

@@ -468,6 +468,9 @@ def assemble_database(
             descriptor=config.granularity_descriptor,
             index_sync=lambda: sync_indexes(existing_only=True),
             writable=not config.read_only,
+            max_transaction_rows=config.max_transaction_rows,
+            max_transaction_bytes=config.max_transaction_bytes,
+            max_wal_batch_bytes=config.max_wal_batch_bytes,
         )
         queries = QueryEngine(
             catalog=catalog,
@@ -478,6 +481,7 @@ def assemble_database(
             indexes=indexes,
             vectors=vectors,
             page_stager=transactions._stage_page_image,
+            max_statement_writes=config.max_statement_writes,
         )
         attached = tuple(attached_names)
         adopted = set(attached)

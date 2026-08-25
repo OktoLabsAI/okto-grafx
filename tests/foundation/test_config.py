@@ -40,6 +40,10 @@ def test_defaults_match_the_contract() -> None:
     assert config.wal_segment_bytes == 4 * 1024 * 1024
     assert config.wal_max_bytes is None
     assert config.checkpoint_interval_records == 512
+    assert config.max_statement_writes is None
+    assert config.max_transaction_rows is None
+    assert config.max_transaction_bytes is None
+    assert config.max_wal_batch_bytes is None
     assert config.metrics == "noop"
     assert config.metrics_destination is None
     assert config.vector_math == "auto"
@@ -166,6 +170,22 @@ def test_a_positive_wal_maximum_is_canonicalized() -> None:
     config = DatabaseConfig(path=":memory:", wal_max_bytes=_HostileInt(8192))
     assert type(config.wal_max_bytes) is int
     assert config.wal_max_bytes == 8192
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_statement_writes",
+        "max_transaction_rows",
+        "max_transaction_bytes",
+        "max_wal_batch_bytes",
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1, "1024", 1024.5, True])
+def test_an_invalid_transaction_budget_is_rejected(field: str, value: object) -> None:
+    with pytest.raises(GrafxConfigurationError) as raised:
+        DatabaseConfig(path=":memory:", **{field: value})
+    assert raised.value.details["field"] == field
 
 
 def test_the_buffer_budget_must_hold_both_store_working_sets() -> None:
@@ -587,6 +607,10 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         wal_segment_bytes=_HostileInt(4096),
         wal_max_bytes=_HostileInt(8192),
         checkpoint_interval_records=_HostileInt(32),
+        max_statement_writes=_HostileInt(64),
+        max_transaction_rows=_HostileInt(128),
+        max_transaction_bytes=_HostileInt(16384),
+        max_wal_batch_bytes=_HostileInt(8192),
         vector_exact_scan_threshold=_HostileInt(128),
         vector_ef_search=_HostileInt(640),
     )
@@ -598,6 +622,10 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         "wal_segment_bytes",
         "wal_max_bytes",
         "checkpoint_interval_records",
+        "max_statement_writes",
+        "max_transaction_rows",
+        "max_transaction_bytes",
+        "max_wal_batch_bytes",
         "vector_exact_scan_threshold",
         "vector_ef_search",
     ):

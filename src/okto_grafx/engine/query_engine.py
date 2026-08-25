@@ -51,11 +51,13 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
     GrafxIndexError,
     GrafxEmbeddingSpaceMismatch,
     GrafxError,
     GrafxPlanError,
     GrafxQueryError,
+    GrafxTransactionBudgetExceeded,
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
 )
@@ -508,6 +510,7 @@ class _Context:
         everything until the statement is complete makes the refusal leave the transaction
         exactly as it found it.
         """
+        self._require_statement_write_capacity()
         self.staged_rows.append(_HeldRow(_HELD_INSERT, table, values, identity, None, token))
         self.staged_partitions.append((table.table_id, key))
 
@@ -528,6 +531,7 @@ class _Context:
         validation, and the heap refused it inside the commit section instead (C10 round-2 B2).
         Declaring both makes the two commits meet where step 3.3 can see them.
         """
+        self._require_statement_write_capacity()
         self.staged_rows.append(_HeldRow(_HELD_UPDATE, table, values, None, reference))
         self.staged_partitions.append((table.table_id, key))
         for previous in previous_keys:
@@ -536,15 +540,32 @@ class _Context:
 
     def hold_delete(self, table: TableDef, reference: object, key: bytes) -> None:
         """Hold the end of an existing row under the same statement discipline."""
+        self._require_statement_write_capacity()
         self.staged_rows.append(_HeldRow(_HELD_DELETE, table, None, None, reference))
         self.staged_partitions.append((table.table_id, key))
+
+    def _require_statement_write_capacity(self) -> None:
+        """Refuse the next logical write before this statement retains it."""
+        limit = self.engine._max_statement_writes
+        observed = len(self.staged_rows) + 1
+        if limit is None or observed <= limit:
+            return
+        raise GrafxTransactionBudgetExceeded(
+            f"Statement would exceed max_statement_writes: limit {limit}, "
+            f"observed {observed}.",
+            field="max_statement_writes",
+            limit=limit,
+            observed=observed,
+            txn_id=getattr(self.txn, "txn_id", None),
+        )
 
     def release(self) -> int:
         """Hand every held row to the transaction, in the order the statement built them.
 
         Order is kept because a statement may touch one row more than once -- update it and then
         delete it -- and the two stamps the transaction writes are only correct in the order they
-        were asked for. Nothing here can refuse: every value was checked while it was held.
+        were asked for. Values were checked while held; transaction-wide row/byte admission may
+        still refuse the handover, and the exact staging mark below then restores all prior work.
         """
         if not self.staged_rows:
             return 0
@@ -559,6 +580,7 @@ class _Context:
         # CREATE that created (C10 round-3 B1). The transaction's own mark is what unwinds it.
         take_mark = getattr(transaction, "staging_mark", None)
         discard = getattr(transaction, "discard_since", None)
+        settle = getattr(transaction, "settle_staging_mark", None)
         mark = take_mark() if callable(take_mark) else None
         try:
             for held in self.staged_rows:
@@ -573,6 +595,8 @@ class _Context:
             if note_write is not None and partition_of is not None:
                 for table_id, key in self.staged_partitions:
                     note_write(partition_of(table_id, key))
+            if mark is not None and callable(settle):
+                settle(mark)
         except BaseException:
             if mark is not None and callable(discard):
                 discard(mark)
@@ -624,6 +648,7 @@ class QueryEngine:
         "_working",
         "_txn_effects",
         "_page_stager",
+        "_max_statement_writes",
     )
 
     def __init__(
@@ -637,6 +662,7 @@ class QueryEngine:
         indexes: object = None,
         vectors: object = None,
         page_stager: Callable[[object, str, int, bytes], None] | None = None,
+        max_statement_writes: int | None = None,
     ) -> None:
         """Adopt one catalog, one heap, one pool and whichever engines this composition has."""
         self._catalog = catalog
@@ -663,6 +689,9 @@ class QueryEngine:
         self._indexes = indexes
         self._vectors = vectors
         self._page_stager = page_stager
+        self._max_statement_writes = _require_optional_positive_limit(
+            "max_statement_writes", max_statement_writes
+        )
         self._metrics = MetricEmitter(metrics)
         self._clock = clock
         if metrics.enabled:
@@ -927,9 +956,26 @@ class QueryEngine:
         base = self._working_catalog(txn)
         catalog = Catalog.deserialize(base.serialize())
         undo: list[tuple[str, str]] = []
+        take_mark = getattr(txn, "staging_mark", None)
+        discard = getattr(txn, "discard_since", None)
+        settle = getattr(txn, "settle_staging_mark", None)
+        mark = take_mark() if callable(take_mark) else None
         try:
             self._schema_change(node, txn, statistics, catalog, undo)
-        except BaseException:
+            if mark is not None and callable(settle):
+                settle(mark)
+        except BaseException as failure:
+            if mark is not None and callable(discard):
+                try:
+                    discard(mark)
+                except BaseException as unwind_failure:
+                    try:
+                        failure.add_note(
+                            "Schema staging also failed to restore its transaction mark "
+                            f"({type(unwind_failure).__name__}): {unwind_failure}"
+                        )
+                    except BaseException:
+                        pass
             self._unwind_schema_statement(undo)
             raise
         self._remember_working(txn, catalog)
@@ -3222,6 +3268,19 @@ def _freeze(value: object) -> object:
     if isinstance(value, dict):
         return ("map", tuple(sorted((str(key), _freeze(item)) for key, item in value.items())))
     return ("scalar", type(value).__name__, value)
+
+
+def _require_optional_positive_limit(field: str, value: int | None) -> int | None:
+    """Return an exact optional positive limit for direct engine composition."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise GrafxConfigurationError(
+            f"{field} must be a positive integer or None; got {value!r}.",
+            field=field,
+            value=repr(value),
+        )
+    return int(value)
 
 
 def _sort_key(value: object) -> tuple[int, object]:

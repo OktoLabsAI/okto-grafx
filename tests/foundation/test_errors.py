@@ -28,6 +28,7 @@ CONTRACT_TABLE: tuple[tuple[str, str, bool], ...] = (
     ("GrafxDurabilityBarrierFailed", "durability_barrier_failed", False),
     ("GrafxRecoveryRefused", "recovery_refused", False),
     ("GrafxBufferBudgetExceeded", "buffer_budget_exceeded", True),
+    ("GrafxTransactionBudgetExceeded", "transaction_budget_exceeded", False),
     ("GrafxSchemaVersionMismatch", "schema_version_mismatch", False),
     ("GrafxPortNotConfigured", "port_not_configured", False),
     ("GrafxTransactionStateError", "transaction_state", False),

@@ -698,6 +698,21 @@ Related, and to be decided with it: `QuarantineStore.restore`'s `PROTECTED_PREFI
 but not `wal/`, so a whole-segment quarantine entry could be restored into a freed `wal/NNN.wal`.
 C6-owned, no caller in `src/` today.
 
+### F1 transaction budgets — opt-in hard refusals (C0/C5/C10; CLOSED)
+
+Four operational fields default to `None`, preserving the prior unbounded behaviour.
+`max_statement_writes` counts logical inserts, updates and deletes held by one statement;
+`max_transaction_rows` counts retained `row_intents`; `max_transaction_bytes` charges encoded
+insert/update tuples, staged logical-record `encoded_length()` values and retained page-image
+generations. Ordinary replacement charges by delta; a rollback preimage held by a live mark remains
+charged until settle/discard. `max_wal_batch_bytes` charges the final records'
+encoded lengths including `COMMIT` and excluding `SEGMENT_HEADER`, and refuses before WAL append.
+
+Every overrun is the non-retryable `GrafxTransactionBudgetExceeded`. A statement-level refusal
+restores the exact staging it received, while a final-batch refusal neither appends nor truncates
+the WAL; neither path can persist half a statement. This is transaction admission only: it does not
+claim query streaming, query-memory/RSS enforcement or chunked WAL commits.
+
 ### D5 durable_commit — MEASURED. Do not amend the ceiling. (coordinator-commissioned profile)
 
 **The 234 ms is not fsync.** A bare `os.fsync` on this volume is 0.29 ms; the one barrier §8.5 step 3.5
@@ -984,6 +999,14 @@ no-op, Cypher's reading); `release()` is all-or-nothing on the transaction (`sta
 `discard_since` around the handover); a MERGE-matched row this transaction UPDATED comes back WITH its
 reference (the latest values on a real `RowBinding`) so later clauses work. A DELETE of a row created
 by an EARLIER statement refuses with a typed error naming W5b (E4's family).
+
+The budget handover exposed one remaining hole in that mark: counts cannot restore a page image
+replaced under an existing key, and deleting keys by sorted suffix loses a newly added key that sorts
+before an older one. The mark keeps its `tuple[int, int, int]` signature but now seals exact shallow
+snapshots of the image map and its provenance proofs, plus write partitions and charged payload
+bytes. The exact tuple object is the capability (an equal stale tuple is refused), and successful
+handover releases the seal. Refusal restores those snapshots exactly, so neither replacement nor
+key order can leak part of a statement.
 
 **B2**: the held insert was identified by VALUES; two created rows with identical values (a table
 without a primary key) sent a second SET clause to the wrong row. Now each held insert carries a token

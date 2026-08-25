@@ -1267,3 +1267,20 @@ option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`
   invented target-to-beam formula. `connect()` retains a typed tombstone that points callers to
   `bench.harness.gate --recall-target`; vector regression floors now come from that offline owner.
   `vector_ef_search` remains the separately tested runtime effort control.
+
+## F1 — opt-in transaction budgets (2026-08-25)
+
+- **CLOSED** — four positive-integer operational limits default to `None`:
+  `max_statement_writes` counts logical writes held by one statement; `max_transaction_rows`
+  counts retained `row_intents`; `max_transaction_bytes` charges encoded row tuples, staged
+  logical-record `encoded_length()` values and retained page-image generations. Ordinary
+  replacement charges by delta; a rollback preimage stays charged while its mark is live.
+  `max_wal_batch_bytes` charges the complete record batch including `COMMIT` and
+  excluding `SEGMENT_HEADER`. The last check runs before WAL append.
+- **CLOSED** — overruns raise non-retryable `GrafxTransactionBudgetExceeded`. A refusal restores
+  statement staging or abandons the provisional commit attempt without appending, truncating or
+  partially persisting the statement.
+- **CLOSED** — `staging_mark()` keeps its `tuple[int, int, int]` signature but seals exact internal
+  snapshots of page images, their proofs, write partitions and charged bytes. Marks are matched by
+  exact tuple-object identity and settled on success; `discard_since()` restores both an image
+  replaced at an existing key and an added key that sorts before older keys.

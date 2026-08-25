@@ -499,6 +499,10 @@ refused with the field name the caller actually wrote.
 | `wal_segment_bytes` | `4 MiB` | Log segment target, from 256 B through the reader's 1 GiB ceiling; an exceptional batch that would cross the ceiling is refused before writing |
 | `wal_max_bytes` | `None` | Optional soft high-water trigger: after a durable write, checkpoint when live WAL bytes reach this value; reader pins, atomic batches and deferred recycling may retain more without data loss |
 | `checkpoint_interval_records` | `512` | After a durable write, checkpoint when the published WAL distance reaches this many records; a failed attempt is reported and retried after the next write |
+| `max_statement_writes` | `None` | Optional hard limit on logical row writes retained by one statement |
+| `max_transaction_rows` | `None` | Optional hard limit on retained `row_intents` in one transaction |
+| `max_transaction_bytes` | `None` | Optional hard limit on encoded row tuples, staged logical-record `encoded_length()` values and retained page-image generations; ordinary replacement charges the byte delta, while a rollback preimage held by a live statement mark remains charged until settle/discard |
+| `max_wal_batch_bytes` | `None` | Optional hard limit on the sum of final record `encoded_length()` values, including `COMMIT` and excluding `SEGMENT_HEADER`; checked before WAL append |
 | `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
 | `metrics_destination` | `None` | Required for `"json"` |
 | `vector_math` | `"auto"` | `"auto"` and `"pure"` both bind the pure oracle; `"numpy"` requires `[accel]` |
@@ -512,6 +516,11 @@ Recall is an offline calibration result, not a per-database runtime promise. The
 error. Set the benchmark floor with
 `python -m bench.harness.gate --metrics <metrics.json> --require-recall --recall-target <floor>`.
 Use `vector_ef_search` when the intended change is the HNSW work performed by runtime queries.
+
+The four transaction limits are opt-in: `None` preserves the unbounded behaviour. Exceeding one
+raises the non-retryable `GrafxTransactionBudgetExceeded`. A refused statement restores its exact
+pre-statement staging, and a refused final WAL batch is rejected before append; these refusals do
+not truncate the WAL or persist a partial statement.
 
 ---
 
@@ -530,6 +539,7 @@ located `details`. Nothing else escapes a public door.
 | `GrafxDurabilityBarrierFailed` | ❌ | An fsync failed — nothing may be acknowledged as durable |
 | `GrafxRecoveryRefused` | ❌ | Recovery would not be safe; the evidence is preserved |
 | `GrafxBufferBudgetExceeded` | ✅ | The working set exceeded the budget |
+| `GrafxTransactionBudgetExceeded` | ❌ | An enabled statement, transaction or final WAL-batch limit was exceeded before partial persistence |
 | `GrafxSchemaVersionMismatch` | ❌ | This build cannot read this database |
 | `GrafxPortNotConfigured` | ❌ | An incomplete registry, naming every missing slot |
 | `GrafxTransactionStateError` | ❌ | The transaction is not in a state that allows this |
