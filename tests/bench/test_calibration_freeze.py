@@ -107,6 +107,11 @@ EXPECTED_WORKFLOW_TRIGGERS: dict[str, object] = {
     "workflow_dispatch": None,
 }
 
+EXPECTED_WORKFLOW_NON_TRIGGER_KEYS: frozenset[object] = frozenset(
+    {"name", "permissions", "jobs"}
+)
+EXPECTED_WORKFLOW_PERMISSIONS: dict[str, str] = {"contents": "read"}
+
 FORBIDDEN_WORKFLOW_GATE_CONTROLS: frozenset[str] = frozenset({"defaults", "env"})
 FORBIDDEN_GATE_JOB_CONTROLS: frozenset[str] = frozenset(
     {"container", "continue-on-error", "defaults", "env", "if", "needs"}
@@ -497,6 +502,18 @@ def _gate_command(workflow_text: str | None = None) -> list[str]:
     # as boolean ``True``. Accept either representation, but never both or neither.
     trigger_keys = [key for key in ("on", True) if key in document]
     assert len(trigger_keys) == 1, "the workflow must declare one unambiguous on: trigger mapping"
+    expected_workflow_keys = EXPECTED_WORKFLOW_NON_TRIGGER_KEYS | {trigger_keys[0]}
+    assert set(document) == expected_workflow_keys, (
+        "the workflow top-level key set changed, so an execution control may bypass the "
+        "governed gate: "
+        f"missing={sorted(map(str, expected_workflow_keys - set(document)))}, "
+        f"unexpected={sorted(map(str, set(document) - expected_workflow_keys))}"
+    )
+    assert document.get("name") == "ci", "the governed workflow identity must remain exactly 'ci'"
+    assert document.get("permissions") == EXPECTED_WORKFLOW_PERMISSIONS, (
+        "the governed workflow permissions must remain read-only and exact; "
+        f"found {document.get('permissions')!r}"
+    )
     triggers = document[trigger_keys[0]]
     assert triggers == EXPECTED_WORKFLOW_TRIGGERS, (
         "the calibration gate must run for push, pull request, weekly full recall and manual "
@@ -1670,6 +1687,36 @@ def test_workflow_wide_context_cannot_redirect_the_gate(control: str, value: str
     assert workflow.count(name_line) == 1
     mutated = workflow.replace(name_line, f"{name_line}\n\n{control}: {value}")
     with pytest.raises(AssertionError, match=rf"workflow-wide.*{re.escape(control)}"):
+        _gate_command(mutated)
+
+
+@pytest.mark.parametrize(
+    ("control", "value"),
+    (
+        ("concurrency", "{group: ci, cancel-in-progress: true}"),
+        ("concurrency", "{group: 'ci-${{ github.ref }}', cancel-in-progress: true}"),
+        ("run-name", "silent-unmeasured-run"),
+    ),
+)
+def test_no_new_workflow_top_level_control_can_silence_the_gate(
+    control: str, value: str
+) -> None:
+    """The top level is an allowlist, so an unanticipated cancellation door fails closed."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    name_line = "name: ci"
+    assert workflow.count(name_line) == 1
+    mutated = workflow.replace(name_line, f"{name_line}\n\n{control}: {value}")
+    with pytest.raises(AssertionError, match=rf"top-level key set changed.*{re.escape(control)}"):
+        _gate_command(mutated)
+
+
+def test_workflow_permissions_cannot_be_widened_behind_the_same_top_level_key() -> None:
+    """An allowlisted key still needs its value frozen when that value can cancel workflows."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    permissions = "permissions:\n  contents: read"
+    assert workflow.count(permissions) == 1
+    mutated = workflow.replace(permissions, "permissions:\n  actions: write\n  contents: read")
+    with pytest.raises(AssertionError, match="permissions must remain read-only and exact"):
         _gate_command(mutated)
 
 
