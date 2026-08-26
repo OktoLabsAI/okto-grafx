@@ -1021,18 +1021,21 @@ class QueryEngine:
                 field="plan",
                 value=root.label,
             )
+        coalesce_types = _bound_coalesce_types(plan, parameters)
+        case_types = _bound_case_types(plan, parameters)
         context = _Context(
             engine=self,
             txn=txn,
             parameters=parameters,
             analysis=plan.analysis,
             statistics=statistics,
-            coalesce_types=_bound_coalesce_types(plan, parameters),
-            timestamp_values=_bound_timestamp_values(plan, parameters),
-            case_types=_bound_case_types(plan, parameters),
+            coalesce_types=coalesce_types,
+            timestamp_values={},
+            case_types=case_types,
             catalog=catalog,
             result_node=root.child if root.columns else None,
         )
+        _bind_timestamp_values(plan, context)
         _validate_bound_subscript_types(plan, parameters)
         _validate_bound_label_arguments(plan, parameters)
         stream = self._rows(root.child, context)
@@ -4524,6 +4527,16 @@ def _timestamp_of(function_name: str, value: object) -> Timestamp | None:
             field="function",
             value=function_name,
         )
+    # ``datetime.fromisoformat`` deliberately accepts any single Unicode character between
+    # the date and time.  The public Grafx contract is narrower: a date-time uses exactly
+    # ``T`` or a space (while a ten-character date remains valid on its own).
+    if len(value) > 10 and value[10] not in ("T", " "):
+        message = f"{function_name} could not read {value!r} as an ISO-8601 instant."
+        raise GrafxPlanError(
+            message,
+            field="function",
+            value=function_name,
+        )
     try:
         moment = datetime.fromisoformat(value)
     except ValueError as exc:
@@ -4540,9 +4553,43 @@ def _timestamp_of(function_name: str, value: object) -> Timestamp | None:
     return Timestamp(micros=(moment - _EPOCH) // _ONE_MICROSECOND)
 
 
-def _bound_timestamp_values(
-    plan: PlannedQuery, parameters: Mapping[str, object]
-) -> dict[FunctionCall, object]:
+def _timestamp_bindable(expression: Expression) -> bool:
+    """Whether a scalar can be evaluated before rows without stealing aggregate work.
+
+    Merely lacking a ``Variable`` is not enough: aggregates such as ``min($value)`` read the
+    grouped values carried by ``_Row.computed``.  This vocabulary is intentionally local to
+    timestamp binding and contains only scalar shapes whose complete value is already known.
+    """
+
+    if _binder_resolvable(expression):
+        return True
+    if isinstance(expression, NullCheck):
+        return _timestamp_bindable(expression.operand)
+    if isinstance(expression, UnaryOperation):
+        return _timestamp_bindable(expression.operand)
+    if isinstance(expression, BinaryOperation):
+        return _timestamp_bindable(expression.left) and _timestamp_bindable(
+            expression.right
+        )
+    if isinstance(expression, FunctionCall):
+        return expression.name.upper() == COALESCE_FUNCTION and all(
+            _timestamp_bindable(argument) for argument in expression.arguments
+        )
+    if isinstance(expression, CaseExpression):
+        compared = (
+            tuple(alternative.condition for alternative in expression.alternatives)
+            if expression.operand is None
+            else (
+                expression.operand,
+                *(alternative.condition for alternative in expression.alternatives),
+            )
+        )
+        results = expression.result_expressions()
+        return all(_timestamp_bindable(item) for item in (*compared, *results))
+    return False
+
+
+def _bind_timestamp_values(plan: PlannedQuery, context: _Context) -> None:
     """Read every timestamp() argument the call has made knowable, before the stream.
 
     An unreadable instant is wrong whether or not the pattern matches, and a write must not
@@ -4550,15 +4597,14 @@ def _bound_timestamp_values(
     with it.  Keeping the result means a row does not re-parse text that cannot have changed.
     """
 
-    resolved: dict[FunctionCall, object] = {}
+    empty = _Row(bindings={})
     for call in plan.timestamp_calls:
         argument = call.arguments[0]
-        if not _binder_resolvable(argument):
+        if not _timestamp_bindable(argument):
             continue
-        resolved[call] = _timestamp_of(
-            call.name, _bound_postfix_value(argument, parameters, owner=call.name)
+        context.timestamp_values[call] = _timestamp_of(
+            call.name, _evaluate(argument, empty, context)
         )
-    return resolved
 
 
 def _validate_bound_label_arguments(

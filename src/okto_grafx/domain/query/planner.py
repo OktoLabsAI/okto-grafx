@@ -698,8 +698,11 @@ class _Planner:
             pipeline = self._updating_clause(pipeline, clause)
         self._record_coalesce_types(statement)
         self._record_label_arguments(statement)
-        self._record_timestamp_arguments(statement)
         self._record_case_and_subscript_types(statement)
+        # CASE/subscript metadata has to exist before timestamp() asks for the type of a
+        # composed argument such as timestamp(CASE ... END).  Recording the instant first
+        # would mistake an otherwise fully knowable CASE for an unresolved expression.
+        self._record_timestamp_arguments(statement)
         if statement.updating_clauses:
             # Everything that writes is drawn in full before anything above can stop early. A
             # LIMIT truncates what the caller RECEIVES; it must not decide how many rows got

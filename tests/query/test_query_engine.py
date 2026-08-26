@@ -737,6 +737,7 @@ def test_timestamp_passes_a_timestamp_through_and_answers_null_with_null(
     "value",
     (
         "2024-01-02T03:04:05z",
+        "2024-01-02X03:04:05",
         "2024-13-01",
         "2024-01-32",
         "not-a-date",
@@ -776,6 +777,81 @@ def test_timestamp_refuses_before_any_row_is_read(
         "field": "function",
         "value": "timestamp",
     }
+
+
+@pytest.mark.parametrize(
+    ("argument", "parameters"),
+    (
+        ("'not-' + 'a-date'", {}),
+        ("$a + $b", {"a": 1, "b": 1}),
+        ("coalesce($bad, null)", {"bad": "not-a-date"}),
+        ("coalesce($bad, null)", {"bad": 1}),
+    ),
+)
+def test_timestamp_refuses_a_known_composed_value_before_read_or_write(
+    labelled_graph, argument: str, parameters: dict[str, object]
+) -> None:
+    """A row-independent scalar composition is as knowable as a direct parameter."""
+
+    with pytest.raises(GrafxPlanError) as read_failure:
+        with labelled_graph.begin("read") as txn:
+            txn.execute(
+                "MATCH (p:Person) WHERE p.id = 'nobody' "
+                f"RETURN timestamp({argument})",
+                parameters,
+            )
+    with pytest.raises(GrafxPlanError) as write_failure:
+        with labelled_graph.begin("write") as txn:
+            txn.execute(
+                "MATCH (p:Person) WHERE p.id = 'nobody' "
+                f"SET p.id = timestamp({argument})",
+                parameters,
+            )
+    assert read_failure.value.details == write_failure.value.details == {
+        "field": "function",
+        "value": "timestamp",
+    }
+
+
+def test_timestamp_accepts_a_valid_case_as_its_argument(stack: QueryStack) -> None:
+    """CASE metadata is available before timestamp() validates its result family."""
+
+    found = run(
+        stack,
+        "MATCH (p:Person) RETURN "
+        "timestamp(CASE WHEN true THEN $a ELSE $b END) LIMIT 1",
+        {"a": "2024-01-02T03:04:05Z", "b": "2024-01-02"},
+    )
+    assert found.rows == ((Timestamp(micros=_INSTANT_MICROS),),)
+
+
+@pytest.mark.parametrize("invalid", ("not-a-date", 1))
+def test_timestamp_refuses_a_known_case_value_before_an_empty_stream(
+    stack: QueryStack, invalid: object
+) -> None:
+    """A CASE made only from bound values is decided even when MATCH has no rows."""
+
+    with pytest.raises(GrafxPlanError) as failure:
+        run(
+            stack,
+            "MATCH (p:Person) WHERE p.id = 99 RETURN "
+            "timestamp(CASE WHEN true THEN $a ELSE $b END)",
+            {"a": invalid, "b": invalid},
+        )
+    assert failure.value.details == {"field": "function", "value": "timestamp"}
+
+
+def test_timestamp_leaves_aggregate_arguments_for_the_grouped_row(
+    stack: QueryStack,
+) -> None:
+    """A parameter-only aggregate is not row-independent: it reads grouped computation."""
+
+    found = run(
+        stack,
+        "RETURN timestamp(min($instant))",
+        {"instant": "2024-01-02T03:04:05Z"},
+    )
+    assert found.rows == ((Timestamp(micros=_INSTANT_MICROS),),)
 
 
 def test_timestamp_composes_with_case_and_coalesce_as_its_own_family(
