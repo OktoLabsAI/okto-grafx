@@ -29,9 +29,21 @@
   pré-write de endpoints pending entrou em `d2b73bacd861982a67d4ac217a8997ed332b0aca` e a capacidade
   atômica necessária a `replace_node_payload` foi provada em
   `959bb6e313433b489211d1cb3a8c6c1bb10587c0`. A visão pública combinada de relações staged foi
-  concluída em `512e2f8656bd14c9f1a7cecd3fe18caabe32cb2a`; as primitives estruturadas do
-  `GraphTransactionScope` no provider Pulse continuam abertas, portanto M-PULSE-1 e a
-  compatibilidade total ainda não estão declarados concluídos. O registro verificável está em 9.7.
+  concluída em `512e2f8656bd14c9f1a7cecd3fe18caabe32cb2a`. O bridge público de valores
+  temporais/vetoriais entrou na `main@f3683e3dbca731a7f027e0df30e406d805244fac`. O contrato
+  esparso para embeddings nullable, necessário ao tombstone do Pulse, foi integrado na
+  `main@ad38ed080c1359d347c5e0399d49d2c46eb60820`. O primeiro
+  lote inativo do provider transacional Grafx foi publicado no Pulse Community em
+  `milestone/grafx-graph-transaction@50cd190dc18aab199bbadeb62a9f44f4be626e03` após 36 testes e
+  auditoria independente; o tombstone source-deleted atômico foi publicado sobre esse lote em
+  `milestone/grafx-source-deleted-tombstone@f8769d17fff5f74b9cdd2ee220813d811b7ed9da`. O bundle
+  Community coerente com o provider Kuzu foi integrado por fast-forward em
+  `feature/v0.3.3@c12f4d9db662c7ba42f0f3689c30c1afab8ba620`, seguido do contrato Core em
+  `feature/v0.3.3@9f6f37da0c19371781ec86abd2cae2ae8fb400d3`; os worktrees originais sujos
+  permaneceram intocados.
+  Lineage, active-set, conformance completa e o bundle coerente ainda estão abertos; portanto
+  M-PULSE-1 e a compatibilidade total não estão declarados concluídos. O registro verificável está
+  em 9.7.
 
 ## 1. Resumo executivo
 
@@ -765,13 +777,13 @@ Também fazem parte do contrato:
 
 | Área | Estado atual do Grafx | Gap para o Pulse | Severidade |
 |---|---|---|---|
-| CRUD básico de nós/arestas | Overlay owner-only combinado de nós e relações concluído, incluindo insert/update/delete staged | falta encapsular as operações no provider Pulse e normalizar seus resultados | P0 |
+| CRUD básico de nós/arestas | Overlay owner-only combinado de nós e relações concluído, incluindo insert/update/delete staged | lote básico em `50cd190` e tombstone atômico em `f8769d1`, ambos ainda inativos; lineage e active-set ainda faltam | P0 |
 | `DELETE`/`DETACH DELETE` | relationship delete e detach físico cobrem estado committed e cancelamento de relações staged de statements anteriores | falta mapear a exclusão destrutiva do port Pulse sempre para essa primitive | P0 |
-| Transação | commit/rollback, read-your-own-writes combinado, resolução pré-write de endpoints e crash all-or-none concluídos no engine | falta implementar o `GraphTransactionScope` Grafx com fencing e conformance pública | P0 |
-| Substituição de payload | um `MATCH ... SET` único já substitui o payload e preserva identidade/arestas sob isolamento, rollback, conflito e reopen | falta somente encapsular/confirmar a primitive no provider Pulse | P1 |
+| Transação | commit/rollback, read-your-own-writes combinado, resolução pré-write de endpoints e crash all-or-none concluídos no engine | provider básico com fencing/rollback publicado em `50cd190`; falta a superfície completa e a conformance pública do port | P0 |
+| Substituição de payload | um `MATCH ... SET` único já substitui o payload e preserva identidade/arestas sob isolamento, rollback, conflito e reopen | wrapper Grafx `50cd190`, freeze Core `9f6f37d` e provider Kuzu `3a5a499` foram integrados coerentemente no bundle `c12f4d9`; o gap desta primitive está fechado, embora o provider Grafx completo continue inativo até a conformance do M-PULSE-1 | P1 |
 | Cypher read-only 1.0 | subconjunto menor | faltam `OPTIONAL MATCH`, `WITH`, `UNWIND`, `UNION`, `CASE` e funções usadas | P1 |
 | Schema/DDL | criação básica | faltam idempotência, evolução aditiva, múltiplos pares de endpoints e introspecção equivalente | P1 |
-| Vetores | espaços e busca existem | contrato, criação de índices, filtros, ranking e tipos de retorno diferem | P1 |
+| Vetores | espaços e busca existem; índices vetoriais nullable são esparsos e avançam cobertura sem entrada falsa desde `main@ad38ed0` | contrato de criação de índices, filtros, ranking e tipos de retorno ainda difere | P1 |
 | Lifecycle/recovery | primitivas fortes do Grafx | o provider Pulse ainda assume arquivos e procedimentos Ladybug | P1 |
 | Migração | formato físico pre-alpha, sem migrador | grafo cognitivo contém dados que não podem ser sempre reconstruídos do SQL | P0 para corte |
 | Performance | commits duráveis e writer serializado | adapter ingênuo por statement causaria grande regressão | P1 |
@@ -1126,13 +1138,26 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-1B — resolução de endpoints | concluído | `main@d2b73bacd861982a67d4ac217a8997ed332b0aca` (origem revisada `1b5a4266658b186014c8159c2861755a86320b0c`; handoff Nexus `hof_5836d33c98d04c27b152dc7f56902749`) | 31 regressões novas; 1.203 testes txn/query e 612 API (1 skip) passaram antes do rebase; 178 gates de integração passaram depois do rebase; Ruff/diff-check limpos; 15 mutantes mortos; auditoria independente: 139/139 e zero blocker |
 | M-PULSE-1 — capacidade `replace_node_payload` | concluído no engine; wrapper Pulse pendente | `main@959bb6e313433b489211d1cb3a8c6c1bb10587c0` | 4 regressões públicas provam substituição de 5 campos em um único `MATCH ... SET`, identidade imutável, multiconjunto exato de incoming/outgoing/self-loop/paralelas, owner/outsider, no-op, rollback, conflito, cold reopen e `verify()`; Ruff/diff-check limpos |
 | M-PULSE-1C — overlay relacional (engine) | concluído | `main@512e2f8656bd14c9f1a7cecd3fe18caabe32cb2a`; branch publicado `m1/pulse-rel-overlay-hardening`; origem Claude `06869c1` + rework `3358453`; handoff Nexus verificado `hof_bbccc4744e7943e09109845d387a1a8e` | 9 regressões congeladas verdes; 1.245 testes query/txn e 536 crash/index/vector passaram no candidato integrado; docs 3/3, Ruff global e diff-check limpos; auditoria independente PASS. Owner/outsider, pending start, source+target OCC, `_write_rows == 0` no conflito, unwind de read guards, crash pré-WAL/pós-barreira, cold reopen, endpoint token fail-closed e payload+arestas estão cobertos |
-| M-PULSE-1 — primitives `GraphTransactionScope` no provider | em execução | próximo lote após `main@512e2f8656bd14c9f1a7cecd3fe18caabe32cb2a`; contrato Pulse dirty ainda precisa de SHA reproduzível antes da implementação isolada | create/update/snapshot/restore, replace payload, lineage, active-set, deletes por sessão, fencing por mutação+commit e recusa tipada de `execute()` até M-PULSE-2; falta suíte pública do port |
+| M-PULSE-1 — valores públicos para adapters | concluído | `main@f3683e3dbca731a7f027e0df30e406d805244fac` | `Timestamp` e `VectorValue` exportados pela raiz suportada, contrato e packaging atualizados; import boundary/public surface passaram; auditoria independente PASS; nenhum import privado do domínio é necessário no provider Pulse |
+| M-PULSE-1 — índice vetorial nullable/esparso | concluído e integrado | `main@ad38ed080c1359d347c5e0399d49d2c46eb60820`; branch `m1/pulse-nullable-vector-index` | matriz NULL→NULL/valor, WAL, empty marker, rebuild, verifier, HNSW/exact, rollback, retarget e cold reopen cobertos; 20 testes focados e lotes amplos passaram; auditoria independente executou 180 updates NULL→NULL em 29 segmentos e mutantes críticos. A suíte global chegou a 100% com uma única expectativa CLI preexistente, reproduzida sem o commit em `main@f3683e3`; o teste obsoleto foi alinhado separadamente ao contrato owner-only em `main@6e63345a24a30f97b817decd19e46c346da99002` e o arquivo completo passou 40/40 |
+| M-PULSE-1 — freeze de `replace_node_payload` no Core | concluído e integrado no branch de release atual | Pulse Core `feature/v0.3.3@9f6f37da0c19371781ec86abd2cae2ae8fb400d3`; milestone preservado em `milestone/grafx-transaction-contract`; handoff Nexus `hof_25a808d44abb4fc4a97cdf15d0fc8b91` concluído/PASS | 19/19 testes independentes; Protocol, delegação fail-closed e memory provider confirmam payload exato, identidade estrutural, multiconjunto de incoming/outgoing/self-loop/paralelas e restauração quando o publisher aplica e lança. O push ocorreu somente depois do provider Kuzu compatível |
+| M-PULSE-1 — provider Grafx, primitives básicas | concluído no branch; propositalmente inativo | Pulse Community `milestone/grafx-graph-transaction@50cd190dc18aab199bbadeb62a9f44f4be626e03` | create/update/snapshot/restore, replace exato baseado no catálogo físico, supersedence, edges, cleanup, attestation, timestamps, fencing por mutação+commit, rollback após falha de commit, resultado pós-durabilidade e taxonomia/redaction cobertos; 36/36, Ruff/format/diff-check e auditoria independente PASS. `execute()`, lineage e active-set permanecem fail-closed/deferidos |
+| M-PULSE-1 — tombstone source-deleted no provider Grafx | concluído e integrado; provider ainda inativo | milestone Pulse Community `f8769d17fff5f74b9cdd2ee220813d811b7ed9da`, incorporado ao bundle `feature/v0.3.3@c12f4d9db662c7ba42f0f3689c30c1afab8ba620` | swap `DETACH DELETE + CREATE` em uma única statement, payload erasure fail-closed por schema, vetores nullable, remoção de todas as relações catalogadas, retry idempotente, fencing e rollback/poison após apply-then-raise ou confirmação divergente; 46/46 no arquivo completo, 4/4 revalidados pelo Codex, Ruff/format/diff-check limpos e revisão independente sem blocker |
+| M-PULSE-1 — provider Kuzu compatível com `replace_node_payload` | concluído e integrado no branch de release atual | origem `milestone/kuzu-atomic-payload-contract@3a5a499f7d2addda98f0b37ce8b9d8ed36d4025d`; cherry-pick validado no bundle Community `feature/v0.3.3@c12f4d9db662c7ba42f0f3689c30c1afab8ba620`; handoff Nexus `hof_24969ea99ef247248fd3d127138b20f7` concluído/PASS | 22/22 contra Kuzu real passaram duas vezes pelo Codex com os paths Community/Core fixados e resolução de módulos comprovada; identidade, payload integral, arestas paralelas idênticas, incoming/outgoing/same-label/self-loop, lease loss e compensação pós-COMMIT cobertos; cinco mutantes mortos; `git diff --check` limpo e Ruff TRY/I sem delta contra o baseline |
+| M-PULSE-1 — bundle transacional Core/Community | concluído para este lote | Community `feature/v0.3.3@c12f4d9db662c7ba42f0f3689c30c1afab8ba620` publicado antes do Core `feature/v0.3.3@9f6f37da0c19371781ec86abd2cae2ae8fb400d3` | gate conjunto contra o mesmo contrato: Grafx 46/46, Kuzu 22/22 e Core versionado 14/14; ambos os updates foram fast-forward. Os 12 arquivos sujos do Community original e os 13 entries do Core original permaneceram exatamente no worktree local, sem reset, checkout ou sobrescrita |
+| M-PULSE-1 — primitives completas `GraphTransactionScope` | em execução | próximo lote sobre os branches reproduzíveis acima | tombstone está fechado no branch; faltam as três primitives de lineage, as duas de active-set e a conformance pública completa do port. `execute()` genérico continua deliberadamente em M-PULSE-2 |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um
 `DELETE p, p` que recusava o segundo nome do mesmo insert. O primeiro agora falha tipado antes do
 handover enquanto M-PULSE-1C não chega; o segundo é idempotente e conta uma exclusão. Nenhum
 resultado desta tabela fecha M-PULSE-1 por antecipação.
+
+O provider Grafx de `50cd190` não foi registrado na composição. Ativar somente
+`graph_transaction` dividiria o board entre writes Grafx e reads/schema/lifecycle/recovery Kuzu.
+A troca produtiva fica bloqueada até existir o bundle coerente de 9.1 e um catálogo físico
+compartilhado por `(relationship_type, from_type, to_type)` para os 69 pares concretos; essa decisão
+evita split-brain e retrabalho no Core do Pulse.
 
 ## 10. Roadmap priorizado
 
