@@ -34,23 +34,20 @@ including the on-disk format.
   proves ownership, order, node kind and declared endpoint role, plans every durable record ID and
   resolves the endpoint tuple before its first heap mutation. Exact byte budgets include pending
   endpoints, explicit IDs cannot collide with the batch or reuse any physical version (including
-  ended versions), and no pending token can enter heap rows, indexes or WAL. The public Cypher
-  relationship overlay remains the next milestone.
+  ended versions), and no pending token can enter heap rows, indexes or WAL.
 - **Properties of committed relationships now participate in the owner-only transaction
   overlay.** A later `MATCH` in the same transaction reads the latest staged `SET`, including
   when parallel edges connect the same pair, while other transactions keep their committed
   snapshot. Commit, rollback and optimistic conflicts retain their existing all-or-nothing
-  behavior. The layout-owned `_from` and `_to` columns are immutable and receive a typed refusal;
-  public Cypher relationship inserts with pending endpoints remain fail-closed until their
-  separate overlay lands.
+  behavior. The layout-owned `_from` and `_to` columns are immutable and receive a typed
+  refusal.
 - **Write transactions now have an owner-only node overlay.** A later statement in the same
   transaction can `MATCH`, read, `SET`, `MERGE` or `DELETE` a node staged earlier. Inserts,
   updates and deletes are reduced through the same intent view used by commit; a dirty table
   withholds exact indexes and uses scan+overlay, including primary-key changes. Private
   `PendingRowRef` identities are authenticated by owner/table/object identity and never appear in
-  public results, heap rows, indexes or WAL. Public Cypher relationship INSERT/traversal and vector
-  search over unsupported dirty state remain typed, pre-mutation refusals until their overlays
-  land; the lower transaction substrate already resolves staged relationship endpoints at commit.
+  public results, heap rows, indexes or WAL. Vector search over a dirty table remains a typed,
+  pre-mutation refusal.
 - **`DETACH DELETE` and relationship deletion are implemented.** `DELETE r` ends a relationship a
   `MATCH` bound and leaves both endpoints standing; the planner now registers a matched
   relationship variable in its table map exactly as a written one, which is what the refusal was
@@ -139,10 +136,12 @@ including the on-disk format.
 ### Fixed
 
 - **`DETACH DELETE` no longer acknowledges a node deletion while overlooking an incident
-  relationship staged by the same transaction.** Until the relationship overlay can cancel that
-  insert, the statement refuses before handing any of its effects to the transaction; unrelated
-  pending relationships do not block it. Repeating the same pending node in one `DELETE` is also
-  idempotent instead of refusing after the first name cancels the held insert.
+  relationship staged by the same transaction.** A relationship an earlier statement staged is
+  cancelled with the node; one the SAME statement is still holding refuses before any of the
+  statement's effects reach the transaction, because it is not yet an intent a delete could
+  name. Unrelated pending relationships do not block the detach. Repeating the same pending node
+  in one `DELETE` is also idempotent instead of refusing after the first name cancels the held
+  insert.
 - **A row a statement ends more than once is no longer ended, counted and charged more than
   once.** The end of a row is now recorded for the whole STATEMENT and checked against what the
   transaction has already staged, keyed by the stored version an end is actually written to. It

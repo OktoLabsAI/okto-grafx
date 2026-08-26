@@ -203,12 +203,13 @@ with db.begin("write") as txn:
     txn.execute("CREATE (:Person {id: 2, name: 'Grace', city: 'New York'})")
     txn.execute("CREATE (:Person {id: 3, name: 'Alan',  city: 'London'})")
 
-# MATCH already sees nodes this transaction staged. The commit substrate can resolve their private
-# identities, but the public Cypher relationship overlay is the next milestone; commit the nodes
-# before creating the edge in this release.
+# MATCH sees what this transaction staged, so the edge can be created beside the nodes it joins.
+# The endpoints are named by identities the commit resolves before its first write; what a
+# statement cannot name is a node that SAME statement is creating, which has nothing to resolve.
 with db.begin("write") as txn:
+    txn.execute("CREATE (:Person {id: 4, name: 'Edsger', city: 'Rotterdam'})")
     txn.execute(
-        "MATCH (a:Person {id: 1}), (b:Person {id: 2}) CREATE (a)-[:Knows {since: 1994}]->(b)"
+        "MATCH (a:Person {id: 1}), (b:Person {id: 4}) CREATE (a)-[:Knows {since: 1994}]->(b)"
     )
 
 # --- reads --------------------------------------------------------------------
