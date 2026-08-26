@@ -111,6 +111,11 @@
   passaram, sem aumentar a dívida de formatter (250 arquivos na base e no candidato). Incoming,
   undirected, relação sem tipo, ranges escritos, `OPTIONAL`, `WITH`, writes, paths e multi-endpoint
   permanecem fora.
+  O próximo lote fixo M-PULSE-2I cobre somente named path decorativo, não projetado e não lido,
+  sobre um único hop tipado; raw deve passar exatamente a 72/15 com sete débitos, enquanto as 97
+  entries permanecem 82/13. Em paralelo, M-PULSE-3B fixa no adapter Community o layout lógico de
+  16 tipos/69 pares de relações como tabelas físicas distintas, sem alterar o formato Grafx,
+  executar DDL, ativar o provider ou reclassificar o corpus.
   Em paralelo, a primeira capacidade M-PULSE-3A de propriedades de node foi integrada no Pulse
   Community `feature/v0.3.3@4aae27eca9c0a2d1d14a3334b03e6c57976dea75`, ainda inativa até a
   composição do provider completo.
@@ -1136,6 +1141,28 @@ o handoff Nexus `hof_8ceb3eb19622472bbd50a83c81921015` foi concluído/verificado
 `--check`, Ruff e diff-check passaram; a dívida de formatter permaneceu em 250 arquivos tanto na
 base quanto no candidato.
 
+O próximo sublote fixo M-PULSE-2I aceita somente um named path decorativo e não lido na forma
+read-only `MATCH path = (a:A)-[r:TYPE]->(b:B) [WHERE ...] RETURN ...`: um `Query`, um `MATCH`, um
+pattern, um hop fixo outgoing e tipado, path/relação/endpoints nomeados, ambos os endpoints com
+exatamente um label, sem mapas inline ou range escrito e com `RETURN` obrigatório. `PatternPath`
+ganha `variable` no final dos campos, com default `None`, preservando construtores posicionais; o
+parser reconhece `name =` somente dentro de `MATCH`, `describe()` preserva o texto e o plano ignora
+o nome apenas depois de analyzer e planner comprovarem que ele não é lido. O planner repete o gate
+diretamente sobre o `Statement`, inclusive com AST/análise fornecida, e o gate de M-PULSE-2H passa
+a exigir path sem nome.
+
+Path projection ou qualquer referência ao nome em `WHERE`, `WITH`, `RETURN`, `ORDER BY`, `SKIP` ou
+`LIMIT`; colisão com nome de node/relação; múltiplos `MATCH`/patterns/named paths; `OPTIONAL`,
+`UNION`, `UNWIND`, `WITH`, writes, `CREATE`/`MERGE` nomeado; relação sem tipo, incoming/undirected,
+multi-hop, qualquer `*`, maps, endpoint anônimo/sem label; DTO/path runtime, schema/provider e
+multi-endpoint ficam fora. O ratchet é exato: os 87 probes e o contrato raw 74/13 permanecem no
+inventário; engine raw passa de 71/16 para 72/15 e o débito de oito para sete; somente `named path`
+passa a `planned/accepted`, enquanto `path projection` continua recusado pre-stream e pode mudar de
+`parse_error` para `analysis_error` por a sintaxe agora ser reconhecida. Os outros 85 objetos raw e
+todas as 97 entries permanecem integrais em 82/13. Parser/AST/`describe`, zero/uma/paralelas,
+owner-only/rollback, colisões, exclusões, AST/análise forjada, diferencial full-object, corpus
+`--check`, Ruff e diff-check formam o gate; o digest novo só é registrado depois da regeneração.
+
 1. gerar um corpus versionado a partir do contrato e das queries reais read-only e write do Pulse;
 2. implementar clauses/expressões/funções ausentes;
 3. traduzir mutations internas para primitives estruturados quando isso evitar copiar DDL/procedures
@@ -1157,6 +1184,24 @@ diferencial; formas fora do corpus recusam antes de executar.
 
 **Gate:** bootstrap vazio, bootstrap repetido e upgrade a partir do schema anterior produzem o
 mesmo fingerprint de schema esperado pelo Pulse.
+
+O sublote fixo M-PULSE-3B estabelece somente o layout lógico de relações no adapter Community. A
+autoridade fechada do Core gera um manifesto de 16 tipos lógicos e 69 pares e um codec bijetivo
+`(logical_type, from_type, to_type) -> logical__From__To`; a resolução reversa vem do manifesto,
+nunca de inferir tipos quebrando um nome físico. A introspecção read-only valida no catálogo Grafx
+que cada tabela é `rel` e possui exatamente o par declarado, agrupa por nome lógico e não expõe o
+nome físico nos DTOs Pulse. O mesmo resolvedor passa a ser usado pelo
+`CommunityGrafxGraphTransaction`; desconhecido, colisão ou endpoint divergente falha tipado.
+
+M-PULSE-3B não executa DDL/bootstrap/evolve, não ativa provider, não reescreve queries lógicas, não
+reclassifica corpus, não altera `TableDef`, catálogo, `CATALOG_FORMAT_VERSION`, gramática ou
+`label(r)` e não corrige `EXPLAIN_CONSTRAINT_ORIGINS`. Os dez templates de supersedence continuam
+gaps até o sublote de bootstrap/rewrite; `EXPLAIN_CONSTRAINT_ORIGINS` exige antes resolver a
+inconsistência normativa, pois a query usa `derives_from(Decision->Constraint)` e a autoridade atual
+declara apenas `Decision->Requirement` e `Entity->Entity`. O gate é 16 tipos, 69 pares, 69 nomes
+únicos/reversíveis; unknown/collision/mismatch fail-closed; dois pares do mesmo tipo em tabelas
+distintas; visão lógica idêntica após reopen; nomes físicos ausentes da introspecção; regressões do
+provider transacional e prova de zero delta no formato/gramática Grafx.
 
 #### M-PULSE-4 — paridade vetorial
 
