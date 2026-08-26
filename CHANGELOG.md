@@ -20,14 +20,15 @@ including the on-disk format.
   created, relationships it updated or ended, and endpoint nodes it created, updated or ended --
   with multiplicity, direction, self-loops and exact properties. `DELETE r` cancels the one
   pending relationship it names; `DETACH DELETE` cancels every pending relationship incident on
-  the node and leaves the rest standing. A relationship table this transaction has touched is
-  walked by a scan plus the overlay rather than by its endpoint indexes, which describe only
-  committed edges; an untouched table keeps the indexed path. An edge also declares the two
-  endpoint rows it depends on, so a transaction that deletes one of them and a transaction that
-  creates the edge no longer both commit -- the refusal arrives at the first validation, before a
-  row is written or a page allocated for it. Two same-statement shapes remain typed refusals
-  rather than guesses: an endpoint that very statement is creating, and a `DETACH DELETE` of a
-  node an edge held by that same statement points at.
+  the node and leaves the rest standing. Pending relationship inserts force one grouped scan plus
+  the overlay because endpoint indexes contain only committed edges. Update/delete-only overlays
+  can keep using fresh indexes, while a start node created by this transaction takes the scan path
+  because its private identity has no index encoding. An edge also declares the two endpoint rows
+  it depends on, so a transaction that deletes one of them and a transaction that creates the edge
+  no longer both commit -- the refusal arrives at the first validation, before a row is written or
+  a page allocated for it. Two same-statement shapes remain typed refusals rather than guesses: an
+  endpoint that very statement is creating, and a `DETACH DELETE` of a node an edge held by that
+  same statement points at.
 - **Relationship endpoints may now name nodes staged by the same transaction at the transaction
   substrate.** `stage_row_insert()` returns an authenticated owner-local `PendingRowRef`; only the
   two endpoint slots of a relationship INSERT may carry it. Commit reduces the full intent set,

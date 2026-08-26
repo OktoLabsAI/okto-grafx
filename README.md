@@ -77,7 +77,7 @@ openCypher in the Kùzu dialect, executed by a planner that produces one operato
 | `CREATE` (nodes and relationships) | patterns with inline properties |
 | `MATCH` … `WHERE` … `RETURN` | equality, comparison, `STARTS WITH`, `ENDS WITH`, boolean operators |
 | `MERGE` | matches on the properties the pattern NAMED |
-| `SET` | on nodes |
+| `SET` | on node properties and matched relationship properties; relationship endpoints are immutable |
 | `DELETE` | nodes, and relationships a `MATCH` bound |
 | `DETACH DELETE` | ends every relationship incident on the node together with it |
 | Traversal | one hop, bounded ranges `[:REL*1..3]`, both directions, relationship isomorphism |
@@ -91,12 +91,14 @@ describes committed rows. A `CREATE` may name a node an earlier statement of the
 transaction created, and both private endpoint identities are resolved before the first heap
 write. Traversal reads that owner's combined view: relationships it created, relationships it
 updated or ended, and endpoint nodes it created, updated or ended, with multiplicity, direction
-and self-loops preserved. A dirty relationship table is walked by a scan and the overlay rather
-than by its endpoint indexes, which describe only committed edges; a clean table keeps the
-indexed path. Two same-statement shapes stay refused rather than guessed: an edge whose endpoint
-that very statement is creating, and a `DETACH DELETE` of a node an edge held by that same
-statement points at. Vector search over a dirty table is fail-closed. Updates of properties on
-committed relationships are owner-visible, while their `_from`/`_to` layout columns remain
+and self-loops preserved. Pending relationship inserts force one grouped scan plus the overlay,
+because endpoint indexes contain only committed edges; update/delete-only overlays can still use
+fresh indexes and validate or suppress their candidates. A start node created by this transaction
+takes the scan path even when the relationship table has no pending insert, because its private
+identity has no index encoding. Two same-statement shapes stay refused rather than guessed: an edge
+whose endpoint that very statement is creating, and a `DETACH DELETE` of a node an edge held by
+that same statement points at. Vector search over a dirty table is fail-closed. Updates of
+relationship properties are owner-visible, while their `_from`/`_to` layout columns remain
 immutable. A table declared inside a transaction is usable by that transaction's own later
 statements and becomes visible to every other transaction when it commits — schema changes are
 transactions like any other.
