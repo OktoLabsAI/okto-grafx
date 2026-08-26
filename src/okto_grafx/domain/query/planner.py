@@ -1475,7 +1475,9 @@ class _Planner:
         if standalone and not pattern.labels:
             return self._match_every_node(pipeline, pattern, terms, variable)
         table = (
-            inferred_table if inferred_table is not None else self._node_table_of(pattern)
+            inferred_table
+            if inferred_table is not None
+            else self._node_table_of(pattern)
         )
         self.tables[variable] = table
         if pattern.properties is not None:

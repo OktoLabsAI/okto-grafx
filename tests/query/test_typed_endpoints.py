@@ -39,9 +39,7 @@ from okto_grafx.domain.query.planner import build_plan
 
 I01 = "MATCH (a)-[r:R]->(b) RETURN r.layer, r.rule_id"
 """The frozen I01 text; ``test_the_two_frozen_templates_are_the_ones_used`` pins it."""
-CORPUS = (
-    Path(__file__).resolve().parents[1] / "corpus" / "pulse_query_corpus_1_0.json"
-)
+CORPUS = Path(__file__).resolve().parents[1] / "corpus" / "pulse_query_corpus_1_0.json"
 
 
 def _frozen() -> dict:
@@ -69,8 +67,12 @@ def database(tmp_path: Path) -> Iterator[object]:
     """Return two node tables joined by one typed relationship, with one edge in it."""
     handle = okto_grafx.connect(tmp_path / "db", page_size=512)
     with handle.begin("write") as schema:
-        schema.execute("CREATE NODE TABLE A(id STRING, kind_of STRING, PRIMARY KEY(id))")
-        schema.execute("CREATE NODE TABLE B(id STRING, kind_of STRING, PRIMARY KEY(id))")
+        schema.execute(
+            "CREATE NODE TABLE A(id STRING, kind_of STRING, PRIMARY KEY(id))"
+        )
+        schema.execute(
+            "CREATE NODE TABLE B(id STRING, kind_of STRING, PRIMARY KEY(id))"
+        )
         schema.execute("CREATE REL TABLE R(FROM A TO B, layer STRING, rule_id STRING)")
     with handle.begin("write") as seed:
         seed.execute("CREATE (n:A {id: 'a1', kind_of: 'decision'})")
@@ -120,7 +122,9 @@ def test_no_edge_at_all_is_no_rows_rather_than_a_refusal(tmp_path: Path) -> None
         with handle.begin("write") as schema:
             schema.execute("CREATE NODE TABLE A(id STRING, PRIMARY KEY(id))")
             schema.execute("CREATE NODE TABLE B(id STRING, PRIMARY KEY(id))")
-            schema.execute("CREATE REL TABLE R(FROM A TO B, layer STRING, rule_id STRING)")
+            schema.execute(
+                "CREATE REL TABLE R(FROM A TO B, layer STRING, rule_id STRING)"
+            )
         with handle.begin("write") as seed:
             seed.execute("CREATE (n:A {id: 'a1'})")
 
@@ -150,7 +154,9 @@ def test_a_property_the_edge_left_unset_reads_as_null(database: object) -> None:
         )
 
     # A null and a string do not compare, so the unset one is ordered as the empty string.
-    assert sorted(database.execute(I01).rows, key=lambda row: (row[0], row[1] or "")) == [
+    assert sorted(
+        database.execute(I01).rows, key=lambda row: (row[0], row[1] or "")
+    ) == [
         ("canonical", None),
         ("canonical", "rule-1"),
     ]
@@ -158,9 +164,9 @@ def test_a_property_the_edge_left_unset_reads_as_null(database: object) -> None:
 
 def test_both_ends_are_readable_and_a_typo_still_refuses(database: object) -> None:
     """The ends have TABLES here, so an unknown column is a mistake and still says so."""
-    assert database.execute("MATCH (a)-[r:R]->(b) RETURN a.kind_of, b.kind_of").rows == (
-        ("decision", "note"),
-    )
+    assert database.execute(
+        "MATCH (a)-[r:R]->(b) RETURN a.kind_of, b.kind_of"
+    ).rows == (("decision", "note"),)
 
     with pytest.raises(GrafxPlanError) as raised:
         database.execute("MATCH (a)-[r:R]->(b) RETURN a.no_such_column")
@@ -172,7 +178,9 @@ def test_the_code_traceability_filter_blocks_at_either_end(database: object) -> 
     with database.begin("write") as transaction:
         transaction.execute("CREATE (n:A {id: 'a-code', kind_of: 'code_evidence'})")
         transaction.execute("CREATE (n:B {id: 'b-plain', kind_of: 'note'})")
-        transaction.execute("CREATE (n:B {id: 'b-code', kind_of: 'implementation_target'})")
+        transaction.execute(
+            "CREATE (n:B {id: 'b-code', kind_of: 'implementation_target'})"
+        )
         # b1 is the seeded target and is ordinary; the fixture's own edge is the clean one.
         transaction.execute(
             "MATCH (a:A {id: 'a-code'}), (b:B {id: 'b-plain'}) "
@@ -276,17 +284,24 @@ def test_a_written_hop_range_is_outside_the_form_even_when_it_means_one_hop() ->
     plain_hop = plain.match_clauses[0].patterns[0].relationships[0]
     starred_hop = starred.match_clauses[0].patterns[0].relationships[0]
 
-    assert (plain_hop.min_hops, plain_hop.max_hops) == (starred_hop.min_hops, starred_hop.max_hops)
+    assert (plain_hop.min_hops, plain_hop.max_hops) == (
+        starred_hop.min_hops,
+        starred_hop.max_hops,
+    )
     assert plain_hop.variable_length is starred_hop.variable_length is False
     assert plain_hop.hop_range_written is False
     assert starred_hop.hop_range_written is True
     assert starred_hop.describe() == "-[r:R*1..1]->"
 
 
-def test_unwind_before_the_form_is_refused_for_the_clause_it_is(database: object) -> None:
+def test_unwind_before_the_form_is_refused_for_the_clause_it_is(
+    database: object,
+) -> None:
     """UNWIND names its own tail rule, and that refusal arrives first; it is not widened here."""
     with pytest.raises(GrafxPlanError) as raised:
-        database.execute("UNWIND $rows AS x MATCH (a)-[r:R]->(b) RETURN r.layer", {"rows": [1]})
+        database.execute(
+            "UNWIND $rows AS x MATCH (a)-[r:R]->(b) RETURN r.layer", {"rows": [1]}
+        )
 
     assert raised.value.details["field"] == "clause"
 
@@ -324,7 +339,9 @@ def _supplied_analysis(statement: Query) -> QueryAnalysis:
 def _returns_layer() -> ReturnClause:
     """Return the RETURN clause the frozen form carries."""
     return ReturnClause(
-        items=(ReturnItem(expression=Property(subject=Variable(name="r"), key="layer")),)
+        items=(
+            ReturnItem(expression=Property(subject=Variable(name="r"), key="layer")),
+        )
     )
 
 
@@ -339,7 +356,9 @@ def _returns_layer() -> ReturnClause:
                     SetClause(
                         items=(
                             SetItem(
-                                target=Property(subject=Variable(name="a"), key="kind_of"),
+                                target=Property(
+                                    subject=Variable(name="a"), key="kind_of"
+                                ),
                                 value=Literal(value="z"),
                             ),
                         )
