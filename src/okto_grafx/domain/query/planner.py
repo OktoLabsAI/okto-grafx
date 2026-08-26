@@ -699,6 +699,12 @@ class _Planner:
                 value=relationship.describe(),
             )
         self._require_endpoint(source, table, relationship.direction)
+        if relationship.variable is not None:
+            # A matched relationship variable names its table exactly as a written one does in
+            # ``_written_pattern``. Without this the table map knew every node of the pattern
+            # and none of its edges, so DELETE r refused a variable the traversal had already
+            # bound at runtime -- the plan, not the execution, was what lacked the edge.
+            self.tables[relationship.variable] = table
         named = target_pattern.variable
         already_bound = named is not None and named in self.tables
         target_variable = named if named is not None else self._anonymous()

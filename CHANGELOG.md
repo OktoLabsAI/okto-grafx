@@ -7,6 +7,19 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### Added
+
+- **`DETACH DELETE` and relationship deletion are implemented.** `DELETE r` ends a relationship a
+  `MATCH` bound and leaves both endpoints standing; the planner now registers a matched
+  relationship variable in its table map exactly as a written one, which is what the refusal was
+  missing. `DETACH DELETE` ends every relationship incident on a node — incoming, outgoing,
+  self-loops, several at once — together with the node in one commit, or leaves all of them
+  standing if the statement refuses. Incidence is matched POSITIONALLY against each relationship
+  table's declared `FROM` and `TO`: record numbers are allocated per table, so the same number
+  names different rows on the two sides and an edge is only ever incident on the side its own
+  table names. A plain `DELETE` is unchanged and deliberately so: it ends the node and leaves its
+  relationships on the pages as rows no traversal will follow.
+
 ### Changed
 
 - **Public recovery and metrics facades now expose their concrete detached result types.**
@@ -82,6 +95,16 @@ including the on-disk format.
   type, ownership, active state and retry eligibility before schema bookkeeping can move.
 
 ### Fixed
+
+- **A row a statement ends more than once is no longer ended, counted and charged more than
+  once.** The end of a row is now recorded for the whole STATEMENT and checked against what the
+  transaction has already staged, keyed by the stored version an end is actually written to. It
+  used to be recorded per ROW of the pipeline, so a Cartesian that handed the same node over
+  three times reported three deletions of one node and held three writes for it; under
+  `max_statement_writes` that spent the budget on repeats and refused a statement for exceeding a
+  limit it never needed. A `DETACH DELETE` following an earlier `DELETE` of one of the same
+  relationships was the same fault across statements: both read one snapshot, and a snapshot
+  cannot see either one's uncommitted work.
 
 - **Statement rollback now restores exact page staging.** `staging_mark()` retains its
   `tuple[int, int, int]` signature while sealing exact internal snapshots of page images, their

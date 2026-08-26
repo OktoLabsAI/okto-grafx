@@ -841,3 +841,131 @@ def test_public_connect_quarantines_a_torn_ledger_tail_and_opens() -> None:
         assert len(entries) == 1
         assert entries[0].manifest.origin == LEDGER_FILE
         assert reopened.read_quarantine(entries[0].name) == torn
+
+
+REL_TABLE = "R"
+"""A relationship table, so a crash can be aimed at a statement that ends more than one row."""
+
+
+def _surviving(database: Database) -> tuple[int, ...]:
+    """Return the node identities a reader can still see, ordered."""
+    return tuple(sorted(row[0] for row in database.execute("MATCH (p:P) RETURN p.id").rows))
+
+
+def _live_edges(database: Database) -> tuple[tuple[object, object], ...]:
+    """Return the endpoints of every relationship version still live on the pages, ordered.
+
+    Walked rather than queried, because the join needs BOTH endpoints: an edge whose source is
+    gone drops out of a traversal whether it was ended with the node or merely left behind, and
+    telling those two apart is the whole claim here.
+    """
+    definition = database.catalog.catalog.table(REL_TABLE)
+    return tuple(
+        sorted(
+            (version.values[0], version.values[1])
+            for _ref, version in database._heap.scan_all(definition)
+            if version.live
+        )
+    )
+
+
+class _CrashBeforeTheLogAccepts(FaultInjectingStorageDevice):
+    """Stop the process before the WAL accepts anything, leaving nothing to replay.
+
+    Aimed by FILE, not by call number. The commit path appends to control files as well, and the
+    first ``append_log`` of a commit turned out to be a writer lease -- so an occurrence count
+    would have crashed somewhere else entirely while still looking like a WAL cut.
+    """
+
+    def __init__(self, inner: MemoryStorageDevice) -> None:
+        super().__init__(inner, seed=20260826)
+        self.armed = False
+
+    def append_log(self, file: str, payload: bytes) -> int:
+        if self.armed and file.startswith("wal/"):
+            raise SimulatedCrash(
+                f"The test device stopped the process before the WAL accepted {file!r}.",
+                sequence=len(self.trail()),
+                method="append_log",
+                file=file,
+                moment="before",
+            )
+        return super().append_log(file, payload)
+
+
+def _detach_crash(
+    aim: str,
+) -> tuple[MemoryStorageDevice, FaultInjectingStorageDevice, int, SimulatedCrash]:
+    """Cut one DETACH DELETE off at one write point and report where it stopped.
+
+    The victim carries one outgoing and one incoming edge, so the statement ends three rows in
+    three different states of the same commit -- which is what makes "all or none" a claim with
+    something to say.
+    """
+    memory = MemoryStorageDevice(page_size=PAGE_SIZE)
+    fault: FaultInjectingStorageDevice = (
+        _CrashBeforeTheLogAccepts(memory)
+        if aim == "log"
+        else FaultInjectingStorageDevice(memory, seed=20260826)
+    )
+    with _connect(fault, namespace=memory) as setup:
+        with setup.begin("write") as txn:
+            txn.execute(f"CREATE NODE TABLE {TABLE}(id INT64, name STRING, PRIMARY KEY(id))")
+            txn.execute(f"CREATE REL TABLE {REL_TABLE}(FROM {TABLE} TO {TABLE}, w INT64)")
+        with setup.begin("write") as txn:
+            for identity in (1, 2, 3):
+                txn.execute(f"CREATE (:{TABLE} {{id: $i, name: 'n'}})", {"i": identity})
+        with setup.begin("write") as txn:
+            for source, target in ((1, 2), (3, 1)):
+                txn.execute(
+                    f"MATCH (a:{TABLE}), (b:{TABLE}) WHERE a.id = $a AND b.id = $b "
+                    f"CREATE (a)-[:{REL_TABLE} {{w: 1}}]->(b)",
+                    {"a": source, "b": target},
+                )
+
+    crashed = _connect(fault, namespace=memory)
+    published_before = _published(memory).last_committed_lsn
+    txn = crashed.begin("write")
+    txn.execute(f"MATCH (p:{TABLE}) WHERE p.id = 1 DETACH DELETE p")
+    fault.clear_trail()
+    if aim == "log":
+        fault.armed = True
+    else:
+        fault.crash_on(aim, occurrence=1, moment="before")
+    with pytest.raises(SimulatedCrash) as stopped:
+        txn.commit()
+    if aim == "log":
+        fault.armed = False
+    else:
+        fault.disarm()
+    return memory, fault, published_before, stopped.value
+
+
+def test_a_crashed_detach_delete_publishes_the_node_with_its_edges_or_neither() -> None:
+    """Where the process died decides WHETHER the statement lands, never WHICH PART of it does.
+
+    A detach ends a node and the relationships hanging from it as one statement. Half of that
+    surviving a crash is the shape that cannot be allowed: a node gone with its edges still
+    standing is the orphan the detach exists to prevent, and edges gone with the node still
+    standing is a graph quietly missing relationships nobody deleted.
+    """
+    # Cut AFTER the COMMIT record is durable: the next open completes all three ends.
+    memory, fault, before, stopped = _detach_crash("write_page")
+    assert stopped.file == "heap.dat"
+    assert _published(memory).last_committed_lsn == before  # not published yet, but durable
+    with _connect(fault, namespace=memory) as recovered:
+        assert recovered.recovery_report.records_replayed > 0
+        assert _published(memory).last_committed_lsn > before
+        assert _surviving(recovered) == (2, 3)
+        assert _live_edges(recovered) == ()  # BOTH incident edges came with the node
+        assert recovered.verify("all").findings == ()
+
+    # Cut BEFORE anything of the statement reached the log: none of the three ends exists.
+    memory, fault, before, stopped = _detach_crash("log")
+    assert stopped.file is not None and stopped.file.startswith("wal/")
+    with _connect(fault, namespace=memory) as reopened:
+        assert _published(memory).last_committed_lsn == before
+        assert _surviving(reopened) == (1, 2, 3)
+        # The node kept BOTH of its relationships, not one of them.
+        assert len(_live_edges(reopened)) == 2
+        assert reopened.verify("all").findings == ()

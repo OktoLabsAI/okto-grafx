@@ -77,15 +77,17 @@ openCypher in the Kùzu dialect, executed by a planner that produces one operato
 | `CREATE` (nodes and relationships) | patterns with inline properties |
 | `MATCH` … `WHERE` … `RETURN` | equality, comparison, `STARTS WITH`, `ENDS WITH`, boolean operators |
 | `MERGE` | matches on the properties the pattern NAMED |
-| `SET`, `DELETE` | on nodes |
+| `SET` | on nodes |
+| `DELETE` | nodes, and relationships a `MATCH` bound |
+| `DETACH DELETE` | ends every relationship incident on the node together with it |
 | Traversal | one hop, bounded ranges `[:REL*1..3]`, both directions, relationship isomorphism |
 | `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT`, `WITH` | |
 | Aggregates | `count`, `min`, `max`, and friends |
 | Parameters | `$name`, refused before anything runs if one is missing |
 
 **Not yet supported**, and refused in the error taxonomy rather than silently ignored:
-`DETACH DELETE`, relationship deletion, and `MATCH` binding a row the same transaction created
-(a row's identity is allocated by the commit — commit first, then match). A table declared inside
+`MATCH` binding a row the same transaction created (a row's identity is allocated by the
+commit — commit first, then match). A table declared inside
 a transaction is usable by that transaction's own later statements and becomes visible to every
 other transaction when it commits — schema changes are transactions like any other.
 
@@ -613,7 +615,10 @@ practice:
   store record identities, and identities carry no index yet). Endpoint indexes cover the edges
   themselves, so the old every-edge-per-node scan is gone, but a hop that lands on a large free
   table still pays one scan of it per traversal.
-- **`DETACH DELETE` and relationship deletion are not implemented**, and refuse rather than pretend.
+- **A plain `DELETE` of a node ends the node, not its relationships.** They stay on the pages
+  as rows no traversal will follow — a landing whose snapshot cannot see the node is not
+  reached — so the absence an ordinary `DELETE` promises is a logical one. `DETACH DELETE` is
+  what ends the incident relationships with the node, physically, in the same commit.
 - **Known gaps are written down** rather than hidden: see `docs/architecture/PUNCHLIST.md`.
 
 **Deployment responsibility.** Okto Grafx is an embedded library for local or controlled

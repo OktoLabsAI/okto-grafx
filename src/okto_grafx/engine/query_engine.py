@@ -146,6 +146,7 @@ from okto_grafx.domain.query.tokens import (
     SIMILARITY_FUNCTION,
     SIMILARITY_SCORE_FUNCTION,
 )
+from okto_grafx.domain.txn.context import RowOperation
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.domain.model.catalog import Catalog
@@ -472,6 +473,42 @@ class _Context:
     staged_partitions: list[tuple[int, bytes]] = field(default_factory=list)
     tokens_issued: int = 0
     pending_tokens: dict[int, int] = field(default_factory=dict)
+    ends_held: set[object] = field(default_factory=set)
+    _ends_staged: frozenset[object] | None = None
+
+    def already_ended(self, reference: object) -> bool:
+        """Answer whether this exact version has already been told to stop.
+
+        Two questions with one answer. A statement's write runs once per ROW of its pipeline, so
+        a Cartesian naming the same node three times reaches the delete three times; and an
+        earlier statement of the same transaction may already have ended a row this one finds,
+        because both read the same snapshot and a snapshot cannot see either one's uncommitted
+        work. Either repeat stages a second end at a number the version had already stopped at,
+        counts a row that does not exist, and spends statement budget on a write nobody asked
+        for -- which is how a statement that fits inside `max_statement_writes` gets refused for
+        exceeding it.
+
+        The reference is the key because it names one stored VERSION, which is exactly what an
+        end is written to. Record numbers are per table and would need the table beside them;
+        the reference already carries that distinction.
+
+        A transaction that does not describe its row intents narrows this to the statement it is
+        asked from. The statement's own ends are always known.
+        """
+        if reference in self.ends_held:
+            return True
+        if self._ends_staged is None:
+            intents = getattr(self.txn, "row_intents", None) or ()
+            self._ends_staged = frozenset(
+                intent.reference
+                for intent in intents
+                if getattr(intent, "operation", None) is RowOperation.DELETE
+            )
+        return reference in self._ends_staged
+
+    def note_ended(self, reference: object) -> None:
+        """Record that this statement is holding the end of that exact version."""
+        self.ends_held.add(reference)
 
     def schema(self) -> Catalog:
         """Return the catalog this statement resolves names from."""
@@ -2203,7 +2240,7 @@ def _write_one(
     if isinstance(node, SetProperties):
         return _write_assignments(engine, node, row, context)
     if isinstance(node, DeleteEntities):
-        return _write_deletions(node, row, context)
+        return _write_deletions(engine, node, row, context)
     raise GrafxUnsupportedOperation(
         f"The operator {node.label} cannot write in this build.",
         field="operator",
@@ -2320,14 +2357,58 @@ def _held_insert_position(context: _Context, binding: RowBinding) -> int | None:
     return None
 
 
-def _write_deletions(node: DeleteEntities, row: _Row, context: _Context) -> _Row:
+def _incident_edges(
+    engine: QueryEngine, context: _Context, table: TableDef, record_id: object
+) -> Iterator[tuple[TableDef, object, HeapVersion]]:
+    """Yield every live relationship touching one node, in either direction.
+
+    A stored relationship leads with its two endpoints (W5c), so ``values[0]`` is the source and
+    ``values[1]`` the target. The match is POSITIONAL, and it has to be: record numbers are per
+    table, so ``FROM Person TO Company`` can hold an edge whose Company is number 1 while the
+    node being deleted is Person number 1. Asking only whether the number appears somewhere in
+    the pair would end that edge, which belongs to a different node entirely.
+
+    A self-loop is named on both sides of a table pointing at itself and is still yielded ONCE,
+    because one visible version of one record is one row: ending it twice would write a second
+    end at a number the version had already stopped at. Deduplicating here would be defending
+    against a snapshot showing two live versions of the same record, which is corruption to
+    report rather than a shape to absorb.
+    """
+    snapshot = context.snapshot
+    catalog = context.schema()
+    for candidate in catalog.tables():
+        if candidate.kind != "rel":
+            continue
+        leaves = str(candidate.from_table) == table.name
+        lands = str(candidate.to_table) == table.name
+        if not (leaves or lands):
+            continue
+        for ref, version in engine.heap.scan(candidate, snapshot):
+            incident = (leaves and version.values[0] == record_id) or (
+                lands and version.values[1] == record_id
+            )
+            if not incident:
+                continue
+            yield candidate, ref, version
+
+
+def _write_deletions(
+    engine: QueryEngine, node: DeleteEntities, row: _Row, context: _Context
+) -> _Row:
     """End every row one DELETE names, under the same hold-until-complete discipline.
 
-    A row named twice by one statement is ended once: the second stamp would be an end written
-    at a number the version had already stopped at, which is not a stronger statement of the same
-    fact but a second fact that is not true.
+    A row named twice is ended once, whether the repeat comes from one statement naming it twice,
+    from a Cartesian handing the same row to this write again, or from an earlier statement of
+    the same transaction having already ended it. The second stamp would be an end written at a
+    number the version had already stopped at, which is not a stronger statement of the same fact
+    but a second fact that is not true.
+
+    DETACH is what decides the fate of the relationships hanging from a node. With the keyword
+    they end WITH it, physically, in the same statement. Without it only the node ends, and its
+    edges stay on the pages as rows no traversal will follow: a landing whose snapshot cannot see
+    the node is not reached, so the absence an ordinary DELETE promises is a logical one. Ending
+    those edges anyway without being asked would turn a tombstone into a cascade.
     """
-    seen: set[int] = set()
     for variable in node.variables:
         binding = row.bindings.get(variable)
         if not isinstance(binding, RowBinding):
@@ -2354,9 +2435,23 @@ def _write_deletions(node: DeleteEntities, row: _Row, context: _Context) -> _Row
             del context.staged_rows[position]
             context.count("rows_deleted")
             continue
-        if binding.record_id in seen:
+        if context.already_ended(binding.ref):
             continue
-        seen.add(binding.record_id)
+        context.note_ended(binding.ref)
+        if node.detach and binding.table.kind != "rel":
+            # Incident edges are settled BEFORE the node they hang from is held, so the whole
+            # detach is one statement's worth of staged work: either every edge and the node
+            # end together at the commit stamp, or a refusal leaves all of them standing.
+            for edge_table, edge_ref, edge_version in _incident_edges(
+                engine, context, binding.table, binding.record_id
+            ):
+                if context.already_ended(edge_ref):
+                    continue
+                context.note_ended(edge_ref)
+                context.hold_delete(
+                    edge_table, edge_ref, _partition_key(edge_table, edge_version.values)
+                )
+                context.count("rows_deleted")
         context.hold_delete(
             binding.table, binding.ref, _partition_key(binding.table, binding.version.values)
         )
