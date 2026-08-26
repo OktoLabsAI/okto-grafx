@@ -40,8 +40,9 @@
   Community coerente com o provider Kuzu foi integrado por fast-forward em
   `feature/v0.3.3@c12f4d9db662c7ba42f0f3689c30c1afab8ba620`, seguido do contrato Core em
   `feature/v0.3.3@9f6f37da0c19371781ec86abd2cae2ae8fb400d3`; os worktrees originais sujos
-  permaneceram intocados.
-  Lineage, active-set, conformance completa e o bundle coerente ainda estão abertos; portanto
+  permaneceram intocados. As três primitives transacionais de Spec lineage foram publicadas em
+  `milestone/grafx-lineage-primitives@73b65dafb432b35ff3dea8edde8c6aa07b58c393`.
+  Active-set, conformance completa e o bundle coerente ainda estão abertos; portanto
   M-PULSE-1 e a compatibilidade total não estão declarados concluídos. O registro verificável está
   em 9.7.
 
@@ -1145,7 +1146,8 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-1 — tombstone source-deleted no provider Grafx | concluído e integrado; provider ainda inativo | milestone Pulse Community `f8769d17fff5f74b9cdd2ee220813d811b7ed9da`, incorporado ao bundle `feature/v0.3.3@c12f4d9db662c7ba42f0f3689c30c1afab8ba620` | swap `DETACH DELETE + CREATE` em uma única statement, payload erasure fail-closed por schema, vetores nullable, remoção de todas as relações catalogadas, retry idempotente, fencing e rollback/poison após apply-then-raise ou confirmação divergente; 46/46 no arquivo completo, 4/4 revalidados pelo Codex, Ruff/format/diff-check limpos e revisão independente sem blocker |
 | M-PULSE-1 — provider Kuzu compatível com `replace_node_payload` | concluído e integrado no branch de release atual | origem `milestone/kuzu-atomic-payload-contract@3a5a499f7d2addda98f0b37ce8b9d8ed36d4025d`; cherry-pick validado no bundle Community `feature/v0.3.3@c12f4d9db662c7ba42f0f3689c30c1afab8ba620`; handoff Nexus `hof_24969ea99ef247248fd3d127138b20f7` concluído/PASS | 22/22 contra Kuzu real passaram duas vezes pelo Codex com os paths Community/Core fixados e resolução de módulos comprovada; identidade, payload integral, arestas paralelas idênticas, incoming/outgoing/same-label/self-loop, lease loss e compensação pós-COMMIT cobertos; cinco mutantes mortos; `git diff --check` limpo e Ruff TRY/I sem delta contra o baseline |
 | M-PULSE-1 — bundle transacional Core/Community | concluído para este lote | Community `feature/v0.3.3@c12f4d9db662c7ba42f0f3689c30c1afab8ba620` publicado antes do Core `feature/v0.3.3@9f6f37da0c19371781ec86abd2cae2ae8fb400d3` | gate conjunto contra o mesmo contrato: Grafx 46/46, Kuzu 22/22 e Core versionado 14/14; ambos os updates foram fast-forward. Os 12 arquivos sujos do Community original e os 13 entries do Core original permaneceram exatamente no worktree local, sem reset, checkout ou sobrescrita |
-| M-PULSE-1 — primitives completas `GraphTransactionScope` | em execução | próximo lote sobre os branches reproduzíveis acima | tombstone está fechado no branch; faltam as três primitives de lineage, as duas de active-set e a conformance pública completa do port. `execute()` genérico continua deliberadamente em M-PULSE-2 |
+| M-PULSE-1 — Spec lineage no provider Grafx | concluído no milestone; integração do bundle pendente | Pulse Community `milestone/grafx-lineage-primitives@73b65dafb432b35ff3dea8edde8c6aa07b58c393` | `reconcile`, `clear` e compensação restore-first usam uma única resolução física por operação, before-images completos, transação Grafx real e rollback/poison após qualquer falha pós-mutation. 27/27 regressões próprias e 73/73 no gate combinado passaram; quatro provas adversariais cobriram múltiplos pais, self-loop, incoming/paralelas, metadata drift e cold reopen; Ruff/format/diff-check limpos e duas validações independentes sem blocker |
+| M-PULSE-1 — primitives completas `GraphTransactionScope` | em execução | próximo lote sobre os branches reproduzíveis acima | tombstone e as três primitives de lineage estão fechados; faltam as duas rotas de active-set, a integração coerente e a conformance pública completa do port. `execute()` genérico continua deliberadamente em M-PULSE-2 |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um
