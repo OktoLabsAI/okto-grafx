@@ -9,6 +9,11 @@ including the on-disk format.
 
 ### Added
 
+- **Pulse whole-node payload replacement is pinned at the public boundary.** One
+  `MATCH ... SET` replaces every adapter-owned mutable field while retaining `id` and
+  `source_session_id`, the exact incoming/outgoing/self-loop/parallel edge multiset and every
+  relationship property. Owner/outsider visibility, rollback, optimistic conflict, zero-match
+  no-op, commit, cold reopen and `verify()` are covered without delete/recreate or a new API.
 - **Relationship endpoints may now name nodes staged by the same transaction at the transaction
   substrate.** `stage_row_insert()` returns an authenticated owner-local `PendingRowRef`; only the
   two endpoint slots of a relationship INSERT may carry it. Commit reduces the full intent set,
