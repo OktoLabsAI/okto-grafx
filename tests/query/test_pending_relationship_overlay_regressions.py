@@ -15,7 +15,7 @@ import pytest
 
 import okto_grafx
 from okto_grafx.engine.txn_manager import TransactionManager
-from okto_grafx.errors import GrafxWriteConflict
+from okto_grafx.errors import GrafxPlanError, GrafxWriteConflict
 
 
 def _install_schema(database: object) -> None:
@@ -157,3 +157,28 @@ def test_the_losing_commit_never_reaches_the_write(
     assert writes == []  # the losing commit was refused before it wrote anything
     assert storage.page_count("heap.dat") == after_winner
     assert database.verify("all").findings == ()
+
+
+def test_pending_endpoint_identity_fails_closed_at_the_public_projection(
+    database: object,
+) -> None:
+    """The relationship overlay never exposes its owner-local endpoint tokens."""
+    writer = database.begin("write")
+    try:
+        writer.execute("CREATE (:Person {id: 1, name: 'source'})")
+        writer.execute("CREATE (:Person {id: 2, name: 'target'})")
+        writer.execute(
+            "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
+            "CREATE (a)-[:Knows {since: 2020, note: 'pending'}]->(b)"
+        )
+
+        with pytest.raises(GrafxPlanError) as raised:
+            writer.execute(
+                "MATCH (a:Person)-[r:Knows]->(b:Person) RETURN r._from, r._to"
+            )
+
+        assert raised.value.code == "plan_error"
+        assert "PendingRowRef" not in str(raised.value)
+        assert "PendingRowRef" not in repr(raised.value.details)
+    finally:
+        writer.rollback()
