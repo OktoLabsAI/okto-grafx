@@ -54,6 +54,18 @@
   públicos sobre 27 textos, 87 probes e 36 behaviours, com digest integral `54c3d757...` e zero
   `runtime_fragment`. O gate final passou 45/45, o rebuild ficou em 25,6 s e as revisões
   independente e Nexus `hof_ac705be83fb845ba8193c8f76a477ac8` concluíram sem blocker. Em
+  M-PULSE-2B, `coalesce`, `string_split` e `size` foram publicados na
+  `main@af2e21e678e60eb135967169598f82549157c504` após auditorias local e Nexus
+  `hof_e224557b3aba4ef8baed3bddc1c27de1` PASS. O corpus passou a digest `5ad93542...`,
+  com 61/26 probes aceitos/recusados e 18 débitos públicos. M-PULSE-2C acrescentou `CASE`
+  searched/simple, subscrito de listas e acesso composto a parâmetros no código final
+  `milestone/pulse-query-case-subscript@bf88462`; o corpus combinado tem digest `d9095a0f...`,
+  64/23 probes aceitos/recusados e 15 débitos públicos. A revisão Nexus
+  `hof_e3b5f54f3e2344949286b9768456df3e` encontrou duas composições defeituosas, fechadas
+  sem ampliar a linguagem por `045a8c2` e `bf88462`, com os handoffs
+  `hof_a1b17d76f49940dea1d0b00b609b985a` e
+  `hof_01b133a255454f4c8ed84026093e8d10`. O gate agrupado final manteve a suíte query,
+  o corpus, as fronteiras públicas, Ruff e diff-check verdes. Em
   paralelo, a primeira capacidade M-PULSE-3A de propriedades de node foi integrada no Pulse
   Community `feature/v0.3.3@4aae27eca9c0a2d1d14a3334b03e6c57976dea75`, ainda inativa até a
   composição do provider completo.
@@ -1011,8 +1023,14 @@ para copiar a implementação Kuzu. Esse limite impede que M-PULSE-1 se transfor
 `milestone/pulse-query-corpus@5b05b4f`. O descriptor `pulse-1` fixa os baselines Community
 `befaf1e4...` e Core `ab61b9a...`, as 68 famílias internas e a superfície pública 1.0. O corpus
 possui oráculos estruturados de erro, tipo, nulidade, cardinalidade, ordenação e efeito; o digest
-cobre o payload inteiro. A implementação de linguagem e o ratchet diferencial permanecem nos
-sublotes seguintes do próprio M-PULSE-2.
+cobre o payload inteiro. M-PULSE-2B foi publicado na `main@af2e21e`: `coalesce`,
+`string_split` e `size` reduziram a dívida pública de 21 para 18 constructs, com digest
+`5ad93542...`. M-PULSE-2C está congelado no código final `bf88462`: `CASE`
+searched/simple e subscritos de lista reduziram a dívida a 15 constructs, com digest
+`d9095a0f...`; `map access` permanece
+corretamente devido porque seu probe público depende do `UNWIND` ainda ausente. Os demais
+constructs, mutations internas e o ratchet diferencial total permanecem nos sublotes seguintes
+do próprio M-PULSE-2.
 
 1. gerar um corpus versionado a partir do contrato e das queries reais read-only e write do Pulse;
 2. implementar clauses/expressões/funções ausentes;
@@ -1173,6 +1191,8 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-1 — active-set e cleanup pós-compensação | concluído e integrado | Community `feature/v0.3.3@befaf1e4f9da9d0cff7cfc0f4aee177ef0a3e595` (código `36c2fc6`); Core `feature/v0.3.3@ab61b9a785f2018312fc91541a580877fd068bbb`; handoffs Nexus `hof_9649f2bc0a974519a99b98e7350a1c7e` e `hof_bf680c016aae4c9ca3a14d21d889660f` concluídos/PASS | before-images de nó/relação completos, vetores não nulos reconstituídos no tipo declarado, paralelas idênticas preservadas por multiset, NaN recusado antes de delete, múltiplos receipts netados e `rule_id` de Spec incluído na identidade. Provider legado com apenas `**kwargs` falha tipado antes do sweep |
 | M-PULSE-1 — primitives completas `GraphTransactionScope` | concluído e publicado | Community `milestone/grafx-mpulse1-conformance@befaf1e4f9da9d0cff7cfc0f4aee177ef0a3e595` → `feature/v0.3.3`; Core `milestone/grafx-transaction-contract@ab61b9a785f2018312fc91541a580877fd068bbb` → `feature/v0.3.3` | gate final: Grafx 123/123 em 14m25s, Kuzu/Spec 8/8, Core 61/61; auditoria independente focada 10/10 + 3/3 + 2/2 sem blocker; Ruff/format/diff-check limpos. Os worktrees originais permaneceram em `0401e412` com 12 mudanças e `985f6a88` com 13 entries. `execute()` genérico continua deliberadamente em M-PULSE-2 |
 | M-PULSE-2A — corpus query contract 1.0 | concluído no milestone | `milestone/pulse-query-corpus@5b05b4f`; digest `54c3d75797eb9c92c58bbfb796a3e772b77b4c0307f971af88e8cc4978927554`; revisão Nexus `hof_ac705be83fb845ba8193c8f76a477ac8` concluída/PASS | 97 entradas; 68 famílias internas = 47 read/21 write e 66 current/2 preventive; 17 templates nomeados + 11 gerados sobre 27 textos; 87 probes/36 behaviours; authorities 11/16/69; zero `runtime_fragment`; 45/45, `--check` 25,6 s, Ruff default/TRY/I/BLE, format e diff-check PASS; nenhuma mudança de engine neste sublote |
+| M-PULSE-2B — escalares Pulse | concluído e publicado | `milestone/pulse-query-coalesce@af2e21e678e60eb135967169598f82549157c504` → `main`; código `a48d87c`/`e5063ea`, ratchet `af2e21e`; revisão Nexus `hof_e224557b3aba4ef8baed3bddc1c27de1` concluída/PASS | `coalesce`, `string_split` e `size` tipados; parâmetros e incompatibilidades recusados antes de stream/efeitos; eager errors, falsey, null, promoção numérica e Unicode cobertos. Corpus digest `5ad93542b86cf5cc335d9334f05d1d6c8f5beddbcb15e812c1ba7dc0c224020d`, 69/26 entries, raw 61/26 e 18 débitos. Auditoria local 226/226, corpus 45/45, revisão Nexus query 373/373; Ruff configurado PASS e dívida TRY/I/BLE/format reduziu sem novo arquivo |
+| M-PULSE-2C — CASE e subscritos | concluído e publicado | `milestone/pulse-query-case-subscript@bf88462` → `main` (`863ec04` linguagem + `9787d6e` ratchet + `045a8c2`/`bf88462` hardening); revisão Nexus `hof_e3b5f54f3e2344949286b9768456df3e`; correções `hof_a1b17d76f49940dea1d0b00b609b985a` e `hof_01b133a255454f4c8ed84026093e8d10` concluídas/PASS | CASE searched/simple eager e com promoção determinística; lista 1-based/negativa, map-dot e composições nested; parâmetros nested são bindados antes do stream; colisões case-insensitive `a`/`A` recusadas e cache distingue `true` de `1`. Range conhecido é recusado mesmo em plano zero-row e CASE não recusa falsamente subscript de chamada escalar. Corpus digest `d9095a0fec35f834605c274f94bf1b2bad9ce8b6df144d22f58d3f73a5706bae`, raw 64/23 e 15 débitos. Suítes query/corpus/API saíram em `exit 0`; corpus `--check`, seis probes independentes, Ruff default e diff-check PASS |
 | M-PULSE-3A — propriedades de node | concluído e publicado no branch Pulse atual; helper ainda inativo | Pulse Community `milestone/grafx-mpulse3-node-properties@4aae27eca9c0a2d1d14a3334b03e6c57976dea75` → `feature/v0.3.3`; revisão Nexus `hof_cad849ee19e542eb862930f64054724d` concluída/PASS | labels desconhecidas retornam vazio sem tocar backend; label conhecida ausente/wrong-kind e DB fechado falham tipado; ordem de catálogo, snapshot, reopen e fronteiras públicas cobertos; 8/8, Ruff default/TRY/I/BLE e format PASS. A resolução `board_id → Database` fica no provider/composição, sem ativação parcial |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
