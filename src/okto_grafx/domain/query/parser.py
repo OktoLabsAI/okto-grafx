@@ -63,6 +63,7 @@ from okto_grafx.domain.query.ast import (
     Statement,
     Subscript,
     UnaryOperation,
+    UnwindClause,
     UpdatingClause,
     Variable,
 )
@@ -385,6 +386,7 @@ class _Parser:
 
     def _query(self) -> Query:
         """Parse a reading and updating query: MATCH clauses, updating clauses, then RETURN."""
+        unwind_clause: UnwindClause | None = None
         match_clauses: list[MatchClause] = []
         updating_clauses: list[UpdatingClause] = []
         return_clause: ReturnClause | None = None
@@ -397,6 +399,15 @@ class _Parser:
                     field="clauses",
                     value=MAX_CLAUSES,
                 )
+            if self._at_keyword("UNWIND"):
+                if clauses != 1:
+                    raise self._refuse(
+                        "UNWIND begins a query in this subset, so no clause may come before it",
+                        field="clause",
+                        value="UNWIND",
+                    )
+                unwind_clause = self._unwind_clause()
+                continue
             if self._at_keyword("MATCH"):
                 if updating_clauses or return_clause is not None:
                     raise self._refuse(
@@ -423,7 +434,12 @@ class _Parser:
                     value="WITH",
                 )
             updating_clauses.append(self._updating_clause())
-        if not match_clauses and not updating_clauses and return_clause is None:
+        if (
+            unwind_clause is None
+            and not match_clauses
+            and not updating_clauses
+            and return_clause is None
+        ):
             raise self._refuse("A query may not be empty", field="text")
         if return_clause is None and not updating_clauses:
             raise self._refuse(
@@ -432,10 +448,19 @@ class _Parser:
                 value="RETURN",
             )
         return Query(
+            unwind_clause=unwind_clause,
             match_clauses=tuple(match_clauses),
             updating_clauses=tuple(updating_clauses),
             return_clause=return_clause,
         )
+
+    def _unwind_clause(self) -> UnwindClause:
+        """Parse ``UNWIND <expression> AS <alias>``."""
+        self._take_keyword("UNWIND")
+        expression = self._expression()
+        self._take_keyword("AS")
+        alias = self._take_name("an alias")
+        return UnwindClause(expression=expression, alias=alias)
 
     def _updating_clause(self) -> UpdatingClause:
         """Parse one clause that writes."""

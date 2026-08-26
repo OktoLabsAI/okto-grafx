@@ -253,8 +253,8 @@
       "RETURN"
     ],
     "probe_count": 87,
-    "engine_accepted": 66,
-    "engine_refused": 21,
+    "engine_accepted": 69,
+    "engine_refused": 18,
     "contract_refused": 13,
     "contract_error_codes": {
       "unsafe_cypher": 10,
@@ -755,9 +755,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "parse_error",
-        "engine_verdict": "refused",
-        "error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'UNWIND' (line 1, column 1). [code=parse_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "root",
@@ -1041,9 +1041,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "parse_error",
-        "engine_verdict": "refused",
-        "error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'UNWIND' (line 1, column 1). [code=parse_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "expression",
@@ -1063,9 +1063,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "parse_error",
-        "engine_verdict": "refused",
-        "error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'UNWIND' (line 1, column 1). [code=parse_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "expression",
@@ -1700,10 +1700,10 @@
     "class:fragment": 1,
     "class:read": 75,
     "class:write": 21,
-    "classification:already_supported": 69,
+    "classification:already_supported": 71,
     "classification:duplicate_text": 1,
     "classification:fragment": 1,
-    "classification:generic_gap": 26,
+    "classification:generic_gap": 24,
     "reachability:preventive": 2,
     "reachability:runtime_current": 66,
     "surface:internal_family": 68,
@@ -5370,9 +5370,9 @@
           "receiver": "conn"
         }
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "parse_error",
-      "parse_error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'UNWIND' (line 1, column 1). [code=parse_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "reachability": "runtime_current",
       "expected": {
         "kind": "effect",
@@ -5385,12 +5385,7 @@
         "return_metadata": [],
         "expected_count": "one_per_batch_row",
         "atomicity": "one statement inside the caller's transaction; the scope rolls it back with the rest of the session when compensation runs",
-        "error": {
-          "phase": "parse_error",
-          "code": "parse_error",
-          "type": "GrafxParseError",
-          "message": "Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'UNWIND' (line 1, column 1). [code=parse_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -5414,9 +5409,9 @@
           "receiver": "conn"
         }
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "parse_error",
-      "parse_error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'UNWIND' (line 1, column 1). [code=parse_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "reachability": "runtime_current",
       "expected": {
         "kind": "effect",
@@ -5430,12 +5425,7 @@
         "return_metadata": [],
         "expected_count": "one_per_batch_row",
         "atomicity": "one statement inside the caller's transaction; the scope rolls it back with the rest of the session when compensation runs",
-        "error": {
-          "phase": "parse_error",
-          "code": "parse_error",
-          "type": "GrafxParseError",
-          "message": "Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'UNWIND' (line 1, column 1). [code=parse_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -7817,5 +7807,5 @@
       }
     }
   ],
-  "digest": "75622dfe057ca446d200c91ad1041718bd15058d99e222948f3aae339901dfa0"
+  "digest": "836d55ad41bb617f3e71cf788ca164b0eca9c038964c63ec6542e87184e6f1e9"
 }

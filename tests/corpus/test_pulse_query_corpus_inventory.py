@@ -649,11 +649,20 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         assert name in functions, name
 
     by_construct = {probe["construct"]: probe for probe in raw["probes"]}
-    # M-PULSE-2C closes the standalone list-index and both CASE grammar probes, and M-PULSE-2D
-    # closes the last two functions. Map access deliberately remains owed because its public
-    # probe starts with UNWIND, which is a separate clause milestone and therefore cannot be
-    # claimed from expression support alone.
-    for name in ("list index", "CASE searched", "CASE simple", "label", "timestamp"):
+    # M-PULSE-2C closes the standalone list-index and both CASE grammar probes, M-PULSE-2D
+    # closes the last two functions, and M-PULSE-2E closes the one leading UNWIND source.
+    # The two UNWIND probes with identical text remain distinct grammar keys, so both have to
+    # ratchet beside map access rather than being deduplicated by their spelling.
+    for name in (
+        "list index",
+        "CASE searched",
+        "CASE simple",
+        "label",
+        "timestamp",
+        "UNWIND",
+        "map batch",
+        "map access",
+    ):
         probe = by_construct[name]
         assert probe["contract_disposition"] == "allowed", name
         assert probe["engine_verdict"] == "accepted", name
@@ -665,12 +674,12 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         probe for probe in raw["probes"] if probe["engine_verdict"] == "accepted"
     ]
     refused = [probe for probe in raw["probes"] if probe["engine_verdict"] == "refused"]
-    assert len(accepted) == 66
-    assert len(refused) == 21
-    assert len(owed) == 13
+    assert len(accepted) == 69
+    assert len(refused) == 18
+    assert len(owed) == 10
 
-    assert frozen["counts"]["classification:already_supported"] == 69
-    assert frozen["counts"]["classification:generic_gap"] == 26
+    assert frozen["counts"]["classification:already_supported"] == 71
+    assert frozen["counts"]["classification:generic_gap"] == 24
 
 
 def test_every_raw_probe_has_one_contract_and_engine_verdict(frozen: dict) -> None:

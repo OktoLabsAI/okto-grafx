@@ -60,6 +60,7 @@ __all__ = [
     "Statement",
     "Subscript",
     "UnaryOperation",
+    "UnwindClause",
     "UpdatingClause",
     "Variable",
     "free_variables",
@@ -444,6 +445,24 @@ class PatternPath:
 
 
 @dataclass(frozen=True, slots=True)
+class UnwindClause:
+    """One list expanded into rows, each bound to a name the rest of the query reads.
+
+    Pulse sends its batch writes this way: one parameter carrying a list of maps, then a
+    MATCH keyed on a field of each element. The clause opens the query -- no frozen form has
+    it following anything -- so a plan can treat it as the source of rows rather than as a
+    shaping step over rows that already exist.
+    """
+
+    expression: Expression
+    alias: str
+
+    def describe(self) -> str:
+        """Return the clause as it would be written back."""
+        return f"UNWIND {self.expression.describe()} AS {self.alias}"
+
+
+@dataclass(frozen=True, slots=True)
 class MatchClause:
     """A MATCH clause and the WHERE predicate that belongs to it."""
 
@@ -602,6 +621,7 @@ class Statement:
 class Query(Statement):
     """A reading and updating query: MATCH clauses, then updating clauses, then RETURN."""
 
+    unwind_clause: UnwindClause | None = None
     match_clauses: tuple[MatchClause, ...] = ()
     updating_clauses: tuple[UpdatingClause, ...] = ()
     return_clause: ReturnClause | None = None
@@ -613,7 +633,8 @@ class Query(Statement):
 
     def describe(self) -> str:
         """Return the query as it would be written back."""
-        parts = [clause.describe() for clause in self.match_clauses]
+        parts = [] if self.unwind_clause is None else [self.unwind_clause.describe()]
+        parts.extend(clause.describe() for clause in self.match_clauses)
         parts.extend(clause.describe() for clause in self.updating_clauses)
         if self.return_clause is not None:
             parts.append(self.return_clause.describe())

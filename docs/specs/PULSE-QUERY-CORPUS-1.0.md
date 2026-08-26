@@ -67,9 +67,9 @@ This keeps an unsupported family useful: closing the language gap must change th
 ## Counts at `pulse-1`
 
 `97` entries, digest
-`75622dfe057ca446d200c91ad1041718bd15058d99e222948f3aae339901dfa0`.
+`836d55ad41bb617f3e71cf788ca164b0eca9c038964c63ec6542e87184e6f1e9`.
 
-The engine currently classifies 69 entries as `already_supported` and 26 as `generic_gap`;
+The engine currently classifies 71 entries as `already_supported` and 24 as `generic_gap`;
 the duplicate and declared fragment remain separate classifications.
 
 **Internal families** — 68 closed families over the audited originators, 47 read and
@@ -103,22 +103,19 @@ Each probe carries two independent answers. `contract_disposition` is what the *
 endpoint** admits; `engine_verdict` is what **this engine** does with the same text. They
 differ on purpose: the contract blacklists writes, while the engine accepts writes because
 the internal port needs them. Today the contract allows 74 probes and refuses 13 (10
-`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 66 and refuses 21. The
-intersection that matters to the public endpoint is the 13 allowed probes the engine still
+`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 69 and refuses 18. The
+intersection that matters to the public endpoint is the 10 allowed probes the engine still
 refuses.
 
 ### What M-PULSE-2 owes
 
-These 13 constructs are admitted by the public contract and refused by the engine:
+These 10 constructs are admitted by the public contract and refused by the engine:
 
 | Construct | Category | Refused at |
 | --- | --- | --- |
 | `OPTIONAL MATCH` | root | parse error |
-| `UNWIND` | root | parse error |
 | `WITH` | root | parse error |
 | `UNION` | clause | parse error |
-| `map batch` | parameter | parse error |
-| `map access` | expression | parse error |
 | `untyped relationship` | pattern | plan error |
 | `polymorphic node` | pattern | plan error |
 | `named path` | pattern | parse error |
@@ -132,9 +129,10 @@ No function is owed any more. `label` and `timestamp` were the last two, and the
 call node — which is why acceptance here runs `analyze` and `build_plan` and not the parser
 alone. With M-PULSE-2D they join the three scalar helpers, standalone list indexing and both
 CASE forms at `planned`; those ratchets are frozen in both the JSON and its sentinels.
-`map access` remains owed because its public probe starts with `UNWIND`, so it
-cannot become accepted until that separate clause exists. This is why acceptance records parse,
-analysis and planning separately.
+M-PULSE-2E adds the single leading `UNWIND` source used by Pulse batches, so the root `UNWIND`,
+`map batch` and `map access` probes now plan together. The two internal scoring families I67/I68
+move from `generic_gap` to `already_supported` without changing their frozen effect or atomicity
+oracles. This is why acceptance records parse, analysis and planning separately.
 
 ### The behavioural contract beside the grammar
 
@@ -251,8 +249,8 @@ the environment variable to set. They never pass silently on absent baselines.
 
 ## What this deliberately does not do
 
-- No clauses, provider work or endpoint activation. M-PULSE-2B/2C/2D close only the scalar,
-  CASE, standalone-list and function forms recorded above; the other 13 admitted/refused
+- No provider work or endpoint activation. M-PULSE-2B/2C/2D/2E close only the scalar,
+  CASE, standalone-list, function and leading-UNWIND forms recorded above; the other 10 admitted/refused
   constructs remain later M-PULSE-2 work.
 - No hidden profile switch or Pulse-specific bypass: the helpers use the ordinary typed planner
   and executor paths.

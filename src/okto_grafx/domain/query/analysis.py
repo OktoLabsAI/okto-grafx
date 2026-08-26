@@ -46,6 +46,7 @@ from okto_grafx.domain.query.ast import (
     ReturnClause,
     SetClause,
     Statement,
+    UnwindClause,
     Variable,
     walk,
 )
@@ -64,6 +65,7 @@ from okto_grafx.domain.query.tokens import (
 __all__ = [
     "ENTITY_NODE",
     "ENTITY_RELATIONSHIP",
+    "ENTITY_UNWOUND",
     "Aggregation",
     "Binding",
     "QueryAnalysis",
@@ -75,6 +77,8 @@ __all__ = [
 
 ENTITY_NODE: str = "node"
 ENTITY_RELATIONSHIP: str = "relationship"
+ENTITY_UNWOUND: str = "unwound value"
+"""What UNWIND binds: one element of a list, which is a value and not a matched row."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +225,8 @@ class _Analyzer:
 
     def run(self) -> QueryAnalysis:
         """Analyse the whole query and return what the planner needs."""
+        if self._query.unwind_clause is not None:
+            self._unwind_clause(self._query.unwind_clause)
         for clause in self._query.match_clauses:
             self._match_clause(clause)
         for clause in self._query.updating_clauses:
@@ -282,7 +288,7 @@ class _Analyzer:
             return
         if isinstance(clause, DeleteClause):
             for target in clause.targets:
-                self._require_bound(target.name, "DELETE")
+                self._require_bound_entity(target.name, "DELETE")
             return
         raise self._refuse(
             f"A clause of type {type(clause).__name__} cannot be planned.",
@@ -414,6 +420,18 @@ class _Analyzer:
         for entry in properties.entries:
             self._check_expression(entry.value, where="an inline property")
             self._refuse_aggregate(entry.value, "a pattern")
+
+    def _unwind_clause(self, clause: UnwindClause) -> None:
+        """Check the list UNWIND expands, then bind what it produced.
+
+        The order matters: the expression may not read the alias it is about to define, so it
+        is checked while that name is still unbound.
+        """
+
+        self._check_expression(clause.expression, where="an UNWIND list")
+        # There is no group before the source, so an aggregate here has nothing to summarise.
+        self._refuse_aggregate(clause.expression, "UNWIND")
+        self._bind(clause.alias, ENTITY_UNWOUND, (), created=False)
 
     def _bind(
         self, name: str | None, entity: str, labels: tuple[str, ...], *, created: bool
@@ -729,7 +747,20 @@ class _Analyzer:
                 field="target",
                 value=target.describe(),
             )
-        self._require_bound(target.subject.name, keyword)
+        self._require_bound_entity(target.subject.name, keyword)
+
+    def _require_bound_entity(self, name: str, where: str) -> None:
+        """Require a variable that names a matched node or relationship, not a row value."""
+        self._require_bound(name, where)
+        binding = self._binding(name)
+        if binding is not None and binding.entity in (ENTITY_NODE, ENTITY_RELATIONSHIP):
+            return
+        raise self._refuse(
+            f"{where} targets a matched node or relationship; {name!r} is an "
+            f"{binding.entity if binding is not None else 'unbound value'}.",
+            field="variable",
+            value=name,
+        )
 
     def _note_parameter(self, name: str) -> None:
         """Record a parameter reference, refusing a query that names too many."""

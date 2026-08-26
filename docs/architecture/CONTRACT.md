@@ -903,7 +903,7 @@ class QueryEngine:
 ```
 Cypher subset (openCypher, Kùzu dialect): `CREATE NODE TABLE` / `CREATE REL TABLE` /
 `CREATE VECTOR SPACE`, `CREATE`, `MATCH` (+ variable-length `-[:R*1..3]->`), `WHERE`, `RETURN`
-(`DISTINCT`, aliases), `ORDER BY`, `SKIP`, `LIMIT`, `SET`, `DELETE`, `MERGE`, parameters `$name`,
+(`DISTINCT`, aliases), one leading `UNWIND`, `ORDER BY`, `SKIP`, `LIMIT`, `SET`, `DELETE`, `MERGE`, parameters `$name`,
 aggregates `count/sum/avg/min/max/collect`, the scalar functions `coalesce(value, ...)`,
 `string_split(text, separator)` and `size(value)`, and the similarity extension. `coalesce`
 evaluates every argument from left to right and returns the first non-null one, or null when all
@@ -949,6 +949,18 @@ position, a non-integer index or a non-list subject is refused. Map fields remai
 case-insensitively; bracket syntax is list extraction and never map-key access. A referenced
 parameter map, including a map nested in a list, is refused during binding when two string keys
 collide case-insensitively, so lookup never depends on insertion order.
+
+`UNWIND expression AS alias` is a source clause and therefore appears once, at the beginning of
+the statement. Its carrier must be a list or tuple; null, strings, bytes, maps and scalar carriers
+are refused before the first downstream row, while an empty list produces no rows and a null list
+element remains an ordinary null value. The alias is a value: it may be projected or read through
+case-insensitive map properties, but it is never a `SET` or `DELETE` target and cannot be rebound
+as a node or relationship. The frozen tail is either an immediate `RETURN`, or exactly one
+single-node `MATCH` and one `SET` with no `RETURN`. The latter form holds every write until the
+whole batch succeeds. A primary-key predicate such as `n.id = r.id` plans one correlated
+`IndexSeek` per batch row when the clean index is available; it never opens general correlation
+to arbitrary matched variables. `UnwindRows` is streaming and participates once, through the
+common operator wrapper, in `max_intermediate_rows`.
 
 ```
 MATCH (n:Chunk)-[:BELONGS_TO]->(d:Doc)

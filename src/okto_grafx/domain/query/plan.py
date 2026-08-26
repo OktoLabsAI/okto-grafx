@@ -68,6 +68,7 @@ __all__ = [
     "SkipRows",
     "SortRows",
     "TraverseRelationship",
+    "UnwindRows",
     "VectorSearch",
     "plan_nodes",
     "validate_plan",
@@ -178,6 +179,28 @@ class SingleRow(PlanNode):
     def details(self) -> Mapping[str, object]:
         """Return nothing; this operator has no settings."""
         return {}
+
+
+@dataclass(frozen=True, slots=True)
+class UnwindRows(PlanNode):
+    """One row per element of a list, each bound to the name the clause gave it.
+
+    The source of a batch statement. It streams: the executor pulls one element at a time and
+    the rest of the plan runs to completion for that element before the next is read, so a
+    thousand-element batch never has to exist as a thousand rows at once.
+    """
+
+    child: PlanNode
+    alias: str
+    expression: Expression
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Return the operator whose single row this expansion runs under."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Return the name bound and the list it was bound from."""
+        return {"alias": self.alias, "list": self.expression.describe()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,7 +360,9 @@ class VectorSearch(PlanNode):
             "k": "all candidates" if self.k is None else self.k.describe(),
         }
         if self.threshold is not None and self.threshold_operator is not None:
-            settings["threshold"] = f"{self.threshold_operator} {self.threshold.describe()}"
+            settings["threshold"] = (
+                f"{self.threshold_operator} {self.threshold.describe()}"
+            )
         return settings
 
 
@@ -578,9 +603,7 @@ class SetProperties(PlanNode):
 
     def details(self) -> Mapping[str, object]:
         """Return the assignments."""
-        return {
-            "assignments": ", ".join(item.describe() for item in self.assignments)
-        }
+        return {"assignments": ", ".join(item.describe() for item in self.assignments)}
 
 
 @dataclass(frozen=True, slots=True)

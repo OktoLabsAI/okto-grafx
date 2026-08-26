@@ -117,6 +117,7 @@ from okto_grafx.domain.query.plan import (
     SkipRows,
     SortRows,
     TraverseRelationship,
+    UnwindRows,
     VectorSearch,
     validate_plan,
 )
@@ -1882,6 +1883,7 @@ _QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
         SkipRows,
         SortRows,
         TraverseRelationship,
+        UnwindRows,
         VectorSearch,
     }
 )

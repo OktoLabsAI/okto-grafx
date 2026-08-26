@@ -150,6 +150,7 @@ from okto_grafx.domain.query.plan import (
     SkipRows,
     SortRows,
     TraverseRelationship,
+    UnwindRows,
     VectorSearch,
     validate_plan,
 )
@@ -1594,6 +1595,39 @@ def _single_row(
 ) -> Iterator[_Row]:
     """Produce the one empty row a bare RETURN reads."""
     yield _Row(bindings={})
+
+
+def _unwind_rows(
+    engine: QueryEngine, node: UnwindRows, context: _Context
+) -> Iterator[_Row]:
+    """Expand one list into rows, one element at a time.
+
+    The list is read as the source of the statement, so a carrier that is not a list is
+    refused before any row leaves this operator and therefore before anything downstream can
+    stage a write. A string and a map are refused with it: both are iterable in Python and
+    neither is a list, and quietly expanding one into characters or keys would answer a
+    different query from the one that was written.
+
+    Null INSIDE the list is an ordinary element and binds as null; only the carrier itself
+    has to be a list. An empty list produces no rows, which is how a batch with nothing to do
+    writes nothing rather than failing.
+    """
+
+    for row in engine._rows(node.child, context):
+        carrier = _evaluate(node.expression, row, context)
+        if not isinstance(carrier, (list, tuple)):
+            named = "null" if carrier is None else type(carrier).__name__
+            message = (
+                f"{node.expression.describe()} is expanded by UNWIND, so it has to be a "
+                f"list; got {named}."
+            )
+            raise GrafxPlanError(
+                message,
+                field="unwind",
+                value=node.alias,
+            )
+        for element in carrier:
+            yield _Row(bindings={**row.bindings, node.alias: element})
 
 
 def _node_scan(
@@ -3596,6 +3630,7 @@ _Handler = Callable[[QueryEngine, PlanNode, _Context], Iterator[_Row]]
 
 _HANDLERS: dict[type, _Handler] = {
     SingleRow: _single_row,  # type: ignore[dict-item]
+    UnwindRows: _unwind_rows,  # type: ignore[dict-item]
     NodeScan: _node_scan,  # type: ignore[dict-item]
     IndexSeek: _index_seek,  # type: ignore[dict-item]
     TraverseRelationship: _traverse,  # type: ignore[dict-item]

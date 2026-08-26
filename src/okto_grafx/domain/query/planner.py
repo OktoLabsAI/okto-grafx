@@ -103,6 +103,7 @@ from okto_grafx.domain.query.plan import (
     SkipRows,
     SortRows,
     TraverseRelationship,
+    UnwindRows,
     VectorSearch,
     validate_plan,
 )
@@ -403,6 +404,7 @@ class _Planner:
     analysis: QueryAnalysis
     tables: dict[str, TableDef] = field(default_factory=dict)
     multi_hop_variables: set[str] = field(default_factory=set)
+    unwind_alias: str | None = None
     label_calls: list[FunctionCall] = field(default_factory=list)
     timestamp_calls: list[FunctionCall] = field(default_factory=list)
     coalesce_argument_types: dict[FunctionCall, tuple[ValueType | None, ...]] = field(
@@ -689,6 +691,14 @@ class _Planner:
     def _query(self, statement: Query) -> PlannedQuery:
         """Plan a reading and updating query."""
         pipeline: PlanNode = SingleRow()
+        if statement.unwind_clause is not None:
+            self._require_batch_shape(statement)
+            self.unwind_alias = statement.unwind_clause.alias
+            pipeline = UnwindRows(
+                child=pipeline,
+                alias=statement.unwind_clause.alias,
+                expression=statement.unwind_clause.expression,
+            )
         similarity_terms: list[Expression] = []
         for clause in statement.match_clauses:
             pipeline, deferred = self._match_clause(pipeline, clause)
@@ -733,6 +743,35 @@ class _Planner:
                 )
                 coalesce_result_type(node.name, types)
                 self.coalesce_argument_types[node] = types
+
+    def _require_batch_shape(self, statement: Query) -> None:
+        """Refuse any tail this batch subset does not carry.
+
+        The frozen corpus has exactly two shapes after UNWIND: a RETURN, and a MATCH whose
+        SET writes the properties of each element. Naming what is supported rather than
+        guessing keeps a CREATE or a DELETE from arriving through a clause that was only ever
+        meant to feed a scoring update.
+        """
+
+        if statement.return_clause is not None:
+            if not statement.match_clauses and not statement.updating_clauses:
+                return
+        elif (
+            len(statement.match_clauses) == 1
+            and len(statement.updating_clauses) == 1
+            and isinstance(statement.updating_clauses[0], SetClause)
+            and len(statement.match_clauses[0].patterns) == 1
+            and len(statement.match_clauses[0].patterns[0].nodes) == 1
+            and not statement.match_clauses[0].patterns[0].relationships
+            and statement.match_clauses[0].predicate is None
+        ):
+            return
+        raise GrafxPlanError(
+            "UNWIND is followed either directly by RETURN, or by exactly one MATCH and one "
+            "single-node SET with no RETURN in this subset.",
+            field="clause",
+            value="UNWIND",
+        )
 
     def _record_label_arguments(self, statement: Query) -> None:
         """Refuse a label() argument that is not one matched row, while still planning.
@@ -1257,6 +1296,8 @@ class _Planner:
     def _query_expressions(self, statement: Query) -> tuple[Expression, ...]:
         """Return every expression root the query may evaluate."""
         roots: list[Expression] = []
+        if statement.unwind_clause is not None:
+            roots.append(statement.unwind_clause.expression)
         for clause in statement.match_clauses:
             for pattern in clause.patterns:
                 roots.extend(self._pattern_expressions(pattern))
@@ -1438,9 +1479,7 @@ class _Planner:
                 continue
             if subject.subject.name != variable:
                 continue
-            if free_variables(value):
-                continue
-            if not isinstance(value, (Literal, Parameter)):
+            if not self._seekable_key(value):
                 continue
             if self._column_of(table, subject.key) is None:
                 raise GrafxPlanError(
@@ -1450,6 +1489,29 @@ class _Planner:
                 )
             return subject.key, value
         return None
+
+    def _seekable_key(self, value: Expression) -> bool:
+        """Whether an index can be probed with this value once per driving row.
+
+        A literal or a parameter is the same for every row, so the seek is trivially valid.
+        The batch element is the one row-dependent value allowed: ``UnwindRows`` has already
+        bound it by the time the seek runs, and probing the index once per element is the
+        whole point of the shape -- the alternative is a scan of the table for every element.
+
+        Nothing wider is admitted. Another matched variable would make the seek depend on a
+        row this operator may not have produced yet, which is a different feature with a
+        different correctness argument.
+        """
+
+        if isinstance(value, (Literal, Parameter)):
+            return not free_variables(value)
+        if self.unwind_alias is None:
+            return False
+        return (
+            isinstance(value, Property)
+            and isinstance(value.subject, Variable)
+            and value.subject.name == self.unwind_alias
+        )
 
     def _traverse(
         self,
