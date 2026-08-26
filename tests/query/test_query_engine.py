@@ -532,6 +532,59 @@ def test_zero_and_out_of_range_list_positions_are_typed_refusals(
     assert failure.value.details == {"field": "subscript", "value": index}
 
 
+@pytest.mark.parametrize("index", (0, 3, -3))
+def test_out_of_range_list_positions_are_refused_when_no_row_matches(
+    stack: QueryStack, index: int
+) -> None:
+    """An empty match must not swallow a subscript that is already wrong.
+
+    The list and the position are both bound, so the query is invalid whatever the pattern
+    finds.  Leaving the check to row evaluation meant an off-by-one returned an empty result
+    and only surfaced once the board happened to hold data.
+    """
+
+    with pytest.raises(GrafxPlanError) as failure:
+        run(stack, f"MATCH (p:Person) WHERE p.id = 99 RETURN $items[{index}]",
+            {"items": [10, 20]})
+    assert failure.value.details == {"field": "subscript", "value": index}
+
+
+def test_an_empty_match_refuses_an_out_of_range_subscript_in_a_predicate(
+    stack: QueryStack,
+) -> None:
+    """The same holds in WHERE, where an empty result is even easier to mistake for success."""
+
+    with pytest.raises(GrafxPlanError) as failure:
+        run(
+            stack,
+            "MATCH (p:Person) WHERE p.id = 99 AND $items[0] = 10 RETURN p.id",
+            {"items": [10, 20]},
+        )
+    assert failure.value.details == {"field": "subscript", "value": 0}
+
+
+def test_subscripts_the_binder_cannot_resolve_still_run_per_row(
+    stack: QueryStack,
+) -> None:
+    """Anticipating the range check must not turn a valid query into a bind-time refusal.
+
+    A row-dependent subject obviously has to wait for rows, but so does a call such as
+    ``string_split('a,b', ',')[1]``: it is row-independent and still outside the binder's
+    postfix vocabulary.  Guarding on "contains no variable" instead of "the binder can
+    evaluate this" would refuse both of these before they ever ran.
+    """
+
+    per_row = run(
+        stack, "MATCH (p:Person) WHERE p.id = 99 RETURN string_split(p.name, 'a')[1]"
+    )
+    assert per_row.rows == ()
+
+    literal_call = run(
+        stack, "MATCH (p:Person) WHERE p.id = 99 RETURN string_split('a,b', ',')[1]"
+    )
+    assert literal_call.rows == ()
+
+
 @pytest.mark.parametrize("index", (1.0, True, "1"))
 def test_list_subscript_parameter_type_is_checked_before_rows(
     stack: QueryStack, index: object

@@ -4058,6 +4058,30 @@ def _bound_value_type(
         ) from failure
 
 
+def _binder_resolvable(expression: Expression) -> bool:
+    """Whether ``_bound_postfix_value`` can evaluate this expression during binding.
+
+    Deliberately narrower than "contains no Variable": a call such as
+    ``string_split('a,b', ',')[1]`` is row-independent yet outside the binder's postfix
+    vocabulary, so asking it to evaluate one would turn a valid query into a bind-time
+    refusal.  This predicate lists exactly the shapes that function handles.
+    """
+
+    if isinstance(expression, (Literal, Parameter)):
+        return True
+    if isinstance(expression, ListExpression):
+        return all(_binder_resolvable(element) for element in expression.elements)
+    if isinstance(expression, MapExpression):
+        return all(_binder_resolvable(entry.value) for entry in expression.entries)
+    if isinstance(expression, Property):
+        return _binder_resolvable(expression.subject)
+    if isinstance(expression, Subscript):
+        return _binder_resolvable(expression.subject) and _binder_resolvable(
+            expression.index
+        )
+    return False
+
+
 def _bound_postfix_value(
     expression: Expression, parameters: Mapping[str, object], *, owner: str
 ) -> object:
@@ -4413,6 +4437,14 @@ def _validate_bound_subscript_types(
             owner=expression.describe(),
         )
         subscript_argument_types(expression, subject_type, index_type)
+        if _binder_resolvable(expression):
+            # Evaluating it here is what turns "zero rows" back into a refusal: the position
+            # and the list are both bound, so an out-of-range subscript is already wrong
+            # whether or not the pattern matches anything.  The value is discarded; only the
+            # refusal inside _subscript_value matters.
+            _bound_postfix_value(
+                expression, parameters, owner=expression.describe()
+            )
 
 
 def _bound_coalesce_types(
