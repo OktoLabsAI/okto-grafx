@@ -253,8 +253,8 @@
       "RETURN"
     ],
     "probe_count": 87,
-    "engine_accepted": 64,
-    "engine_refused": 23,
+    "engine_accepted": 66,
+    "engine_refused": 21,
     "contract_refused": 13,
     "contract_error_codes": {
       "unsafe_cypher": 10,
@@ -1195,9 +1195,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "analysis_error",
-        "engine_verdict": "refused",
-        "error": "GrafxPlanError: There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "function",
@@ -1239,9 +1239,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "analysis_error",
-        "engine_verdict": "refused",
-        "error": "GrafxPlanError: There is no function named 'timestamp' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "function",
@@ -5509,8 +5509,8 @@
         "node_type"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -5530,10 +5530,10 @@
         "limit": null,
         "notes": "ungrouped aggregate: one null-free scalar row",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
+          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
         }
       }
     },
@@ -5934,8 +5934,8 @@
         "min_relevance"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6081,10 +6081,10 @@
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
+          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
         }
       }
     },
@@ -6112,8 +6112,8 @@
         "min_relevance"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6259,10 +6259,10 @@
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
+          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
         }
       }
     },
@@ -6289,8 +6289,8 @@
         "node_type"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6436,10 +6436,10 @@
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
+          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
         }
       }
     },
@@ -6468,8 +6468,8 @@
         "node_type"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6615,10 +6615,10 @@
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
+          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
         }
       }
     },
@@ -7817,5 +7817,5 @@
       }
     }
   ],
-  "digest": "d9095a0fec35f834605c274f94bf1b2bad9ce8b6df144d22f58d3f73a5706bae"
+  "digest": "75622dfe057ca446d200c91ad1041718bd15058d99e222948f3aae339901dfa0"
 }

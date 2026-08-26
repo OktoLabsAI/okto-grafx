@@ -67,7 +67,7 @@ This keeps an unsupported family useful: closing the language gap must change th
 ## Counts at `pulse-1`
 
 `97` entries, digest
-`d9095a0fec35f834605c274f94bf1b2bad9ce8b6df144d22f58d3f73a5706bae`.
+`75622dfe057ca446d200c91ad1041718bd15058d99e222948f3aae339901dfa0`.
 
 The engine currently classifies 69 entries as `already_supported` and 26 as `generic_gap`;
 the duplicate and declared fragment remain separate classifications.
@@ -103,13 +103,13 @@ Each probe carries two independent answers. `contract_disposition` is what the *
 endpoint** admits; `engine_verdict` is what **this engine** does with the same text. They
 differ on purpose: the contract blacklists writes, while the engine accepts writes because
 the internal port needs them. Today the contract allows 74 probes and refuses 13 (10
-`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 64 and refuses 23. The
-intersection that matters to the public endpoint is the 15 allowed probes the engine still
+`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 66 and refuses 21. The
+intersection that matters to the public endpoint is the 13 allowed probes the engine still
 refuses.
 
 ### What M-PULSE-2 owes
 
-These 15 constructs are admitted by the public contract and refused by the engine:
+These 13 constructs are admitted by the public contract and refused by the engine:
 
 | Construct | Category | Refused at |
 | --- | --- | --- |
@@ -119,8 +119,6 @@ These 15 constructs are admitted by the public contract and refused by the engin
 | `UNION` | clause | parse error |
 | `map batch` | parameter | parse error |
 | `map access` | expression | parse error |
-| `label` | function | analysis error |
-| `timestamp` | function | analysis error |
 | `untyped relationship` | pattern | plan error |
 | `polymorphic node` | pattern | plan error |
 | `named path` | pattern | parse error |
@@ -129,10 +127,12 @@ These 15 constructs are admitted by the public contract and refused by the engin
 | `unbounded variable length` | limits | parse error |
 | `path projection` | result | parse error |
 
-Two of them, `label` and `timestamp`, are functions and fail at **analysis**, not at parsing:
-an unknown function still parses into a generic call node. The three scalar helpers, standalone
-list indexing and both CASE forms now reach `planned`; those ratchets are frozen in both the JSON
-and its sentinels. `map access` remains owed because its public probe starts with `UNWIND`, so it
+No function is owed any more. `label` and `timestamp` were the last two, and they failed at
+**analysis** rather than at parsing, because an unknown function still parses into a generic
+call node — which is why acceptance here runs `analyze` and `build_plan` and not the parser
+alone. With M-PULSE-2D they join the three scalar helpers, standalone list indexing and both
+CASE forms at `planned`; those ratchets are frozen in both the JSON and its sentinels.
+`map access` remains owed because its public probe starts with `UNWIND`, so it
 cannot become accepted until that separate clause exists. This is why acceptance records parse,
 analysis and planning separately.
 
@@ -159,7 +159,7 @@ non-mutating root is `unsupported_operation`, an unsafe canonical rewrite is
 Typed values keep their boundary explicit. Graph `TIMESTAMP` values remain typed until
 `KGService` converts them to ISO text for its public result. Similarity retrieval stays on
 the structured `graph_store.vector_search` port; Pulse does not require a provider-specific
-raw Cypher vector function. The raw `timestamp()` probe is still recorded as an endpoint
+raw Cypher vector function. The raw `timestamp()` probe is recorded as an endpoint
 language mismatch, while these behavioural facts prevent it from being confused with the
 way current Pulse application paths store timestamps or request vector search.
 
@@ -178,8 +178,9 @@ By execution, not by judgement.
 2. Otherwise the template is materialized and handed to this repository's own `parse`,
    `analyze` and `build_plan` against the closed Pulse catalog. Only a query accepted by all
    three is `already_supported`; the last phase reached is recorded in `acceptance_phase`.
-   Parsing alone is not accepting: `label` and `timestamp` still become generic call nodes,
-   while polymorphic nodes and untyped relationships reach planning before they are refused.
+   Parsing alone is not accepting: an unknown function becomes a generic call node and is
+   only caught by `analyze`, while polymorphic nodes and untyped relationships reach
+   planning before they are refused.
 3. Materialization happens **twice**: once filling holes with identifiers, once with the
    empty string. A hole is not always an identifier — some carry an optional clause — and
    filling a clause hole with an identifier produces text that was never sent. If either
@@ -250,9 +251,9 @@ the environment variable to set. They never pass silently on absent baselines.
 
 ## What this deliberately does not do
 
-- No clauses, provider work or endpoint activation. M-PULSE-2B/2C close only the scalar, CASE and
-  standalone-list forms recorded above; the other 15 admitted/refused constructs remain later
-  M-PULSE-2 work.
+- No clauses, provider work or endpoint activation. M-PULSE-2B/2C/2D close only the scalar,
+  CASE, standalone-list and function forms recorded above; the other 13 admitted/refused
+  constructs remain later M-PULSE-2 work.
 - No hidden profile switch or Pulse-specific bypass: the helpers use the ordinary typed planner
   and executor paths.
 - No differential execution against Ladybug. The corpus records what Pulse sends and whether
