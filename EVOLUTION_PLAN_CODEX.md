@@ -86,9 +86,20 @@
   1.060/1.060, corpus 45/45, fronteiras públicas selecionadas e Ruff/diff-check passaram, sem
   aumentar a dívida de formatter (250 arquivos na base e no candidato). Duas auditorias
   independentes e o handoff Nexus `hof_89b6fa0a5aa243d7b314b71a72782ebc` concluíram/PASS após
-  corrigir compatibilidade posicional, bypass por AST e reutilização cíclica de alias. O próximo
-  lote fixo M-PULSE-2G é somente `MATCH (n)` polimórfico para node scan; não inclui `OPTIONAL`,
-  relações sem tipo, paths, `UNION` ou writes polimórficos. Em paralelo, a primeira capacidade
+  corrigir compatibilidade posicional, bypass por AST e reutilização cíclica de alias. Em
+  M-PULSE-2G, `MATCH (n)` polimórfico read-only foi concluído no código
+  `6e4f1d5e91878395f9736a95b855296f69e2e248`: um único `AllNodesScan` une somente node tables,
+  preserva a visão owner-only, aplica filtro/agregação/ordem/janela globalmente e destaca o node
+  público como `{label, properties}`, sem identidade interna. Propriedade ausente lê `NULL` e
+  tipos homônimos incompatíveis recusam antes do stream. O corpus passou ao digest
+  `ac19e6735a90e5fe9831fdca67a80de1a3f4fffadd54b81151d9e343a7bd0d7a`, raw 71/16 com oito
+  débitos e entries 80/15; exatamente um probe e sete entries mudaram, enquanto I01/I02 e todos
+  os demais gaps permaneceram integralmente iguais. A suíte query final passou 1.088/1.088, o
+  lote combinado dedicado+corpus 73/73 e as fronteiras públicas selecionadas 158/158; três
+  auditorias independentes, corpus `--check`, Ruff e diff-check passaram, e o handoff Nexus
+  `hof_a28be7ad2f584fd693c3ef9cbaec75e8` foi concluído/verificado/PASS, sem aumentar a dívida
+  de formatter (250 arquivos na base e no candidato). Os oito constructs restantes permanecem
+  congelados para os sublotes seguintes do próprio M-PULSE-2. Em paralelo, a primeira capacidade
   M-PULSE-3A de propriedades de node foi integrada no Pulse
   Community `feature/v0.3.3@4aae27eca9c0a2d1d14a3334b03e6c57976dea75`, ainda inativa até a
   composição do provider completo.
@@ -828,7 +839,7 @@ Também fazem parte do contrato:
 | `DELETE`/`DETACH DELETE` | relationship delete e detach físico cobrem estado committed e cancelamento de relações staged de statements anteriores | falta mapear a exclusão destrutiva do port Pulse sempre para essa primitive | P0 |
 | Transação | commit/rollback, read-your-own-writes combinado, resolução pré-write de endpoints e crash all-or-none concluídos no engine | superfície estruturada completa do port e compensações integradas em Community `36c2fc6`/Core `ab61b9a`; `execute()` genérico permanece em M-PULSE-2 | P0 |
 | Substituição de payload | um `MATCH ... SET` único já substitui o payload e preserva identidade/arestas sob isolamento, rollback, conflito e reopen | wrapper Grafx e contratos Core/Kuzu integrados no bundle final `befaf1e`/`ab61b9a`; provider permanece deliberadamente inativo até o bundle integral do M-PULSE-6 | P1 |
-| Cypher read-only 1.0 | subconjunto menor | faltam `OPTIONAL MATCH`, `WITH`, `UNWIND`, `UNION`, `CASE` e funções usadas | P1 |
+| Cypher read-only 1.0 | escalares, `CASE`, subscritos, `label`, `timestamp`, `UNWIND`, `WITH` não agregante e `MATCH (n)` polimórfico concluídos até M-PULSE-2G | restam oito constructs congelados: `OPTIONAL MATCH`, `UNION`, relação sem tipo, named path, homoglyph na raiz, trailing clause não suportada, var-length sem limite e path projection | P1 |
 | Schema/DDL | criação básica | faltam idempotência, evolução aditiva, múltiplos pares de endpoints e introspecção equivalente | P1 |
 | Vetores | espaços e busca existem; índices vetoriais nullable são esparsos e avançam cobertura sem entrada falsa desde `main@ad38ed0` | contrato de criação de índices, filtros, ranking e tipos de retorno ainda difere | P1 |
 | Lifecycle/recovery | primitivas fortes do Grafx | o provider Pulse ainda assume arquivos e procedimentos Ladybug | P1 |
@@ -1068,16 +1079,18 @@ nome descartado não pode reaparecer como outro alias. O corpus ficou no digest
 entries 73/22. A revisão Nexus `hof_89b6fa0a5aa243d7b314b71a72782ebc` foi concluída/verificada e
 PASS, assim como duas auditorias independentes.
 
-O próximo sublote fixo M-PULSE-2G é somente `MATCH (n)` polimórfico para node scan. Ele inclui o
-probe `MATCH (n) RETURN n`, I19 e os seis templates públicos `COUNT_ALL_NODES`,
-`COUNT_ALL_NODES_BY_TYPE`, `GET_ALL_NODES`, `GET_ALL_NODES_AFTER_CURSOR`,
-`GET_ALL_NODES_BY_TYPE` e `GET_ALL_NODES_BY_TYPE_AFTER_CURSOR`. `OPTIONAL MATCH`, endpoints ou
-relações sem tipo, named/path projection, `UNION`, writes polimórficos e agregação/ordenação em
-`WITH` continuam fora. O gate diferencial é exato: somente esse probe muda para `planned`, somente
-esses sete IDs mudam para `already_supported`, raw passa a 71/16 com oito débitos e entries a
-80/15; os demais gaps preservam classificação e recusa. Os demais constructs, mutations internas,
-DTO/erros, perfil `pulse-1` e o ratchet diferencial total permanecem nos sublotes seguintes do
-próprio M-PULSE-2.
+M-PULSE-2G está concluído no código `6e4f1d5e91878395f9736a95b855296f69e2e248`. Ele cobre somente
+o node scan polimórfico read-only do probe `MATCH (n) RETURN n`, I19 e os seis templates públicos
+`COUNT_ALL_NODES`, `COUNT_ALL_NODES_BY_TYPE`, `GET_ALL_NODES`,
+`GET_ALL_NODES_AFTER_CURSOR`, `GET_ALL_NODES_BY_TYPE` e
+`GET_ALL_NODES_BY_TYPE_AFTER_CURSOR`. `OPTIONAL MATCH`, endpoints ou relações sem tipo,
+named/path projection, `UNION`, writes polimórficos e agregação/ordenação em `WITH` continuam
+fora. O gate diferencial fechou exatamente como congelado: somente esse probe mudou para
+`planned`, somente esses sete IDs mudaram para `already_supported`, raw passou a 71/16 com oito
+débitos e entries a 80/15; I01/I02 e todos os demais gaps preservaram seus objetos completos. O
+corpus final tem digest `ac19e6735a90e5fe9831fdca67a80de1a3f4fffadd54b81151d9e343a7bd0d7a`.
+Os demais constructs, mutations internas, DTO/erros, perfil `pulse-1` e o ratchet diferencial
+total permanecem nos sublotes seguintes do próprio M-PULSE-2.
 
 1. gerar um corpus versionado a partir do contrato e das queries reais read-only e write do Pulse;
 2. implementar clauses/expressões/funções ausentes;
@@ -1243,6 +1256,7 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-2D — `label` e `timestamp` | concluído e publicado | `milestone/pulse-query-label-timestamp@a1846c3`; `0a7509f` label, `e74e89f` timestamp, `eaf413e`/`a33b09a`/`89e3494`/`a1846c3` hardening e `9fe3cee`/`cd7b7c1` ratchet; revisão Nexus `hof_7b8a913b11644a4c98ee129ce7ae2b85` concluída/verificada/PASS | `label` devolve o nome físico exato de node/relação e NULL, com recusas pré-stream; `timestamp` cobre T/espaço, Z/offset/naive/date-only/micros, identidade/NULL e composições conhecíveis, sem antecipar agregados. Auditorias independentes: label PASS e candidato final PASS. Query 996/996, corpus 45/45, API pública selecionada 147/147, revisão Claude API 615/615 + 1 skip, `--check` digest `75622dfe057ca446d200c91ad1041718bd15058d99e222948f3aae339901dfa0`, entries 69/26, raw 66/21 e 13 débitos; Ruff/diff-check verdes |
 | M-PULSE-2E — `UNWIND` e map batch | concluído e publicado | código `4fc8ca5`; branch `milestone/pulse-query-unwind-map`; revisão Nexus `hof_9e5978356c68454ca7303e13b62b61c0` concluída/verificada/PASS | Source leading streaming com carrier fail-closed, mapa destacado, alias read-only, resolução tipada e duas formas estritas: `RETURN` ou um `MATCH` + um `SET`. I67/I68 usam seek correlacionado em PK limpa e fallback correto em índice ausente/dirty/stale; budget é contado uma vez e recusa tardia não libera escrita parcial. Corpus digest `836d55ad41bb617f3e71cf788ca164b0eca9c038964c63ec6542e87184e6f1e9`, raw 69/18, dez débitos e entries 71/24; query 1.019/1.019, gate focado final 68/68, API pública selecionada, Ruff e diff-check PASS; formatter sem dívida nova (250 arquivos contra 251 na base). Auditoria independente final PASS |
 | M-PULSE-2F — `WITH` não agregante | concluído e publicado | código final `5b32e8e`; branch `milestone/pulse-query-with`; revisão Nexus `hof_89b6fa0a5aa243d7b314b71a72782ebc` concluída/verificada/PASS | Projeções sequenciais substituem o escopo e aplicam cada `WHERE` depois do estágio; I06/I07 preservam snapshot pré-write, piso zero, fallback nulo e atomicidade. Compatibilidade posicional do AST e portas analyzer/planner são fail-closed; alias descartado não pode ser reutilizado. Corpus digest `33254881effa0b8325d351c0732ec4e23a260e0d9cd78ed83de75dc9f6ba1b04`, raw 70/17, nove débitos e entries 73/22; query 1.060/1.060, `test_with.py` 41/41, corpus 45/45, fronteiras públicas selecionadas, Ruff e diff-check PASS; formatter 250/250 contra a base; duas auditorias independentes PASS |
+| M-PULSE-2G — node scan polimórfico | concluído e publicado | código final `6e4f1d5e91878395f9736a95b855296f69e2e248`; branch `milestone/pulse-query-polymorphic-node`; handoff Nexus `hof_a28be7ad2f584fd693c3ef9cbaec75e8` concluído/verificado/PASS | Um único `AllNodesScan` une somente node tables e mantém filtro, agregação, `DISTINCT`, ordem e janela globais. A visão transacional é owner-only; propriedade ausente lê `NULL`, conflito de tipo recusa pré-stream e o DTO destacado `{label, properties}` não expõe identidade. Corpus digest `ac19e6735a90e5fe9831fdca67a80de1a3f4fffadd54b81151d9e343a7bd0d7a`, raw 71/16, oito débitos e entries 80/15; exatamente 1 probe/7 entries mudaram, com I01/I02 e os demais gaps intactos. Query 1.088/1.088, dedicado+corpus 73/73, fronteiras públicas 158/158, `--check`, Ruff e diff-check PASS; formatter 250/250 contra a base; três auditorias independentes PASS |
 | M-PULSE-3A — propriedades de node | concluído e publicado no branch Pulse atual; helper ainda inativo | Pulse Community `milestone/grafx-mpulse3-node-properties@4aae27eca9c0a2d1d14a3334b03e6c57976dea75` → `feature/v0.3.3`; revisão Nexus `hof_cad849ee19e542eb862930f64054724d` concluída/PASS | labels desconhecidas retornam vazio sem tocar backend; label conhecida ausente/wrong-kind e DB fechado falham tipado; ordem de catálogo, snapshot, reopen e fronteiras públicas cobertos; 8/8, Ruff default/TRY/I/BLE e format PASS. A resolução `board_id → Database` fica no provider/composição, sem ativação parcial |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria

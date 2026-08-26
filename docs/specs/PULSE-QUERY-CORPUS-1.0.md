@@ -6,8 +6,9 @@ M-PULSE-2A introduced this freeze of **what Pulse actually asks a graph to do**,
 language sub-batch can ratchet against evidence rather than against an impression of how much
 Cypher is in use. M-PULSE-2B added `coalesce`, `string_split` and `size`; M-PULSE-2C added searched
 and simple `CASE` plus list subscripts; M-PULSE-2D added `label` and `timestamp`; M-PULSE-2E added
-the leading `UNWIND` batch source and map access; and M-PULSE-2F added non-aggregating `WITH`.
-The remaining gaps stay explicit.
+the leading `UNWIND` batch source and map access; M-PULSE-2F added non-aggregating `WITH`; and
+M-PULSE-2G added the read-only polymorphic node scan `MATCH (n)`. The remaining gaps stay
+explicit.
 
 The scanner and JSON do not widen the public endpoint or execute Pulse code. Engine changes
 are reviewed in their own commits, and regenerating this corpus makes each accepted/refused
@@ -69,9 +70,9 @@ This keeps an unsupported family useful: closing the language gap must change th
 ## Counts at `pulse-1`
 
 `97` entries, digest
-`836d55ad41bb617f3e71cf788ca164b0eca9c038964c63ec6542e87184e6f1e9`.
+`ac19e6735a90e5fe9831fdca67a80de1a3f4fffadd54b81151d9e343a7bd0d7a`.
 
-The engine currently classifies 71 entries as `already_supported` and 24 as `generic_gap`;
+The engine currently classifies 80 entries as `already_supported` and 15 as `generic_gap`;
 the duplicate and declared fragment remain separate classifications.
 
 **Internal families** — 68 closed families over the audited originators, 47 read and
@@ -105,20 +106,19 @@ Each probe carries two independent answers. `contract_disposition` is what the *
 endpoint** admits; `engine_verdict` is what **this engine** does with the same text. They
 differ on purpose: the contract blacklists writes, while the engine accepts writes because
 the internal port needs them. Today the contract allows 74 probes and refuses 13 (10
-`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 70 and refuses 17. The
-intersection that matters to the public endpoint is the 9 allowed probes the engine still
+`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 71 and refuses 16. The
+intersection that matters to the public endpoint is the 8 allowed probes the engine still
 refuses.
 
 ### What M-PULSE-2 owes
 
-These 9 constructs are admitted by the public contract and refused by the engine:
+These 8 constructs are admitted by the public contract and refused by the engine:
 
 | Construct | Category | Refused at |
 | --- | --- | --- |
 | `OPTIONAL MATCH` | root | parse error |
 | `UNION` | clause | parse error |
 | `untyped relationship` | pattern | plan error |
-| `polymorphic node` | pattern | plan error |
 | `named path` | pattern | parse error |
 | `root operation as a homoglyph` | security | parse error |
 | `unsupported clause after a supported root` | taxonomy | parse error |
@@ -137,7 +137,11 @@ oracles. M-PULSE-2F adds the non-aggregating `WITH`, which moves the root `WITH`
 `planned` and the two cancellation-decay mutations I06/I07 to `already_supported`; I19 stays a
 gap, and its recorded refusal moves from the parse error for `WITH` to the plan error for its
 polymorphic `MATCH (n)`, which is the next barrier rather than a widened subset. This is why
-acceptance records parse, analysis and planning separately.
+acceptance records parse, analysis and planning separately. M-PULSE-2G closes only that
+standalone read shape: one `AllNodesScan` reads all node tables as a single set, so I19 and the
+six public all-node templates move to `already_supported` without changing their result oracles.
+The one raw probe moves to `planned`; paths with label-free endpoints retain their previous
+planner refusal, and the other eight constructs retain their complete frozen objects.
 
 ### The behavioural contract beside the grammar
 
@@ -182,8 +186,8 @@ By execution, not by judgement.
    `analyze` and `build_plan` against the closed Pulse catalog. Only a query accepted by all
    three is `already_supported`; the last phase reached is recorded in `acceptance_phase`.
    Parsing alone is not accepting: an unknown function becomes a generic call node and is
-   only caught by `analyze`, while polymorphic nodes and untyped relationships reach
-   planning before they are refused.
+   only caught by `analyze`. An eligible standalone polymorphic node now plans; label-free path
+   endpoints and untyped relationships retain their planning refusals.
 3. Materialization happens **twice**: once filling holes with identifiers, once with the
    empty string. A hole is not always an identifier — some carry an optional clause — and
    filling a clause hole with an identifier produces text that was never sent. If either
@@ -254,9 +258,10 @@ the environment variable to set. They never pass silently on absent baselines.
 
 ## What this deliberately does not do
 
-- No provider work or endpoint activation. M-PULSE-2B/2C/2D/2E/2F close only the scalar,
-  CASE, standalone-list, function, leading-UNWIND and non-aggregating-WITH forms recorded
-  above; the other 9 admitted/refused constructs remain later M-PULSE-2 work.
+- No provider work or endpoint activation. M-PULSE-2B/2C/2D/2E/2F/2G close only the scalar,
+  CASE, standalone-list, function, leading-UNWIND, non-aggregating-WITH and standalone
+  polymorphic-node forms recorded above; the other 8 admitted/refused constructs remain later
+  M-PULSE-2 work.
 - No hidden profile switch or Pulse-specific bypass: the helpers use the ordinary typed planner
   and executor paths.
 - No differential execution against Ladybug. The corpus records what Pulse sends and whether
