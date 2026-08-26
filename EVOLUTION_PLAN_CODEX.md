@@ -24,9 +24,11 @@
 - **Compatibilidade Okto Pulse: em execução serial na `main`.** M-PULSE-0 foi concluído em
   `5b7551b40dba2facb28c46770f166ab3ac9daecc`. A fundação de identidades pendentes do
   M-PULSE-1 entrou em `d487ac9312229e0376ad8e65625213af111d9c9c`; o overlay owner-only de nós
-  e suas barreiras fail-closed chegaram até `aef1df7`. A resolução/visão de relacionamentos e as
-  primitives do `GraphTransactionScope` continuam abertas, portanto M-PULSE-1 e a compatibilidade
-  total ainda não estão declarados concluídos. O registro verificável está em 9.7.
+  e suas barreiras fail-closed chegaram até `aef1df7`. O update owner-only de propriedades de
+  relações committed foi publicado em `a3bb8cb44cf86f5c151a232406c703f54f9a1316`. A resolução de
+  endpoints, a visão de relações staged e as primitives do `GraphTransactionScope` continuam
+  abertas, portanto M-PULSE-1 e a compatibilidade total ainda não estão declarados concluídos. O
+  registro verificável está em 9.7.
 
 ## 1. Resumo executivo
 
@@ -1104,6 +1106,7 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-0 | concluído | `main@5b7551b40dba2facb28c46770f166ab3ac9daecc` | suites query/API do marco: 1.398 passes e 1 skip; chunks globais: 3.841 + 1.205 + 2.021 passes, 10 skips; Ruff limpo; nove mutantes mortos; revisão cruzada sem blocker |
 | M-PULSE-1A — identidade pendente | concluído | `main@d487ac9312229e0376ad8e65625213af111d9c9c` | regressões de `PendingRowRef`, redução de intents, prevalidation e bloqueios passaram; Ruff e `git diff --check` limpos após rebase |
 | M-PULSE-1A — overlay de nós | concluído | `main@3f354d9b4973086421500654fe74982606767df3` + hardening `main@aef1df734582cd04097fcc0393ecda587ee5409f` | `tests/query`, `tests/txn` e `tests/api` com exit 0; 51 regressões focadas pós-auditoria com exit 0; Ruff limpo; revisão independente encontrou dois casos, ambos reproduzidos e fechados antes do merge |
+| M-PULSE-1A — update de relações committed | concluído | `main@a3bb8cb44cf86f5c151a232406c703f54f9a1316` | 6 regressões públicas e 814 testes de query passaram; Ruff global e diff-check limpos; validação independente focada 6/6; preservação de endpoints, isolamento, rollback, conflito, cold reopen e `verify()` cobertos |
 | M-PULSE-1B — resolução de endpoints | em execução | branch `milestone/pulse-m1-rel-resolution`, handoff Nexus `hof_5836d33c98d04c27b152dc7f56902749` | exige prova de proveniência/ordem/papel, resolução antes de mutação e zero `PendingRowRef` em heap/index/WAL |
 | M-PULSE-1C — overlay relacional e primitives Pulse | pendente | depende de M-PULSE-1B | traversal, `DELETE r`, `DETACH`, rollback/crash e suíte pública do port sobre visão combinada |
 
