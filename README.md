@@ -87,12 +87,17 @@ openCypher in the Kùzu dialect, executed by a planner that produces one operato
 
 `MATCH` in a write transaction sees that owner's earlier node inserts, updates and deletes. A
 dirty node table plans a scan plus the private overlay instead of consulting an index that only
-describes committed rows. The transaction substrate can now stage a relationship against pending
-nodes and resolves both private endpoint identities before its first heap write. The public Cypher
-path still refuses relationship INSERT/traversal over inserted overlay state until the combined
-relationship view lands; vector search over a dirty table is likewise fail-closed. Updates of
-properties on committed relationships are owner-visible, while their `_from`/`_to` layout columns
-remain immutable. A table declared inside a transaction is usable by that transaction's own later
+describes committed rows. A `CREATE` may name a node an earlier statement of the same
+transaction created, and both private endpoint identities are resolved before the first heap
+write. Traversal reads that owner's combined view: relationships it created, relationships it
+updated or ended, and endpoint nodes it created, updated or ended, with multiplicity, direction
+and self-loops preserved. A dirty relationship table is walked by a scan and the overlay rather
+than by its endpoint indexes, which describe only committed edges; a clean table keeps the
+indexed path. Two same-statement shapes stay refused rather than guessed: an edge whose endpoint
+that very statement is creating, and a `DETACH DELETE` of a node an edge held by that same
+statement points at. Vector search over a dirty table is fail-closed. Updates of properties on
+committed relationships are owner-visible, while their `_from`/`_to` layout columns remain
+immutable. A table declared inside a transaction is usable by that transaction's own later
 statements and becomes visible to every other transaction when it commits — schema changes are
 transactions like any other.
 
