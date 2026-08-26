@@ -674,7 +674,7 @@ def test_timestamp_reads_iso_forms_into_utc_microseconds(
 
 @pytest.mark.parametrize(
     "argument",
-    ("p.age", "p", "size('abc')", "1"),
+    ("p.age", "p", "size('abc')", "1", "1 + 1", "-1", "true", "[1]", "{a: 1}"),
 )
 def test_timestamp_refuses_a_family_the_schema_already_rules_out(
     stack: QueryStack, argument: str
@@ -683,6 +683,10 @@ def test_timestamp_refuses_a_family_the_schema_already_rules_out(
 
     Only a parameter has to wait for the call.  Leaving these to evaluation let an empty
     match answer with no rows for a query that could never have produced an instant.
+
+    The arithmetic cases are here because the first version of the check listed the shapes
+    it knew about, and `1 + 1` is neither one of them nor resolvable by the binder, so it
+    slipped through exactly where the rule was supposed to hold.
     """
 
     with pytest.raises(GrafxPlanError) as matching:

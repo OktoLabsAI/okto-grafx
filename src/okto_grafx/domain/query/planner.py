@@ -825,8 +825,10 @@ class _Planner:
                     value=node.name,
                 )
             return
-        if not isinstance(argument, (Literal, Property, FunctionCall)):
-            return
+        # Every remaining shape goes through the same question rather than a list of the
+        # ones thought of here.  Enumerating shapes is how `1 + 1` slipped past: it is
+        # neither binder-resolvable nor one of the three that were named, so an empty match
+        # answered with no rows for an argument that could never be an instant.
         static = self._pulse_expression_type(argument, owner=node.name)
         if static in (None, ValueType.NULL, ValueType.STRING, ValueType.TIMESTAMP):
             return
