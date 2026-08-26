@@ -445,6 +445,95 @@ def test_pending_node_cannot_reach_the_heap_as_a_relationship_endpoint(
         handle.close()
 
 
+def test_detach_delete_refuses_an_incident_relationship_staged_earlier(
+    tmp_path: Path,
+) -> None:
+    """DETACH must not strand an edge that exists only in the owner's overlay."""
+    handle = okto_grafx.connect(str(tmp_path / "pending-detach-db"))
+    try:
+        with handle.begin("write") as schema:
+            schema.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
+            schema.execute("CREATE REL TABLE Knows(FROM Person TO Person, since INT64)")
+        with handle.begin("write") as seed:
+            seed.execute("CREATE (:Person {id: 1})")
+            seed.execute("CREATE (:Person {id: 2})")
+
+        with handle.begin("write") as writer:
+            writer.execute(
+                "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
+                "CREATE (a)-[:Knows {since: 2020}]->(b)"
+            )
+            before = tuple(writer._context.row_intents)
+
+            with pytest.raises(GrafxUnsupportedOperation) as raised:
+                writer.execute(
+                    "MATCH (a:Person {id: 1}) DETACH DELETE a"
+                )
+
+            relationship = handle.catalog.catalog.table("Knows")
+            assert raised.value.details == {
+                "field": "table",
+                "value": "Knows",
+                "table_id": relationship.table_id,
+                "operation": "detach_delete",
+            }
+            assert tuple(writer._context.row_intents) == before
+
+        assert handle.execute(
+            "MATCH (a:Person)-[:Knows]->(b:Person) RETURN a.id, b.id"
+        ).rows == ((1, 2),)
+    finally:
+        handle.close()
+
+
+def test_detach_delete_refuses_an_incident_relationship_held_by_same_statement(
+    tmp_path: Path,
+) -> None:
+    """A refused compound statement hands neither its edge nor its detach to the txn."""
+    handle = okto_grafx.connect(str(tmp_path / "held-detach-db"))
+    try:
+        with handle.begin("write") as schema:
+            schema.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
+            schema.execute("CREATE REL TABLE Knows(FROM Person TO Person, since INT64)")
+        with handle.begin("write") as seed:
+            seed.execute("CREATE (:Person {id: 1})")
+            seed.execute("CREATE (:Person {id: 2})")
+
+        with handle.begin("write") as writer:
+            with pytest.raises(GrafxUnsupportedOperation) as raised:
+                writer.execute(
+                    "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
+                    "CREATE (a)-[:Knows {since: 2020}]->(b) DETACH DELETE a"
+                )
+            assert raised.value.details["operation"] == "detach_delete"
+            assert writer._context.row_intents == []
+
+        assert handle.execute(
+            "MATCH (p:Person) RETURN p.id ORDER BY p.id"
+        ).rows == ((1,), (2,))
+        assert handle.execute(
+            "MATCH (a:Person)-[:Knows]->(b:Person) RETURN a.id"
+        ).rows == ()
+    finally:
+        handle.close()
+
+
+def test_same_statement_pending_node_named_twice_by_delete_is_cancelled_once(
+    database: object,
+) -> None:
+    """Repeated DELETE of one held insert is idempotent, just like a stored-row delete."""
+    with database.begin("write") as writer:
+        result = writer.execute(
+            "CREATE (p:Person {id: 99, name: 'temporary', age: 1}) DELETE p, p"
+        )
+        assert result.statistics["rows_deleted"] == 1
+        assert writer._context.row_intents == []
+
+    assert database.execute(
+        "MATCH (p:Person {id: 99}) RETURN p.id"
+    ).rows == ()
+
+
 def test_malformed_pending_sequence_is_refused_before_heap_access(
     database: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:

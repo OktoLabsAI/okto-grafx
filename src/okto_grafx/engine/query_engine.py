@@ -474,6 +474,7 @@ class _Context:
     staged_partitions: list[tuple[int, bytes]] = field(default_factory=list)
     tokens_issued: int = 0
     pending_tokens: dict[int, int] = field(default_factory=dict)
+    cancelled_insert_tokens: set[int] = field(default_factory=set)
     ends_held: set[object] = field(default_factory=set)
     _ends_staged: frozenset[object] | None = None
 
@@ -2448,7 +2449,7 @@ def _held_insert_position(context: _Context, binding: RowBinding) -> int | None:
 
 
 def _incident_edges(
-    engine: QueryEngine, context: _Context, table: TableDef, record_id: object
+    engine: QueryEngine, context: _Context, table: TableDef, endpoint_identity: object
 ) -> Iterator[tuple[TableDef, object, HeapVersion]]:
     """Yield every live relationship touching one node, in either direction.
 
@@ -2466,6 +2467,7 @@ def _incident_edges(
     """
     snapshot = context.snapshot
     catalog = context.schema()
+    candidates: list[tuple[TableDef, bool, bool]] = []
     for candidate in catalog.tables():
         if candidate.kind != "rel":
             continue
@@ -2473,9 +2475,33 @@ def _incident_edges(
         lands = str(candidate.to_table) == table.name
         if not (leaves or lands):
             continue
+        candidates.append((candidate, leaves, lands))
+
+        # Until the relationship overlay lands, a relationship created by this transaction is
+        # not in the heap scan below. Silently overlooking an incident one would let DETACH end
+        # the node while the pending relationship survives the commit as a physically live
+        # orphan. Refuse the whole statement before yielding (and therefore before holding) any
+        # physical edge. Unrelated pending relationships are safe and do not block the detach.
+        _changed, inserted = _transaction_row_view(context, candidate)
+        for _reference, values in inserted:
+            incident = (leaves and values[0] == endpoint_identity) or (
+                lands and values[1] == endpoint_identity
+            )
+            if incident:
+                raise GrafxUnsupportedOperation(
+                    f"DETACH DELETE cannot yet include the pending {candidate.name!r} "
+                    "relationship incident on this node. Commit or roll back first; "
+                    "relationship read-your-own-writes is not implemented in this build.",
+                    field="table",
+                    value=candidate.name,
+                    table_id=candidate.table_id,
+                    operation="detach_delete",
+                )
+
+    for candidate, leaves, lands in candidates:
         for ref, version in engine.heap.scan(candidate, snapshot):
-            incident = (leaves and version.values[0] == record_id) or (
-                lands and version.values[1] == record_id
+            incident = (leaves and version.values[0] == endpoint_identity) or (
+                lands and version.values[1] == endpoint_identity
             )
             if not incident:
                 continue
@@ -2515,6 +2541,9 @@ def _write_deletions(
             # caller's commit made the rest of the statement durable (C10 round-3 B1).
             position = _held_insert_position(context, binding)
             if position is None:
+                token = context.pending_tokens.get(id(binding.version))
+                if token is not None and token in context.cancelled_insert_tokens:
+                    continue
                 raise GrafxUnsupportedOperation(
                     f"DELETE names {variable!r}, a row created by an earlier statement of this "
                     f"transaction; a row's identity is allocated by the commit (W5b), so it "
@@ -2522,6 +2551,9 @@ def _write_deletions(
                     field="variable",
                     value=variable,
                 )
+            token = context.pending_tokens.get(id(binding.version))
+            if token is not None:
+                context.cancelled_insert_tokens.add(token)
             del context.staged_rows[position]
             context.count("rows_deleted")
             continue
@@ -2532,8 +2564,13 @@ def _write_deletions(
             # Incident edges are settled BEFORE the node they hang from is held, so the whole
             # detach is one statement's worth of staged work: either every edge and the node
             # end together at the commit stamp, or a refusal leaves all of them standing.
+            endpoint_identity = (
+                binding.ref
+                if isinstance(binding.ref, PendingRowRef)
+                else binding.record_id
+            )
             for edge_table, edge_ref, edge_version in _incident_edges(
-                engine, context, binding.table, binding.record_id
+                engine, context, binding.table, endpoint_identity
             ):
                 if context.already_ended(edge_ref):
                     continue
