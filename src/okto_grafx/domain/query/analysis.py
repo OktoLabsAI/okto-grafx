@@ -528,15 +528,19 @@ class _Analyzer:
             return
         if name == COALESCE_FUNCTION:
             if call.named_arguments:
-                raise self._refuse(
+                message = (
                     f"{call.name} takes positional arguments only; got "
-                    f"{len(call.named_arguments)} named.",
+                    f"{len(call.named_arguments)} named."
+                )
+                raise self._refuse(
+                    message,
                     field="function",
                     value=call.name,
                 )
             if not call.arguments:
+                message = f"{call.name} needs at least one argument."
                 raise self._refuse(
-                    f"{call.name} needs at least one argument.",
+                    message,
                     field="function",
                     value=call.name,
                 )
