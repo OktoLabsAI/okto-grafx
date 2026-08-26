@@ -23,8 +23,7 @@
   somente depois desse gate.
 - **Compatibilidade Okto Pulse: iniciada em 2026-08-25.** A seção 9 congela o contrato atual e os
   gates M-PULSE-0 a M-PULSE-7. M-PULSE-0 está em execução na branch isolada
-  `milestone/pulse-m0-delete`, começando por relationship delete, `DETACH DELETE` e recusa segura de
-  node delete conectado.
+  `milestone/pulse-m0-delete`, começando por relationship delete e `DETACH DELETE`.
 
 ## 1. Resumo executivo
 
@@ -759,7 +758,7 @@ Também fazem parte do contrato:
 | Área | Estado atual do Grafx | Gap para o Pulse | Severidade |
 |---|---|---|---|
 | CRUD básico de nós/arestas | Parcialmente disponível | faltam semânticas destrutivas completas e equivalência de resultados | P0 |
-| `DELETE`/`DETACH DELETE` | parser/planner aceitam; execução não honra `detach`; relationship delete ausente | risco de aceitação silenciosa e estado órfão | P0 |
+| `DELETE`/`DETACH DELETE` | `DELETE` de nó usa tombstone lógico; execução não honra `detach`; relationship delete ausente | o Pulse exige relationship delete e remoção física das incidentes no `DETACH DELETE` | P0 |
 | Transação | commit/rollback reais, sem read-your-own-writes | o Pulse cria nós e depois os consulta/relaciona no mesmo scope | P0 |
 | Substituição de payload | update existe | o Pulse exige substituir payload preservando exatamente as arestas incidentes | P0 |
 | Cypher read-only 1.0 | subconjunto menor | faltam `OPTIONAL MATCH`, `WITH`, `UNWIND`, `UNION`, `CASE` e funções usadas | P1 |
@@ -793,11 +792,14 @@ O Grafx precisa oferecer, com atomicidade transacional:
 - create, match, update e delete de nós por label e chave lógica;
 - create, match, update e delete de relações, incluindo propriedades;
 - `DELETE r` removendo somente as relações matched;
-- `DELETE n` recusando de forma tipada quando houver qualquer relação incidente;
+- `DELETE n` preservando a semântica já estabilizada do Grafx: tombstone do nó e relações incidentes
+  não observáveis porque o endpoint deixa de ser visível; o provider do Pulse não usa essa operação
+  para exclusão destrutiva de nó;
 - `DETACH DELETE n` removendo todas as relações incidentes — incoming, outgoing, self-loop e
   múltiplas relações — e somente depois o nó;
 - zero matches como no-op bem-sucedido;
-- rollback completo e recovery/reopen sem relações órfãs;
+- rollback completo e recovery/reopen sem relações logicamente observáveis cujo endpoint não exista;
+  após `DETACH DELETE`, nenhuma relação incidente permanece fisicamente viva;
 - direção, label, endpoints, propriedades e multiplicidade preservados;
 - cobertura dos 11 node types, 16 relationship names e 69 pares concretos de endpoints do schema
   atual do Pulse;
@@ -928,12 +930,14 @@ estabilidade; linguagem, schema e evolução vêm depois.
 
 1. implementar relationship delete;
 2. implementar `DETACH DELETE` atômico;
-3. recusar node delete simples com relações;
+3. preservar e documentar o tombstone lógico de `DELETE n`; o provider deve mapear a exclusão
+   destrutiva do Pulse para `DETACH DELETE`, que é a operação realmente usada pelo adapter atual;
 4. cobrir rollback, conflito, self-loop, múltiplas direções, reopen e `verify()`;
 5. corrigir documentação que hoje diverge da execução.
 
-**Gate:** nenhuma relação órfã física ou lógica após commit, abort, crash ou reopen; regressão deve
-falhar no SHA anterior.
+**Gate:** `DETACH DELETE` não deixa relação incidente física ou lógica após commit, abort, crash ou
+reopen; `DELETE n` não torna uma relação observável através de endpoint tombstonado e permanece
+`verify()`-clean. As regressões de relationship delete e `DETACH DELETE` devem falhar no SHA anterior.
 
 #### M-PULSE-1 — read-your-own-writes e operações atômicas do scope
 
