@@ -187,13 +187,13 @@ def test_the_last_statement_is_the_answer_the_command_reports(
     assert document["statistics"] == document["results"][-1]["statistics"]
 
 
-def test_a_read_inside_a_write_transaction_does_not_see_that_transaction_yet(
+def test_a_read_inside_a_write_transaction_sees_its_staged_row(
     tmp_path: Path, cli: CliRunner
 ) -> None:
-    # Measured, and worth pinning because an operator writing a migration will meet it: a row
-    # staged inside a write transaction becomes visible at the COMMIT number, so a read in the
-    # same transaction still sees the snapshot the transaction opened on (SPEC-M1 FR-2, BR-9).
-    # The row is there the moment the transaction has committed.
+    # M-PULSE-1A added the owner-only PendingRowRef overlay: later statements in the same write
+    # transaction see staged nodes without exposing provisional physical ids. A later reader sees
+    # the same row after commit. This CLI contract must track that engine contract rather than the
+    # pre-overlay behavior it originally measured.
     path = str(tmp_path / "isolation")
     assert cli("query", path, TABLE_STATEMENT, "--write", "--create").code == OK
     inside = cli(
@@ -201,7 +201,9 @@ def test_a_read_inside_a_write_transaction_does_not_see_that_transaction_yet(
     )
     assert inside.code == OK
     assert inside.document["results"][0]["statistics"]["rows_created"] == 1
-    assert inside.document["results"][-1]["row_count"] == 0, "the staged row is not visible yet"
+    assert inside.document["results"][-1]["row_count"] == 1, (
+        "the owner sees its staged row"
+    )
     after = cli("query", path, "MATCH (p:Person) RETURN p.id", "--json")
     assert after.code == OK
     assert after.document["row_count"] == 1, "the committed row is visible to a later reader"
