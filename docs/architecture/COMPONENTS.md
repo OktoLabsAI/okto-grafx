@@ -900,7 +900,7 @@ search returns `achieved_k=3`, hits `[1, 3, 2]`, `verify("all") == ()` before an
 `recovery` pass GREEN.** Three new tests in `tests/query/test_lifecycle.py` are the only things in
 the repository that see it.
 
-### E4 — read-your-own-writes de nós (registro histórico; FECHADO em M-PULSE-1A)
+### E4 — read-your-own-writes de nós e relações (FECHADO em M-PULSE-1C)
 
 Found by the coordinator while driving traversal: `CREATE (:P {id:1})` followed in the SAME
 transaction by `MATCH (a:P {id:1}) ... CREATE (a)-[:R]->(b)` creates no edge, and
@@ -914,9 +914,11 @@ and `_to`; commit proves provenance/order/kind/role, plans the durable IDs, rewr
 and re-encodes every row before its first heap mutation. No private token reaches heap, index or
 WAL, and rollback/refusal spends no planned identity.
 
-The remaining M-PULSE-1C seam is the public query overlay for relationship INSERT/traversal and
-cancellation by `DELETE r`/`DETACH DELETE`. Same-statement fresh nodes plus edge remain explicitly
-fail-closed in this cut; cross-statement work in one owner scope is the compatibility target.
+M-PULSE-1C closed the public query seam for relationship INSERT/traversal and cancellation by
+`DELETE r`/`DETACH DELETE`. A write transaction now traverses its combined committed+staged graph;
+pending endpoints resolve before the first write, and endpoint OCC guards refuse a concurrent
+delete before `_write_rows`. Same-statement fresh nodes plus edge remain explicitly fail-closed;
+cross-statement work in one owner scope is the supported compatibility contract.
 
 ### Coordinator closures after the method change (all verified by counterfactual)
 
@@ -931,10 +933,12 @@ fail-closed in this cut; cross-statement work in one owner scope is the compatib
 
 **Fechado em `d487ac9`/`3f354d9`, com hardening em `aef1df7`.** A solução escolhida foi a opção (b)
 acima: `PendingRowRef` autenticado e privado, redução única de intents e `NodeScan` sobre
-snapshot+overlay. Tabelas dirty não usam seek; PK, SET, DELETE, MERGE, DISTINCT/ordenação e
+snapshot+overlay. Tabelas de nós dirty não usam seek; PK, SET, DELETE, MERGE, DISTINCT/ordenação e
 isolamento têm regressões. IDs provisórios não escapam para heap, índice, WAL ou resultado público.
-Endpoints/traversal de relações e busca vetorial dirty continuam recusando de forma tipada até os
-submarcos seguintes; portanto o fechamento desta entrada é especificamente o overlay de nós.
+M-PULSE-1C extended that same owner view to relationship inserts, property updates and deletes,
+including pending endpoints and incident cancellation. Dirty vector search remains a typed
+refusal; the closure recorded here is the combined node/relationship transactional view, not
+vector overlay support or the Pulse provider itself.
 
 **Still open, performance only (D5):** commit ~161 ms. `_windows_posix_replace` 4/commit (the
 `retain_lease` option now exists in C5 -- measure it on), pure CRC when no provider is installed,
