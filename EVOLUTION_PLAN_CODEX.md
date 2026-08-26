@@ -49,6 +49,14 @@
   `feature/v0.3.3@ab61b9a785f2018312fc91541a580877fd068bbb`. O gate final passou com
   Grafx 123/123, Kuzu/Spec 8/8, Core 61/61 e auditoria independente sem blocker. M-PULSE-1 está
   concluído; `execute()` genérico e a compatibilidade total permanecem abertos nos M-PULSE-2 a 7.
+  O corpus fail-closed M-PULSE-2A foi congelado em
+  `milestone/pulse-query-corpus@5b05b4f`: 97 entradas, 68 famílias internas, 28 templates
+  públicos sobre 27 textos, 87 probes e 36 behaviours, com digest integral `54c3d757...` e zero
+  `runtime_fragment`. O gate final passou 45/45, o rebuild ficou em 25,6 s e as revisões
+  independente e Nexus `hof_ac705be83fb845ba8193c8f76a477ac8` concluíram sem blocker. Em
+  paralelo, a primeira capacidade M-PULSE-3A de propriedades de node foi integrada no Pulse
+  Community `feature/v0.3.3@4aae27eca9c0a2d1d14a3334b03e6c57976dea75`, ainda inativa até a
+  composição do provider completo.
   O registro verificável está em 9.7.
 
 ## 1. Resumo executivo
@@ -876,8 +884,11 @@ O alvo é o subconjunto read-only público 1.0 e o corpus interno efetivamente e
   path sem vazar `RecordId`;
 - padrões directed, incoming, outgoing e undirected, incluindo hops 1 e 2 usados pelo contrato;
 - envelope público preservado: normalização NFKC, parsing seguro de comments/literals, distinção
-  `unsafe_cypher`/`unsupported_operation`, `auto-LIMIT`, range máximo `*..20`, rewrite de layer
-  canônica, `execute_read_only_pair`, columns/row_count/truncation e contagem de linhas omitidas.
+  `unsafe_cypher`/`unsupported_operation`, `auto-LIMIT`, auto-bound em 20 apenas quando o upper
+  bound está ausente, rewrite de layer canônica, `execute_read_only_pair`,
+  columns/row_count/truncation e contagem de linhas omitidas. O pin atual admite e preserva um
+  limite explícito como `*1..21`; M-PULSE-2 não pode assumir que ele foi clampado e deve manter a
+  recusa canônica `canonical_filter_unenforceable` ou versionar outra política antes de executar.
 
 O gate não é “aceitar os tokens”. Cada forma deve ter semântica diferencial contra Ladybug para
 linhas, colunas, tipos, nulidade, ordem, cardinalidade e erro. Qualquer construção fora desse
@@ -995,6 +1006,13 @@ não se adicionará `timestamp()`, `coalesce()` ou statements `BEGIN/COMMIT/ROLL
 para copiar a implementação Kuzu. Esse limite impede que M-PULSE-1 se transforme em M-PULSE-2.
 
 #### M-PULSE-2 — contrato de query Pulse 1.0
+
+**Estado em 2026-08-26:** o sublote M-PULSE-2A de corpus está concluído em
+`milestone/pulse-query-corpus@5b05b4f`. O descriptor `pulse-1` fixa os baselines Community
+`befaf1e4...` e Core `ab61b9a...`, as 68 famílias internas e a superfície pública 1.0. O corpus
+possui oráculos estruturados de erro, tipo, nulidade, cardinalidade, ordenação e efeito; o digest
+cobre o payload inteiro. A implementação de linguagem e o ratchet diferencial permanecem nos
+sublotes seguintes do próprio M-PULSE-2.
 
 1. gerar um corpus versionado a partir do contrato e das queries reais read-only e write do Pulse;
 2. implementar clauses/expressões/funções ausentes;
@@ -1154,7 +1172,8 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-1 — Spec lineage no provider Grafx | concluído e integrado | origem Pulse Community `milestone/grafx-lineage-primitives@73b65dafb432b35ff3dea8edde8c6aa07b58c393`; bundle final `feature/v0.3.3@befaf1e4f9da9d0cff7cfc0f4aee177ef0a3e595` | `reconcile`, `clear` e compensação restore-first usam uma única resolução física por operação, before-images completos, transação Grafx real e rollback/poison após qualquer falha pós-mutation. 27/27 regressões próprias e 73/73 no gate combinado passaram; quatro provas adversariais cobriram múltiplos pais, self-loop, incoming/paralelas, metadata drift e cold reopen; Ruff/format/diff-check limpos e duas validações independentes sem blocker |
 | M-PULSE-1 — active-set e cleanup pós-compensação | concluído e integrado | Community `feature/v0.3.3@befaf1e4f9da9d0cff7cfc0f4aee177ef0a3e595` (código `36c2fc6`); Core `feature/v0.3.3@ab61b9a785f2018312fc91541a580877fd068bbb`; handoffs Nexus `hof_9649f2bc0a974519a99b98e7350a1c7e` e `hof_bf680c016aae4c9ca3a14d21d889660f` concluídos/PASS | before-images de nó/relação completos, vetores não nulos reconstituídos no tipo declarado, paralelas idênticas preservadas por multiset, NaN recusado antes de delete, múltiplos receipts netados e `rule_id` de Spec incluído na identidade. Provider legado com apenas `**kwargs` falha tipado antes do sweep |
 | M-PULSE-1 — primitives completas `GraphTransactionScope` | concluído e publicado | Community `milestone/grafx-mpulse1-conformance@befaf1e4f9da9d0cff7cfc0f4aee177ef0a3e595` → `feature/v0.3.3`; Core `milestone/grafx-transaction-contract@ab61b9a785f2018312fc91541a580877fd068bbb` → `feature/v0.3.3` | gate final: Grafx 123/123 em 14m25s, Kuzu/Spec 8/8, Core 61/61; auditoria independente focada 10/10 + 3/3 + 2/2 sem blocker; Ruff/format/diff-check limpos. Os worktrees originais permaneceram em `0401e412` com 12 mudanças e `985f6a88` com 13 entries. `execute()` genérico continua deliberadamente em M-PULSE-2 |
-| M-PULSE-2A — corpus query contract 1.0 | em execução | branch isolado `milestone/pulse-query-corpus`; handoff Nexus `hof_dbf1d0c0d4c24677986ee569ce1250cc` | escopo fechado ao corpus versionado, descriptor `pulse-1` e inventário fail-closed; nenhuma implementação de dialeto neste sublote |
+| M-PULSE-2A — corpus query contract 1.0 | concluído no milestone | `milestone/pulse-query-corpus@5b05b4f`; digest `54c3d75797eb9c92c58bbfb796a3e772b77b4c0307f971af88e8cc4978927554`; revisão Nexus `hof_ac705be83fb845ba8193c8f76a477ac8` concluída/PASS | 97 entradas; 68 famílias internas = 47 read/21 write e 66 current/2 preventive; 17 templates nomeados + 11 gerados sobre 27 textos; 87 probes/36 behaviours; authorities 11/16/69; zero `runtime_fragment`; 45/45, `--check` 25,6 s, Ruff default/TRY/I/BLE, format e diff-check PASS; nenhuma mudança de engine neste sublote |
+| M-PULSE-3A — propriedades de node | concluído e publicado no branch Pulse atual; helper ainda inativo | Pulse Community `milestone/grafx-mpulse3-node-properties@4aae27eca9c0a2d1d14a3334b03e6c57976dea75` → `feature/v0.3.3`; revisão Nexus `hof_cad849ee19e542eb862930f64054724d` concluída/PASS | labels desconhecidas retornam vazio sem tocar backend; label conhecida ausente/wrong-kind e DB fechado falham tipado; ordem de catálogo, snapshot, reopen e fronteiras públicas cobertos; 8/8, Ruff default/TRY/I/BLE e format PASS. A resolução `board_id → Database` fica no provider/composição, sem ativação parcial |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um
