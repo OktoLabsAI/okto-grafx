@@ -631,14 +631,28 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         for p in raw["probes"]
         if p["contract_disposition"] == "allowed" and p["engine_verdict"] == "refused"
     ]
-    # The four functions the audit named must be owed, and owed at ANALYSIS, not at parsing.
-    for name in ("coalesce", "label", "string_split", "size"):
+    functions = {
+        probe["construct"]: probe
+        for probe in raw["probes"]
+        if probe["category"] == "function"
+    }
+    # M-PULSE-2B is a ratchet: the three scalar helpers are no longer merely parsed, while
+    # label/timestamp remain explicit work instead of disappearing from the owed surface.
+    for name in ("coalesce", "string_split", "size"):
+        probe = functions[name]
+        assert probe["contract_disposition"] == "allowed", name
+        assert probe["engine_verdict"] == "accepted", name
+        assert probe["acceptance_phase"] == "planned", name
+        assert probe["error"] is None, name
+        assert name not in owed, owed
+    for name in ("label", "timestamp"):
+        probe = functions[name]
         assert name in owed, owed
-    functions = [p for p in raw["probes"] if p["category"] == "function"]
-    for probe in functions:
-        if probe["construct"] not in {"coalesce", "label", "string_split", "size"}:
-            continue
-        assert probe["acceptance_phase"] == "analysis_error", probe["construct"]
+        assert probe["acceptance_phase"] == "analysis_error", name
+        assert probe["error"], name
+
+    assert frozen["counts"]["classification:already_supported"] == 69
+    assert frozen["counts"]["classification:generic_gap"] == 26
 
 
 def test_every_raw_probe_has_one_contract_and_engine_verdict(frozen: dict) -> None:

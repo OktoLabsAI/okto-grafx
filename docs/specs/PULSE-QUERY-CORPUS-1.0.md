@@ -2,13 +2,14 @@
 
 `KG_QUERY_CONTRACT_VERSION = 1.0`
 
-This is the first sub-batch of M-PULSE-2. It freezes **what Pulse actually asks a graph to
-do**, so the milestone that follows can be scoped against evidence rather than against an
-impression of how much Cypher is in use.
+M-PULSE-2A introduced this freeze of **what Pulse actually asks a graph to do**, so every
+language sub-batch can ratchet against evidence rather than against an impression of how much
+Cypher is in use. This revision also records M-PULSE-2B: `coalesce`, `string_split` and `size`
+now plan and execute, while the remaining gaps stay explicit.
 
-It implements no parser, no clause, no function, no engine change and no provider. The
-default dialect is untouched. The only new behaviour in this repository is a scanner, a frozen
-JSON corpus and a test that refuses to let the two drift apart.
+The scanner and JSON do not widen the public endpoint or execute Pulse code. Engine changes
+are reviewed in their own commits, and regenerating this corpus makes each accepted/refused
+transition visible instead of silently redefining the target.
 
 ## Baselines
 
@@ -66,7 +67,10 @@ This keeps an unsupported family useful: closing the language gap must change th
 ## Counts at `pulse-1`
 
 `97` entries, digest
-`54c3d75797eb9c92c58bbfb796a3e772b77b4c0307f971af88e8cc4978927554`.
+`5ad93542b86cf5cc335d9334f05d1d6c8f5beddbcb15e812c1ba7dc0c224020d`.
+
+The engine currently classifies 69 entries as `already_supported` and 26 as `generic_gap`;
+the duplicate and declared fragment remain separate classifications.
 
 **Internal families** — 68 closed families over the audited originators, 47 read and
 21 write, identified `I01`..`I68`. Each records every origin that supports it. 66 are
@@ -99,13 +103,13 @@ Each probe carries two independent answers. `contract_disposition` is what the *
 endpoint** admits; `engine_verdict` is what **this engine** does with the same text. They
 differ on purpose: the contract blacklists writes, while the engine accepts writes because
 the internal port needs them. Today the contract allows 74 probes and refuses 13 (10
-`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 58 and refuses 29. The
-intersection that matters to the public endpoint is the 21 allowed probes the engine still
+`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 61 and refuses 26. The
+intersection that matters to the public endpoint is the 18 allowed probes the engine still
 refuses.
 
 ### What M-PULSE-2 owes
 
-These 21 constructs are admitted by the public contract and refused by the engine:
+These 18 constructs are admitted by the public contract and refused by the engine:
 
 | Construct | Category | Refused at |
 | --- | --- | --- |
@@ -119,9 +123,6 @@ These 21 constructs are admitted by the public contract and refused by the engin
 | `CASE searched` | expression | parse error |
 | `CASE simple` | expression | parse error |
 | `label` | function | analysis error |
-| `coalesce` | function | analysis error |
-| `string_split` | function | analysis error |
-| `size` | function | analysis error |
 | `timestamp` | function | analysis error |
 | `untyped relationship` | pattern | plan error |
 | `polymorphic node` | pattern | plan error |
@@ -131,10 +132,10 @@ These 21 constructs are admitted by the public contract and refused by the engin
 | `unbounded variable length` | limits | parse error |
 | `path projection` | result | parse error |
 
-Five of them are functions and fail at **analysis**, not at
-parsing: an unknown function still parses into a generic call node. That is why acceptance
-here is `parse` **and** `analyze`, and why `acceptance_phase` is recorded — a later commit
-that teaches one function moves exactly the entries it should and nothing else.
+Two of them, `label` and `timestamp`, are functions and fail at **analysis**, not at parsing:
+an unknown function still parses into a generic call node. `coalesce`, `string_split` and
+`size` now reach `planned`; that ratchet is frozen in both the JSON and its sentinels. This is
+why acceptance records parse, analysis and planning separately.
 
 ### The behavioural contract beside the grammar
 
@@ -178,7 +179,7 @@ By execution, not by judgement.
 2. Otherwise the template is materialized and handed to this repository's own `parse`,
    `analyze` and `build_plan` against the closed Pulse catalog. Only a query accepted by all
    three is `already_supported`; the last phase reached is recorded in `acceptance_phase`.
-   Parsing alone is not accepting: an unknown function still becomes a generic call node,
+   Parsing alone is not accepting: `label` and `timestamp` still become generic call nodes,
    while polymorphic nodes and untyped relationships reach planning before they are refused.
 3. Materialization happens **twice**: once filling holes with identifiers, once with the
    empty string. A hole is not always an identifier — some carry an optional clause — and
@@ -250,8 +251,10 @@ the environment variable to set. They never pass silently on absent baselines.
 
 ## What this deliberately does not do
 
-- No parser, clause, function, engine or provider work. That is the rest of M-PULSE-2.
-- No change to the default dialect.
+- No clauses, provider work or endpoint activation. M-PULSE-2B closes only the three scalar
+  helpers recorded above; the other 18 admitted/refused constructs remain later M-PULSE-2 work.
+- No hidden profile switch or Pulse-specific bypass: the helpers use the ordinary typed planner
+  and executor paths.
 - No differential execution against Ladybug. The corpus records what Pulse sends and whether
   this engine plans it. Its structured expected rows/effects, types, nullability, cardinality
   and ordering are static compatibility oracles, not sampled Ladybug results.

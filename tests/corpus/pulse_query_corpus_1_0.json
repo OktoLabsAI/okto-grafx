@@ -253,8 +253,8 @@
       "RETURN"
     ],
     "probe_count": 87,
-    "engine_accepted": 58,
-    "engine_refused": 29,
+    "engine_accepted": 61,
+    "engine_refused": 26,
     "contract_refused": 13,
     "contract_error_codes": {
       "unsafe_cypher": 10,
@@ -1197,7 +1197,7 @@
         "contract_reason": null,
         "acceptance_phase": "analysis_error",
         "engine_verdict": "refused",
-        "error": "GrafxPlanError: There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+        "error": "GrafxPlanError: There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
       },
       {
         "category": "function",
@@ -1206,9 +1206,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "analysis_error",
-        "engine_verdict": "refused",
-        "error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "function",
@@ -1217,9 +1217,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "analysis_error",
-        "engine_verdict": "refused",
-        "error": "GrafxPlanError: There is no function named 'string_split' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "function",
@@ -1228,9 +1228,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "analysis_error",
-        "engine_verdict": "refused",
-        "error": "GrafxPlanError: There is no function named 'size' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "function",
@@ -1241,7 +1241,7 @@
         "contract_reason": null,
         "acceptance_phase": "analysis_error",
         "engine_verdict": "refused",
-        "error": "GrafxPlanError: There is no function named 'timestamp' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+        "error": "GrafxPlanError: There is no function named 'timestamp' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
       },
       {
         "category": "function",
@@ -1700,10 +1700,10 @@
     "class:fragment": 1,
     "class:read": 75,
     "class:write": 21,
-    "classification:already_supported": 57,
+    "classification:already_supported": 69,
     "classification:duplicate_text": 1,
     "classification:fragment": 1,
-    "classification:generic_gap": 38,
+    "classification:generic_gap": 26,
     "reachability:preventive": 2,
     "reachability:runtime_current": 66,
     "surface:internal_family": 68,
@@ -1801,8 +1801,8 @@
         }
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (a). [code=plan_error retryable=False]",
       "reachability": "runtime_current",
       "expected": {
         "kind": "rows",
@@ -1829,10 +1829,10 @@
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (a). [code=plan_error retryable=False]"
         }
       }
     },
@@ -1913,9 +1913,9 @@
           "receiver": "scope"
         }
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "reachability": "runtime_current",
       "expected": {
         "kind": "rows",
@@ -1935,12 +1935,7 @@
         "order_by": null,
         "limit": null,
         "notes": "ungrouped aggregate: one null-free scalar row",
-        "error": {
-          "phase": "analysis_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -3874,9 +3869,9 @@
           "receiver": "scope"
         }
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'COALESCE' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "reachability": "runtime_current",
       "expected": {
         "kind": "effect",
@@ -3889,12 +3884,7 @@
         "return_metadata": [],
         "expected_count": "at_most_one",
         "atomicity": "one statement inside the caller's transaction; the scope rolls it back with the rest of the session when compensation runs",
-        "error": {
-          "phase": "analysis_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "There is no function named 'COALESCE' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -4450,9 +4440,9 @@
           "receiver": "graph_scope"
         }
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "reachability": "runtime_current",
       "expected": {
         "kind": "rows",
@@ -4472,12 +4462,7 @@
         "order_by": "coalesce(n.generation, 0) DESC, n.id DESC",
         "limit": "1",
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "analysis_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -5474,8 +5459,8 @@
         "min_relevance"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -5495,10 +5480,10 @@
         "limit": null,
         "notes": "ungrouped aggregate: one null-free scalar row",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
         }
       }
     },
@@ -5525,7 +5510,7 @@
       ],
       "classification": "generic_gap",
       "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "parse_error": "GrafxPlanError: There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -5548,7 +5533,7 @@
           "phase": "analysis_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
         }
       }
     },
@@ -5569,9 +5554,9 @@
       "params": [
         "constraint_id"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -5620,12 +5605,7 @@
         "order_by": null,
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "analysis_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -5646,8 +5626,8 @@
         "constraint_id"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A 'derives_from' relationship written this way starts at Requirement, and 'c' is bound to 'Constraint', so this pattern can match nothing. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -5673,10 +5653,10 @@
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "A 'derives_from' relationship written this way starts at Requirement, and 'c' is bound to 'Constraint', so this pattern can match nothing. [code=plan_error retryable=False]"
         }
       }
     },
@@ -5697,9 +5677,9 @@
       "params": [
         "constraint_id"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -5724,12 +5704,7 @@
         "order_by": null,
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "analysis_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -5749,9 +5724,9 @@
       "params": [
         "max_rows"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -5794,12 +5769,7 @@
         "order_by": null,
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "analysis_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -5820,9 +5790,9 @@
         "max_rows",
         "node_id"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -5865,12 +5835,7 @@
         "order_by": null,
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "analysis_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -5893,9 +5858,9 @@
         "min_relevance",
         "topic"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -5944,12 +5909,7 @@
         "order_by": "d.relevance_score DESC, d.source_confidence DESC",
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "analysis_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -5975,7 +5935,7 @@
       ],
       "classification": "generic_gap",
       "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "parse_error": "GrafxPlanError: There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6124,7 +6084,7 @@
           "phase": "analysis_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
         }
       }
     },
@@ -6153,7 +6113,7 @@
       ],
       "classification": "generic_gap",
       "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "parse_error": "GrafxPlanError: There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6302,7 +6262,7 @@
           "phase": "analysis_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
         }
       }
     },
@@ -6330,7 +6290,7 @@
       ],
       "classification": "generic_gap",
       "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "parse_error": "GrafxPlanError: There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6479,7 +6439,7 @@
           "phase": "analysis_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
         }
       }
     },
@@ -6509,7 +6469,7 @@
       ],
       "classification": "generic_gap",
       "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "parse_error": "GrafxPlanError: There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6658,7 +6618,7 @@
           "phase": "analysis_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "There is no function named 'label' in this dialect; it reads avg, collect, count, max, min, sum, coalesce, size, similarity, similarity_score and string_split. [code=plan_error retryable=False]"
         }
       }
     },
@@ -6683,9 +6643,9 @@
         "min_relevance",
         "topic"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6746,12 +6706,7 @@
         "order_by": "d.relevance_score DESC, d.created_at DESC",
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "analysis_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -6774,9 +6729,9 @@
         "min_confidence",
         "min_relevance"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6831,12 +6786,7 @@
         "order_by": "l.relevance_score DESC, l.source_confidence DESC",
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "analysis_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -6949,9 +6899,9 @@
       "params": [
         "decision_id"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6994,12 +6944,7 @@
         "order_by": null,
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "analysis_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -7020,9 +6965,9 @@
         "decision_id",
         "max_rows"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -7071,12 +7016,7 @@
         "order_by": "alt.source_confidence DESC",
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "analysis_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -7129,8 +7069,8 @@
         "decision_id"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'APIContract', so this pattern can match nothing. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -7174,10 +7114,10 @@
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'APIContract', so this pattern can match nothing. [code=plan_error retryable=False]"
         }
       }
     },
@@ -7199,8 +7139,8 @@
         "decision_id"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Alternative', so this pattern can match nothing. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -7244,10 +7184,10 @@
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Alternative', so this pattern can match nothing. [code=plan_error retryable=False]"
         }
       }
     },
@@ -7269,8 +7209,8 @@
         "decision_id"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Assumption', so this pattern can match nothing. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -7314,10 +7254,10 @@
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Assumption', so this pattern can match nothing. [code=plan_error retryable=False]"
         }
       }
     },
@@ -7339,8 +7279,8 @@
         "decision_id"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Bug', so this pattern can match nothing. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -7384,10 +7324,10 @@
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Bug', so this pattern can match nothing. [code=plan_error retryable=False]"
         }
       }
     },
@@ -7409,8 +7349,8 @@
         "decision_id"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Constraint', so this pattern can match nothing. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -7454,10 +7394,10 @@
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Constraint', so this pattern can match nothing. [code=plan_error retryable=False]"
         }
       }
     },
@@ -7479,8 +7419,8 @@
         "decision_id"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Criterion', so this pattern can match nothing. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -7524,10 +7464,10 @@
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Criterion', so this pattern can match nothing. [code=plan_error retryable=False]"
         }
       }
     },
@@ -7614,8 +7554,8 @@
         "decision_id"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Entity', so this pattern can match nothing. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -7659,10 +7599,10 @@
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Entity', so this pattern can match nothing. [code=plan_error retryable=False]"
         }
       }
     },
@@ -7684,8 +7624,8 @@
         "decision_id"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Learning', so this pattern can match nothing. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -7729,10 +7669,10 @@
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Learning', so this pattern can match nothing. [code=plan_error retryable=False]"
         }
       }
     },
@@ -7754,8 +7694,8 @@
         "decision_id"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Requirement', so this pattern can match nothing. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -7799,10 +7739,10 @@
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'Requirement', so this pattern can match nothing. [code=plan_error retryable=False]"
         }
       }
     },
@@ -7824,8 +7764,8 @@
         "decision_id"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "analysis_error",
-      "parse_error": "GrafxPlanError: There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'TestScenario', so this pattern can match nothing. [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -7869,13 +7809,13 @@
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "analysis_error",
+          "phase": "plan_error",
           "code": "plan_error",
           "type": "GrafxPlanError",
-          "message": "There is no function named 'coalesce' in this dialect; it reads avg, collect, count, max, min, sum, similarity and similarity_score. [code=plan_error retryable=False]"
+          "message": "A 'supersedes' relationship written this way starts at Decision, and 'current' is bound to 'TestScenario', so this pattern can match nothing. [code=plan_error retryable=False]"
         }
       }
     }
   ],
-  "digest": "54c3d75797eb9c92c58bbfb796a3e772b77b4c0307f971af88e8cc4978927554"
+  "digest": "5ad93542b86cf5cc335d9334f05d1d6c8f5beddbcb15e812c1ba7dc0c224020d"
 }
