@@ -89,7 +89,12 @@ from okto_grafx.domain.model.value import (
 )
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
-from okto_grafx.domain.txn.context import PendingRowRef, RowIntent, RowOperation
+from okto_grafx.domain.txn.context import (
+    SIZING_ENDPOINT,
+    PendingRowRef,
+    RowIntent,
+    RowOperation,
+)
 from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.query.analysis import Aggregation, QueryAnalysis, analyze
 from okto_grafx.domain.query.ast import (
@@ -472,6 +477,7 @@ class _Context:
     intermediate_rows: dict[int, int] = field(default_factory=dict)
     staged_rows: list[_HeldRow] = field(default_factory=list)
     staged_partitions: list[tuple[int, bytes]] = field(default_factory=list)
+    staged_reads: list[tuple[int, bytes]] = field(default_factory=list)
     tokens_issued: int = 0
     pending_tokens: dict[int, int] = field(default_factory=dict)
     cancelled_insert_tokens: set[int] = field(default_factory=set)
@@ -586,6 +592,19 @@ class _Context:
         self.staged_rows.append(_HeldRow(_HELD_DELETE, table, None, None, reference))
         self.staged_partitions.append((table.table_id, key))
 
+    def hold_read(self, table: TableDef, key: bytes) -> None:
+        """Hold a dependency this statement's work rests on, under the statement's discipline.
+
+        A row a statement READ and then depended on has to be declared, or optimistic validation
+        cannot refuse the transaction that changed it underneath. Held rather than declared on
+        the spot, exactly like the writes: a statement that refuses half way through must leave
+        the transaction's interest set as it found it, and a guard published by a refused
+        statement would make a LATER commit conflict over work nobody did.
+        """
+        entry = (table.table_id, key)
+        if entry not in self.staged_reads:
+            self.staged_reads.append(entry)
+
     def _require_statement_write_capacity(self) -> None:
         """Refuse the next logical write before this statement retains it."""
         limit = self.engine._max_statement_writes
@@ -609,7 +628,7 @@ class _Context:
         were asked for. Values were checked while held; transaction-wide row/byte admission may
         still refuse the handover, and the exact staging mark below then restores all prior work.
         """
-        if not self.staged_rows:
+        if not self.staged_rows and not self.staged_reads:
             return 0
         transaction = _require_write_transaction(self.txn)
         note_write = getattr(transaction, "note_write", None)
@@ -634,9 +653,14 @@ class _Context:
                     transaction.stage_row_update(held.table, held.reference, held.values or ())
                 else:
                     transaction.stage_row_delete(held.table, held.reference)
-            if note_write is not None and partition_of is not None:
-                for table_id, key in self.staged_partitions:
-                    note_write(partition_of(table_id, key))
+            if partition_of is not None:
+                note_read = getattr(transaction, "note_read", None)
+                if note_read is not None:
+                    for table_id, key in self.staged_reads:
+                        note_read(partition_of(table_id, key))
+                if note_write is not None:
+                    for table_id, key in self.staged_partitions:
+                        note_write(partition_of(table_id, key))
             if mark is not None and callable(settle):
                 settle(mark)
         except BaseException:
@@ -646,6 +670,7 @@ class _Context:
         moved = len(self.staged_rows)
         self.staged_rows.clear()
         self.staged_partitions.clear()
+        self.staged_reads.clear()
         return moved
 
     @property
@@ -1624,6 +1649,7 @@ def _edge_steps(
     incoming: bool,
     ended: frozenset[object] | set[object],
     changed: Mapping[object, tuple[Value, ...] | None],
+    pending: Sequence[tuple[object, HeapVersion]] = (),
 ) -> Callable[[object], Iterator[tuple[object, HeapVersion, TableDef, object]]]:
     """Return the function a traversal expands one frontier node with.
 
@@ -1669,6 +1695,12 @@ def _edge_steps(
         else None
     )
     indexed = ((not outgoing) or from_name) and ((not incoming) or to_name)
+    if pending:
+        # An endpoint index describes COMMITTED edges. An edge this transaction created is not in
+        # it and cannot be put in it before the commit, so a lookup would answer a question about
+        # a graph its owner is no longer looking at. The grouped scan can be overlaid; an index
+        # answer cannot be, because what is missing from it leaves no trace to overlay.
+        indexed = False
     snapshot = context.snapshot
 
     def owner_version(ref: object, version: HeapVersion) -> HeapVersion | None:
@@ -1731,6 +1763,14 @@ def _edge_steps(
                 version = owner_version(ref, version)
                 if version is None:
                     continue
+                if outgoing:
+                    by_source.setdefault(version.values[0], []).append((ref, version))
+                if incoming:
+                    by_target.setdefault(version.values[1], []).append((ref, version))
+            for ref, version in pending:
+                # Their endpoints may be pending identities themselves, which is exactly the key
+                # `_owner_nodes` answers to, so a created edge between two created nodes needs no
+                # special case here.
                 if outgoing:
                     by_source.setdefault(version.values[0], []).append((ref, version))
                 if incoming:
@@ -1813,61 +1853,28 @@ def _traverse(
     """
     catalog = context.schema()
     relationship = node.table
-    involved = {
-        table.table_id: table
-        for table in (
-            relationship,
-            catalog.table(relationship.from_table),
-            catalog.table(relationship.to_table),
-        )
-    }
     dirty_tables = _intent_table_ids(context.txn)
+    # The owner reads its own staged work. Everything this transaction has done to the three
+    # tables a hop touches -- a committed edge whose properties it replaced, an edge it created,
+    # a node it created, updated or ended -- folds into one view here, and a reader outside the
+    # transaction never reaches this code at all.
     relationship_changes: Mapping[object, tuple[Value, ...] | None] = {}
-    for table in involved.values():
-        if table.table_id not in dirty_tables:
-            continue
-        changed, inserted = _transaction_row_view(context, table, include_held=False)
-        if table.table_id == relationship.table_id and not inserted:
-            # A committed relationship keeps its identity and endpoints while an UPDATE replaces
-            # only its property picture.  `_edge_steps` can therefore overlay it exactly.  A
-            # pending relationship INSERT still has no safe traversal representation and takes
-            # the typed refusal below.
-            relationship_changes = changed
-            continue
-        if not inserted and all(values is None for values in changed.values()):
-            # Stored-row deletes already have the pre-M1 traversal overlay: `_edge_steps` and
-            # `node_at` omit references returned by `_ended_by_this_transaction`. Keep that
-            # supported path. Stored relationship updates take the exact overlay above; pending
-            # relationship inserts and endpoint-node updates still need their own identity-aware
-            # traversal overlay.
-            continue
-        raise GrafxUnsupportedOperation(
-            f"A traversal involving {table.name!r} cannot include rows this transaction has "
-            "staged in this shape. Commit or roll back first; pending relationship inserts and "
-            "endpoint-node read-your-own-writes are not implemented in this build.",
-            field="table",
-            value=table.name,
-            table_id=table.table_id,
-            operation="traversal",
-        )
-    snapshot = context.snapshot
+    pending_edges: tuple[tuple[object, HeapVersion], ...] = ()
+    if relationship.table_id in dirty_tables:
+        relationship_changes, pending_edges = _owner_edges(context, relationship)
     from_table = catalog.table(relationship.from_table)
     to_table = catalog.table(relationship.to_table)
     nodes_by_id: dict[int, dict[int, tuple[object, HeapVersion]]] = {}
 
     ended = _ended_by_this_transaction(context)
 
-    def node_at(table: TableDef, record_id: object) -> tuple[object, HeapVersion] | None:
-        """Return the visible version of one node by identity, indexing each table once."""
+    def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
+        """Return the version of one node its owner can see, indexing each table once."""
         found = nodes_by_id.get(table.table_id)
         if found is None:
-            found = {
-                version.record_id: (ref, version)
-                for ref, version in engine.heap.scan(table, snapshot)
-                if ref not in ended  # a node this transaction ended is not a landing
-            }
+            found = _owner_nodes(engine, context, table, ended)
             nodes_by_id[table.table_id] = found
-        return found.get(record_id)  # type: ignore[arg-type]
+        return found.get(identity)  # type: ignore[arg-type]
 
     outgoing = node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
     incoming = node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
@@ -1881,6 +1888,7 @@ def _traverse(
         incoming,
         ended,
         relationship_changes,
+        pending_edges,
     )
 
     for row in engine._rows(node.child, context):
@@ -1894,7 +1902,7 @@ def _traverse(
         bound_target = row.bindings.get(node.target) if node.target_bound else None
         # (current record id, current table, edges taken so far)
         frontier: list[tuple[object, TableDef, tuple[RowBinding, ...]]] = [
-            (start.record_id, start.table, ())
+            (_overlay_identity(start), start.table, ())
         ]
         for depth in range(1, node.max_hops + 1):
             reached: list[tuple[object, TableDef, tuple[RowBinding, ...]]] = []
@@ -1905,7 +1913,7 @@ def _traverse(
                         continue
                     if (
                         isinstance(bound_target, RowBinding)
-                        and bound_target.record_id == next_id
+                        and _overlay_identity(bound_target) == next_id
                         and bound_target.table.table_id == next_table.table_id
                     ):
                         # The landing IS the bound row, which arrived through operators that
@@ -1926,7 +1934,7 @@ def _traverse(
                         continue
                     landing_ref, landing_version = landing
                     if isinstance(bound_target, RowBinding) and (
-                        bound_target.record_id != next_id
+                        _overlay_identity(bound_target) != next_id
                         or bound_target.table.table_id != next_table.table_id
                     ):
                         continue
@@ -2528,21 +2536,25 @@ def _incident_edges(
             continue
         candidates.append((candidate, leaves, lands))
 
-        # Until the relationship overlay lands, a relationship created by this transaction is
-        # not in the heap scan below. Silently overlooking an incident one would let DETACH end
-        # the node while the pending relationship survives the commit as a physically live
-        # orphan. Refuse the whole statement before yielding (and therefore before holding) any
-        # physical edge. Unrelated pending relationships are safe and do not block the detach.
-        _changed, inserted = _transaction_row_view(context, candidate)
-        for _reference, values in inserted:
-            incident = (leaves and values[0] == endpoint_identity) or (
+        # An edge THIS statement is still holding has no logical identity the transaction can
+        # be told to end: it is not on `row_intents` yet, so ending it would have to reach into
+        # the statement's own held work while that work is still being built. Refuse before
+        # anything is yielded, and therefore before any physical edge is held.
+        for held in context.staged_rows:
+            if held.operation is not _HELD_INSERT:
+                continue
+            if held.table.table_id != candidate.table_id:
+                continue
+            values = held.values or ()
+            if len(values) < ENDPOINT_COLUMN_COUNT:
+                continue
+            if (leaves and values[0] == endpoint_identity) or (
                 lands and values[1] == endpoint_identity
-            )
-            if incident:
+            ):
                 raise GrafxUnsupportedOperation(
-                    f"DETACH DELETE cannot yet include the pending {candidate.name!r} "
-                    "relationship incident on this node. Commit or roll back first; "
-                    "relationship read-your-own-writes is not implemented in this build.",
+                    f"DETACH DELETE cannot include a {candidate.name!r} relationship this same "
+                    "statement is creating. Create the relationship in an earlier statement, or "
+                    "detach the node in one of its own.",
                     field="table",
                     value=candidate.name,
                     table_id=candidate.table_id,
@@ -2550,6 +2562,28 @@ def _incident_edges(
                 )
 
     for candidate, leaves, lands in candidates:
+        # The edges earlier statements created come first, and ending one CANCELS it: the
+        # transaction's own reducer folds an insert followed by a delete into no row at all, so
+        # the node and everything hanging from it leave together with nothing to publish.
+        _changed, inserted = _transaction_row_view(context, candidate, include_held=False)
+        for reference, values in inserted:
+            if not isinstance(reference, PendingRowRef):
+                continue
+            if not (
+                (leaves and values[0] == endpoint_identity)
+                or (lands and values[1] == endpoint_identity)
+            ):
+                continue
+            yield candidate, reference, HeapVersion(
+                record_id=0,
+                xmin=NO_CSN,
+                xmax=NO_CSN,
+                values=values,
+                prev=None,
+                schema_version=candidate.schema_version,
+                deleted=False,
+                table_id=candidate.table_id,
+            )
         for ref, version in engine.heap.scan(candidate, snapshot):
             incident = (leaves and version.values[0] == endpoint_identity) or (
                 lands and version.values[1] == endpoint_identity
@@ -2711,7 +2745,8 @@ def _materialise_edge(
                 field=end,
                 value=variable,
             )
-    endpoints: list[int] = []
+    endpoints: list[object] = []
+    guards: list[tuple[TableDef, bytes]] = []
     for end, variable in (("source", edge.source), ("target", edge.target)):
         binding = bindings.get(variable)
         if not isinstance(binding, RowBinding):
@@ -2721,11 +2756,20 @@ def _materialise_edge(
                 field=end,
                 value=variable,
             )
-        if isinstance(binding.ref, PendingRowRef) or binding.record_id == 0:
+        guards.append(
+            (binding.table, _partition_key(binding.table, binding.version.values))
+        )
+        if isinstance(binding.ref, PendingRowRef):
+            # The node was staged by an EARLIER statement, so it has a private identity this
+            # transaction owns and the commit path resolves before anything is written. The
+            # endpoint carries that identity rather than a number nobody has issued.
+            endpoints.append(binding.ref)
+            continue
+        if binding.record_id == 0:
             raise GrafxUnsupportedOperation(
-                f"The {end} of a {edge.table.name!r} edge is {variable!r}, a node this "
-                "transaction has staged but whose durable identity does not exist until commit. "
-                "Commit the node first, then create the relationship.",
+                f"The {end} of a {edge.table.name!r} edge is {variable!r}, a staged node that "
+                "carries no identity this transaction can resolve. Commit the node first, then "
+                "create the relationship.",
                 field=end,
                 value=variable,
                 table=edge.table.name,
@@ -2735,7 +2779,21 @@ def _materialise_edge(
     properties = materialise_row(
         engine, edge.table, edge.properties, row, context, endpoints=(endpoints[0], endpoints[1])
     )
-    engine.heap.require_endpoints(edge.table, properties, context.snapshot)
+    if not any(isinstance(endpoint, PendingRowRef) for endpoint in endpoints):
+        # The heap's own door, asked BEFORE anything is staged, so an edge naming a row this
+        # snapshot cannot see leaves nothing behind. A pending endpoint has no stored row to ask
+        # about; what stands behind it is the staging proof, which the commit path re-runs over
+        # the reduced intents before it writes.
+        engine.heap.require_endpoints(edge.table, properties, context.snapshot)
+    # LAST, once nothing about this edge can still refuse. An edge is a statement ABOUT its two
+    # endpoints: it is only correct while those rows are still there, and another transaction
+    # deleting one of them makes it wrong. Without the declaration the two commits touch
+    # disjoint partitions -- the edge table and the node table -- and neither refuses, so the
+    # edge would be published against a node that no longer exists. Declaring the dependency is
+    # also what makes that refusal arrive at the FIRST validation, before a row is written and
+    # before a page is allocated for it.
+    for guard in guards:
+        context.hold_read(*guard)
     return edge.table, properties
 
 
@@ -3074,6 +3132,91 @@ def _current_values(context: _Context, binding: RowBinding) -> tuple[Value, ...]
     return binding.version.values
 
 
+def _overlay_identity(binding: RowBinding) -> object:
+    """Return what names this row inside its owner's combined view.
+
+    A committed row is named by its record id. A row this transaction staged has none yet -- the
+    commit allocates it -- so it is named by the private reference the staging door issued. That
+    is the SAME token a pending edge carries in its endpoint slot, which is what lets one map
+    answer for both kinds of row without a second key space to keep in step.
+    """
+    reference = binding.ref
+    if isinstance(reference, PendingRowRef):
+        return reference
+    return binding.record_id
+
+
+def _owner_nodes(
+    engine: QueryEngine,
+    context: _Context,
+    table: TableDef,
+    ended: frozenset[object] | set[object],
+) -> dict[object, tuple[object, HeapVersion]]:
+    """Return every row of a node table its owner can see, keyed by what names it.
+
+    Three things fold together here, and they have to fold in one place: the committed rows this
+    snapshot can see, the property pictures this transaction has replaced, and the rows it has
+    created but not committed. A reader outside the transaction never calls this at all, so the
+    view is owner-only by construction rather than by a rule someone has to remember.
+    """
+    changed, inserted = _transaction_row_view(context, table, include_held=False)
+    found: dict[object, tuple[object, HeapVersion]] = {}
+    for ref, version in engine.heap.scan(table, context.snapshot):
+        if ref in ended:
+            continue  # a row this transaction ended is not a landing
+        if ref in changed:
+            values = changed[ref]
+            if values is None:
+                continue
+            version = replace(version, values=values)
+        found[version.record_id] = (ref, version)
+    for reference, values in inserted:
+        if not isinstance(reference, PendingRowRef):
+            continue
+        found[reference] = (
+            reference,
+            HeapVersion(
+                record_id=0,
+                xmin=NO_CSN,
+                xmax=NO_CSN,
+                values=values,
+                prev=None,
+                schema_version=table.schema_version,
+                deleted=False,
+                table_id=table.table_id,
+            ),
+        )
+    return found
+
+
+def _owner_edges(
+    context: _Context, table: TableDef
+) -> tuple[
+    dict[object, tuple[Value, ...] | None],
+    tuple[tuple[object, HeapVersion], ...],
+]:
+    """Return this transaction's changes to stored edges and the edges it has created."""
+    changed, inserted = _transaction_row_view(context, table, include_held=False)
+    pending = tuple(
+        (
+            reference,
+            HeapVersion(
+                record_id=0,
+                xmin=NO_CSN,
+                xmax=NO_CSN,
+                values=values,
+                prev=None,
+                schema_version=table.schema_version,
+                deleted=False,
+                table_id=table.table_id,
+            ),
+        )
+        for reference, values in inserted
+        if isinstance(reference, PendingRowRef)
+    )
+    return changed, pending
+
+
 def _ended_by_this_transaction(context: _Context) -> set[object]:
     """Return the stored rows this transaction has already staged the end of.
 
@@ -3209,9 +3352,15 @@ def _partition_key(table: TableDef, values: tuple[Value, ...]) -> bytes:
     to happen, never miss one that did.
     """
     if table.kind == "rel":
-        return b"".join(
-            encode_value(values[position]) for position in range(ENDPOINT_COLUMN_COUNT)
-        )
+        endpoints = tuple(values[position] for position in range(ENDPOINT_COLUMN_COUNT))
+        if any(isinstance(endpoint, PendingRowRef) for endpoint in endpoints):
+            # An endpoint this transaction has not resolved yet has no encoding, and inventing
+            # one would put the edge in a partition its committed self will not land in. The
+            # table itself is the honest key here: it over-approximates, and an over-approximate
+            # interest set can only produce a conflict that did not have to happen -- never miss
+            # one that did.
+            return b""
+        return b"".join(encode_value(endpoint) for endpoint in endpoints)
     if table.primary_key is not None:
         return encode_value(values[table.column_index(table.primary_key)])
     return b""
@@ -3291,8 +3440,39 @@ def materialise_row(
             )
             values[position] = stored
     materialised = tuple(values)
-    encode_tuple(table, materialised)
+    # An endpoint an earlier statement promised has no stored encoding yet, so the shape is
+    # validated against the width it will occupy. Nothing about the promise is waved through:
+    # the commit path resolves it and re-encodes the resolved row before anything is written,
+    # and every column the caller actually wrote is checked here exactly as before.
+    encode_tuple(table, _validatable_row(table, materialised))
     return materialised
+
+
+def _validatable_row(table: TableDef, values: tuple[Value, ...]) -> tuple[Value, ...]:
+    """Return the row with each unresolved endpoint standing in for the id it will become.
+
+    Only the two endpoint columns of a relationship may hold a promise, and the substitution is
+    positional for that reason. Anywhere else a promise is a value that will never become one, so
+    it is refused HERE rather than widened into the encoder -- the staging door draws the same
+    line, and two doors drawing it differently is how a token eventually walks through one.
+    """
+    endpoints = ENDPOINT_COLUMN_COUNT if table.kind == "rel" else 0
+    substituted: list[Value] = []
+    for position, value in enumerate(values):
+        if not isinstance(value, PendingRowRef):
+            substituted.append(value)
+            continue
+        if position >= endpoints:
+            raise GrafxUnsupportedOperation(
+                "Only the two endpoint columns of a relationship may name a row this "
+                "transaction has not committed yet.",
+                field="column",
+                value=table.columns[position].name if position < table.arity else position,
+                table=table.name,
+                operation="pending_value",
+            )
+        substituted.append(SIZING_ENDPOINT)
+    return tuple(substituted)
 
 
 def _column_named(table: TableDef, key: str) -> ColumnDef:
