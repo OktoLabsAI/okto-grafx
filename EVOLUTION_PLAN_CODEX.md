@@ -704,13 +704,20 @@ O WAL físico não deve virar API pública porque seu formato e granularidade s�
 - Okto Pulse Community `feature/v0.3.3@0401e412c5104d7ee0ee98e7b91061f0ce94f6d2`;
 - Okto Pulse Core `feature/v0.3.3@985f6a88b526bc16e0c9faa0b7f1d9b2acd27ca9`;
 - contrato público de consulta `KG_QUERY_CONTRACT_VERSION = "1.0"`, em
-  `../okto-pulse-core/src/okto_pulse/core/kg/query_contract.py`.
+  `../okto-pulse-core/src/okto_pulse/core/kg/query_contract.py`;
+- schema de board `SCHEMA_VERSION = "0.5.0"` e Global Discovery
+  `GLOBAL_SCHEMA_VERSION = "0.1.2"`.
 
-Os dois worktrees do Pulse possuíam alterações locais durante a análise. Os hashes acima são a
-base reproduzível; o gate diferencial final deve registrar também o SHA limpo que incorporar essas
-alterações antes do corte. A compatibilidade desta seção fica limitada ao contrato e aos fluxos
-efetivamente usados por esse Pulse. Não é uma promessa de compatibilidade com todo o dialeto Kuzu,
-nem um alvo móvel para features futuras do Pulse.
+Os dois worktrees do Pulse possuíam alterações locais durante a análise — inclusive mudanças em
+`GraphTransactionScope` —, portanto os hashes acima são coordenadas da base, **não ainda um
+baseline reproduzível do estado observado**. M-PULSE-0 e M-PULSE-1 podem avançar porque seus
+invariantes de engine independem desse delta. Antes de fechar M-PULSE-2, o Pulse deve publicar um
+commit limpo contendo o contrato corrente, e esse SHA substituirá esta nota. Nenhum gate de
+compatibilidade total pode ser declarado apenas contra um worktree dirty.
+
+A compatibilidade desta seção fica limitada ao contrato e aos fluxos efetivamente usados por esse
+Pulse. Não é uma promessa de compatibilidade com todo o dialeto Kuzu, nem um alvo móvel para
+features futuras do Pulse.
 
 ### 9.1 Definição de “totalmente compatível”
 
@@ -724,7 +731,8 @@ bundle de providers de grafo** sem alterar a semântica observada pelo Core do P
 - `GraphLifecycle`;
 - `GraphRuntimeStore`;
 - runtime e recovery de Global Discovery;
-- `GraphRecovery`.
+- `GraphRecovery`;
+- `QuarantineRestore`.
 
 As referências canônicas estão em
 `../okto-pulse-core/src/okto_pulse/core/kg/interfaces/`, e a composição concreta atual está em
@@ -742,7 +750,9 @@ Também fazem parte do contrato:
 5. erros incompatíveis ou operações não implementadas devem falhar de forma tipada e explícita,
    nunca ser aceitos parcialmente;
 6. o endpoint público de Cypher continua read-only e obedece ao contrato 1.0; mutações internas
-   usam os ports estruturados ou um dialeto versionado e coberto pela suíte de conformidade.
+   usam os ports estruturados ou um dialeto versionado e coberto pela suíte de conformidade;
+7. cada write e o `COMMIT` final revalidam o fencing token/lease fornecido pelo Pulse; perder a
+   autoridade durante a unidade de trabalho impede a publicação.
 
 ### 9.2 Situação atual e bloqueadores
 
@@ -789,6 +799,8 @@ O Grafx precisa oferecer, com atomicidade transacional:
 - zero matches como no-op bem-sucedido;
 - rollback completo e recovery/reopen sem relações órfãs;
 - direção, label, endpoints, propriedades e multiplicidade preservados;
+- cobertura dos 11 node types, 16 relationship names e 69 pares concretos de endpoints do schema
+  atual do Pulse;
 - operação atômica de substituição integral do payload do nó sem trocar identidade ou arestas;
 - remoção por `source_session_id`, incluindo a variante que preserva lineage de Spec;
 - reconciliação e compensação de lineage/active-set com recibos completos conforme o port Pulse.
@@ -805,11 +817,16 @@ A transação write deve possuir um overlay privado consultável pelo mesmo owne
 - create/update → read das novas propriedades;
 - delete → ausência nas leituras posteriores;
 - unicidade/PK considerando estado committed e staged;
-- consultas por scan e por índice produzindo a mesma visão;
-- vetores staged não vazam para outros readers e são visíveis ao owner quando consultados;
+- consultas por scan e por índice produzem a mesma visão; no primeiro corte correto, tabelas com
+  overlay podem desabilitar seeks e usar scan+overlay, deixando a otimização para depois;
+- vetores staged não vazam para outros readers; enquanto o corpus Pulse não exigir consulta
+  vetorial sobre overlay, esse caso recusa de forma tipada e a publicação/indexação ocorre
+  atomicamente no commit;
 - commit publica toda a unidade ou nada; rollback não deixa heap, índices, vetores ou relações;
 - retry de conflito não reutiliza estado provisório inseguro;
-- outro processo continua vendo apenas o snapshot committed.
+- outro processo continua vendo apenas o snapshot committed;
+- o fencing token/lease é verificado no início das mutações e novamente imediatamente antes da
+  publicação final.
 
 IDs físicos provisórios podem existir, mas não podem escapar pela API. A resolução de endpoints e
 índices deve permanecer determinística após commit, abort, conflito e recovery.
@@ -824,13 +841,25 @@ O alvo é o subconjunto read-only público 1.0 e o corpus interno efetivamente e
 - strings: `CONTAINS`, `STARTS WITH`, `ENDS WITH`;
 - agregações: `COUNT`, `COLLECT`, `SUM`, `AVG`, `MIN`, `MAX`;
 - expressões: `CASE/WHEN/THEN/ELSE/END`, acesso a listas/mapas e parâmetros em lote;
-- funções observadas: `label`, `coalesce`, `string_split`, conversão de timestamp e as funções
+- funções observadas: `label`, `coalesce`, `string_split`, `size`, conversão de timestamp e as funções
   vetoriais mapeadas pelo adapter;
-- padrões directed, incoming, outgoing e undirected, incluindo hops 1 e 2 usados pelo contrato.
+- `MATCH (n)` polimórfico, relação sem tipo, named paths e retorno serializável de nó, relação e
+  path sem vazar `RecordId`;
+- padrões directed, incoming, outgoing e undirected, incluindo hops 1 e 2 usados pelo contrato;
+- envelope público preservado: normalização NFKC, parsing seguro de comments/literals, distinção
+  `unsafe_cypher`/`unsupported_operation`, `auto-LIMIT`, range máximo `*..20`, rewrite de layer
+  canônica, `execute_read_only_pair`, columns/row_count/truncation e contagem de linhas omitidas.
 
 O gate não é “aceitar os tokens”. Cada forma deve ter semântica diferencial contra Ladybug para
 linhas, colunas, tipos, nulidade, ordem, cardinalidade e erro. Qualquer construção fora desse
-corpus deve recusar explicitamente até ser versionada.
+corpus deve recusar explicitamente até ser versionada. Além do corpus público read-only, a suíte
+inclui as mutations internas que hoje passam por `GraphTransactionScope.execute`, como
+`MATCH ... SET`, `UNWIND ... SET`, `CREATE`, relationship create/return e deletes. Elas podem ser
+traduzidas pelo provider para operações estruturadas; não precisam ampliar o endpoint raw público.
+
+Ordem só é comparada quando a query possui `ORDER BY`; nos demais casos compara-se multiset. O
+Ladybug funciona como detector diferencial, não como oracle quando seu comportamento é indefinido
+ou viola o port. O contrato normativo e os invariantes de dados têm precedência.
 
 #### 9.3.4 Schema e introspecção
 
@@ -840,7 +869,8 @@ São requisitos:
 - node tables com PK, propriedades obrigatórias/opcionais e evolução aditiva;
 - relação lógica com mais de um par válido de tipos de endpoint, ainda que o adapter a materialize
   em tabelas físicas separadas;
-- mapeamento estável de `STRING`, `BOOL`, inteiros, doubles, listas e vetores de dimensão fixa;
+- mapeamento estável de `STRING`, `BOOL`, `INT64`, `DOUBLE`, `TIMESTAMP`, listas e vetores de
+  dimensão fixa;
 - `ALTER ... ADD PROPERTY/COLUMN` idempotente ou operação de schema equivalente;
 - enumeração de objetos, labels, propriedades, endpoints, PKs, espaços e índices;
 - versão de schema persistida e verificável;
@@ -853,8 +883,9 @@ com os mesmos DTOs do Pulse sem scraping de arquivos privados.
 
 #### 9.3.5 Busca vetorial
 
-O Grafx deve cobrir todos os node types indexados declarados em
-`../okto-pulse-core/src/okto_pulse/core/kg/schema_contract.py` e garantir:
+O Grafx deve cobrir os nove espaços de board declarados em
+`../okto-pulse-core/src/okto_pulse/core/kg/schema_contract.py` e os quatro espaços de Global
+Discovery (`Board`, `Topic`, `Entity` e `DecisionDigest`), e garantir:
 
 - dimensão e métrica validadas no schema e em cada write;
 - atualização/delete refletidos no índice e após reopen;
@@ -870,8 +901,14 @@ O Grafx deve cobrir todos os node types indexados declarados em
 - diretórios Kuzu/Ladybug e Grafx são sempre separados;
 - open, close, checkpoint, verify, quarantine, rebuild e recovery são oferecidos pelo provider
   completo, sem caminhos híbridos que ainda assumam `graph.lbug`;
+- inspect/restore de quarentena, privacy erase, purge, footprint e budgets preservam os DTOs e as
+  recusas dos ports Pulse;
+- operações de Global Discovery que constroem candidato/cutover recebem e revalidam o fence antes
+  da publicação;
 - export/import lógico é streaming, versionado, com manifesto e checksums;
 - o formato lógico inclui schema, nós, relações, propriedades, layers, vetores e IDs lógicos;
+- o fingerprint lógico canônico inclui type tags, `NULL`, direção e multiplicidade de relações e
+  nunca depende de `RecordId`, página, ordem física ou nome de arquivo;
 - import só é publicado depois de `verify()` e fingerprint lógico completo;
 - upgrade de formato físico ocorre por export/import ou rebuild para nova geração, nunca in-place;
 - versão antiga deve recusar formato obrigatório desconhecido de maneira fail-closed;
@@ -906,13 +943,15 @@ efeito parcial e readers externos nunca veem staged state.
 
 #### M-PULSE-2 — contrato de query Pulse 1.0
 
-1. gerar um corpus versionado a partir do contrato e das queries reais do Pulse;
+1. gerar um corpus versionado a partir do contrato e das queries reais read-only e write do Pulse;
 2. implementar clauses/expressões/funções ausentes;
-3. estabilizar DTO de resultado e taxonomia de erros;
-4. adicionar modo/capability `pulse-cypher-1.0` sem alterar silenciosamente o dialeto default.
+3. traduzir mutations internas para primitives estruturados quando isso evitar copiar DDL/procedures
+   Kuzu sem benefício;
+4. estabilizar DTO de resultado e taxonomia de erros;
+5. adicionar modo/capability `pulse-cypher-1.0` sem alterar silenciosamente o dialeto default.
 
-**Gate:** 100% do corpus read-only público e interno necessário passa em teste diferencial; formas
-fora do corpus recusam antes de executar.
+**Gate:** 100% do corpus read-only público e das mutations internas necessárias passa em teste
+diferencial; formas fora do corpus recusam antes de executar.
 
 #### M-PULSE-3 — schema, endpoints e introspecção
 
@@ -927,7 +966,7 @@ mesmo fingerprint de schema esperado pelo Pulse.
 
 #### M-PULSE-4 — paridade vetorial
 
-1. mapear os nove índices/tipos do Pulse para espaços Grafx;
+1. mapear os nove espaços de board e os quatro de Global Discovery para espaços Grafx;
 2. normalizar score e filtros;
 3. suportar create/rebuild/status dos índices;
 4. executar gates exact/ANN, cold/warm, churn e reopen.
@@ -938,10 +977,17 @@ item inelegível por board/layer/supersedence.
 #### M-PULSE-5 — export/import, backup e recovery portável
 
 1. formato lógico versionado;
-2. export e import em streaming;
-3. fingerprint e verificação pós-import;
-4. backup/restore consistente;
-5. adaptação das operações de lifecycle/recovery do Pulse sem nomes Ladybug.
+2. exporter Ladybug consistente sob freeze/snapshot e importer Grafx em streaming;
+3. exporter Grafx e importer de retorno, ou journal lógico reversível enquanto rollback estiver
+   aberto;
+4. fingerprint lógico canônico e verificação pós-import;
+5. backup/restore consistente;
+6. adaptação das operações de lifecycle/recovery do Pulse sem nomes Ladybug.
+
+O `graph_export.py` atual do Pulse não serve como formato de cutover: ele exporta um subconjunto de
+campos, omite embeddings e várias propriedades e deduplica arestas por tipo/endpoints, perdendo
+propriedades e multiplicidade. Ele deve ser substituído/estendido pelo exporter full-fidelity do
+milestone, não reutilizado como prova de paridade.
 
 **Gate:** round-trip completo preserva 100% dos nós, arestas, propriedades e vetores, incluindo os
 nós cognitivos sem fonte SQL, e permite rollback para a geração anterior.
@@ -949,10 +995,13 @@ nós cognitivos sem fonte SQL, e permite rollback para a geração anterior.
 #### M-PULSE-6 — providers Grafx e conformance end-to-end
 
 1. criar o bundle coerente `CommunityGrafx*` no Pulse;
-2. selecionar backend sem misturar providers Kuzu/Grafx;
+2. criar um routing bundle estável que selecione backend+geração por board; cada scope usa um único
+   backend coerente, e Global Discovery possui binding global separado;
 3. manter nomes de configuração legados como aliases durante a transição;
 4. fixar versão exata do Grafx;
-5. adicionar suíte diferencial por port e por fluxo de negócio.
+5. normalizar resultados, timestamps, mapas, vetores e erros nos DTOs/taxonomia Pulse;
+6. revalidar fencing em toda mutação e imediatamente antes do commit/cutover;
+7. adicionar suíte diferencial por port e por fluxo de negócio.
 
 **Gate:** a mesma suíte de Core passa com os dois bundles; nenhum import/tipo/erro Grafx aparece no
 Core e nenhuma operação cai silenciosamente no provider Kuzu.
@@ -964,11 +1013,15 @@ Core e nenhuma operação cai silenciosamente no provider Kuzu.
    sem reconciliação;
 3. comparar fingerprints e resultados continuamente;
 4. executar canário por board com freeze curto, delta final e troca atômica do binding;
-5. manter Ladybug intacto até o fim da janela de rollback.
+5. manter Ladybug intacto até o fim da janela de rollback;
+6. depois do primeiro write aceito pelo Grafx, rollback só permanece aberto se o journal lógico
+   também conseguir aplicar e confirmar o delta reverso no Ladybug; sem isso, a janela encerra
+   explicitamente antes de aceitar novos writes.
 
 **Gate de corte:** pelo menos 10.000 mutações representativas, três ciclos completos de
-close/reopen/recovery e zero divergência não explicada; nenhuma falha de `verify()`; todas as
-queries do corpus dentro do timeout do Pulse. O benchmark publicado deve registrar throughput,
+close/reopen/recovery e zero divergência não explicada; nenhuma falha de `verify()`; cada query do
+corpus termina dentro do limite externo atual de 30 segundos do Pulse. Se o port ganhar um timeout
+próprio, isso exige nova versão do contrato. O benchmark publicado deve registrar throughput,
 p50/p90/p99 e pico de memória de ambos os backends antes da decisão operacional.
 
 ### 9.5 Política para evitar breaking changes no Pulse
@@ -983,7 +1036,8 @@ p50/p90/p99 e pico de memória de ambos os backends antes da decisão operaciona
 6. o binding por board impede que atualizar a dependência troque o backend automaticamente;
 7. workarounds específicos do Grafx não entram no Core: ficam no provider ou são recusados;
 8. o endpoint raw Cypher declara backend/capability e mantém o mesmo erro público
-   `unsupported_operation`/`unsafe_cypher` quando aplicável.
+   `unsupported_operation`/`unsafe_cypher` quando aplicável;
+9. o router pode variar backend entre boards, nunca entre providers de uma mesma operação/scope.
 
 Com essa fronteira, otimizações internas previstas neste plano — vacuum, HNSW, leasing, locks,
 budgets e group commit — podem evoluir sem retrabalho no Core do Pulse. O trabalho inevitável de
