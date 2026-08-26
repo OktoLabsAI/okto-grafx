@@ -21,6 +21,10 @@
 - **Próximo gate:** concluir C13 e o censo de retornos públicos tipados, integrar serialmente no
   branch M1, executar a suíte completa e publicar um SHA imutável. M2 inicia identity-range leasing
   somente depois desse gate.
+- **Compatibilidade Okto Pulse: iniciada em 2026-08-25.** A seção 9 congela o contrato atual e os
+  gates M-PULSE-0 a M-PULSE-7. M-PULSE-0 está em execução na branch isolada
+  `milestone/pulse-m0-delete`, começando por relationship delete, `DETACH DELETE` e recusa segura de
+  node delete conectado.
 
 ## 1. Resumo executivo
 
@@ -690,7 +694,316 @@ Depois de backup/export e estabilização da semântica de recovery, adicionar u
 
 O WAL físico não deve virar API pública porque seu formato e granularidade são detalhes internos.
 
-## 9. Roadmap priorizado
+## 9. Compatibilidade total com o Okto Pulse atual
+
+**Compatibilidade analisada em:** 2026-08-25
+
+**Baseline funcional observado:**
+
+- Okto Grafx `main@fc32f87f73efdae10ca8404c18feaf141cacdbff`;
+- Okto Pulse Community `feature/v0.3.3@0401e412c5104d7ee0ee98e7b91061f0ce94f6d2`;
+- Okto Pulse Core `feature/v0.3.3@985f6a88b526bc16e0c9faa0b7f1d9b2acd27ca9`;
+- contrato público de consulta `KG_QUERY_CONTRACT_VERSION = "1.0"`, em
+  `../okto-pulse-core/src/okto_pulse/core/kg/query_contract.py`.
+
+Os dois worktrees do Pulse possuíam alterações locais durante a análise. Os hashes acima são a
+base reproduzível; o gate diferencial final deve registrar também o SHA limpo que incorporar essas
+alterações antes do corte. A compatibilidade desta seção fica limitada ao contrato e aos fluxos
+efetivamente usados por esse Pulse. Não é uma promessa de compatibilidade com todo o dialeto Kuzu,
+nem um alvo móvel para features futuras do Pulse.
+
+### 9.1 Definição de “totalmente compatível”
+
+O Grafx será considerado totalmente compatível quando puder substituir Kuzu/Ladybug em **todo o
+bundle de providers de grafo** sem alterar a semântica observada pelo Core do Pulse:
+
+- `SemanticGraphStore`;
+- `CypherExecutor` para o subconjunto público read-only 1.0;
+- `GraphTransaction` e `GraphTransactionScope`;
+- `GraphSchemaManager`;
+- `GraphLifecycle`;
+- `GraphRuntimeStore`;
+- runtime e recovery de Global Discovery;
+- `GraphRecovery`.
+
+As referências canônicas estão em
+`../okto-pulse-core/src/okto_pulse/core/kg/interfaces/`, e a composição concreta atual está em
+`../okto-pulse/src/okto_pulse/community/adapters/kg.py`. Compatibilidade não significa expor
+`Database`, `Transaction`, `RecordId`, resultados, configurações ou exceções do Grafx ao Core.
+Esses detalhes devem permanecer confinados aos adapters `grafx_*` da edição Community.
+
+Também fazem parte do contrato:
+
+1. mesmas linhas, colunas, tipos lógicos, ordenação e tratamento de `NULL`;
+2. mesmas contagens e decisões de idempotência nas mutações;
+3. atomicidade, rollback e visibilidade transacional equivalentes ou mais fortes;
+4. preservação exata de nós, arestas, propriedades, layers e vetores após reopen, recovery e
+   migração;
+5. erros incompatíveis ou operações não implementadas devem falhar de forma tipada e explícita,
+   nunca ser aceitos parcialmente;
+6. o endpoint público de Cypher continua read-only e obedece ao contrato 1.0; mutações internas
+   usam os ports estruturados ou um dialeto versionado e coberto pela suíte de conformidade.
+
+### 9.2 Situação atual e bloqueadores
+
+| Área | Estado atual do Grafx | Gap para o Pulse | Severidade |
+|---|---|---|---|
+| CRUD básico de nós/arestas | Parcialmente disponível | faltam semânticas destrutivas completas e equivalência de resultados | P0 |
+| `DELETE`/`DETACH DELETE` | parser/planner aceitam; execução não honra `detach`; relationship delete ausente | risco de aceitação silenciosa e estado órfão | P0 |
+| Transação | commit/rollback reais, sem read-your-own-writes | o Pulse cria nós e depois os consulta/relaciona no mesmo scope | P0 |
+| Substituição de payload | update existe | o Pulse exige substituir payload preservando exatamente as arestas incidentes | P0 |
+| Cypher read-only 1.0 | subconjunto menor | faltam `OPTIONAL MATCH`, `WITH`, `UNWIND`, `UNION`, `CASE` e funções usadas | P1 |
+| Schema/DDL | criação básica | faltam idempotência, evolução aditiva, múltiplos pares de endpoints e introspecção equivalente | P1 |
+| Vetores | espaços e busca existem | contrato, criação de índices, filtros, ranking e tipos de retorno diferem | P1 |
+| Lifecycle/recovery | primitivas fortes do Grafx | o provider Pulse ainda assume arquivos e procedimentos Ladybug | P1 |
+| Migração | formato físico pre-alpha, sem migrador | grafo cognitivo contém dados que não podem ser sempre reconstruídos do SQL | P0 para corte |
+| Performance | commits duráveis e writer serializado | adapter ingênuo por statement causaria grande regressão | P1 |
+
+O defeito destrutivo é comprovável no código: `DeleteClause.detach` chega ao plano em
+`src/okto_grafx/domain/query/planner.py`, mas o caminho de delete em
+`src/okto_grafx/engine/query_engine.py` não aplica a semântica de detach. O README afirma que a
+operação recusaria; o comportamento atual, porém, aceita a instrução. Esse caso deve ser corrigido
+antes de qualquer shadow write.
+
+O requisito de read-your-own-writes também é estrutural. O contrato do Pulse cria nós, verifica
+existência e cria relações dentro do mesmo `GraphTransactionScope`, além de exigir
+`replace_node_payload()` atômico preservando o multiconjunto exato de arestas. A referência está em
+`../okto-pulse-core/src/okto_pulse/core/kg/interfaces/graph_transaction.py`.
+
+Por fim, a migração não pode assumir rebuild determinístico de tudo. O próprio Pulse registra que
+nós cognitivos canônicos podem não ter fonte SQL e seriam silenciosamente perdidos; ver
+`../okto-pulse-core/src/okto_pulse/core/kg/canonical_cognitive_preservation.py`.
+
+### 9.3 Contrato funcional fechado
+
+#### 9.3.1 Nós e relacionamentos
+
+O Grafx precisa oferecer, com atomicidade transacional:
+
+- create, match, update e delete de nós por label e chave lógica;
+- create, match, update e delete de relações, incluindo propriedades;
+- `DELETE r` removendo somente as relações matched;
+- `DELETE n` recusando de forma tipada quando houver qualquer relação incidente;
+- `DETACH DELETE n` removendo todas as relações incidentes — incoming, outgoing, self-loop e
+  múltiplas relações — e somente depois o nó;
+- zero matches como no-op bem-sucedido;
+- rollback completo e recovery/reopen sem relações órfãs;
+- direção, label, endpoints, propriedades e multiplicidade preservados;
+- operação atômica de substituição integral do payload do nó sem trocar identidade ou arestas;
+- remoção por `source_session_id`, incluindo a variante que preserva lineage de Spec;
+- reconciliação e compensação de lineage/active-set com recibos completos conforme o port Pulse.
+
+Nenhuma forma de delete pode degradar para “best effort” silencioso. Uma capacidade ainda ausente
+deve responder com `GrafxUnsupportedOperation` antes da primeira mutação.
+
+#### 9.3.2 Visibilidade e unidade de trabalho
+
+A transação write deve possuir um overlay privado consultável pelo mesmo owner:
+
+- create → match;
+- create node A/B → create edge A→B;
+- create/update → read das novas propriedades;
+- delete → ausência nas leituras posteriores;
+- unicidade/PK considerando estado committed e staged;
+- consultas por scan e por índice produzindo a mesma visão;
+- vetores staged não vazam para outros readers e são visíveis ao owner quando consultados;
+- commit publica toda a unidade ou nada; rollback não deixa heap, índices, vetores ou relações;
+- retry de conflito não reutiliza estado provisório inseguro;
+- outro processo continua vendo apenas o snapshot committed.
+
+IDs físicos provisórios podem existir, mas não podem escapar pela API. A resolução de endpoints e
+índices deve permanecer determinística após commit, abort, conflito e recovery.
+
+#### 9.3.3 Consulta e expressões
+
+O alvo é o subconjunto read-only público 1.0 e o corpus interno efetivamente emitido pelo Pulse:
+
+- roots: `MATCH`, `OPTIONAL MATCH`, `UNWIND`, `WITH` e `RETURN`;
+- composição: `WHERE`, `UNION`, `DISTINCT`, `ORDER BY`, `LIMIT` e aliases;
+- booleanos e nulos: `AND`, `OR`, `NOT`, `IN`, `IS [NOT] NULL`, `TRUE/FALSE`;
+- strings: `CONTAINS`, `STARTS WITH`, `ENDS WITH`;
+- agregações: `COUNT`, `COLLECT`, `SUM`, `AVG`, `MIN`, `MAX`;
+- expressões: `CASE/WHEN/THEN/ELSE/END`, acesso a listas/mapas e parâmetros em lote;
+- funções observadas: `label`, `coalesce`, `string_split`, conversão de timestamp e as funções
+  vetoriais mapeadas pelo adapter;
+- padrões directed, incoming, outgoing e undirected, incluindo hops 1 e 2 usados pelo contrato.
+
+O gate não é “aceitar os tokens”. Cada forma deve ter semântica diferencial contra Ladybug para
+linhas, colunas, tipos, nulidade, ordem, cardinalidade e erro. Qualquer construção fora desse
+corpus deve recusar explicitamente até ser versionada.
+
+#### 9.3.4 Schema e introspecção
+
+São requisitos:
+
+- bootstrap repetível e idempotente (`IF NOT EXISTS` ou API equivalente);
+- node tables com PK, propriedades obrigatórias/opcionais e evolução aditiva;
+- relação lógica com mais de um par válido de tipos de endpoint, ainda que o adapter a materialize
+  em tabelas físicas separadas;
+- mapeamento estável de `STRING`, `BOOL`, inteiros, doubles, listas e vetores de dimensão fixa;
+- `ALTER ... ADD PROPERTY/COLUMN` idempotente ou operação de schema equivalente;
+- enumeração de objetos, labels, propriedades, endpoints, PKs, espaços e índices;
+- versão de schema persistida e verificável;
+- criação/rebuild/inspeção de índices vetoriais;
+- divergência de schema deve falhar antes de aceitar writes.
+
+A compatibilidade não exige reproduzir texto Kuzu de introspecção internamente. Ela exige que o
+adapter possa preencher `get_schema_info()`, `list_schema_objects()` e `list_node_properties()`
+com os mesmos DTOs do Pulse sem scraping de arquivos privados.
+
+#### 9.3.5 Busca vetorial
+
+O Grafx deve cobrir todos os node types indexados declarados em
+`../okto-pulse-core/src/okto_pulse/core/kg/schema_contract.py` e garantir:
+
+- dimensão e métrica validadas no schema e em cada write;
+- atualização/delete refletidos no índice e após reopen;
+- filtros de board, layer e supersedence aplicados antes do resultado final;
+- `top_k`, `min_similarity`, empates e under-k com resultado determinístico/documentado;
+- score normalizado conforme o contrato Pulse, independentemente do score físico do Grafx;
+- busca exata como oracle e ANN com gate de recall;
+- nenhum HNSW parcial, stale ou de outra geração pode ser certificado como resultado válido.
+
+#### 9.3.6 Lifecycle, recovery e migração
+
+- cada board e Global Discovery têm binding persistido de backend, geração e versão de formato;
+- diretórios Kuzu/Ladybug e Grafx são sempre separados;
+- open, close, checkpoint, verify, quarantine, rebuild e recovery são oferecidos pelo provider
+  completo, sem caminhos híbridos que ainda assumam `graph.lbug`;
+- export/import lógico é streaming, versionado, com manifesto e checksums;
+- o formato lógico inclui schema, nós, relações, propriedades, layers, vetores e IDs lógicos;
+- import só é publicado depois de `verify()` e fingerprint lógico completo;
+- upgrade de formato físico ocorre por export/import ou rebuild para nova geração, nunca in-place;
+- versão antiga deve recusar formato obrigatório desconhecido de maneira fail-closed;
+- backup/restore e rollback são exercitados antes de remover a cópia Ladybug.
+
+### 9.4 Milestones de implementação
+
+Os milestones abaixo são o escopo fechado da compatibilidade Pulse. Primeiro entram correções e
+estabilidade; linguagem, schema e evolução vêm depois.
+
+#### M-PULSE-0 — deletes corretos e fail-closed
+
+1. implementar relationship delete;
+2. implementar `DETACH DELETE` atômico;
+3. recusar node delete simples com relações;
+4. cobrir rollback, conflito, self-loop, múltiplas direções, reopen e `verify()`;
+5. corrigir documentação que hoje diverge da execução.
+
+**Gate:** nenhuma relação órfã física ou lógica após commit, abort, crash ou reopen; regressão deve
+falhar no SHA anterior.
+
+#### M-PULSE-1 — read-your-own-writes e operações atômicas do scope
+
+1. overlay transacional único para heap, relações, índices e vetores;
+2. endpoint lookup de nós staged;
+3. delete/update staged e unicidade considerando a visão combinada;
+4. `replace_node_payload` preservando arestas;
+5. primitives de reconciliação/compensação necessárias ao `GraphTransactionScope`.
+
+**Gate:** suíte pública do port roda contra Grafx; matrizes de abort/conflito/crash não deixam
+efeito parcial e readers externos nunca veem staged state.
+
+#### M-PULSE-2 — contrato de query Pulse 1.0
+
+1. gerar um corpus versionado a partir do contrato e das queries reais do Pulse;
+2. implementar clauses/expressões/funções ausentes;
+3. estabilizar DTO de resultado e taxonomia de erros;
+4. adicionar modo/capability `pulse-cypher-1.0` sem alterar silenciosamente o dialeto default.
+
+**Gate:** 100% do corpus read-only público e interno necessário passa em teste diferencial; formas
+fora do corpus recusam antes de executar.
+
+#### M-PULSE-3 — schema, endpoints e introspecção
+
+1. API idempotente de ensure/evolve schema;
+2. relações lógicas multi-endpoint;
+3. tipos Pulse, propriedades aditivas e constraints;
+4. introspecção estável independente do layout físico;
+5. manifest de capabilities e schema version.
+
+**Gate:** bootstrap vazio, bootstrap repetido e upgrade a partir do schema anterior produzem o
+mesmo fingerprint de schema esperado pelo Pulse.
+
+#### M-PULSE-4 — paridade vetorial
+
+1. mapear os nove índices/tipos do Pulse para espaços Grafx;
+2. normalizar score e filtros;
+3. suportar create/rebuild/status dos índices;
+4. executar gates exact/ANN, cold/warm, churn e reopen.
+
+**Gate:** top-k exato tem paridade total; ANN atende o recall congelado pelo harness e nunca retorna
+item inelegível por board/layer/supersedence.
+
+#### M-PULSE-5 — export/import, backup e recovery portável
+
+1. formato lógico versionado;
+2. export e import em streaming;
+3. fingerprint e verificação pós-import;
+4. backup/restore consistente;
+5. adaptação das operações de lifecycle/recovery do Pulse sem nomes Ladybug.
+
+**Gate:** round-trip completo preserva 100% dos nós, arestas, propriedades e vetores, incluindo os
+nós cognitivos sem fonte SQL, e permite rollback para a geração anterior.
+
+#### M-PULSE-6 — providers Grafx e conformance end-to-end
+
+1. criar o bundle coerente `CommunityGrafx*` no Pulse;
+2. selecionar backend sem misturar providers Kuzu/Grafx;
+3. manter nomes de configuração legados como aliases durante a transição;
+4. fixar versão exata do Grafx;
+5. adicionar suíte diferencial por port e por fluxo de negócio.
+
+**Gate:** a mesma suíte de Core passa com os dois bundles; nenhum import/tipo/erro Grafx aparece no
+Core e nenhuma operação cai silenciosamente no provider Kuzu.
+
+#### M-PULSE-7 — shadow, canário e corte
+
+1. construir geração Grafx separada por cópia lógica;
+2. alimentar shadow por journal/outbox durável de mutações lógicas — não por dual-write síncrono
+   sem reconciliação;
+3. comparar fingerprints e resultados continuamente;
+4. executar canário por board com freeze curto, delta final e troca atômica do binding;
+5. manter Ladybug intacto até o fim da janela de rollback.
+
+**Gate de corte:** pelo menos 10.000 mutações representativas, três ciclos completos de
+close/reopen/recovery e zero divergência não explicada; nenhuma falha de `verify()`; todas as
+queries do corpus dentro do timeout do Pulse. O benchmark publicado deve registrar throughput,
+p50/p90/p99 e pico de memória de ambos os backends antes da decisão operacional.
+
+### 9.5 Política para evitar breaking changes no Pulse
+
+1. o capability manifest `pulse-1` e os DTOs do adapter são a fronteira estável;
+2. toda versão consumida pelo Pulse é pinada por SHA/versão exata;
+3. mudança de API/query/resultado exige nova capability version, nunca mudança silenciosa;
+4. mudança de formato físico exige migrador lógico e fixture n−1/n; o Pulse não abre formato
+   incompatível por tentativa;
+5. aliases de configuração Kuzu existentes permanecem durante pelo menos uma release de
+   transição;
+6. o binding por board impede que atualizar a dependência troque o backend automaticamente;
+7. workarounds específicos do Grafx não entram no Core: ficam no provider ou são recusados;
+8. o endpoint raw Cypher declara backend/capability e mantém o mesmo erro público
+   `unsupported_operation`/`unsafe_cypher` quando aplicável.
+
+Com essa fronteira, otimizações internas previstas neste plano — vacuum, HNSW, leasing, locks,
+budgets e group commit — podem evoluir sem retrabalho no Core do Pulse. O trabalho inevitável de
+uma mudança de formato ou semântica fica concentrado no Grafx, no adapter Community e no migrador.
+
+### 9.6 Ordem e paralelismo autorizados
+
+- M-PULSE-0 precede qualquer write em shadow.
+- M-PULSE-1 precede a implementação completa do `GraphTransactionScope`.
+- Depois de M-PULSE-1, M-PULSE-2, M-PULSE-3 e M-PULSE-4 podem avançar em paralelo em arquivos e
+  branches isolados.
+- M-PULSE-5 pode iniciar em paralelo após o formato lógico ser congelado, mas seu gate depende de
+  schema e vetores.
+- M-PULSE-6 depende dos gates M-PULSE-0 a M-PULSE-5.
+- M-PULSE-7 é apenas rollout; não pode ser usado para descobrir semântica básica faltante.
+
+Cada milestone deve ter branch, commit e push próprios, suíte direcionada, suíte global verde,
+revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
+
+## 10. Roadmap priorizado
 
 ### Fase 0 — Correção obrigatória antes de uma release estável
 
@@ -759,7 +1072,7 @@ O WAL físico não deve virar API pública porque seu formato e granularidade s�
 6. política explícita de conflitos distribuídos;
 7. criptografia em repouso somente após threat model completo.
 
-## 10. Estratégia de testes recomendada
+## 11. Estratégia de testes recomendada
 
 ### Recovery e power loss
 
@@ -804,7 +1117,7 @@ O WAL físico não deve virar API pública porque seu formato e granularidade s�
 - point lookup com buckets saturados;
 - throughput, p50/p90/p99, conflitos, syscalls e peak RSS.
 
-## 11. Pontos fortes a preservar
+## 12. Pontos fortes a preservar
 
 As correções não devem enfraquecer os seguintes fundamentos:
 
@@ -822,7 +1135,7 @@ As correções não devem enfraquecer os seguintes fundamentos:
 
 Especialmente em performance, otimizações de formato ou redo lógico não devem ser adotadas antes que as opções de menor risco — batching, leasing, redução de metadados e access paths — sejam medidas.
 
-## 12. Avaliação final
+## 13. Avaliação final
 
 O projeto é arquiteturalmente mais maduro do que o número de versão sugere. O desenho de ports, WAL, verificação, fault injection e documentação fornece uma base muito boa para evolução.
 
