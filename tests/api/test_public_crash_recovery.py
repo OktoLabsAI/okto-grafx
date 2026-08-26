@@ -969,3 +969,142 @@ def test_a_crashed_detach_delete_publishes_the_node_with_its_edges_or_neither() 
         # The node kept BOTH of its relationships, not one of them.
         assert len(_live_edges(reopened)) == 2
         assert reopened.verify("all").findings == ()
+
+
+def _created_graph(
+    database: Database,
+) -> tuple[tuple[int, ...], tuple[tuple[object, ...], ...]]:
+    """Return the two public halves of the graph created by the pending-endpoint test."""
+    nodes = _surviving(database)
+    edges = database.execute(
+        f"MATCH (a:{TABLE})-[r:{REL_TABLE}]->(b:{TABLE}) "
+        "RETURN a.id, b.id, r.w"
+    ).rows
+    return nodes, edges
+
+
+def _pending_graph_crash(
+    aim: str,
+) -> tuple[
+    MemoryStorageDevice,
+    FaultInjectingStorageDevice,
+    int,
+    int,
+    SimulatedCrash,
+]:
+    """Create two pending nodes and their edge, then cut their one commit."""
+    memory = MemoryStorageDevice(page_size=PAGE_SIZE)
+    fault: FaultInjectingStorageDevice = (
+        _CrashBeforeTheLogAccepts(memory)
+        if aim == "log"
+        else FaultInjectingStorageDevice(memory, seed=20260830)
+    )
+    with _connect(fault, namespace=memory) as setup:
+        with setup.begin("write") as schema:
+            schema.execute(
+                f"CREATE NODE TABLE {TABLE}(id INT64, name STRING, PRIMARY KEY(id))"
+            )
+            schema.execute(
+                f"CREATE REL TABLE {REL_TABLE}(FROM {TABLE} TO {TABLE}, w INT64)"
+            )
+
+    crashed = _connect(fault, namespace=memory)
+    published_before = _published(memory).last_committed_lsn
+    transaction = crashed.begin("write")
+    transaction.execute(f"CREATE (:{TABLE} {{id: 1, name: 'source'}})")
+    transaction.execute(f"CREATE (:{TABLE} {{id: 2, name: 'target'}})")
+    transaction.execute(
+        f"MATCH (a:{TABLE} {{id: 1}}), (b:{TABLE} {{id: 2}}) "
+        f"CREATE (a)-[:{REL_TABLE} {{w: 7}}]->(b)"
+    )
+
+    fault.clear_trail()
+    if aim == "log":
+        assert isinstance(fault, _CrashBeforeTheLogAccepts)
+        fault.armed = True
+    else:
+        fault.crash_on("write_page", occurrence=1, moment="before")
+    with pytest.raises(SimulatedCrash) as stopped:
+        transaction.commit()
+    if isinstance(fault, _CrashBeforeTheLogAccepts):
+        fault.armed = False
+    else:
+        fault.disarm()
+    return (
+        memory,
+        fault,
+        published_before,
+        crashed.wal.last_lsn,
+        stopped.value,
+    )
+
+
+def test_pending_nodes_and_edge_cross_a_crash_only_as_one_resolved_graph() -> None:
+    """A private endpoint promise reaches durability only as one complete stored graph."""
+    # The first page write is refused AFTER the commit's WAL barrier. Recovery must therefore
+    # obtain all three rows from that durable batch; none can have reached the heap beforehand.
+    memory, fault, before, committed, stopped = _pending_graph_crash("write_page")
+    assert stopped.file == "heap.dat"
+    assert committed > before
+    assert _published(memory).last_committed_lsn == before
+    assert any(
+        call.method == "durable_barrier"
+        and call.outcome == "ok"
+        and call.file is not None
+        and call.file.startswith("wal/")
+        and call.sequence < stopped.sequence
+        for call in fault.trail()
+    )
+
+    with _connect(fault, namespace=memory) as recovered:
+        assert recovered.recovery_report.records_replayed > 0
+        assert _published(memory).last_committed_lsn == committed
+        assert _created_graph(recovered) == ((1, 2), ((1, 2, 7),))
+
+        node_table = recovered.catalog.catalog.table(TABLE)
+        relationship_table = recovered.catalog.catalog.table(REL_TABLE)
+        node_record_ids = {
+            version.values[0]: version.record_id
+            for _ref, version in recovered._heap.scan_all(node_table)
+            if version.live
+        }
+        edges = tuple(
+            version
+            for _ref, version in recovered._heap.scan_all(relationship_table)
+            if version.live
+        )
+        assert set(node_record_ids) == {1, 2}
+        assert len(edges) == 1
+        endpoints = edges[0].values[:2]
+        assert endpoints == (node_record_ids[1], node_record_ids[2])
+        # Exact ``int`` deliberately excludes PendingRowRef as well as bool. Because the first
+        # page write never landed, these recovered values are also the endpoint values the WAL
+        # carried, not values inherited from a partly applied heap.
+        assert all(type(endpoint) is int and endpoint > 0 for endpoint in endpoints)
+        assert recovered.verify("all").findings == ()
+
+    # A second object graph proves that recovery did not depend on a warm page or query cache.
+    with _connect(fault, namespace=memory) as reopened:
+        assert _created_graph(reopened) == ((1, 2), ((1, 2, 7),))
+        assert reopened.verify("all").findings == ()
+
+    # Before the WAL accepts the batch, neither pending node nor their relationship may exist.
+    memory, fault, before, after, stopped = _pending_graph_crash("log")
+    assert stopped.file is not None and stopped.file.startswith("wal/")
+    assert after == before
+    assert _published(memory).last_committed_lsn == before
+    assert not any(
+        call.method == "durable_barrier"
+        and call.file is not None
+        and call.file.startswith("wal/")
+        for call in fault.trail()
+    )
+    with _connect(fault, namespace=memory) as reopened:
+        assert _created_graph(reopened) == ((), ())
+        assert _live_edges(reopened) == ()
+        # Row staging may reserve zero-filled heap pages before WAL append. With no record to
+        # replay they remain unreachable and logically empty; the verifier names exactly that
+        # known, non-corrupt shape rather than pretending the physical allocation never happened.
+        findings = reopened.verify("all").findings
+        assert findings
+        assert {finding.kind for finding in findings} == {"page_unwritten"}
