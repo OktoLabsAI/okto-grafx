@@ -1,0 +1,4 @@
+{
+  "_comment": "Callsites whose statement the freezer cannot follow even after resolving one hop back through an active wrapper. Each entry names WHY. An empty list is the goal: anything here is a form the corpus does not describe.",
+  "dynamic_statements": {}
+}
