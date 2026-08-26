@@ -1623,6 +1623,7 @@ def _edge_steps(
     outgoing: bool,
     incoming: bool,
     ended: frozenset[object] | set[object],
+    changed: Mapping[object, tuple[Value, ...] | None],
 ) -> Callable[[object], Iterator[tuple[object, HeapVersion, TableDef, object]]]:
     """Return the function a traversal expands one frontier node with.
 
@@ -1670,6 +1671,30 @@ def _edge_steps(
     indexed = ((not outgoing) or from_name) and ((not incoming) or to_name)
     snapshot = context.snapshot
 
+    def owner_version(ref: object, version: HeapVersion) -> HeapVersion | None:
+        """Overlay one committed edge with this transaction's latest property values.
+
+        Relationship endpoints are layout, not properties.  Public SET refuses to name them,
+        and this check is the fail-closed backstop for an intent staged through a lower-level
+        collaborator: endpoint indexes and traversal direction describe the committed pair, so
+        accepting a changed pair here would make the index and the row disagree.
+        """
+        if ref not in changed:
+            return version
+        values = changed[ref]
+        if values is None:
+            return None
+        if values[:ENDPOINT_COLUMN_COUNT] != version.values[:ENDPOINT_COLUMN_COUNT]:
+            raise GrafxTransactionStateError(
+                f"An update of relationship table {relationship.name!r} may change properties "
+                "but not its layout-owned endpoints.",
+                field="endpoints",
+                table=relationship.name,
+                table_id=relationship.table_id,
+                operation="relationship_update",
+            )
+        return replace(version, values=values)
+
     def by_index(
         record_id: object,
     ) -> Iterator[tuple[object, HeapVersion, TableDef, object]]:
@@ -1679,12 +1704,18 @@ def _edge_steps(
                 if ref in ended:
                     continue
                 version = engine.heap.read(ref)
+                version = owner_version(ref, version)
+                if version is None:
+                    continue
                 yield ref, version, to_table, version.values[1]
         if incoming:
             for ref in lookup(to_name, index_key((None, record_id), (1,)), snapshot):
                 if ref in ended:
                     continue
                 version = engine.heap.read(ref)
+                version = owner_version(ref, version)
+                if version is None:
+                    continue
                 yield ref, version, from_table, version.values[0]
 
     maps: list[tuple[dict, dict]] = []
@@ -1696,6 +1727,9 @@ def _edge_steps(
             by_target: dict[object, list[tuple[object, HeapVersion]]] = {}
             for ref, version in engine.heap.scan(relationship, snapshot):
                 if ref in ended:
+                    continue
+                version = owner_version(ref, version)
+                if version is None:
                     continue
                 if outgoing:
                     by_source.setdefault(version.values[0], []).append((ref, version))
@@ -1788,20 +1822,29 @@ def _traverse(
         )
     }
     dirty_tables = _intent_table_ids(context.txn)
+    relationship_changes: Mapping[object, tuple[Value, ...] | None] = {}
     for table in involved.values():
         if table.table_id not in dirty_tables:
             continue
         changed, inserted = _transaction_row_view(context, table, include_held=False)
+        if table.table_id == relationship.table_id and not inserted:
+            # A committed relationship keeps its identity and endpoints while an UPDATE replaces
+            # only its property picture.  `_edge_steps` can therefore overlay it exactly.  A
+            # pending relationship INSERT still has no safe traversal representation and takes
+            # the typed refusal below.
+            relationship_changes = changed
+            continue
         if not inserted and all(values is None for values in changed.values()):
             # Stored-row deletes already have the pre-M1 traversal overlay: `_edge_steps` and
             # `node_at` omit references returned by `_ended_by_this_transaction`. Keep that
-            # supported path; inserts and updates need endpoint/property overlay that is outside
-            # this node-only commit.
+            # supported path. Stored relationship updates take the exact overlay above; pending
+            # relationship inserts and endpoint-node updates still need their own identity-aware
+            # traversal overlay.
             continue
         raise GrafxUnsupportedOperation(
             f"A traversal involving {table.name!r} cannot include rows this transaction has "
-            "staged. Commit or roll back first; relationship and endpoint read-your-own-writes "
-            "are not implemented in this build.",
+            "staged in this shape. Commit or roll back first; pending relationship inserts and "
+            "endpoint-node read-your-own-writes are not implemented in this build.",
             field="table",
             value=table.name,
             table_id=table.table_id,
@@ -1829,7 +1872,15 @@ def _traverse(
     outgoing = node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
     incoming = node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
     steps = _edge_steps(
-        engine, context, relationship, from_table, to_table, outgoing, incoming, ended
+        engine,
+        context,
+        relationship,
+        from_table,
+        to_table,
+        outgoing,
+        incoming,
+        ended,
+        relationship_changes,
     )
 
     for row in engine._rows(node.child, context):
@@ -3187,6 +3238,14 @@ def _prepare_assignment(
             f"SET names {target.subject.name!r}, which the rows reaching it do not carry.",
             field="variable",
             value=target.subject.name,
+        )
+    if binding.table.kind == "rel" and target.key in ENDPOINT_COLUMNS:
+        raise GrafxPlanError(
+            f"{target.key!r} is the layout's own endpoint column of a relationship table, so "
+            "SET may not write it; the arrow decides it.",
+            field="column",
+            value=target.key,
+            table=binding.table.name,
         )
     column = _column_named(binding.table, target.key)
     value = _evaluate(assignment.value, row, context)

@@ -9,13 +9,21 @@ including the on-disk format.
 
 ### Added
 
+- **Properties of committed relationships now participate in the owner-only transaction
+  overlay.** A later `MATCH` in the same transaction reads the latest staged `SET`, including
+  when parallel edges connect the same pair, while other transactions keep their committed
+  snapshot. Commit, rollback and optimistic conflicts retain their existing all-or-nothing
+  behavior. The layout-owned `_from` and `_to` columns are immutable and receive a typed refusal;
+  relationship inserts and pending node endpoints remain fail-closed until their separate overlay
+  lands.
 - **Write transactions now have an owner-only node overlay.** A later statement in the same
   transaction can `MATCH`, read, `SET`, `MERGE` or `DELETE` a node staged earlier. Inserts,
   updates and deletes are reduced through the same intent view used by commit; a dirty table
   withholds exact indexes and uses scan+overlay, including primary-key changes. Private
   `PendingRowRef` identities are authenticated by owner/table/object identity and never appear in
-  public results, heap rows, indexes or WAL. Relationship endpoints/traversal and vector search
-  over unsupported dirty state remain typed, pre-mutation refusals until their overlays land.
+  public results, heap rows, indexes or WAL. Pending relationship endpoints/traversal and vector
+  search over unsupported dirty state remain typed, pre-mutation refusals until their overlays
+  land.
 - **`DETACH DELETE` and relationship deletion are implemented.** `DELETE r` ends a relationship a
   `MATCH` bound and leaves both endpoints standing; the planner now registers a matched
   relationship variable in its table map exactly as a written one, which is what the refusal was
