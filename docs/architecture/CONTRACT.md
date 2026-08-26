@@ -915,6 +915,12 @@ types, literal types and bound parameter types before rows are produced, so a nu
 argument still promotes an integer result and a known mismatch is refused even for an empty
 result. `string_split` takes exactly two positional strings and `size` takes exactly one
 positional string or list; both propagate null.
+`label` takes exactly one positional argument and answers the table a matched node or
+relationship came from, as ``TableDef.name``; null answers null. Anything that never came from a
+matched row is refused before the first row is read, including a bound parameter carrying a
+scalar and a variable-length relationship, which binds every hop it walked rather than one row.
+The name it answers is the PHYSICAL table name; mapping a physical relationship table back to a
+logical Pulse type for a multi-endpoint relationship is not part of this contract.
 `string_split` compresses empty fields between repeated separators, preserves a final empty field
 and, with an empty separator, splits a non-empty input into Unicode code points. The empty-input,
 empty-separator pair is undefined and refused. `size` counts Unicode code points in a string and

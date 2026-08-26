@@ -111,6 +111,7 @@ from okto_grafx.domain.query.tokens import (
     COALESCE_FUNCTION,
     SIMILARITY_FUNCTION,
     SIMILARITY_SCORE_FUNCTION,
+    LABEL_FUNCTION,
     SIZE_FUNCTION,
     STRING_SPLIT_FUNCTION,
 )
@@ -328,6 +329,7 @@ class PlannedQuery:
         tuple[Subscript, tuple[ValueType | None, ValueType | None]], ...
     ] = ()
     pulse_expression_types: tuple[tuple[Expression, ValueType | None], ...] = ()
+    label_calls: tuple[FunctionCall, ...] = ()
 
     def describe(self) -> str:
         """Return the operator tree as one block of indented lines."""
@@ -397,6 +399,8 @@ class _Planner:
     indexes: tuple[IndexDefinition, ...]
     analysis: QueryAnalysis
     tables: dict[str, TableDef] = field(default_factory=dict)
+    multi_hop_variables: set[str] = field(default_factory=set)
+    label_calls: list[FunctionCall] = field(default_factory=list)
     coalesce_argument_types: dict[FunctionCall, tuple[ValueType | None, ...]] = field(
         default_factory=dict
     )
@@ -447,6 +451,7 @@ class _Planner:
             case_result_types=tuple(self.case_result_types.values()),
             subscript_types=tuple(self.subscript_types.values()),
             pulse_expression_types=tuple(self.pulse_expression_types.values()),
+            label_calls=tuple(self.label_calls),
         )
 
     # --- schema ------------------------------------------------------------------------------
@@ -687,6 +692,7 @@ class _Planner:
         for clause in statement.updating_clauses:
             pipeline = self._updating_clause(pipeline, clause)
         self._record_coalesce_types(statement)
+        self._record_label_arguments(statement)
         self._record_case_and_subscript_types(statement)
         if statement.updating_clauses:
             # Everything that writes is drawn in full before anything above can stop early. A
@@ -718,6 +724,61 @@ class _Planner:
                 )
                 coalesce_result_type(node.name, types)
                 self.coalesce_argument_types[node] = types
+
+    def _record_label_arguments(self, statement: Query) -> None:
+        """Refuse a label() argument that is not one matched row, while still planning.
+
+        The runtime can only read a table off a binding, so anything else is wrong before a
+        row exists.  Leaving the check to evaluation would let an empty match answer with no
+        rows for a query that could never have worked.
+        """
+
+        for expression in self._query_expressions(statement):
+            for node in walk(expression):
+                if not isinstance(node, FunctionCall):
+                    continue
+                if node.name.upper() != LABEL_FUNCTION:
+                    continue
+                argument = node.arguments[0]
+                if isinstance(argument, Literal) and argument.value is None:
+                    # A written null is the one non-binding the contract answers rather than
+                    # refuses, and it answers null.
+                    continue
+                if isinstance(argument, Parameter):
+                    # The value arrives with the call, so the binder decides: null answers
+                    # null, anything else is refused there, still before the first row.
+                    self.label_calls.append(node)
+                    continue
+                if not isinstance(argument, Variable):
+                    message = (
+                        f"{node.name} reads the table of a matched node or relationship; "
+                        f"{argument.describe()} is not one."
+                    )
+                    raise GrafxPlanError(
+                        message,
+                        field="function",
+                        value=node.name,
+                    )
+                if argument.name in self.multi_hop_variables:
+                    message = (
+                        f"{node.name} reads one matched row, and {argument.name!r} is a "
+                        "variable-length relationship, which binds every hop it walked."
+                    )
+                    raise GrafxPlanError(
+                        message,
+                        field="function",
+                        value=node.name,
+                    )
+                if argument.name not in self.tables:
+                    message = (
+                        f"{node.name} reads the table of a matched node or relationship; "
+                        f"{argument.name!r} is bound to none."
+                    )
+                    raise GrafxPlanError(
+                        message,
+                        field="function",
+                        value=node.name,
+                    )
 
     def _record_case_and_subscript_types(self, statement: Query) -> None:
         """Resolve CASE and list-subscript types after every pattern has bound a table."""
@@ -925,6 +986,8 @@ class _Planner:
                 return coalesce_result_type(expression.name, types)
             if name == STRING_SPLIT_FUNCTION:
                 return ValueType.LIST
+            if name == LABEL_FUNCTION:
+                return ValueType.STRING
             if name == SIZE_FUNCTION or name == "COUNT":
                 return ValueType.INT64
             if name in (SIMILARITY_FUNCTION, SIMILARITY_SCORE_FUNCTION, "AVG"):
@@ -1088,6 +1151,12 @@ class _Planner:
                 if argument.operator == "^" or ValueType.DOUBLE in concrete:
                     return ValueType.DOUBLE
                 return ValueType.INT64
+        if isinstance(argument, FunctionCall) and argument.name.upper() == (
+            LABEL_FUNCTION
+        ):
+            # label() always answers a table name or null, so its family is known
+            # without waiting for a row.
+            return ValueType.STRING
         message = (
             f"{call.name} needs arguments whose scalar type is known from a literal, parameter "
             f"or bound property; got {argument.describe()}."
@@ -1340,6 +1409,11 @@ class _Planner:
                 value=relationship.describe(),
             )
         self._require_endpoint(source, table, relationship.direction)
+        if relationship.variable is not None and relationship.variable_length:
+            # `[r*1..3]` binds every hop it walked, so `r` is a tuple of bindings rather
+            # than one row.  Recording that here is what lets label() refuse it while
+            # planning instead of discovering the shape once a row arrives.
+            self.multi_hop_variables.add(relationship.variable)
         if relationship.variable is not None:
             # A matched relationship variable names its table exactly as a written one does in
             # ``_written_pattern``. Without this the table map knew every node of the pattern

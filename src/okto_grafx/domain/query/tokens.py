@@ -21,6 +21,7 @@ __all__ = [
     "AGGREGATE_FUNCTIONS",
     "COALESCE_FUNCTION",
     "KEYWORDS",
+    "LABEL_FUNCTION",
     "SIZE_FUNCTION",
     "SIMILARITY_FUNCTION",
     "SIMILARITY_SCORE_FUNCTION",
@@ -175,6 +176,9 @@ AGGREGATE_FUNCTIONS: frozenset[str] = frozenset(
 
 COALESCE_FUNCTION: str = "COALESCE"
 """The null-selection function required by the Pulse query contract 1.0."""
+
+LABEL_FUNCTION: str = "LABEL"
+"""The table a matched node or relationship came from, as Pulse contract 1.0 asks."""
 
 SIZE_FUNCTION: str = "SIZE"
 """The collection and string cardinality function required by the Pulse query contract 1.0."""

@@ -5,7 +5,11 @@ from __future__ import annotations
 import pytest
 
 from okto_grafx.domain.errors import GrafxParseError, GrafxPlanError
-from okto_grafx.domain.query import SIZE_FUNCTION, STRING_SPLIT_FUNCTION
+from okto_grafx.domain.query import (
+    LABEL_FUNCTION,
+    SIZE_FUNCTION,
+    STRING_SPLIT_FUNCTION,
+)
 from okto_grafx.domain.query.analysis import (
     ENTITY_NODE,
     ENTITY_RELATIONSHIP,
@@ -32,6 +36,7 @@ def analysis_of(text: str):
 
 
 def test_pulse_scalar_function_names_are_exported() -> None:
+    assert LABEL_FUNCTION == "LABEL"
     assert SIZE_FUNCTION == "SIZE"
     assert STRING_SPLIT_FUNCTION == "STRING_SPLIT"
 
@@ -424,6 +429,27 @@ def test_coalesce_refuses_an_empty_or_named_argument_list(expression: str) -> No
         analysis_of(f"MATCH (p:Person) RETURN {expression}")
     assert failure.value.details["field"] == "function"
     assert failure.value.details["value"].lower() == "coalesce"
+
+
+def test_label_is_case_insensitive_and_analysed_like_the_other_scalars() -> None:
+    found = analysis_of("MATCH (p:Person) RETURN LaBeL(p) AS kind")
+    assert found.parameters == ()
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ("label()", "label(p, p)", "label(value => p)"),
+)
+def test_label_refuses_wrong_or_named_arguments(expression: str) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of(f"MATCH (p:Person) RETURN {expression}")
+    assert failure.value.details == {"field": "function", "value": "label"}
+
+
+@pytest.mark.parametrize("expression", ("label(DISTINCT p)", "label(*)"))
+def test_label_takes_neither_distinct_nor_a_star(expression: str) -> None:
+    with pytest.raises(GrafxParseError):
+        analysis_of(f"MATCH (p:Person) RETURN {expression}")
 
 
 def test_string_split_and_size_are_case_insensitive_and_collect_parameters() -> None:

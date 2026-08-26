@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from pathlib import Path
+
 import pytest
+
+import okto_grafx
 
 from okto_grafx.domain.errors import (
     GrafxEmbeddingSpaceMismatch,
@@ -510,6 +515,133 @@ def test_case_may_wrap_aggregates_without_changing_group_evaluation(
         "ELSE sum(p.age) END AS score",
     )
     assert found.rows == ((174.0,),)
+
+
+
+@pytest.fixture
+def labelled_graph(tmp_path: Path) -> Iterator[object]:
+    """A real database whose node and relationship tables are named as Pulse names them.
+
+    The physical table name and the logical one coincide here on purpose: label() answers
+    with ``TableDef.name``, which is the PHYSICAL name, and this fixture is not evidence
+    about the physical-to-logical mapping of a multi-endpoint relationship.
+    """
+
+    handle = okto_grafx.connect(str(tmp_path / "labels"))
+    with handle.begin("write") as txn:
+        txn.execute("CREATE NODE TABLE Person(id STRING, PRIMARY KEY(id))")
+        txn.execute("CREATE NODE TABLE Doc(id STRING, PRIMARY KEY(id))")
+        txn.execute("CREATE REL TABLE Wrote(FROM Person TO Doc, note STRING)")
+        txn.execute("CREATE (p:Person {id: 'p1'})")
+        txn.execute("CREATE (d:Doc {id: 'd1'})")
+        txn.execute(
+            "MATCH (p:Person), (d:Doc) WHERE p.id = 'p1' AND d.id = 'd1' "
+            "CREATE (p)-[:Wrote {note: 'n'}]->(d)"
+        )
+    try:
+        yield handle
+    finally:
+        handle.close()
+
+
+def test_label_answers_the_table_of_a_matched_node_and_relationship(
+    labelled_graph,
+) -> None:
+    """Both kinds of binding carry a table, and label() reads it off the binding."""
+
+    with labelled_graph.begin("read") as txn:
+        node = txn.execute("MATCH (p:Person) RETURN label(p) AS kind", {})
+        edge = txn.execute(
+            "MATCH (p:Person)-[w:Wrote]->(d:Doc) RETURN label(w) AS kind", {}
+        )
+    assert tuple(tuple(row) for row in node) == (("Person",),)
+    assert tuple(tuple(row) for row in edge) == (("Wrote",),)
+
+
+def test_label_is_case_insensitive_like_the_other_scalars(stack: QueryStack) -> None:
+    found = run(stack, "MATCH (p:Person) RETURN LaBeL(p) AS kind ORDER BY p.id LIMIT 1")
+    assert found.rows == (("Person",),)
+    assert found.columns == ("kind",)
+
+
+def test_label_of_null_is_null_by_literal_and_by_parameter(stack: QueryStack) -> None:
+    """Null is the one non-binding the contract answers rather than refuses."""
+
+    assert run(stack, "MATCH (p:Person) RETURN label(null) LIMIT 1").rows == ((None,),)
+    assert run(
+        stack, "MATCH (p:Person) RETURN label($p) LIMIT 1", {"p": None}
+    ).rows == ((None,),)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ("label(p.name)", "label(1)", "label('x')", "label([1])", "label({a: 1})"),
+)
+def test_label_refuses_what_never_came_from_a_row(
+    stack: QueryStack, expression: str
+) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        run(stack, f"MATCH (p:Person) RETURN {expression}")
+    assert failure.value.details["field"] == "function"
+
+
+@pytest.mark.parametrize("arguments", ("", "p, p"))
+def test_label_takes_exactly_one_positional_argument(
+    stack: QueryStack, arguments: str
+) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        run(stack, f"MATCH (p:Person) RETURN label({arguments})")
+    assert failure.value.details == {"field": "function", "value": "label"}
+
+
+def test_label_takes_neither_distinct_nor_a_star(stack: QueryStack) -> None:
+    with pytest.raises(GrafxParseError):
+        run(stack, "MATCH (p:Person) RETURN label(DISTINCT p)")
+    with pytest.raises(GrafxParseError):
+        run(stack, "MATCH (p:Person) RETURN label(*)")
+
+
+def test_label_refuses_a_variable_length_relationship(stack: QueryStack) -> None:
+    """`[r*1..2]` binds every hop it walked, so it is not one row to read a table from."""
+
+    with pytest.raises(GrafxPlanError) as failure:
+        run(stack, "MATCH (a:Person)-[r:Knows*1..2]->(b:Person) RETURN label(r)")
+    assert failure.value.details == {"field": "function", "value": "label"}
+
+
+@pytest.mark.parametrize("value", ("x", 7, True, [1], {"a": 1}))
+def test_label_refuses_a_bound_scalar_before_any_row_is_read(
+    stack: QueryStack, value: object
+) -> None:
+    """The refusal must not depend on whether the pattern went on to match anything.
+
+    An empty match used to be able to swallow a query that could never have worked; the
+    binder decides once the parameter's value is known.
+    """
+
+    with pytest.raises(GrafxPlanError) as matching:
+        run(stack, "MATCH (p:Person) RETURN label($p)", {"p": value})
+    with pytest.raises(GrafxPlanError) as empty:
+        run(stack, "MATCH (p:Person) WHERE p.id = 99 RETURN label($p)", {"p": value})
+    assert matching.value.details == empty.value.details == {
+        "field": "function",
+        "value": "label",
+    }
+
+
+def test_label_composes_with_case_and_coalesce_as_a_string(stack: QueryStack) -> None:
+    """A STRING result has to be visible to the constructs that unify types."""
+
+    found = run(
+        stack,
+        "MATCH (p:Person) RETURN CASE WHEN true THEN label(p) ELSE 'none' END AS a, "
+        "coalesce(label(p), 'none') AS b ORDER BY p.id LIMIT 1",
+    )
+    assert found.rows == (("Person", "Person"),)
+
+    with pytest.raises(GrafxPlanError) as mixed:
+        run(stack, "MATCH (p:Person) RETURN coalesce(label(p), 1)")
+    assert mixed.value.details["field"] == "function"
 
 
 def test_list_subscript_matches_ladybug_one_based_and_negative_positions(

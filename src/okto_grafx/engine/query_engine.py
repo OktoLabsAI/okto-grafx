@@ -165,6 +165,7 @@ from okto_grafx.domain.query.tokens import (
     COALESCE_FUNCTION,
     SIMILARITY_FUNCTION,
     SIMILARITY_SCORE_FUNCTION,
+    LABEL_FUNCTION,
     SIZE_FUNCTION,
     STRING_SPLIT_FUNCTION,
 )
@@ -1025,6 +1026,7 @@ class QueryEngine:
             result_node=root.child if root.columns else None,
         )
         _validate_bound_subscript_types(plan, parameters)
+        _validate_bound_label_arguments(plan, parameters)
         stream = self._rows(root.child, context)
         rows = self._collect_result_rows(stream) if root.columns else tuple(stream)
         context.release()
@@ -4249,6 +4251,22 @@ def _bound_pulse_expression_type(
                     value=expression.name,
                 )
             return ValueType.LIST
+        if name == LABEL_FUNCTION:
+            argument_type = argument_types[0]
+            if argument_type not in (None, ValueType.NULL):
+                # A parameter or literal reached the binder with a scalar value, and a scalar
+                # never came from a matched row.  Refusing here keeps the answer independent
+                # of whether the pattern went on to match anything.
+                message = (
+                    f"{expression.name} reads the table of a matched node or relationship; "
+                    f"got {argument_type.name}."
+                )
+                raise GrafxPlanError(
+                    message,
+                    field="function",
+                    value=expression.name,
+                )
+            return ValueType.STRING
         if name == SIZE_FUNCTION:
             argument_type = argument_types[0]
             if argument_type not in (
@@ -4451,6 +4469,34 @@ def _validate_bound_subscript_types(
             )
 
 
+def _validate_bound_label_arguments(
+    plan: PlannedQuery, parameters: Mapping[str, object]
+) -> None:
+    """Finish the label() arguments the planner had to leave to the call.
+
+    A parameter can never carry a matched row, so once its value is known the answer is
+    either null or a refusal.  Deciding it here means an empty match cannot swallow the
+    refusal, which is the rule the subscript range check already follows.
+    """
+
+    for call in plan.label_calls:
+        argument = call.arguments[0]
+        if not _binder_resolvable(argument):
+            continue
+        value = _bound_postfix_value(argument, parameters, owner=call.name)
+        if value is None:
+            continue
+        message = (
+            f"{call.name} reads the table of a matched node or relationship; got "
+            f"{type(value).__name__}."
+        )
+        raise GrafxPlanError(
+            message,
+            field="function",
+            value=call.name,
+        )
+
+
 def _bound_coalesce_types(
     plan: PlannedQuery, parameters: Mapping[str, object]
 ) -> dict[FunctionCall, ValueType | None]:
@@ -4536,6 +4582,23 @@ def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
         if trailing_empty:
             result.append("")
         return tuple(result)
+    if name == LABEL_FUNCTION:
+        subject = _evaluate(expression.arguments[0], row, context)
+        if subject is None:
+            return None
+        if not isinstance(subject, RowBinding):
+            # The planner refuses everything it can see, so reaching here means the shape was
+            # only knowable once the row arrived.  Refusing beats returning a plausible string.
+            message = (
+                f"{expression.name} reads the table of a matched node or relationship; got "
+                f"{type(subject).__name__}."
+            )
+            raise GrafxPlanError(
+                message,
+                field="function",
+                value=expression.name,
+            )
+        return subject.table.name
     if name == SIZE_FUNCTION:
         value = _evaluate(expression.arguments[0], row, context)
         if value is None:
