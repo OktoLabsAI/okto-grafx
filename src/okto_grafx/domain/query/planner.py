@@ -817,7 +817,10 @@ class _Planner:
 
         argument = node.arguments[0]
         if isinstance(argument, Variable):
-            if argument.name in self.multi_hop_variables or argument.name in self.tables:
+            if (
+                argument.name in self.multi_hop_variables
+                or argument.name in self.tables
+            ):
                 message = (
                     f"{node.name} reads an ISO-8601 string or a timestamp; "
                     f"{argument.name!r} is a matched row."

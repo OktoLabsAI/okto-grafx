@@ -803,8 +803,7 @@ def test_timestamp_refuses_a_known_composed_value_before_read_or_write(
     with pytest.raises(GrafxPlanError) as read_failure:
         with labelled_graph.begin("read") as txn:
             txn.execute(
-                "MATCH (p:Person) WHERE p.id = 'nobody' "
-                f"RETURN timestamp({argument})",
+                f"MATCH (p:Person) WHERE p.id = 'nobody' RETURN timestamp({argument})",
                 parameters,
             )
     with pytest.raises(GrafxPlanError) as write_failure:

@@ -159,9 +159,9 @@ non-mutating root is `unsupported_operation`, an unsafe canonical rewrite is
 Typed values keep their boundary explicit. Graph `TIMESTAMP` values remain typed until
 `KGService` converts them to ISO text for its public result. Similarity retrieval stays on
 the structured `graph_store.vector_search` port; Pulse does not require a provider-specific
-raw Cypher vector function. The raw `timestamp()` probe is recorded as an endpoint
-language mismatch, while these behavioural facts prevent it from being confused with the
-way current Pulse application paths store timestamps or request vector search.
+raw Cypher vector function. The raw `timestamp()` probe is recorded as endpoint-language
+coverage; these behavioural facts keep it distinct from the way current Pulse application
+paths store timestamps or request vector search.
 
 Finally, both paired and single execution pass through the same canonical projection. Its
 envelope contract covers `columns`, the recomputed `row_count`, the preserved `truncated`
