@@ -9,6 +9,7 @@ from okto_grafx.domain.query import (
     LABEL_FUNCTION,
     SIZE_FUNCTION,
     STRING_SPLIT_FUNCTION,
+    TIMESTAMP_FUNCTION,
 )
 from okto_grafx.domain.query.analysis import (
     ENTITY_NODE,
@@ -39,6 +40,7 @@ def test_pulse_scalar_function_names_are_exported() -> None:
     assert LABEL_FUNCTION == "LABEL"
     assert SIZE_FUNCTION == "SIZE"
     assert STRING_SPLIT_FUNCTION == "STRING_SPLIT"
+    assert TIMESTAMP_FUNCTION == "TIMESTAMP"
 
 
 # --- bindings -------------------------------------------------------------------------------
@@ -429,6 +431,27 @@ def test_coalesce_refuses_an_empty_or_named_argument_list(expression: str) -> No
         analysis_of(f"MATCH (p:Person) RETURN {expression}")
     assert failure.value.details["field"] == "function"
     assert failure.value.details["value"].lower() == "coalesce"
+
+
+def test_timestamp_is_case_insensitive_and_collects_its_parameter() -> None:
+    found = analysis_of("RETURN TiMeStAmP($moment) AS at")
+    assert found.parameters == ("moment",)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ("timestamp()", "timestamp('a', 'b')", "timestamp(value => 'a')"),
+)
+def test_timestamp_refuses_wrong_or_named_arguments(expression: str) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of(f"RETURN {expression}")
+    assert failure.value.details == {"field": "function", "value": "timestamp"}
+
+
+@pytest.mark.parametrize("expression", ("timestamp(DISTINCT 'a')", "timestamp(*)"))
+def test_timestamp_takes_neither_distinct_nor_a_star(expression: str) -> None:
+    with pytest.raises(GrafxParseError):
+        analysis_of(f"RETURN {expression}")
 
 
 def test_label_is_case_insensitive_and_analysed_like_the_other_scalars() -> None:

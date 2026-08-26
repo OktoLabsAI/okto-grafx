@@ -140,6 +140,7 @@ from okto_grafx.domain.query.tokens import (
     SIZE_FUNCTION,
     STRING_SPLIT_FUNCTION,
     SYMBOLS,
+    TIMESTAMP_FUNCTION,
     Token,
     TokenKind,
 )
@@ -178,6 +179,7 @@ __all__ = [
     "SIMILARITY_SCORE_FUNCTION",
     "STRING_SPLIT_FUNCTION",
     "SYMBOLS",
+    "TIMESTAMP_FUNCTION",
     "THRESHOLD_OPERATORS",
     "VECTOR_TYPE_NAME",
     "AggregateRows",

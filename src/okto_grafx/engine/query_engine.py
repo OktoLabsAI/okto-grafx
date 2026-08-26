@@ -49,6 +49,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -82,6 +83,7 @@ from okto_grafx.domain.model.schema import (
 )
 from okto_grafx.domain.model.value import (
     INT64_MAX,
+    Timestamp,
     Value,
     ValueType,
     VectorValue,
@@ -168,6 +170,7 @@ from okto_grafx.domain.query.tokens import (
     LABEL_FUNCTION,
     SIZE_FUNCTION,
     STRING_SPLIT_FUNCTION,
+    TIMESTAMP_FUNCTION,
 )
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.engine.buffer_pool import BufferPool
@@ -1027,6 +1030,7 @@ class QueryEngine:
         )
         _validate_bound_subscript_types(plan, parameters)
         _validate_bound_label_arguments(plan, parameters)
+        _validate_bound_timestamp_arguments(plan, parameters)
         stream = self._rows(root.child, context)
         rows = self._collect_result_rows(stream) if root.columns else tuple(stream)
         context.release()
@@ -4251,6 +4255,24 @@ def _bound_pulse_expression_type(
                     value=expression.name,
                 )
             return ValueType.LIST
+        if name == TIMESTAMP_FUNCTION:
+            argument_type = argument_types[0]
+            if argument_type not in (
+                None,
+                ValueType.NULL,
+                ValueType.STRING,
+                ValueType.TIMESTAMP,
+            ):
+                message = (
+                    f"{expression.name} reads an ISO-8601 string or a timestamp; got "
+                    f"{argument_type.name}."
+                )
+                raise GrafxPlanError(
+                    message,
+                    field="function",
+                    value=expression.name,
+                )
+            return ValueType.TIMESTAMP
         if name == LABEL_FUNCTION:
             argument_type = argument_types[0]
             if argument_type not in (None, ValueType.NULL):
@@ -4469,6 +4491,67 @@ def _validate_bound_subscript_types(
             )
 
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_ONE_MICROSECOND = timedelta(microseconds=1)
+
+
+def _timestamp_of(function_name: str, value: object) -> Timestamp | None:
+    """Read one ISO-8601 instant, or refuse it.
+
+    The single place the conversion lives, so the binder and the evaluator cannot answer
+    differently for the same text.  Whole microseconds come from integer division of a
+    timedelta rather than from seconds-as-float, because a float loses the last digits of a
+    microsecond reading and a timestamp is stored to the microsecond.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, Timestamp):
+        return value
+    if not isinstance(value, str):
+        # A number is refused rather than read as an epoch: there would be no way to tell a
+        # count of microseconds from a count of seconds, and guessing wrong is silent.
+        message = (
+            f"{function_name} reads an ISO-8601 string or a timestamp; got "
+            f"{type(value).__name__}."
+        )
+        raise GrafxPlanError(
+            message,
+            field="function",
+            value=function_name,
+        )
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError as exc:
+        message = f"{function_name} could not read {value!r} as an ISO-8601 instant."
+        raise GrafxPlanError(
+            message,
+            field="function",
+            value=function_name,
+        ) from exc
+    if moment.tzinfo is None:
+        # A reading with no zone is UTC by contract, rather than the machine's local time,
+        # so the same text means the same instant wherever it is read.
+        moment = moment.replace(tzinfo=timezone.utc)
+    return Timestamp(micros=(moment - _EPOCH) // _ONE_MICROSECOND)
+
+
+def _validate_bound_timestamp_arguments(
+    plan: PlannedQuery, parameters: Mapping[str, object]
+) -> None:
+    """Convert every timestamp() argument the call has made knowable, before the stream.
+
+    An unreadable instant is wrong whether or not the pattern matches, and a write must not
+    stage anything on its way to finding out.
+    """
+
+    for call in plan.timestamp_calls:
+        argument = call.arguments[0]
+        if not _binder_resolvable(argument):
+            continue
+        _timestamp_of(call.name, _bound_postfix_value(argument, parameters, owner=call.name))
+
+
 def _validate_bound_label_arguments(
     plan: PlannedQuery, parameters: Mapping[str, object]
 ) -> None:
@@ -4582,6 +4665,10 @@ def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
         if trailing_empty:
             result.append("")
         return tuple(result)
+    if name == TIMESTAMP_FUNCTION:
+        return _timestamp_of(
+            expression.name, _evaluate(expression.arguments[0], row, context)
+        )
     if name == LABEL_FUNCTION:
         subject = _evaluate(expression.arguments[0], row, context)
         if subject is None:

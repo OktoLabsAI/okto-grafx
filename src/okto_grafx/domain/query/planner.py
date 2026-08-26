@@ -114,6 +114,7 @@ from okto_grafx.domain.query.tokens import (
     LABEL_FUNCTION,
     SIZE_FUNCTION,
     STRING_SPLIT_FUNCTION,
+    TIMESTAMP_FUNCTION,
 )
 
 __all__ = [
@@ -167,6 +168,7 @@ _COALESCE_FAMILY: dict[ValueType, str] = {
     ValueType.INT64: "number",
     ValueType.DOUBLE: "number",
     ValueType.STRING: "string",
+    ValueType.TIMESTAMP: "timestamp",
 }
 
 
@@ -330,6 +332,7 @@ class PlannedQuery:
     ] = ()
     pulse_expression_types: tuple[tuple[Expression, ValueType | None], ...] = ()
     label_calls: tuple[FunctionCall, ...] = ()
+    timestamp_calls: tuple[FunctionCall, ...] = ()
 
     def describe(self) -> str:
         """Return the operator tree as one block of indented lines."""
@@ -401,6 +404,7 @@ class _Planner:
     tables: dict[str, TableDef] = field(default_factory=dict)
     multi_hop_variables: set[str] = field(default_factory=set)
     label_calls: list[FunctionCall] = field(default_factory=list)
+    timestamp_calls: list[FunctionCall] = field(default_factory=list)
     coalesce_argument_types: dict[FunctionCall, tuple[ValueType | None, ...]] = field(
         default_factory=dict
     )
@@ -452,6 +456,7 @@ class _Planner:
             subscript_types=tuple(self.subscript_types.values()),
             pulse_expression_types=tuple(self.pulse_expression_types.values()),
             label_calls=tuple(self.label_calls),
+            timestamp_calls=tuple(self.timestamp_calls),
         )
 
     # --- schema ------------------------------------------------------------------------------
@@ -693,6 +698,7 @@ class _Planner:
             pipeline = self._updating_clause(pipeline, clause)
         self._record_coalesce_types(statement)
         self._record_label_arguments(statement)
+        self._record_timestamp_arguments(statement)
         self._record_case_and_subscript_types(statement)
         if statement.updating_clauses:
             # Everything that writes is drawn in full before anything above can stop early. A
@@ -779,6 +785,21 @@ class _Planner:
                         field="function",
                         value=node.name,
                     )
+
+    def _record_timestamp_arguments(self, statement: Query) -> None:
+        """Carry every timestamp() call to the binder, which is where the value arrives.
+
+        The reading itself cannot be judged here: a literal could be checked, but a parameter
+        is only known at the call, and both have to answer the same way.  Recording the call
+        lets one converter decide both, before the first row.
+        """
+
+        for expression in self._query_expressions(statement):
+            for node in walk(expression):
+                if isinstance(node, FunctionCall) and node.name.upper() == (
+                    TIMESTAMP_FUNCTION
+                ):
+                    self.timestamp_calls.append(node)
 
     def _record_case_and_subscript_types(self, statement: Query) -> None:
         """Resolve CASE and list-subscript types after every pattern has bound a table."""
@@ -988,6 +1009,8 @@ class _Planner:
                 return ValueType.LIST
             if name == LABEL_FUNCTION:
                 return ValueType.STRING
+            if name == TIMESTAMP_FUNCTION:
+                return ValueType.TIMESTAMP
             if name == SIZE_FUNCTION or name == "COUNT":
                 return ValueType.INT64
             if name in (SIMILARITY_FUNCTION, SIMILARITY_SCORE_FUNCTION, "AVG"):
@@ -1157,6 +1180,10 @@ class _Planner:
             # label() always answers a table name or null, so its family is known
             # without waiting for a row.
             return ValueType.STRING
+        if isinstance(argument, FunctionCall) and argument.name.upper() == (
+            TIMESTAMP_FUNCTION
+        ):
+            return ValueType.TIMESTAMP
         message = (
             f"{call.name} needs arguments whose scalar type is known from a literal, parameter "
             f"or bound property; got {argument.describe()}."

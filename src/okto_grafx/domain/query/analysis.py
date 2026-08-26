@@ -58,6 +58,7 @@ from okto_grafx.domain.query.tokens import (
     LABEL_FUNCTION,
     SIZE_FUNCTION,
     STRING_SPLIT_FUNCTION,
+    TIMESTAMP_FUNCTION,
 )
 
 __all__ = [
@@ -563,6 +564,9 @@ class _Analyzer:
         if name == SIZE_FUNCTION:
             self._check_positional_call(call, arguments=1)
             return
+        if name == TIMESTAMP_FUNCTION:
+            self._check_positional_call(call, arguments=1)
+            return
         if name == SIMILARITY_FUNCTION:
             self._check_similarity_call(call)
             return
@@ -572,7 +576,7 @@ class _Analyzer:
             f"{COALESCE_FUNCTION.lower()}, {LABEL_FUNCTION.lower()}, "
             f"{SIZE_FUNCTION.lower()}, "
             f"{SIMILARITY_FUNCTION.lower()}, {SIMILARITY_SCORE_FUNCTION.lower()} and "
-            f"{STRING_SPLIT_FUNCTION.lower()}.",
+            f"{STRING_SPLIT_FUNCTION.lower()} and {TIMESTAMP_FUNCTION.lower()}.",
             field="function",
             value=call.name,
             where=where,

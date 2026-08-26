@@ -83,7 +83,7 @@ openCypher in the Kùzu dialect, executed by a planner that produces one operato
 | Traversal | one hop, bounded ranges `[:REL*1..3]`, both directions, relationship isomorphism |
 | `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT`, `WITH` | |
 | Aggregates | `count`, `min`, `max`, and friends |
-| Scalar functions | `coalesce`, `string_split`, `size`, `label` |
+| Scalar functions | `coalesce`, `string_split`, `size`, `label`, `timestamp` |
 | Conditional/list expressions | searched and simple `CASE`; one-based and negative `list[index]` |
 | Parameters | `$name`, refused before anything runs if one is missing |
 

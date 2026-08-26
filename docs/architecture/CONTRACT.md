@@ -915,6 +915,17 @@ types, literal types and bound parameter types before rows are produced, so a nu
 argument still promotes an integer result and a known mismatch is refused even for an empty
 result. `string_split` takes exactly two positional strings and `size` takes exactly one
 positional string or list; both propagate null.
+`timestamp` takes exactly one positional argument and answers an instant in whole
+microseconds. Null answers null and a timestamp passes through unchanged; an ISO-8601 string is
+read with either `T` or a space, with or without a fractional part, and as a date alone. A
+written zone is honoured and normalized to UTC, and an absent zone is UTC rather than the
+reading machine's local time, so one text always means one instant. Lowercase `z` is not
+ISO-8601 and is refused, as is any date that does not exist. A number is refused rather than
+read as an epoch, because seconds and microseconds are both plausible readings of it and
+guessing wrong is silent. The microseconds come from integer arithmetic on a `timedelta`, so a
+reading keeps its last digits. `TIMESTAMP` unifies with `TIMESTAMP` and with no other family in
+`coalesce` and `CASE`. An argument the call makes knowable is converted before the first row, so
+an unreadable instant refuses without staging anything.
 `label` takes exactly one positional argument and answers the table a matched node or
 relationship came from, as ``TableDef.name``; null answers null. Anything that never came from a
 matched row is refused before the first row is read, including a bound parameter carrying a

@@ -17,7 +17,7 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
-from okto_grafx.domain.model.value import ValueType
+from okto_grafx.domain.model.value import Timestamp, ValueType
 from okto_grafx.domain.query.plan import ProduceResults, VectorSearch
 from okto_grafx.engine.query_engine import (
     PHASE_EXECUTE,
@@ -642,6 +642,152 @@ def test_label_composes_with_case_and_coalesce_as_a_string(stack: QueryStack) ->
     with pytest.raises(GrafxPlanError) as mixed:
         run(stack, "MATCH (p:Person) RETURN coalesce(label(p), 1)")
     assert mixed.value.details["field"] == "function"
+
+
+
+# One instant, written six ways, so the readings can be compared rather than each asserted
+# against a number nobody can check. 2024-01-02T03:04:05Z is 1704164645 seconds.
+_INSTANT_MICROS = 1_704_164_645_000_000
+
+
+@pytest.mark.parametrize(
+    ("written", "micros"),
+    (
+        ("2024-01-02T03:04:05Z", _INSTANT_MICROS),
+        ("2024-01-02T03:04:05", _INSTANT_MICROS),
+        ("2024-01-02 03:04:05", _INSTANT_MICROS),
+        ("2024-01-02T03:04:05+00:00", _INSTANT_MICROS),
+        ("2024-01-02T03:04:05+02:00", _INSTANT_MICROS - 2 * 3_600_000_000),
+        ("2024-01-02T03:04:05-05:00", _INSTANT_MICROS + 5 * 3_600_000_000),
+        ("2024-01-02T03:04:05.123456Z", _INSTANT_MICROS + 123_456),
+        ("2024-01-02", _INSTANT_MICROS - (3 * 3600 + 4 * 60 + 5) * 1_000_000),
+    ),
+)
+def test_timestamp_reads_iso_forms_into_utc_microseconds(
+    stack: QueryStack, written: str, micros: int
+) -> None:
+    """A zone that is written is honoured; a zone that is absent is UTC, not local time."""
+
+    found = run(stack, "MATCH (p:Person) RETURN timestamp($t) LIMIT 1", {"t": written})
+    assert found.rows == ((Timestamp(micros=micros),),)
+
+
+def test_timestamp_keeps_whole_microseconds(stack: QueryStack) -> None:
+    """The last digits survive, which they would not through seconds-as-float."""
+
+    found = run(
+        stack,
+        "MATCH (p:Person) RETURN timestamp($t) LIMIT 1",
+        {"t": "2024-01-02T03:04:05.123457Z"},
+    )
+    assert found.rows == ((Timestamp(micros=_INSTANT_MICROS + 123_457),),)
+
+
+def test_timestamp_passes_a_timestamp_through_and_answers_null_with_null(
+    stack: QueryStack,
+) -> None:
+    already = Timestamp(micros=_INSTANT_MICROS)
+    assert run(
+        stack, "MATCH (p:Person) RETURN timestamp($t) LIMIT 1", {"t": already}
+    ).rows == ((already,),)
+    assert run(stack, "MATCH (p:Person) RETURN timestamp(null) LIMIT 1").rows == (
+        (None,),
+    )
+    assert run(
+        stack, "MATCH (p:Person) RETURN timestamp($t) LIMIT 1", {"t": None}
+    ).rows == ((None,),)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "2024-01-02T03:04:05z",
+        "2024-13-01",
+        "2024-01-32",
+        "not-a-date",
+        "",
+    ),
+)
+def test_timestamp_refuses_text_it_cannot_read(stack: QueryStack, value: str) -> None:
+    """Lowercase z is not ISO-8601, and neither is a date that does not exist."""
+
+    with pytest.raises(GrafxPlanError) as failure:
+        run(stack, "MATCH (p:Person) RETURN timestamp($t)", {"t": value})
+    assert failure.value.details == {"field": "function", "value": "timestamp"}
+
+
+@pytest.mark.parametrize("value", (1_704_164_645_000_000, 1.5, True, [1], {"a": 1}))
+def test_timestamp_refuses_a_number_rather_than_guessing_an_epoch(
+    stack: QueryStack, value: object
+) -> None:
+    """Seconds and microseconds are both plausible readings of a number, so neither is taken."""
+
+    with pytest.raises(GrafxPlanError) as failure:
+        run(stack, "MATCH (p:Person) RETURN timestamp($t)", {"t": value})
+    assert failure.value.details == {"field": "function", "value": "timestamp"}
+
+
+@pytest.mark.parametrize("value", ("2024-01-02T03:04:05z", 1_704_164_645_000_000))
+def test_timestamp_refuses_before_any_row_is_read(
+    stack: QueryStack, value: object
+) -> None:
+    """An unreadable instant is wrong whether or not the pattern matches anything."""
+
+    with pytest.raises(GrafxPlanError) as matching:
+        run(stack, "MATCH (p:Person) RETURN timestamp($t)", {"t": value})
+    with pytest.raises(GrafxPlanError) as empty:
+        run(stack, "MATCH (p:Person) WHERE p.id = 99 RETURN timestamp($t)", {"t": value})
+    assert matching.value.details == empty.value.details == {
+        "field": "function",
+        "value": "timestamp",
+    }
+
+
+def test_timestamp_composes_with_case_and_coalesce_as_its_own_family(
+    stack: QueryStack,
+) -> None:
+    """TIMESTAMP unifies with TIMESTAMP and with nothing else."""
+
+    found = run(
+        stack,
+        "MATCH (p:Person) RETURN CASE WHEN true THEN timestamp($a) ELSE timestamp($b) END "
+        "AS chosen, coalesce(timestamp($c), timestamp($b)) AS filled LIMIT 1",
+        {"a": "2024-01-02T03:04:05Z", "b": "2024-01-02", "c": None},
+    )
+    assert found.rows == (
+        (
+            Timestamp(micros=_INSTANT_MICROS),
+            Timestamp(micros=_INSTANT_MICROS - (3 * 3600 + 4 * 60 + 5) * 1_000_000),
+        ),
+    )
+
+    with pytest.raises(GrafxPlanError) as mixed:
+        run(
+            stack,
+            "MATCH (p:Person) RETURN coalesce(timestamp($a), 'text')",
+            {"a": "2024-01-02"},
+        )
+    assert mixed.value.details["field"] == "function"
+
+
+def test_a_refused_timestamp_stages_nothing(labelled_graph) -> None:
+    """A write must not leave anything behind on its way to finding the argument unreadable."""
+
+    with labelled_graph.begin("read") as txn:
+        before = tuple(
+            tuple(row) for row in txn.execute("MATCH (p:Person) RETURN p.id", {})
+        )
+    with pytest.raises(GrafxPlanError):
+        with labelled_graph.begin("write") as txn:
+            txn.execute(
+                "MATCH (p:Person) WHERE p.id = 'nobody' SET p.id = timestamp($t)",
+                {"t": "nope"},
+            )
+    with labelled_graph.begin("read") as txn:
+        after = tuple(
+            tuple(row) for row in txn.execute("MATCH (p:Person) RETURN p.id", {})
+        )
+    assert after == before
 
 
 def test_list_subscript_matches_ladybug_one_based_and_negative_positions(
