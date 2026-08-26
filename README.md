@@ -83,6 +83,7 @@ openCypher in the Kùzu dialect, executed by a planner that produces one operato
 | Traversal | one hop, bounded ranges `[:REL*1..3]`, both directions, relationship isomorphism |
 | `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT`, `WITH` | |
 | Aggregates | `count`, `min`, `max`, and friends |
+| Scalar functions | `coalesce` |
 | Parameters | `$name`, refused before anything runs if one is missing |
 
 `MATCH` in a write transaction sees that owner's earlier node inserts, updates and deletes. A

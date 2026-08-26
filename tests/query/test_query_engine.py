@@ -110,6 +110,61 @@ def test_is_null_finds_what_a_comparison_with_null_cannot(stack: QueryStack) -> 
     assert names(run(stack, "MATCH (p:Person) WHERE p.age = null RETURN p.name")) == []
 
 
+def test_coalesce_preserves_falsey_values_and_returns_null_when_all_are_null(
+    stack: QueryStack,
+) -> None:
+    found = run(
+        stack,
+        "RETURN CoAlEsCe(null, false, true) AS flag, "
+        "coalesce(null, 0, 1) AS number, "
+        "coalesce(null, '', 'fallback') AS text, "
+        "coalesce(null, null) AS missing",
+    )
+    assert found.columns == ("flag", "number", "text", "missing")
+    assert found.rows == ((False, 0, "", None),)
+
+
+def test_coalesce_short_circuits_after_the_first_non_null_value(
+    stack: QueryStack,
+) -> None:
+    assert run(stack, "RETURN coalesce('chosen', 1 / 0) AS value").rows == (
+        ("chosen",),
+    )
+
+
+def test_coalesce_works_in_filters_projections_and_sort_keys(stack: QueryStack) -> None:
+    filtered = run(
+        stack,
+        "MATCH (p:Person) WHERE coalesce(p.city, '') = 'London' "
+        "RETURN p.name ORDER BY p.name",
+    )
+    projected = run(
+        stack,
+        "MATCH (p:Person) RETURN p.name, coalesce(p.city, 'zzz') AS city "
+        "ORDER BY city, p.name",
+    )
+    sorted_by_unprojected_expression = run(
+        stack,
+        "MATCH (p:Person) RETURN p.name ORDER BY coalesce(p.age, 0), p.name",
+    )
+
+    assert filtered.rows == (("Ada",), ("Alan",))
+    assert projected.rows == (
+        ("Ada", "London"),
+        ("Alan", "London"),
+        ("Grace", "New York"),
+        ("Edsger", "Rotterdam"),
+        ("Barbara", "zzz"),
+    )
+    assert sorted_by_unprojected_expression.rows == (
+        ("Edsger",),
+        ("Ada",),
+        ("Alan",),
+        ("Grace",),
+        ("Barbara",),
+    )
+
+
 def test_and_is_false_as_soon_as_either_side_is(stack: QueryStack) -> None:
     found = run(stack, "MATCH (p:Person) WHERE p.age > 40 AND p.city = 'Nowhere' RETURN p.name")
     assert found.rows == ()

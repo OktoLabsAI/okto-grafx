@@ -19,6 +19,7 @@ from enum import Enum
 
 __all__ = [
     "AGGREGATE_FUNCTIONS",
+    "COALESCE_FUNCTION",
     "KEYWORDS",
     "SIMILARITY_FUNCTION",
     "SIMILARITY_SCORE_FUNCTION",
@@ -164,6 +165,9 @@ AGGREGATE_FUNCTIONS: frozenset[str] = frozenset(
     {"COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT"}
 )
 """The six aggregates CONTRACT.md section 8.9 freezes, compared case-insensitively."""
+
+COALESCE_FUNCTION: str = "COALESCE"
+"""The null-selection function required by the Pulse query contract 1.0."""
 
 SIMILARITY_FUNCTION: str = "SIMILARITY"
 """The similarity extension of SPEC-VEC FR-4, which puts the search in the query language."""

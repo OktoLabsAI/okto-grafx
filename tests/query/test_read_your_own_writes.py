@@ -10,6 +10,7 @@ import pytest
 import okto_grafx
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
+    GrafxPlanError,
     GrafxTransactionBudgetExceeded,
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
@@ -99,6 +100,43 @@ def test_created_node_can_be_set_then_read_and_committed(database: object) -> No
         "MATCH (p:Person {id: 1}) RETURN p.name, p.age"
     )
     assert committed.rows == (("Ada L", 37),)
+
+
+def test_coalesce_in_set_observes_nulls_and_rollback(database: object) -> None:
+    with database.begin("write") as seed:
+        seed.execute("CREATE (:Person {id: 1, name: 'Ada', age: null})")
+
+    writer = database.begin("write")
+    try:
+        changed = writer.execute(
+            "MATCH (p:Person {id: 1}) "
+            "SET p.age = coalesce(p.age, 0) + $delta RETURN p.age",
+            {"delta": 5},
+        )
+
+        assert changed.statistics["rows_updated"] == 1
+        assert writer.execute("MATCH (p:Person {id: 1}) RETURN p.age").rows == ((5,),)
+    finally:
+        writer.rollback()
+
+    assert database.execute("MATCH (p:Person {id: 1}) RETURN p.age").rows == ((None,),)
+
+
+def test_invalid_coalesce_refuses_before_a_set_has_any_effect(database: object) -> None:
+    with database.begin("write") as seed:
+        seed.execute("CREATE (:Person {id: 1, name: 'Ada', age: 36})")
+
+    writer = database.begin("write")
+    try:
+        accepted = tuple(writer._context.row_intents)
+        with pytest.raises(GrafxPlanError) as failure:
+            writer.execute("MATCH (p:Person {id: 1}) SET p.age = coalesce()")
+
+        assert failure.value.details["field"] == "function"
+        assert tuple(writer._context.row_intents) == accepted
+        assert writer.execute("MATCH (p:Person {id: 1}) RETURN p.age").rows == ((36,),)
+    finally:
+        writer.rollback()
 
 
 def test_nested_pending_binding_is_detached_before_a_write_is_released(

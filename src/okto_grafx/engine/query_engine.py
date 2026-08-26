@@ -150,6 +150,7 @@ from okto_grafx.domain.query.plan import (
 from okto_grafx.domain.query.planner import SCORE_COLUMN, PlannedQuery, build_plan
 from okto_grafx.domain.query.tokens import (
     AGGREGATE_FUNCTIONS,
+    COALESCE_FUNCTION,
     SIMILARITY_FUNCTION,
     SIMILARITY_SCORE_FUNCTION,
 )
@@ -3820,6 +3821,12 @@ def _arithmetic(operator: str, left: object, right: object) -> object:
 def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
     """Return the value of a function call: the score, or an aggregate already computed."""
     name = expression.name.upper()
+    if name == COALESCE_FUNCTION:
+        for argument in expression.arguments:
+            value = _evaluate(argument, row, context)
+            if value is not None:
+                return value
+        return None
     if name in (SIMILARITY_FUNCTION, SIMILARITY_SCORE_FUNCTION):
         score = row.bindings.get(SCORE_COLUMN)
         if score is None:

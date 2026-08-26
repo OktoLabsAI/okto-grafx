@@ -904,7 +904,10 @@ class QueryEngine:
 Cypher subset (openCypher, Kùzu dialect): `CREATE NODE TABLE` / `CREATE REL TABLE` /
 `CREATE VECTOR SPACE`, `CREATE`, `MATCH` (+ variable-length `-[:R*1..3]->`), `WHERE`, `RETURN`
 (`DISTINCT`, aliases), `ORDER BY`, `SKIP`, `LIMIT`, `SET`, `DELETE`, `MERGE`, parameters `$name`,
-aggregates `count/sum/avg/min/max/collect`, and the similarity extension:
+aggregates `count/sum/avg/min/max/collect`, the scalar function `coalesce(value, ...)`, and the
+similarity extension. `coalesce` returns the first non-null argument, or null when all arguments
+are null; it is case-insensitive, positional-only and requires at least one argument.
+
 ```
 MATCH (n:Chunk)-[:BELONGS_TO]->(d:Doc)
 WHERE n.layer = $layer AND d.active = true

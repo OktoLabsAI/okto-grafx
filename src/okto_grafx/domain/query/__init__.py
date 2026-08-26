@@ -129,6 +129,7 @@ from okto_grafx.domain.query.planner import (
 )
 from okto_grafx.domain.query.tokens import (
     AGGREGATE_FUNCTIONS,
+    COALESCE_FUNCTION,
     KEYWORDS,
     SIMILARITY_FUNCTION,
     SIMILARITY_SCORE_FUNCTION,
@@ -142,6 +143,7 @@ __all__ = [
     "ANONYMOUS_VARIABLE_PREFIX",
     "COLUMN_TYPE_NAMES",
     "COLUMN_VALUE_TYPES",
+    "COALESCE_FUNCTION",
     "ENTITY_NODE",
     "ENTITY_RELATIONSHIP",
     "KEYWORDS",

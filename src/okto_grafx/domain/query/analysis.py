@@ -51,6 +51,7 @@ from okto_grafx.domain.query.ast import (
 from okto_grafx.domain.query.limits import MAX_PARAMETERS
 from okto_grafx.domain.query.tokens import (
     AGGREGATE_FUNCTIONS,
+    COALESCE_FUNCTION,
     SIMILARITY_FUNCTION,
     SIMILARITY_SCORE_FUNCTION,
 )
@@ -523,13 +524,29 @@ class _Analyzer:
                 )
             self._scores = True
             return
+        if name == COALESCE_FUNCTION:
+            if call.named_arguments:
+                raise self._refuse(
+                    f"{call.name} takes positional arguments only; got "
+                    f"{len(call.named_arguments)} named.",
+                    field="function",
+                    value=call.name,
+                )
+            if not call.arguments:
+                raise self._refuse(
+                    f"{call.name} needs at least one argument.",
+                    field="function",
+                    value=call.name,
+                )
+            return
         if name == SIMILARITY_FUNCTION:
             self._check_similarity_call(call)
             return
         raise self._refuse(
             f"There is no function named {call.name!r} in this dialect; it reads "
             f"{', '.join(sorted(function.lower() for function in AGGREGATE_FUNCTIONS))}, "
-            f"{SIMILARITY_FUNCTION.lower()} and {SIMILARITY_SCORE_FUNCTION.lower()}.",
+            f"{COALESCE_FUNCTION.lower()}, {SIMILARITY_FUNCTION.lower()} and "
+            f"{SIMILARITY_SCORE_FUNCTION.lower()}.",
             field="function",
             value=call.name,
             where=where,

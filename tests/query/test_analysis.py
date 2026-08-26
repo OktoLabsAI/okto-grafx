@@ -360,7 +360,30 @@ def test_an_unknown_function_names_the_ones_that_exist() -> None:
     with pytest.raises(GrafxPlanError) as failure:
         analysis_of("MATCH (p:Person) RETURN nosuch(p.id)")
     assert failure.value.details["value"] == "nosuch"
+    assert "coalesce" in failure.value.message
     assert "similarity" in failure.value.message
+
+
+def test_coalesce_is_case_insensitive_and_takes_positional_arguments() -> None:
+    found = analysis_of(
+        "MATCH (p:Person) RETURN CoAlEsCe(p.name, $fallback) AS name"
+    )
+    assert found.parameters == ("fallback",)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    (
+        "coalesce()",
+        "coalesce(fallback => 'Ada')",
+        "coalesce(null, fallback => 'Ada')",
+    ),
+)
+def test_coalesce_refuses_an_empty_or_named_argument_list(expression: str) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of(f"MATCH (p:Person) RETURN {expression}")
+    assert failure.value.details["field"] == "function"
+    assert failure.value.details["value"].lower() == "coalesce"
 
 
 def test_a_schema_statement_analyses_to_an_empty_analysis() -> None:
