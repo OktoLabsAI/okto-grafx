@@ -965,6 +965,16 @@ scope em execução.
 **Gate:** suíte pública do port roda contra Grafx; matrizes de abort/conflito/crash não deixam
 efeito parcial e readers externos nunca veem staged state.
 
+**Fechamento de escopo em 2026-08-26:** o inventário read-only de todos os métodos do
+`GraphTransactionScope` atual confirmou que, fora o `execute()` genérico já atribuído ao
+M-PULSE-2, nenhum método exige outro primitive de engine depois da visão combinada do M-PULSE-1C.
+Create/update/snapshot/restore, supersedence, attestation, lookup de tipo e lifecycle já se apoiam
+na `main`; replace de payload, lineage, active-set e deletes por sessão usam as mesmas operações de
+nó/relação sob o overlay 1C. O provider Grafx deve converter timestamps ISO para o tipo armazenado,
+calcular o default de attestation a partir do before-image e chamar `Transaction.commit/rollback`;
+não se adicionará `timestamp()`, `coalesce()` ou statements `BEGIN/COMMIT/ROLLBACK` ao dialeto apenas
+para copiar a implementação Kuzu. Esse limite impede que M-PULSE-1 se transforme em M-PULSE-2.
+
 #### M-PULSE-2 — contrato de query Pulse 1.0
 
 1. gerar um corpus versionado a partir do contrato e das queries reais read-only e write do Pulse;
