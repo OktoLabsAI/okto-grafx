@@ -253,8 +253,8 @@
       "RETURN"
     ],
     "probe_count": 87,
-    "engine_accepted": 70,
-    "engine_refused": 17,
+    "engine_accepted": 71,
+    "engine_refused": 16,
     "contract_refused": 13,
     "contract_error_codes": {
       "unsafe_cypher": 10,
@@ -1338,9 +1338,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "plan_error",
-        "engine_verdict": "refused",
-        "error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "pattern",
@@ -1700,10 +1700,10 @@
     "class:fragment": 1,
     "class:read": 75,
     "class:write": 21,
-    "classification:already_supported": 73,
+    "classification:already_supported": 80,
     "classification:duplicate_text": 1,
     "classification:fragment": 1,
-    "classification:generic_gap": 22,
+    "classification:generic_gap": 15,
     "reachability:preventive": 2,
     "reachability:runtime_current": 66,
     "surface:internal_family": 68,
@@ -2601,9 +2601,9 @@
           "receiver": "scope"
         }
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "plan_error",
-      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "reachability": "runtime_current",
       "expected": {
         "kind": "rows",
@@ -2629,12 +2629,7 @@
         "order_by": "artifact_type ASC, artifact_id ASC",
         "limit": "$scan_limit",
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "plan_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -5438,9 +5433,9 @@
         "min_confidence",
         "min_relevance"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "plan_error",
-      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -5459,12 +5454,7 @@
         "order_by": null,
         "limit": null,
         "notes": "ungrouped aggregate: one null-free scalar row",
-        "error": {
-          "phase": "plan_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -5488,9 +5478,9 @@
         "min_relevance",
         "node_type"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "plan_error",
-      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -5509,12 +5499,7 @@
         "order_by": null,
         "limit": null,
         "notes": "ungrouped aggregate: one null-free scalar row",
-        "error": {
-          "phase": "plan_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -5913,9 +5898,9 @@
         "min_confidence",
         "min_relevance"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "plan_error",
-      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6060,12 +6045,7 @@
         "order_by": "n.created_at DESC, n.id DESC",
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "plan_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -6091,9 +6071,9 @@
         "min_confidence",
         "min_relevance"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "plan_error",
-      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6238,12 +6218,7 @@
         "order_by": "n.created_at DESC, n.id DESC",
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "plan_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -6268,9 +6243,9 @@
         "min_relevance",
         "node_type"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "plan_error",
-      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6415,12 +6390,7 @@
         "order_by": "n.created_at DESC, n.id DESC",
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "plan_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -6447,9 +6417,9 @@
         "min_relevance",
         "node_type"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "plan_error",
-      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6594,12 +6564,7 @@
         "order_by": "n.created_at DESC, n.id DESC",
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "plan_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -7797,5 +7762,5 @@
       }
     }
   ],
-  "digest": "33254881effa514647b487c1a351d5be4b553f7cc053719a25d4bda9e66a29b6"
+  "digest": "ac19e6735a90e5fe9831fdca67a80de1a3f4fffadd54b81151d9e343a7bd0d7a"
 }

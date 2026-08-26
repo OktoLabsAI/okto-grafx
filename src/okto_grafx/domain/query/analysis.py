@@ -39,6 +39,7 @@ from okto_grafx.domain.query.ast import (
     MapExpression,
     MatchClause,
     MergeClause,
+    NodePattern,
     Parameter,
     PatternPath,
     Property,
@@ -67,6 +68,7 @@ from okto_grafx.domain.query.tokens import (
 
 __all__ = [
     "ENTITY_NODE",
+    "POLYMORPHIC_NODE_SHAPE",
     "ENTITY_RELATIONSHIP",
     "ENTITY_PROJECTED",
     "ENTITY_UNWOUND",
@@ -77,6 +79,8 @@ __all__ = [
     "analyze",
     "contains_aggregate",
     "is_aggregate",
+    "polymorphic_node",
+    "polymorphic_node_refusal",
 ]
 
 ENTITY_NODE: str = "node"
@@ -169,6 +173,88 @@ class QueryAnalysis:
         )
 
 
+POLYMORPHIC_NODE_SHAPE: str = (
+    "one MATCH of one named node with no label, no relationship and no inline property map, "
+    "no UNWIND, no clause that writes, and a RETURN"
+)
+"""The only shape a node written without a label is read in."""
+
+
+def polymorphic_node(query: Query) -> NodePattern | None:
+    """Return the node this query matches without naming a label, or None when it matches none.
+
+    Only a node that stands ALONE counts, because only that one has to be looked for
+    everywhere. A node written without a label anywhere in a path takes its table from the
+    relationship beside it -- both ends of a hop are named by the relationship's own schema --
+    and a second mention of a name an earlier pattern bound takes the table that pattern gave
+    it. Neither reads every table, so neither is this, and a path that names no label on an end
+    keeps the refusal it already had rather than being re-explained as a shape rule.
+    """
+    bound: set[str] = set()
+    for clause in query.match_clauses:
+        for pattern in clause.patterns:
+            first = pattern.nodes[0]
+            if (
+                not pattern.relationships
+                and not first.labels
+                and (first.variable is None or first.variable not in bound)
+            ):
+                return first
+            for node in pattern.nodes:
+                if node.variable is not None:
+                    bound.add(node.variable)
+            for relationship in pattern.relationships:
+                if relationship.variable is not None:
+                    bound.add(relationship.variable)
+    return None
+
+
+def polymorphic_node_refusal(query: Query) -> tuple[str, str] | None:
+    """Return the refusal a label-free node earns outside its one shape, or None.
+
+    One function, asked by the analysis and asked again by the planner. Both need the answer --
+    a tree that never passed the parser reaches the first, and a caller's own analysis walks
+    past it to the second -- and two implementations of a shape rule are two chances to admit
+    different things.
+    """
+    driver = polymorphic_node(query)
+    if driver is None:
+        return None
+    reason = _polymorphic_shape_reason(query, driver)
+    if reason is None:
+        return None
+    return (
+        "A node that names no label matches every node table, and this subset reads one in "
+        f"exactly one shape: {POLYMORPHIC_NODE_SHAPE}. {reason}",
+        driver.describe(),
+    )
+
+
+def _polymorphic_shape_reason(query: Query, driver: NodePattern) -> str | None:
+    """Return what this statement does that the one shape does not allow, or None."""
+    if driver.variable is None:
+        return "This one carries no name, so nothing below it could read what it matched."
+    if driver.properties is not None:
+        return (
+            "This one carries an inline property map, and which column that matches depends "
+            "on the table."
+        )
+    if query.unwind_clause is not None:
+        return "This one follows an UNWIND."
+    if len(query.match_clauses) != 1:
+        return f"This query has {len(query.match_clauses)} MATCH clauses."
+    pattern = query.match_clauses[0].patterns
+    if len(pattern) != 1:
+        return f"This MATCH carries {len(pattern)} patterns."
+    if pattern[0].relationships:
+        return "This one is an end of a relationship, which names the table at each end."
+    if query.updating_clauses:
+        return "This query writes, and a write needs one table to write into."
+    if query.return_clause is None:
+        return "This query has no RETURN, so it would read every table for nothing."
+    return None
+
+
 def is_aggregate(expression: Expression) -> bool:
     """Return True when this expression is itself a call to one of the six aggregates."""
     return (
@@ -241,6 +327,10 @@ class _Analyzer:
 
     def run(self) -> QueryAnalysis:
         """Analyse the whole query and return what the planner needs."""
+        refusal = polymorphic_node_refusal(self._query)
+        if refusal is not None:
+            message, value = refusal
+            raise self._refuse(message, field="pattern", value=value)
         if self._query.unwind_clause is not None and self._query.with_clauses:
             # The parser refuses this text, but the parser is one door and not the only one:
             # a tree handed straight to analyze() never passed it, and the meaning of a

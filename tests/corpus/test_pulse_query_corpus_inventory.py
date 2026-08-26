@@ -650,8 +650,9 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
 
     by_construct = {probe["construct"]: probe for probe in raw["probes"]}
     # M-PULSE-2C closes the standalone list-index and both CASE grammar probes, M-PULSE-2D
-    # closes the last two functions, M-PULSE-2E closes the one leading UNWIND source and
-    # M-PULSE-2F closes the leading WITH.  The two UNWIND probes with identical text remain
+    # closes the last two functions, M-PULSE-2E closes the one leading UNWIND source,
+    # M-PULSE-2F closes the leading WITH and M-PULSE-2G closes the label-free node, which
+    # takes the six all-node templates and I19 with it.  The two UNWIND probes with identical text remain
     # distinct grammar keys, so both have to ratchet beside map access rather than being
     # deduplicated by their spelling.
     for name in (
@@ -662,6 +663,7 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         "timestamp",
         "UNWIND",
         "WITH",
+        "polymorphic node",
         "map batch",
         "map access",
     ):
@@ -676,12 +678,12 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         probe for probe in raw["probes"] if probe["engine_verdict"] == "accepted"
     ]
     refused = [probe for probe in raw["probes"] if probe["engine_verdict"] == "refused"]
-    assert len(accepted) == 70
-    assert len(refused) == 17
-    assert len(owed) == 9
+    assert len(accepted) == 71
+    assert len(refused) == 16
+    assert len(owed) == 8
 
-    assert frozen["counts"]["classification:already_supported"] == 73
-    assert frozen["counts"]["classification:generic_gap"] == 22
+    assert frozen["counts"]["classification:already_supported"] == 80
+    assert frozen["counts"]["classification:generic_gap"] == 15
 
 
 def test_every_raw_probe_has_one_contract_and_engine_verdict(frozen: dict) -> None:

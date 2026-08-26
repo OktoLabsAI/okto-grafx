@@ -978,6 +978,24 @@ after one, a `WITH` after a clause that writes, and `UNWIND` combined with `WITH
 `WithRows` is streaming -- one row in, one row out -- and participates once, through the common
 operator wrapper, in `max_intermediate_rows`.
 
+`MATCH (n)` -- a node that names no label -- matches every node table, and `AllNodesScan` reads
+them in table_id order under one name. It is one operator over the union rather than one scan per
+table, so a predicate, `label(n)`, an aggregate, `DISTINCT`, an `ORDER BY` and a window each apply
+once to the whole set; paging over all nodes therefore answers in one order across tables instead
+of per table. The scan gives the owner the view a single-table scan gives: rows committed under
+its snapshot, its own updates overlaid, its own deletes gone and its own pending inserts included,
+and nothing another transaction has staged. A property a row's table does not declare reads as
+null rather than refusing, because the same scan crosses tables that were never obliged to carry
+the same columns; a property two tables declare with families that cannot both be right is
+refused before the first row, since which answer arrived would otherwise depend on which table
+the scan reached first. Integers and doubles still promote. A node matched this way projects as a
+map of `label` and `properties`, detached and carrying no identity; a node matched under a label
+keeps projecting what it always did. The subset reads a label-free node in exactly one shape --
+one `MATCH` of one named node, no relationship and no inline property map, no `UNWIND`, no clause
+that writes, and a `RETURN`, with `WHERE` and `WITH` free to shape the rows -- and every other
+shape is refused before a table is read. A node written without a label at the end of a hop is
+not this: the relationship names the table at each end.
+
 ```
 MATCH (n:Chunk)-[:BELONGS_TO]->(d:Doc)
 WHERE n.layer = $layer AND d.active = true

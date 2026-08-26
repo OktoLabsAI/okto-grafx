@@ -45,6 +45,7 @@ from okto_grafx.domain.query.limits import MAX_EXPRESSION_DEPTH
 __all__ = [
     "MAX_PLAN_DEPTH",
     "AggregateRows",
+    "AllNodesScan",
     "CreateNodeTable",
     "CreateRelTable",
     "CreateRelationships",
@@ -202,6 +203,38 @@ class UnwindRows(PlanNode):
     def details(self) -> Mapping[str, object]:
         """Return the name bound and the list it was bound from."""
         return {"alias": self.alias, "list": self.expression.describe()}
+
+
+@dataclass(frozen=True, slots=True)
+class AllNodesScan(PlanNode):
+    """Every node row of every node table, under one name.
+
+    A pattern that names no label matches a node whatever table it lives in, so this operator
+    reads the tables in one pass and binds each row under the same variable. It is ONE operator
+    rather than a chain of scans on purpose: chained scans would multiply the tables into a
+    product, and a union of scans placed side by side would need a filter of its own to know
+    which branch produced a row. Everything above -- the predicate, the grouping, the ordering
+    and the window -- therefore applies to the whole set exactly once, which is what a caller
+    counting all nodes or paging through them is asking for.
+
+    The tables are fixed when the plan is built and they are read in table_id order, so a plan
+    says which tables it will read and two runs of one plan read them in one order.
+    """
+
+    child: PlanNode
+    variable: str
+    tables: tuple[TableDef, ...]
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Return the operator whose rows drive this scan."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Return the name bound and the tables the scan unites, in the order it reads them."""
+        return {
+            "variable": self.variable,
+            "tables": ", ".join(table.name for table in self.tables) or "none",
+        }
 
 
 @dataclass(frozen=True, slots=True)

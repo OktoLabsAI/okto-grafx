@@ -92,6 +92,7 @@ from okto_grafx.domain.query.limits import (
     MAX_STRING_CHARACTERS,
 )
 from okto_grafx.domain.query.plan import (
+    AllNodesScan,
     MAX_PLAN_DEPTH,
     AggregateRows,
     CreateNodeTable,
@@ -1865,6 +1866,7 @@ def _bounded_mapping_pairs(
 _QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
     {
         AggregateRows,
+        AllNodesScan,
         CreateNodeTable,
         CreateRelationships,
         CreateRelTable,

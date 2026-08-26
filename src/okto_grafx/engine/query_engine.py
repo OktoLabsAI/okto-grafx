@@ -127,6 +127,7 @@ from okto_grafx.domain.query.limits import (
 from okto_grafx.domain.query.parser import parse as parse_text
 from okto_grafx.domain.query.plan import (
     AggregateRows,
+    AllNodesScan,
     CreateNodeTable,
     CreatedNode,
     CreatedRelationship,
@@ -242,6 +243,8 @@ class RowBinding:
     table: TableDef
     ref: object
     version: HeapVersion
+    polymorphic: bool = False
+    """Whether the pattern that bound this row named no label."""
 
     @property
     def record_id(self) -> int:
@@ -249,12 +252,20 @@ class RowBinding:
         return self.version.record_id
 
     def value(self, key: str) -> Value:
-        """Return one property of this row, refusing a column its table does not declare."""
+        """Return one property of this row, refusing a column its table does not declare.
+
+        Unless the pattern named no label. A polymorphic match reads one name across tables
+        that were never obliged to carry the same columns, so a column this row's table does
+        not declare is null here rather than a refusal -- refusing would make a query answer
+        for one table and fail for the next one in the same scan.
+        """
         for position, column in enumerate(self.table.columns):
             if column.name == key:
                 if position >= len(self.version.values):
                     return None
                 return self.version.values[position]
+        if self.polymorphic:
+            return None
         raise GrafxPlanError(
             f"Table {self.table.name!r} has no column named {key!r}, so {self.variable}.{key} "
             "reads nothing.",
@@ -1652,6 +1663,49 @@ def _with_rows(
         yield _Row(bindings=projected)
 
 
+def _all_nodes_scan(
+    engine: QueryEngine, node: AllNodesScan, context: _Context
+) -> Iterator[_Row]:
+    """Produce every node row of every node table the plan named, under one name.
+
+    One operator over many tables, not one operator per table: what comes out is a single
+    stream, so the filter, the grouping, the ordering and the window above it see the whole set
+    once. Each table contributes the same owner-only view a single-table scan gives -- committed
+    rows under this snapshot, this transaction's own updates overlaid and its own deletes gone,
+    and its own pending inserts appended -- and the tables are read in the order the plan fixed.
+    """
+    snapshot = context.snapshot
+    views = [
+        (table, *_transaction_row_view(context, table, include_held=False))
+        for table in node.tables
+    ]
+    for row in engine._rows(node.child, context):
+        for table, changed, inserted in views:
+            for ref, version in engine.heap.scan(table, snapshot):
+                if ref in changed:
+                    latest = changed[ref]
+                    if latest is None:
+                        continue
+                    version = replace(version, values=latest)
+                bindings = dict(row.bindings)
+                bindings[node.variable] = RowBinding(
+                    variable=node.variable,
+                    table=table,
+                    ref=ref,
+                    version=version,
+                    polymorphic=True,
+                )
+                context.count("rows_scanned")
+                yield _Row(bindings=bindings)
+            for reference, values in inserted:
+                bindings = dict(row.bindings)
+                bindings[node.variable] = _pending_binding(
+                    node.variable, table, values, reference=reference, polymorphic=True
+                )
+                context.count("rows_scanned")
+                yield _Row(bindings=bindings)
+
+
 def _node_scan(
     engine: QueryEngine, node: NodeScan, context: _Context
 ) -> Iterator[_Row]:
@@ -2901,6 +2955,7 @@ def _pending_binding(
     values: tuple[Value, ...],
     *,
     reference: object = None,
+    polymorphic: bool = False,
 ) -> RowBinding:
     """Return a binding for a row this statement staged but has not yet given an identity.
 
@@ -2914,6 +2969,7 @@ def _pending_binding(
         variable=variable,
         table=table,
         ref=reference,
+        polymorphic=polymorphic,
         version=HeapVersion(
             record_id=0,
             xmin=NO_CSN,
@@ -3654,6 +3710,7 @@ _HANDLERS: dict[type, _Handler] = {
     SingleRow: _single_row,  # type: ignore[dict-item]
     UnwindRows: _unwind_rows,  # type: ignore[dict-item]
     WithRows: _with_rows,  # type: ignore[dict-item]
+    AllNodesScan: _all_nodes_scan,  # type: ignore[dict-item]
     NodeScan: _node_scan,  # type: ignore[dict-item]
     IndexSeek: _index_seek,  # type: ignore[dict-item]
     TraverseRelationship: _traverse,  # type: ignore[dict-item]
@@ -4883,8 +4940,24 @@ def _binding_identity(binding: RowBinding) -> tuple[object, ...]:
 
 
 def _as_value(value: object) -> Value:
-    """Detach bindings recursively so no private pending reference reaches a result value."""
+    """Detach bindings recursively so no private pending reference reaches a result value.
+
+    A node matched WITHOUT a label detaches as a map of its label and its properties. It has to
+    carry the label: the caller asked across tables and the row alone would not say which one it
+    came from. It carries no identity at all -- no record id, no reference, no version, no table
+    id -- because those are owner-private and a caller who received one could do nothing correct
+    with it. A node matched under a label keeps answering the identity it always answered; this
+    path is additive rather than a change to what was already published.
+    """
     if isinstance(value, RowBinding):
+        if value.polymorphic:
+            return {
+                "label": value.table.name,
+                "properties": {
+                    column.name: _as_value(value.value(column.name))
+                    for column in value.table.columns
+                },
+            }
         return value.record_id
     if isinstance(value, (list, tuple)):
         return tuple(_as_value(item) for item in value)

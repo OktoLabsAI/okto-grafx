@@ -41,7 +41,12 @@ from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import VECTOR_DTYPES, ValueType, value_type_of
 from okto_grafx.domain.ports.vectormath import DistanceMetric
-from okto_grafx.domain.query.analysis import QueryAnalysis, SimilarityUse, analyze
+from okto_grafx.domain.query.analysis import (
+    QueryAnalysis,
+    SimilarityUse,
+    analyze,
+    polymorphic_node_refusal,
+)
 from okto_grafx.domain.query.ast import (
     BinaryOperation,
     CaseExpression,
@@ -81,6 +86,7 @@ from okto_grafx.domain.query.ast import (
 )
 from okto_grafx.domain.query.plan import (
     AggregateRows,
+    AllNodesScan,
     CreatedNode,
     CreatedRelationship,
     CreateNodeTable,
@@ -406,6 +412,7 @@ class _Planner:
     analysis: QueryAnalysis
     tables: dict[str, TableDef] = field(default_factory=dict)
     multi_hop_variables: set[str] = field(default_factory=set)
+    polymorphic_variables: set[str] = field(default_factory=set)
     unwind_alias: str | None = None
     alias_definitions: dict[str, Expression] = field(default_factory=dict)
     label_calls: list[FunctionCall] = field(default_factory=list)
@@ -693,6 +700,10 @@ class _Planner:
 
     def _query(self, statement: Query) -> PlannedQuery:
         """Plan a reading and updating query."""
+        refusal = polymorphic_node_refusal(statement)
+        if refusal is not None:
+            message, value = refusal
+            raise GrafxPlanError(message, field="pattern", value=value)
         pipeline: PlanNode = SingleRow()
         if statement.unwind_clause is not None:
             self._require_batch_shape(statement)
@@ -711,6 +722,7 @@ class _Planner:
             pipeline = self._with_clause(pipeline, clause)
         for clause in statement.updating_clauses:
             pipeline = self._updating_clause(pipeline, clause)
+        self._record_polymorphic_properties(statement)
         self._record_coalesce_types(statement)
         self._record_label_arguments(statement)
         self._record_case_and_subscript_types(statement)
@@ -851,7 +863,7 @@ class _Planner:
                         field="function",
                         value=node.name,
                     )
-                if argument.name not in self.tables:
+                if not self._matched_row(argument.name):
                     message = (
                         f"{node.name} reads the table of a matched node or relationship; "
                         f"{argument.name!r} is bound to none."
@@ -890,9 +902,8 @@ class _Planner:
 
         argument = node.arguments[0]
         if isinstance(argument, Variable):
-            if (
-                argument.name in self.multi_hop_variables
-                or argument.name in self.tables
+            if argument.name in self.multi_hop_variables or self._matched_row(
+                argument.name
             ):
                 message = (
                     f"{node.name} reads an ISO-8601 string or a timestamp; "
@@ -1032,6 +1043,8 @@ class _Planner:
                 return self._pulse_expression_type(definition, owner=owner)
         if isinstance(expression, Property):
             if isinstance(expression.subject, Variable):
+                if expression.subject.name in self.polymorphic_variables:
+                    return self._polymorphic_property_type(expression.key, owner)
                 table = self.tables.get(expression.subject.name)
                 if table is None:
                     message = f"{owner} reads {expression.describe()}, whose variable has no table."
@@ -1249,6 +1262,10 @@ class _Planner:
         if isinstance(argument, Literal):
             return value_type_of(argument.value)
         if isinstance(argument, Property) and isinstance(argument.subject, Variable):
+            if argument.subject.name in self.polymorphic_variables:
+                # A node matched without a label: the family is whatever the tables that
+                # declare the column agree on, and null when none of them declares it.
+                return self._polymorphic_property_type(argument.key, call.name)
             table = self.tables.get(argument.subject.name)
             if table is None:
                 message = (
@@ -1405,7 +1422,9 @@ class _Planner:
     ) -> tuple[PlanNode, list[Expression]]:
         """Plan one connected path, taking index seeks from the predicate where it can."""
         first = pattern.nodes[0]
-        pipeline, terms, source = self._match_node(pipeline, first, terms)
+        pipeline, terms, source = self._match_node(
+            pipeline, first, terms, standalone=not pattern.relationships
+        )
         for position, relationship in enumerate(pattern.relationships):
             target_pattern = pattern.nodes[position + 1]
             pipeline, source = self._traverse(
@@ -1422,9 +1441,20 @@ class _Planner:
         return pipeline, terms
 
     def _match_node(
-        self, pipeline: PlanNode, pattern: NodePattern, terms: list[Expression]
+        self,
+        pipeline: PlanNode,
+        pattern: NodePattern,
+        terms: list[Expression],
+        *,
+        standalone: bool = True,
     ) -> tuple[PlanNode, list[Expression], str]:
-        """Bind one node of a pattern, as a reference, an index seek or a scan."""
+        """Bind one node of a pattern, as a reference, an index seek or a scan.
+
+        ``standalone`` is false when a relationship follows this node in its path. A node at
+        the end of a hop is named by the relationship's own schema, so it is resolved the way
+        it always was -- reading every table for it would answer a different query, and the
+        refusal it already earns for naming no label is the one to keep.
+        """
         variable = pattern.variable or self._anonymous()
         if pattern.variable is not None and pattern.variable in self.tables:
             if pattern.labels:
@@ -1432,6 +1462,8 @@ class _Planner:
             if pattern.properties is not None:
                 terms = terms + list(self._property_terms(variable, pattern.properties))
             return pipeline, terms, variable
+        if standalone and not pattern.labels:
+            return self._match_every_node(pipeline, pattern, terms, variable)
         table = self._node_table_of(pattern)
         self.tables[variable] = table
         if pattern.properties is not None:
@@ -1440,6 +1472,94 @@ class _Planner:
         if seek is not None:
             return seek, remaining, variable
         return NodeScan(child=pipeline, variable=variable, table=table), terms, variable
+
+    def _match_every_node(
+        self,
+        pipeline: PlanNode,
+        pattern: NodePattern,
+        terms: list[Expression],
+        variable: str,
+    ) -> tuple[PlanNode, list[Expression], str]:
+        """Bind one node that names no label, which is every node of every node table.
+
+        The variable is deliberately NOT recorded in ``tables``: it is bound to a row, but not
+        to one table, and every rule that reads a variable's table has to see the difference
+        rather than a missing entry it can read as "unbound".
+        """
+
+        if pattern.properties is not None:
+            # An inline map is a shorthand for equality against a column, and which column that
+            # is depends on the table. This subset reads the property rules through the
+            # predicate, where the polymorphic type check can see them.
+            raise GrafxPlanError(
+                "A node that names no label matches every node table, so an inline property "
+                f"map has no one column to match; got {pattern.describe()}.",
+                field="properties",
+                value=pattern.describe(),
+            )
+        self.polymorphic_variables.add(variable)
+        return (
+            AllNodesScan(child=pipeline, variable=variable, tables=self._node_tables()),
+            terms,
+            variable,
+        )
+
+    def _node_tables(self) -> tuple[TableDef, ...]:
+        """Return every node table of the catalog, in the order a scan reads them."""
+        return tuple(table for table in self.catalog.tables() if table.kind == "node")
+
+    def _matched_row(self, name: str) -> bool:
+        """Return True when this variable names a matched row, table or no table."""
+        return name in self.tables or name in self.polymorphic_variables
+
+    def _polymorphic_property_type(self, key: str, owner: str) -> ValueType | None:
+        """Return the one type a property has across the tables that declare it.
+
+        A polymorphic match reads one name across many tables, so the property is typed only
+        when the tables that declare it agree; integers and doubles still promote, which is the
+        rule everywhere else here. Two tables that declare the same name with families that
+        cannot both be right make the read wrong for a reason no row settles -- the answer would
+        depend on which table the scan reached first -- so it is refused before the first row.
+
+        A name NO table declares is not an error: the scan spans tables that were never obliged
+        to carry it, and every row reads null.
+        """
+
+        declared = [
+            (table.name, column.type)
+            for table in self._node_tables()
+            for column in (self._column_of(table, key),)
+            if column is not None
+        ]
+        if not declared:
+            return None
+        types = {value_type for _, value_type in declared}
+        if len(types) == 1:
+            return next(iter(types))
+        if types <= {ValueType.INT64, ValueType.DOUBLE}:
+            return ValueType.DOUBLE
+        listing = ", ".join(
+            f"{name}.{key} is {value_type.name}" for name, value_type in declared
+        )
+        raise GrafxPlanError(
+            f"{owner} reads {key!r} on a node that names no label, and the tables do not agree "
+            f"on what it is: {listing}.",
+            field="property",
+            value=key,
+        )
+
+    def _record_polymorphic_properties(self, statement: Query) -> None:
+        """Check every property a label-free node reads, before any row is produced."""
+        for expression in self._query_expressions(statement):
+            for node in walk(expression):
+                if not isinstance(node, Property):
+                    continue
+                subject = node.subject
+                if not isinstance(subject, Variable):
+                    continue
+                if subject.name not in self.polymorphic_variables:
+                    continue
+                self._polymorphic_property_type(node.key, node.describe())
 
     def _node_table_of(self, pattern: NodePattern) -> TableDef:
         """Return the table a matched node reads, refusing a pattern that names none or many."""
