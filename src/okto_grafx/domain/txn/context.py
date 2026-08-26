@@ -25,7 +25,7 @@ from okto_grafx.domain.errors import (
     GrafxTransactionStateError,
 )
 from okto_grafx.domain.ids import NO_CSN, Csn, Epoch, PageIndex, RecordRef, TxnId
-from okto_grafx.domain.model.schema import encode_tuple
+from okto_grafx.domain.model.schema import ENDPOINT_COLUMN_COUNT, encode_tuple
 from okto_grafx.domain.txn.partitions import page_partition
 from okto_grafx.domain.txn.records import (
     WalRecordLike,
@@ -43,6 +43,28 @@ __all__ = [
     "TransactionMode",
     "TransactionState",
 ]
+
+
+SIZING_ENDPOINT: int = 1
+"""The positive INT64 a pending endpoint is measured as while it has no durable id yet.
+
+Any positive INT64 gives the same answer -- the encoding is fixed width -- so this constant
+exists to say that the choice is arbitrary ON PURPOSE and carries no meaning into the row.
+"""
+
+
+def _is_relationship(table: object) -> bool:
+    """Return whether this table stores edges, without assuming it is a real TableDef."""
+    return getattr(table, "kind", None) == "rel"
+
+
+def _sizing_values(values: tuple[object, ...]) -> tuple[object, ...]:
+    """Return the tuple with every pending identity replaced by the width it will occupy."""
+    if not any(isinstance(value, PendingRowRef) for value in values):
+        return values
+    return tuple(
+        SIZING_ENDPOINT if isinstance(value, PendingRowRef) else value for value in values
+    )
 
 
 class RowOperation(str, Enum):
@@ -524,8 +546,8 @@ class TransactionContext:
 
     def stage_row_insert(
         self, table: object, values: Iterable[object], *, record_id: int | None = None
-    ) -> None:
-        """Stage a row to be written at the number that makes it visible.
+    ) -> PendingRowRef:
+        """Stage a row to be written at the number that makes it visible, and name it privately.
 
         Nothing reaches the heap here. The row is written inside the commit section, once the
         log has assigned the commit number, because that number is the row's birth stamp and it
@@ -533,6 +555,13 @@ class TransactionContext:
         same discipline the page images already follow, for the same reason: an uncommitted
         transaction must leave nothing behind, and a row that is already in the heap is not
         nothing.
+
+        The returned :class:`PendingRowRef` is the transaction-local identity of THIS insert, and
+        it is returned even when the caller supplied ``record_id``: the private identity names the
+        staged intent, which is a different thing from the durable id the row will carry. A
+        relationship staged against a node this transaction is still creating puts that identity
+        in an endpoint slot; the commit path resolves it to the node's record id before anything
+        durable is written, and refuses if the promise cannot be kept.
         """
         self._require_active()
         self._require_write_mode("stage a row")
@@ -547,6 +576,7 @@ class TransactionContext:
         self._require_row_count_capacity()
         accepted_table = _require_table(table)
         accepted_values = tuple(values)
+        self._require_stageable_values(accepted_table, accepted_values)
         payload_bytes = self._row_payload_bytes(accepted_table, accepted_values)
         self._require_payload_capacity(payload_bytes)
         pending = self._allocate_pending_row_ref(accepted_table)
@@ -559,6 +589,7 @@ class TransactionContext:
             )
         )
         self._staged_payload_bytes += payload_bytes
+        return pending
 
     def _allocate_pending_row_ref(self, table: object) -> PendingRowRef:
         """Return the next private insert identity without allocating a durable record id."""
@@ -597,6 +628,7 @@ class TransactionContext:
         accepted_reference = self._require_row_reference(accepted_table, reference)
         self._require_row_count_capacity()
         accepted_values = tuple(values)
+        self._require_stageable_values(accepted_table, accepted_values, inserting=False)
         payload_bytes = self._row_payload_bytes(accepted_table, accepted_values)
         self._require_payload_capacity(payload_bytes)
         self.row_intents.append(
@@ -819,10 +851,53 @@ class TransactionContext:
         )
 
     def _row_payload_bytes(self, table: object, values: tuple[object, ...]) -> int:
-        """Return the canonical encoded payload size of one inserted or updated row."""
+        """Return the canonical encoded payload size of one inserted or updated row.
+
+        An endpoint that still names a pending identity is measured as the id it will become. The
+        two endpoint columns are INT64 and INT64 encodes to a fixed width (section 7.1), so
+        substituting any positive one gives the row's EXACT stored size rather than an estimate --
+        which matters, because a budget that charged an approximation would refuse or admit rows
+        on a number the heap never writes.
+        """
         if self._max_transaction_bytes is None:
             return 0
-        return len(encode_tuple(table, values))  # type: ignore[arg-type]
+        return len(encode_tuple(table, _sizing_values(values)))  # type: ignore[arg-type]
+
+    def _require_stageable_values(
+        self, table: object, values: tuple[object, ...], *, inserting: bool = True
+    ) -> None:
+        """Refuse a pending identity anywhere it cannot be resolved into a stored value.
+
+        Only the two endpoint columns of a relationship INSERT may carry one, and only when this
+        transaction emitted it and still holds it. Everything deeper -- that the insert it names
+        comes first, is a node, and belongs to the side that slot declares -- is proven from the
+        REDUCED intents by the commit path, because a later statement can still cancel the insert
+        this one is pointing at. Refusing the obviously impossible here keeps that later proof
+        from being the first place an ordinary mistake is reported.
+        """
+        endpoints = ENDPOINT_COLUMN_COUNT if inserting and _is_relationship(table) else 0
+        for slot, value in enumerate(values):
+            if not isinstance(value, PendingRowRef):
+                continue
+            if slot >= endpoints:
+                raise GrafxTransactionStateError(
+                    "Only the two endpoint columns of a relationship insert may carry a pending "
+                    "row identity; every other column must carry a stored value.",
+                    field="values",
+                    slot=slot,
+                    value=repr(value),
+                    table=getattr(table, "name", None),
+                    txn_id=self._txn_id,
+                )
+            if value.txn_id != self._txn_id or not self.owns_pending_row_ref(value):
+                raise GrafxTransactionStateError(
+                    "A relationship endpoint may name only a pending row identity this "
+                    "transaction emitted and still holds.",
+                    field="pending_row_reference",
+                    slot=slot,
+                    value=repr(value),
+                    txn_id=self._txn_id,
+                )
 
     def _intent_payload_bytes(self, intent: RowIntent) -> int:
         """Return retained payload bytes for one validated row intent."""

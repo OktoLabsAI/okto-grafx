@@ -91,8 +91,10 @@ from okto_grafx.domain.ids import (
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.coordination import ProcessCoordinator
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
+from okto_grafx.domain.page.layout import MAX_U64
 from okto_grafx.domain.recovery.decision import CommittedReplay, committed_replay
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
+from okto_grafx.domain.model.schema import ENDPOINT_COLUMN_COUNT, encode_tuple
 from okto_grafx.domain.page import HEADER_PAGE_INDEX, Page
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.txn.commit_record import CommitPayload, FileIdMap, PageTouch
@@ -106,7 +108,10 @@ from okto_grafx.domain.txn.context import (
     TransactionMode,
     TransactionState,
 )
-from okto_grafx.domain.txn.intents import reduce_row_intents
+from okto_grafx.domain.txn.intents import (
+    plan_relationship_endpoints,
+    reduce_row_intents,
+)
 from okto_grafx.domain.txn.partitions import (
     page_partition,
     partition_of,
@@ -128,6 +133,7 @@ from okto_grafx.engine.commit_state_store import (
     CommitStateStore,
 )
 from okto_grafx.engine.commit_redo import CommitRedo
+from okto_grafx.engine.heap_store import FIRST_RECORD_ID
 from okto_grafx.engine.coordination import (
     COMMIT_SECTION,
     DEFAULT_RENEWAL_FRACTION,
@@ -1845,8 +1851,23 @@ class TransactionManager:
                         txn_id=txn.txn_id,
                     )
 
-        # The same pure reducer used by the writer is also the final sequence validator.
-        reduce_row_intents(txn.row_intents)
+        # The same pure reducer used by the writer is also the final sequence validator, and the
+        # same pure planner proves every pending endpoint. Both run HERE, before the commit
+        # section, so a promise this transaction cannot keep is refused while nothing of it has
+        # been written; the writer runs them again on the same intents and, being pure, must
+        # reach the same verdict.
+        settled = reduce_row_intents(txn.row_intents)
+        plan_relationship_endpoints(
+            settled, txn_id=txn.txn_id, owns=txn.owns_pending_row_ref
+        )
+        # Identities a batch chose for itself are checked here too, and for the same reason: two
+        # rows of one table under one identity must be refused while the transaction still has
+        # nothing on a page, not when the second row reaches a heap that already holds the first.
+        # The reuse check runs against the picture the caller had; it runs AGAIN inside the
+        # section, against the settled read view, for the same reason optimistic validation does
+        # -- this pass reports a caller's own mistake before the transaction spends anything, and
+        # the later one decides against the picture as it is when the commit actually happens.
+        self._refuse_reused_identities(txn, self._reserved_record_ids(txn, settled))
 
     def _validate_pending_index_records(
         self, txn: TransactionContext, records: Sequence[object]
@@ -2213,6 +2234,7 @@ class TransactionManager:
         key did not change: an update writes a new version at a NEW location, so the entry that
         pointed at the old one has to end whatever its key looks like.
         """
+        self._refuse_unresolved_rows(txn, rows)
         manager = self._index_manager
         if manager is None:
             return
@@ -2317,6 +2339,31 @@ class TransactionManager:
         """Return the file the heap of this database writes."""
         return self._file_ids.heap_file
 
+    def _refuse_unresolved_rows(
+        self, txn: TransactionContext, rows: Sequence[_RowWrite]
+    ) -> None:
+        """Refuse a written row whose values still name a private identity.
+
+        The rows are what the indexes are keyed on and what the WAL carries, so this is the last
+        place a transient token could turn into a durable one. It should be unreachable -- the
+        values came from intents this commit already resolved -- and it is stated anyway, because
+        an invariant that is only true by construction stops being true the moment someone adds a
+        second way to build a row.
+        """
+        for row in rows:
+            for values in (row.born_values, row.ended_values):
+                for slot, value in enumerate(values or ()):
+                    if isinstance(value, PendingRowRef):
+                        raise GrafxTransactionStateError(
+                            "A written row still names a pending identity, which must never "
+                            "reach an index or the log.",
+                            field="row_values",
+                            slot=slot,
+                            value=repr(value),
+                            table=getattr(row.table, "name", None),
+                            txn_id=txn.txn_id,
+                        )
+
     def _write_rows(self, txn: TransactionContext) -> tuple[_RowWrite, ...]:
         """Write the rows this transaction staged and return where each one landed.
 
@@ -2368,7 +2415,7 @@ class TransactionManager:
         written: list[_RowWrite],
     ) -> None:
         """Write each settled intent into the heap, appending to ``written`` as each one lands."""
-        for intent in reduce_row_intents(txn.row_intents):
+        for intent in self._resolved_intents(txn, heap):
             if intent.operation is RowOperation.DELETE:
                 ending = self._values_at(intent.reference)
                 heap.delete(intent.table, intent.reference, provisional)
@@ -2396,11 +2443,10 @@ class TransactionManager:
                     )
                 )
                 continue
+            # Planned above, never None here: the identity had to exist before the row was
+            # written, because an edge staged in this same transaction may already carry it.
             record_id = intent.record_id
-            if record_id is None:
-                record_id = heap.allocate_record_id(intent.table)
-            else:
-                heap.observe_record_id(intent.table, record_id)
+            heap.observe_record_id(intent.table, record_id)
             reference = heap.insert(intent.table, record_id, intent.values, provisional)
             written.append(
                 _RowWrite(
@@ -2410,6 +2456,256 @@ class TransactionManager:
                     born_values=tuple(intent.values),
                 )
             )
+
+    def _resolved_intents(
+        self, txn: TransactionContext, heap: object
+    ) -> tuple[RowIntent, ...]:
+        """Return the settled intents with every pending identity turned into a stored value.
+
+        This runs before the first row is written, and that ordering is the whole point. An edge
+        staged against a node the same transaction is still creating carries that node's PRIVATE
+        identity, which is a negative token that must never reach the heap, an index or the WAL.
+        Resolving it needs the node's durable id, and the node's durable id is not allocated until
+        the row is written -- so the ids are PLANNED first, from the counter each table would hand
+        out next, and only then does anything move.
+
+        Planning rather than allocating also keeps the failure shape right. An identity spent by
+        an attempt that then refuses leaves a GAP in the sequence, which no reader can observe;
+        an identity handed out twice would put two rows under one name. Planning spends nothing:
+        the counter is advanced by ``observe_record_id`` as each row actually lands, so an attempt
+        abandoned here leaves the counter exactly where it was.
+        """
+        settled = reduce_row_intents(txn.row_intents)
+        plans = plan_relationship_endpoints(
+            settled, txn_id=txn.txn_id, owns=txn.owns_pending_row_ref
+        )
+        planned = self._plan_record_ids(txn, settled, heap)
+        endpoints: dict[int, dict[int, int]] = {}
+        for plan in plans:
+            endpoints.setdefault(plan.relationship_position, {})[plan.slot] = planned[
+                plan.endpoint_position
+            ]
+        resolved = list(settled)
+        for position, intent in enumerate(settled):
+            identity = planned.get(position)
+            slots = endpoints.get(position)
+            if identity is None and slots is None:
+                continue
+            values = intent.values
+            if slots is not None:
+                values = tuple(
+                    slots.get(slot, value) for slot, value in enumerate(intent.values)
+                )
+            resolved[position] = replace(
+                intent,
+                values=values,
+                record_id=intent.record_id if identity is None else identity,
+            )
+        settled_rows = tuple(resolved)
+        self._refuse_unresolved_intents(txn, settled_rows)
+        return settled_rows
+
+    def _plan_record_ids(
+        self, txn: TransactionContext, intents: Sequence[RowIntent], heap: object
+    ) -> dict[int, int]:
+        """Return the durable identity each staged insert will take, by position, spending none.
+
+        Deterministic per table, and in two passes rather than one. The identities a batch chose
+        for ITSELF are collected first, and each table's cursor starts above all of them, so an
+        implicit identity cannot land on an explicit one that appears LATER in the same batch --
+        which a single pass cannot know about, and which is how two rows of one table end up
+        under one identity while every step looks locally correct.
+        """
+        reserved = self._reserved_record_ids(txn, intents)
+        self._refuse_reused_identities(txn, reserved)
+        planned: dict[int, int] = {}
+        cursors: dict[int, int] = {}
+        for position, intent in enumerate(intents):
+            if intent.operation is not RowOperation.INSERT:
+                continue
+            table = intent.table
+            table_id = getattr(table, "table_id", None)
+            if table_id not in cursors:
+                taken = reserved.get(table_id, (None, frozenset()))[1]
+                cursors[table_id] = max(
+                    (heap.next_record_id(table), *(identity + 1 for identity in taken))
+                )
+            identity = intent.record_id
+            if identity is None:
+                identity = cursors[table_id]
+                cursors[table_id] = identity + 1
+            self._require_unexhausted_identity(txn, table, table_id, identity)
+            planned[position] = identity
+        return planned
+
+    def _reserved_record_ids(
+        self, txn: TransactionContext, intents: Sequence[RowIntent]
+    ) -> dict[int, tuple[object, frozenset[int]]]:
+        """Return the identities this batch named for itself, per table, with their table.
+
+        Three refusals live here rather than at the heap. Two inserts of one table under one
+        identity is the failure this exists to stop, and by the time the second one reaches the
+        heap the first is already on a page. The DOMAIN is checked for the same reason: the
+        staging door validates what it is handed, but ``row_intents`` is a public mutable list, so
+        a caller can put a boolean or a negative number in an intent after staging it -- and a
+        negative one is what a private token looks like.
+        """
+        chosen: dict[int, tuple[object, set[int]]] = {}
+        for position, intent in enumerate(intents):
+            if intent.operation is not RowOperation.INSERT or intent.record_id is None:
+                continue
+            table_id = getattr(intent.table, "table_id", None)
+            identity = intent.record_id
+            if (
+                isinstance(identity, bool)
+                or not isinstance(identity, int)
+                or identity < FIRST_RECORD_ID
+                or identity >= MAX_U64
+            ):
+                raise GrafxTransactionStateError(
+                    "A staged row identity must be an integer inside the durable identity "
+                    f"domain, from {FIRST_RECORD_ID} up to but not including {MAX_U64}.",
+                    field="record_id",
+                    position=position,
+                    value=repr(identity),
+                    table=getattr(intent.table, "name", None),
+                    table_id=table_id,
+                    txn_id=txn.txn_id,
+                )
+            _table, taken = chosen.setdefault(table_id, (intent.table, set()))
+            if identity in taken:
+                raise GrafxTransactionStateError(
+                    "Two inserts of one table cannot name the same row identity.",
+                    field="record_id",
+                    position=position,
+                    value=identity,
+                    table=getattr(intent.table, "name", None),
+                    table_id=table_id,
+                    txn_id=txn.txn_id,
+                )
+            taken.add(identity)
+        return {
+            table_id: (table, frozenset(taken))
+            for table_id, (table, taken) in chosen.items()
+        }
+
+    def _refuse_reused_identities(
+        self, txn: TransactionContext, reserved: dict[int, tuple[object, frozenset[int]]]
+    ) -> None:
+        """Refuse an identity a row of that table already carries, gap or no gap.
+
+        A counter that has moved past an identity nobody used leaves a GAP, and a gap costs
+        nothing -- no reader can observe it. An identity a row already carries is a different
+        thing entirely: ``observe_record_id`` only ever raises the counter, so it accepts a number
+        BELOW it without a word, and the heap would then hold two rows under one name. That is the
+        one half of "gaps are fine, reuse is never" that nothing else was checking.
+
+        The walk covers ended versions too. An identity whose row was deleted was still handed
+        out, and a snapshot opened before the delete is still entitled to read it.
+        """
+        if not reserved:
+            return
+        heap = self._heap
+        for table_id, (table, identities) in reserved.items():
+            for _ref, version in heap.scan_all(table):
+                if version.record_id not in identities:
+                    continue
+                raise GrafxTransactionStateError(
+                    "A staged row identity is already carried by a row of that table; an unused "
+                    "gap may be taken, an identity in use may not.",
+                    field="record_id",
+                    value=version.record_id,
+                    table=getattr(table, "name", None),
+                    table_id=table_id,
+                    txn_id=txn.txn_id,
+                )
+
+    def _require_unexhausted_identity(
+        self, txn: TransactionContext, table: object, table_id: object, identity: int
+    ) -> None:
+        """Refuse an identity at or above the exhausted marker, one step before the heap would.
+
+        The same boundary ``allocate_record_id`` draws: the marker is not a usable id, because a
+        counter with nowhere to move to is a counter that hands one identity out twice.
+        """
+        if identity < MAX_U64:
+            return
+        raise GrafxUnsupportedOperation(
+            f"Table {getattr(table, 'name', None)!r} has no row identity left below the "
+            f"exhausted marker {MAX_U64}.",
+            table=getattr(table, "name", None),
+            table_id=table_id,
+            field="next_record_id",
+            value=identity,
+            txn_id=txn.txn_id,
+        )
+
+    def _refuse_unresolved_intents(
+        self, txn: TransactionContext, intents: Sequence[RowIntent]
+    ) -> None:
+        """Refuse anything still carrying a private identity, and re-encode what will be stored.
+
+        A typed refusal rather than an ``assert``: this is the boundary that keeps a transient
+        token out of the heap, the indexes and the WAL, and a check that disappears under ``-O``
+        is not a boundary. Re-encoding is the second half of the same guarantee -- the values that
+        will be written are checked against the schema HERE, before the first of them lands, so a
+        row whose resolved endpoint does not fit its column refuses while nothing has moved.
+        """
+        for position, intent in enumerate(intents):
+            if intent.operation is RowOperation.DELETE:
+                continue
+            for slot, value in enumerate(intent.values):
+                if isinstance(value, PendingRowRef):
+                    raise GrafxTransactionStateError(
+                        "A row reached the heap boundary still naming a pending identity; every "
+                        "endpoint must be resolved to a stored row before anything is written.",
+                        field="values",
+                        position=position,
+                        slot=slot,
+                        value=repr(value),
+                        table=getattr(intent.table, "name", None),
+                        txn_id=txn.txn_id,
+                    )
+            if intent.operation is RowOperation.INSERT and intent.record_id is None:
+                raise GrafxTransactionStateError(
+                    "An insert reached the heap boundary with no planned identity.",
+                    field="record_id",
+                    position=position,
+                    table=getattr(intent.table, "name", None),
+                    txn_id=txn.txn_id,
+                )
+            self._refuse_unstored_endpoints(txn, intent, position)
+            encode_tuple(intent.table, intent.values)
+
+    def _refuse_unstored_endpoints(
+        self, txn: TransactionContext, intent: RowIntent, position: int
+    ) -> None:
+        """Refuse a relationship whose endpoints are not both identities a row can carry.
+
+        Stated rather than inherited. The column type would catch a string and the heap would
+        catch a value outside the INT64 endpoint domain, but neither says that ZERO and negative
+        numbers are the interesting cases here: a private token IS a negative integer, so "looks
+        like an int" is exactly the check that would let one through.
+        """
+        if getattr(intent.table, "kind", None) != "rel":
+            return
+        for slot in range(min(ENDPOINT_COLUMN_COUNT, len(intent.values))):
+            endpoint = intent.values[slot]
+            if (
+                isinstance(endpoint, bool)
+                or not isinstance(endpoint, int)
+                or endpoint < FIRST_RECORD_ID
+            ):
+                raise GrafxTransactionStateError(
+                    "A relationship endpoint must be a positive stored row identity by the time "
+                    "the row is written.",
+                    field="endpoint",
+                    position=position,
+                    slot=slot,
+                    value=repr(endpoint),
+                    table=getattr(intent.table, "name", None),
+                    txn_id=txn.txn_id,
+                )
 
     def _unstage_index_changes(
         self, txn: TransactionContext, mark: int
