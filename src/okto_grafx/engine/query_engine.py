@@ -1807,6 +1807,14 @@ def _edge_steps(
         record_id: object,
     ) -> Iterator[tuple[object, HeapVersion, TableDef, object]]:
         """Serve by index up to the fan limit, then by the grouped scan for good."""
+        if isinstance(record_id, PendingRowRef):
+            # A node this transaction created is not in any index, and its private identity is
+            # not a stored value, so building a lookup key out of it asks the encoder to store a
+            # promise. The scan answers the same question and answers it correctly: a node
+            # created here can only be joined by edges created here, which the grouped maps
+            # already carry.
+            yield from by_scan(record_id)
+            return
         if not maps:
             seen_starts.add(record_id)
             if len(seen_starts) <= _EDGE_LOOKUP_FAN_LIMIT:
