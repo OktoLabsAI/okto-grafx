@@ -636,26 +636,24 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         for probe in raw["probes"]
         if probe["category"] == "function"
     }
-    # M-PULSE-2B is a ratchet: the three scalar helpers are no longer merely parsed, while
-    # label/timestamp remain explicit work instead of disappearing from the owed surface.
-    for name in ("coalesce", "string_split", "size"):
-        probe = functions[name]
+    # M-PULSE-2B took the three scalar helpers and M-PULSE-2D took the last two, so no
+    # function is owed any more.  The claim is made over EVERY function probe rather than a
+    # written list, because a list is what lets a new function arrive already forgotten.
+    for name, probe in functions.items():
         assert probe["contract_disposition"] == "allowed", name
         assert probe["engine_verdict"] == "accepted", name
         assert probe["acceptance_phase"] == "planned", name
         assert probe["error"] is None, name
         assert name not in owed, owed
-    for name in ("label", "timestamp"):
-        probe = functions[name]
-        assert name in owed, owed
-        assert probe["acceptance_phase"] == "analysis_error", name
-        assert probe["error"], name
+    for name in ("coalesce", "string_split", "size", "label", "timestamp"):
+        assert name in functions, name
 
     by_construct = {probe["construct"]: probe for probe in raw["probes"]}
-    # M-PULSE-2C closes the standalone list-index and both CASE grammar probes. Map access
-    # deliberately remains owed because its public probe starts with UNWIND, which is a separate
-    # clause milestone and therefore cannot be claimed from expression support alone.
-    for name in ("list index", "CASE searched", "CASE simple"):
+    # M-PULSE-2C closes the standalone list-index and both CASE grammar probes, and M-PULSE-2D
+    # closes the last two functions. Map access deliberately remains owed because its public
+    # probe starts with UNWIND, which is a separate clause milestone and therefore cannot be
+    # claimed from expression support alone.
+    for name in ("list index", "CASE searched", "CASE simple", "label", "timestamp"):
         probe = by_construct[name]
         assert probe["contract_disposition"] == "allowed", name
         assert probe["engine_verdict"] == "accepted", name
@@ -667,9 +665,9 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         probe for probe in raw["probes"] if probe["engine_verdict"] == "accepted"
     ]
     refused = [probe for probe in raw["probes"] if probe["engine_verdict"] == "refused"]
-    assert len(accepted) == 64
-    assert len(refused) == 23
-    assert len(owed) == 15
+    assert len(accepted) == 66
+    assert len(refused) == 21
+    assert len(owed) == 13
 
     assert frozen["counts"]["classification:already_supported"] == 69
     assert frozen["counts"]["classification:generic_gap"] == 26
