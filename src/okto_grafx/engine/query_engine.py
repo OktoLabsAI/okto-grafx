@@ -152,6 +152,7 @@ from okto_grafx.domain.query.plan import (
     TraverseRelationship,
     UnwindRows,
     VectorSearch,
+    WithRows,
     validate_plan,
 )
 from okto_grafx.domain.query.planner import (
@@ -1628,6 +1629,27 @@ def _unwind_rows(
             )
         for element in carrier:
             yield _Row(bindings={**row.bindings, node.alias: element})
+
+
+def _with_rows(
+    engine: QueryEngine, node: WithRows, context: _Context
+) -> Iterator[_Row]:
+    """Project one stage and hand on a row bound to only the names it projected.
+
+    Every item is evaluated against the row that ARRIVED, all of them before any is bound, so
+    an item cannot read what another item of the same stage is producing.
+
+    What leaves carries nothing else. A variable this stage did not name is gone from the row,
+    which is what makes reading it below the stage a refusal rather than an accident of what
+    the executor happened to still be holding. A matched row carried under its own name keeps
+    the binding it had, so the clauses below still read its properties and still write it.
+    """
+
+    for row in engine._rows(node.child, context):
+        projected = {
+            item.name: _evaluate(item.expression, row, context) for item in node.items
+        }
+        yield _Row(bindings=projected)
 
 
 def _node_scan(
@@ -3631,6 +3653,7 @@ _Handler = Callable[[QueryEngine, PlanNode, _Context], Iterator[_Row]]
 _HANDLERS: dict[type, _Handler] = {
     SingleRow: _single_row,  # type: ignore[dict-item]
     UnwindRows: _unwind_rows,  # type: ignore[dict-item]
+    WithRows: _with_rows,  # type: ignore[dict-item]
     NodeScan: _node_scan,  # type: ignore[dict-item]
     IndexSeek: _index_seek,  # type: ignore[dict-item]
     TraverseRelationship: _traverse,  # type: ignore[dict-item]

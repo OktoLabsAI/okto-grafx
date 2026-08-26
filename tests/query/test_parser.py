@@ -392,9 +392,11 @@ def test_a_match_after_a_write_is_refused() -> None:
 
 
 def test_the_unsupported_clause_is_named_rather_than_puzzled_over() -> None:
+    # A plain WITH is part of the subset now; the deduplicating one is not, and the refusal
+    # names the clause it read rather than the token it happened to stop on.
     with pytest.raises(GrafxParseError) as failure:
-        parse("MATCH (a:Person) WITH a RETURN a.id")
-    assert failure.value.details["value"] == "WITH"
+        parse("MATCH (a:Person) WITH DISTINCT a RETURN a.id")
+    assert failure.value.details["value"] == "WITH DISTINCT"
 
 
 def test_comparisons_do_not_chain() -> None:

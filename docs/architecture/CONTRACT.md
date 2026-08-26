@@ -903,7 +903,7 @@ class QueryEngine:
 ```
 Cypher subset (openCypher, Kùzu dialect): `CREATE NODE TABLE` / `CREATE REL TABLE` /
 `CREATE VECTOR SPACE`, `CREATE`, `MATCH` (+ variable-length `-[:R*1..3]->`), `WHERE`, `RETURN`
-(`DISTINCT`, aliases), one leading `UNWIND`, `ORDER BY`, `SKIP`, `LIMIT`, `SET`, `DELETE`, `MERGE`, parameters `$name`,
+(`DISTINCT`, aliases), one leading `UNWIND`, non-aggregating `WITH` stages, `ORDER BY`, `SKIP`, `LIMIT`, `SET`, `DELETE`, `MERGE`, parameters `$name`,
 aggregates `count/sum/avg/min/max/collect`, the scalar functions `coalesce(value, ...)`,
 `string_split(text, separator)` and `size(value)`, and the similarity extension. `coalesce`
 evaluates every argument from left to right and returns the first non-null one, or null when all
@@ -961,6 +961,22 @@ whole batch succeeds. A primary-key predicate such as `n.id = r.id` plans one co
 `IndexSeek` per batch row when the clean index is available; it never opens general correlation
 to arbitrary matched variables. `UnwindRows` is streaming and participates once, through the
 common operator wrapper, in `max_intermediate_rows`.
+
+`WITH items [WHERE predicate]` is a projection stage rather than a second `RETURN`. It computes
+its items against the row it received, and the names it projects become the ONLY names below it,
+so a variable a stage does not carry is unreadable under it and a stage may narrow a row to the
+few values the clauses below need. Every item of one stage is evaluated against the incoming row,
+so an item cannot read an alias its own stage is creating; a later stage can. A computed item
+needs `AS`; a matched node or relationship is carried under the name its pattern gave it and is
+never renamed, because the plan resolved that name to a table when the pattern bound it; and one
+stage projects each name once. A carried matched variable keeps its binding, so the clauses below
+still read its properties and still write it, while a computed item is a value and never a `SET`
+or `DELETE` target. The `WHERE` belongs to the stage it was written under and therefore filters
+what that projection produced, which is what lets a guard such as `size(parts) >= 2` protect the
+stage after it. Aggregation, `DISTINCT`, `ORDER BY`, `SKIP` and `LIMIT` inside a `WITH`, a `MATCH`
+after one, a `WITH` after a clause that writes, and `UNWIND` combined with `WITH` are all refused.
+`WithRows` is streaming -- one row in, one row out -- and participates once, through the common
+operator wrapper, in `max_intermediate_rows`.
 
 ```
 MATCH (n:Chunk)-[:BELONGS_TO]->(d:Doc)

@@ -75,6 +75,7 @@ from okto_grafx.domain.query.ast import (
     UnaryOperation,
     UpdatingClause,
     Variable,
+    WithClause,
     free_variables,
     walk,
 )
@@ -105,6 +106,7 @@ from okto_grafx.domain.query.plan import (
     TraverseRelationship,
     UnwindRows,
     VectorSearch,
+    WithRows,
     validate_plan,
 )
 from okto_grafx.domain.query.tokens import (
@@ -405,6 +407,7 @@ class _Planner:
     tables: dict[str, TableDef] = field(default_factory=dict)
     multi_hop_variables: set[str] = field(default_factory=set)
     unwind_alias: str | None = None
+    alias_definitions: dict[str, Expression] = field(default_factory=dict)
     label_calls: list[FunctionCall] = field(default_factory=list)
     timestamp_calls: list[FunctionCall] = field(default_factory=list)
     coalesce_argument_types: dict[FunctionCall, tuple[ValueType | None, ...]] = field(
@@ -704,6 +707,8 @@ class _Planner:
             pipeline, deferred = self._match_clause(pipeline, clause)
             similarity_terms.extend(deferred)
         pipeline = self._similarity(pipeline, statement, similarity_terms)
+        for clause in statement.with_clauses:
+            pipeline = self._with_clause(pipeline, clause)
         for clause in statement.updating_clauses:
             pipeline = self._updating_clause(pipeline, clause)
         self._record_coalesce_types(statement)
@@ -728,6 +733,25 @@ class _Planner:
             columns=columns,
             writes=statement.writes,
         )
+
+    def _with_clause(self, pipeline: PlanNode, clause: WithClause) -> PlanNode:
+        """Plan one WITH stage: the projection, then the WHERE that belongs to it."""
+        for item in clause.items:
+            if item.alias is None or item.expression == Variable(name=item.alias):
+                # A name carried under itself defines nothing new; recording it would make the
+                # alias its own definition and the type of it would ask for itself.
+                continue
+            # What the alias stands for, so a type that is provable for the expression is
+            # provable for every use of the name below it: parts[1] is a STRING because parts
+            # is the string_split() this stage projected.
+            self.alias_definitions[item.alias] = item.expression
+        pipeline = WithRows(child=pipeline, items=clause.items)
+        if clause.predicate is not None:
+            # The predicate belongs to THIS stage, so it filters what the projection produced
+            # rather than what the projection read. It is not pushed down beside the pattern
+            # filters for the same reason: the names it reads exist only above this operator.
+            pipeline = FilterRows(child=pipeline, predicate=clause.predicate)
+        return pipeline
 
     def _record_coalesce_types(self, statement: Query) -> None:
         """Resolve every COALESCE argument whose type the bound schema makes knowable."""
@@ -991,6 +1015,11 @@ class _Planner:
             return None
         if isinstance(expression, Literal):
             return value_type_of(expression.value)
+        if isinstance(expression, Variable):
+            definition = self.alias_definitions.get(expression.name)
+            if definition is not None:
+                # An alias is exactly as knowable as what it was projected from.
+                return self._pulse_expression_type(definition, owner=owner)
         if isinstance(expression, Property):
             if isinstance(expression.subject, Variable):
                 table = self.tables.get(expression.subject.name)
@@ -1119,14 +1148,17 @@ class _Planner:
             target = self._static_postfix_target(expression)
             if target is not expression:
                 return self._pulse_expression_type(target, owner=owner)
-            if isinstance(expression.subject, FunctionCall) and (
-                expression.subject.name.upper() == STRING_SPLIT_FUNCTION
+            # A subscript of an alias is a subscript of what the alias was
+            # projected from, which is where the element type is written.
+            subject = self._alias_definition(expression.subject)
+            if isinstance(subject, FunctionCall) and (
+                subject.name.upper() == STRING_SPLIT_FUNCTION
             ):
                 return ValueType.STRING
-            if isinstance(expression.subject, ListExpression):
+            if isinstance(subject, ListExpression):
                 element_types = tuple(
                     self._pulse_expression_type(element, owner=owner)
-                    for element in expression.subject.elements
+                    for element in subject.elements
                 )
                 concrete = tuple(
                     value_type
@@ -1142,7 +1174,9 @@ class _Planner:
                     for value_type in concrete
                 ):
                     return ValueType.DOUBLE
-                message = f"The elements of {expression.subject.describe()} have incompatible types."
+                message = (
+                    f"The elements of {subject.describe()} have incompatible types."
+                )
                 raise GrafxPlanError(
                     message,
                     field="subscript",
@@ -1162,6 +1196,13 @@ class _Planner:
             field="expression",
             value=expression.describe(),
         )
+
+    def _alias_definition(self, expression: Expression) -> Expression:
+        """Resolve a WITH alias to the expression it was projected from, or leave it alone."""
+        if not isinstance(expression, Variable):
+            return expression
+        definition = self.alias_definitions.get(expression.name)
+        return expression if definition is None else definition
 
     def _static_postfix_target(self, expression: Expression) -> Expression:
         """Resolve map-dot and literal-list postfixes when their target is written in the AST."""
@@ -1301,6 +1342,10 @@ class _Planner:
         for clause in statement.match_clauses:
             for pattern in clause.patterns:
                 roots.extend(self._pattern_expressions(pattern))
+            if clause.predicate is not None:
+                roots.append(clause.predicate)
+        for clause in statement.with_clauses:
+            roots.extend(item.expression for item in clause.items)
             if clause.predicate is not None:
                 roots.append(clause.predicate)
         for clause in statement.updating_clauses:

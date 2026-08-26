@@ -61,6 +61,7 @@ __all__ = [
     "Subscript",
     "UnaryOperation",
     "UnwindClause",
+    "WithClause",
     "UpdatingClause",
     "Variable",
     "free_variables",
@@ -607,6 +608,32 @@ class ReturnClause:
         return " ".join(parts)
 
 
+@dataclass(frozen=True, slots=True)
+class WithClause:
+    """One projection that becomes the scope of everything written after it.
+
+    A WITH is not a second RETURN. It computes its items against the row it received, and the
+    names it projects are then the ONLY names below it: a variable this clause does not carry
+    is out of reach, which is what lets a query narrow a row down to the few values the rest
+    of it needs. The WHERE belongs to this stage rather than to the one before it, so it reads
+    the aliases this projection just created and runs after them.
+    """
+
+    items: tuple[ReturnItem, ...]
+    predicate: Expression | None = None
+
+    def column_names(self) -> tuple[str, ...]:
+        """Return the names this stage leaves in scope, in written order."""
+        return tuple(item.name for item in self.items)
+
+    def describe(self) -> str:
+        """Return the clause as it would be written back."""
+        body = ", ".join(item.describe() for item in self.items)
+        if self.predicate is None:
+            return f"WITH {body}"
+        return f"WITH {body} WHERE {self.predicate.describe()}"
+
+
 class Statement:
     """The base of everything :func:`~okto_grafx.domain.query.parser.parse` can return."""
 
@@ -623,6 +650,7 @@ class Query(Statement):
 
     unwind_clause: UnwindClause | None = None
     match_clauses: tuple[MatchClause, ...] = ()
+    with_clauses: tuple[WithClause, ...] = ()
     updating_clauses: tuple[UpdatingClause, ...] = ()
     return_clause: ReturnClause | None = None
 
@@ -635,6 +663,7 @@ class Query(Statement):
         """Return the query as it would be written back."""
         parts = [] if self.unwind_clause is None else [self.unwind_clause.describe()]
         parts.extend(clause.describe() for clause in self.match_clauses)
+        parts.extend(clause.describe() for clause in self.with_clauses)
         parts.extend(clause.describe() for clause in self.updating_clauses)
         if self.return_clause is not None:
             parts.append(self.return_clause.describe())

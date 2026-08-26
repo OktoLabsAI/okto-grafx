@@ -66,6 +66,7 @@ from okto_grafx.domain.query.ast import (
     UnwindClause,
     UpdatingClause,
     Variable,
+    WithClause,
 )
 from okto_grafx.domain.query.lexer import tokenize
 from okto_grafx.domain.query.limits import (
@@ -388,6 +389,7 @@ class _Parser:
         """Parse a reading and updating query: MATCH clauses, updating clauses, then RETURN."""
         unwind_clause: UnwindClause | None = None
         match_clauses: list[MatchClause] = []
+        with_clauses: list[WithClause] = []
         updating_clauses: list[UpdatingClause] = []
         return_clause: ReturnClause | None = None
         clauses = 0
@@ -409,6 +411,13 @@ class _Parser:
                 unwind_clause = self._unwind_clause()
                 continue
             if self._at_keyword("MATCH"):
+                if with_clauses:
+                    raise self._refuse(
+                        "A MATCH clause reads the graph, and in this subset it reads before "
+                        "the first WITH; none may follow one",
+                        field="clause",
+                        value="MATCH",
+                    )
                 if updating_clauses or return_clause is not None:
                     raise self._refuse(
                         "A MATCH clause comes before every clause that writes and before RETURN",
@@ -427,16 +436,27 @@ class _Parser:
                 return_clause = self._return_clause()
                 continue
             if self._at_keyword("WITH"):
-                raise self._refuse(
-                    "WITH is not part of the query subset this engine supports; the clauses it "
-                    "reads are MATCH, WHERE, CREATE, MERGE, SET, DELETE and RETURN",
-                    field="clause",
-                    value="WITH",
-                )
+                if updating_clauses:
+                    raise self._refuse(
+                        "WITH shapes the rows a write reads, so it comes before every clause "
+                        "that writes and not after one",
+                        field="clause",
+                        value="WITH",
+                    )
+                if unwind_clause is not None:
+                    raise self._refuse(
+                        "UNWIND hands its elements straight to the clauses below it in this "
+                        "subset; WITH may not reshape them",
+                        field="clause",
+                        value="WITH",
+                    )
+                with_clauses.append(self._with_clause())
+                continue
             updating_clauses.append(self._updating_clause())
         if (
             unwind_clause is None
             and not match_clauses
+            and not with_clauses
             and not updating_clauses
             and return_clause is None
         ):
@@ -450,6 +470,7 @@ class _Parser:
         return Query(
             unwind_clause=unwind_clause,
             match_clauses=tuple(match_clauses),
+            with_clauses=tuple(with_clauses),
             updating_clauses=tuple(updating_clauses),
             return_clause=return_clause,
         )
@@ -461,6 +482,49 @@ class _Parser:
         self._take_keyword("AS")
         alias = self._take_name("an alias")
         return UnwindClause(expression=expression, alias=alias)
+
+    def _with_clause(self) -> WithClause:
+        """Parse ``WITH items [WHERE predicate]``."""
+        self._take_keyword("WITH")
+        if self._at_keyword("DISTINCT"):
+            raise self._refuse(
+                "WITH DISTINCT removes duplicate rows, and in this subset only RETURN "
+                "DISTINCT removes any",
+                field="clause",
+                value="WITH DISTINCT",
+            )
+        items: list[ReturnItem] = []
+        while True:
+            if len(items) >= MAX_PROJECTION_ITEMS:
+                raise self._refuse(
+                    f"A WITH clause may project at most {MAX_PROJECTION_ITEMS} items",
+                    field="items",
+                    value=MAX_PROJECTION_ITEMS,
+                )
+            items.append(self._return_item())
+            if not self._match_symbol(","):
+                break
+        # ORDER BY, SKIP and LIMIT are looked for on BOTH sides of the WHERE, because both are
+        # where a caller would write them: the language puts them before it, and someone who
+        # has only ever written them on a RETURN reaches for them after.
+        self._refuse_with_row_window()
+        predicate: Expression | None = None
+        if self._match_keyword("WHERE"):
+            predicate = self._expression()
+            self._refuse_with_row_window()
+        return WithClause(items=tuple(items), predicate=predicate)
+
+    def _refuse_with_row_window(self) -> None:
+        """Refuse the ordering and the windowing a WITH does not carry in this subset."""
+        for keyword in ("ORDER", "SKIP", "LIMIT"):
+            if not self._at_keyword(keyword):
+                continue
+            raise self._refuse(
+                f"{keyword} shapes a result and only RETURN shapes one here; a WITH carries "
+                "its items and an optional WHERE",
+                field="clause",
+                value=keyword,
+            )
 
     def _updating_clause(self) -> UpdatingClause:
         """Parse one clause that writes."""

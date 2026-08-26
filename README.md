@@ -81,6 +81,7 @@ openCypher in the Kùzu dialect, executed by a planner that produces one operato
 | `DELETE` | nodes, and relationships a `MATCH` bound |
 | `DETACH DELETE` | ends every relationship incident on the node together with it |
 | `UNWIND $rows AS r` | one leading list source, followed directly by `RETURN` or by one single-node `MATCH` and `SET` |
+| `WITH` … `WHERE` | non-aggregating projection stages; each one replaces the scope with the names it projects, and its `WHERE` runs after the projection |
 | Traversal | one hop, bounded ranges `[:REL*1..3]`, both directions, relationship isomorphism |
 | `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT` | |
 | Aggregates | `count`, `min`, `max`, and friends |

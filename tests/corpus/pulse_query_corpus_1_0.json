@@ -253,8 +253,8 @@
       "RETURN"
     ],
     "probe_count": 87,
-    "engine_accepted": 69,
-    "engine_refused": 18,
+    "engine_accepted": 70,
+    "engine_refused": 17,
     "contract_refused": 13,
     "contract_error_codes": {
       "unsafe_cypher": 10,
@@ -766,9 +766,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "parse_error",
-        "engine_verdict": "refused",
-        "error": "GrafxParseError: WITH is not part of the query subset this engine supports; the clauses it reads are MATCH, WHERE, CREATE, MERGE, SET, DELETE and RETURN (line 1, column 1). [code=parse_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "root",
@@ -1700,10 +1700,10 @@
     "class:fragment": 1,
     "class:read": 75,
     "class:write": 21,
-    "classification:already_supported": 71,
+    "classification:already_supported": 73,
     "classification:duplicate_text": 1,
     "classification:fragment": 1,
-    "classification:generic_gap": 24,
+    "classification:generic_gap": 22,
     "reachability:preventive": 2,
     "reachability:runtime_current": 66,
     "surface:internal_family": 68,
@@ -1997,9 +1997,9 @@
           "receiver": "scope"
         }
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "parse_error",
-      "parse_error": "GrafxParseError: WITH is not part of the query subset this engine supports; the clauses it reads are MATCH, WHERE, CREATE, MERGE, SET, DELETE and RETURN (line 1, column 94). [code=parse_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "reachability": "runtime_current",
       "expected": {
         "kind": "effect",
@@ -2023,12 +2023,7 @@
         ],
         "expected_count": "all_matched_rows",
         "atomicity": "one statement inside the caller's transaction; the scope rolls it back with the rest of the session when compensation runs",
-        "error": {
-          "phase": "parse_error",
-          "code": "parse_error",
-          "type": "GrafxParseError",
-          "message": "WITH is not part of the query subset this engine supports; the clauses it reads are MATCH, WHERE, CREATE, MERGE, SET, DELETE and RETURN (line 1, column 94). [code=parse_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -2053,9 +2048,9 @@
           "receiver": "scope"
         }
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "parse_error",
-      "parse_error": "GrafxParseError: WITH is not part of the query subset this engine supports; the clauses it reads are MATCH, WHERE, CREATE, MERGE, SET, DELETE and RETURN (line 1, column 157). [code=parse_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "reachability": "runtime_current",
       "expected": {
         "kind": "effect",
@@ -2079,12 +2074,7 @@
         ],
         "expected_count": "all_matched_rows",
         "atomicity": "one statement inside the caller's transaction; the scope rolls it back with the rest of the session when compensation runs",
-        "error": {
-          "phase": "parse_error",
-          "code": "parse_error",
-          "type": "GrafxParseError",
-          "message": "WITH is not part of the query subset this engine supports; the clauses it reads are MATCH, WHERE, CREATE, MERGE, SET, DELETE and RETURN (line 1, column 157). [code=parse_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -2612,8 +2602,8 @@
         }
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "parse_error",
-      "parse_error": "GrafxParseError: WITH is not part of the query subset this engine supports; the clauses it reads are MATCH, WHERE, CREATE, MERGE, SET, DELETE and RETURN (line 21, column 9). [code=parse_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]",
       "reachability": "runtime_current",
       "expected": {
         "kind": "rows",
@@ -2640,10 +2630,10 @@
         "limit": "$scan_limit",
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "parse_error",
-          "code": "parse_error",
-          "type": "GrafxParseError",
-          "message": "WITH is not part of the query subset this engine supports; the clauses it reads are MATCH, WHERE, CREATE, MERGE, SET, DELETE and RETURN (line 21, column 9). [code=parse_error retryable=False]"
+          "phase": "plan_error",
+          "code": "plan_error",
+          "type": "GrafxPlanError",
+          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (n). [code=plan_error retryable=False]"
         }
       }
     },
@@ -7807,5 +7797,5 @@
       }
     }
   ],
-  "digest": "836d55ad41bb617f3e71cf788ca164b0eca9c038964c63ec6542e87184e6f1e9"
+  "digest": "33254881effa514647b487c1a351d5be4b553f7cc053719a25d4bda9e66a29b6"
 }

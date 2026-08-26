@@ -119,6 +119,7 @@ from okto_grafx.domain.query.plan import (
     TraverseRelationship,
     UnwindRows,
     VectorSearch,
+    WithRows,
     validate_plan,
 )
 from okto_grafx.domain.recovery.manifest import (
@@ -1885,6 +1886,7 @@ _QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
         TraverseRelationship,
         UnwindRows,
         VectorSearch,
+        WithRows,
     }
 )
 """Every exact operator implementation the frozen query planner may publish."""

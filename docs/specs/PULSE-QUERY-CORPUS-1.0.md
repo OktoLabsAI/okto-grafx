@@ -132,7 +132,11 @@ CASE forms at `planned`; those ratchets are frozen in both the JSON and its sent
 M-PULSE-2E adds the single leading `UNWIND` source used by Pulse batches, so the root `UNWIND`,
 `map batch` and `map access` probes now plan together. The two internal scoring families I67/I68
 move from `generic_gap` to `already_supported` without changing their frozen effect or atomicity
-oracles. This is why acceptance records parse, analysis and planning separately.
+oracles. M-PULSE-2F adds the non-aggregating `WITH`, which moves the root `WITH` probe to
+`planned` and the two cancellation-decay mutations I06/I07 to `already_supported`; I19 stays a
+gap, and its recorded refusal moves from the parse error for `WITH` to the plan error for its
+polymorphic `MATCH (n)`, which is the next barrier rather than a widened subset. This is why
+acceptance records parse, analysis and planning separately.
 
 ### The behavioural contract beside the grammar
 
@@ -249,9 +253,9 @@ the environment variable to set. They never pass silently on absent baselines.
 
 ## What this deliberately does not do
 
-- No provider work or endpoint activation. M-PULSE-2B/2C/2D/2E close only the scalar,
-  CASE, standalone-list, function and leading-UNWIND forms recorded above; the other 10 admitted/refused
-  constructs remain later M-PULSE-2 work.
+- No provider work or endpoint activation. M-PULSE-2B/2C/2D/2E/2F close only the scalar,
+  CASE, standalone-list, function, leading-UNWIND and non-aggregating-WITH forms recorded
+  above; the other 9 admitted/refused constructs remain later M-PULSE-2 work.
 - No hidden profile switch or Pulse-specific bypass: the helpers use the ordinary typed planner
   and executor paths.
 - No differential execution against Ladybug. The corpus records what Pulse sends and whether

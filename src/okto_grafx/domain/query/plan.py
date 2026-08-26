@@ -70,6 +70,7 @@ __all__ = [
     "TraverseRelationship",
     "UnwindRows",
     "VectorSearch",
+    "WithRows",
     "plan_nodes",
     "validate_plan",
 ]
@@ -384,6 +385,32 @@ class AggregateRows(PlanNode):
             "grouping": ", ".join(item.describe() for item in self.grouping) or "none",
             "aggregates": ", ".join(item.describe() for item in self.aggregations),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class WithRows(PlanNode):
+    """The rows one WITH stage projects, carrying only the names that stage named.
+
+    Every item is evaluated against the row that ARRIVED, so the items of one stage cannot read
+    each other: they are produced together or not at all. What leaves is bound to exactly the
+    projected names -- a matched row carried under its own name keeps the binding it had, so
+    the clauses below still read its properties and can still write it, and a computed item
+    arrives as the value it evaluated to.
+
+    It streams one row in, one row out. The stage narrows what a row carries; it never holds
+    rows back, which is why a WHERE above it filters as early as the projection allows.
+    """
+
+    child: PlanNode
+    items: tuple[ReturnItem, ...]
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Return the operator whose rows this stage projects."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Return the projected items as they were written."""
+        return {"items": ", ".join(item.describe() for item in self.items)}
 
 
 @dataclass(frozen=True, slots=True)

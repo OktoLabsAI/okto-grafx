@@ -44,10 +44,13 @@ from okto_grafx.domain.query.ast import (
     Property,
     Query,
     ReturnClause,
+    ReturnItem,
     SetClause,
     Statement,
     UnwindClause,
     Variable,
+    WithClause,
+    free_variables,
     walk,
 )
 from okto_grafx.domain.query.limits import MAX_PARAMETERS
@@ -65,6 +68,7 @@ from okto_grafx.domain.query.tokens import (
 __all__ = [
     "ENTITY_NODE",
     "ENTITY_RELATIONSHIP",
+    "ENTITY_PROJECTED",
     "ENTITY_UNWOUND",
     "Aggregation",
     "Binding",
@@ -79,6 +83,8 @@ ENTITY_NODE: str = "node"
 ENTITY_RELATIONSHIP: str = "relationship"
 ENTITY_UNWOUND: str = "unwound value"
 """What UNWIND binds: one element of a list, which is a value and not a matched row."""
+ENTITY_PROJECTED: str = "expression alias"
+"""What a WITH item with AS binds: a value the projection computed for this row."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,11 +220,21 @@ def _parameters_of_schema(statement: Statement) -> tuple[str, ...]:
 class _Analyzer:
     """The single-use walker that decides what one query means."""
 
-    __slots__ = ("_query", "_bindings", "_parameters", "_similarity", "_scores")
+    __slots__ = (
+        "_query",
+        "_bindings",
+        "_discarded",
+        "_parameters",
+        "_similarity",
+        "_scores",
+    )
 
     def __init__(self, query: Query) -> None:
         self._query = query
         self._bindings: list[Binding] = []
+        # The names a WITH stopped carrying, kept only so that reading one below it
+        # is refused for what it is rather than as a variable nothing ever bound.
+        self._discarded: set[str] = set()
         self._parameters: list[str] = []
         self._similarity: SimilarityUse | None = None
         self._scores = False
@@ -229,6 +245,8 @@ class _Analyzer:
             self._unwind_clause(self._query.unwind_clause)
         for clause in self._query.match_clauses:
             self._match_clause(clause)
+        for clause in self._query.with_clauses:
+            self._with_clause(clause)
         for clause in self._query.updating_clauses:
             self._updating_clause(clause)
         grouping, aggregations = self._return_clause()
@@ -432,6 +450,106 @@ class _Analyzer:
         # There is no group before the source, so an aggregate here has nothing to summarise.
         self._refuse_aggregate(clause.expression, "UNWIND")
         self._bind(clause.alias, ENTITY_UNWOUND, (), created=False)
+
+    def _with_clause(self, clause: WithClause) -> None:
+        """Replace the scope with what this stage projects, then check the WHERE it carries.
+
+        Every item is checked against the scope the stage RECEIVED, and only when all of them
+        are checked does the projected scope take over. That order is what makes the two rules
+        of a stage true at once: an item cannot read an alias its own WITH is creating, because
+        those names arrive together; and a variable this stage did not carry is unreadable
+        below it, because it is no longer in the scope the clauses under it are checked in.
+
+        The predicate is checked AFTER the substitution, because it belongs to this stage: it
+        reads the aliases just created and it runs once the projection has produced them.
+        """
+
+        incoming = tuple(self._bindings)
+        created = {item.alias for item in clause.items if item.alias is not None}
+        projected: list[Binding] = []
+        for item in clause.items:
+            binding = self._projected_binding(item, created)
+            if any(carried.name == binding.name for carried in projected):
+                raise self._refuse(
+                    f"WITH projects the name {binding.name!r} twice, and a row carries each "
+                    "name once.",
+                    field="item",
+                    value=binding.name,
+                )
+            projected.append(binding)
+        self._bindings = projected
+        names = {binding.name for binding in projected}
+        self._discarded.update(
+            binding.name for binding in incoming if binding.name not in names
+        )
+        self._discarded.difference_update(names)
+        if clause.predicate is not None:
+            self._check_expression(clause.predicate, where="the WHERE of a WITH")
+            self._refuse_aggregate(clause.predicate, "the WHERE of a WITH")
+
+    def _projected_binding(self, item: ReturnItem, created: set[str]) -> Binding:
+        """Check one WITH item against the incoming scope and return what it leaves bound."""
+        self._refuse_same_stage_alias(item, created)
+        expression = item.expression
+        if isinstance(expression, Variable):
+            self._require_bound(expression.name, "a WITH item")
+            carried = self._binding(expression.name)
+            assert carried is not None  # _require_bound refused when nothing bound it
+            if item.alias is None or item.alias == expression.name:
+                return carried
+            if carried.entity in (ENTITY_NODE, ENTITY_RELATIONSHIP):
+                # A matched row keeps the name its pattern gave it. The planner resolved that
+                # name to a table when the pattern bound it, and a rename here would leave the
+                # scope and the tables disagreeing about which variable names which row.
+                raise self._refuse(
+                    f"WITH carries a matched {carried.entity} under the name its pattern gave "
+                    f"it; {expression.name!r} cannot be renamed to {item.alias!r}.",
+                    field="item",
+                    value=item.describe(),
+                )
+            self._refuse_shadowed_alias(item)
+            return Binding(
+                name=item.alias, entity=ENTITY_PROJECTED, labels=(), created=False
+            )
+        if item.alias is None:
+            raise self._refuse(
+                "WITH gives every item it computes a name; "
+                f"{expression.describe()} needs AS.",
+                field="item",
+                value=expression.describe(),
+            )
+        self._check_expression(expression, where="a WITH item")
+        # A stage projects the row it received one row at a time, so there is no group here for
+        # an aggregate to summarise; WITH count(n) is a different clause from the one this is.
+        self._refuse_aggregate(expression, "WITH")
+        self._refuse_shadowed_alias(item)
+        return Binding(
+            name=item.alias, entity=ENTITY_PROJECTED, labels=(), created=False
+        )
+
+    def _refuse_same_stage_alias(self, item: ReturnItem, created: set[str]) -> None:
+        """Refuse an item that reads a name its own WITH is creating."""
+        for name in free_variables(item.expression):
+            if name not in created or self._binding(name) is not None:
+                continue
+            raise self._refuse(
+                f"The alias {name!r} is created by this WITH, so the items beside it cannot "
+                "read it; a WITH below this one can.",
+                field="variable",
+                value=name,
+            )
+
+    def _refuse_shadowed_alias(self, item: ReturnItem) -> None:
+        """Refuse an alias that reuses a name the incoming scope already gave something."""
+        existing = self._binding(item.alias) if item.alias is not None else None
+        if existing is None:
+            return
+        raise self._refuse(
+            f"WITH would bind {item.alias!r} to {item.expression.describe()} while it already "
+            f"names {existing.describe()}; a stage renames nothing it carries.",
+            field="item",
+            value=item.describe(),
+        )
 
     def _bind(
         self, name: str | None, entity: str, labels: tuple[str, ...], *, created: bool
@@ -730,6 +848,13 @@ class _Analyzer:
         """Refuse a variable no pattern bound."""
         if self._binding(name) is not None:
             return
+        if name in self._discarded:
+            raise self._refuse(
+                f"The variable {name!r} used in {where} was dropped by a WITH "
+                "clause; only the names a WITH projects stay in scope below it.",
+                field="variable",
+                value=name,
+            )
         known = ", ".join(binding.name for binding in self._bindings) or "none"
         raise self._refuse(
             f"The variable {name!r} used in {where} is bound by no pattern; the variables this "

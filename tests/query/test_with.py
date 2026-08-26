@@ -1,0 +1,466 @@
+"""The Pulse projection stage: a non-aggregating WITH that really replaces the scope.
+
+Two frozen mutations drive this file. Both open on a MATCH, narrow the row twice through a
+WITH, and only then write -- and each WHERE belongs to the stage above it rather than to the
+pattern, so it reads names the projection has just created. What the stage does NOT carry is
+as much of the contract as what it does: a variable a stage drops is out of reach below it,
+which is what stops the second stage from reading a list the first one deliberately filtered.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+import okto_grafx
+from okto_grafx.domain.errors import (
+    GrafxParseError,
+    GrafxPlanError,
+    GrafxQueryBudgetExceeded,
+)
+from okto_grafx.domain.query.analysis import (
+    ENTITY_NODE,
+    ENTITY_PROJECTED,
+    analyze,
+)
+from okto_grafx.domain.query.parser import parse
+
+I06 = (
+    "MATCH (n:Decision) WHERE n.source_artifact_ref IS NOT NULL "
+    "AND n.revocation_reason IS NULL "
+    "WITH n, string_split(n.source_artifact_ref, ':') AS parts "
+    "WHERE size(parts) >= 2 "
+    "WITH n, CASE parts[1] WHEN 'card' THEN 'card' "
+    "WHEN 'card_relationship_target' THEN 'card' WHEN 'task' THEN 'card' "
+    "WHEN 'test' THEN 'card' WHEN 'bug' THEN 'card' ELSE parts[1] END AS owner_type, "
+    "parts[2] AS owner_id "
+    "WHERE owner_type = $owner_type AND owner_id = $owner_id "
+    "SET n.pre_cancellation_relevance_score = n.relevance_score, "
+    "n.relevance_score = CASE WHEN n.relevance_score - $penalty < 0.0 THEN 0.0 "
+    "ELSE n.relevance_score - $penalty END, "
+    "n.revocation_reason = $reason, n.superseded_by = $reason, n.superseded_at = $now "
+    "RETURN n.id"
+)
+I07 = (
+    "MATCH (n:Decision) WHERE n.source_artifact_ref IS NOT NULL "
+    "AND n.revocation_reason = $reason "
+    "AND (n.superseded_by IS NULL OR n.superseded_by = $reason) "
+    "WITH n, string_split(n.source_artifact_ref, ':') AS parts "
+    "WHERE size(parts) >= 2 "
+    "WITH n, CASE parts[1] WHEN 'card' THEN 'card' "
+    "WHEN 'card_relationship_target' THEN 'card' WHEN 'task' THEN 'card' "
+    "WHEN 'test' THEN 'card' WHEN 'bug' THEN 'card' ELSE parts[1] END AS owner_type, "
+    "parts[2] AS owner_id "
+    "WHERE owner_type = $owner_type AND owner_id = $owner_id "
+    "SET n.relevance_score = CASE WHEN n.pre_cancellation_relevance_score IS NULL "
+    "THEN n.relevance_score + $penalty ELSE n.pre_cancellation_relevance_score END, "
+    "n.pre_cancellation_relevance_score = NULL, n.revocation_reason = NULL, "
+    "n.superseded_by = NULL, n.superseded_at = NULL "
+    "RETURN n.id"
+)
+# owner_type and owner_id reach the statement through **owner_params rather than through the
+# frozen parameter map, so a test that leaves them out is testing a different statement.
+CANCEL = {
+    "owner_type": "card",
+    "owner_id": "c1",
+    "penalty": 0.25,
+    "reason": "cancelled",
+    "now": "2026-08-26T12:00:00+00:00",
+}
+RESTORE = {
+    "owner_type": "card",
+    "owner_id": "c1",
+    "penalty": 0.25,
+    "reason": "cancelled",
+}
+# The same two stages with the guard removed: every row reaches parts[2], including the one
+# whose reference carries no colon at all.
+UNGUARDED = (
+    "MATCH (n:Decision) "
+    "WITH n, string_split(n.source_artifact_ref, ':') AS parts "
+    "WITH n, parts[2] AS owner_id "
+    "SET n.superseded_by = owner_id "
+    "RETURN n.id"
+)
+
+
+@pytest.fixture
+def database(tmp_path: Path) -> Iterator[object]:
+    """Return a database seeded with the reference shapes the two mutations sort through."""
+    handle = okto_grafx.connect(tmp_path / "db", page_size=512)
+    with handle.begin("write") as schema:
+        schema.execute(
+            "CREATE NODE TABLE Decision("
+            "id STRING, source_artifact_ref STRING, relevance_score DOUBLE, "
+            "pre_cancellation_relevance_score DOUBLE, revocation_reason STRING, "
+            "superseded_by STRING, superseded_at STRING, PRIMARY KEY(id))"
+        )
+    with handle.begin("write") as seed:
+        for identity, reference in (
+            ("d1", "task:c1:9"),
+            ("d2", "card:c1:8"),
+            ("d3", "note:c1:7"),
+            ("d4", "card:c2:6"),
+            ("d5", "nocolon"),
+        ):
+            seed.execute(
+                "CREATE (:Decision {id: $id, source_artifact_ref: $ref, "
+                "relevance_score: 0.8})",
+                {"id": identity, "ref": reference},
+            )
+    try:
+        yield handle
+    finally:
+        handle.close()
+
+
+def _operators(root: object) -> tuple[str, ...]:
+    """Return the labels in one public plan, parents before children."""
+    return tuple(node.label for node in root.walk())
+
+
+def _scores(handle: object) -> tuple[tuple[object, ...], ...]:
+    """Return what the two mutations read and write, for every row, in a stable order."""
+    return handle.execute(
+        "MATCH (n:Decision) RETURN n.id, n.relevance_score, "
+        "n.pre_cancellation_relevance_score, n.revocation_reason, n.superseded_by "
+        "ORDER BY n.id"
+    ).rows
+
+
+# --- the parser ------------------------------------------------------------------------------
+
+
+def test_a_leading_with_is_a_query_of_its_own() -> None:
+    statement = parse("WITH 1 AS value RETURN value")
+
+    assert statement.describe() == "WITH 1 AS value RETURN value"
+    assert len(statement.with_clauses) == 1
+    assert statement.with_clauses[0].column_names() == ("value",)
+    assert statement.with_clauses[0].predicate is None
+
+
+def test_each_where_belongs_to_the_stage_it_was_written_under() -> None:
+    statement = parse(
+        "MATCH (n:Decision) WHERE n.id = $id "
+        "WITH n, n.relevance_score AS score WHERE score > 0.5 "
+        "WITH n, score AS kept "
+        "RETURN kept"
+    )
+
+    first, second = statement.with_clauses
+    assert statement.match_clauses[0].predicate.describe() == "(n.id = $id)"
+    assert first.predicate.describe() == "(score > 0.5)"
+    assert second.predicate is None
+    assert statement.describe().count("WHERE") == 2
+
+
+@pytest.mark.parametrize(
+    ("query", "value"),
+    [
+        ("MATCH (n:Decision) WITH DISTINCT n RETURN n.id", "WITH DISTINCT"),
+        ("MATCH (n:Decision) WITH n ORDER BY n.id RETURN n.id", "ORDER"),
+        ("MATCH (n:Decision) WITH n SKIP 1 RETURN n.id", "SKIP"),
+        ("MATCH (n:Decision) WITH n LIMIT 1 RETURN n.id", "LIMIT"),
+        ("MATCH (n:Decision) WITH n WHERE n.id = 'd1' LIMIT 1 RETURN n.id", "LIMIT"),
+        ("MATCH (n:Decision) WITH n MATCH (m:Decision) RETURN n.id", "MATCH"),
+        ("MATCH (n:Decision) SET n.relevance_score = 1.0 WITH n RETURN n.id", "WITH"),
+        ("UNWIND $rows AS r WITH r RETURN r", "WITH"),
+    ],
+)
+def test_the_shapes_outside_this_subset_are_refused_by_name(
+    query: str, value: str
+) -> None:
+    with pytest.raises(GrafxParseError) as raised:
+        parse(query)
+    assert raised.value.details["field"] == "clause"
+    assert raised.value.details["value"] == value
+
+
+# --- the scope -------------------------------------------------------------------------------
+
+
+def test_a_stage_replaces_the_scope_rather_than_adding_to_it() -> None:
+    analysis = analyze(
+        parse(
+            "MATCH (n:Decision), (m:Decision) "
+            "WITH n, n.relevance_score AS score "
+            "RETURN score"
+        )
+    )
+
+    assert [(b.name, b.entity) for b in analysis.bindings] == [
+        ("n", ENTITY_NODE),
+        ("score", ENTITY_PROJECTED),
+    ]
+    assert analysis.binding("n").labels == ("Decision",)
+
+
+def test_a_variable_a_stage_dropped_is_refused_for_being_dropped() -> None:
+    with pytest.raises(GrafxPlanError) as raised:
+        analyze(parse("MATCH (n:Decision) WITH n.id AS kept RETURN n.id"))
+
+    assert raised.value.details == {"field": "variable", "value": "n"}
+    assert "dropped by a WITH clause" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("query", "field", "value"),
+    [
+        ("MATCH (n:Decision) WITH n, n.id RETURN n.id", "item", "n.id"),
+        ("WITH 1 AS a, 2 AS a RETURN a", "item", "a"),
+        ("MATCH (n:Decision) WITH n, n.id AS n RETURN n", "item", "n.id AS n"),
+        ("MATCH (n:Decision) WITH n AS m RETURN m.id", "item", "n AS m"),
+        ("WITH 1 AS a, a + 1 AS b RETURN b", "variable", "a"),
+        ("MATCH (n:Decision) WITH count(n) AS total RETURN total", "expression", "count(n)"),
+        (
+            "MATCH (n:Decision) WITH n WHERE count(n) > 1 RETURN n.id",
+            "expression",
+            "(count(n) > 1)",
+        ),
+    ],
+)
+def test_a_stage_refuses_the_projections_that_have_no_single_meaning(
+    query: str, field: str, value: str
+) -> None:
+    with pytest.raises(GrafxPlanError) as raised:
+        analyze(parse(query))
+    assert raised.value.details == {"field": field, "value": value}
+
+
+@pytest.mark.parametrize("keyword", ["SET ref.x = 1", "DELETE ref"])
+def test_a_projected_value_is_never_a_write_target(keyword: str) -> None:
+    with pytest.raises(GrafxPlanError) as raised:
+        analyze(parse(f"MATCH (n:Decision) WITH n.id AS ref {keyword}"))
+
+    assert raised.value.details == {"field": "variable", "value": "ref"}
+    assert "expression alias" in str(raised.value)
+
+
+def test_a_later_stage_reads_what_an_earlier_stage_created() -> None:
+    analysis = analyze(parse("WITH 1 AS a WITH a + 1 AS b RETURN b"))
+
+    assert [binding.name for binding in analysis.bindings] == ["b"]
+
+
+# --- the plan --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("statement", [I06, I07])
+def test_each_stage_plans_a_projection_with_its_own_filter_above_it(
+    database: object, statement: str
+) -> None:
+    assert _operators(database.explain(statement)) == (
+        "ProduceResults",
+        "ProjectRows",
+        "EagerRows",
+        "SetProperties",
+        "FilterRows",
+        "WithRows",
+        "FilterRows",
+        "WithRows",
+        "FilterRows",
+        "NodeScan",
+        "SingleRow",
+    )
+
+
+def test_a_stage_without_a_where_plans_no_filter_of_its_own(database: object) -> None:
+    assert _operators(database.explain("WITH 1 AS value RETURN value")) == (
+        "ProduceResults",
+        "ProjectRows",
+        "WithRows",
+        "SingleRow",
+    )
+
+
+# --- the two mutations -----------------------------------------------------------------------
+
+
+def test_the_public_probe_answers_from_a_single_row() -> None:
+    with okto_grafx.connect(":memory:") as handle:
+        assert handle.execute("WITH 1 AS value RETURN value").rows == ((1,),)
+
+
+def test_i06_cancels_only_the_rows_both_stages_kept(database: object) -> None:
+    with database.begin("write") as transaction:
+        result = transaction.execute(I06, CANCEL)
+
+    # d1 and d2 map to the card owner c1; d3 keeps its own owner type, d4 belongs to another
+    # card and d5 never reaches the second stage at all.
+    assert result.rows == (("d1",), ("d2",))
+    assert result.statistics["rows_updated"] == 2
+    assert _scores(database) == (
+        ("d1", 0.55, 0.8, "cancelled", "cancelled"),
+        ("d2", 0.55, 0.8, "cancelled", "cancelled"),
+        ("d3", 0.8, None, None, None),
+        ("d4", 0.8, None, None, None),
+        ("d5", 0.8, None, None, None),
+    )
+
+
+def test_i07_restores_what_i06_saved_and_leaves_the_rest_alone(
+    database: object,
+) -> None:
+    with database.begin("write") as transaction:
+        transaction.execute(I06, CANCEL)
+    with database.begin("write") as transaction:
+        result = transaction.execute(I07, RESTORE)
+
+    assert result.rows == (("d1",), ("d2",))
+    assert _scores(database) == (
+        ("d1", 0.8, None, None, None),
+        ("d2", 0.8, None, None, None),
+        ("d3", 0.8, None, None, None),
+        ("d4", 0.8, None, None, None),
+        ("d5", 0.8, None, None, None),
+    )
+
+
+def test_every_set_value_reads_the_row_as_the_statement_matched_it(
+    database: object,
+) -> None:
+    """The saved score is the score BEFORE the penalty, not the penalised one beside it."""
+    with database.begin("write") as transaction:
+        transaction.execute(I06, CANCEL)
+
+    saved, penalised = database.execute(
+        "MATCH (n:Decision {id: 'd1'}) RETURN n.pre_cancellation_relevance_score, "
+        "n.relevance_score"
+    ).rows[0]
+    assert saved == 0.8
+    assert penalised == 0.55
+
+
+def test_a_reference_the_first_stage_filtered_never_reaches_the_second(
+    database: object,
+) -> None:
+    """d5 splits into one part, so parts[2] would refuse -- and the guard is what stops it."""
+    with database.begin("write") as transaction:
+        transaction.execute(I06, CANCEL)
+    assert _scores(database)[4] == ("d5", 0.8, None, None, None)
+
+    with pytest.raises(GrafxPlanError) as raised:
+        database.execute(UNGUARDED)
+    assert raised.value.details["field"] == "subscript"
+
+    # The same statement over the rows that DO carry an owner is accepted, so what the guard
+    # protects against is the one short reference and not the shape of the query.
+    with database.begin("write") as transaction:
+        transaction.execute(
+            UNGUARDED.replace("MATCH (n:Decision) ", "MATCH (n:Decision) WHERE n.id <> 'd5' ")
+        )
+    assert database.execute(
+        "MATCH (n:Decision {id: 'd1'}) RETURN n.superseded_by"
+    ).rows == (("c1",),)
+
+
+def test_a_late_refusal_releases_the_rows_the_stages_had_already_written(
+    database: object,
+) -> None:
+    transaction = database.begin("write")
+    transaction.execute("MATCH (n:Decision {id: 'd3'}) SET n.relevance_score = 0.4")
+    accepted = tuple(transaction._context.row_intents)
+
+    with pytest.raises(GrafxPlanError):
+        transaction.execute(UNGUARDED)
+
+    assert tuple(transaction._context.row_intents) == accepted
+    assert transaction.commit().wrote is True
+    assert database.execute(
+        "MATCH (n:Decision) RETURN n.id, n.superseded_by, n.relevance_score ORDER BY n.id"
+    ).rows == (
+        ("d1", None, 0.8),
+        ("d2", None, 0.8),
+        ("d3", None, 0.4),
+        ("d4", None, 0.8),
+        ("d5", None, 0.8),
+    )
+
+
+BUDGETED = (
+    "MATCH (n:Decision) "
+    "WITH n, string_split(n.source_artifact_ref, ':') AS parts "
+    "WITH n, parts[2] AS owner_id "
+    "SET n.superseded_by = owner_id"
+)
+
+
+def _budget_database(path: Path, **options: object) -> object:
+    """Return three rows the stages will write, under whatever budget the caller set."""
+    handle = okto_grafx.connect(path, **options)
+    with handle.begin("write") as schema:
+        schema.execute(
+            "CREATE NODE TABLE Decision("
+            "id STRING, source_artifact_ref STRING, superseded_by STRING, "
+            "PRIMARY KEY(id))"
+        )
+    for identity in ("d1", "d2", "d3"):
+        with handle.begin("write") as seed:
+            seed.execute(
+                "CREATE (:Decision {id: $id, source_artifact_ref: 'card:c1:1'})",
+                {"id": identity},
+            )
+    return handle
+
+
+def test_a_budget_refusal_mid_stage_releases_no_partial_write(tmp_path: Path) -> None:
+    generous = _budget_database(tmp_path / "generous", max_intermediate_rows=4)
+    try:
+        with generous.begin("write") as transaction:
+            transaction.execute(BUDGETED)
+        # The same statement over the same three rows writes all three when the budget allows
+        # it, so the refusal below arrives with two of them already built.
+        assert generous.execute(
+            "MATCH (n:Decision) RETURN n.superseded_by ORDER BY n.id"
+        ).rows == (("c1",), ("c1",), ("c1",))
+    finally:
+        generous.close()
+
+    handle = _budget_database(tmp_path / "budget", max_intermediate_rows=2)
+    try:
+        transaction = handle.begin("write")
+        transaction.execute("MATCH (n:Decision {id: 'd3'}) SET n.superseded_by = 'kept'")
+        accepted = tuple(transaction._context.row_intents)
+        assert accepted
+
+        with pytest.raises(GrafxQueryBudgetExceeded) as raised:
+            transaction.execute(BUDGETED)
+        assert raised.value.details == {
+            "field": "max_intermediate_rows",
+            "limit": 2,
+            "observed": 3,
+            "operator": "NodeScan",
+        }
+
+        assert tuple(transaction._context.row_intents) == accepted
+        assert transaction.commit().wrote is True
+    finally:
+        handle.close()
+
+    reopened = okto_grafx.connect(tmp_path / "budget")
+    try:
+        assert reopened.execute(
+            "MATCH (n:Decision) RETURN n.id, n.superseded_by ORDER BY n.id"
+        ).rows == (("d1", None), ("d2", None), ("d3", "kept"))
+    finally:
+        reopened.close()
+
+
+def test_a_carried_variable_is_still_the_row_it_was_matched_from(
+    database: object,
+) -> None:
+    """WITH n hands on the binding itself, so the stages below still read and write the row."""
+    with database.begin("write") as transaction:
+        transaction.execute(
+            "MATCH (n:Decision) WHERE n.id = 'd4' "
+            "WITH n, n.relevance_score AS before "
+            "WHERE before > 0.5 "
+            "SET n.superseded_by = 'carried'"
+        )
+
+    assert database.execute(
+        "MATCH (n:Decision {id: 'd4'}) RETURN n.superseded_by, n.relevance_score"
+    ).rows == (("carried", 0.8),)
