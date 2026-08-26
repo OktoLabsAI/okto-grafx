@@ -948,7 +948,15 @@ Every metric here MUST appear in a `dashboards/*.json` panel (OR-5/OR-3) — the
 ## 10. Public API (C11) — `okto_grafx/__init__.py`
 
 ```python
-from okto_grafx import connect, Database, Transaction, QueryResult, __version__
+from okto_grafx import (
+    Database,
+    QueryResult,
+    Timestamp,
+    Transaction,
+    VectorValue,
+    __version__,
+    connect,
+)
 from okto_grafx.errors import GrafxError, GrafxWriteConflict, ...
 
 db = connect("./mydb", partitions_per_table=64)          # or ":memory:"
@@ -962,6 +970,8 @@ db.close()
 ```
 `Database` is a context manager. `close()` releases the lease and the reader registration; closing
 with an open transaction aborts it and never corrupts. Every public method has an en-US docstring.
+`Timestamp` and `VectorValue` are the supported parameter/result value types for temporal and
+vector columns; integrations must not import their definitions through `okto_grafx.domain`.
 
 **P2.5 / Fase 1.6 — concrete facade result types (CLOSED).** The detached objects returned at the
 public boundary are named exactly: `Database.recovery_report -> RecoveryReport | None`,

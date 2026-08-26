@@ -150,7 +150,9 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
         "DatabaseIdentity",
         "PortRegistry",
         "QueryResult",
+        "Timestamp",
         "Transaction",
+        "VectorValue",
         "__version__",
         "connect",
     ]
@@ -158,6 +160,8 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
     assert len(set(okto_grafx.__all__)) == len(okto_grafx.__all__), "__all__ repeats a name"
     for name in okto_grafx.__all__:
         assert hasattr(okto_grafx, name), f"__all__ exports {name!r}, which does not resolve"
+    assert okto_grafx.Timestamp.__module__ == "okto_grafx.domain.model.value"
+    assert okto_grafx.VectorValue.__module__ == "okto_grafx.domain.model.value"
 
 
 def test_the_public_package_exposes_the_facade() -> None:

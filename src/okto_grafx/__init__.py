@@ -24,6 +24,7 @@ that owns it (A24), and this module only makes it reachable by its supported pat
 from __future__ import annotations
 
 from okto_grafx.api import connect
+from okto_grafx.domain.model import Timestamp, VectorValue
 from okto_grafx.engine.database import Database, DatabaseIdentity, Transaction
 from okto_grafx.engine.query_engine import QueryResult
 from okto_grafx.runtime.config import DatabaseConfig
@@ -35,7 +36,9 @@ __all__ = [
     "DatabaseIdentity",
     "PortRegistry",
     "QueryResult",
+    "Timestamp",
     "Transaction",
+    "VectorValue",
     "__version__",
     "connect",
 ]
