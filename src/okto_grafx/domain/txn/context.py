@@ -24,7 +24,7 @@ from okto_grafx.domain.errors import (
     GrafxTransactionBudgetExceeded,
     GrafxTransactionStateError,
 )
-from okto_grafx.domain.ids import NO_CSN, Csn, Epoch, PageIndex, TxnId
+from okto_grafx.domain.ids import NO_CSN, Csn, Epoch, PageIndex, RecordRef, TxnId
 from okto_grafx.domain.model.schema import encode_tuple
 from okto_grafx.domain.txn.partitions import page_partition
 from okto_grafx.domain.txn.records import (
@@ -36,6 +36,7 @@ from okto_grafx.domain.txn.snapshot import Snapshot
 
 __all__ = [
     "CommitReport",
+    "PendingRowRef",
     "RowIntent",
     "RowOperation",
     "TransactionContext",
@@ -53,6 +54,37 @@ class RowOperation(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class PendingRowRef:
+    """Transaction-local identity of an insert that has no physical ``RecordId`` yet.
+
+    The token is deliberately negative. Durable record identities are positive, and a pending
+    token must never be mistaken for one or escape to the heap, WAL or an index. ``txn_id`` and
+    ``table_id`` make accidental cross-transaction/table reuse fail equality even before the
+    commit path performs its stronger validation.
+    """
+
+    txn_id: TxnId
+    table_id: int
+    token: int
+
+    def __post_init__(self) -> None:
+        """Refuse values outside the private, non-durable identity domain."""
+        for field, value in (("txn_id", self.txn_id), ("table_id", self.table_id)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise GrafxConfigurationError(
+                    f"A pending row {field} must be a positive integer; got {value!r}.",
+                    field=field,
+                    value=repr(value),
+                )
+        if isinstance(self.token, bool) or not isinstance(self.token, int) or self.token >= 0:
+            raise GrafxConfigurationError(
+                f"A pending row token must be a negative integer; got {self.token!r}.",
+                field="token",
+                value=repr(self.token),
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class RowIntent:
     """A row this transaction wants written, held until the commit number exists.
 
@@ -63,9 +95,11 @@ class RowIntent:
     and transactions that must not see it do, too high and transactions that must see it do not.
 
     So the intent is staged and the row is written inside the commit section, at the number the
-    log actually assigned. ``record_id`` of None means the identity is allocated then too, which
-    is what keeps an abandoned commit from burning one: an id allocated and abandoned leaves a
-    gap in the sequence, and a gap is harmless where a REUSED id is not.
+    log actually assigned. ``record_id`` of None means the durable identity is allocated then
+    too, which is what keeps an abandoned commit from burning one: an id allocated and abandoned
+    leaves a gap in the sequence, and a gap is harmless where a REUSED id is not. An INSERT's
+    ``reference`` is only a :class:`PendingRowRef`; it names the intent inside its transaction and
+    is never a durable identity.
     """
 
     table: object
@@ -184,6 +218,8 @@ class TransactionContext:
         "_max_transaction_bytes",
         "_staged_payload_bytes",
         "_staging_marks",
+        "_next_pending_token",
+        "_pending_row_refs",
         "row_intents",
         "row_refs",
     )
@@ -242,6 +278,11 @@ class TransactionContext:
                 int,
             ]
         ] = []
+        self._next_pending_token: int = -1
+        # A PendingRowRef is authentic only when this exact object was emitted by this context.
+        # txn_id is process-local and tokens restart in every context, so value equality alone
+        # cannot distinguish another handle's first insert from this handle's first insert.
+        self._pending_row_refs: dict[int, PendingRowRef] = {}
         self.row_intents: list[RowIntent] = []
         self.row_refs: list[object] = []
 
@@ -508,10 +549,36 @@ class TransactionContext:
         accepted_values = tuple(values)
         payload_bytes = self._row_payload_bytes(accepted_table, accepted_values)
         self._require_payload_capacity(payload_bytes)
+        pending = self._allocate_pending_row_ref(accepted_table)
         self.row_intents.append(
-            RowIntent(table=accepted_table, values=accepted_values, record_id=record_id)
+            RowIntent(
+                table=accepted_table,
+                values=accepted_values,
+                record_id=record_id,
+                reference=pending,
+            )
         )
         self._staged_payload_bytes += payload_bytes
+
+    def _allocate_pending_row_ref(self, table: object) -> PendingRowRef:
+        """Return the next private insert identity without allocating a durable record id."""
+        table_id = getattr(table, "table_id", None)
+        if isinstance(table_id, bool) or not isinstance(table_id, int) or table_id < 1:
+            raise GrafxConfigurationError(
+                "A staged row table must carry a positive integer table_id before it can "
+                "receive a pending identity.",
+                field="table_id",
+                value=repr(table_id),
+                txn_id=self._txn_id,
+            )
+        reference = PendingRowRef(
+            txn_id=self._txn_id,
+            table_id=table_id,
+            token=self._next_pending_token,
+        )
+        self._next_pending_token -= 1
+        self._pending_row_refs[reference.token] = reference
+        return reference
 
     def stage_row_update(
         self, table: object, reference: object, values: Iterable[object]
@@ -527,7 +594,7 @@ class TransactionContext:
         self._require_active()
         self._require_write_mode("stage a row update")
         accepted_table = _require_table(table)
-        accepted_reference = _require_reference(reference)
+        accepted_reference = self._require_row_reference(accepted_table, reference)
         self._require_row_count_capacity()
         accepted_values = tuple(values)
         payload_bytes = self._row_payload_bytes(accepted_table, accepted_values)
@@ -552,7 +619,7 @@ class TransactionContext:
         self._require_active()
         self._require_write_mode("stage a row delete")
         accepted_table = _require_table(table)
-        accepted_reference = _require_reference(reference)
+        accepted_reference = self._require_row_reference(accepted_table, reference)
         self._require_row_count_capacity()
         self.row_intents.append(
             RowIntent(
@@ -620,7 +687,23 @@ class TransactionContext:
             write_partitions,
             payload_bytes,
         ) = self._staging_marks.pop()
+        discarded_intents = tuple(self.row_intents[rows:])
         del self.row_intents[rows:]
+        remaining_insert_ids = {
+            id(intent.reference)
+            for intent in self.row_intents
+            if intent.operation is RowOperation.INSERT
+            and isinstance(intent.reference, PendingRowRef)
+        }
+        for intent in discarded_intents:
+            reference = intent.reference
+            if (
+                intent.operation is RowOperation.INSERT
+                and isinstance(reference, PendingRowRef)
+                and id(reference) not in remaining_insert_ids
+                and self._pending_row_refs.get(reference.token) is reference
+            ):
+                del self._pending_row_refs[reference.token]
         del self.pending_records[records:]
         self.page_images.clear()
         self.page_images.update(page_images)
@@ -679,7 +762,13 @@ class TransactionContext:
         for location, image in self.page_images.items():
             seen.add((location, id(image)))
             total += len(image)
-        for _mark, images, _proofs, _partitions, _payload_bytes in self._staging_marks:
+        for (
+            _mark,
+            images,
+            _proofs,
+            _partitions,
+            _payload_bytes,
+        ) in self._staging_marks:
             for location, image in images.items():
                 identity = (location, id(image))
                 if identity in seen:
@@ -841,7 +930,41 @@ class TransactionContext:
         self.row_intents.clear()
         self.row_refs.clear()
         self._staged_payload_bytes = 0
+        self._next_pending_token = -1
+        self._pending_row_refs.clear()
         self._staging_marks.clear()
+
+    def owns_pending_row_ref(self, reference: PendingRowRef) -> bool:
+        """Return whether this exact live pending identity was emitted by this context."""
+        return self._pending_row_refs.get(reference.token) is reference
+
+    def _require_row_reference(self, table: object, reference: object) -> object:
+        """Accept a physical ref or an authentic pending ref for this exact table."""
+        accepted = _require_reference(reference)
+        if isinstance(accepted, RecordRef):
+            return accepted
+        if not isinstance(accepted, PendingRowRef):
+            raise GrafxConfigurationError(
+                "A staged update or delete must name a physical or pending row reference.",
+                field="reference",
+                value=repr(accepted),
+                txn_id=self._txn_id,
+            )
+        table_id = getattr(table, "table_id", None)
+        if (
+            accepted.txn_id != self._txn_id
+            or accepted.table_id != table_id
+            or not self.owns_pending_row_ref(accepted)
+        ):
+            raise GrafxTransactionStateError(
+                "A pending row reference may be used only by the transaction and table that "
+                "issued its still-live insert.",
+                field="pending_row_reference",
+                value=repr(accepted),
+                txn_id=self._txn_id,
+                table_id=table_id,
+            )
+        return accepted
 
     def _require_active(self) -> None:
         """Refuse any use of a transaction that has already ended."""

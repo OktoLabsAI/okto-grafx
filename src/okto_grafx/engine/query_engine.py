@@ -89,6 +89,8 @@ from okto_grafx.domain.model.value import (
 )
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
+from okto_grafx.domain.txn.context import RowIntent, RowOperation
+from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.query.analysis import Aggregation, QueryAnalysis, analyze
 from okto_grafx.domain.query.ast import (
     Direction,
@@ -146,7 +148,6 @@ from okto_grafx.domain.query.tokens import (
     SIMILARITY_FUNCTION,
     SIMILARITY_SCORE_FUNCTION,
 )
-from okto_grafx.domain.txn.context import RowOperation
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.domain.model.catalog import Catalog
@@ -2582,7 +2583,8 @@ def _transaction_row_view(
 
     Two things come back. ``state`` maps the reference of every stored row this transaction
     touched to the values it now holds -- or to None when the transaction ended it. ``inserted``
-    lists the rows it created, which name no stored row yet. Earlier statements' intents come
+    lists the rows it created, including rows carrying a transaction-local pending reference but
+    no stored row yet. Earlier statements' intents come
     first and this statement's held rows after, so the LAST thing said about a row is what the
     view reports: an update after an update builds on the first, a delete after an update ends
     the row, and an update after a delete does not resurrect it (the row cannot be matched once
@@ -2599,7 +2601,10 @@ def _transaction_row_view(
 
     def note(operation: str, reference: object, values: object) -> None:
         """Fold one staged change into the view, in the order the transaction made it."""
-        if reference is None:
+        # Inserts can carry a PendingRowRef so later statements can identify them.  They are
+        # nevertheless new logical rows, not heap-backed rows; classifying only by ``reference
+        # is None`` would make matching code try to read the pending token from the heap.
+        if operation == "INSERT" or reference is None:
             if values:
                 inserted.append(tuple(values))  # type: ignore[arg-type]
             return
@@ -2610,19 +2615,31 @@ def _transaction_row_view(
         elif values is not None:
             state[reference] = tuple(values)  # type: ignore[arg-type]
 
+    logical_intents: list[RowIntent] = []
     for intent in getattr(context.txn, "row_intents", ()):
         intent_table = getattr(intent, "table", None)
         if getattr(intent_table, "table_id", None) != table.table_id:
             continue
-        operation = getattr(getattr(intent, "operation", None), "name", "INSERT")
-        note(operation, getattr(intent, "reference", None), getattr(intent, "values", None))
+        logical_intents.append(intent)
     for held in context.staged_rows:
         if held.table.table_id != table.table_id:
             continue
-        operation = {_HELD_INSERT: "INSERT", _HELD_UPDATE: "UPDATE", _HELD_DELETE: "DELETE"}[
-            held.operation
-        ]
-        note(operation, held.reference, held.values)
+        operation = {
+            _HELD_INSERT: RowOperation.INSERT,
+            _HELD_UPDATE: RowOperation.UPDATE,
+            _HELD_DELETE: RowOperation.DELETE,
+        }[held.operation]
+        logical_intents.append(
+            RowIntent(
+                table=held.table,
+                values=() if held.values is None else tuple(held.values),
+                record_id=held.identity,
+                operation=operation,
+                reference=held.reference,
+            )
+        )
+    for intent in reduce_row_intents(logical_intents):
+        note(intent.operation.name, intent.reference, intent.values)
     return state, inserted
 
 

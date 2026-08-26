@@ -23,6 +23,8 @@ import pytest
 
 import okto_grafx
 from okto_grafx.domain.errors import GrafxPlanError
+from okto_grafx.domain.txn.context import PendingRowRef
+from okto_grafx.engine.heap_store import HeapStore
 
 SCHEMA: tuple[str, ...] = (
     "CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))",
@@ -111,6 +113,62 @@ def test_a_merge_matches_a_row_an_earlier_statement_of_the_same_transaction_crea
             txn.execute("CREATE (:Person {id: 1, name: 'Ada'})")
             report = txn.execute("MERGE (p:Person {id: 1, name: 'Ada'})")
         assert "rows_created" not in report.statistics
+    finally:
+        handle.close()
+    assert reopened(tmp_path / "db", "Person") == [(1, "Ada")]
+
+
+def test_pending_insert_update_uses_the_commit_reducer_in_the_query_view(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handle = build(tmp_path / "db")
+    original_read = HeapStore.read
+
+    def read_only_physical_rows(heap: HeapStore, reference: object):  # noqa: ANN202
+        assert not isinstance(reference, PendingRowRef)
+        return original_read(heap, reference)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(HeapStore, "read", read_only_physical_rows)
+    try:
+        with handle.begin("write") as txn:
+            table = handle.catalog.catalog.table("Person")
+            txn._context.stage_row_insert(table, (1, "before"))
+            pending = txn._context.row_intents[0].reference
+            txn._context.stage_row_update(table, pending, (1, "Ada"))
+
+            report = txn.execute("MERGE (p:Person {id: 1, name: 'Ada'})")
+
+        assert "rows_created" not in report.statistics
+        assert report.statistics["rows_matched"] == 1
+    finally:
+        handle.close()
+    assert reopened(tmp_path / "db", "Person") == [(1, "Ada")]
+
+
+def test_pending_insert_delete_is_absent_from_the_query_view(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handle = build(tmp_path / "db")
+    original_read = HeapStore.read
+
+    def read_only_physical_rows(heap: HeapStore, reference: object):  # noqa: ANN202
+        assert not isinstance(reference, PendingRowRef)
+        return original_read(heap, reference)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(HeapStore, "read", read_only_physical_rows)
+    try:
+        with handle.begin("write") as txn:
+            table = handle.catalog.catalog.table("Person")
+            txn._context.stage_row_insert(table, (1, "Ada"))
+            pending = txn._context.row_intents[0].reference
+            txn._context.stage_row_delete(table, pending)
+
+            report = txn.execute("MERGE (p:Person {id: 1, name: 'Ada'})")
+
+        assert report.statistics["rows_created"] == 1
+        assert "rows_matched" not in report.statistics
     finally:
         handle.close()
     assert reopened(tmp_path / "db", "Person") == [(1, "Ada")]

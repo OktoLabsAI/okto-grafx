@@ -99,12 +99,14 @@ from okto_grafx.domain.txn.commit_record import CommitPayload, FileIdMap, PageTo
 from okto_grafx.domain.txn.commit_state import CommitState
 from okto_grafx.domain.txn.context import (
     CommitReport,
+    PendingRowRef,
     RowIntent,
     RowOperation,
     TransactionContext,
     TransactionMode,
     TransactionState,
 )
+from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.txn.partitions import (
     page_partition,
     partition_of,
@@ -962,6 +964,8 @@ class TransactionManager:
                 txn.row_intents.clear()
                 txn.row_refs.clear()
                 txn._staged_payload_bytes = 0
+                txn._next_pending_token = -1
+                txn._pending_row_refs.clear()
                 txn._staging_marks.clear()
         reader_failure = self._release_reader(txn)
         failure = _accumulate_failure(failure, reader_failure)
@@ -1324,6 +1328,8 @@ class TransactionManager:
                                         txn.row_intents.clear()
                                         txn.row_refs.clear()
                                         txn._staged_payload_bytes = 0
+                                        txn._next_pending_token = -1
+                                        txn._pending_row_refs.clear()
                                         txn._staging_marks.clear()
                                 self._open.pop(txn.txn_id, None)
                                 pin = self._pins.pop(txn.txn_id, None)
@@ -1709,6 +1715,10 @@ class TransactionManager:
 
     def _validate_staged_inputs(self, txn: TransactionContext) -> None:
         """Refuse caller-reachable durable inputs before the commit mutates a page or WAL."""
+        # Row intents are public, mutable staging state. Validate them before even the index
+        # provenance hook below: a malformed pending identity must not reach any collaborator,
+        # and certainly must not be mistaken for a physical RecordRef by the heap.
+        self._validate_row_intents(txn)
         unproved = txn.unproved_page_images()
         if unproved:
             raise GrafxConfigurationError(
@@ -1731,6 +1741,112 @@ class TransactionManager:
         # the second validation in _build_records too: legitimate row work can make the index
         # manager stage additional records later in this same attempt.
         self._validate_pending_index_records(txn, tuple(txn.pending_records))
+
+    def _validate_row_intents(self, txn: TransactionContext) -> None:
+        """Prove row intent shape and pending-reference provenance, then reduce safely."""
+        pending_inserts: dict[int, PendingRowRef] = {}
+        stored_tables: dict[RecordRef, int] = {}
+        for position, raw_intent in enumerate(txn.row_intents):
+            if not isinstance(raw_intent, RowIntent):
+                raise GrafxConfigurationError(
+                    "Every staged row change must be a RowIntent.",
+                    field="row_intents",
+                    position=position,
+                    value=type(raw_intent).__name__,
+                    txn_id=txn.txn_id,
+                )
+            intent = raw_intent
+            operation = intent.operation
+            if not isinstance(operation, RowOperation):
+                raise GrafxConfigurationError(
+                    "Every staged row intent must carry a supported RowOperation.",
+                    field="row_operation",
+                    position=position,
+                    value=repr(operation),
+                    txn_id=txn.txn_id,
+                )
+            table_id = getattr(intent.table, "table_id", None)
+            if (
+                isinstance(table_id, bool)
+                or not isinstance(table_id, int)
+                or table_id < 1
+            ):
+                raise GrafxConfigurationError(
+                    "Every staged row intent must name a table with a positive table_id.",
+                    field="table_id",
+                    position=position,
+                    value=repr(table_id),
+                    txn_id=txn.txn_id,
+                )
+            reference = intent.reference
+            if operation is RowOperation.INSERT:
+                if reference is None:
+                    continue  # accepted legacy insert; new inserts receive PendingRowRef
+                if not isinstance(reference, PendingRowRef):
+                    raise GrafxTransactionStateError(
+                        "An insert may carry only its transaction-local pending reference.",
+                        field="pending_row_reference",
+                        position=position,
+                        value=repr(reference),
+                        txn_id=txn.txn_id,
+                    )
+            elif not isinstance(reference, (PendingRowRef, RecordRef)):
+                raise GrafxTransactionStateError(
+                    "An update or delete must name a physical or pending row reference.",
+                    field="reference",
+                    position=position,
+                    value=repr(reference),
+                    txn_id=txn.txn_id,
+                )
+
+            if isinstance(reference, PendingRowRef):
+                if (
+                    reference.txn_id != txn.txn_id
+                    or reference.table_id != table_id
+                    or not txn.owns_pending_row_ref(reference)
+                ):
+                    raise GrafxTransactionStateError(
+                        "A pending row reference must be the exact live identity emitted by "
+                        "this transaction for this table.",
+                        field="pending_row_reference",
+                        position=position,
+                        value=repr(reference),
+                        txn_id=txn.txn_id,
+                        table_id=table_id,
+                    )
+                identity = id(reference)
+                if operation is RowOperation.INSERT:
+                    if identity in pending_inserts:
+                        raise GrafxTransactionStateError(
+                            "One pending row reference cannot name two inserts.",
+                            field="pending_row_reference",
+                            position=position,
+                            value=repr(reference),
+                            txn_id=txn.txn_id,
+                        )
+                    pending_inserts[identity] = reference
+                elif pending_inserts.get(identity) is not reference:
+                    raise GrafxTransactionStateError(
+                        "A pending update or delete must follow the insert that emitted its "
+                        "exact reference in this transaction.",
+                        field="pending_row_reference",
+                        position=position,
+                        value=repr(reference),
+                        txn_id=txn.txn_id,
+                    )
+            elif isinstance(reference, RecordRef):
+                previous_table = stored_tables.setdefault(reference, table_id)
+                if previous_table != table_id:
+                    raise GrafxTransactionStateError(
+                        "One physical row reference cannot be staged against two tables.",
+                        field="reference",
+                        position=position,
+                        value=repr(reference),
+                        txn_id=txn.txn_id,
+                    )
+
+        # The same pure reducer used by the writer is also the final sequence validator.
+        reduce_row_intents(txn.row_intents)
 
     def _validate_pending_index_records(
         self, txn: TransactionContext, records: Sequence[object]
@@ -2204,7 +2320,7 @@ class TransactionManager:
     def _write_rows(self, txn: TransactionContext) -> tuple[_RowWrite, ...]:
         """Write the rows this transaction staged and return where each one landed.
 
-        The staged intents are settled first (see :func:`_settled_intents`), because a stored row
+        The staged intents are settled first (see :func:`reduce_row_intents`), because a stored row
         can be named more than once by one transaction and every version may be ended exactly
         once. Settling is not an optimisation: without it, a transaction that updates a row and
         then deletes it asks the heap to end the same version twice, and the heap refuses -- so a
@@ -2252,7 +2368,7 @@ class TransactionManager:
         written: list[_RowWrite],
     ) -> None:
         """Write each settled intent into the heap, appending to ``written`` as each one lands."""
-        for intent in _settled_intents(txn.row_intents):
+        for intent in reduce_row_intents(txn.row_intents):
             if intent.operation is RowOperation.DELETE:
                 ending = self._values_at(intent.reference)
                 heap.delete(intent.table, intent.reference, provisional)
@@ -2879,58 +2995,6 @@ class TransactionManager:
             f"TransactionManager(partitions_per_table={self._partitions_per_table}, "
             f"open_transactions={len(self._open)})"
         )
-
-
-def _settled_intents(intents: Sequence[RowIntent]) -> tuple[RowIntent, ...]:
-    """Return what one transaction does to each row, with every stored row named at most once.
-
-    A transaction may name one stored row more than once -- update it and then delete it, or set
-    two different properties in two statements -- and the two stamps a change writes are only
-    correct once each: the version it replaces ends at the commit number, and a version cannot
-    end twice. Asking the heap to end it again is refused, correctly, and that refusal would
-    arrive inside the commit section, where the only failures still meant to be possible are the
-    device's.
-
-    So the intents are read in order and reduced to the OUTCOME per stored row: the last thing
-    the transaction said about it. A delete wins over the updates before it, because ending a row
-    and also leaving a new version of it behind is not a state any snapshot rule can make sense
-    of. Updates collapse to the last values for the same reason a single statement collapses its
-    own assignments -- the transaction's answer about a row is one row.
-
-    Inserts pass through untouched and keep their order among themselves: they name no stored
-    row, so nothing about them can collide, and two inserts are two rows however alike they look.
-    Each settled outcome keeps the position of the FIRST intent that named its row, so the order
-    a caller sees does not depend on which statement happened to finish the row off.
-    """
-    settled: dict[object, RowIntent] = {}
-    order: list[object] = []
-    passthrough: list[tuple[int, RowIntent]] = []
-    for position, intent in enumerate(intents):
-        if intent.operation is RowOperation.INSERT or intent.reference is None:
-            passthrough.append((position, intent))
-            continue
-        key = intent.reference
-        if key not in settled:
-            order.append(key)
-        elif settled[key].operation is RowOperation.DELETE:
-            # Ended is ended. An update staged after the delete of the same version does not
-            # bring the row back: the engine no longer matches an ended row, and this is the
-            # second line of the same defence (C10 round-2 B3). A delete after an update still
-            # wins, as the docstring says.
-            continue
-        settled[key] = intent
-    if not settled:
-        return tuple(intents)
-    placed: list[tuple[int, RowIntent]] = list(passthrough)
-    first_seen: dict[object, int] = {}
-    for position, intent in enumerate(intents):
-        reference = intent.reference
-        if reference is not None and reference not in first_seen:
-            first_seen[reference] = position
-    for key in order:
-        placed.append((first_seen[key], settled[key]))
-    placed.sort(key=lambda item: item[0])
-    return tuple(intent for _position, intent in placed)
 
 
 def _require_optional_positive_limit(field: str, value: int | None) -> int | None:
