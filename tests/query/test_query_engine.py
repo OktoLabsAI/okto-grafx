@@ -738,6 +738,7 @@ def test_timestamp_passes_a_timestamp_through_and_answers_null_with_null(
     (
         "2024-01-02T03:04:05z",
         "2024-01-02X03:04:05",
+        "2024-01-02_03:04:05",
         "2024-13-01",
         "2024-01-32",
         "not-a-date",
@@ -786,6 +787,12 @@ def test_timestamp_refuses_before_any_row_is_read(
         ("$a + $b", {"a": 1, "b": 1}),
         ("coalesce($bad, null)", {"bad": "not-a-date"}),
         ("coalesce($bad, null)", {"bad": 1}),
+        ("string_split('not-a-date', ',')[1]", {}),
+        (
+            "CASE WHEN true THEN string_split('not-a-date', ',')[1] "
+            "ELSE '2024-01-02' END",
+            {},
+        ),
     ),
 )
 def test_timestamp_refuses_a_known_composed_value_before_read_or_write(

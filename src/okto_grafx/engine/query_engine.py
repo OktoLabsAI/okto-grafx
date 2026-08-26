@@ -4571,8 +4571,23 @@ def _timestamp_bindable(expression: Expression) -> bool:
         return _timestamp_bindable(expression.left) and _timestamp_bindable(
             expression.right
         )
+    if isinstance(expression, ListExpression):
+        return all(_timestamp_bindable(item) for item in expression.elements)
+    if isinstance(expression, MapExpression):
+        return all(
+            _timestamp_bindable(entry.value) for entry in expression.entries
+        )
+    if isinstance(expression, Property):
+        return _timestamp_bindable(expression.subject)
+    if isinstance(expression, Subscript):
+        return _timestamp_bindable(expression.subject) and _timestamp_bindable(
+            expression.index
+        )
     if isinstance(expression, FunctionCall):
-        return expression.name.upper() == COALESCE_FUNCTION and all(
+        return expression.name.upper() in (
+            COALESCE_FUNCTION,
+            STRING_SPLIT_FUNCTION,
+        ) and all(
             _timestamp_bindable(argument) for argument in expression.arguments
         )
     if isinstance(expression, CaseExpression):
