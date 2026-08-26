@@ -297,6 +297,7 @@ class TransactionContext:
                 dict[tuple[str, PageIndex], bytes],
                 dict[tuple[str, PageIndex], bytes],
                 set[int],
+                set[int],
                 int,
             ]
         ] = []
@@ -676,6 +677,7 @@ class TransactionContext:
                 mark,
                 dict(self.page_images),
                 dict(self._page_image_proofs),
+                set(self.read_partitions),
                 set(self.write_partitions),
                 self._staged_payload_bytes,
             )
@@ -686,9 +688,10 @@ class TransactionContext:
         """Drop everything staged after the mark, leaving what was staged before it untouched.
 
         Page images are keyed by location rather than ordered, so the mark seals an internal
-        shallow snapshot of the exact map, its proofs and write partitions. Bytes are immutable:
-        restoring that state restores both a replaced image and additions whose key sorts before
-        an older key, without copying page payloads or guessing insertion order from a count.
+        shallow snapshot of the exact map, its proofs, and its read/write partitions. Bytes are
+        immutable: restoring that state restores both a replaced image and additions whose key
+        sorts before an older key, without copying page payloads or guessing insertion order
+        from a count.
         """
         rows, records, pages = mark
         if (
@@ -716,6 +719,7 @@ class TransactionContext:
             _issued,
             page_images,
             page_proofs,
+            read_partitions,
             write_partitions,
             payload_bytes,
         ) = self._staging_marks.pop()
@@ -741,6 +745,8 @@ class TransactionContext:
         self.page_images.update(page_images)
         self._page_image_proofs.clear()
         self._page_image_proofs.update(page_proofs)
+        self.read_partitions.clear()
+        self.read_partitions.update(read_partitions)
         self.write_partitions.clear()
         self.write_partitions.update(write_partitions)
         self._staged_payload_bytes = payload_bytes
@@ -798,7 +804,8 @@ class TransactionContext:
             _mark,
             images,
             _proofs,
-            _partitions,
+            _read_partitions,
+            _write_partitions,
             _payload_bytes,
         ) in self._staging_marks:
             for location, image in images.items():
@@ -815,7 +822,7 @@ class TransactionContext:
         """Return whether a live mark keeps this exact page generation as a preimage."""
         return any(
             images.get(location) is image
-            for _mark, images, _proofs, _partitions, _size in self._staging_marks
+            for _mark, images, _proofs, _reads, _writes, _size in self._staging_marks
         )
 
     def _require_row_count_capacity(self) -> None:

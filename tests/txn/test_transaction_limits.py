@@ -223,7 +223,6 @@ def test_discard_restores_replaced_and_new_page_images_exactly() -> None:
     assert transaction.page_images == expected_images
     assert transaction._page_image_proofs == expected_proofs
     assert transaction._staged_payload_bytes == expected_bytes
-
     # A settlement failure must leave its mark available to the statement failure path.
     # Otherwise the staged row survives the refusal and a later commit can publish it.
     transaction, _capability = _context(max_transaction_bytes=64)
@@ -257,6 +256,21 @@ def test_discard_restores_replaced_and_new_page_images_exactly() -> None:
     assert transaction.page_images == expected_images
     assert transaction._page_image_proofs == expected_proofs
     assert transaction._staged_payload_bytes == expected_bytes
+
+
+def test_discard_restores_read_and_write_partitions_exactly() -> None:
+    """A refused statement cannot retain conflict guards for work it discarded."""
+    transaction, _capability = _context()
+    transaction.note_read(11)
+    transaction.note_write(12)
+
+    mark = transaction.staging_mark()
+    transaction.note_read(21)
+    transaction.note_write(22)
+    transaction.discard_since(mark)
+
+    assert transaction.read_partitions == {11}
+    assert transaction.write_partitions == {12}
 
 
 def test_schema_byte_budget_refusal_restores_the_whole_statement(tmp_path: Path) -> None:

@@ -9,6 +9,7 @@ import pytest
 
 import okto_grafx
 from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
     GrafxTransactionBudgetExceeded,
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
@@ -17,6 +18,7 @@ from okto_grafx.domain.txn.context import (
     PendingRowRef,
     RowIntent,
     RowOperation,
+    TransactionContext,
 )
 from okto_grafx.engine.query_engine import QueryResult
 
@@ -259,6 +261,48 @@ def test_pending_update_or_delete_budget_refusal_restores_the_statement(
         ).rows == (("Ada",),)
     finally:
         handle.close()
+
+
+def test_failed_relationship_handover_discards_endpoint_read_guards(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure after endpoint guards are published leaves no ghost OCC dependency."""
+    with database.begin("write") as schema:
+        schema.execute("CREATE REL TABLE Knows(FROM Person TO Person)")
+    with database.begin("write") as seed:
+        seed.execute("CREATE (:Person {id: 1, name: 'Ada'})")
+        seed.execute("CREATE (:Person {id: 2, name: 'Grace'})")
+
+    writer = database.begin("write")
+    writer._context.note_read(11)
+    writer._context.note_write(12)
+    expected_rows = tuple(writer._context.row_intents)
+    expected_reads = set(writer._context.read_partitions)
+    expected_writes = set(writer._context.write_partitions)
+
+    def refuse_write(_context: TransactionContext, _partition: int) -> None:
+        raise RuntimeError("injected failure after endpoint guards")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(TransactionContext, "note_write", refuse_write)
+            with pytest.raises(
+                GrafxConfigurationError, match="collaborator raised RuntimeError"
+            ) as raised:
+                writer.execute(
+                    "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
+                    "CREATE (a)-[:Knows]->(b)"
+                )
+            assert isinstance(raised.value.__cause__, RuntimeError)
+
+        assert tuple(writer._context.row_intents) == expected_rows
+        assert writer._context.read_partitions == expected_reads
+        assert writer._context.write_partitions == expected_writes
+        assert writer.execute(
+            "MATCH (a:Person)-[r:Knows]->(b:Person) RETURN a.id, b.id"
+        ).rows == ()
+    finally:
+        writer.rollback()
 
 
 def test_budget_refusal_mid_handover_unwinds_stored_and_pending_deletes(
