@@ -282,28 +282,25 @@ def test_deleting_a_row_the_statement_created_creates_nothing_and_loses_nothing(
     assert [row[0] for row in _live(path)] == expected
 
 
-def test_a_refusal_while_handing_held_rows_to_the_transaction_unwinds_all_of_them(
+def test_one_statement_deletes_a_stored_row_and_a_pending_row_atomically(
     path: str,
 ) -> None:
-    """The second line: release() is all-or-nothing on the transaction itself.
+    """A pending row now has the private identity DELETE needs to take it back.
 
-    Driven through a row the engine cannot take back -- a delete of a row created by an EARLIER
-    statement, which is refused with a typed error -- the statement's other held rows must not
-    reach the transaction, and a commit afterwards must not carry them.
+    The stored delete and the pending delete are still handed over under one staging mark. At
+    commit the shared reducer keeps the former and cancels the earlier insert, so the statement
+    publishes all of its outcome rather than preserving the historical unsupported-operation
+    seam this milestone closes.
     """
-    from okto_grafx.domain.errors import GrafxUnsupportedOperation
-
     _write(path, "CREATE (:P {id: 1, a: 0})", "CREATE (:P {id: 2, a: 0})")
     handle = okto_grafx.connect(path)
     try:
         with handle.begin("write") as txn:
             txn.execute("CREATE (:P {id: 9, a: 0})")
-            with pytest.raises(GrafxUnsupportedOperation):
-                txn.execute("MATCH (m:P {id: 2}) MERGE (n:P {id: 9}) DELETE m, n")
+            txn.execute("MATCH (m:P {id: 2}) MERGE (n:P {id: 9}) DELETE m, n")
     finally:
         handle.close()
-    # Row 9 was committed by its own statement; row 2 survived the refused one.
-    assert [row[0] for row in _live(path)] == [1, 2, 9]
+    assert [row[0] for row in _live(path)] == [1]
 
 
 def test_a_merge_matched_row_this_transaction_updated_can_be_set_and_deleted(path: str) -> None:

@@ -89,7 +89,7 @@ from okto_grafx.domain.model.value import (
 )
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
-from okto_grafx.domain.txn.context import RowIntent, RowOperation
+from okto_grafx.domain.txn.context import PendingRowRef, RowIntent, RowOperation
 from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.query.analysis import Aggregation, QueryAnalysis, analyze
 from okto_grafx.domain.query.ast import (
@@ -683,6 +683,22 @@ class _Context:
         self.intermediate_rows[identity] = observed
 
 
+def _intent_table_ids(txn: object) -> frozenset[int]:
+    """Return the tables whose indexes do not yet describe their owner's row view.
+
+    Row intents are private to the transaction passed to :meth:`QueryEngine.execute`, so this
+    set is owner-only by construction. Even an insert later cancelled by a delete keeps the
+    table dirty until commit: planning from the raw intents preserves transaction budgets and
+    avoids making plan safety depend on a second, planner-local reduction rule.
+    """
+    table_ids: set[int] = set()
+    for intent in getattr(txn, "row_intents", ()):
+        table_id = getattr(getattr(intent, "table", None), "table_id", None)
+        if isinstance(table_id, int) and not isinstance(table_id, bool) and table_id > 0:
+            table_ids.add(table_id)
+    return frozenset(table_ids)
+
+
 class QueryEngine:
     """The query surface of one database (CONTRACT.md section 8.9).
 
@@ -805,17 +821,19 @@ class QueryEngine:
         what an outside caller asks about. A statement running INSIDE a transaction that has
         already declared tables must be planned against that transaction's working catalog, or
         the second statement of the quick start's schema block fails to plan the table the first
-        one declared.
+        one declared. A table this transaction has already changed also withholds its indexes:
+        only a scan can be safely combined with pending inserts and changed primary keys.
         """
-        if working is None:
+        dirty_tables = _intent_table_ids(txn)
+        if working is None and not dirty_tables:
             return self.planned(statement)
         started = self._reading()
         try:
             analysis = analyze(statement)
             plan = build_plan(
                 statement,
-                catalog=working,
-                indexes=self._index_definitions(),
+                catalog=working if working is not None else self._catalog.catalog,
+                indexes=self._index_definitions(without_indexes_for=dirty_tables),
                 analysis=analysis,
             )
         except GrafxError as failure:
@@ -877,8 +895,10 @@ class QueryEngine:
 
     # --- planning support ---------------------------------------------------------------------
 
-    def _index_definitions(self) -> tuple[object, ...]:
-        """Return the definitions of every registered index, or none without a framework."""
+    def _index_definitions(
+        self, *, without_indexes_for: frozenset[int] = frozenset()
+    ) -> tuple[object, ...]:
+        """Return usable index definitions, withholding tables that need an owner overlay."""
         if self._indexes is None:
             return ()
         listing = getattr(self._indexes, "indexes", None)
@@ -893,7 +913,10 @@ class QueryEngine:
         # is slower and right. The index says so itself through `stale`, and `Database.
         # stale_indexes` is where an operator sees which ones need rebuilding.
         return tuple(
-            index.definition for index in listing() if not getattr(index, "stale", False)
+            index.definition
+            for index in listing()
+            if not getattr(index, "stale", False)
+            and index.definition.table_id not in without_indexes_for
         )
 
     def _bind_parameters(
@@ -1516,20 +1539,33 @@ def _single_row(
 def _node_scan(
     engine: QueryEngine, node: NodeScan, context: _Context
 ) -> Iterator[_Row]:
-    """Produce one row per visible version of the table, per incoming row."""
+    """Produce the owner's logical node rows, overlaid on its physical snapshot.
+
+    The heap is deliberately scanned even when a primary-key index exists whenever this
+    transaction has touched the table: an exact index describes only durable heap versions and
+    cannot offer a pending insert or a pending row under its newly updated key. The settled view
+    comes from the same reducer commit uses, so insert-update is one pending row and
+    insert-delete is no row at all.
+    """
     snapshot = context.snapshot
-    ended = _ended_by_this_transaction(context)
+    changed, inserted = _transaction_row_view(context, node.table, include_held=False)
     for row in engine._rows(node.child, context):
         for ref, version in engine.heap.scan(node.table, snapshot):
-            if ref in ended:
-                # The snapshot still shows it -- its end stamp is the commit number, which does
-                # not exist yet -- but this transaction has already said it wants the row gone.
-                # Matching it again let a later bulk SET stage an update that the settle then
-                # let win over the delete: an acknowledged delete silently lost (C10 round-2 B3).
-                continue
+            if ref in changed:
+                latest = changed[ref]
+                if latest is None:
+                    continue
+                version = replace(version, values=latest)
             bindings = dict(row.bindings)
             bindings[node.variable] = RowBinding(
                 variable=node.variable, table=node.table, ref=ref, version=version
+            )
+            context.count("rows_scanned")
+            yield _Row(bindings=bindings)
+        for reference, values in inserted:
+            bindings = dict(row.bindings)
+            bindings[node.variable] = _pending_binding(
+                node.variable, node.table, values, reference=reference
             )
             context.count("rows_scanned")
             yield _Row(bindings=bindings)
@@ -1706,6 +1742,20 @@ def _edge_steps(
     return hybrid
 
 
+def _planned_table_for_variable(root: PlanNode, variable: str) -> TableDef | None:
+    """Resolve the node table a planned subtree binds for ``variable``, without reading data."""
+    for planned in root.walk():
+        if isinstance(planned, (NodeScan, IndexSeek)) and planned.variable == variable:
+            return planned.table
+        if (
+            isinstance(planned, TraverseRelationship)
+            and planned.target == variable
+            and planned.target_table is not None
+        ):
+            return planned.target_table
+    return None
+
+
 def _traverse(
     engine: QueryEngine, node: TraverseRelationship, context: _Context
 ) -> Iterator[_Row]:
@@ -1726,9 +1776,37 @@ def _traverse(
     ``MATCH (a), (b) ... (a)-[]->(b)`` -- is a filter: the path counts only when it lands on that
     very row.
     """
-    snapshot = context.snapshot
     catalog = context.schema()
     relationship = node.table
+    involved = {
+        table.table_id: table
+        for table in (
+            relationship,
+            catalog.table(relationship.from_table),
+            catalog.table(relationship.to_table),
+        )
+    }
+    dirty_tables = _intent_table_ids(context.txn)
+    for table in involved.values():
+        if table.table_id not in dirty_tables:
+            continue
+        changed, inserted = _transaction_row_view(context, table, include_held=False)
+        if not inserted and all(values is None for values in changed.values()):
+            # Stored-row deletes already have the pre-M1 traversal overlay: `_edge_steps` and
+            # `node_at` omit references returned by `_ended_by_this_transaction`. Keep that
+            # supported path; inserts and updates need endpoint/property overlay that is outside
+            # this node-only commit.
+            continue
+        raise GrafxUnsupportedOperation(
+            f"A traversal involving {table.name!r} cannot include rows this transaction has "
+            "staged. Commit or roll back first; relationship and endpoint read-your-own-writes "
+            "are not implemented in this build.",
+            field="table",
+            value=table.name,
+            table_id=table.table_id,
+            operation="traversal",
+        )
+    snapshot = context.snapshot
     from_table = catalog.table(relationship.from_table)
     to_table = catalog.table(relationship.to_table)
     nodes_by_id: dict[int, dict[int, tuple[object, HeapVersion]]] = {}
@@ -1853,6 +1931,17 @@ def _vector_search(
     that could not count itself would be treated as the whole space and would push every query
     into the approximate regime.
     """
+    table = _planned_table_for_variable(node.child, node.variable)
+    if table is not None and table.table_id in _intent_table_ids(context.txn):
+        raise GrafxUnsupportedOperation(
+            f"A similarity search over {table.name!r} cannot include rows this transaction has "
+            "staged: its vector index describes only committed rows. Commit or roll back first; "
+            "vector read-your-own-writes is not implemented in this build.",
+            field="table",
+            value=table.name,
+            table_id=table.table_id,
+            operation="similarity",
+        )
     vectors = engine.require_vectors()
     candidates = tuple(engine._rows(node.child, context))
     by_record: dict[int, list[_Row]] = {}
@@ -2544,6 +2633,16 @@ def _materialise_edge(
                 field=end,
                 value=variable,
             )
+        if isinstance(binding.ref, PendingRowRef) or binding.record_id == 0:
+            raise GrafxUnsupportedOperation(
+                f"The {end} of a {edge.table.name!r} edge is {variable!r}, a node this "
+                "transaction has staged but whose durable identity does not exist until commit. "
+                "Commit the node first, then create the relationship.",
+                field=end,
+                value=variable,
+                table=edge.table.name,
+                operation="relationship_endpoint",
+            )
         endpoints.append(binding.record_id)
     properties = materialise_row(
         engine, edge.table, edge.properties, row, context, endpoints=(endpoints[0], endpoints[1])
@@ -2552,17 +2651,25 @@ def _materialise_edge(
     return edge.table, properties
 
 
-def _pending_binding(variable: str, table: TableDef, values: tuple[Value, ...]) -> RowBinding:
+def _pending_binding(
+    variable: str,
+    table: TableDef,
+    values: tuple[Value, ...],
+    *,
+    reference: object = None,
+) -> RowBinding:
     """Return a binding for a row this statement staged but has not yet given an identity.
 
     The identity is zero because the commit allocates it, and zero is the value section 3
     reserves for "none" -- so a projection of a created row reads back the properties it was
-    written with and never a number that looks like an identity and is not one.
+    written with and never a number that looks like an identity and is not one. A row handed over
+    by an earlier statement carries its private pending reference only in ``RowBinding.ref``;
+    that lets SET and DELETE stage another logical intent without exposing the token as a value.
     """
     return RowBinding(
         variable=variable,
         table=table,
-        ref=None,
+        ref=reference,
         version=HeapVersion(
             record_id=0,
             xmin=NO_CSN,
@@ -2577,14 +2684,17 @@ def _pending_binding(variable: str, table: TableDef, values: tuple[Value, ...]) 
 
 
 def _transaction_row_view(
-    context: _Context, table: TableDef
-) -> tuple[dict[object, tuple[Value, ...] | None], list[tuple[Value, ...]]]:
+    context: _Context, table: TableDef, *, include_held: bool = True
+) -> tuple[
+    dict[object, tuple[Value, ...] | None],
+    list[tuple[object, tuple[Value, ...]]],
+]:
     """Return what this transaction has done to each stored row of a table, in order, settled.
 
     Two things come back. ``state`` maps the reference of every stored row this transaction
     touched to the values it now holds -- or to None when the transaction ended it. ``inserted``
-    lists the rows it created, including rows carrying a transaction-local pending reference but
-    no stored row yet. Earlier statements' intents come
+    lists the reference and values of rows it created, including rows carrying a transaction-local
+    pending reference but no stored row yet. Earlier statements' intents come
     first and this statement's held rows after, so the LAST thing said about a row is what the
     view reports: an update after an update builds on the first, a delete after an update ends
     the row, and an update after a delete does not resurrect it (the row cannot be matched once
@@ -2597,7 +2707,7 @@ def _transaction_row_view(
     transaction had deleted (C10 round-2 B3, B4, B5).
     """
     state: dict[object, tuple[Value, ...] | None] = {}
-    inserted: list[tuple[Value, ...]] = []
+    inserted: list[tuple[object, tuple[Value, ...]]] = []
 
     def note(operation: str, reference: object, values: object) -> None:
         """Fold one staged change into the view, in the order the transaction made it."""
@@ -2605,8 +2715,7 @@ def _transaction_row_view(
         # nevertheless new logical rows, not heap-backed rows; classifying only by ``reference
         # is None`` would make matching code try to read the pending token from the heap.
         if operation == "INSERT" or reference is None:
-            if values:
-                inserted.append(tuple(values))  # type: ignore[arg-type]
+            inserted.append((reference, tuple(values)))  # type: ignore[arg-type]
             return
         if operation == "DELETE":
             state[reference] = None
@@ -2621,24 +2730,59 @@ def _transaction_row_view(
         if getattr(intent_table, "table_id", None) != table.table_id:
             continue
         logical_intents.append(intent)
-    for held in context.staged_rows:
-        if held.table.table_id != table.table_id:
-            continue
-        operation = {
-            _HELD_INSERT: RowOperation.INSERT,
-            _HELD_UPDATE: RowOperation.UPDATE,
-            _HELD_DELETE: RowOperation.DELETE,
-        }[held.operation]
-        logical_intents.append(
-            RowIntent(
-                table=held.table,
-                values=() if held.values is None else tuple(held.values),
-                record_id=held.identity,
-                operation=operation,
-                reference=held.reference,
+    if include_held:
+        for held in context.staged_rows:
+            if held.table.table_id != table.table_id:
+                continue
+            operation = {
+                _HELD_INSERT: RowOperation.INSERT,
+                _HELD_UPDATE: RowOperation.UPDATE,
+                _HELD_DELETE: RowOperation.DELETE,
+            }[held.operation]
+            logical_intents.append(
+                RowIntent(
+                    table=held.table,
+                    values=() if held.values is None else tuple(held.values),
+                    record_id=held.identity,
+                    operation=operation,
+                    reference=held.reference,
+                )
             )
-        )
-    for intent in reduce_row_intents(logical_intents):
+    for intent in logical_intents:
+        reference = intent.reference
+        if isinstance(reference, PendingRowRef):
+            owns = getattr(context.txn, "owns_pending_row_ref", None)
+            table_id = getattr(intent.table, "table_id", None)
+            if (
+                reference.txn_id != getattr(context.txn, "txn_id", None)
+                or reference.table_id != table_id
+                or not callable(owns)
+                or not owns(reference)
+            ):
+                raise GrafxTransactionStateError(
+                    "A node overlay may read only a pending row identity issued by its owner "
+                    "for this exact table.",
+                    field="pending_row_reference",
+                    value=repr(reference),
+                    txn_id=getattr(context.txn, "txn_id", None),
+                    table_id=table.table_id,
+                )
+    reduced = reduce_row_intents(logical_intents)
+    for intent in reduced:
+        if (
+            isinstance(intent.reference, PendingRowRef)
+            and intent.operation is not RowOperation.INSERT
+        ):
+            raise GrafxTransactionStateError(
+                "A pending row identity must begin with an insert before it can be updated or "
+                "deleted by its owner.",
+                field="pending_row_reference",
+                value=repr(intent.reference),
+                txn_id=getattr(context.txn, "txn_id", None),
+                table_id=table.table_id,
+                operation=intent.operation.value,
+            )
+    for intent in reduced:
         note(intent.operation.name, intent.reference, intent.values)
     return state, inserted
 
@@ -2678,7 +2822,9 @@ def _require_unique_primary_key(
         if _equal(other[position], key):
             raise _duplicate_key(table, key)
     state, inserted = _transaction_row_view(context, table)
-    for pending in inserted:
+    for reference, pending in inserted:
+        if replacing is not None and reference == replacing:
+            continue
         if len(pending) > position and _equal(pending[position], key):
             raise _duplicate_key(table, key)
     for reference, latest in state.items():
@@ -2771,14 +2917,13 @@ def _uncommitted_rows_with_refs(
 ) -> Iterator[tuple[object, tuple[Value, ...]]]:
     """Yield this transaction's uncommitted rows of one table WITH the stored row each replaces.
 
-    An insert carries no reference. An update carries the reference of the version it replaces,
-    which is what lets a key check tell "another row under this key" from "an earlier statement
-    of this transaction updating the very row being updated again" -- the second is the ordinary
-    shape of two SETs on one row and must not refuse itself.
+    An insert carries its pending reference. An update carries the reference of the version it
+    replaces, which is what lets a key check tell "another row under this key" from "an earlier
+    statement of this transaction updating the very row being updated again" -- the second is
+    the ordinary shape of two SETs on one row and must not refuse itself.
     """
     state, inserted = _transaction_row_view(context, table)
-    for values in inserted:
-        yield None, values
+    yield from inserted
     for reference, latest in state.items():
         if latest is not None:
             yield reference, latest
@@ -2831,9 +2976,14 @@ def _current_values(context: _Context, binding: RowBinding) -> tuple[Value, ...]
             if held is not None:
                 return held
         return binding.version.values
-    state, _inserted = _transaction_row_view(context, binding.table)
+    state, inserted = _transaction_row_view(context, binding.table)
     latest = state.get(binding.ref)
-    return binding.version.values if latest is None else latest
+    if latest is not None:
+        return latest
+    for reference, pending in inserted:
+        if reference == binding.ref:
+            return pending
+    return binding.version.values
 
 
 def _ended_by_this_transaction(context: _Context) -> set[object]:
@@ -2885,11 +3035,13 @@ def _matching_row(
     if positions is None:
         return None
     state, inserted = _transaction_row_view(context, table)
-    for pending in inserted:
+    for reference, pending in inserted:
         if len(pending) == len(values) and all(
             _equal(pending[at], values[at]) for at in positions
         ):
-            return _pending_binding(written.variable, table, pending)
+            return _pending_binding(
+                written.variable, table, pending, reference=reference
+            )
     for reference, latest in state.items():
         if latest is None or len(latest) != len(values):
             continue
@@ -3417,10 +3569,24 @@ def _projected(row: _Row, columns: tuple[str, ...]) -> tuple[Value, ...]:
     return tuple(_as_value(values.get(name)) for name in columns)
 
 
+def _binding_identity(binding: RowBinding) -> tuple[object, ...]:
+    """Return one owner-private logical identity for equality, dedupe and ordering."""
+    reference = binding.ref
+    if isinstance(reference, PendingRowRef):
+        return ("pending", reference.txn_id, reference.table_id, reference.token)
+    if reference is None and binding.record_id == 0:
+        return ("held", binding.table.table_id, id(binding.version))
+    return ("stored", binding.table.table_id, binding.record_id)
+
+
 def _as_value(value: object) -> Value:
-    """Return a value in the shape the value system stores, resolving a bound row to its id."""
+    """Detach bindings recursively so no private pending reference reaches a result value."""
     if isinstance(value, RowBinding):
         return value.record_id
+    if isinstance(value, (list, tuple)):
+        return tuple(_as_value(item) for item in value)
+    if isinstance(value, dict):
+        return {_as_value(key): _as_value(item) for key, item in value.items()}
     return value  # type: ignore[return-value]
 
 
@@ -3435,7 +3601,7 @@ def _freeze(value: object) -> object:
     answers the second one before it ever reaches here.
     """
     if isinstance(value, RowBinding):
-        return ("binding", value.table.name, value.record_id)
+        return ("binding", _binding_identity(value))
     if isinstance(value, (bytes, bytearray)):
         return ("bytes", bytes(value))
     if isinstance(value, (list, tuple)):
@@ -3477,7 +3643,7 @@ def _sort_key(value: object) -> tuple[int, object]:
     if isinstance(value, (bytes, bytearray)):
         return (3, bytes(value))
     if isinstance(value, RowBinding):
-        return (4, (value.table.name, value.record_id))
+        return (4, _binding_identity(value))
     return (6, repr(value))
 
 
@@ -3549,7 +3715,6 @@ def _equal(left: object, right: object) -> bool:
         return (
             isinstance(left, RowBinding)
             and isinstance(right, RowBinding)
-            and left.table.name == right.table.name
-            and left.record_id == right.record_id
+            and _binding_identity(left) == _binding_identity(right)
         )
     return _freeze(left) == _freeze(right)

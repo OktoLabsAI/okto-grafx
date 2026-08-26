@@ -1569,6 +1569,30 @@ class Database:
                 # use. Checking before it would let a racing rollback withdraw this snapshot's
                 # reader pin in the gap and leave the search below a recyclable horizon.
                 transaction._require_active()
+                dirty_table = next(
+                    (
+                        table
+                        for intent in transaction._context.row_intents
+                        if (table := getattr(intent, "table", None)) is not None
+                        and any(
+                            getattr(column, "vector_space", None) == wanted_space
+                            for column in getattr(table, "columns", ())
+                        )
+                    ),
+                    None,
+                )
+                if dirty_table is not None:
+                    raise GrafxUnsupportedOperation(
+                        f"A vector search in {wanted_space!r} cannot include rows of "
+                        f"{dirty_table.name!r} this transaction has staged: the vector index "
+                        "describes only committed rows. Commit or roll back first; vector "
+                        "read-your-own-writes is not implemented in this build.",
+                        field="table",
+                        value=dirty_table.name,
+                        table_id=dirty_table.table_id,
+                        operation="search_vectors",
+                        space=wanted_space,
+                    )
                 snapshot = _public_snapshot(transaction._context.snapshot)
                 result = vectors.search(  # type: ignore[attr-defined]
                     space=wanted_space,
