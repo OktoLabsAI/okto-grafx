@@ -32,6 +32,8 @@ from okto_grafx.domain.query.analysis import (
 )
 from okto_grafx.domain.query.ast import (
     BinaryOperation,
+    CaseAlternative,
+    CaseExpression,
     ColumnSpec,
     CreateClause,
     CreateNodeTableStatement,
@@ -61,6 +63,7 @@ from okto_grafx.domain.query.ast import (
     SetItem,
     SortItem,
     Statement,
+    Subscript,
     UnaryOperation,
     UpdatingClause,
     Variable,
@@ -179,6 +182,8 @@ __all__ = [
     "Aggregation",
     "BinaryOperation",
     "Binding",
+    "CaseAlternative",
+    "CaseExpression",
     "ColumnSpec",
     "CreateClause",
     "CreateNodeTable",
@@ -233,6 +238,7 @@ __all__ = [
     "SortItem",
     "SortRows",
     "Statement",
+    "Subscript",
     "Token",
     "TokenKind",
     "TraverseRelationship",

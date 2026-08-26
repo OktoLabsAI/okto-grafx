@@ -84,6 +84,7 @@ openCypher in the Kùzu dialect, executed by a planner that produces one operato
 | `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT`, `WITH` | |
 | Aggregates | `count`, `min`, `max`, and friends |
 | Scalar functions | `coalesce`, `string_split`, `size` |
+| Conditional/list expressions | searched and simple `CASE`; one-based and negative `list[index]` |
 | Parameters | `$name`, refused before anything runs if one is missing |
 
 `MATCH` in a write transaction sees that owner's earlier node inserts, updates and deletes. A

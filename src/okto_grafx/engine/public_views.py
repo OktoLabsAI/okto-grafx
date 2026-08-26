@@ -62,6 +62,8 @@ from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.query.analysis import Aggregation
 from okto_grafx.domain.query.ast import (
     BinaryOperation,
+    CaseAlternative,
+    CaseExpression,
     Expression,
     FunctionCall,
     ListExpression,
@@ -74,6 +76,7 @@ from okto_grafx.domain.query.ast import (
     Property,
     ReturnItem,
     SortItem,
+    Subscript,
     UnaryOperation,
     Variable,
 )
@@ -1888,6 +1891,7 @@ _QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
 _QUERY_PLAN_EXPRESSION_TYPES: frozenset[type[Expression]] = frozenset(
     {
         BinaryOperation,
+        CaseExpression,
         FunctionCall,
         ListExpression,
         Literal,
@@ -1895,6 +1899,7 @@ _QUERY_PLAN_EXPRESSION_TYPES: frozenset[type[Expression]] = frozenset(
         NullCheck,
         Parameter,
         Property,
+        Subscript,
         UnaryOperation,
         Variable,
     }
@@ -1905,6 +1910,7 @@ _QUERY_PLAN_EXPRESSION_TYPES: frozenset[type[Expression]] = frozenset(
 _QUERY_PLAN_AUXILIARY_TYPES: frozenset[type[object]] = frozenset(
     {
         Aggregation,
+        CaseAlternative,
         ColumnDef,
         CreatedNode,
         CreatedRelationship,

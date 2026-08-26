@@ -359,6 +359,251 @@ def test_string_split_and_size_type_errors_are_typed_refusals(
     assert failure.value.details == {"field": "function", "value": function}
 
 
+def test_searched_and_simple_case_select_the_first_match_and_default_to_null(
+    stack: QueryStack,
+) -> None:
+    found = run(
+        stack,
+        "RETURN CASE WHEN false THEN 'no' WHEN true THEN 'yes' ELSE 'late' END, "
+        "CASE 'card_relationship_target' "
+        "WHEN 'card' THEN 'card' WHEN 'card_relationship_target' THEN 'card' "
+        "ELSE 'other' END, CASE WHEN null THEN 1 END, "
+        "CASE null WHEN null THEN 'null-matches-null' ELSE 'no' END",
+    )
+    assert found.rows == (("yes", "card", None, "null-matches-null"),)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    (
+        "CASE WHEN true THEN 1 ELSE 1 / 0 END",
+        "CASE WHEN true THEN 1 WHEN 1 / 0 = 0 THEN 2 ELSE 3 END",
+        "CASE 1 WHEN 1 THEN 1 ELSE 1 / 0 END",
+        "CASE 1 WHEN 1 THEN 1 WHEN 2 THEN 1 / 0 ELSE 3 END",
+    ),
+)
+def test_case_eagerly_evaluates_every_condition_and_result_arm(
+    stack: QueryStack, expression: str
+) -> None:
+    # Ladybug 0.16.0 evaluates all WHEN, THEN and ELSE expressions before choosing an arm.
+    with pytest.raises(GrafxPlanError):
+        run(stack, f"RETURN {expression}")
+
+
+def test_case_promotes_declared_numeric_arms_before_reading_rows(
+    stack: QueryStack,
+) -> None:
+    _add_coalesce_type_table(stack)
+    found = run(
+        stack,
+        "MATCH (t:ScalarTypes) RETURN CASE WHEN t.id = 1 THEN t.i ELSE t.d END "
+        "ORDER BY t.id",
+    )
+    assert found.rows == ((1.0,), (2.5,))
+    assert all(type(row[0]) is float for row in found.rows)
+
+    # A zero-row plan still resolves both declared types and keeps the DOUBLE result contract.
+    stack.engine.explain(
+        "MATCH (t:ScalarTypes) WHERE t.id = -1 "
+        "RETURN CASE WHEN true THEN t.i ELSE t.d END"
+    )
+
+    # Deliberate Ladybug 0.16.0 divergence: the reference lets the first arm choose INT64 and
+    # truncates a later DOUBLE. Grafx uses the common numeric type in either written order.
+    reordered = run(
+        stack,
+        "RETURN CASE WHEN true THEN 1 ELSE 2.5 END, "
+        "CASE WHEN false THEN 2.5 ELSE 1 END, "
+        "CASE WHEN true THEN $number ELSE 1 END",
+        {"number": 2.5},
+    )
+    assert reordered.rows == ((1.0, 1.0, 2.5),)
+    assert all(type(value) is float for value in reordered.rows[0])
+
+
+@pytest.mark.parametrize(
+    "expression",
+    (
+        "CASE WHEN true THEN 1 ELSE 'text' END",
+        "CASE WHEN 1 THEN 1 ELSE 2 END",
+        "CASE 1 WHEN '1' THEN 1 ELSE 2 END",
+        "CASE WHEN true THEN [1] ELSE [2] END",
+        "CASE WHEN true THEN {a: 1} ELSE {a: 2} END",
+    ),
+)
+def test_case_refuses_non_boolean_conditions_and_incompatible_or_non_scalar_arms(
+    stack: QueryStack, expression: str
+) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        stack.engine.explain(f"RETURN {expression}")
+    assert failure.value.details["field"] == "case"
+
+
+@pytest.mark.parametrize(
+    ("query", "field"),
+    (
+        (
+            "RETURN CASE WHEN true THEN 1 ELSE 2 END, "
+            "CASE WHEN 1 THEN 1 ELSE 2 END",
+            "case",
+        ),
+        ("RETURN [10][1], [10][true]", "subscript"),
+    ),
+)
+def test_type_metadata_never_confuses_boolean_and_integer_literals(
+    stack: QueryStack, query: str, field: str
+) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        run(stack, query)
+    assert failure.value.details["field"] == field
+
+
+def test_case_parameter_types_are_resolved_before_a_zero_row_stream(
+    stack: QueryStack,
+) -> None:
+    _add_coalesce_type_table(stack)
+    query = (
+        "MATCH (t:ScalarTypes) WHERE t.id = -1 "
+        "RETURN CASE WHEN $condition THEN t.i ELSE $fallback END"
+    )
+    with pytest.raises(GrafxPlanError) as wrong_condition:
+        run(stack, query, {"condition": 1, "fallback": 2})
+    assert wrong_condition.value.details["field"] == "case"
+    with pytest.raises(GrafxPlanError) as wrong_result:
+        run(stack, query, {"condition": True, "fallback": "text"})
+    assert wrong_result.value.details["field"] == "case"
+
+
+def test_case_binds_a_nested_parameter_expression_even_when_its_arm_is_not_selected(
+    stack: QueryStack,
+) -> None:
+    query = "RETURN CASE WHEN false THEN $number + 0 ELSE 1 END"
+    found = run(stack, query, {"number": 2.5})
+    assert found.rows == ((1.0,),)
+    assert type(found.rows[0][0]) is float
+
+    with pytest.raises(GrafxPlanError) as invalid:
+        run(stack, query, {"number": "bad"})
+    assert invalid.value.details == {"field": "operator", "value": "+"}
+
+
+def test_case_binds_a_nested_parameter_expression_before_a_zero_row_stream(
+    stack: QueryStack,
+) -> None:
+    query = (
+        "MATCH (p:Person) WHERE p.id = -1 "
+        "RETURN CASE WHEN false THEN $number + 0 ELSE p.id END"
+    )
+    assert run(stack, query, {"number": 2.5}).rows == ()
+
+    with pytest.raises(GrafxPlanError) as invalid:
+        run(stack, query, {"number": "bad"})
+    assert invalid.value.details == {"field": "operator", "value": "+"}
+
+
+def test_case_may_wrap_aggregates_without_changing_group_evaluation(
+    stack: QueryStack,
+) -> None:
+    found = run(
+        stack,
+        "MATCH (p:Person) RETURN CASE WHEN count(p.id) = 0 THEN 0.0 "
+        "ELSE sum(p.age) END AS score",
+    )
+    assert found.rows == ((174.0,),)
+
+
+def test_list_subscript_matches_ladybug_one_based_and_negative_positions(
+    stack: QueryStack,
+) -> None:
+    found = run(
+        stack,
+        "RETURN [10, 20][1], [10, 20][2], [10, 20][-1], [10, 20][-2], "
+        "[10, null][2], [10, 20][null], null[1]",
+    )
+    assert found.rows == ((10, 20, 20, 10, None, None, None),)
+
+
+@pytest.mark.parametrize("index", (0, 3, -3))
+def test_zero_and_out_of_range_list_positions_are_typed_refusals(
+    stack: QueryStack, index: int
+) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        run(stack, f"RETURN [10, 20][{index}]")
+    assert failure.value.details == {"field": "subscript", "value": index}
+
+
+@pytest.mark.parametrize("index", (1.0, True, "1"))
+def test_list_subscript_parameter_type_is_checked_before_rows(
+    stack: QueryStack, index: object
+) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        run(stack, "RETURN $items[$index]", {"items": [10, 20], "index": index})
+    assert failure.value.details["field"] == "subscript"
+
+
+def test_string_split_and_map_dot_compose_with_list_subscript(
+    stack: QueryStack,
+) -> None:
+    found = run(
+        stack,
+        "RETURN string_split('spec:abc:fr', ':')[2], {parts: [[10, 20]]}.PARTS[1][2]",
+    )
+    assert found.rows == (("abc", 20),)
+
+    with pytest.raises(GrafxPlanError) as map_bracket:
+        run(stack, "RETURN {a: 1}['a']")
+    assert map_bracket.value.details["field"] == "subscript"
+
+    with pytest.raises(GrafxPlanError) as missing_key:
+        run(stack, "RETURN {a: 1}.missing")
+    assert missing_key.value.details == {"field": "property", "value": "missing"}
+
+
+def test_parameter_map_dot_and_nested_list_subscripts_compose_in_a_batch(
+    stack: QueryStack,
+) -> None:
+    parameters = {
+        "m": {"items": [10, 20]},
+        "matrix": [[10, 20], [30, 40]],
+        "rows": [{"id": "x"}, {"id": "y"}],
+    }
+    found = run(
+        stack,
+        "RETURN $m.items[1], $matrix[1][2], $rows[1].ID, "
+        "CASE $rows[1].ID WHEN 'x' THEN $m.items[2] ELSE $matrix[2][1] END",
+        parameters,
+    )
+    assert found.rows == ((10, 20, "x", 20),)
+
+    with pytest.raises(GrafxPlanError) as map_bracket:
+        run(stack, "RETURN $m['items']", parameters)
+    assert map_bracket.value.details["field"] == "subscript"
+
+
+def test_parameter_map_key_collisions_are_refused_independently_of_order(
+    stack: QueryStack,
+) -> None:
+    failures: list[tuple[str, dict[str, object]]] = []
+    for value in ({"a": 1, "A": 2}, {"A": 2, "a": 1}):
+        with pytest.raises(GrafxPlanError) as collision:
+            run(stack, "RETURN $m.a", {"m": value})
+        failures.append((str(collision.value), collision.value.details))
+
+    assert failures[0] == failures[1]
+    assert failures[0][1] == {"field": "parameter", "value": "m"}
+
+
+@pytest.mark.parametrize(
+    "row", ({"id": "x", "ID": "y"}, {"ID": "y", "id": "x"})
+)
+def test_nested_batch_map_key_collisions_are_refused_at_bind(
+    stack: QueryStack, row: dict[str, str]
+) -> None:
+    with pytest.raises(GrafxPlanError) as collision:
+        run(stack, "RETURN $rows[1].id", {"rows": [row]})
+    assert collision.value.details == {"field": "parameter", "value": "rows"}
+
+
 def test_and_is_false_as_soon_as_either_side_is(stack: QueryStack) -> None:
     found = run(stack, "MATCH (p:Person) WHERE p.age > 40 AND p.city = 'Nowhere' RETURN p.name")
     assert found.rows == ()

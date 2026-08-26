@@ -918,7 +918,20 @@ positional string or list; both propagate null.
 `string_split` compresses empty fields between repeated separators, preserves a final empty field
 and, with an empty separator, splits a non-empty input into Unicode code points. The empty-input,
 empty-separator pair is undefined and refused. `size` counts Unicode code points in a string and
-elements in a list.
+elements in a list. Searched and simple `CASE` evaluate every written `WHEN`, `THEN` and `ELSE`
+expression from left to right before choosing the first match; an omitted `ELSE` produces null.
+Searched conditions accept only boolean or null. Simple CASE compares within one scalar family,
+with integer/double compatibility and null matching null. Result arms accept the same scalar
+families as `coalesce` and use the same numeric promotion; declared, literal and parameter types
+are resolved before rows are produced. This numeric rule deliberately differs from Ladybug 0.16,
+which lets the first result arm choose the output type and can truncate a later double to an
+integer: Grafx promotes to double in either written order and never makes row order or nullness
+decide the type. `list[index]` uses one-based positive positions and
+negative positions from the end. A null list or index produces null; zero, an out-of-range
+position, a non-integer index or a non-list subject is refused. Map fields remain dot-accessed
+case-insensitively; bracket syntax is list extraction and never map-key access. A referenced
+parameter map, including a map nested in a list, is refused during binding when two string keys
+collide case-insensitively, so lookup never depends on insertion order.
 
 ```
 MATCH (n:Chunk)-[:BELONGS_TO]->(d:Doc)

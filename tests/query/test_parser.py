@@ -8,6 +8,7 @@ from okto_grafx.domain.errors import GrafxParseError, GrafxQueryError
 from okto_grafx.domain.model.value import INT64_MAX, INT64_MIN
 from okto_grafx.domain.query.ast import (
     BinaryOperation,
+    CaseExpression,
     CreateClause,
     CreateNodeTableStatement,
     CreateRelTableStatement,
@@ -21,6 +22,7 @@ from okto_grafx.domain.query.ast import (
     Property,
     Query,
     SetClause,
+    Subscript,
     UnaryOperation,
     Variable,
 )
@@ -322,6 +324,38 @@ def test_an_aggregate_may_take_distinct_or_a_star() -> None:
 def test_a_list_and_a_map_read_as_their_own_nodes() -> None:
     assert only_item("RETURN [1, 2]").describe() == "[1, 2]"
     assert only_item("RETURN {a: 1}").describe() == "{a: 1}"
+
+
+def test_searched_and_simple_case_are_distinct_immutable_nodes() -> None:
+    searched = only_item("RETURN CASE WHEN true THEN 1 ELSE 2 END")
+    simple = only_item("RETURN CASE $kind WHEN 'a' THEN 1 END")
+    assert isinstance(searched, CaseExpression)
+    assert searched.operand is None
+    assert searched.alternatives[0].condition == Literal(value=True)
+    assert searched.fallback == Literal(value=2)
+    assert isinstance(simple, CaseExpression)
+    assert simple.operand == Parameter(name="kind")
+    assert simple.fallback is None
+
+
+def test_property_and_subscript_postfixes_may_be_interleaved() -> None:
+    expression = only_item("RETURN {parts: [[10, 20]]}.parts[1][2]")
+    assert isinstance(expression, Subscript)
+    assert expression.describe() == "{parts: [[10, 20]]}.parts[1][2]"
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "RETURN CASE END",
+        "RETURN CASE WHEN true END",
+        "RETURN CASE WHEN true THEN 1",
+        "RETURN [1][]",
+    ),
+)
+def test_incomplete_case_and_subscript_forms_are_located_refusals(text: str) -> None:
+    with pytest.raises(GrafxParseError):
+        parse(text)
 
 
 # --- refusals -------------------------------------------------------------------------------

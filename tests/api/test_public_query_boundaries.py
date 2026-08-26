@@ -188,6 +188,17 @@ def test_maximum_string_literal_keeps_its_query_derived_result_column() -> None:
     assert result.rows == ((literal,),)
 
 
+def test_case_and_subscript_survive_the_detached_public_plan_boundary() -> None:
+    text = "RETURN CASE WHEN true THEN [10, 20][2] ELSE 0 END AS selected"
+    with connect(":memory:") as database:
+        plan = database.explain(text)
+        result = database.execute(text)
+
+    assert type(plan) is ProduceResults
+    assert result.columns == ("selected",)
+    assert result.rows == ((20,),)
+
+
 @pytest.mark.parametrize("character", ["\x00", "\U000e0001"])
 def test_maximum_nonprintable_string_literal_fits_rendered_query_bound(
     character: str,

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 
 from okto_grafx.domain.errors import GrafxPlanError
 from okto_grafx.domain.query.ast import (
+    CaseExpression,
     CreateClause,
     CreateNodeTableStatement,
     CreateRelTableStatement,
@@ -489,6 +490,13 @@ class _Analyzer:
                 self._note_parameter(node.name)
             elif isinstance(node, FunctionCall):
                 self._check_call(node, where=where)
+            elif isinstance(node, CaseExpression) and not node.alternatives:
+                message = "A CASE expression needs at least one WHEN alternative."
+                raise self._refuse(
+                    message,
+                    field="case",
+                    value=node.describe(),
+                )
 
     def _check_call(self, call: FunctionCall, *, where: str) -> None:
         """Check one function call: aggregate nesting, the star form and the two extensions."""

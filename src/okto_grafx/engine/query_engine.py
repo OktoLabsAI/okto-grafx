@@ -101,6 +101,7 @@ from okto_grafx.domain.query.analysis import Aggregation, QueryAnalysis, analyze
 from okto_grafx.domain.query.ast import (
     Direction,
     BinaryOperation,
+    CaseExpression,
     Expression,
     FunctionCall,
     ListExpression,
@@ -111,8 +112,10 @@ from okto_grafx.domain.query.ast import (
     Property,
     SortItem,
     Statement,
+    Subscript,
     UnaryOperation,
     Variable,
+    walk,
 )
 from okto_grafx.domain.query.limits import (
     MAX_NAME_CHARACTERS,
@@ -152,7 +155,10 @@ from okto_grafx.domain.query.planner import (
     SCORE_COLUMN,
     PlannedQuery,
     build_plan,
+    case_comparison_type,
+    case_result_type,
     coalesce_result_type,
+    subscript_argument_types,
 )
 from okto_grafx.domain.query.tokens import (
     AGGREGATE_FUNCTIONS,
@@ -478,6 +484,7 @@ class _Context:
     analysis: QueryAnalysis
     statistics: dict[str, int]
     coalesce_types: dict[FunctionCall, ValueType | None]
+    case_types: dict[int, ValueType | None]
     # The catalog this statement was PLANNED against. Inside a transaction that has declared
     # schema of its own, that is the transaction's working copy, and execution must resolve
     # tables and spaces from the same picture the planner did -- a row materialised for a table
@@ -982,6 +989,7 @@ class QueryEngine:
                     value=name,
                 )
             bound[name] = supplied[name]  # type: ignore[assignment]
+        _validate_parameter_maps(bound)
         return bound
 
     # --- running -----------------------------------------------------------------------------
@@ -1012,9 +1020,11 @@ class QueryEngine:
             analysis=plan.analysis,
             statistics=statistics,
             coalesce_types=_bound_coalesce_types(plan, parameters),
+            case_types=_bound_case_types(plan, parameters),
             catalog=catalog,
             result_node=root.child if root.columns else None,
         )
+        _validate_bound_subscript_types(plan, parameters)
         stream = self._rows(root.child, context)
         rows = self._collect_result_rows(stream) if root.columns else tuple(stream)
         context.release()
@@ -3623,6 +3633,8 @@ def _evaluate(expression: Expression, row: _Row, context: _Context) -> object:
         subject = _evaluate(expression.subject, row, context)
         if subject is None:
             return None
+        if isinstance(subject, Mapping):
+            return _map_property_value(subject, expression)
         if not isinstance(subject, RowBinding):
             raise GrafxPlanError(
                 f"A property is read from a matched row; {expression.describe()} reads a "
@@ -3642,12 +3654,144 @@ def _evaluate(expression: Expression, row: _Row, context: _Context) -> object:
         return tuple(_evaluate(element, row, context) for element in expression.elements)
     if isinstance(expression, MapExpression):
         return {entry.key: _evaluate(entry.value, row, context) for entry in expression.entries}
+    if isinstance(expression, CaseExpression):
+        return _case(expression, row, context)
+    if isinstance(expression, Subscript):
+        return _subscript(expression, row, context)
     if isinstance(expression, FunctionCall):
         return _call(expression, row, context)
     raise GrafxPlanError(
         f"An expression of type {type(expression).__name__} cannot be evaluated.",
         field="expression",
         value=type(expression).__name__,
+    )
+
+
+def _case(expression: CaseExpression, row: _Row, context: _Context) -> object:
+    """Evaluate every CASE expression eagerly, then select its first matching arm."""
+    operand = (
+        _evaluate(expression.operand, row, context)
+        if expression.operand is not None
+        else None
+    )
+    alternatives: list[tuple[object, object]] = []
+    for alternative in expression.alternatives:
+        condition = _evaluate(alternative.condition, row, context)
+        result = _evaluate(alternative.result, row, context)
+        alternatives.append((condition, result))
+    fallback = (
+        _evaluate(expression.fallback, row, context)
+        if expression.fallback is not None
+        else None
+    )
+
+    selected = fallback
+    if expression.operand is None:
+        for condition, result in alternatives:
+            if condition is not None and not isinstance(condition, bool):
+                message = (
+                    f"A searched CASE tests booleans or nulls; got "
+                    f"{type(condition).__name__}."
+                )
+                raise GrafxPlanError(
+                    message,
+                    field="case",
+                    value=expression.describe(),
+                )
+            if condition is True:
+                selected = result
+                break
+    else:
+        for condition, result in alternatives:
+            equal = (
+                operand is None
+                and condition is None
+                or operand is not None
+                and condition is not None
+                and _equal(operand, condition)
+            )
+            if equal:
+                selected = result
+                break
+
+    result_type = context.case_types.get(id(expression))
+    if result_type is ValueType.DOUBLE and selected is not None:
+        return float(selected)
+    return selected
+
+
+def _subscript(expression: Subscript, row: _Row, context: _Context) -> object:
+    """Extract one element with Ladybug's one-based positive and negative positions."""
+    subject = _evaluate(expression.subject, row, context)
+    index = _evaluate(expression.index, row, context)
+    return _subscript_value(expression, subject, index)
+
+
+def _subscript_value(
+    expression: Subscript, subject: object, index: object
+) -> object:
+    """Extract one already evaluated list element under the public subscript contract."""
+    if subject is None or index is None:
+        return None
+    if not isinstance(subject, (list, tuple)):
+        message = f"A subscript extracts from a list; got {type(subject).__name__}."
+        raise GrafxPlanError(
+            message,
+            field="subscript",
+            value=expression.describe(),
+        )
+    if isinstance(index, bool) or not isinstance(index, int):
+        message = (
+            f"A list subscript is a whole-number position; got {type(index).__name__}."
+        )
+        raise GrafxPlanError(
+            message,
+            field="subscript",
+            value=expression.describe(),
+        )
+    if index == 0:
+        message = "A list subscript uses one-based positions; zero is not a position."
+        raise GrafxPlanError(
+            message,
+            field="subscript",
+            value=index,
+        )
+    offset = index - 1 if index > 0 else index
+    if not -len(subject) <= offset < len(subject):
+        message = (
+            f"The list subscript {index} is out of range for {len(subject)} elements."
+        )
+        raise GrafxPlanError(
+            message,
+            field="subscript",
+            value=index,
+        )
+    return subject[offset]
+
+
+def _map_property_value(subject: Mapping[object, object], expression: Property) -> object:
+    """Read one case-insensitive map key, refusing an ambiguous parameter map."""
+    folded = expression.key.lower()
+    matches = tuple(
+        (key, value)
+        for key, value in subject.items()
+        if isinstance(key, str) and key.lower() == folded
+    )
+    if len(matches) > 1:
+        keys = ", ".join(repr(key) for key, _value in sorted(matches))
+        message = f"The map in {expression.describe()} has colliding keys {keys}."
+        raise GrafxPlanError(
+            message,
+            field="property",
+            value=expression.key,
+        )
+    if matches:
+        return matches[0][1]
+    message = f"The map in {expression.describe()} has no key {expression.key!r}."
+    raise GrafxPlanError(
+        message,
+        field="property",
+        value=expression.key,
     )
 
 
@@ -3842,6 +3986,433 @@ def _coalesce_value_type(expression: FunctionCall, value: object) -> ValueType:
             field="function",
             value=expression.name,
         ) from failure
+
+
+def _validate_parameter_maps(parameters: Mapping[str, object]) -> None:
+    """Refuse case-insensitive map-key collisions deterministically during binding."""
+    for name in sorted(parameters):
+        _validate_parameter_map_value(parameters[name], parameter=name, seen=set())
+
+
+def _validate_parameter_map_value(
+    value: object, *, parameter: str, seen: set[int]
+) -> None:
+    """Validate every nested map carried by one referenced parameter."""
+    if not isinstance(value, (Mapping, list, tuple)):
+        return
+    marker = id(value)
+    if marker in seen:
+        return
+    seen.add(marker)
+    if isinstance(value, Mapping):
+        by_folded: dict[str, list[str]] = {}
+        for key in value:
+            if isinstance(key, str):
+                by_folded.setdefault(key.lower(), []).append(key)
+        collisions = tuple(
+            sorted(
+                (folded, tuple(sorted(keys)))
+                for folded, keys in by_folded.items()
+                if len(keys) > 1
+            )
+        )
+        if collisions:
+            keys = ", ".join(repr(key) for key in collisions[0][1])
+            message = (
+                f"Parameter ${parameter} contains map keys {keys} that collide "
+                "case-insensitively."
+            )
+            raise GrafxPlanError(
+                message,
+                field="parameter",
+                value=parameter,
+            )
+        ordered = sorted(
+            value.items(), key=lambda item: (type(item[0]).__name__, repr(item[0]))
+        )
+        for _key, item in ordered:
+            _validate_parameter_map_value(item, parameter=parameter, seen=seen)
+        return
+    for item in value:
+        _validate_parameter_map_value(item, parameter=parameter, seen=seen)
+
+
+def _bound_value_type(
+    expression: Expression, value: object, *, owner: str
+) -> ValueType:
+    """Return a parameter-derived value type with the query binder's error taxonomy."""
+    if isinstance(value, Mapping):
+        return ValueType.MAP
+    try:
+        return value_type_of(value)  # type: ignore[arg-type]
+    except GrafxError as failure:
+        message = f"{owner} cannot use a value of type {type(value).__name__}."
+        parameter = next(
+            (node.name for node in walk(expression) if isinstance(node, Parameter)),
+            expression.describe(),
+        )
+        raise GrafxPlanError(
+            message,
+            field="parameter",
+            value=parameter,
+        ) from failure
+
+
+def _bound_postfix_value(
+    expression: Expression, parameters: Mapping[str, object], *, owner: str
+) -> object:
+    """Evaluate a row-independent parameter/list/map postfix chain during binding."""
+    if isinstance(expression, Literal):
+        return expression.value
+    if isinstance(expression, Parameter):
+        return parameters[expression.name]
+    if isinstance(expression, ListExpression):
+        return tuple(
+            _bound_postfix_value(element, parameters, owner=owner)
+            for element in expression.elements
+        )
+    if isinstance(expression, MapExpression):
+        return {
+            entry.key: _bound_postfix_value(entry.value, parameters, owner=owner)
+            for entry in expression.entries
+        }
+    if isinstance(expression, Property):
+        subject = _bound_postfix_value(expression.subject, parameters, owner=owner)
+        if subject is None:
+            return None
+        if isinstance(subject, Mapping):
+            return _map_property_value(subject, expression)
+    elif isinstance(expression, Subscript):
+        subject = _bound_postfix_value(expression.subject, parameters, owner=owner)
+        index = _bound_postfix_value(expression.index, parameters, owner=owner)
+        return _subscript_value(expression, subject, index)
+    message = (
+        f"The binder cannot evaluate the row-independent postfix value "
+        f"{expression.describe()} in {owner}."
+    )
+    raise GrafxPlanError(
+        message,
+        field="expression",
+        value=expression.describe(),
+    )
+
+
+def _bound_pulse_expression_type(
+    expression: Expression,
+    static_types: Mapping[int, ValueType | None],
+    parameters: Mapping[str, object],
+    *,
+    owner: str,
+) -> ValueType | None:
+    """Resolve and validate one CASE/subscript expression before rows are produced."""
+    static_type = static_types.get(id(expression))
+    if isinstance(expression, Literal):
+        return value_type_of(expression.value)
+    if isinstance(expression, Parameter):
+        return _bound_value_type(
+            expression, parameters[expression.name], owner=owner
+        )
+    if isinstance(expression, Property):
+        if any(isinstance(node, Variable) for node in walk(expression.subject)):
+            return static_type
+        value = _bound_postfix_value(expression, parameters, owner=owner)
+        return _bound_value_type(expression, value, owner=owner)
+    if isinstance(expression, NullCheck):
+        _bound_pulse_expression_type(
+            expression.operand, static_types, parameters, owner=owner
+        )
+        return ValueType.BOOL
+    if isinstance(expression, UnaryOperation):
+        operand_type = _bound_pulse_expression_type(
+            expression.operand, static_types, parameters, owner=owner
+        )
+        if expression.operator == "NOT":
+            return ValueType.BOOL
+        if operand_type in (ValueType.NULL, ValueType.INT64, ValueType.DOUBLE):
+            return operand_type
+        if operand_type is None:
+            return static_type
+        message = f"A sign applies to a number; got {operand_type.name}."
+        raise GrafxPlanError(
+            message,
+            field="operator",
+            value=expression.operator,
+        )
+    if isinstance(expression, BinaryOperation):
+        left = _bound_pulse_expression_type(
+            expression.left, static_types, parameters, owner=owner
+        )
+        right = _bound_pulse_expression_type(
+            expression.right, static_types, parameters, owner=owner
+        )
+        if expression.operator in (
+            "AND",
+            "OR",
+            "XOR",
+            "=",
+            "<>",
+            "<",
+            "<=",
+            ">",
+            ">=",
+            "STARTS WITH",
+            "ENDS WITH",
+            "CONTAINS",
+        ):
+            return ValueType.BOOL
+        if expression.operator == "IN":
+            if right not in (None, ValueType.NULL, ValueType.LIST):
+                message = f"IN looks inside a list; got {right.name}."
+                raise GrafxPlanError(
+                    message,
+                    field="operator",
+                    value=expression.operator,
+                )
+            return ValueType.BOOL
+        if left is None or right is None:
+            return static_type
+        if ValueType.NULL in (left, right):
+            return ValueType.NULL
+        if (
+            expression.operator == "+"
+            and left is ValueType.STRING
+            and right is ValueType.STRING
+        ):
+            return ValueType.STRING
+        if left in (ValueType.INT64, ValueType.DOUBLE) and right in (
+            ValueType.INT64,
+            ValueType.DOUBLE,
+        ):
+            if expression.operator == "^" or ValueType.DOUBLE in (left, right):
+                return ValueType.DOUBLE
+            return ValueType.INT64
+        message = (
+            f"The operator {expression.operator!r} applies to numbers; got "
+            f"{left.name} and {right.name}."
+        )
+        raise GrafxPlanError(
+            message,
+            field="operator",
+            value=expression.operator,
+        )
+    if isinstance(expression, FunctionCall):
+        name = expression.name.upper()
+        argument_types = tuple(
+            _bound_pulse_expression_type(
+                argument, static_types, parameters, owner=owner
+            )
+            for argument in expression.arguments
+        )
+        if name == COALESCE_FUNCTION:
+            result_type = coalesce_result_type(expression.name, argument_types)
+            if result_type is None and all(
+                value_type is ValueType.NULL for value_type in argument_types
+            ):
+                return ValueType.NULL
+            return result_type
+        if name == STRING_SPLIT_FUNCTION:
+            wrong = tuple(
+                value_type
+                for value_type in argument_types
+                if value_type not in (None, ValueType.NULL, ValueType.STRING)
+            )
+            if wrong:
+                names = ", ".join(sorted({value_type.name for value_type in wrong}))
+                message = f"{expression.name} takes strings; got {names}."
+                raise GrafxPlanError(
+                    message,
+                    field="function",
+                    value=expression.name,
+                )
+            return ValueType.LIST
+        if name == SIZE_FUNCTION:
+            argument_type = argument_types[0]
+            if argument_type not in (
+                None,
+                ValueType.NULL,
+                ValueType.STRING,
+                ValueType.LIST,
+            ):
+                message = (
+                    f"{expression.name} measures a string or list; got "
+                    f"{argument_type.name}."
+                )
+                raise GrafxPlanError(
+                    message,
+                    field="function",
+                    value=expression.name,
+                )
+            return ValueType.INT64
+        return static_type
+    if isinstance(expression, ListExpression):
+        for element in expression.elements:
+            _bound_pulse_expression_type(
+                element, static_types, parameters, owner=owner
+            )
+        return ValueType.LIST
+    if isinstance(expression, MapExpression):
+        for entry in expression.entries:
+            _bound_pulse_expression_type(
+                entry.value, static_types, parameters, owner=owner
+            )
+        return ValueType.MAP
+    if isinstance(expression, Subscript):
+        subject_type = _bound_pulse_expression_type(
+            expression.subject, static_types, parameters, owner=owner
+        )
+        index_type = _bound_pulse_expression_type(
+            expression.index, static_types, parameters, owner=owner
+        )
+        subscript_argument_types(expression, subject_type, index_type)
+        if not any(isinstance(node, Variable) for node in walk(expression)):
+            value = _bound_postfix_value(expression, parameters, owner=owner)
+            return _bound_value_type(expression, value, owner=owner)
+        return static_type
+    if isinstance(expression, CaseExpression):
+        compared = (
+            tuple(alternative.condition for alternative in expression.alternatives)
+            if expression.operand is None
+            else (
+                expression.operand,
+                *(alternative.condition for alternative in expression.alternatives),
+            )
+        )
+        comparison_types = tuple(
+            _bound_pulse_expression_type(
+                item, static_types, parameters, owner=expression.describe()
+            )
+            for item in compared
+        )
+        case_comparison_type(expression, comparison_types)
+        result_types = tuple(
+            _bound_pulse_expression_type(
+                item, static_types, parameters, owner=expression.describe()
+            )
+            for item in expression.result_expressions()
+        )
+        result_type = case_result_type(expression, result_types)
+        if result_type is None and all(
+            value_type is ValueType.NULL for value_type in result_types
+        ):
+            return ValueType.NULL
+        return result_type
+    return static_type
+
+
+def _required_bound_expression_type(
+    expression: Expression,
+    static_types: Mapping[int, ValueType | None],
+    parameters: Mapping[str, object],
+    *,
+    owner: str,
+) -> ValueType:
+    """Return a fully bound scalar type, refusing metadata that still depends on a row."""
+    value_type = _bound_pulse_expression_type(
+        expression, static_types, parameters, owner=owner
+    )
+    if value_type is not None:
+        return value_type
+    message = f"The plan left the type of {expression.describe()} in {owner} unresolved."
+    raise GrafxPlanError(
+        message,
+        field="expression",
+        value=expression.describe(),
+    )
+
+
+def _bound_case_types(
+    plan: PlannedQuery, parameters: Mapping[str, object]
+) -> dict[int, ValueType | None]:
+    """Resolve CASE comparands and result arms before the first row is read."""
+    comparisons = {
+        id(expression): planned_types
+        for expression, planned_types in plan.case_comparison_types
+    }
+    static_types = {
+        id(expression): value_type
+        for expression, value_type in plan.pulse_expression_types
+    }
+    resolved: dict[int, ValueType | None] = {}
+    for expression, planned_results in plan.case_result_types:
+        compared = (
+            tuple(alternative.condition for alternative in expression.alternatives)
+            if expression.operand is None
+            else (
+                expression.operand,
+                *(alternative.condition for alternative in expression.alternatives),
+            )
+        )
+        marker = id(expression)
+        planned_comparisons = comparisons.get(marker)
+        if planned_comparisons is None or len(planned_comparisons) != len(compared):
+            message = "A CASE plan must carry every comparison type."
+            raise GrafxPlanError(
+                message,
+                field="plan",
+                value=expression.describe(),
+            )
+        comparison_types = tuple(
+            _required_bound_expression_type(
+                item,
+                static_types,
+                parameters,
+                owner=expression.describe(),
+            )
+            for item in compared
+        )
+        case_comparison_type(expression, comparison_types)
+        results = expression.result_expressions()
+        if len(planned_results) != len(results):
+            message = "A CASE plan must carry every result-arm type."
+            raise GrafxPlanError(
+                message,
+                field="plan",
+                value=expression.describe(),
+            )
+        result_types = tuple(
+            _required_bound_expression_type(
+                item,
+                static_types,
+                parameters,
+                owner=expression.describe(),
+            )
+            for item in results
+        )
+        resolved[marker] = case_result_type(expression, result_types)
+    if set(comparisons) != set(resolved):
+        message = (
+            "A CASE plan carries comparison metadata without matching result metadata."
+        )
+        raise GrafxPlanError(
+            message,
+            field="plan",
+            value="case_types",
+        )
+    return resolved
+
+
+def _validate_bound_subscript_types(
+    plan: PlannedQuery, parameters: Mapping[str, object]
+) -> None:
+    """Complete list and index parameter types before the first row is read."""
+    static_types = {
+        id(expression): value_type
+        for expression, value_type in plan.pulse_expression_types
+    }
+    for expression, planned_types in plan.subscript_types:
+        subject_type = _required_bound_expression_type(
+            expression.subject,
+            static_types,
+            parameters,
+            owner=expression.describe(),
+        )
+        index_type = _required_bound_expression_type(
+            expression.index,
+            static_types,
+            parameters,
+            owner=expression.describe(),
+        )
+        subscript_argument_types(expression, subject_type, index_type)
 
 
 def _bound_coalesce_types(

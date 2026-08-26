@@ -27,6 +27,8 @@ from okto_grafx.domain.query.limits import MAX_EXPRESSION_DEPTH
 
 __all__ = [
     "BinaryOperation",
+    "CaseAlternative",
+    "CaseExpression",
     "ColumnSpec",
     "CreateClause",
     "CreateNodeTableStatement",
@@ -56,6 +58,7 @@ __all__ = [
     "SetItem",
     "SortItem",
     "Statement",
+    "Subscript",
     "UnaryOperation",
     "UpdatingClause",
     "Variable",
@@ -167,6 +170,77 @@ class BinaryOperation(Expression):
     def describe(self) -> str:
         """Return the parenthesised operation, so precedence is never ambiguous in a plan."""
         return f"({self.left.describe()} {self.operator} {self.right.describe()})"
+
+
+@dataclass(frozen=True, slots=True)
+class CaseAlternative:
+    """One ``WHEN`` expression and the ``THEN`` expression paired with it."""
+
+    condition: Expression
+    result: Expression
+
+    def describe(self) -> str:
+        """Return this alternative as it is written inside a CASE expression."""
+        return f"WHEN {self.condition.describe()} THEN {self.result.describe()}"
+
+
+@dataclass(frozen=True, slots=True)
+class CaseExpression(Expression):
+    """A searched or simple ``CASE`` expression.
+
+    ``operand`` is absent for searched CASE and present for simple CASE. ``fallback`` being absent
+    records an omitted ELSE rather than manufacturing a literal; execution gives both forms the
+    same null result while the AST still describes exactly what the caller wrote.
+    """
+
+    operand: Expression | None
+    alternatives: tuple[CaseAlternative, ...]
+    fallback: Expression | None = None
+
+    def children(self) -> tuple[Expression, ...]:
+        """Return every written expression in evaluation order."""
+        children: list[Expression] = []
+        if self.operand is not None:
+            children.append(self.operand)
+        for alternative in self.alternatives:
+            children.extend((alternative.condition, alternative.result))
+        if self.fallback is not None:
+            children.append(self.fallback)
+        return tuple(children)
+
+    def result_expressions(self) -> tuple[Expression, ...]:
+        """Return every explicit result arm, including ELSE when it was written."""
+        results = [alternative.result for alternative in self.alternatives]
+        if self.fallback is not None:
+            results.append(self.fallback)
+        return tuple(results)
+
+    def describe(self) -> str:
+        """Return a compact unambiguous rendering of this CASE expression."""
+        parts = ["CASE"]
+        if self.operand is not None:
+            parts.append(self.operand.describe())
+        parts.extend(alternative.describe() for alternative in self.alternatives)
+        if self.fallback is not None:
+            parts.extend(("ELSE", self.fallback.describe()))
+        parts.append("END")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True, slots=True)
+class Subscript(Expression):
+    """A one-based list extraction written as ``subject[index]``."""
+
+    subject: Expression
+    index: Expression
+
+    def children(self) -> tuple[Expression, ...]:
+        """Return the list expression and then its index."""
+        return (self.subject, self.index)
+
+    def describe(self) -> str:
+        """Return the postfix list extraction."""
+        return f"{self.subject.describe()}[{self.index.describe()}]"
 
 
 @dataclass(frozen=True, slots=True)

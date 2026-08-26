@@ -14,6 +14,7 @@ from okto_grafx.domain.query.analysis import (
     is_aggregate,
 )
 from okto_grafx.domain.query.ast import (
+    CaseExpression,
     FunctionCall,
     Literal,
     Parameter,
@@ -83,6 +84,32 @@ def test_parameters_are_collected_once_each_in_first_appearance_order() -> None:
         "MATCH (p:Person) WHERE p.id = $id AND p.age = $age OR p.city = $id RETURN p.name"
     )
     assert found.parameters == ("id", "age")
+
+
+def test_case_and_subscript_parameters_follow_written_order() -> None:
+    found = analysis_of(
+        "RETURN CASE $kind WHEN $wanted THEN $items[$position] ELSE $fallback END"
+    )
+    assert found.parameters == ("kind", "wanted", "items", "position", "fallback")
+
+
+def test_a_prebuilt_case_still_needs_one_when_alternative() -> None:
+    statement = Query(
+        return_clause=ReturnClause(
+            items=(
+                ReturnItem(
+                    expression=CaseExpression(
+                        operand=None,
+                        alternatives=(),
+                        fallback=Literal(value=1),
+                    )
+                ),
+            )
+        )
+    )
+    with pytest.raises(GrafxPlanError) as failure:
+        analyze(statement)
+    assert failure.value.details["field"] == "case"
 
 
 def test_a_row_window_may_be_a_parameter() -> None:

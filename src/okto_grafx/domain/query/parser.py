@@ -30,6 +30,8 @@ from okto_grafx.domain.errors import GrafxParseError
 from okto_grafx.domain.model.value import INT64_MAX, INT64_MIN
 from okto_grafx.domain.query.ast import (
     BinaryOperation,
+    CaseAlternative,
+    CaseExpression,
     ColumnSpec,
     CreateClause,
     CreateNodeTableStatement,
@@ -59,6 +61,7 @@ from okto_grafx.domain.query.ast import (
     SetItem,
     SortItem,
     Statement,
+    Subscript,
     UnaryOperation,
     UpdatingClause,
     Variable,
@@ -843,13 +846,23 @@ class _Parser:
         return number
 
     def _postfix(self) -> Expression:
-        """Parse an atom followed by any number of property accesses."""
+        """Parse an atom followed by any number of property accesses or list extracts."""
         expression = self._atom()
-        while self._at_symbol(".") and self._peek().kind is TokenKind.NAME:
-            self._advance()
-            key = self._advance().text
-            expression = Property(subject=expression, key=key)
-        return expression
+        while True:
+            if self._at_symbol(".") and self._peek().kind is TokenKind.NAME:
+                self._advance()
+                key = self._advance().text
+                expression = Property(subject=expression, key=key)
+                continue
+            if self._at_symbol("["):
+                self._advance()
+                self._descend()
+                index = self._expression()
+                self._ascend()
+                self._take_symbol("]")
+                expression = Subscript(subject=expression, index=index)
+                continue
+            return expression
 
     def _atom(self) -> Expression:
         """Parse the smallest complete expression: a literal, a name, a call or a grouping."""
@@ -877,9 +890,51 @@ class _Parser:
             return self._list_literal()
         if self._at_symbol("{"):
             return self._map_literal()
+        if self._at_keyword("CASE"):
+            return self._case_expression()
         if token.kind is TokenKind.NAME:
             return self._name_expression(token)
         raise self._unexpected("an expression")
+
+    def _case_expression(self) -> CaseExpression:
+        """Parse searched and simple CASE, each with one or more WHEN alternatives."""
+        self._take_keyword("CASE")
+        operand: Expression | None = None
+        if not self._at_keyword("WHEN"):
+            self._descend()
+            operand = self._expression()
+            self._ascend()
+        alternatives: list[CaseAlternative] = []
+        while self._match_keyword("WHEN"):
+            if len(alternatives) >= MAX_LIST_ELEMENTS:
+                message = f"A CASE expression may carry at most {MAX_LIST_ELEMENTS} alternatives"
+                raise self._refuse(
+                    message,
+                    field="alternatives",
+                    value=MAX_LIST_ELEMENTS,
+                )
+            self._descend()
+            condition = self._expression()
+            self._ascend()
+            self._take_keyword("THEN")
+            self._descend()
+            result = self._expression()
+            self._ascend()
+            alternatives.append(CaseAlternative(condition=condition, result=result))
+        if not alternatives:
+            wanted = "WHEN in a CASE expression"
+            raise self._unexpected(wanted)
+        fallback: Expression | None = None
+        if self._match_keyword("ELSE"):
+            self._descend()
+            fallback = self._expression()
+            self._ascend()
+        self._take_keyword("END")
+        return CaseExpression(
+            operand=operand,
+            alternatives=tuple(alternatives),
+            fallback=fallback,
+        )
 
     def _name_expression(self, token: Token) -> Expression:
         """Parse a name, which may be a constant, a function call or a variable."""
