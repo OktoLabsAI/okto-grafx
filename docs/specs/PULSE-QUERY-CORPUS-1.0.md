@@ -4,8 +4,10 @@
 
 M-PULSE-2A introduced this freeze of **what Pulse actually asks a graph to do**, so every
 language sub-batch can ratchet against evidence rather than against an impression of how much
-Cypher is in use. M-PULSE-2B added `coalesce`, `string_split` and `size`; M-PULSE-2C adds searched
-and simple `CASE` plus list subscripts. The remaining gaps stay explicit.
+Cypher is in use. M-PULSE-2B added `coalesce`, `string_split` and `size`; M-PULSE-2C added searched
+and simple `CASE` plus list subscripts; M-PULSE-2D added `label` and `timestamp`; M-PULSE-2E added
+the leading `UNWIND` batch source and map access; and M-PULSE-2F added non-aggregating `WITH`.
+The remaining gaps stay explicit.
 
 The scanner and JSON do not widen the public endpoint or execute Pulse code. Engine changes
 are reviewed in their own commits, and regenerating this corpus makes each accepted/refused
@@ -103,18 +105,17 @@ Each probe carries two independent answers. `contract_disposition` is what the *
 endpoint** admits; `engine_verdict` is what **this engine** does with the same text. They
 differ on purpose: the contract blacklists writes, while the engine accepts writes because
 the internal port needs them. Today the contract allows 74 probes and refuses 13 (10
-`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 69 and refuses 18. The
-intersection that matters to the public endpoint is the 10 allowed probes the engine still
+`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 70 and refuses 17. The
+intersection that matters to the public endpoint is the 9 allowed probes the engine still
 refuses.
 
 ### What M-PULSE-2 owes
 
-These 10 constructs are admitted by the public contract and refused by the engine:
+These 9 constructs are admitted by the public contract and refused by the engine:
 
 | Construct | Category | Refused at |
 | --- | --- | --- |
 | `OPTIONAL MATCH` | root | parse error |
-| `WITH` | root | parse error |
 | `UNION` | clause | parse error |
 | `untyped relationship` | pattern | plan error |
 | `polymorphic node` | pattern | plan error |

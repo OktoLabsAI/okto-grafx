@@ -79,7 +79,17 @@
   públicos e entries 71/24. A suíte query final passou 1.019/1.019; o gate focado final somou
   68/68 em `test_unwind.py` + corpus; Ruff, diff-check e fronteiras públicas passaram. A auditoria
   independente e a revisão Nexus `hof_9e5978356c68454ca7303e13b62b61c0` foram PASS. Em
-  paralelo, a primeira capacidade M-PULSE-3A de propriedades de node foi integrada no Pulse
+  M-PULSE-2F, `WITH` não agregante foi concluído no código final `5b32e8e`: o probe público e as
+  mutations I06/I07 executam projeções sequenciais com troca real de escopo, `WHERE` por estágio,
+  snapshot pré-`SET`, piso zero, fallback nulo e atomicidade. O corpus passou ao digest
+  `33254881effa...`, raw 70/17, nove débitos e entries 73/22. A suíte query final passou
+  1.060/1.060, corpus 45/45, fronteiras públicas selecionadas e Ruff/diff-check passaram, sem
+  aumentar a dívida de formatter (250 arquivos na base e no candidato). Duas auditorias
+  independentes e o handoff Nexus `hof_89b6fa0a5aa243d7b314b71a72782ebc` concluíram/PASS após
+  corrigir compatibilidade posicional, bypass por AST e reutilização cíclica de alias. O próximo
+  lote fixo M-PULSE-2G é somente `MATCH (n)` polimórfico para node scan; não inclui `OPTIONAL`,
+  relações sem tipo, paths, `UNION` ou writes polimórficos. Em paralelo, a primeira capacidade
+  M-PULSE-3A de propriedades de node foi integrada no Pulse
   Community `feature/v0.3.3@4aae27eca9c0a2d1d14a3334b03e6c57976dea75`, ainda inativa até a
   composição do provider completo.
   O registro verificável está em 9.7.
@@ -1049,11 +1059,25 @@ débitos de função, com digest `75622dfe...`, raw 66/21 e 13 débitos público
 I67/I68 sem liberar escrita parcial em erro tardio ou budget. O corpus ficou no digest
 `836d55ad41bb617f3e71cf788ca164b0eca9c038964c63ec6542e87184e6f1e9`, raw 69/18, dez débitos
 públicos e entries 71/24; a revisão Nexus `hof_9e5978356c68454ca7303e13b62b61c0` foi concluída,
-verificada e PASS. O próximo sublote fixo M-PULSE-2F é somente `WITH` não agregante: o probe
-público `WITH 1 AS value RETURN value` e as mutations I06/I07 com duas projeções sequenciais e
-`WHERE` pós-projeção. Agregação, `DISTINCT`, `ORDER/SKIP/LIMIT` em `WITH`, `OPTIONAL` e `UNION`
-continuam fora desse lote. Os demais constructs, mutations internas, DTO/erros, perfil `pulse-1`
-e o ratchet diferencial total permanecem nos sublotes seguintes do próprio M-PULSE-2.
+verificada e PASS. M-PULSE-2F está concluído no código final `5b32e8e`: `WITH` não agregante cobre
+o probe público `WITH 1 AS value RETURN value` e as mutations I06/I07 com duas projeções
+sequenciais e `WHERE` pós-projeção. A troca real de escopo, o snapshot pré-`SET`, o piso zero e o
+fallback de restauração nulo têm regressões; AST construída à mão não contorna as recusas e um
+nome descartado não pode reaparecer como outro alias. O corpus ficou no digest
+`33254881effa0b8325d351c0732ec4e23a260e0d9cd78ed83de75dc9f6ba1b04`, raw 70/17, nove débitos e
+entries 73/22. A revisão Nexus `hof_89b6fa0a5aa243d7b314b71a72782ebc` foi concluída/verificada e
+PASS, assim como duas auditorias independentes.
+
+O próximo sublote fixo M-PULSE-2G é somente `MATCH (n)` polimórfico para node scan. Ele inclui o
+probe `MATCH (n) RETURN n`, I19 e os seis templates públicos `COUNT_ALL_NODES`,
+`COUNT_ALL_NODES_BY_TYPE`, `GET_ALL_NODES`, `GET_ALL_NODES_AFTER_CURSOR`,
+`GET_ALL_NODES_BY_TYPE` e `GET_ALL_NODES_BY_TYPE_AFTER_CURSOR`. `OPTIONAL MATCH`, endpoints ou
+relações sem tipo, named/path projection, `UNION`, writes polimórficos e agregação/ordenação em
+`WITH` continuam fora. O gate diferencial é exato: somente esse probe muda para `planned`, somente
+esses sete IDs mudam para `already_supported`, raw passa a 71/16 com oito débitos e entries a
+80/15; os demais gaps preservam classificação e recusa. Os demais constructs, mutations internas,
+DTO/erros, perfil `pulse-1` e o ratchet diferencial total permanecem nos sublotes seguintes do
+próprio M-PULSE-2.
 
 1. gerar um corpus versionado a partir do contrato e das queries reais read-only e write do Pulse;
 2. implementar clauses/expressões/funções ausentes;
@@ -1218,6 +1242,7 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-2C — CASE e subscritos | concluído e publicado | `milestone/pulse-query-case-subscript@bf88462` → `main` (`863ec04` linguagem + `9787d6e` ratchet + `045a8c2`/`bf88462` hardening); revisão Nexus `hof_e3b5f54f3e2344949286b9768456df3e`; correções `hof_a1b17d76f49940dea1d0b00b609b985a` e `hof_01b133a255454f4c8ed84026093e8d10` concluídas/PASS | CASE searched/simple eager e com promoção determinística; lista 1-based/negativa, map-dot e composições nested; parâmetros nested são bindados antes do stream; colisões case-insensitive `a`/`A` recusadas e cache distingue `true` de `1`. Range conhecido é recusado mesmo em plano zero-row e CASE não recusa falsamente subscript de chamada escalar. Corpus digest `d9095a0fec35f834605c274f94bf1b2bad9ce8b6df144d22f58d3f73a5706bae`, raw 64/23 e 15 débitos. Suítes query/corpus/API saíram em `exit 0`; corpus `--check`, seis probes independentes, Ruff default e diff-check PASS |
 | M-PULSE-2D — `label` e `timestamp` | concluído e publicado | `milestone/pulse-query-label-timestamp@a1846c3`; `0a7509f` label, `e74e89f` timestamp, `eaf413e`/`a33b09a`/`89e3494`/`a1846c3` hardening e `9fe3cee`/`cd7b7c1` ratchet; revisão Nexus `hof_7b8a913b11644a4c98ee129ce7ae2b85` concluída/verificada/PASS | `label` devolve o nome físico exato de node/relação e NULL, com recusas pré-stream; `timestamp` cobre T/espaço, Z/offset/naive/date-only/micros, identidade/NULL e composições conhecíveis, sem antecipar agregados. Auditorias independentes: label PASS e candidato final PASS. Query 996/996, corpus 45/45, API pública selecionada 147/147, revisão Claude API 615/615 + 1 skip, `--check` digest `75622dfe057ca446d200c91ad1041718bd15058d99e222948f3aae339901dfa0`, entries 69/26, raw 66/21 e 13 débitos; Ruff/diff-check verdes |
 | M-PULSE-2E — `UNWIND` e map batch | concluído e publicado | código `4fc8ca5`; branch `milestone/pulse-query-unwind-map`; revisão Nexus `hof_9e5978356c68454ca7303e13b62b61c0` concluída/verificada/PASS | Source leading streaming com carrier fail-closed, mapa destacado, alias read-only, resolução tipada e duas formas estritas: `RETURN` ou um `MATCH` + um `SET`. I67/I68 usam seek correlacionado em PK limpa e fallback correto em índice ausente/dirty/stale; budget é contado uma vez e recusa tardia não libera escrita parcial. Corpus digest `836d55ad41bb617f3e71cf788ca164b0eca9c038964c63ec6542e87184e6f1e9`, raw 69/18, dez débitos e entries 71/24; query 1.019/1.019, gate focado final 68/68, API pública selecionada, Ruff e diff-check PASS; formatter sem dívida nova (250 arquivos contra 251 na base). Auditoria independente final PASS |
+| M-PULSE-2F — `WITH` não agregante | concluído e publicado | código final `5b32e8e`; branch `milestone/pulse-query-with`; revisão Nexus `hof_89b6fa0a5aa243d7b314b71a72782ebc` concluída/verificada/PASS | Projeções sequenciais substituem o escopo e aplicam cada `WHERE` depois do estágio; I06/I07 preservam snapshot pré-write, piso zero, fallback nulo e atomicidade. Compatibilidade posicional do AST e portas analyzer/planner são fail-closed; alias descartado não pode ser reutilizado. Corpus digest `33254881effa0b8325d351c0732ec4e23a260e0d9cd78ed83de75dc9f6ba1b04`, raw 70/17, nove débitos e entries 73/22; query 1.060/1.060, `test_with.py` 41/41, corpus 45/45, fronteiras públicas selecionadas, Ruff e diff-check PASS; formatter 250/250 contra a base; duas auditorias independentes PASS |
 | M-PULSE-3A — propriedades de node | concluído e publicado no branch Pulse atual; helper ainda inativo | Pulse Community `milestone/grafx-mpulse3-node-properties@4aae27eca9c0a2d1d14a3334b03e6c57976dea75` → `feature/v0.3.3`; revisão Nexus `hof_cad849ee19e542eb862930f64054724d` concluída/PASS | labels desconhecidas retornam vazio sem tocar backend; label conhecida ausente/wrong-kind e DB fechado falham tipado; ordem de catálogo, snapshot, reopen e fronteiras públicas cobertos; 8/8, Ruff default/TRY/I/BLE e format PASS. A resolução `board_id → Database` fica no provider/composição, sem ativação parcial |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
