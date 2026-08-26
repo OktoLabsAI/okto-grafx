@@ -99,8 +99,13 @@
   auditorias independentes, corpus `--check`, Ruff e diff-check passaram, e o handoff Nexus
   `hof_a28be7ad2f584fd693c3ef9cbaec75e8` foi concluído/verificado/PASS, sem aumentar a dívida
   de formatter (250 arquivos na base e no candidato). Os oito constructs restantes permanecem
-  congelados para os sublotes seguintes do próprio M-PULSE-2. Em paralelo, a primeira capacidade
-  M-PULSE-3A de propriedades de node foi integrada no Pulse
+  congelados para os sublotes seguintes do próprio M-PULSE-2. O próximo lote fixo M-PULSE-2H
+  cobre somente I01/I02 na forma read-only `MATCH (a)-[r:TYPE]->(b)`: um hop tipado e outgoing,
+  com relação e endpoints nomeados, ambos os endpoints sem label e sem mapas inline. O planner
+  infere `a`/`b` do par `from_table`/`to_table` já declarado pela relação e reutiliza os operadores
+  existentes; raw permanece 71/16 e somente I01/I02 mudam, levando entries a 82/13. Incoming,
+  undirected, relação sem tipo, `OPTIONAL`, `WITH`, writes, paths e multi-endpoint permanecem fora.
+  Em paralelo, a primeira capacidade M-PULSE-3A de propriedades de node foi integrada no Pulse
   Community `feature/v0.3.3@4aae27eca9c0a2d1d14a3334b03e6c57976dea75`, ainda inativa até a
   composição do provider completo.
   O registro verificável está em 9.7.
@@ -1091,6 +1096,22 @@ débitos e entries a 80/15; I01/I02 e todos os demais gaps preservaram seus obje
 corpus final tem digest `ac19e6735a90e5fe9831fdca67a80de1a3f4fffadd54b81151d9e343a7bd0d7a`.
 Os demais constructs, mutations internas, DTO/erros, perfil `pulse-1` e o ratchet diferencial
 total permanecem nos sublotes seguintes do próprio M-PULSE-2.
+
+O próximo sublote fixo M-PULSE-2H é a inferência de endpoints exclusivamente para o path read-only
+`MATCH (a)-[r:TYPE]->(b)` usado por I01/I02: exatamente um `MATCH`, um pattern, um hop fixo e
+outgoing, relação e endpoints nomeados, um único tipo, nodes sem label ou mapa inline, `WHERE`
+opcional e `RETURN` obrigatório. O planner resolve primeiro a tabela da relação, infere o source
+por `from_table` e deixa o target seguir o `to_table` já suportado, formando os operadores atuais
+`NodeScan -> TraverseRelationship`; não há operador, DTO ou superfície pública nova. Incoming,
+undirected, variável-length, relação sem tipo, `OPTIONAL MATCH`, `WITH`, writes, named/path
+projection, `UNION`, schema/provider e tipos lógicos multi-endpoint ficam explicitamente fora.
+O gate diferencial é exato: nenhum dos 87 probes muda, raw permanece 71/16 com oito débitos,
+somente I01/I02 passam de `generic_gap/plan_error` para `already_supported/planned`, entries passa
+a 82/13 e os treze gaps restantes preservam seus objetos completos. I01/I02 mantêm duas colunas
+`r.layer`/`r.rule_id`, ambas `STRING` nullable, cardinalidade many-rows e comparação por multiset,
+sem `ORDER BY` ou `LIMIT`. A matriz dos 16 tipos, zero/uma/paralelas, `NULL`, filtro I02,
+owner-only/rollback, shapes excluídos, corpus byte a byte, Ruff e diff-check formam o gate; o novo
+digest só será registrado depois da regeneração.
 
 1. gerar um corpus versionado a partir do contrato e das queries reais read-only e write do Pulse;
 2. implementar clauses/expressões/funções ausentes;
