@@ -4,8 +4,8 @@
 
 M-PULSE-2A introduced this freeze of **what Pulse actually asks a graph to do**, so every
 language sub-batch can ratchet against evidence rather than against an impression of how much
-Cypher is in use. This revision also records M-PULSE-2B: `coalesce`, `string_split` and `size`
-now plan and execute, while the remaining gaps stay explicit.
+Cypher is in use. M-PULSE-2B added `coalesce`, `string_split` and `size`; M-PULSE-2C adds searched
+and simple `CASE` plus list subscripts. The remaining gaps stay explicit.
 
 The scanner and JSON do not widen the public endpoint or execute Pulse code. Engine changes
 are reviewed in their own commits, and regenerating this corpus makes each accepted/refused
@@ -67,7 +67,7 @@ This keeps an unsupported family useful: closing the language gap must change th
 ## Counts at `pulse-1`
 
 `97` entries, digest
-`5ad93542b86cf5cc335d9334f05d1d6c8f5beddbcb15e812c1ba7dc0c224020d`.
+`d9095a0fec35f834605c274f94bf1b2bad9ce8b6df144d22f58d3f73a5706bae`.
 
 The engine currently classifies 69 entries as `already_supported` and 26 as `generic_gap`;
 the duplicate and declared fragment remain separate classifications.
@@ -103,13 +103,13 @@ Each probe carries two independent answers. `contract_disposition` is what the *
 endpoint** admits; `engine_verdict` is what **this engine** does with the same text. They
 differ on purpose: the contract blacklists writes, while the engine accepts writes because
 the internal port needs them. Today the contract allows 74 probes and refuses 13 (10
-`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 61 and refuses 26. The
-intersection that matters to the public endpoint is the 18 allowed probes the engine still
+`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 64 and refuses 23. The
+intersection that matters to the public endpoint is the 15 allowed probes the engine still
 refuses.
 
 ### What M-PULSE-2 owes
 
-These 18 constructs are admitted by the public contract and refused by the engine:
+These 15 constructs are admitted by the public contract and refused by the engine:
 
 | Construct | Category | Refused at |
 | --- | --- | --- |
@@ -118,10 +118,7 @@ These 18 constructs are admitted by the public contract and refused by the engin
 | `WITH` | root | parse error |
 | `UNION` | clause | parse error |
 | `map batch` | parameter | parse error |
-| `list index` | expression | parse error |
 | `map access` | expression | parse error |
-| `CASE searched` | expression | parse error |
-| `CASE simple` | expression | parse error |
 | `label` | function | analysis error |
 | `timestamp` | function | analysis error |
 | `untyped relationship` | pattern | plan error |
@@ -133,9 +130,11 @@ These 18 constructs are admitted by the public contract and refused by the engin
 | `path projection` | result | parse error |
 
 Two of them, `label` and `timestamp`, are functions and fail at **analysis**, not at parsing:
-an unknown function still parses into a generic call node. `coalesce`, `string_split` and
-`size` now reach `planned`; that ratchet is frozen in both the JSON and its sentinels. This is
-why acceptance records parse, analysis and planning separately.
+an unknown function still parses into a generic call node. The three scalar helpers, standalone
+list indexing and both CASE forms now reach `planned`; those ratchets are frozen in both the JSON
+and its sentinels. `map access` remains owed because its public probe starts with `UNWIND`, so it
+cannot become accepted until that separate clause exists. This is why acceptance records parse,
+analysis and planning separately.
 
 ### The behavioural contract beside the grammar
 
@@ -251,8 +250,9 @@ the environment variable to set. They never pass silently on absent baselines.
 
 ## What this deliberately does not do
 
-- No clauses, provider work or endpoint activation. M-PULSE-2B closes only the three scalar
-  helpers recorded above; the other 18 admitted/refused constructs remain later M-PULSE-2 work.
+- No clauses, provider work or endpoint activation. M-PULSE-2B/2C close only the scalar, CASE and
+  standalone-list forms recorded above; the other 15 admitted/refused constructs remain later
+  M-PULSE-2 work.
 - No hidden profile switch or Pulse-specific bypass: the helpers use the ordinary typed planner
   and executor paths.
 - No differential execution against Ladybug. The corpus records what Pulse sends and whether
