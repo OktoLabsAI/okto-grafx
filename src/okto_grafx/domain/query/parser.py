@@ -697,8 +697,11 @@ class _Parser:
         min_hops = 1
         max_hops = 1
         properties: MapExpression | None = None
+        starred = False
         if self._match_symbol("["):
-            variable, types, min_hops, max_hops, properties = self._relationship_detail()
+            variable, types, min_hops, max_hops, properties, starred = (
+                self._relationship_detail()
+            )
             self._take_symbol("]")
         self._take_symbol("-")
         outgoing = self._match_symbol(">")
@@ -720,11 +723,12 @@ class _Parser:
             min_hops=min_hops,
             max_hops=max_hops,
             properties=properties,
+            hop_range_written=starred,
         )
 
     def _relationship_detail(
         self,
-    ) -> tuple[str | None, tuple[str, ...], int, int, MapExpression | None]:
+    ) -> tuple[str | None, tuple[str, ...], int, int, MapExpression | None, bool]:
         """Parse the inside of ``[variable:TYPE|TYPE*1..3 {properties}]``."""
         variable: str | None = None
         if self._current.kind is TokenKind.NAME:
@@ -734,9 +738,10 @@ class _Parser:
             types.append(self._take_name("a relationship type"))
             while self._match_symbol("|"):
                 types.append(self._take_name("a relationship type"))
-        min_hops, max_hops = self._hop_range() if self._at_symbol("*") else (1, 1)
+        starred = self._at_symbol("*")
+        min_hops, max_hops = self._hop_range() if starred else (1, 1)
         properties = self._map_literal() if self._at_symbol("{") else None
-        return variable, tuple(types), min_hops, max_hops, properties
+        return variable, tuple(types), min_hops, max_hops, properties, starred
 
     def _hop_range(self) -> tuple[int, int]:
         """Parse ``*``, ``*n``, ``*n..m`` or ``*..m``, refusing anything without an upper bound.

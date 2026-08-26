@@ -1113,6 +1113,19 @@ sem `ORDER BY` ou `LIMIT`. A matriz dos 16 tipos, zero/uma/paralelas, `NULL`, fi
 owner-only/rollback, shapes excluídos, corpus byte a byte, Ruff e diff-check formam o gate; o novo
 digest só será registrado depois da regeneração.
 
+M-PULSE-2H está implementado e entregue para verificação, ainda NÃO concluído. O corpus foi
+regenerado e o gate diferencial fechou exatamente como previsto acima: nenhum dos 87 objetos raw
+mudou, raw permanece 71/16 com oito débitos, somente I01 e I02 passaram de
+`generic_gap/plan_error` para `already_supported/planned`, entries passou a 82/13 e os treze gaps
+restantes preservaram seus objetos completos. Nos dois oracles alterados o bloco de linhas é
+idêntico byte a byte; o que sai é apenas o `error` da recusa anterior, que era o registro do gap.
+O corpus regenerado tem digest
+`2fec52e0f033c3674aa8558fc5cca4aec05dacc7eae82e111bc2819864873e36`. Uma exclusão que o texto
+congelado já previa exigiu uma correção de proveniência: `min_hops`/`max_hops` não distinguiam
+`-[r:T]->` de `-[r:T*1..1]->`, então o pattern passou a registrar se um `*` foi escrito, com
+default compatível e sem mudar o que qualquer pattern casa; `*1..1` e `*1..2` são recusados. A
+conclusão do sublote depende da verificação do Codex sobre o commit entregue.
+
 1. gerar um corpus versionado a partir do contrato e das queries reais read-only e write do Pulse;
 2. implementar clauses/expressões/funções ausentes;
 3. traduzir mutations internas para primitives estruturados quando isso evitar copiar DDL/procedures

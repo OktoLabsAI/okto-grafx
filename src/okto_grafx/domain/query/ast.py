@@ -406,6 +406,16 @@ class RelationshipPattern:
     min_hops: int = 1
     max_hops: int = 1
     properties: MapExpression | None = None
+    hop_range_written: bool = False
+    """Whether a ``*`` was WRITTEN, which the hop counts alone cannot say.
+
+    ``*1..1`` and no star at all match the same single hop, so ``variable_length`` answers
+    False for both -- correctly, because that property is about what a pattern MATCHES. What
+    the counts lose is the syntax, and a rule that admits one exact written form has to be
+    able to see it: a subset frozen without variable-length traversal must not admit
+    ``*1..1`` merely because it happens to mean the same thing as no star. The default keeps
+    every existing constructor working, and this field never changes what a pattern matches.
+    """
 
     @property
     def variable_length(self) -> bool:
@@ -417,7 +427,7 @@ class RelationshipPattern:
         inner = self.variable or ""
         if self.types:
             inner += ":" + "|".join(self.types)
-        if self.variable_length:
+        if self.variable_length or self.hop_range_written:
             inner += f"*{self.min_hops}..{self.max_hops}"
         if self.properties is not None:
             inner += f" {self.properties.describe()}"

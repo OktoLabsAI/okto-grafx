@@ -7,8 +7,8 @@ language sub-batch can ratchet against evidence rather than against an impressio
 Cypher is in use. M-PULSE-2B added `coalesce`, `string_split` and `size`; M-PULSE-2C added searched
 and simple `CASE` plus list subscripts; M-PULSE-2D added `label` and `timestamp`; M-PULSE-2E added
 the leading `UNWIND` batch source and map access; M-PULSE-2F added non-aggregating `WITH`; and
-M-PULSE-2G added the read-only polymorphic node scan `MATCH (n)`. The remaining gaps stay
-explicit.
+M-PULSE-2G added the read-only polymorphic node scan `MATCH (n)`; and M-PULSE-2H read the near
+end of a typed hop from the relationship that declares it. The remaining gaps stay explicit.
 
 The scanner and JSON do not widen the public endpoint or execute Pulse code. Engine changes
 are reviewed in their own commits, and regenerating this corpus makes each accepted/refused
@@ -142,6 +142,13 @@ standalone read shape: one `AllNodesScan` reads all node tables as a single set,
 six public all-node templates move to `already_supported` without changing their result oracles.
 The one raw probe moves to `planned`; paths with label-free endpoints retain their previous
 planner refusal, and the other eight constructs retain their complete frozen objects.
+M-PULSE-2H then takes those paths, but only in one written form: `MATCH (a)-[r:TYPE]->(b)` with
+both ends named and unlabelled reads the near end from the relationship's FROM table, exactly as
+the far end has always been read from its TO table. I01 and I02 move to `already_supported` with
+their result oracles unchanged -- only the recorded refusal goes -- and NO raw probe object
+changes at all, because the probe for a label-free path writes a relationship with no type and is
+refused for that. A batch that moves entries and no probe is the expected shape here, not a
+missed ratchet.
 
 ### The behavioural contract beside the grammar
 

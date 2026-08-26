@@ -996,6 +996,19 @@ that writes, and a `RETURN`, with `WHERE` and `WITH` free to shape the rows -- a
 shape is refused before a table is read. A node written without a label at the end of a hop is
 not this: the relationship names the table at each end.
 
+That naming is now used at BOTH ends. `(a:X)-[r:T]->(b)` already bound b to T's TO table without
+b writing a label; `MATCH (a)-[r:T]->(b) [WHERE ...] RETURN ...` binds a to T's FROM table the
+same way, so a caller that queries by edge type does not have to know which node tables the edge
+joins. The plan is the ordinary `NodeScan` feeding the ordinary `TraverseRelationship`; no
+operator, value or public name is added. It applies to exactly that written form -- one `MATCH`
+of one pattern, one named outgoing hop of one type with no written hop range, both ends named
+and carrying neither a label nor an inline map, an optional `WHERE`, and a `RETURN`. An incoming
+or undirected hop, an anonymous end, a second pattern or `MATCH`, a clause that writes, a `WITH`,
+an `UNWIND` or a relationship with no type keeps the refusal it already had, because a schema
+answers unambiguously only where the direction fixes which end is which. `*1..1` is refused with
+the other ranges even though it matches a single hop: what the form excludes is a written range,
+and the pattern records that a `*` was typed rather than inferring it from the hop counts.
+
 ```
 MATCH (n:Chunk)-[:BELONGS_TO]->(d:Doc)
 WHERE n.layer = $layer AND d.active = true

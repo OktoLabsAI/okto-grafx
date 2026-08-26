@@ -1700,10 +1700,10 @@
     "class:fragment": 1,
     "class:read": 75,
     "class:write": 21,
-    "classification:already_supported": 80,
+    "classification:already_supported": 82,
     "classification:duplicate_text": 1,
     "classification:fragment": 1,
-    "classification:generic_gap": 15,
+    "classification:generic_gap": 13,
     "reachability:preventive": 2,
     "reachability:runtime_current": 66,
     "surface:internal_family": 68,
@@ -1738,9 +1738,9 @@
           "receiver": "scope"
         }
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "plan_error",
-      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (a). [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "reachability": "runtime_current",
       "expected": {
         "kind": "rows",
@@ -1766,12 +1766,7 @@
         "order_by": null,
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "plan_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (a). [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -1800,9 +1795,9 @@
           "receiver": "scope"
         }
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "plan_error",
-      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (a). [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "reachability": "runtime_current",
       "expected": {
         "kind": "rows",
@@ -1828,12 +1823,7 @@
         "order_by": null,
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "plan_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (a). [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -7762,5 +7752,5 @@
       }
     }
   ],
-  "digest": "ac19e6735a90e5fe9831fdca67a80de1a3f4fffadd54b81151d9e343a7bd0d7a"
+  "digest": "2fec52e0f033c3674aa8558fc5cca4aec05dacc7eae82e111bc2819864873e36"
 }

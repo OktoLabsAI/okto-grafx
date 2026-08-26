@@ -678,12 +678,14 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         probe for probe in raw["probes"] if probe["engine_verdict"] == "accepted"
     ]
     refused = [probe for probe in raw["probes"] if probe["engine_verdict"] == "refused"]
+    # M-PULSE-2H moves two ENTRIES and no probe: the raw matrix is unchanged on purpose, and
+    # saying so here is what keeps a later reader from mistaking it for a missed ratchet.
     assert len(accepted) == 71
     assert len(refused) == 16
     assert len(owed) == 8
 
-    assert frozen["counts"]["classification:already_supported"] == 80
-    assert frozen["counts"]["classification:generic_gap"] == 15
+    assert frozen["counts"]["classification:already_supported"] == 82
+    assert frozen["counts"]["classification:generic_gap"] == 13
 
 
 def test_every_raw_probe_has_one_contract_and_engine_verdict(frozen: dict) -> None:

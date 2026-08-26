@@ -413,6 +413,7 @@ class _Planner:
     tables: dict[str, TableDef] = field(default_factory=dict)
     multi_hop_variables: set[str] = field(default_factory=set)
     polymorphic_variables: set[str] = field(default_factory=set)
+    typed_endpoint_form: bool = False
     unwind_alias: str | None = None
     alias_definitions: dict[str, Expression] = field(default_factory=dict)
     label_calls: list[FunctionCall] = field(default_factory=list)
@@ -704,6 +705,7 @@ class _Planner:
         if refusal is not None:
             message, value = refusal
             raise GrafxPlanError(message, field="pattern", value=value)
+        self.typed_endpoint_form = self._is_typed_endpoint_form(statement)
         pipeline: PlanNode = SingleRow()
         if statement.unwind_clause is not None:
             self._require_batch_shape(statement)
@@ -1422,8 +1424,15 @@ class _Planner:
     ) -> tuple[PlanNode, list[Expression]]:
         """Plan one connected path, taking index seeks from the predicate where it can."""
         first = pattern.nodes[0]
+        inferred: TableDef | None = None
+        if pattern.relationships and not first.labels:
+            inferred = self._typed_endpoint_source(pattern)
         pipeline, terms, source = self._match_node(
-            pipeline, first, terms, standalone=not pattern.relationships
+            pipeline,
+            first,
+            terms,
+            standalone=not pattern.relationships,
+            inferred_table=inferred,
         )
         for position, relationship in enumerate(pattern.relationships):
             target_pattern = pattern.nodes[position + 1]
@@ -1447,6 +1456,7 @@ class _Planner:
         terms: list[Expression],
         *,
         standalone: bool = True,
+        inferred_table: TableDef | None = None,
     ) -> tuple[PlanNode, list[Expression], str]:
         """Bind one node of a pattern, as a reference, an index seek or a scan.
 
@@ -1464,7 +1474,9 @@ class _Planner:
             return pipeline, terms, variable
         if standalone and not pattern.labels:
             return self._match_every_node(pipeline, pattern, terms, variable)
-        table = self._node_table_of(pattern)
+        table = (
+            inferred_table if inferred_table is not None else self._node_table_of(pattern)
+        )
         self.tables[variable] = table
         if pattern.properties is not None:
             terms = terms + list(self._property_terms(variable, pattern.properties))
@@ -1560,6 +1572,76 @@ class _Planner:
                 if subject.name not in self.polymorphic_variables:
                     continue
                 self._polymorphic_property_type(node.key, node.describe())
+
+    def _typed_endpoint_source(self, pattern: PatternPath) -> TableDef | None:
+        """Return the table a label-free source reads, when the query is the one shape for it.
+
+        The FAR end of a hop already takes its table from the relationship: ``(a:X)-[r:T]->(b)``
+        binds b to T's TO table without b naming a label, because a relationship declares what
+        sits at each of its ends. This is that same rule applied to the NEAR end, and
+        deliberately nothing more -- it answers only for the exact frozen form, so no other
+        pattern in the language starts resolving a name from a schema it did not resolve it
+        from before.
+        """
+        if not self.typed_endpoint_form:
+            return None
+        relationship = pattern.relationships[0]
+        # A name that is not a relationship is refused HERE, with the message the hop itself
+        # would have given. Returning None instead would have let the source be refused first,
+        # for naming no label -- an answer about the wrong half of the pattern, and one this
+        # subset never gave before.
+        table = self._relationship_table(relationship)
+        return self._table_named(str(table.from_table), "from_table")
+
+    def _relationship_table(self, relationship: RelationshipPattern) -> TableDef:
+        """Return the table one relationship pattern reads, refusing a name that is not one."""
+        table = self._table_named(relationship.types[0], "type")
+        if table.kind != "rel":
+            raise GrafxPlanError(
+                f"The type {table.name!r} names a {table.kind} table, so it cannot match a "
+                "relationship.",
+                field="type",
+                value=table.name,
+            )
+        return table
+
+    @staticmethod
+    def _is_typed_endpoint_form(statement: Query) -> bool:
+        """Whether this is the one read-only shape that reads its endpoints from the type.
+
+        Exact and closed on purpose. One MATCH of one pattern; one named outgoing hop of one
+        type and no range; both ends named, and neither carrying a label nor an inline map; an
+        optional WHERE; a RETURN. Anything else -- a clause that writes, a WITH, an UNWIND, an
+        incoming or undirected hop, an anonymous end -- keeps the refusal it has today, for the
+        reason it has it. The question is asked of the STATEMENT, so an analysis handed in by a
+        caller cannot widen the answer.
+        """
+        if statement.unwind_clause is not None or statement.with_clauses:
+            return False
+        if statement.updating_clauses or statement.return_clause is None:
+            return False
+        if len(statement.match_clauses) != 1:
+            return False
+        patterns = statement.match_clauses[0].patterns
+        if len(patterns) != 1:
+            return False
+        pattern = patterns[0]
+        if len(pattern.relationships) != 1 or len(pattern.nodes) != 2:
+            return False
+        relationship = pattern.relationships[0]
+        if relationship.variable is None or len(relationship.types) != 1:
+            return False
+        if relationship.direction is not Direction.OUTGOING:
+            return False
+        if relationship.variable_length or relationship.hop_range_written:
+            # `*1..1` means one hop, but it WRITES a range, and the frozen text has none.
+            return False
+        if relationship.properties is not None:
+            return False
+        return all(
+            node.variable is not None and not node.labels and node.properties is None
+            for node in pattern.nodes
+        )
 
     def _node_table_of(self, pattern: NodePattern) -> TableDef:
         """Return the table a matched node reads, refusing a pattern that names none or many."""
@@ -1703,14 +1785,7 @@ class _Planner:
                 field="types",
                 value=relationship.describe(),
             )
-        table = self._table_named(relationship.types[0], "type")
-        if table.kind != "rel":
-            raise GrafxPlanError(
-                f"The type {table.name!r} names a {table.kind} table, so it cannot match a "
-                "relationship.",
-                field="type",
-                value=table.name,
-            )
+        table = self._relationship_table(relationship)
         if relationship.properties is not None:
             raise GrafxPlanError(
                 "A matched relationship carries no inline property map in this dialect; write "
