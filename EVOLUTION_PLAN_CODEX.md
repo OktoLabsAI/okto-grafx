@@ -7,7 +7,7 @@
 **Ambiente principal:** Windows, Python 3.13.1
 **Escopo:** integridade, recuperação, concorrência, estabilidade, performance, API, configuração e novas capacidades.
 
-## Estado de execução — 2026-08-24
+## Estado de execução — 2026-08-26
 
 - **M0 estabilização: concluído e publicado** em
   `milestone/m0-stabilization@e2d6a22da8ec2571127fc9d1533995d40330c632`. Os cinco P0
@@ -21,9 +21,12 @@
 - **Próximo gate:** concluir C13 e o censo de retornos públicos tipados, integrar serialmente no
   branch M1, executar a suíte completa e publicar um SHA imutável. M2 inicia identity-range leasing
   somente depois desse gate.
-- **Compatibilidade Okto Pulse: iniciada em 2026-08-25.** A seção 9 congela o contrato atual e os
-  gates M-PULSE-0 a M-PULSE-7. M-PULSE-0 está em execução na branch isolada
-  `milestone/pulse-m0-delete`, começando por relationship delete e `DETACH DELETE`.
+- **Compatibilidade Okto Pulse: em execução serial na `main`.** M-PULSE-0 foi concluído em
+  `5b7551b40dba2facb28c46770f166ab3ac9daecc`. A fundação de identidades pendentes do
+  M-PULSE-1 entrou em `d487ac9312229e0376ad8e65625213af111d9c9c`; o overlay owner-only de nós
+  e suas barreiras fail-closed chegaram até `aef1df7`. A resolução/visão de relacionamentos e as
+  primitives do `GraphTransactionScope` continuam abertas, portanto M-PULSE-1 e a compatibilidade
+  total ainda não estão declarados concluídos. O registro verificável está em 9.7.
 
 ## 1. Resumo executivo
 
@@ -757,9 +760,9 @@ Também fazem parte do contrato:
 
 | Área | Estado atual do Grafx | Gap para o Pulse | Severidade |
 |---|---|---|---|
-| CRUD básico de nós/arestas | Parcialmente disponível | faltam semânticas destrutivas completas e equivalência de resultados | P0 |
-| `DELETE`/`DETACH DELETE` | `DELETE` de nó usa tombstone lógico; execução não honra `detach`; relationship delete ausente | o Pulse exige relationship delete e remoção física das incidentes no `DETACH DELETE` | P0 |
-| Transação | commit/rollback reais, sem read-your-own-writes | o Pulse cria nós e depois os consulta/relaciona no mesmo scope | P0 |
+| CRUD básico de nós/arestas | Overlay owner-only de nós disponível; relações ainda parciais | faltam endpoint/relationship overlay e equivalência completa de resultados | P0 |
+| `DELETE`/`DETACH DELETE` | relationship delete e detach físico concluídos para estado committed; relação staged incidente recusa antes do handover | o overlay definitivo deve cancelar também a relação staged incidente | P0 |
+| Transação | commit/rollback reais e read-your-own-writes de nós; relações staged ainda fail-closed | o Pulse cria nós e depois os relaciona no mesmo scope | P0 |
 | Substituição de payload | update existe | o Pulse exige substituir payload preservando exatamente as arestas incidentes | P0 |
 | Cypher read-only 1.0 | subconjunto menor | faltam `OPTIONAL MATCH`, `WITH`, `UNWIND`, `UNION`, `CASE` e funções usadas | P1 |
 | Schema/DDL | criação básica | faltam idempotência, evolução aditiva, múltiplos pares de endpoints e introspecção equivalente | P1 |
@@ -768,11 +771,12 @@ Também fazem parte do contrato:
 | Migração | formato físico pre-alpha, sem migrador | grafo cognitivo contém dados que não podem ser sempre reconstruídos do SQL | P0 para corte |
 | Performance | commits duráveis e writer serializado | adapter ingênuo por statement causaria grande regressão | P1 |
 
-O defeito destrutivo é comprovável no código: `DeleteClause.detach` chega ao plano em
-`src/okto_grafx/domain/query/planner.py`, mas o caminho de delete em
-`src/okto_grafx/engine/query_engine.py` não aplica a semântica de detach. O README afirma que a
-operação recusaria; o comportamento atual, porém, aceita a instrução. Esse caso deve ser corrigido
-antes de qualquer shadow write.
+O defeito destrutivo original foi fechado em M-PULSE-0: `DELETE r` e `DETACH DELETE` estão na
+`main@5b7551b`, com incidência posicional, self-loop, multiplicidade, conflito, crash, reopen e
+`verify()` cobertos. A revisão do overlay de nós encontrou uma segunda janela: uma relação criada
+em statement anterior da mesma transação não aparecia no heap percorrido pelo detach. Até o overlay
+relacional definitivo, `main@aef1df7` recusa esse caso antes de entregar qualquer efeito do
+statement à transação. Isso preserva integridade sem alegar uma capacidade ainda ausente.
 
 O requisito de read-your-own-writes também é estrutural. O contrato do Pulse cria nós, verifica
 existência e cria relações dentro do mesmo `GraphTransactionScope`, além de exigir
@@ -928,6 +932,8 @@ estabilidade; linguagem, schema e evolução vêm depois.
 
 #### M-PULSE-0 — deletes corretos e fail-closed
 
+**Estado em 2026-08-26:** concluído e publicado na `main@5b7551b`.
+
 1. implementar relationship delete;
 2. implementar `DETACH DELETE` atômico;
 3. preservar e documentar o tombstone lógico de `DELETE n`; o provider deve mapear a exclusão
@@ -940,6 +946,9 @@ reopen; `DELETE n` não torna uma relação observável através de endpoint tom
 `verify()`-clean. As regressões de relationship delete e `DETACH DELETE` devem falhar no SHA anterior.
 
 #### M-PULSE-1 — read-your-own-writes e operações atômicas do scope
+
+**Estado em 2026-08-26:** parcial na `main@aef1df7`; fundação e overlay de nós concluídos,
+resolução/overlay de relacionamentos e primitives do scope em execução.
 
 1. overlay transacional único para heap, relações, índices e vetores;
 2. endpoint lookup de nós staged;
@@ -1087,6 +1096,22 @@ uma mudança de formato ou semântica fica concentrado no Grafx, no adapter Comm
 
 Cada milestone deve ter branch, commit e push próprios, suíte direcionada, suíte global verde,
 revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
+
+### 9.7 Registro de execução e evidências
+
+| Marco | Estado | Evidência integrada | Validação registrada |
+|---|---|---|---|
+| M-PULSE-0 | concluído | `main@5b7551b40dba2facb28c46770f166ab3ac9daecc` | suites query/API do marco: 1.398 passes e 1 skip; chunks globais: 3.841 + 1.205 + 2.021 passes, 10 skips; Ruff limpo; nove mutantes mortos; revisão cruzada sem blocker |
+| M-PULSE-1A — identidade pendente | concluído | `main@d487ac9312229e0376ad8e65625213af111d9c9c` | regressões de `PendingRowRef`, redução de intents, prevalidation e bloqueios passaram; Ruff e `git diff --check` limpos após rebase |
+| M-PULSE-1A — overlay de nós | concluído | `main@3f354d9b4973086421500654fe74982606767df3` + hardening `main@aef1df734582cd04097fcc0393ecda587ee5409f` | `tests/query`, `tests/txn` e `tests/api` com exit 0; 51 regressões focadas pós-auditoria com exit 0; Ruff limpo; revisão independente encontrou dois casos, ambos reproduzidos e fechados antes do merge |
+| M-PULSE-1B — resolução de endpoints | em execução | branch `milestone/pulse-m1-rel-resolution`, handoff Nexus `hof_5836d33c98d04c27b152dc7f56902749` | exige prova de proveniência/ordem/papel, resolução antes de mutação e zero `PendingRowRef` em heap/index/WAL |
+| M-PULSE-1C — overlay relacional e primitives Pulse | pendente | depende de M-PULSE-1B | traversal, `DELETE r`, `DETACH`, rollback/crash e suíte pública do port sobre visão combinada |
+
+O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
+reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um
+`DELETE p, p` que recusava o segundo nome do mesmo insert. O primeiro agora falha tipado antes do
+handover enquanto M-PULSE-1B/C não chegam; o segundo é idempotente e conta uma exclusão. Nenhum
+resultado desta tabela fecha M-PULSE-1 por antecipação.
 
 ## 10. Roadmap priorizado
 

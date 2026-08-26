@@ -85,11 +85,14 @@ openCypher in the Kùzu dialect, executed by a planner that produces one operato
 | Aggregates | `count`, `min`, `max`, and friends |
 | Parameters | `$name`, refused before anything runs if one is missing |
 
-**Not yet supported**, and refused in the error taxonomy rather than silently ignored:
-`MATCH` binding a row the same transaction created (a row's identity is allocated by the
-commit — commit first, then match). A table declared inside
-a transaction is usable by that transaction's own later statements and becomes visible to every
-other transaction when it commits — schema changes are transactions like any other.
+`MATCH` in a write transaction sees that owner's earlier node inserts, updates and deletes. A
+dirty node table plans a scan plus the private overlay instead of consulting an index that only
+describes committed rows. Relationship endpoints that are themselves pending, relationship
+traversal over inserted/updated overlay state and vector search over a dirty table are **not yet
+supported**; each refuses explicitly before touching the heap or index rather than returning a
+stale answer. A table declared inside a transaction is usable by that transaction's own later
+statements and becomes visible to every other transaction when it commits — schema changes are
+transactions like any other.
 
 ### Indexes
 
@@ -193,8 +196,8 @@ with db.begin("write") as txn:
     txn.execute("CREATE (:Person {id: 2, name: 'Grace', city: 'New York'})")
     txn.execute("CREATE (:Person {id: 3, name: 'Alan',  city: 'London'})")
 
-# A row's identity is allocated by the COMMIT, so a MATCH cannot bind a row the same
-# transaction created. Commit the rows, then match them.
+# MATCH already sees nodes this transaction staged. Relationship endpoints still require durable
+# identities in this release, so commit the nodes before creating the edge.
 with db.begin("write") as txn:
     txn.execute(
         "MATCH (a:Person {id: 1}), (b:Person {id: 2}) CREATE (a)-[:Knows {since: 1994}]->(b)"

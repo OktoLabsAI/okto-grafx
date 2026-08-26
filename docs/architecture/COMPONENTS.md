@@ -900,7 +900,7 @@ search returns `achieved_k=3`, hits `[1, 3, 2]`, `verify("all") == ()` before an
 `recovery` pass GREEN.** Three new tests in `tests/query/test_lifecycle.py` are the only things in
 the repository that see it.
 
-### E4 — a MATCH inside the transaction that created a row cannot bind it (known limitation, by design)
+### E4 — read-your-own-writes de nós (registro histórico; FECHADO em M-PULSE-1A)
 
 Found by the coordinator while driving traversal: `CREATE (:P {id:1})` followed in the SAME
 transaction by `MATCH (a:P {id:1}) ... CREATE (a)-[:R]->(b)` creates no edge, and
@@ -933,9 +933,12 @@ Routed to W6 as a decision; the CLI and README must state it.
 | **E3 index seam** | see above | 3 tests | 1,615 green without it |
 | **D5 item 2** | `install_checksum` in bootstrap; `checksum` selector `auto/pure/native`; `accel` extra declares `google-crc32c` | 5 tests in `test_bootstrap.py` + 1 in `test_packaging.py` | -- |
 
-**Known limitation recorded, not fixed (E4):** a MATCH inside the transaction that created a row
-cannot bind it (RecordId is allocated by the commit, W5b). The remedy is to commit before matching.
-Routed to W6 as a design decision.
+**Fechado em `d487ac9`/`3f354d9`, com hardening em `aef1df7`.** A solução escolhida foi a opção (b)
+acima: `PendingRowRef` autenticado e privado, redução única de intents e `NodeScan` sobre
+snapshot+overlay. Tabelas dirty não usam seek; PK, SET, DELETE, MERGE, DISTINCT/ordenação e
+isolamento têm regressões. IDs provisórios não escapam para heap, índice, WAL ou resultado público.
+Endpoints/traversal de relações e busca vetorial dirty continuam recusando de forma tipada até os
+submarcos seguintes; portanto o fechamento desta entrada é especificamente o overlay de nós.
 
 **Still open, performance only (D5):** commit ~161 ms. `_windows_posix_replace` 4/commit (the
 `retain_lease` option now exists in C5 -- measure it on), pure CRC when no provider is installed,
