@@ -4288,7 +4288,11 @@ def _bound_pulse_expression_type(
             expression.index, static_types, parameters, owner=owner
         )
         subscript_argument_types(expression, subject_type, index_type)
-        if not any(isinstance(node, Variable) for node in walk(expression)):
+        # Only shapes the binder can actually evaluate are materialized here.  Absence of a
+        # Variable is not the same question: string_split('a,b', ',')[1] has none and is still
+        # outside the postfix vocabulary, so the old guard sent it to _bound_postfix_value and
+        # a valid query was refused at bind time whenever the plan carried no rows.
+        if _binder_resolvable(expression):
             value = _bound_postfix_value(expression, parameters, owner=owner)
             return _bound_value_type(expression, value, owner=owner)
         return static_type

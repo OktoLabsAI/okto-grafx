@@ -585,6 +585,35 @@ def test_subscripts_the_binder_cannot_resolve_still_run_per_row(
     assert literal_call.rows == ()
 
 
+def test_a_scalar_call_subscript_inside_case_is_not_refused_at_bind_time(
+    stack: QueryStack,
+) -> None:
+    """A CASE arm may subscript a scalar call, and an empty plan must not refuse it.
+
+    The binder materializes only what it can evaluate, and ``string_split`` is not in that
+    vocabulary.  Asking it to try produced "the binder cannot evaluate the row-independent
+    postfix value" for a query that is perfectly valid and that returns rows normally as soon
+    as the pattern matches anything.
+    """
+
+    text = (
+        "MATCH (p:Person) WHERE p.id = {chosen} "
+        "RETURN CASE WHEN true THEN string_split('a,b', ',')[1] ELSE 'z' END AS part"
+    )
+
+    empty = run(stack, text.format(chosen=99))
+    assert empty.rows == ()
+    # The zero-row plan still has to describe the column it would have produced; the result
+    # surface carries names rather than types, so this is the whole of the metadata here.
+    assert empty.columns == ("part",)
+    assert empty.plan.columns == ("part",)
+
+    found = run(stack, text.format(chosen=1))
+    assert found.rows == (("a",),)
+    assert found.columns == ("part",)
+    assert all(type(row[0]) is str for row in found.rows)
+
+
 @pytest.mark.parametrize("index", (1.0, True, "1"))
 def test_list_subscript_parameter_type_is_checked_before_rows(
     stack: QueryStack, index: object
