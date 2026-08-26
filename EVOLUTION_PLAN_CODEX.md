@@ -25,10 +25,10 @@
   `5b7551b40dba2facb28c46770f166ab3ac9daecc`. A fundação de identidades pendentes do
   M-PULSE-1 entrou em `d487ac9312229e0376ad8e65625213af111d9c9c`; o overlay owner-only de nós
   e suas barreiras fail-closed chegaram até `aef1df7`. O update owner-only de propriedades de
-  relações committed foi publicado em `a3bb8cb44cf86f5c151a232406c703f54f9a1316`. A resolução de
-  endpoints, a visão de relações staged e as primitives do `GraphTransactionScope` continuam
-  abertas, portanto M-PULSE-1 e a compatibilidade total ainda não estão declarados concluídos. O
-  registro verificável está em 9.7.
+  relações committed foi publicado em `a3bb8cb44cf86f5c151a232406c703f54f9a1316`; a resolução
+  pré-write de endpoints pending entrou em `d2b73bacd861982a67d4ac217a8997ed332b0aca`. A visão pública de relações staged e as
+  primitives do `GraphTransactionScope` continuam abertas, portanto M-PULSE-1 e a compatibilidade
+  total ainda não estão declarados concluídos. O registro verificável está em 9.7.
 
 ## 1. Resumo executivo
 
@@ -764,7 +764,7 @@ Também fazem parte do contrato:
 |---|---|---|---|
 | CRUD básico de nós/arestas | Overlay owner-only de nós disponível; relações ainda parciais | faltam endpoint/relationship overlay e equivalência completa de resultados | P0 |
 | `DELETE`/`DETACH DELETE` | relationship delete e detach físico concluídos para estado committed; relação staged incidente recusa antes do handover | o overlay definitivo deve cancelar também a relação staged incidente | P0 |
-| Transação | commit/rollback reais e read-your-own-writes de nós; relações staged ainda fail-closed | o Pulse cria nós e depois os relaciona no mesmo scope | P0 |
+| Transação | commit/rollback reais e read-your-own-writes de nós; o substrate resolve endpoints pending, mas o Cypher de relações staged ainda é fail-closed | o Pulse cria nós e depois os relaciona no mesmo scope | P0 |
 | Substituição de payload | update existe | o Pulse exige substituir payload preservando exatamente as arestas incidentes | P0 |
 | Cypher read-only 1.0 | subconjunto menor | faltam `OPTIONAL MATCH`, `WITH`, `UNWIND`, `UNION`, `CASE` e funções usadas | P1 |
 | Schema/DDL | criação básica | faltam idempotência, evolução aditiva, múltiplos pares de endpoints e introspecção equivalente | P1 |
@@ -949,8 +949,9 @@ reopen; `DELETE n` não torna uma relação observável através de endpoint tom
 
 #### M-PULSE-1 — read-your-own-writes e operações atômicas do scope
 
-**Estado em 2026-08-26:** parcial na `main@aef1df7`; fundação e overlay de nós concluídos,
-resolução/overlay de relacionamentos e primitives do scope em execução.
+**Estado em 2026-08-26:** parcial na `main@d2b73bacd861982a67d4ac217a8997ed332b0aca`; fundação, overlay de nós, update de relações
+committed e resolução pré-write de endpoints concluídos; overlay de relações staged e primitives
+do scope em execução.
 
 1. overlay transacional único para heap, relações, índices e vetores;
 2. endpoint lookup de nós staged;
@@ -1107,13 +1108,13 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-1A — identidade pendente | concluído | `main@d487ac9312229e0376ad8e65625213af111d9c9c` | regressões de `PendingRowRef`, redução de intents, prevalidation e bloqueios passaram; Ruff e `git diff --check` limpos após rebase |
 | M-PULSE-1A — overlay de nós | concluído | `main@3f354d9b4973086421500654fe74982606767df3` + hardening `main@aef1df734582cd04097fcc0393ecda587ee5409f` | `tests/query`, `tests/txn` e `tests/api` com exit 0; 51 regressões focadas pós-auditoria com exit 0; Ruff limpo; revisão independente encontrou dois casos, ambos reproduzidos e fechados antes do merge |
 | M-PULSE-1A — update de relações committed | concluído | `main@a3bb8cb44cf86f5c151a232406c703f54f9a1316` | 6 regressões públicas e 814 testes de query passaram; Ruff global e diff-check limpos; validação independente focada 6/6; preservação de endpoints, isolamento, rollback, conflito, cold reopen e `verify()` cobertos |
-| M-PULSE-1B — resolução de endpoints | em execução | branch `milestone/pulse-m1-rel-resolution`, handoff Nexus `hof_5836d33c98d04c27b152dc7f56902749` | exige prova de proveniência/ordem/papel, resolução antes de mutação e zero `PendingRowRef` em heap/index/WAL |
-| M-PULSE-1C — overlay relacional e primitives Pulse | pendente | depende de M-PULSE-1B | traversal, `DELETE r`, `DETACH`, rollback/crash e suíte pública do port sobre visão combinada |
+| M-PULSE-1B — resolução de endpoints | concluído | `main@d2b73bacd861982a67d4ac217a8997ed332b0aca` (origem revisada `1b5a4266658b186014c8159c2861755a86320b0c`; handoff Nexus `hof_5836d33c98d04c27b152dc7f56902749`) | 31 regressões novas; 1.203 testes txn/query e 612 API (1 skip) passaram antes do rebase; 178 gates de integração passaram depois do rebase; Ruff/diff-check limpos; 15 mutantes mortos; auditoria independente: 139/139 e zero blocker |
+| M-PULSE-1C — overlay relacional e primitives Pulse | em execução | contrato tests-only congelado e publicado em `milestone/pulse-m1-rel-overlay-tests@fa3d97aac0c057587caf92a76dde95475ea3dabf`; depende de `main@d2b73bacd861982a67d4ac217a8997ed332b0aca` | 9 regressões públicas deliberadamente vermelhas no SHA-base; same-statement fail-closed preservado; faltam engine overlay, crash pré-barreira e suíte pública do port |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um
 `DELETE p, p` que recusava o segundo nome do mesmo insert. O primeiro agora falha tipado antes do
-handover enquanto M-PULSE-1B/C não chegam; o segundo é idempotente e conta uma exclusão. Nenhum
+handover enquanto M-PULSE-1C não chega; o segundo é idempotente e conta uma exclusão. Nenhum
 resultado desta tabela fecha M-PULSE-1 por antecipação.
 
 ## 10. Roadmap priorizado

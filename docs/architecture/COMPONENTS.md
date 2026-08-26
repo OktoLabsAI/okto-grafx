@@ -906,21 +906,17 @@ Found by the coordinator while driving traversal: `CREATE (:P {id:1})` followed 
 transaction by `MATCH (a:P {id:1}) ... CREATE (a)-[:R]->(b)` creates no edge, and
 `MATCH (p:P {id:1}) RETURN p` returns nothing, until the transaction commits.
 
-This follows from W5b: a row's RecordId is allocated by the commit, so a staged row has no identity
-a NodeScan could bind and no identity an edge could reference. C10 already refuses an edge to a node
-the same STATEMENT creates, with a remedy ("create the nodes first and match them"); MERGE consults
-the staged rows explicitly (`_uncommitted_rows`) so it matches its own work. NodeScan does not, and
-answers silently.
+W5b remains intact: a durable RecordId is allocated only inside commit. M-PULSE-1A chose a private
+`PendingRowRef` and an owner-only NodeScan overlay, so later statements now bind the exact staged
+node without exposing a provisional physical ID. M-PULSE-1B extends that decision at the
+transaction substrate: a relationship INSERT may carry those private references only in `_from`
+and `_to`; commit proves provenance/order/kind/role, plans the durable IDs, rewrites the endpoints
+and re-encodes every row before its first heap mutation. No private token reaches heap, index or
+WAL, and rollback/refusal spends no planned identity.
 
-openCypher / Kuzu read-your-own-writes would have the MATCH see the row. Closing this means one of:
-(a) allocating the RecordId at staging time (W5b reversed -- an abandoned commit then burns an id,
-which W5b judged acceptable as a GAP but not as a REUSE, so the allocator would have to be durable
-before the commit), or (b) synthesising pending RowBindings from staged intents in NodeScan with a
-provisional identity and rewriting them at commit. Both are a W6 design decision, not a patch.
-
-Recorded here because the silent empty answer is the worse half; the remedy for a caller is to
-commit the rows before matching them, which every test and every example in this repository does.
-Routed to W6 as a decision; the CLI and README must state it.
+The remaining M-PULSE-1C seam is the public query overlay for relationship INSERT/traversal and
+cancellation by `DELETE r`/`DETACH DELETE`. Same-statement fresh nodes plus edge remain explicitly
+fail-closed in this cut; cross-statement work in one owner scope is the compatibility target.
 
 ### Coordinator closures after the method change (all verified by counterfactual)
 

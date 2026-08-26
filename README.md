@@ -87,10 +87,12 @@ openCypher in the Kùzu dialect, executed by a planner that produces one operato
 
 `MATCH` in a write transaction sees that owner's earlier node inserts, updates and deletes. A
 dirty node table plans a scan plus the private overlay instead of consulting an index that only
-describes committed rows. Relationship endpoints that are themselves pending, relationship
-traversal over inserted/updated overlay state and vector search over a dirty table are **not yet
-supported**; each refuses explicitly before touching the heap or index rather than returning a
-stale answer. A table declared inside a transaction is usable by that transaction's own later
+describes committed rows. The transaction substrate can now stage a relationship against pending
+nodes and resolves both private endpoint identities before its first heap write. The public Cypher
+path still refuses relationship INSERT/traversal over inserted overlay state until the combined
+relationship view lands; vector search over a dirty table is likewise fail-closed. Updates of
+properties on committed relationships are owner-visible, while their `_from`/`_to` layout columns
+remain immutable. A table declared inside a transaction is usable by that transaction's own later
 statements and becomes visible to every other transaction when it commits — schema changes are
 transactions like any other.
 
@@ -196,8 +198,9 @@ with db.begin("write") as txn:
     txn.execute("CREATE (:Person {id: 2, name: 'Grace', city: 'New York'})")
     txn.execute("CREATE (:Person {id: 3, name: 'Alan',  city: 'London'})")
 
-# MATCH already sees nodes this transaction staged. Relationship endpoints still require durable
-# identities in this release, so commit the nodes before creating the edge.
+# MATCH already sees nodes this transaction staged. The commit substrate can resolve their private
+# identities, but the public Cypher relationship overlay is the next milestone; commit the nodes
+# before creating the edge in this release.
 with db.begin("write") as txn:
     txn.execute(
         "MATCH (a:Person {id: 1}), (b:Person {id: 2}) CREATE (a)-[:Knows {since: 1994}]->(b)"
