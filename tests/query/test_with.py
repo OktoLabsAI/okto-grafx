@@ -227,7 +227,11 @@ def test_a_variable_a_stage_dropped_is_refused_for_being_dropped() -> None:
         ("MATCH (n:Decision) WITH n, n.id AS n RETURN n", "item", "n.id AS n"),
         ("MATCH (n:Decision) WITH n AS m RETURN m.id", "item", "n AS m"),
         ("WITH 1 AS a, a + 1 AS b RETURN b", "variable", "a"),
-        ("MATCH (n:Decision) WITH count(n) AS total RETURN total", "expression", "count(n)"),
+        (
+            "MATCH (n:Decision) WITH count(n) AS total RETURN total",
+            "expression",
+            "count(n)",
+        ),
         (
             "MATCH (n:Decision) WITH n WHERE count(n) > 1 RETURN n.id",
             "expression",
@@ -363,7 +367,9 @@ def test_a_reference_the_first_stage_filtered_never_reaches_the_second(
     # protects against is the one short reference and not the shape of the query.
     with database.begin("write") as transaction:
         transaction.execute(
-            UNGUARDED.replace("MATCH (n:Decision) ", "MATCH (n:Decision) WHERE n.id <> 'd5' ")
+            UNGUARDED.replace(
+                "MATCH (n:Decision) ", "MATCH (n:Decision) WHERE n.id <> 'd5' "
+            )
         )
     assert database.execute(
         "MATCH (n:Decision {id: 'd1'}) RETURN n.superseded_by"
@@ -435,7 +441,9 @@ def test_a_budget_refusal_mid_stage_releases_no_partial_write(tmp_path: Path) ->
     handle = _budget_database(tmp_path / "budget", max_intermediate_rows=2)
     try:
         transaction = handle.begin("write")
-        transaction.execute("MATCH (n:Decision {id: 'd3'}) SET n.superseded_by = 'kept'")
+        transaction.execute(
+            "MATCH (n:Decision {id: 'd3'}) SET n.superseded_by = 'kept'"
+        )
         accepted = tuple(transaction._context.row_intents)
         assert accepted
 
@@ -503,7 +511,9 @@ def test_a_query_built_positionally_still_means_what_it_meant() -> None:
     assert statement.with_clauses == ()
 
 
-def test_unwind_beside_with_is_refused_by_the_analysis_of_a_tree_nobody_parsed() -> None:
+def test_unwind_beside_with_is_refused_by_the_analysis_of_a_tree_nobody_parsed() -> (
+    None
+):
     with pytest.raises(GrafxPlanError) as raised:
         analyze(_unwound_then_projected())
     assert raised.value.details == {"field": "clause", "value": "WITH"}
@@ -580,7 +590,9 @@ def test_i06_floors_the_penalised_score_and_still_saves_the_one_it_read(
     )
 
 
-def test_i07_adds_the_penalty_back_only_when_nothing_was_saved(database: object) -> None:
+def test_i07_adds_the_penalty_back_only_when_nothing_was_saved(
+    database: object,
+) -> None:
     """The two arms are told apart by making the sum differ from the saved value."""
     with database.begin("write") as transaction:
         transaction.execute(I06, CANCEL)
