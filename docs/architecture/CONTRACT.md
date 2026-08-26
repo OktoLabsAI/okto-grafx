@@ -904,9 +904,21 @@ class QueryEngine:
 Cypher subset (openCypher, Kùzu dialect): `CREATE NODE TABLE` / `CREATE REL TABLE` /
 `CREATE VECTOR SPACE`, `CREATE`, `MATCH` (+ variable-length `-[:R*1..3]->`), `WHERE`, `RETURN`
 (`DISTINCT`, aliases), `ORDER BY`, `SKIP`, `LIMIT`, `SET`, `DELETE`, `MERGE`, parameters `$name`,
-aggregates `count/sum/avg/min/max/collect`, the scalar function `coalesce(value, ...)`, and the
-similarity extension. `coalesce` returns the first non-null argument, or null when all arguments
-are null; it is case-insensitive, positional-only and requires at least one argument.
+aggregates `count/sum/avg/min/max/collect`, the scalar functions `coalesce(value, ...)`,
+`string_split(text, separator)` and `size(value)`, and the similarity extension. `coalesce`
+evaluates every argument from left to right and returns the first non-null one, or null when all
+arguments are null. It is case-insensitive, positional-only and requires at least one argument.
+Its supported non-null families are string, boolean and numeric; arguments must stay in one
+family, except that integers and doubles may mix and promote the selected result to double. Lists,
+maps, graph bindings and other families are refused. Families are resolved from declared column
+types, literal types and bound parameter types before rows are produced, so a nullable double
+argument still promotes an integer result and a known mismatch is refused even for an empty
+result. `string_split` takes exactly two positional strings and `size` takes exactly one
+positional string or list; both propagate null.
+`string_split` compresses empty fields between repeated separators, preserves a final empty field
+and, with an empty separator, splits a non-empty input into Unicode code points. The empty-input,
+empty-separator pair is undefined and refused. `size` counts Unicode code points in a string and
+elements in a list.
 
 ```
 MATCH (n:Chunk)-[:BELONGS_TO]->(d:Doc)

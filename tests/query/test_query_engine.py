@@ -11,6 +11,8 @@ from okto_grafx.domain.errors import (
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
 )
+from okto_grafx.domain.model.schema import ColumnDef, TableDef
+from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.query.plan import ProduceResults, VectorSearch
 from okto_grafx.engine.query_engine import (
     PHASE_EXECUTE,
@@ -124,12 +126,122 @@ def test_coalesce_preserves_falsey_values_and_returns_null_when_all_are_null(
     assert found.rows == ((False, 0, "", None),)
 
 
-def test_coalesce_short_circuits_after_the_first_non_null_value(
+@pytest.mark.parametrize(
+    "expression",
+    (
+        "coalesce(7, 1 / 0)",
+        "coalesce(null, 1 / 0, 7)",
+    ),
+)
+def test_coalesce_evaluates_every_argument_and_propagates_errors(
+    stack: QueryStack, expression: str
+) -> None:
+    # Ladybug 0.16.0 eagerly evaluates even arguments after the selected value.
+    with pytest.raises(GrafxPlanError):
+        run(stack, f"RETURN {expression} AS value")
+
+
+def test_coalesce_promotes_mixed_width_numbers_to_double(stack: QueryStack) -> None:
+    found = run(
+        stack,
+        "RETURN coalesce(1, 2.5) AS integer_first, "
+        "coalesce(null, 2.5, 1) AS double_first, coalesce(1, 2) AS integers",
+    )
+    assert found.rows == ((1.0, 2.5, 1),)
+    assert type(found.rows[0][0]) is float
+    assert type(found.rows[0][1]) is float
+    assert type(found.rows[0][2]) is int
+
+
+def _add_coalesce_type_table(stack: QueryStack) -> None:
+    """Add rows whose nulls hide, but do not change, their declared scalar types."""
+    stack.catalog_store.catalog.add_table(
+        TableDef(
+            table_id=4,
+            name="ScalarTypes",
+            kind="node",
+            columns=(
+                ColumnDef(name="id", type=ValueType.INT64, nullable=False),
+                ColumnDef(name="i", type=ValueType.INT64),
+                ColumnDef(name="d", type=ValueType.DOUBLE),
+                ColumnDef(name="s", type=ValueType.STRING),
+            ),
+            primary_key="id",
+        )
+    )
+    stack.catalog_store.save()
+    stack.insert("ScalarTypes", 1, (1, 1, None, "one"), csn=1)
+    stack.insert("ScalarTypes", 2, (2, None, 2.5, None), csn=1)
+
+
+def test_coalesce_uses_declared_column_types_even_when_values_are_null(
     stack: QueryStack,
 ) -> None:
-    assert run(stack, "RETURN coalesce('chosen', 1 / 0) AS value").rows == (
-        ("chosen",),
+    _add_coalesce_type_table(stack)
+    found = run(
+        stack,
+        "MATCH (t:ScalarTypes) "
+        "RETURN coalesce(t.i, t.d) AS numeric, coalesce(t.i, 0) AS integer "
+        "ORDER BY t.id",
     )
+    assert found.rows == ((1.0, 1), (2.5, 0))
+    assert all(type(row[0]) is float for row in found.rows)
+    assert all(type(row[1]) is int for row in found.rows)
+
+
+def test_coalesce_refuses_declared_families_hidden_by_alternating_nulls(
+    stack: QueryStack,
+) -> None:
+    _add_coalesce_type_table(stack)
+    with pytest.raises(GrafxPlanError) as failure:
+        run(stack, "MATCH (t:ScalarTypes) RETURN coalesce(t.s, t.i)")
+    assert failure.value.details == {"field": "function", "value": "coalesce"}
+
+
+def test_coalesce_refuses_known_mismatch_while_planning_a_zero_row_query(
+    stack: QueryStack,
+) -> None:
+    _add_coalesce_type_table(stack)
+    with pytest.raises(GrafxPlanError) as failure:
+        stack.engine.explain(
+            "MATCH (t:ScalarTypes) WHERE t.id = -1 RETURN coalesce(t.s, t.i)"
+        )
+    assert failure.value.details == {"field": "function", "value": "coalesce"}
+
+
+def test_coalesce_resolves_parameter_types_before_reading_zero_rows(
+    stack: QueryStack,
+) -> None:
+    _add_coalesce_type_table(stack)
+    with pytest.raises(GrafxPlanError) as failure:
+        run(
+            stack,
+            "MATCH (t:ScalarTypes) WHERE t.id = -1 RETURN coalesce(t.s, $fallback)",
+            {"fallback": 0},
+        )
+    assert failure.value.details == {"field": "function", "value": "coalesce"}
+
+    promoted = run(stack, "RETURN coalesce(1, $fallback)", {"fallback": 2.5})
+    assert promoted.rows == ((1.0,),)
+    assert type(promoted.rows[0][0]) is float
+
+
+@pytest.mark.parametrize(
+    "expression",
+    (
+        "coalesce(true, 1)",
+        "coalesce(1, true)",
+        "coalesce('text', 1)",
+        "coalesce([1], [2])",
+        "coalesce({a: 1}, {a: 2})",
+    ),
+)
+def test_coalesce_refuses_mixed_or_non_scalar_families(
+    stack: QueryStack, expression: str
+) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        run(stack, f"RETURN {expression}")
+    assert failure.value.details == {"field": "function", "value": "coalesce"}
 
 
 def test_coalesce_works_in_filters_projections_and_sort_keys(stack: QueryStack) -> None:
@@ -163,6 +275,88 @@ def test_coalesce_works_in_filters_projections_and_sort_keys(stack: QueryStack) 
         ("Grace",),
         ("Barbara",),
     )
+
+
+def test_string_split_and_size_are_case_insensitive_and_accept_parameters(
+    stack: QueryStack,
+) -> None:
+    found = run(
+        stack,
+        "RETURN StRiNg_SpLiT($reference, $separator) AS parts, "
+        "SiZe(string_split($reference, $separator)) AS total",
+        {"reference": "spec:abc:fr", "separator": ":"},
+    )
+    assert found.rows == ((("spec", "abc", "fr"), 3),)
+
+
+def test_string_split_and_size_propagate_null(stack: QueryStack) -> None:
+    found = run(
+        stack,
+        "RETURN string_split(null, ':') AS null_text, "
+        "string_split('text', null) AS null_separator, size(null) AS null_size",
+    )
+    assert found.rows == ((None, None, None),)
+
+
+def test_string_split_and_size_pin_delimiters_collections_and_unicode(
+    stack: QueryStack,
+) -> None:
+    # Ladybug 0.16.0 is the oracle for leading/intermediate compression, trailing preservation
+    # and the non-empty text/empty separator code-point split.
+    found = run(
+        stack,
+        "RETURN string_split('plain', ':') AS absent, "
+        "string_split(':spec::abc:', ':') AS repeated, "
+        "string_split('á🐍', '') AS characters, size('á🐍') AS code_points, "
+        "size([1, null, 3]) AS list_items",
+    )
+    assert found.rows == (
+        (
+            ("plain",),
+            ("spec", "abc", ""),
+            ("á", "🐍"),
+            2,
+            3,
+        ),
+    )
+
+
+def test_empty_text_with_an_empty_separator_is_a_typed_refusal(
+    stack: QueryStack,
+) -> None:
+    # Ladybug 0.16.0 reports this exact pair as an invalid string position. Grafx keeps the same
+    # refusal boundary but translates it into the public query-error taxonomy.
+    with pytest.raises(GrafxPlanError) as failure:
+        run(stack, "RETURN string_split('', '')")
+    assert failure.value.details == {"field": "function", "value": "string_split"}
+
+
+def test_size_of_string_split_filters_a_typed_node_property(stack: QueryStack) -> None:
+    stack.insert("Person", 9, (9, "spec:abc", 20, "Paris"), csn=1)
+    found = run(
+        stack,
+        "MATCH (p:Person) WHERE size(string_split(p.name, ':')) >= 2 "
+        "RETURN p.name",
+    )
+    assert found.rows == (("spec:abc",),)
+
+
+@pytest.mark.parametrize(
+    ("expression", "function"),
+    (
+        ("string_split(1, ':')", "string_split"),
+        ("string_split('text', 1)", "string_split"),
+        ("size(1)", "size"),
+        ("size(true)", "size"),
+        ("size({a: 1})", "size"),
+    ),
+)
+def test_string_split_and_size_type_errors_are_typed_refusals(
+    stack: QueryStack, expression: str, function: str
+) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        run(stack, f"RETURN {expression}")
+    assert failure.value.details == {"field": "function", "value": function}
 
 
 def test_and_is_false_as_soon_as_either_side_is(stack: QueryStack) -> None:

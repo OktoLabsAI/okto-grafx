@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from okto_grafx.domain.errors import GrafxPlanError
+from okto_grafx.domain.errors import GrafxParseError, GrafxPlanError
+from okto_grafx.domain.query import SIZE_FUNCTION, STRING_SPLIT_FUNCTION
 from okto_grafx.domain.query.analysis import (
     ENTITY_NODE,
     ENTITY_RELATIONSHIP,
@@ -12,7 +13,14 @@ from okto_grafx.domain.query.analysis import (
     contains_aggregate,
     is_aggregate,
 )
-from okto_grafx.domain.query.ast import Literal, Parameter
+from okto_grafx.domain.query.ast import (
+    FunctionCall,
+    Literal,
+    Parameter,
+    Query,
+    ReturnClause,
+    ReturnItem,
+)
 from okto_grafx.domain.query.limits import MAX_PARAMETERS
 from okto_grafx.domain.query.parser import parse
 
@@ -20,6 +28,11 @@ from okto_grafx.domain.query.parser import parse
 def analysis_of(text: str):
     """Return the analysis of one query text."""
     return analyze(parse(text))
+
+
+def test_pulse_scalar_function_names_are_exported() -> None:
+    assert SIZE_FUNCTION == "SIZE"
+    assert STRING_SPLIT_FUNCTION == "STRING_SPLIT"
 
 
 # --- bindings -------------------------------------------------------------------------------
@@ -384,6 +397,81 @@ def test_coalesce_refuses_an_empty_or_named_argument_list(expression: str) -> No
         analysis_of(f"MATCH (p:Person) RETURN {expression}")
     assert failure.value.details["field"] == "function"
     assert failure.value.details["value"].lower() == "coalesce"
+
+
+def test_string_split_and_size_are_case_insensitive_and_collect_parameters() -> None:
+    found = analysis_of(
+        "RETURN SiZe(StRiNg_SpLiT($reference, $separator)) AS pieces"
+    )
+    assert found.parameters == ("reference", "separator")
+
+
+@pytest.mark.parametrize(
+    ("expression", "function"),
+    (
+        ("string_split()", "string_split"),
+        ("string_split('a')", "string_split"),
+        ("string_split('a', ':', 'extra')", "string_split"),
+        (
+            "string_split(text => 'a', separator => ':')",
+            "string_split",
+        ),
+        ("size()", "size"),
+        ("size('a', 'extra')", "size"),
+        ("size(value => 'a')", "size"),
+    ),
+)
+def test_string_split_and_size_refuse_wrong_or_named_arguments(
+    expression: str, function: str
+) -> None:
+    with pytest.raises(GrafxPlanError) as failure:
+        analysis_of(f"RETURN {expression}")
+    assert failure.value.details == {"field": "function", "value": function}
+
+
+@pytest.mark.parametrize(
+    "expression",
+    (
+        "size(DISTINCT 'abc')",
+        "string_split(DISTINCT 'abc', ':')",
+        "size(*)",
+        "string_split(*)",
+    ),
+)
+def test_scalar_distinct_and_star_text_are_typed_parse_refusals(
+    expression: str,
+) -> None:
+    with pytest.raises(GrafxParseError) as failure:
+        parse(f"RETURN {expression}")
+    assert failure.value.details["field"] == "function"
+
+
+@pytest.mark.parametrize("modifier", ("distinct", "star"))
+@pytest.mark.parametrize(
+    ("function", "arguments"),
+    (
+        ("size", (Literal(value="abc"),)),
+        (
+            "string_split",
+            (Literal(value="abc"), Literal(value=":")),
+        ),
+    ),
+)
+def test_prebuilt_scalar_ast_refuses_distinct_and_star(
+    modifier: str, function: str, arguments: tuple[Literal, ...]
+) -> None:
+    call = FunctionCall(
+        name=function,
+        arguments=arguments,
+        distinct=modifier == "distinct",
+        star=modifier == "star",
+    )
+    statement = Query(
+        return_clause=ReturnClause(items=(ReturnItem(expression=call),))
+    )
+    with pytest.raises(GrafxPlanError) as failure:
+        analyze(statement)
+    assert failure.value.details == {"field": "function", "value": function}
 
 
 def test_a_schema_statement_analyses_to_an_empty_analysis() -> None:

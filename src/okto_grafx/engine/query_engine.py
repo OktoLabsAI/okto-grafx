@@ -83,6 +83,7 @@ from okto_grafx.domain.model.schema import (
 from okto_grafx.domain.model.value import (
     INT64_MAX,
     Value,
+    ValueType,
     VectorValue,
     encode_value,
     value_type_of,
@@ -147,12 +148,19 @@ from okto_grafx.domain.query.plan import (
     VectorSearch,
     validate_plan,
 )
-from okto_grafx.domain.query.planner import SCORE_COLUMN, PlannedQuery, build_plan
+from okto_grafx.domain.query.planner import (
+    SCORE_COLUMN,
+    PlannedQuery,
+    build_plan,
+    coalesce_result_type,
+)
 from okto_grafx.domain.query.tokens import (
     AGGREGATE_FUNCTIONS,
     COALESCE_FUNCTION,
     SIMILARITY_FUNCTION,
     SIMILARITY_SCORE_FUNCTION,
+    SIZE_FUNCTION,
+    STRING_SPLIT_FUNCTION,
 )
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.engine.buffer_pool import BufferPool
@@ -469,6 +477,7 @@ class _Context:
     parameters: dict[str, Value]
     analysis: QueryAnalysis
     statistics: dict[str, int]
+    coalesce_types: dict[FunctionCall, ValueType | None]
     # The catalog this statement was PLANNED against. Inside a transaction that has declared
     # schema of its own, that is the transaction's working copy, and execution must resolve
     # tables and spaces from the same picture the planner did -- a row materialised for a table
@@ -1002,6 +1011,7 @@ class QueryEngine:
             parameters=parameters,
             analysis=plan.analysis,
             statistics=statistics,
+            coalesce_types=_bound_coalesce_types(plan, parameters),
             catalog=catalog,
             result_node=root.child if root.columns else None,
         )
@@ -3818,15 +3828,130 @@ def _arithmetic(operator: str, left: object, right: object) -> object:
     )
 
 
+def _coalesce_value_type(expression: FunctionCall, value: object) -> ValueType:
+    """Return one runtime scalar type with COALESCE's public error taxonomy."""
+    try:
+        return value_type_of(value)  # type: ignore[arg-type]
+    except GrafxError as failure:
+        message = (
+            f"{expression.name} accepts nulls, strings, booleans and numbers; got "
+            f"{type(value).__name__}."
+        )
+        raise GrafxPlanError(
+            message,
+            field="function",
+            value=expression.name,
+        ) from failure
+
+
+def _bound_coalesce_types(
+    plan: PlannedQuery, parameters: Mapping[str, object]
+) -> dict[FunctionCall, ValueType | None]:
+    """Resolve parameter types and refuse incompatible COALESCE calls before row production."""
+    resolved: dict[FunctionCall, ValueType | None] = {}
+    for expression, planned_types in plan.coalesce_argument_types:
+        argument_types: list[ValueType | None] = []
+        for argument, planned_type in zip(
+            expression.arguments, planned_types, strict=True
+        ):
+            if planned_type is not None:
+                argument_types.append(planned_type)
+                continue
+            if not isinstance(argument, Parameter):
+                message = (
+                    f"{expression.name} could not resolve the type of {argument.describe()}."
+                )
+                raise GrafxPlanError(
+                    message,
+                    field="function",
+                    value=expression.name,
+                )
+            argument_types.append(
+                _coalesce_value_type(expression, parameters[argument.name])
+            )
+        resolved[expression] = coalesce_result_type(expression.name, argument_types)
+    return resolved
+
+
+def _coalesce(expression: FunctionCall, row: _Row, context: _Context) -> object:
+    """Return the first non-null scalar after eagerly evaluating every argument."""
+    values = tuple(_evaluate(argument, row, context) for argument in expression.arguments)
+    selected = next((value for value in values if value is not None), None)
+    if selected is None:
+        return None
+    result_type = context.coalesce_types.get(expression)
+    if result_type is None:
+        runtime_types = tuple(
+            _coalesce_value_type(expression, value) for value in values
+        )
+        result_type = coalesce_result_type(expression.name, runtime_types)
+    if result_type is ValueType.DOUBLE:
+        return float(selected)
+    return selected
+
+
 def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
     """Return the value of a function call: the score, or an aggregate already computed."""
     name = expression.name.upper()
     if name == COALESCE_FUNCTION:
-        for argument in expression.arguments:
-            value = _evaluate(argument, row, context)
-            if value is not None:
-                return value
-        return None
+        return _coalesce(expression, row, context)
+    if name == STRING_SPLIT_FUNCTION:
+        text = _evaluate(expression.arguments[0], row, context)
+        separator = _evaluate(expression.arguments[1], row, context)
+        if text is None or separator is None:
+            return None
+        if not isinstance(text, str) or not isinstance(separator, str):
+            message = (
+                f"{expression.name} takes a string and a string separator; got "
+                f"{type(text).__name__} and {type(separator).__name__}."
+            )
+            raise GrafxPlanError(
+                message,
+                field="function",
+                value=expression.name,
+            )
+        if not separator:
+            if not text:
+                message = (
+                    f"{expression.name} cannot split an empty string with an empty separator."
+                )
+                raise GrafxPlanError(
+                    message,
+                    field="function",
+                    value=expression.name,
+                )
+            return tuple(text)
+        pieces = str.split(text, separator)
+        if len(pieces) == 1:
+            return tuple(pieces)
+        trailing_empty = pieces[-1] == ""
+        result = [piece for piece in pieces if piece]
+        if trailing_empty:
+            result.append("")
+        return tuple(result)
+    if name == SIZE_FUNCTION:
+        value = _evaluate(expression.arguments[0], row, context)
+        if value is None:
+            return None
+        if not isinstance(value, (str, list, tuple)):
+            message = (
+                f"{expression.name} measures a string or list; got "
+                f"{type(value).__name__}."
+            )
+            raise GrafxPlanError(
+                message,
+                field="function",
+                value=expression.name,
+            )
+        try:
+            return len(value)
+        except TypeError as exc:
+            message = f"{expression.name} could not measure this {type(value).__name__}."
+            raise GrafxPlanError(
+                message,
+                field="function",
+                value=expression.name,
+            ) from exc
     if name in (SIMILARITY_FUNCTION, SIMILARITY_SCORE_FUNCTION):
         score = row.bindings.get(SCORE_COLUMN)
         if score is None:

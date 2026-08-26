@@ -54,6 +54,8 @@ from okto_grafx.domain.query.tokens import (
     COALESCE_FUNCTION,
     SIMILARITY_FUNCTION,
     SIMILARITY_SCORE_FUNCTION,
+    SIZE_FUNCTION,
+    STRING_SPLIT_FUNCTION,
 )
 
 __all__ = [
@@ -539,18 +541,58 @@ class _Analyzer:
                     value=call.name,
                 )
             return
+        if name == STRING_SPLIT_FUNCTION:
+            self._check_positional_call(call, arguments=2)
+            return
+        if name == SIZE_FUNCTION:
+            self._check_positional_call(call, arguments=1)
+            return
         if name == SIMILARITY_FUNCTION:
             self._check_similarity_call(call)
             return
         raise self._refuse(
             f"There is no function named {call.name!r} in this dialect; it reads "
             f"{', '.join(sorted(function.lower() for function in AGGREGATE_FUNCTIONS))}, "
-            f"{COALESCE_FUNCTION.lower()}, {SIMILARITY_FUNCTION.lower()} and "
-            f"{SIMILARITY_SCORE_FUNCTION.lower()}.",
+            f"{COALESCE_FUNCTION.lower()}, {SIZE_FUNCTION.lower()}, "
+            f"{SIMILARITY_FUNCTION.lower()}, {SIMILARITY_SCORE_FUNCTION.lower()} and "
+            f"{STRING_SPLIT_FUNCTION.lower()}.",
             field="function",
             value=call.name,
             where=where,
         )
+
+    def _check_positional_call(self, call: FunctionCall, *, arguments: int) -> None:
+        """Require one scalar function's exact positional-only signature."""
+        if call.distinct or call.star:
+            message = (
+                f"{call.name} is a scalar function, so it takes neither DISTINCT nor a star."
+            )
+            raise self._refuse(
+                message,
+                field="function",
+                value=call.name,
+            )
+        if call.named_arguments:
+            message = (
+                f"{call.name} takes positional arguments only; got "
+                f"{len(call.named_arguments)} named."
+            )
+            raise self._refuse(
+                message,
+                field="function",
+                value=call.name,
+            )
+        if len(call.arguments) != arguments:
+            message = (
+                f"{call.name} takes exactly {arguments} positional "
+                f"{'argument' if arguments == 1 else 'arguments'}; got "
+                f"{len(call.arguments)}."
+            )
+            raise self._refuse(
+                message,
+                field="function",
+                value=call.name,
+            )
 
     def _check_similarity_call(self, call: FunctionCall) -> None:
         """Check the shape of the similarity extension and take it apart for the planner."""

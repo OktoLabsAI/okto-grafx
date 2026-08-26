@@ -39,7 +39,7 @@ from okto_grafx.domain.errors import GrafxEmbeddingSpaceMismatch, GrafxPlanError
 from okto_grafx.domain.index.definition import IndexDefinition
 from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
-from okto_grafx.domain.model.value import VECTOR_DTYPES, ValueType
+from okto_grafx.domain.model.value import VECTOR_DTYPES, ValueType, value_type_of
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.query.analysis import QueryAnalysis, SimilarityUse, analyze
 from okto_grafx.domain.query.ast import (
@@ -101,7 +101,11 @@ from okto_grafx.domain.query.plan import (
     VectorSearch,
     validate_plan,
 )
-from okto_grafx.domain.query.tokens import SIMILARITY_FUNCTION, SIMILARITY_SCORE_FUNCTION
+from okto_grafx.domain.query.tokens import (
+    COALESCE_FUNCTION,
+    SIMILARITY_FUNCTION,
+    SIMILARITY_SCORE_FUNCTION,
+)
 
 __all__ = [
     "ANONYMOUS_VARIABLE_PREFIX",
@@ -110,6 +114,7 @@ __all__ = [
     "THRESHOLD_OPERATORS",
     "PlannedQuery",
     "build_plan",
+    "coalesce_result_type",
     "conjuncts_of",
 ]
 
@@ -145,6 +150,51 @@ COLUMN_VALUE_TYPES: dict[str, ValueType] = {
 
 _SPACE_OPTIONS: tuple[str, ...] = ("dimension", "metric", "normalized", "storage_dtype")
 
+_COALESCE_FAMILY: dict[ValueType, str] = {
+    ValueType.BOOL: "boolean",
+    ValueType.INT64: "number",
+    ValueType.DOUBLE: "number",
+    ValueType.STRING: "string",
+}
+
+
+def coalesce_result_type(
+    function_name: str, argument_types: Sequence[ValueType | None]
+) -> ValueType | None:
+    """Return the scalar family a COALESCE call produces, or its unresolved type."""
+    concrete = tuple(
+        value_type
+        for value_type in argument_types
+        if value_type is not None and value_type is not ValueType.NULL
+    )
+    unsupported = tuple(
+        value_type for value_type in concrete if value_type not in _COALESCE_FAMILY
+    )
+    if unsupported:
+        names = ", ".join(sorted({value_type.name for value_type in unsupported}))
+        message = f"{function_name} accepts nulls, strings, booleans and numbers; got {names}."
+        raise GrafxPlanError(
+            message,
+            field="function",
+            value=function_name,
+        )
+    families = {_COALESCE_FAMILY[value_type] for value_type in concrete}
+    if len(families) > 1:
+        joined = ", ".join(sorted(families))
+        message = (
+            f"{function_name} arguments must belong to one scalar family; got {joined}."
+        )
+        raise GrafxPlanError(
+            message,
+            field="function",
+            value=function_name,
+        )
+    if not concrete:
+        return None
+    if ValueType.DOUBLE in concrete:
+        return ValueType.DOUBLE
+    return concrete[0]
+
 
 @dataclass(frozen=True, slots=True)
 class PlannedQuery:
@@ -154,6 +204,9 @@ class PlannedQuery:
     analysis: QueryAnalysis
     columns: tuple[str, ...] = ()
     writes: bool = False
+    coalesce_argument_types: tuple[
+        tuple[FunctionCall, tuple[ValueType | None, ...]], ...
+    ] = ()
 
     def describe(self) -> str:
         """Return the operator tree as one block of indented lines."""
@@ -223,6 +276,9 @@ class _Planner:
     indexes: tuple[IndexDefinition, ...]
     analysis: QueryAnalysis
     tables: dict[str, TableDef] = field(default_factory=dict)
+    coalesce_argument_types: dict[FunctionCall, tuple[ValueType | None, ...]] = field(
+        default_factory=dict
+    )
     anonymous: int = 0
 
     # --- entry -------------------------------------------------------------------------------
@@ -252,6 +308,7 @@ class _Planner:
             analysis=self.analysis,
             columns=columns,
             writes=writes,
+            coalesce_argument_types=tuple(self.coalesce_argument_types.items()),
         )
 
     # --- schema ------------------------------------------------------------------------------
@@ -325,9 +382,7 @@ class _Planner:
             value=name,
         )
 
-    def _required_option(
-        self, options: MapExpression, key: str, kind: type
-    ) -> object:
+    def _required_option(self, options: MapExpression, key: str, kind: type) -> object:
         """Return one option of an embedding space, refusing a missing or non-constant one."""
         value = options.entry(key)
         if value is None:
@@ -369,7 +424,9 @@ class _Planner:
             raise self._wrong_option(key, "a name in quotes", expression)
         return value
 
-    def _wrong_option(self, key: str, wanted: str, expression: Expression) -> GrafxPlanError:
+    def _wrong_option(
+        self, key: str, wanted: str, expression: Expression
+    ) -> GrafxPlanError:
         """Return the refusal for an option written with the wrong kind of constant."""
         return GrafxPlanError(
             f"The {key} of an embedding space is {wanted}; got {expression.describe()}.",
@@ -491,6 +548,7 @@ class _Planner:
         pipeline = self._similarity(pipeline, statement, similarity_terms)
         for clause in statement.updating_clauses:
             pipeline = self._updating_clause(pipeline, clause)
+        self._record_coalesce_types(statement)
         if statement.updating_clauses:
             # Everything that writes is drawn in full before anything above can stop early. A
             # LIMIT truncates what the caller RECEIVES; it must not decide how many rows got
@@ -506,6 +564,141 @@ class _Planner:
             columns=columns,
             writes=statement.writes,
         )
+
+    def _record_coalesce_types(self, statement: Query) -> None:
+        """Resolve every COALESCE argument whose type the bound schema makes knowable."""
+        for expression in self._query_expressions(statement):
+            for node in walk(expression):
+                if not isinstance(node, FunctionCall):
+                    continue
+                if node.name.upper() != COALESCE_FUNCTION:
+                    continue
+                types = tuple(
+                    self._coalesce_argument_type(node, argument)
+                    for argument in node.arguments
+                )
+                coalesce_result_type(node.name, types)
+                self.coalesce_argument_types[node] = types
+
+    def _coalesce_argument_type(
+        self, call: FunctionCall, argument: Expression
+    ) -> ValueType | None:
+        """Return one provable COALESCE argument type; parameters remain runtime-bound."""
+        if isinstance(argument, Parameter):
+            return None
+        if isinstance(argument, Literal):
+            return value_type_of(argument.value)
+        if isinstance(argument, Property) and isinstance(argument.subject, Variable):
+            table = self.tables.get(argument.subject.name)
+            if table is None:
+                message = (
+                    f"{call.name} reads {argument.describe()}, whose variable is bound to no "
+                    "table."
+                )
+                raise GrafxPlanError(
+                    message,
+                    field="function",
+                    value=call.name,
+                )
+            column = self._column_of(table, argument.key)
+            if column is None:
+                message = (
+                    f"{call.name} reads {argument.describe()}, but table {table.name!r} has no "
+                    f"column named {argument.key!r}."
+                )
+                raise GrafxPlanError(
+                    message,
+                    field="function",
+                    value=call.name,
+                )
+            return column.type
+        if isinstance(argument, BinaryOperation) and argument.operator in (
+            "+",
+            "-",
+            "*",
+            "/",
+            "%",
+            "^",
+        ):
+            left = self._coalesce_argument_type(call, argument.left)
+            right = self._coalesce_argument_type(call, argument.right)
+            if left is None or right is None:
+                message = (
+                    f"{call.name} cannot prove the scalar type of {argument.describe()} until "
+                    "a parameter inside it is bound."
+                )
+                raise GrafxPlanError(
+                    message,
+                    field="function",
+                    value=call.name,
+                )
+            concrete = tuple(
+                value_type
+                for value_type in (left, right)
+                if value_type is not None and value_type is not ValueType.NULL
+            )
+            if not concrete:
+                return ValueType.NULL
+            if argument.operator == "+" and all(
+                value_type is ValueType.STRING for value_type in concrete
+            ):
+                return ValueType.STRING
+            if all(
+                value_type in (ValueType.INT64, ValueType.DOUBLE)
+                for value_type in concrete
+            ):
+                if argument.operator == "^" or ValueType.DOUBLE in concrete:
+                    return ValueType.DOUBLE
+                return ValueType.INT64
+        message = (
+            f"{call.name} needs arguments whose scalar type is known from a literal, parameter "
+            f"or bound property; got {argument.describe()}."
+        )
+        raise GrafxPlanError(
+            message,
+            field="function",
+            value=call.name,
+        )
+
+    @staticmethod
+    def _pattern_expressions(pattern: PatternPath) -> tuple[Expression, ...]:
+        """Return every inline property map of one pattern."""
+        roots: list[Expression] = []
+        roots.extend(
+            node.properties for node in pattern.nodes if node.properties is not None
+        )
+        roots.extend(
+            relationship.properties
+            for relationship in pattern.relationships
+            if relationship.properties is not None
+        )
+        return tuple(roots)
+
+    def _query_expressions(self, statement: Query) -> tuple[Expression, ...]:
+        """Return every expression root the query may evaluate."""
+        roots: list[Expression] = []
+        for clause in statement.match_clauses:
+            for pattern in clause.patterns:
+                roots.extend(self._pattern_expressions(pattern))
+            if clause.predicate is not None:
+                roots.append(clause.predicate)
+        for clause in statement.updating_clauses:
+            if isinstance(clause, CreateClause):
+                for pattern in clause.patterns:
+                    roots.extend(self._pattern_expressions(pattern))
+            elif isinstance(clause, MergeClause):
+                roots.extend(self._pattern_expressions(clause.pattern))
+            elif isinstance(clause, SetClause):
+                roots.extend(item.value for item in clause.items)
+        returned = statement.return_clause
+        if returned is not None:
+            roots.extend(item.expression for item in returned.items)
+            roots.extend(item.expression for item in returned.sort_items)
+            if returned.skip is not None:
+                roots.append(returned.skip)
+            if returned.limit is not None:
+                roots.append(returned.limit)
+        return tuple(roots)
 
     def _match_clause(
         self, pipeline: PlanNode, clause: MatchClause
@@ -539,13 +732,17 @@ class _Planner:
         pipeline, terms, source = self._match_node(pipeline, first, terms)
         for position, relationship in enumerate(pattern.relationships):
             target_pattern = pattern.nodes[position + 1]
-            pipeline, source = self._traverse(pipeline, source, relationship, target_pattern)
+            pipeline, source = self._traverse(
+                pipeline, source, relationship, target_pattern
+            )
             if target_pattern.properties is not None:
                 # The inline map on a TARGET node is the same shorthand it is on the first node,
                 # and it used to be dropped here: `(x)-[:R]->(y:P {id: 2})` matched every
                 # neighbour of x, and a SET or DELETE above it touched all of them (C10 round-2
                 # B1). The terms become a filter above the traversal, where the target is bound.
-                terms = terms + list(self._property_terms(source, target_pattern.properties))
+                terms = terms + list(
+                    self._property_terms(source, target_pattern.properties)
+                )
         return pipeline, terms
 
     def _match_node(
@@ -612,7 +809,11 @@ class _Planner:
         )
 
     def _index_seek(
-        self, pipeline: PlanNode, variable: str, table: TableDef, terms: list[Expression]
+        self,
+        pipeline: PlanNode,
+        variable: str,
+        table: TableDef,
+        terms: list[Expression],
     ) -> tuple[PlanNode | None, list[Expression]]:
         """Return an index seek for this variable when an index answers the predicate exactly."""
         constrained: dict[str, tuple[Expression, Expression]] = {}
@@ -651,7 +852,9 @@ class _Planner:
         if not isinstance(term, BinaryOperation) or term.operator != "=":
             return None
         for subject, value in ((term.left, term.right), (term.right, term.left)):
-            if not isinstance(subject, Property) or not isinstance(subject.subject, Variable):
+            if not isinstance(subject, Property) or not isinstance(
+                subject.subject, Variable
+            ):
                 continue
             if subject.subject.name != variable:
                 continue
@@ -731,7 +934,9 @@ class _Planner:
             target_variable,
         )
 
-    def _require_endpoint(self, source: str, table: TableDef, direction: Direction) -> None:
+    def _require_endpoint(
+        self, source: str, table: TableDef, direction: Direction
+    ) -> None:
         """Refuse a hop whose start cannot be an endpoint of that relationship table."""
         bound = self.tables.get(source)
         if bound is None:
@@ -759,8 +964,7 @@ class _Planner:
         if target.labels:
             if len(target.labels) != 1:
                 raise GrafxPlanError(
-                    "A matched node names exactly one label; got "
-                    f"{target.describe()}.",
+                    f"A matched node names exactly one label; got {target.describe()}.",
                     field="labels",
                     value=target.describe(),
                 )
@@ -889,7 +1093,9 @@ class _Planner:
             return term.operator, term.right, remaining
         return None, None, remaining
 
-    def _fusible_k(self, statement: Query, residual: Sequence[Expression]) -> Expression | None:
+    def _fusible_k(
+        self, statement: Query, residual: Sequence[Expression]
+    ) -> Expression | None:
         """Return the neighbour count a LIMIT may become, or None when fusing would drop rows.
 
         Every condition here is a way a row could be discarded after the vector operator ran. A
@@ -919,7 +1125,10 @@ class _Planner:
                     break
         if not isinstance(expression, FunctionCall):
             return False
-        return expression.name.upper() in (SIMILARITY_FUNCTION, SIMILARITY_SCORE_FUNCTION)
+        return expression.name.upper() in (
+            SIMILARITY_FUNCTION,
+            SIMILARITY_SCORE_FUNCTION,
+        )
 
     # --- writes ------------------------------------------------------------------------------
 
@@ -1065,7 +1274,8 @@ class _Planner:
             pipeline = AggregateRows(
                 child=pipeline,
                 grouping=tuple(
-                    clause.items[position] for position in self.analysis.grouping_positions
+                    clause.items[position]
+                    for position in self.analysis.grouping_positions
                 ),
                 aggregations=self.analysis.aggregations,
             )
@@ -1083,5 +1293,6 @@ class _Planner:
     def _projected(self, clause: ReturnClause) -> tuple[ReturnItem, ...]:
         """Return the projected items, giving every one of them the name it is read under."""
         return tuple(
-            ReturnItem(expression=item.expression, alias=item.name) for item in clause.items
+            ReturnItem(expression=item.expression, alias=item.name)
+            for item in clause.items
         )

@@ -21,8 +21,10 @@ __all__ = [
     "AGGREGATE_FUNCTIONS",
     "COALESCE_FUNCTION",
     "KEYWORDS",
+    "SIZE_FUNCTION",
     "SIMILARITY_FUNCTION",
     "SIMILARITY_SCORE_FUNCTION",
+    "STRING_SPLIT_FUNCTION",
     "SYMBOLS",
     "Token",
     "TokenKind",
@@ -169,8 +171,14 @@ AGGREGATE_FUNCTIONS: frozenset[str] = frozenset(
 COALESCE_FUNCTION: str = "COALESCE"
 """The null-selection function required by the Pulse query contract 1.0."""
 
+SIZE_FUNCTION: str = "SIZE"
+"""The collection and string cardinality function required by the Pulse query contract 1.0."""
+
 SIMILARITY_FUNCTION: str = "SIMILARITY"
 """The similarity extension of SPEC-VEC FR-4, which puts the search in the query language."""
 
 SIMILARITY_SCORE_FUNCTION: str = "SIMILARITY_SCORE"
 """The projection of the score the similarity operator produced for the current row."""
+
+STRING_SPLIT_FUNCTION: str = "STRING_SPLIT"
+"""The text partitioning function required by the Pulse query contract 1.0."""
