@@ -23,9 +23,22 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.query.analysis import (
     ENTITY_NODE,
     ENTITY_PROJECTED,
+    ENTITY_UNWOUND,
+    Binding,
+    QueryAnalysis,
     analyze,
 )
+from okto_grafx.domain.query.ast import (
+    Parameter,
+    Query,
+    ReturnClause,
+    ReturnItem,
+    UnwindClause,
+    Variable,
+    WithClause,
+)
 from okto_grafx.domain.query.parser import parse
+from okto_grafx.domain.query.planner import build_plan
 
 I06 = (
     "MATCH (n:Decision) WHERE n.source_artifact_ref IS NOT NULL "
@@ -464,3 +477,129 @@ def test_a_carried_variable_is_still_the_row_it_was_matched_from(
     assert database.execute(
         "MATCH (n:Decision {id: 'd4'}) RETURN n.superseded_by, n.relevance_score"
     ).rows == (("carried", 0.8),)
+
+
+# --- the doors the parser is not ---------------------------------------------------------------
+
+
+def _unwound_then_projected() -> Query:
+    """Return the tree for UNWIND $rows AS r WITH r RETURN r, which no parser would produce."""
+    return Query(
+        unwind_clause=UnwindClause(expression=Parameter(name="rows"), alias="r"),
+        with_clauses=(WithClause(items=(ReturnItem(expression=Variable(name="r")),)),),
+        return_clause=ReturnClause(items=(ReturnItem(expression=Variable(name="r")),)),
+    )
+
+
+def test_a_query_built_positionally_still_means_what_it_meant() -> None:
+    """The new field is declared last, so the four that shipped before keep their positions."""
+    clause = ReturnClause(items=(ReturnItem(expression=Variable(name="x"), alias="x"),))
+    statement = Query(None, (), (), clause)
+
+    assert statement.unwind_clause is None
+    assert statement.match_clauses == ()
+    assert statement.updating_clauses == ()
+    assert statement.return_clause is clause
+    assert statement.with_clauses == ()
+
+
+def test_unwind_beside_with_is_refused_by_the_analysis_of_a_tree_nobody_parsed() -> None:
+    with pytest.raises(GrafxPlanError) as raised:
+        analyze(_unwound_then_projected())
+    assert raised.value.details == {"field": "clause", "value": "WITH"}
+
+
+def test_unwind_beside_with_is_refused_by_the_planner_given_an_analysis_of_its_own(
+    catalog: object, indexes: tuple
+) -> None:
+    """build_plan accepts a caller's analysis, so the shape has to hold at that door too."""
+    statement = _unwound_then_projected()
+    supplied = QueryAnalysis(
+        statement=statement,
+        bindings=(Binding(name="r", entity=ENTITY_UNWOUND, labels=(), created=False),),
+        parameters=("rows",),
+        output_columns=("r",),
+    )
+
+    with pytest.raises(GrafxPlanError) as raised:
+        build_plan(statement, catalog=catalog, indexes=indexes, analysis=supplied)
+    assert raised.value.details == {"field": "clause", "value": "WITH"}
+
+
+# --- a name means one thing per query -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "WITH ['x'] AS a WITH a[1] AS x WITH x WITH x, 1 AS a RETURN x",
+        "WITH ['x'] AS a WITH a AS b WITH b AS a RETURN a[1]",
+    ],
+)
+def test_a_name_a_stage_dropped_is_never_given_to_something_else(
+    database: object, query: str
+) -> None:
+    """Reusing a dropped name would make one name answer for two stages at once.
+
+    The second shape is the one that shows why this is a correctness rule and not tidiness:
+    a -> b -> a is a cycle, and resolving the type of ``a[1]`` through it never terminates.
+    Both refuse before anything runs, as a plan error rather than as a crash dressed up as a
+    configuration problem.
+    """
+
+    with pytest.raises(GrafxPlanError) as raised:
+        analyze(parse(query))
+    assert raised.value.details["field"] == "item"
+
+    with pytest.raises(GrafxPlanError):
+        database.execute(query)
+
+
+def test_a_dropped_name_may_return_when_nothing_else_claims_it() -> None:
+    """The rule is about REUSE: carrying a name forward through every stage is still fine."""
+    analysis = analyze(parse("WITH ['x'] AS a WITH a AS a WITH a RETURN a[1]"))
+
+    assert [binding.name for binding in analysis.bindings] == ["a"]
+
+
+# --- the branches of the two mutations ----------------------------------------------------------
+
+
+def test_i06_floors_the_penalised_score_and_still_saves_the_one_it_read(
+    database: object,
+) -> None:
+    """A score below the penalty lands on 0.0, and the saved score is the one before it."""
+    with database.begin("write") as transaction:
+        transaction.execute("MATCH (n:Decision {id: 'd1'}) SET n.relevance_score = 0.1")
+    with database.begin("write") as transaction:
+        transaction.execute(I06, CANCEL)
+
+    assert _scores(database)[:2] == (
+        ("d1", 0.0, 0.1, "cancelled", "cancelled"),
+        ("d2", 0.55, 0.8, "cancelled", "cancelled"),
+    )
+
+
+def test_i07_adds_the_penalty_back_only_when_nothing_was_saved(database: object) -> None:
+    """The two arms are told apart by making the sum differ from the saved value."""
+    with database.begin("write") as transaction:
+        transaction.execute(I06, CANCEL)
+    with database.begin("write") as transaction:
+        transaction.execute(
+            "MATCH (n:Decision {id: 'd1'}) "
+            "SET n.pre_cancellation_relevance_score = NULL, n.relevance_score = 0.5"
+        )
+
+    with database.begin("write") as transaction:
+        result = transaction.execute(I07, RESTORE)
+
+    # Both rows come back, in whichever order the scan reaches them: the preparation above
+    # rewrote d1, and a RETURN with no ORDER BY promises nothing about where a rewritten row
+    # lands. What the two arms produced is asserted below, and that is not order-dependent.
+    assert sorted(result.rows) == [("d1",), ("d2",)]
+    # d1 had nothing saved, so it gets its penalty back: 0.5 + 0.25. d2 gets the 0.8 it saved,
+    # which is a different number on purpose -- otherwise both arms would look alike.
+    assert _scores(database)[:2] == (
+        ("d1", 0.75, None, None, None),
+        ("d2", 0.8, None, None, None),
+    )

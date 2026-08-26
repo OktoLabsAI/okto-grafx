@@ -650,9 +650,14 @@ class Query(Statement):
 
     unwind_clause: UnwindClause | None = None
     match_clauses: tuple[MatchClause, ...] = ()
-    with_clauses: tuple[WithClause, ...] = ()
     updating_clauses: tuple[UpdatingClause, ...] = ()
     return_clause: ReturnClause | None = None
+    # Declared after the four fields this class already had, and deliberately not in
+    # reading order: a caller who builds a Query positionally must still mean by
+    # Query(None, (), (), clause) what it meant before a WITH stage existed. Where the
+    # stage BELONGS is decided by describe() and the planner, both of which place it
+    # between the MATCH clauses and the clauses that write.
+    with_clauses: tuple[WithClause, ...] = ()
 
     @property
     def writes(self) -> bool:

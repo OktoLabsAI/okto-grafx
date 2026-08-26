@@ -777,6 +777,16 @@ class _Planner:
         meant to feed a scoring update.
         """
 
+        if statement.with_clauses:
+            # Refused again here, and not only in the parser and in the analysis: a caller may
+            # hand build_plan a tree it built itself TOGETHER WITH an analysis of its own, and
+            # then this is the last door before the shape becomes an operator.
+            raise GrafxPlanError(
+                "UNWIND hands its elements straight to the clauses below it in this subset; "
+                "WITH may not reshape them.",
+                field="clause",
+                value="WITH",
+            )
         if statement.return_clause is not None:
             if not statement.match_clauses and not statement.updating_clauses:
                 return

@@ -241,6 +241,16 @@ class _Analyzer:
 
     def run(self) -> QueryAnalysis:
         """Analyse the whole query and return what the planner needs."""
+        if self._query.unwind_clause is not None and self._query.with_clauses:
+            # The parser refuses this text, but the parser is one door and not the only one:
+            # a tree handed straight to analyze() never passed it, and the meaning of a
+            # statement is decided here.
+            raise self._refuse(
+                "UNWIND hands its elements straight to the clauses below it in this subset; "
+                "WITH may not reshape them.",
+                field="clause",
+                value="WITH",
+            )
         if self._query.unwind_clause is not None:
             self._unwind_clause(self._query.unwind_clause)
         for clause in self._query.match_clauses:
@@ -540,16 +550,32 @@ class _Analyzer:
             )
 
     def _refuse_shadowed_alias(self, item: ReturnItem) -> None:
-        """Refuse an alias that reuses a name the incoming scope already gave something."""
-        existing = self._binding(item.alias) if item.alias is not None else None
-        if existing is None:
+        """Refuse an alias that reuses a name this query has already given something.
+
+        Not only a name still in scope: a name an earlier stage DROPPED cannot come back
+        either. One name would then stand for two different things in one query, and everything
+        that answers a question about a name -- the type of ``parts[1]``, say -- would have to
+        know which stage it was standing in before it could answer correctly.
+        """
+
+        if item.alias is None:
             return
-        raise self._refuse(
-            f"WITH would bind {item.alias!r} to {item.expression.describe()} while it already "
-            f"names {existing.describe()}; a stage renames nothing it carries.",
-            field="item",
-            value=item.describe(),
-        )
+        existing = self._binding(item.alias)
+        if existing is not None:
+            raise self._refuse(
+                f"WITH would bind {item.alias!r} to {item.expression.describe()} while it "
+                f"already names {existing.describe()}; a stage renames nothing it carries.",
+                field="item",
+                value=item.describe(),
+            )
+        if item.alias in self._discarded:
+            raise self._refuse(
+                f"WITH would bind {item.alias!r} to {item.expression.describe()}, and an "
+                "earlier stage already used that name for something else; a name a stage "
+                "dropped is not reused.",
+                field="item",
+                value=item.describe(),
+            )
 
     def _bind(
         self, name: str | None, entity: str, labels: tuple[str, ...], *, created: bool
