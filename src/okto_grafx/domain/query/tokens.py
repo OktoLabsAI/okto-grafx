@@ -195,4 +195,3 @@ STRING_SPLIT_FUNCTION: str = "STRING_SPLIT"
 
 TIMESTAMP_FUNCTION: str = "TIMESTAMP"
 """An ISO-8601 reading normalized to UTC microseconds, as Pulse contract 1.0 asks."""
-"""The text partitioning function required by the Pulse query contract 1.0."""

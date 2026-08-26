@@ -672,6 +672,37 @@ def test_timestamp_reads_iso_forms_into_utc_microseconds(
     assert found.rows == ((Timestamp(micros=micros),),)
 
 
+@pytest.mark.parametrize(
+    "argument",
+    ("p.age", "p", "size('abc')", "1"),
+)
+def test_timestamp_refuses_a_family_the_schema_already_rules_out(
+    stack: QueryStack, argument: str
+) -> None:
+    """A declared column type, or a matched row, is wrong the moment the tables resolve.
+
+    Only a parameter has to wait for the call.  Leaving these to evaluation let an empty
+    match answer with no rows for a query that could never have produced an instant.
+    """
+
+    with pytest.raises(GrafxPlanError) as matching:
+        run(stack, f"MATCH (p:Person) RETURN timestamp({argument})")
+    with pytest.raises(GrafxPlanError) as empty:
+        run(stack, f"MATCH (p:Person) WHERE p.id = 99 RETURN timestamp({argument})")
+    assert matching.value.details == empty.value.details == {
+        "field": "function",
+        "value": "timestamp",
+    }
+
+
+def test_a_row_dependent_timestamp_is_still_read_per_row(stack: QueryStack) -> None:
+    """A STRING column can only be judged once a row carries a value, and still is."""
+
+    assert run(
+        stack, "MATCH (p:Person) WHERE p.id = 99 RETURN timestamp(p.city)"
+    ).rows == ()
+
+
 def test_timestamp_keeps_whole_microseconds(stack: QueryStack) -> None:
     """The last digits survive, which they would not through seconds-as-float."""
 

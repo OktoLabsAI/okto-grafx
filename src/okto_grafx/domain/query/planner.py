@@ -796,10 +796,48 @@ class _Planner:
 
         for expression in self._query_expressions(statement):
             for node in walk(expression):
-                if isinstance(node, FunctionCall) and node.name.upper() == (
-                    TIMESTAMP_FUNCTION
-                ):
-                    self.timestamp_calls.append(node)
+                if not isinstance(node, FunctionCall):
+                    continue
+                if node.name.upper() != TIMESTAMP_FUNCTION:
+                    continue
+                self._require_readable_instant(node)
+                self.timestamp_calls.append(node)
+
+    def _require_readable_instant(self, node: FunctionCall) -> None:
+        """Refuse an argument whose family the schema already rules out.
+
+        A bound parameter is left to the binder because only the call knows its value, but a
+        column of the wrong type, or a matched row, is wrong the moment the tables resolve.
+        Waiting for evaluation would let an empty match answer with no rows for a query that
+        could never have produced an instant.
+        """
+
+        argument = node.arguments[0]
+        if isinstance(argument, Variable):
+            if argument.name in self.multi_hop_variables or argument.name in self.tables:
+                message = (
+                    f"{node.name} reads an ISO-8601 string or a timestamp; "
+                    f"{argument.name!r} is a matched row."
+                )
+                raise GrafxPlanError(
+                    message,
+                    field="function",
+                    value=node.name,
+                )
+            return
+        if not isinstance(argument, (Literal, Property, FunctionCall)):
+            return
+        static = self._pulse_expression_type(argument, owner=node.name)
+        if static in (None, ValueType.NULL, ValueType.STRING, ValueType.TIMESTAMP):
+            return
+        message = (
+            f"{node.name} reads an ISO-8601 string or a timestamp; got {static.name}."
+        )
+        raise GrafxPlanError(
+            message,
+            field="function",
+            value=node.name,
+        )
 
     def _record_case_and_subscript_types(self, statement: Query) -> None:
         """Resolve CASE and list-subscript types after every pattern has bound a table."""

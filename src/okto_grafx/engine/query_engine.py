@@ -489,6 +489,10 @@ class _Context:
     statistics: dict[str, int]
     coalesce_types: dict[FunctionCall, ValueType | None]
     case_types: dict[int, ValueType | None]
+    # Instants whose argument the call already made knowable, read once here rather
+    # than parsed again for every row.  Keyed by the call, so nothing replaces the
+    # parameter the caller passed.
+    timestamp_values: dict[FunctionCall, object]
     # The catalog this statement was PLANNED against. Inside a transaction that has declared
     # schema of its own, that is the transaction's working copy, and execution must resolve
     # tables and spaces from the same picture the planner did -- a row materialised for a table
@@ -1024,13 +1028,13 @@ class QueryEngine:
             analysis=plan.analysis,
             statistics=statistics,
             coalesce_types=_bound_coalesce_types(plan, parameters),
+            timestamp_values=_bound_timestamp_values(plan, parameters),
             case_types=_bound_case_types(plan, parameters),
             catalog=catalog,
             result_node=root.child if root.columns else None,
         )
         _validate_bound_subscript_types(plan, parameters)
         _validate_bound_label_arguments(plan, parameters)
-        _validate_bound_timestamp_arguments(plan, parameters)
         stream = self._rows(root.child, context)
         rows = self._collect_result_rows(stream) if root.columns else tuple(stream)
         context.release()
@@ -4536,20 +4540,25 @@ def _timestamp_of(function_name: str, value: object) -> Timestamp | None:
     return Timestamp(micros=(moment - _EPOCH) // _ONE_MICROSECOND)
 
 
-def _validate_bound_timestamp_arguments(
+def _bound_timestamp_values(
     plan: PlannedQuery, parameters: Mapping[str, object]
-) -> None:
-    """Convert every timestamp() argument the call has made knowable, before the stream.
+) -> dict[FunctionCall, object]:
+    """Read every timestamp() argument the call has made knowable, before the stream.
 
     An unreadable instant is wrong whether or not the pattern matches, and a write must not
-    stage anything on its way to finding out.
+    stage anything on its way to finding out, so the conversion happens here and its refusal
+    with it.  Keeping the result means a row does not re-parse text that cannot have changed.
     """
 
+    resolved: dict[FunctionCall, object] = {}
     for call in plan.timestamp_calls:
         argument = call.arguments[0]
         if not _binder_resolvable(argument):
             continue
-        _timestamp_of(call.name, _bound_postfix_value(argument, parameters, owner=call.name))
+        resolved[call] = _timestamp_of(
+            call.name, _bound_postfix_value(argument, parameters, owner=call.name)
+        )
+    return resolved
 
 
 def _validate_bound_label_arguments(
@@ -4666,6 +4675,8 @@ def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
             result.append("")
         return tuple(result)
     if name == TIMESTAMP_FUNCTION:
+        if expression in context.timestamp_values:
+            return context.timestamp_values[expression]
         return _timestamp_of(
             expression.name, _evaluate(expression.arguments[0], row, context)
         )
