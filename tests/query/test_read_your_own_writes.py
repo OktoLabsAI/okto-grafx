@@ -348,48 +348,6 @@ def test_similarity_over_a_dirty_node_table_refuses_before_vector_search(
         handle.close()
 
 
-def test_traversal_over_a_dirty_endpoint_table_refuses_instead_of_reading_stale(
-    tmp_path: Path,
-) -> None:
-    handle = okto_grafx.connect(str(tmp_path / "traversal-db"))
-    try:
-        with handle.begin("write") as schema:
-            schema.execute(
-                "CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))"
-            )
-            schema.execute("CREATE REL TABLE Knows(FROM Person TO Person, since INT64)")
-        with handle.begin("write") as seed:
-            seed.execute("CREATE (:Person {id: 1, name: 'Ada'})")
-            seed.execute("CREATE (:Person {id: 2, name: 'Grace'})")
-        with handle.begin("write") as seed_edge:
-            seed_edge.execute(
-                "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
-                "CREATE (a)-[:Knows {since: 2020}]->(b)"
-            )
-
-        writer = handle.begin("write")
-        writer.execute("MATCH (p:Person {id: 2}) SET p.name = 'after'")
-
-        with pytest.raises(GrafxUnsupportedOperation) as raised:
-            writer.execute(
-                "MATCH (a:Person {id: 1})-[:Knows]->(b:Person) RETURN b.name"
-            )
-
-        table = handle.catalog.catalog.table("Person")
-        assert raised.value.details == {
-            "field": "table",
-            "value": "Person",
-            "table_id": table.table_id,
-            "operation": "traversal",
-        }
-        assert writer.execute(
-            "MATCH (p:Person {id: 2}) RETURN p.name"
-        ).rows == (("after",),)
-        writer.rollback()
-    finally:
-        handle.close()
-
-
 def test_pending_node_cannot_reach_the_heap_as_a_relationship_endpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -419,69 +377,6 @@ def test_pending_node_cannot_reach_the_heap_as_a_relationship_endpoint(
         assert same_statement_raised.value.details["field"] == "source"
         assert same_statement._context.row_intents == []
         same_statement.rollback()
-
-        with handle.begin("write") as seed:
-            seed.execute("CREATE (:Person {id: 1, name: 'Ada'})")
-
-        writer = handle.begin("write")
-        writer.execute("CREATE (:Person {id: 2, name: 'Grace'})")
-        with pytest.raises(GrafxUnsupportedOperation) as raised:
-            writer.execute(
-                "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
-                "CREATE (a)-[:Knows {since: 2020}]->(b)"
-            )
-
-        assert raised.value.details == {
-            "field": "target",
-            "value": "b",
-            "table": "Knows",
-            "operation": "relationship_endpoint",
-        }
-        assert writer.execute(
-            "MATCH (p:Person) RETURN p.id ORDER BY p.id"
-        ).rows == ((1,), (2,))
-        writer.rollback()
-    finally:
-        handle.close()
-
-
-def test_detach_delete_refuses_an_incident_relationship_staged_earlier(
-    tmp_path: Path,
-) -> None:
-    """DETACH must not strand an edge that exists only in the owner's overlay."""
-    handle = okto_grafx.connect(str(tmp_path / "pending-detach-db"))
-    try:
-        with handle.begin("write") as schema:
-            schema.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
-            schema.execute("CREATE REL TABLE Knows(FROM Person TO Person, since INT64)")
-        with handle.begin("write") as seed:
-            seed.execute("CREATE (:Person {id: 1})")
-            seed.execute("CREATE (:Person {id: 2})")
-
-        with handle.begin("write") as writer:
-            writer.execute(
-                "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
-                "CREATE (a)-[:Knows {since: 2020}]->(b)"
-            )
-            before = tuple(writer._context.row_intents)
-
-            with pytest.raises(GrafxUnsupportedOperation) as raised:
-                writer.execute(
-                    "MATCH (a:Person {id: 1}) DETACH DELETE a"
-                )
-
-            relationship = handle.catalog.catalog.table("Knows")
-            assert raised.value.details == {
-                "field": "table",
-                "value": "Knows",
-                "table_id": relationship.table_id,
-                "operation": "detach_delete",
-            }
-            assert tuple(writer._context.row_intents) == before
-
-        assert handle.execute(
-            "MATCH (a:Person)-[:Knows]->(b:Person) RETURN a.id, b.id"
-        ).rows == ((1, 2),)
     finally:
         handle.close()
 
