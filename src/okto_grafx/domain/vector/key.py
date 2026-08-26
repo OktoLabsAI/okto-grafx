@@ -82,8 +82,9 @@ class VectorIndexDefinition(IndexDefinition):
 
     key_derivation: str = VECTOR_DIGEST_DERIVATION
 
-    def key_for(self, values: Sequence[Value]) -> bytes:
-        """Return the digest of the vector column of one row of this table."""
+    def _value_from(self, values: Sequence[Value]) -> Value:
+        """Return this definition's column value after checking row arity."""
+
         position = self.positions[0]
         if not 0 <= position < len(values):
             raise GrafxIndexError(
@@ -94,4 +95,20 @@ class VectorIndexDefinition(IndexDefinition):
                 value=position,
                 arity=len(values),
             )
-        return vector_digest(values[position])
+        return values[position]
+
+    def key_for(self, values: Sequence[Value]) -> bytes:
+        """Return the digest of a non-null vector column."""
+
+        return vector_digest(self._value_from(values))
+
+    def entry_key_for(self, values: Sequence[Value]) -> bytes | None:
+        """Return no entry for ``NULL`` and a digest for a stored vector."""
+
+        value = self._value_from(values)
+        return None if value is None else vector_digest(value)
+
+    def owes_entry(self, values: Sequence[Value]) -> bool:
+        """Say whether the vector column is populated, without hashing it."""
+
+        return self._value_from(values) is not None

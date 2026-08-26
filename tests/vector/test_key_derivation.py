@@ -17,6 +17,7 @@ import hashlib
 import pytest
 
 from okto_grafx.domain.errors import GrafxIndexError
+from okto_grafx.domain.index import IndexOperation, change_of
 from okto_grafx.domain.index.definition import COLUMN_KEY_DERIVATION, IndexDefinition
 from okto_grafx.domain.index.entry import INDEX_ENTRY_HEADER_SIZE
 from okto_grafx.domain.index.visibility import IndexVisibility
@@ -98,6 +99,131 @@ def test_the_definition_keys_the_vector_column_of_a_row() -> None:
     """The framework's verifier re-derives a key this way, so the two must agree exactly."""
     vector = VectorValue((1.0, 2.0), 3, "float32")
     assert _definition().key_for((7, 0, vector)) == vector_digest(vector)
+    assert _definition().entry_key_for((7, 0, vector)) == vector_digest(vector)
+
+
+def test_a_null_vector_is_omitted_only_by_the_sparse_entry_door() -> None:
+    """NULL is a valid row value but never a digest or a stored vector-index entry."""
+    definition = _definition()
+    assert definition.owes_entry((7, 0, None)) is False
+    assert definition.entry_key_for((7, 0, None)) is None
+    with pytest.raises(GrafxIndexError) as failure:
+        definition.key_for((7, 0, None))
+    assert failure.value.details["field"] == "key"
+
+
+def test_an_exact_index_still_owes_an_entry_for_a_null_scalar_key() -> None:
+    """Sparse vector semantics must not silently change ordinary nullable indexes."""
+    definition = IndexDefinition(
+        name="chunk_by_optional_title",
+        table_id=1,
+        table_name="Chunk",
+        positions=(1,),
+        visibility=IndexVisibility.EXACT,
+    )
+    assert definition.owes_entry((7, None)) is True
+    assert definition.entry_key_for((7, None)) == definition.key_for((7, None))
+
+
+def test_sparse_row_staging_emits_exactly_the_populated_halves(
+    database: VectorFixture,
+) -> None:
+    """Pin the six insert/delete/update cases and their WAL cardinality/order."""
+    space = database.create_space("space", 2)
+    table = database.create_table("Chunk", "space")
+    vector = VectorValue((1.0, 0.0), space.space_id, space.storage_dtype)
+    null_row = (1, 0, None)
+    vector_row = (1, 0, vector)
+    old_ref = database.heap.insert(table, 1, null_row, 10)
+    new_ref = database.heap.insert(table, 2, vector_row, 20)
+
+    cases = (
+        (
+            lambda txn: database.registry.stage_row_insert(
+                txn, table.table_id, old_ref, null_row, 30
+            ),
+            (),
+        ),
+        (
+            lambda txn: database.registry.stage_row_delete(
+                txn, table.table_id, old_ref, null_row, 30
+            ),
+            (),
+        ),
+        (
+            lambda txn: database.registry.stage_row_update(
+                txn, table.table_id, old_ref, null_row, old_ref, null_row, 30
+            ),
+            (),
+        ),
+        (
+            lambda txn: database.registry.stage_row_update(
+                txn, table.table_id, old_ref, null_row, new_ref, vector_row, 30
+            ),
+            (IndexOperation.INSERT,),
+        ),
+        (
+            lambda txn: database.registry.stage_row_update(
+                txn, table.table_id, new_ref, vector_row, old_ref, null_row, 30
+            ),
+            (IndexOperation.TOMBSTONE,),
+        ),
+        (
+            lambda txn: database.registry.stage_row_update(
+                txn, table.table_id, new_ref, vector_row, new_ref, vector_row, 30
+            ),
+            (IndexOperation.TOMBSTONE, IndexOperation.INSERT),
+        ),
+    )
+    for stage, expected in cases:
+        txn = TransactionDouble()
+        records = stage(txn)
+        assert tuple(change_of(record).operation for record in records) == expected
+        assert tuple(txn.records) == records
+        database.registry.rollback(txn)
+
+    assert database.registry.row_entry_count(table.table_id, null_row) == 0
+    assert database.registry.row_entry_count(table.table_id, vector_row) == 1
+
+
+def test_a_null_only_rebuild_stages_only_reset_and_verifies_clean(
+    database: VectorFixture,
+) -> None:
+    """Rebuild must omit NULL heap rows while still replacing the stale generation."""
+    database.create_space("space", 2)
+    table = database.create_table("Chunk", "space")
+    ref = database.heap.insert(table, 1, (1, 0, None), 10)
+    index = database.engine.index("space")
+    index.mark_stale("exercise sparse rebuild")
+    through = index.built_through_lsn
+    txn = TransactionDouble()
+
+    assert database.registry.rebuild(index.name, txn, through) == 1
+    assert [change_of(record).operation for record in txn.records] == [IndexOperation.RESET]
+    assert database.registry.commit(txn, through) == 1
+    database.registry.clear_stale(index.name, through)
+
+    assert index.walk() == ()
+    assert database.registry.verify() == ()
+    assert database.heap.read(ref).values == (1, 0, None)
+
+
+def test_an_entry_pointing_at_a_null_vector_is_reported_as_divergence(
+    database: VectorFixture,
+) -> None:
+    """Sparsity skips coverage; it must not bless an impossible stored entry."""
+    space = database.create_space("space", 2)
+    table = database.create_table("Chunk", "space")
+    ref = database.heap.insert(table, 1, (1, 0, None), 10)
+    index = database.engine.index("space")
+    txn = TransactionDouble()
+    impossible = vector_digest(VectorValue((1.0, 0.0), space.space_id, space.storage_dtype))
+    index.stage_insert(txn, impossible, ref, 20)
+    index.commit(txn, 20)
+
+    findings = database.registry.verify()
+    assert findings
+    assert any(finding.kind == "index_heap_divergence" for finding in findings)
 
 
 def test_a_row_too_short_for_the_keyed_column_is_refused() -> None:

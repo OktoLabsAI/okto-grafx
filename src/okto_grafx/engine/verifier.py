@@ -1136,6 +1136,8 @@ class Verifier:
                 key = _expected_key(definition, version.values, positions)
             except GrafxError:
                 continue
+            if key is None:
+                continue
             if (key, ref.encode()) in covered:
                 continue
             findings.append(
@@ -1164,7 +1166,11 @@ class Verifier:
 _KNOWN_PAGE_TYPES: frozenset[int] = frozenset(int(member) for member in PageType)
 
 
-def _expected_key(definition: object, values: object, positions: object) -> bytes:
+def _expected_key(
+    definition: object,
+    values: object,
+    positions: object,
+) -> bytes | None:
     """Return the key this index would store for a row, asking the DEFINITION how.
 
     The derivation belongs to the index, not to this walk. A vector index keys on a digest of the
@@ -1179,6 +1185,10 @@ def _expected_key(definition: object, values: object, positions: object) -> byte
     populated the others. ``key_for`` is the oracle, and it is the same call the staging path
     makes, so the two cannot drift.
     """
+    entry_key_for = getattr(definition, "entry_key_for", None)
+    if callable(entry_key_for):
+        key = entry_key_for(values)
+        return None if key is None else bytes(key)
     key_for = getattr(definition, "key_for", None)
     if callable(key_for):
         return bytes(key_for(values))

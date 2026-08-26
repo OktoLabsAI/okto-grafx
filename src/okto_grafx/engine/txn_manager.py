@@ -2211,11 +2211,10 @@ class TransactionManager:
             table_id = getattr(row.table, "table_id", None)
             if table_id is None:
                 continue
-            covering = len(manager.indexes_for(table_id))
             if row.ended is not None:
-                total += covering
+                total += manager.row_entry_count(table_id, row.ended_values)
             if row.born is not None:
-                total += covering
+                total += manager.row_entry_count(table_id, row.born_values)
         return total
 
     def _stage_index_changes(

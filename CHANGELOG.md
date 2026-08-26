@@ -62,6 +62,10 @@ including the on-disk format.
 
 ### Changed
 
+- **Nullable vector columns now use a sparse durable index.** A `NULL` embedding creates no
+  vector-index entry or WAL effect; transitions to and from `NULL` insert or tombstone only the
+  populated side.  Empty sparse commits still certify index coverage, while rebuild, exact
+  verification, cold reopen and vector search consistently omit `NULL` rows.
 - **Public recovery and metrics facades now expose their concrete detached result types.**
   `Database.recovery_report` is `RecoveryReport | None`, `Database.recover()` returns
   `RecoveryReport`, and `Database.snapshot_metrics()` returns `MetricsSnapshotView`; runtime

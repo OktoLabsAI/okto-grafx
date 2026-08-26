@@ -204,7 +204,12 @@ class IndexFinding:
 
 @dataclass(slots=True)
 class _Staged:
-    """The changes one transaction has staged into one index, in the order it staged them."""
+    """One transaction's index effects, including a proved empty sparse observation.
+
+    An empty ``changes`` list is meaningful: the transaction wrote the covered table, but a
+    sparse definition decided that the written row owed this index no entry.  Keeping that
+    observation lets commit advance the index's coverage without inventing a WAL effect.
+    """
 
     txn_id: int
     changes: list[IndexChange] = field(default_factory=list)
@@ -1124,6 +1129,20 @@ class IndexStore:
         staged.changes.append(change)
         txn.stage_record(record)
         return record
+
+    def stage_empty_observation(self, txn: StagingTransaction) -> None:
+        """Record that a covered row was examined but owed this sparse index no entry.
+
+        The log records changes, so an omitted sparse entry has no logical index record.  The
+        live index still has to advance through the table's commit: otherwise its durable
+        ``built_through`` position remains behind and the next reader correctly, but needlessly,
+        marks it stale.  An empty staging batch supplies exactly that acknowledgement and is
+        discarded by rollback like an ordinary batch.
+        """
+
+        txn_id = self._require_txn(txn)
+        if txn_id not in self._staged:
+            self._staged[txn_id] = _Staged(txn_id=txn_id)
 
     def pending(self, txn: StagingTransaction) -> tuple[IndexChange, ...]:
         """Return the changes this transaction has staged into this index, in order."""
@@ -2852,6 +2871,15 @@ class IndexManager:
 
     # --- staging ----------------------------------------------------------------------------
 
+    def row_entry_count(self, table_id: int, values: Sequence[object]) -> int:
+        """Count entries this row owes without deriving or hashing their keys."""
+
+        return sum(
+            1
+            for index in self.indexes_for(table_id)
+            if index.definition.owes_entry(values)
+        )
+
     def stage_row_insert(
         self,
         txn: StagingTransaction,
@@ -2861,10 +2889,14 @@ class IndexManager:
         csn: Csn,
     ) -> tuple[WalRecord, ...]:
         """Stage, on every index of the table, the entry this new row version owes it."""
-        return tuple(
-            index.stage_insert(txn, index.definition.key_for(values), ref, csn)
-            for index in self.indexes_for(table_id)
-        )
+        records: list[WalRecord] = []
+        for index in self.indexes_for(table_id):
+            definition = index.definition
+            if not definition.owes_entry(values):
+                index.stage_empty_observation(txn)
+            else:
+                records.append(index.stage_insert(txn, definition.key_for(values), ref, csn))
+        return tuple(records)
 
     def stage_row_delete(
         self,
@@ -2875,10 +2907,14 @@ class IndexManager:
         csn: Csn,
     ) -> tuple[WalRecord, ...]:
         """Stage, on every index of the table, the end of the entry this row version had."""
-        return tuple(
-            index.stage_delete(txn, index.definition.key_for(values), ref, csn)
-            for index in self.indexes_for(table_id)
-        )
+        records: list[WalRecord] = []
+        for index in self.indexes_for(table_id):
+            definition = index.definition
+            if not definition.owes_entry(values):
+                index.stage_empty_observation(txn)
+            else:
+                records.append(index.stage_delete(txn, definition.key_for(values), ref, csn))
+        return tuple(records)
 
     def stage_row_update(
         self,
@@ -2900,12 +2936,18 @@ class IndexManager:
         records: list[WalRecord] = []
         for index in self.indexes_for(table_id):
             definition = index.definition
-            records.append(
-                index.stage_delete(txn, definition.key_for(old_values), old_ref, csn)
-            )
-            records.append(
-                index.stage_insert(txn, definition.key_for(new_values), new_ref, csn)
-            )
+            owes_old = definition.owes_entry(old_values)
+            owes_new = definition.owes_entry(new_values)
+            if not owes_old and not owes_new:
+                index.stage_empty_observation(txn)
+            elif owes_old:
+                records.append(
+                    index.stage_delete(txn, definition.key_for(old_values), old_ref, csn)
+                )
+            if owes_new:
+                records.append(
+                    index.stage_insert(txn, definition.key_for(new_values), new_ref, csn)
+                )
         return tuple(records)
 
     def commit(self, txn: StagingTransaction, csn: Csn) -> int:
@@ -3029,7 +3071,7 @@ class IndexManager:
                     )
                 if not snapshot.visible(version.xmin, version.xmax):
                     continue
-                if definition.key_for(version.values) != entry.key:
+                if definition.entry_key_for(version.values) != entry.key:
                     continue
                 confirmed.append(entry.ref)
             return tuple(confirmed)
@@ -3118,7 +3160,9 @@ class IndexManager:
         for ref, version in self._heap.scan_all(table):
             if is_provisional_csn(version.xmin):
                 continue
-            key = definition.key_for(version.values)
+            key = definition.entry_key_for(version.values)
+            if key is None:
+                continue
             index.stage_insert(txn, key, ref, version.xmin)
             staged += 1
             if not is_open_end_csn(version.xmax):
@@ -3227,7 +3271,7 @@ class IndexManager:
             # Exact indexes may legally retain a candidate for it, and proximity indexes must
             # never have persisted its reserved birth stamp.
             return ()
-        if definition.key_for(version.values) != entry.key:
+        if definition.entry_key_for(version.values) != entry.key:
             findings.append(
                 IndexFinding(
                     kind="stale_entry"
@@ -3311,7 +3355,9 @@ class IndexManager:
         for ref, version in self._heap.scan_all(table):
             if is_provisional_csn(version.xmin):
                 continue
-            key = definition.key_for(version.values)
+            key = definition.entry_key_for(version.values)
+            if key is None:
+                continue
             if (key, ref) in stored:
                 continue
             if not is_open_end_csn(version.xmax) and version.xmax <= reconciled:

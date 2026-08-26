@@ -846,6 +846,15 @@ class SecondaryIndex(Protocol):
 * `PROXIMITY` — entries are versioned with tombstones; `reconcile(horizon)` removes only entries whose
   tombstone CSN is below the snapshot horizon, and every removal is an `INDEX_RECONCILE` WAL record.
 
+**Sparse vector rule:** a nullable vector column whose value is `NULL` owes its vector index no
+entry. `INSERT NULL`, `DELETE NULL` and `NULL -> NULL` therefore emit no logical index WAL record;
+`NULL -> vector` emits only `INSERT`, and `vector -> NULL` emits only the tombstone. This exception
+belongs to the vector definition and does not make nullable scalar `EXACT` indexes sparse. A live
+commit that writes the covered table but owes no vector entry MUST still stage an empty coverage
+observation, so the index advances `built_through` without inventing a WAL change. Recovery may make
+the same coverage claim only after complete replay. Rebuild and both verification walks omit `NULL`
+rows; an existing vector-index entry that points at one is divergence, not a valid sparse entry.
+
 M1 ships `HashIndex` (EXACT) as the reference implementation proving the contract end to end.
 
 ### 8.8 `engine/vector_engine.py` (C9)

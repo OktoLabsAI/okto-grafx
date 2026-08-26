@@ -314,6 +314,13 @@ a primary key be indexed without the index having to understand visibility.
 **PROXIMITY** (vector). Entries are versioned with tombstones and a horizon, and they are already the
 answer — the heap is deliberately not consulted.
 
+Vector indexes are **sparse for nullable embeddings**. A row whose vector is `NULL` remains a normal
+heap row but has no vector entry, cannot enter either search regime and is omitted by rebuild and
+coverage verification. A `NULL`-only write has no index WAL payload, yet its empty staged
+observation advances the vector index through that commit; otherwise the next read would correctly
+classify the index as behind. Nullable scalar exact indexes retain their ordinary encoded `NULL`
+key, so sparsity is a definition-level policy rather than a global null rule.
+
 **Staleness.** An index compares the position it claims to cover against the position the database
 published. A stale index is a *subset* of the heap, and a subset is exactly what validation cannot
 repair: it removes hits that should not be there and cannot invent ones that are missing. So a stale

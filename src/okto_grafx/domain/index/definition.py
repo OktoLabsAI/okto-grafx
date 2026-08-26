@@ -265,6 +265,26 @@ class IndexDefinition:
             )
         return index_key(values, self.positions)
 
+    def entry_key_for(self, values: Sequence[Value]) -> bytes | None:
+        """Return the stored key, or ``None`` when this row has no index entry.
+
+        Ordinary exact indexes represent every row, including nullable scalar
+        keys.  Sparse index definitions override this door so staging,
+        rebuild and both verifiers make the same inclusion decision.
+        """
+
+        return self.key_for(values)
+
+    def owes_entry(self, values: Sequence[Value]) -> bool:
+        """Say whether this row owes an entry without deriving its potentially large key.
+
+        Exact indexes include nullable scalar keys, so the default is deliberately ``True``.
+        Sparse definitions override this predicate; transaction WAL pre-counting uses it to
+        avoid performing an expensive derivation a second time before staging.
+        """
+
+        return True
+
     def digest(self) -> bytes:
         """Return the digest an index file stores to prove which definition wrote it.
 
