@@ -193,6 +193,7 @@ def test_replace_preserves_identity_and_edge_multiset_through_cold_reopen(
         assert changed.statistics.get("rows_created", 0) == 0
         assert changed.statistics.get("rows_deleted", 0) == 0
         assert _node(writer, TARGET) == _expected_node(TARGET, REPLACEMENT)
+        assert _edges(writer) == EXPECTED_EDGES
 
         outsider = database.begin("read")
         assert _node(outsider, TARGET) == _expected_node(TARGET, ORIGINAL)
