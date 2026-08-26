@@ -805,8 +805,10 @@ O Grafx precisa oferecer, com atomicidade transacional:
 - remoção por `source_session_id`, incluindo a variante que preserva lineage de Spec;
 - reconciliação e compensação de lineage/active-set com recibos completos conforme o port Pulse.
 
-Nenhuma forma de delete pode degradar para “best effort” silencioso. Uma capacidade ainda ausente
-deve responder com `GrafxUnsupportedOperation` antes da primeira mutação.
+Nenhuma forma de delete pode degradar para “best effort” silencioso. Dentro do engine, uma
+capacidade ainda ausente deve responder com `GrafxUnsupportedOperation` antes da primeira mutação;
+o provider converte esse erro antes de chegar ao Core em `GraphCapabilityUnavailable` ou no erro
+público `unsupported_operation`, conforme a porta chamada.
 
 #### 9.3.2 Visibilidade e unidade de trabalho
 
@@ -903,12 +905,15 @@ Discovery (`Board`, `Topic`, `Entity` e `DecisionDigest`), e garantir:
   completo, sem caminhos híbridos que ainda assumam `graph.lbug`;
 - inspect/restore de quarentena, privacy erase, purge, footprint e budgets preservam os DTOs e as
   recusas dos ports Pulse;
+- privacy erase invalida/removerá toda cópia que possa reter o board: Grafx ativo e shadow,
+  gerações antigas, quarentena, backups, journal e Ladybug mantido para rollback;
 - operações de Global Discovery que constroem candidato/cutover recebem e revalidam o fence antes
   da publicação;
 - export/import lógico é streaming, versionado, com manifesto e checksums;
 - o formato lógico inclui schema, nós, relações, propriedades, layers, vetores e IDs lógicos;
-- o fingerprint lógico canônico inclui type tags, `NULL`, direção e multiplicidade de relações e
-  nunca depende de `RecordId`, página, ordem física ou nome de arquivo;
+- o fingerprint lógico canônico inclui type tags e mapas completos de propriedades de nós/arestas,
+  distingue propriedade ausente de propriedade presente com `NULL`, preserva relações paralelas,
+  direção e multiplicidade e nunca depende de `RecordId`, página, ordem física ou nome de arquivo;
 - import só é publicado depois de `verify()` e fingerprint lógico completo;
 - upgrade de formato físico ocorre por export/import ou rebuild para nova geração, nunca in-place;
 - versão antiga deve recusar formato obrigatório desconhecido de maneira fail-closed;
@@ -948,7 +953,8 @@ efeito parcial e readers externos nunca veem staged state.
 3. traduzir mutations internas para primitives estruturados quando isso evitar copiar DDL/procedures
    Kuzu sem benefício;
 4. estabilizar DTO de resultado e taxonomia de erros;
-5. adicionar modo/capability `pulse-cypher-1.0` sem alterar silenciosamente o dialeto default.
+5. adicionar o perfil `pulse-1` com `KG_QUERY_CONTRACT_VERSION=1.0`, sem alterar silenciosamente o
+   dialeto default.
 
 **Gate:** 100% do corpus read-only público e das mutations internas necessárias passa em teste
 diferencial; formas fora do corpus recusam antes de executar.
@@ -971,8 +977,10 @@ mesmo fingerprint de schema esperado pelo Pulse.
 3. suportar create/rebuild/status dos índices;
 4. executar gates exact/ANN, cold/warm, churn e reopen.
 
-**Gate:** top-k exato tem paridade total; ANN atende o recall congelado pelo harness e nunca retorna
-item inelegível por board/layer/supersedence.
+**Gate:** top-k exato retorna os mesmos IDs elegíveis e ordenação; empates têm política
+determinística e scores usam tolerâncias absoluta/relativa congeladas no fixture, não igualdade
+bitwise entre backends. ANN atende o recall congelado pelo harness e nunca retorna item inelegível
+por board/layer/supersedence.
 
 #### M-PULSE-5 — export/import, backup e recovery portável
 
@@ -1003,8 +1011,17 @@ nós cognitivos sem fonte SQL, e permite rollback para a geração anterior.
 6. revalidar fencing em toda mutação e imediatamente antes do commit/cutover;
 7. adicionar suíte diferencial por port e por fluxo de negócio.
 
-**Gate:** a mesma suíte de Core passa com os dois bundles; nenhum import/tipo/erro Grafx aparece no
-Core e nenhuma operação cai silenciosamente no provider Kuzu.
+Backend+geração são resolvidos uma vez no `begin/open` e ficam imutavelmente pinados até o scope
+fechar. Cutover por CAS aguarda scopes ativos ou os invalida por fencing; uma chamada individual
+nunca é reroteada no meio da operação.
+
+**Gate:** 100% dos métodos de todos os ports enumerados em 9.1 são exercitados por provider Grafx
+real, além da mesma suíte de Core com os dois bundles. Isso inclui os quatro estados de diagnóstico
+non-opening do runtime, `GraphRecovery.main_untouched=True`,
+`search_decision_digests(exhaustive=True)`, replace de identidade, deletes guarded versus
+lifecycle-authorized, normalização de links, verification scope e flush de Global Discovery.
+Nenhum import/tipo/erro Grafx aparece no Core e nenhuma operação cai silenciosamente no provider
+Kuzu.
 
 #### M-PULSE-7 — shadow, canário e corte
 
@@ -1016,7 +1033,9 @@ Core e nenhuma operação cai silenciosamente no provider Kuzu.
 5. manter Ladybug intacto até o fim da janela de rollback;
 6. depois do primeiro write aceito pelo Grafx, rollback só permanece aberto se o journal lógico
    também conseguir aplicar e confirmar o delta reverso no Ladybug; sem isso, a janela encerra
-   explicitamente antes de aceitar novos writes.
+   explicitamente antes de aceitar novos writes;
+7. privacy erase atravessa o router e invalida todas as cópias, inclusive a fonte de rollback,
+   antes de confirmar sucesso.
 
 **Gate de corte:** pelo menos 10.000 mutações representativas, três ciclos completos de
 close/reopen/recovery e zero divergência não explicada; nenhuma falha de `verify()`; cada query do
@@ -1024,9 +1043,16 @@ corpus termina dentro do limite externo atual de 30 segundos do Pulse. Se o port
 próprio, isso exige nova versão do contrato. O benchmark publicado deve registrar throughput,
 p50/p90/p99 e pico de memória de ambos os backends antes da decisão operacional.
 
+Antes da execução, o trace de 10.000 operações é congelado com fixture, distribuição, seed,
+fingerprints esperados, cobertura de cada família de mutação e pontos de crash. “Representativo”
+sozinho não pode ser usado para mudar o gate durante a rodada.
+
 ### 9.5 Política para evitar breaking changes no Pulse
 
-1. o capability manifest `pulse-1` e os DTOs do adapter são a fronteira estável;
+1. o compatibility descriptor `pulse-1` e os DTOs do adapter são a fronteira estável. Esse
+   descriptor é artefato de release/conformance, de propriedade conjunta do Grafx e do adapter
+   Pulse, e registra query contract 1.0, schemas 0.5.0/0.1.2 e versões dos ports; ele não amplia os
+   três booleanos atuais de `GraphCapabilities` sem uma versão própria do port;
 2. toda versão consumida pelo Pulse é pinada por SHA/versão exata;
 3. mudança de API/query/resultado exige nova capability version, nunca mudança silenciosa;
 4. mudança de formato físico exige migrador lógico e fixture n−1/n; o Pulse não abre formato
@@ -1049,9 +1075,10 @@ uma mudança de formato ou semântica fica concentrado no Grafx, no adapter Comm
 - M-PULSE-1 precede a implementação completa do `GraphTransactionScope`.
 - Depois de M-PULSE-1, M-PULSE-2, M-PULSE-3 e M-PULSE-4 podem avançar em paralelo em arquivos e
   branches isolados.
-- M-PULSE-5 pode iniciar em paralelo após o formato lógico ser congelado, mas seu gate depende de
-  schema e vetores.
-- M-PULSE-6 depende dos gates M-PULSE-0 a M-PULSE-5.
+- O rascunho do formato lógico de M-PULSE-5 pode iniciar imediatamente; só é congelado depois dos
+  contratos de schema e vetor de M-PULSE-3/4.
+- O scaffold do provider/router/harness de M-PULSE-6 pode iniciar após M-PULSE-1; sua certificação
+  final depende dos gates M-PULSE-0 a M-PULSE-5.
 - M-PULSE-7 é apenas rollout; não pode ser usado para descobrir semântica básica faltante.
 
 Cada milestone deve ter branch, commit e push próprios, suíte direcionada, suíte global verde,
