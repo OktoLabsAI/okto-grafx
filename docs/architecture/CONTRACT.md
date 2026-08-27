@@ -991,6 +991,27 @@ subject to the ordinary result and intermediate-row budgets. A chained optional,
 relationship or multiple pattern is refused before streaming. Parser, analysis and planner each
 repeat the structural gate so supplied trees or supplied analysis cannot widen the form.
 
+`left UNION right` is admitted in one deliberately closed form: exactly two top-level, read-only
+queries, each ending in `RETURN`, followed by one global duplicate elimination. Column positions
+must have the same family; null may combine with a known family and integer/double promotes to
+double, while every other mismatch is refused before either branch streams. Bound parameters are
+part of that proof, so parameter-dependent families are resolved once at bind time. Node,
+relationship and path outputs remain refused because this milestone does not define a common
+public identity for them. The left branch supplies the public column names.
+
+The physical shape is `ProduceResults -> DistinctRows -> UnionRows ->` two branch pipelines.
+Both branches share one execution context, transaction and snapshot, and parameters are bound
+once for the statement. Each branch's `ORDER BY`, `SKIP` and `LIMIT` stays local; there is no
+post-union ordering or window. `UnionRows` owns intermediate-row admission and the collector owns
+the result-row limit after duplicate elimination. Coercion to the proven common family happens
+before that elimination, so numerically equal integer/double values are one row.
+
+`UNION ALL`, a third branch, nesting, a branch containing a write or DDL, and a branch containing
+`OPTIONAL MATCH` are refused by parser, analysis and planner gates, including supplied trees and
+supplied analysis. The same bounded expression-depth and parameter-count limits apply to the
+combined statement; alias expansion used only for type proof is memoized and never rewrites the
+executable branch AST.
+
 `MATCH (n)` -- a node that names no label -- matches every node table, and `AllNodesScan` reads
 them in table_id order under one name. It is one operator over the union rather than one scan per
 table, so a predicate, `label(n)`, an aggregate, `DISTINCT`, an `ORDER BY` and a window each apply

@@ -258,8 +258,8 @@
       "YIELD"
     ],
     "probe_count": 87,
-    "engine_accepted": 76,
-    "engine_refused": 11,
+    "engine_accepted": 77,
+    "engine_refused": 10,
     "contract_refused": 14,
     "contract_error_codes": {
       "unsafe_cypher": 10,
@@ -825,9 +825,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "parse_error",
-        "engine_verdict": "refused",
-        "error": "GrafxParseError: RETURN ends a query, so no clause may follow it (line 1, column 32). [code=parse_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "clause",
@@ -7723,5 +7723,5 @@
       }
     }
   ],
-  "digest": "905b29bdb503d77c9ad56878d50586866e1c013e31a00dfbd8793bf9293c484c"
+  "digest": "8963b64ab073d13f84d216cd58ce7f1c683c74b1a1e8dfdcd4897c3c6fd8002f"
 }

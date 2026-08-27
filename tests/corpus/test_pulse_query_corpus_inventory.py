@@ -681,6 +681,7 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         "named path",
         "unbounded variable length",
         "OPTIONAL MATCH",
+        "UNION",
         "map batch",
         "map access",
     ):
@@ -698,10 +699,11 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
     # M-PULSE-2H moved two ENTRIES and no probe; M-PULSE-2I moved two PROBES and no entry;
     # M-PULSE-2J and 2K each move one more probe. M-PULSE-2L then makes the engine verdict
     # follow the public NFKC execution path and closes the unsupported trailing-clause hole in
-    # the Core authority. The three remaining debts are engine capabilities, not boundary drift.
-    assert len(accepted) == 76
-    assert len(refused) == 11
-    assert set(owed) == {"UNION", "untyped relationship", "path projection"}
+    # the Core authority, and M-PULSE-2M moves UNION. The two remaining debts are engine
+    # capabilities, not boundary drift.
+    assert len(accepted) == 77
+    assert len(refused) == 10
+    assert set(owed) == {"untyped relationship", "path projection"}
     assert raw["contract_refused"] == 14
     assert raw["contract_error_codes"] == {
         "unsafe_cypher": 10,

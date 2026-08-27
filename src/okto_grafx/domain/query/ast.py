@@ -743,6 +743,28 @@ class Query(Statement):
 
 
 @dataclass(frozen=True, slots=True)
+class UnionQuery(Statement):
+    """Two reading queries whose rows are one result, with the duplicates removed.
+
+    Exactly two branches, and deliberately not a list. A list would say that three branches
+    are the same shape as two, and they are not: the second UNION would have to decide whether
+    it deduplicates against the first pair's output or against its own input, and answering
+    that question is a different milestone from admitting the pair.
+
+    The column NAMES come from the left branch alone. The right branch may spell its aliases
+    differently -- a caller reading the result never sees them -- but it must produce the same
+    number of columns, and each position must carry a type the pair can agree on.
+    """
+
+    left: Query
+    right: Query
+
+    def describe(self) -> str:
+        """Return the statement as it would be written back."""
+        return f"{self.left.describe()} UNION {self.right.describe()}"
+
+
+@dataclass(frozen=True, slots=True)
 class ColumnSpec:
     """One column of a table as the DDL declared it.
 
@@ -814,7 +836,9 @@ class CreateVectorSpaceStatement(Statement):
         return f"CREATE VECTOR SPACE {self.name} {self.options.describe()}"
 
 
-def walk(expression: Expression, *, limit: int = MAX_EXPRESSION_DEPTH) -> Iterator[Expression]:
+def walk(
+    expression: Expression, *, limit: int = MAX_EXPRESSION_DEPTH
+) -> Iterator[Expression]:
     """Yield every node of an expression tree, parents before children.
 
     The walk is iterative and carries an explicit depth bound, so it terminates on any tree it is

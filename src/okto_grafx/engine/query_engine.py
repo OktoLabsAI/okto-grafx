@@ -151,12 +151,14 @@ from okto_grafx.domain.query.plan import (
     SkipRows,
     SortRows,
     TraverseRelationship,
+    UnionRows,
     UnwindRows,
     VectorSearch,
     WithRows,
     validate_plan,
 )
 from okto_grafx.domain.query.planner import (
+    union_common_type,
     SCORE_COLUMN,
     PlannedQuery,
     build_plan,
@@ -500,7 +502,7 @@ class _Context:
     parameters: dict[str, Value]
     analysis: QueryAnalysis
     statistics: dict[str, int]
-    coalesce_types: dict[FunctionCall, ValueType | None]
+    coalesce_types: dict[int, ValueType | None]
     case_types: dict[int, ValueType | None]
     # Instants whose argument the call already made knowable, read once here rather
     # than parsed again for every row.  Keyed by the call, so nothing replaces the
@@ -512,6 +514,7 @@ class _Context:
     # whose vector space exists only in the working copy cannot ask the live catalog for it.
     catalog: Catalog | None = None
     result_node: PlanNode | None = None
+    union_coercions: tuple[bool, ...] = ()
     intermediate_rows: dict[int, int] = field(default_factory=dict)
     staged_rows: list[_HeldRow] = field(default_factory=list)
     staged_partitions: list[tuple[int, bytes]] = field(default_factory=list)
@@ -597,7 +600,9 @@ class _Context:
         exactly as it found it.
         """
         self._require_statement_write_capacity()
-        self.staged_rows.append(_HeldRow(_HELD_INSERT, table, values, identity, None, token))
+        self.staged_rows.append(
+            _HeldRow(_HELD_INSERT, table, values, identity, None, token)
+        )
         self.staged_partitions.append((table.table_id, key))
 
     def hold_update(
@@ -688,7 +693,9 @@ class _Context:
                         held.table, held.values or (), record_id=held.identity
                     )
                 elif held.operation is _HELD_UPDATE:
-                    transaction.stage_row_update(held.table, held.reference, held.values or ())
+                    transaction.stage_row_update(
+                        held.table, held.reference, held.values or ()
+                    )
                 else:
                     transaction.stage_row_delete(held.table, held.reference)
             if partition_of is not None:
@@ -758,7 +765,11 @@ def _intent_table_ids(txn: object) -> frozenset[int]:
     table_ids: set[int] = set()
     for intent in getattr(txn, "row_intents", ()):
         table_id = getattr(getattr(intent, "table", None), "table_id", None)
-        if isinstance(table_id, int) and not isinstance(table_id, bool) and table_id > 0:
+        if (
+            isinstance(table_id, int)
+            and not isinstance(table_id, bool)
+            and table_id > 0
+        ):
             table_ids.add(table_id)
     return frozenset(table_ids)
 
@@ -1047,6 +1058,7 @@ class QueryEngine:
             case_types=case_types,
             catalog=catalog,
             result_node=root.child if root.columns else None,
+            union_coercions=_bound_union_columns(plan, parameters),
         )
         _bind_timestamp_values(plan, context)
         _validate_bound_subscript_types(plan, parameters)
@@ -1451,7 +1463,7 @@ class QueryEngine:
         published = getattr(self._indexes, "published_lsn", None)
         if isinstance(published, int) and not isinstance(published, bool):
             return published
-        if callable(published):          # a composition whose manager exposes it as a method
+        if callable(published):  # a composition whose manager exposes it as a method
             return int(published())
         return 0
 
@@ -2077,8 +2089,10 @@ def _traverse(
                     if landing is None:
                         continue
                     edge = RowBinding(
-                        variable=node.relationship or "", table=relationship,
-                        ref=ref, version=version,
+                        variable=node.relationship or "",
+                        table=relationship,
+                        ref=ref,
+                        version=version,
                     )
                     extended = (*path, edge)
                     reached.append((next_id, next_table, extended))
@@ -2092,15 +2106,21 @@ def _traverse(
                         continue
                     bindings = dict(row.bindings)
                     bindings[node.target] = RowBinding(
-                        variable=node.target, table=next_table,
-                        ref=landing_ref, version=landing_version,
+                        variable=node.target,
+                        table=next_table,
+                        ref=landing_ref,
+                        version=landing_version,
                     )
                     if node.relationship is not None:
                         bindings[node.relationship] = (
-                            edge if node.max_hops == 1 and node.min_hops == 1 else extended
+                            edge
+                            if node.max_hops == 1 and node.min_hops == 1
+                            else extended
                         )
                     context.count("rows_scanned")
-                    yield _Row(bindings=bindings, computed=row.computed, columns=row.columns)
+                    yield _Row(
+                        bindings=bindings, computed=row.computed, columns=row.columns
+                    )
             frontier = reached
             if not frontier:
                 break
@@ -2193,7 +2213,9 @@ def _vector_search(
         context.statistics["vector_candidates_offered"] = len(by_record)
     threshold = _threshold_value(node, candidates, context)
     for hit in result.hits:
-        if threshold is not None and not _passes(node.threshold_operator, hit.score, threshold):
+        if threshold is not None and not _passes(
+            node.threshold_operator, hit.score, threshold
+        ):
             continue
         for row in by_record.get(hit.record_id, ()):
             bindings = dict(row.bindings)
@@ -2249,8 +2271,7 @@ def _query_vector(
     for component in components:
         if isinstance(component, bool) or not isinstance(component, (int, float)):
             raise GrafxPlanError(
-                "A reference vector holds numbers; got "
-                f"{type(component).__name__}.",
+                f"A reference vector holds numbers; got {type(component).__name__}.",
                 field="query",
                 value=type(component).__name__,
             )
@@ -2336,9 +2357,7 @@ def _aggregate_rows(
         return
     for signature in order:
         keys, accumulators = groups[signature]
-        computed = {
-            item.expression: value for item, value in zip(node.grouping, keys)
-        }
+        computed = {item.expression: value for item, value in zip(node.grouping, keys)}
         for aggregation in node.aggregations:
             accumulator = accumulators.get(aggregation.call)
             computed[aggregation.call] = (
@@ -2430,6 +2449,38 @@ def _optional_rows(
         yield _Row(bindings={node.alias: None})
 
 
+def _union_rows(
+    engine: QueryEngine, node: UnionRows, context: _Context
+) -> Iterator[_Row]:
+    """Yield the left branch's rows and then the right branch's, under one set of names.
+
+    Position, not name, is what joins the two: the right branch may have written different
+    aliases, and its projection produced them in the order it wrote them. Each branch ends in a
+    projection of exactly this arity, so the values of a row arrive in column order and the
+    mapping is exact.
+
+    Widening happens HERE, before the distinct above can look at anything, because 1 and 1.0
+    are the same row of a widened column and two different rows of an unwidened one. Doing it
+    after the distinct would answer both.
+    """
+    coercions = context.union_coercions
+    for child in (node.left, node.right):
+        for row in engine._rows(child, context):
+            values = tuple((row.columns or {}).values())
+            columns = {
+                name: (
+                    float(value)
+                    if position < len(coercions)
+                    and coercions[position]
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                    else value
+                )
+                for position, (name, value) in enumerate(zip(node.columns, values))
+            }
+            yield _Row(bindings={}, computed=None, columns=columns)
+
+
 def _distinct_rows(
     engine: QueryEngine, node: DistinctRows, context: _Context
 ) -> Iterator[_Row]:
@@ -2468,7 +2519,11 @@ def _sort_value(key: SortItem, row: _Row, context: _Context) -> object:
     """Return the value one ORDER BY key reads from a row."""
     expression = key.expression
     columns = row.columns
-    if isinstance(expression, Variable) and columns is not None and expression.name in columns:
+    if (
+        isinstance(expression, Variable)
+        and columns is not None
+        and expression.name in columns
+    ):
         # An alias names a column of the projection this sort reads, and reading it from there
         # is not an optimisation: after DISTINCT or a group the row no longer carries what the
         # expression was computed from, so re-evaluating it would refuse.
@@ -2588,7 +2643,9 @@ def _write_assignments(
     updated: dict[object, tuple[RowBinding, list[Value]]] = {}
     for assignment in node.assignments:
         binding, position, value = _prepare_assignment(engine, assignment, row, context)
-        row_key = binding.ref if binding.ref is not None else ("pending", id(binding.version))
+        row_key = (
+            binding.ref if binding.ref is not None else ("pending", id(binding.version))
+        )
         held = updated.get(row_key)
         if held is None:
             held = (binding, list(_current_values(context, binding)))
@@ -2625,7 +2682,10 @@ def _write_assignments(
 
 
 def _rewrite_held_insert(
-    engine: QueryEngine, context: _Context, binding: RowBinding, settled: tuple[Value, ...]
+    engine: QueryEngine,
+    context: _Context,
+    binding: RowBinding,
+    settled: tuple[Value, ...],
 ) -> None:
     """Replace the values of a row this statement holds as an insert, keeping it an insert.
 
@@ -2645,7 +2705,9 @@ def _rewrite_held_insert(
             raise
         context.staged_rows.insert(
             position,
-            _HeldRow(_HELD_INSERT, held.table, settled, held.identity, None, held.token),
+            _HeldRow(
+                _HELD_INSERT, held.table, settled, held.identity, None, held.token
+            ),
         )
         new_key = _partition_key(binding.table, settled)
         if (binding.table.table_id, new_key) not in context.staged_partitions:
@@ -2734,7 +2796,9 @@ def _incident_edges(
         # The edges earlier statements created come first, and ending one CANCELS it: the
         # transaction's own reducer folds an insert followed by a delete into no row at all, so
         # the node and everything hanging from it leave together with nothing to publish.
-        _changed, inserted = _transaction_row_view(context, candidate, include_held=False)
+        _changed, inserted = _transaction_row_view(
+            context, candidate, include_held=False
+        )
         for reference, values in inserted:
             if not isinstance(reference, PendingRowRef):
                 continue
@@ -2743,15 +2807,19 @@ def _incident_edges(
                 or (lands and values[1] == endpoint_identity)
             ):
                 continue
-            yield candidate, reference, HeapVersion(
-                record_id=0,
-                xmin=NO_CSN,
-                xmax=NO_CSN,
-                values=values,
-                prev=None,
-                schema_version=candidate.schema_version,
-                deleted=False,
-                table_id=candidate.table_id,
+            yield (
+                candidate,
+                reference,
+                HeapVersion(
+                    record_id=0,
+                    xmin=NO_CSN,
+                    xmax=NO_CSN,
+                    values=values,
+                    prev=None,
+                    schema_version=candidate.schema_version,
+                    deleted=False,
+                    table_id=candidate.table_id,
+                ),
             )
         for ref, version in engine.heap.scan(candidate, snapshot):
             incident = (leaves and version.values[0] == endpoint_identity) or (
@@ -2830,11 +2898,15 @@ def _write_deletions(
                     continue
                 context.note_ended(edge_ref)
                 context.hold_delete(
-                    edge_table, edge_ref, _partition_key(edge_table, edge_version.values)
+                    edge_table,
+                    edge_ref,
+                    _partition_key(edge_table, edge_version.values),
                 )
                 context.count("rows_deleted")
         context.hold_delete(
-            binding.table, binding.ref, _partition_key(binding.table, binding.version.values)
+            binding.table,
+            binding.ref,
+            _partition_key(binding.table, binding.version.values),
         )
         context.count("rows_deleted")
     return row
@@ -2856,7 +2928,9 @@ def _write_pattern(
             continue
         if written.table is None:
             continue
-        values = materialise_row(engine, written.table, written.properties, row, context)
+        values = materialise_row(
+            engine, written.table, written.properties, row, context
+        )
         if merging:
             existing = _matching_row(engine, written, values, context)
             if existing is not None:
@@ -2879,7 +2953,9 @@ def _write_pattern(
         edges.append(materialised)
     _require_write_transaction(context.txn)
     for table, values, identity, token in staged:
-        context.hold(table, values, _partition_key(table, values), identity, token=token)
+        context.hold(
+            table, values, _partition_key(table, values), identity, token=token
+        )
         context.count("rows_created")
     for table, values in edges:
         context.hold(table, values, _partition_key(table, values), None)
@@ -2946,7 +3022,12 @@ def _materialise_edge(
             )
         endpoints.append(binding.record_id)
     properties = materialise_row(
-        engine, edge.table, edge.properties, row, context, endpoints=(endpoints[0], endpoints[1])
+        engine,
+        edge.table,
+        edge.properties,
+        row,
+        context,
+        endpoints=(endpoints[0], endpoints[1]),
     )
     if not any(isinstance(endpoint, PendingRowRef) for endpoint in endpoints):
         # The heap's own door, asked BEFORE anything is staged, so an edge naming a row this
@@ -3197,7 +3278,9 @@ def _rows_carrying_key(
         index = index_of(name)
     except GrafxError:
         return None  # no index covers this table's key
-    if index.definition.table_id != table.table_id or index.definition.positions != (position,):
+    if index.definition.table_id != table.table_id or index.definition.positions != (
+        position,
+    ):
         # A name collision rather than this table's index, and this guard is load-bearing rather
         # than defensive. An earlier version of this comment claimed "the catalog is what refuses
         # that"; measured, the catalog does NOT. It compares table names case-SENSITIVELY, so
@@ -3246,7 +3329,9 @@ def _uncommitted_rows_with_refs(
             yield reference, latest
 
 
-def _uncommitted_rows(context: _Context, table: TableDef) -> Iterator[tuple[Value, ...]]:
+def _uncommitted_rows(
+    context: _Context, table: TableDef
+) -> Iterator[tuple[Value, ...]]:
     """Yield the rows of one table this transaction has written but not yet committed.
 
     MERGE asks "does a row like this exist?", and a transaction that created one a moment ago
@@ -3418,7 +3503,10 @@ def _named_positions(table: TableDef, written: CreatedNode) -> tuple[int, ...] |
 
 
 def _matching_row(
-    engine: QueryEngine, written: CreatedNode, values: tuple[Value, ...], context: _Context
+    engine: QueryEngine,
+    written: CreatedNode,
+    values: tuple[Value, ...],
+    context: _Context,
 ) -> RowBinding | None:
     """Return the row a MERGE pattern already matches, or None when it must be created.
 
@@ -3487,7 +3575,9 @@ def _matching_edge(
     table, values = materialised
     positions = [0, 1]
     if edge.properties is not None:
-        positions.extend(table.column_index(entry.key) for entry in edge.properties.entries)
+        positions.extend(
+            table.column_index(entry.key) for entry in edge.properties.entries
+        )
     wanted = tuple(positions)
     for pending in _uncommitted_rows(context, table):
         if len(pending) == len(values) and all(
@@ -3638,7 +3728,9 @@ def _validatable_row(table: TableDef, values: tuple[Value, ...]) -> tuple[Value,
                 "Only the two endpoint columns of a relationship may name a row this "
                 "transaction has not committed yet.",
                 field="column",
-                value=table.columns[position].name if position < table.arity else position,
+                value=table.columns[position].name
+                if position < table.arity
+                else position,
                 table=table.name,
                 operation="pending_value",
             )
@@ -3736,6 +3828,7 @@ _HANDLERS: dict[type, _Handler] = {
     AggregateRows: _aggregate_rows,  # type: ignore[dict-item]
     ProjectRows: _project_rows,  # type: ignore[dict-item]
     DistinctRows: _distinct_rows,  # type: ignore[dict-item]
+    UnionRows: _union_rows,  # type: ignore[dict-item]
     OptionalRows: _optional_rows,  # type: ignore[dict-item]
     EagerRows: _eager_rows,  # type: ignore[dict-item]
     SortRows: _sort_rows,  # type: ignore[dict-item]
@@ -3797,9 +3890,14 @@ def _evaluate(expression: Expression, row: _Row, context: _Context) -> object:
     if isinstance(expression, BinaryOperation):
         return _binary(expression, row, context)
     if isinstance(expression, ListExpression):
-        return tuple(_evaluate(element, row, context) for element in expression.elements)
+        return tuple(
+            _evaluate(element, row, context) for element in expression.elements
+        )
     if isinstance(expression, MapExpression):
-        return {entry.key: _evaluate(entry.value, row, context) for entry in expression.entries}
+        return {
+            entry.key: _evaluate(entry.value, row, context)
+            for entry in expression.entries
+        }
     if isinstance(expression, CaseExpression):
         return _case(expression, row, context)
     if isinstance(expression, Subscript):
@@ -3873,9 +3971,7 @@ def _subscript(expression: Subscript, row: _Row, context: _Context) -> object:
     return _subscript_value(expression, subject, index)
 
 
-def _subscript_value(
-    expression: Subscript, subject: object, index: object
-) -> object:
+def _subscript_value(expression: Subscript, subject: object, index: object) -> object:
     """Extract one already evaluated list element under the public subscript contract."""
     if subject is None or index is None:
         return None
@@ -3915,7 +4011,9 @@ def _subscript_value(
     return subject[offset]
 
 
-def _map_property_value(subject: Mapping[object, object], expression: Property) -> object:
+def _map_property_value(
+    subject: Mapping[object, object], expression: Property
+) -> object:
     """Read one case-insensitive map key, refusing an ambiguous parameter map."""
     folded = expression.key.lower()
     matches = tuple(
@@ -4228,6 +4326,36 @@ def _binder_resolvable(expression: Expression) -> bool:
     return False
 
 
+def _static_postfix_target_expression(expression: Expression) -> Expression | None:
+    """Resolve the expression selected by an exact written map/list postfix chain.
+
+    This is a type proof, not evaluation. Selecting ``{v: $p + 1}.v`` only needs to type the
+    chosen binary expression; materialising the whole map would unnecessarily require the small
+    bind-time postfix evaluator to execute every scalar expression in it. Following one selected
+    path also preserves sharing in a WITH-derived typing DAG.
+    """
+    if isinstance(expression, Property):
+        subject = _static_postfix_target_expression(expression.subject)
+        if not isinstance(subject, MapExpression):
+            return None
+        return subject.entry(expression.key)
+    if isinstance(expression, Subscript):
+        subject = _static_postfix_target_expression(expression.subject)
+        if not isinstance(subject, ListExpression):
+            return None
+        index = expression.index
+        if not isinstance(index, Literal):
+            return None
+        value = index.value
+        if isinstance(value, bool) or not isinstance(value, int) or value == 0:
+            return None
+        offset = value - 1 if value > 0 else value
+        if not -len(subject.elements) <= offset < len(subject.elements):
+            return None
+        return subject.elements[offset]
+    return expression
+
+
 def _bound_postfix_value(
     expression: Expression, parameters: Mapping[str, object], *, owner: str
 ) -> object:
@@ -4273,28 +4401,68 @@ def _bound_pulse_expression_type(
     parameters: Mapping[str, object],
     *,
     owner: str,
+    _resolved: dict[int, ValueType | None] | None = None,
+) -> ValueType | None:
+    """Resolve one expression once per type proof, preserving shared typing DAGs."""
+    resolved = {} if _resolved is None else _resolved
+    marker = id(expression)
+    if marker in resolved:
+        return resolved[marker]
+    value_type = _infer_bound_pulse_expression_type(
+        expression,
+        static_types,
+        parameters,
+        owner=owner,
+        resolved=resolved,
+    )
+    resolved[marker] = value_type
+    return value_type
+
+
+def _infer_bound_pulse_expression_type(
+    expression: Expression,
+    static_types: Mapping[int, ValueType | None],
+    parameters: Mapping[str, object],
+    *,
+    owner: str,
+    resolved: dict[int, ValueType | None],
 ) -> ValueType | None:
     """Resolve and validate one CASE/subscript expression before rows are produced."""
     static_type = static_types.get(id(expression))
     if isinstance(expression, Literal):
         return value_type_of(expression.value)
     if isinstance(expression, Parameter):
-        return _bound_value_type(
-            expression, parameters[expression.name], owner=owner
-        )
+        return _bound_value_type(expression, parameters[expression.name], owner=owner)
     if isinstance(expression, Property):
+        selected = _static_postfix_target_expression(expression)
+        if selected is not None and selected is not expression:
+            return _bound_pulse_expression_type(
+                selected,
+                static_types,
+                parameters,
+                owner=owner,
+                _resolved=resolved,
+            )
         if any(isinstance(node, Variable) for node in walk(expression.subject)):
             return static_type
         value = _bound_postfix_value(expression, parameters, owner=owner)
         return _bound_value_type(expression, value, owner=owner)
     if isinstance(expression, NullCheck):
         _bound_pulse_expression_type(
-            expression.operand, static_types, parameters, owner=owner
+            expression.operand,
+            static_types,
+            parameters,
+            owner=owner,
+            _resolved=resolved,
         )
         return ValueType.BOOL
     if isinstance(expression, UnaryOperation):
         operand_type = _bound_pulse_expression_type(
-            expression.operand, static_types, parameters, owner=owner
+            expression.operand,
+            static_types,
+            parameters,
+            owner=owner,
+            _resolved=resolved,
         )
         if expression.operator == "NOT":
             return ValueType.BOOL
@@ -4310,10 +4478,18 @@ def _bound_pulse_expression_type(
         )
     if isinstance(expression, BinaryOperation):
         left = _bound_pulse_expression_type(
-            expression.left, static_types, parameters, owner=owner
+            expression.left,
+            static_types,
+            parameters,
+            owner=owner,
+            _resolved=resolved,
         )
         right = _bound_pulse_expression_type(
-            expression.right, static_types, parameters, owner=owner
+            expression.right,
+            static_types,
+            parameters,
+            owner=owner,
+            _resolved=resolved,
         )
         if expression.operator in (
             "AND",
@@ -4369,7 +4545,11 @@ def _bound_pulse_expression_type(
         name = expression.name.upper()
         argument_types = tuple(
             _bound_pulse_expression_type(
-                argument, static_types, parameters, owner=owner
+                argument,
+                static_types,
+                parameters,
+                owner=owner,
+                _resolved=resolved,
             )
             for argument in expression.arguments
         )
@@ -4447,25 +4627,49 @@ def _bound_pulse_expression_type(
                     value=expression.name,
                 )
             return ValueType.INT64
+        if name == "COUNT":
+            return ValueType.INT64
+        if name in ("AVG", "SUM"):
+            return ValueType.DOUBLE
+        if name in ("MIN", "MAX"):
+            return argument_types[0]
+        if name == "COLLECT":
+            return ValueType.LIST
         return static_type
     if isinstance(expression, ListExpression):
         for element in expression.elements:
             _bound_pulse_expression_type(
-                element, static_types, parameters, owner=owner
+                element,
+                static_types,
+                parameters,
+                owner=owner,
+                _resolved=resolved,
             )
         return ValueType.LIST
     if isinstance(expression, MapExpression):
         for entry in expression.entries:
             _bound_pulse_expression_type(
-                entry.value, static_types, parameters, owner=owner
+                entry.value,
+                static_types,
+                parameters,
+                owner=owner,
+                _resolved=resolved,
             )
         return ValueType.MAP
     if isinstance(expression, Subscript):
         subject_type = _bound_pulse_expression_type(
-            expression.subject, static_types, parameters, owner=owner
+            expression.subject,
+            static_types,
+            parameters,
+            owner=owner,
+            _resolved=resolved,
         )
         index_type = _bound_pulse_expression_type(
-            expression.index, static_types, parameters, owner=owner
+            expression.index,
+            static_types,
+            parameters,
+            owner=owner,
+            _resolved=resolved,
         )
         subscript_argument_types(expression, subject_type, index_type)
         # Only shapes the binder can actually evaluate are materialized here.  Absence of a
@@ -4475,7 +4679,15 @@ def _bound_pulse_expression_type(
         if _binder_resolvable(expression):
             value = _bound_postfix_value(expression, parameters, owner=owner)
             return _bound_value_type(expression, value, owner=owner)
-        return static_type
+        if static_type is not None:
+            return static_type
+        return _bound_list_element_type(
+            expression.subject,
+            static_types,
+            parameters,
+            owner=owner,
+            resolved=resolved,
+        )
     if isinstance(expression, CaseExpression):
         compared = (
             tuple(alternative.condition for alternative in expression.alternatives)
@@ -4487,14 +4699,22 @@ def _bound_pulse_expression_type(
         )
         comparison_types = tuple(
             _bound_pulse_expression_type(
-                item, static_types, parameters, owner=expression.describe()
+                item,
+                static_types,
+                parameters,
+                owner=expression.describe(),
+                _resolved=resolved,
             )
             for item in compared
         )
         case_comparison_type(expression, comparison_types)
         result_types = tuple(
             _bound_pulse_expression_type(
-                item, static_types, parameters, owner=expression.describe()
+                item,
+                static_types,
+                parameters,
+                owner=expression.describe(),
+                _resolved=resolved,
             )
             for item in expression.result_expressions()
         )
@@ -4505,6 +4725,48 @@ def _bound_pulse_expression_type(
             return ValueType.NULL
         return result_type
     return static_type
+
+
+def _bound_list_element_type(
+    subject: Expression,
+    static_types: Mapping[int, ValueType | None],
+    parameters: Mapping[str, object],
+    *,
+    owner: str,
+    resolved: dict[int, ValueType | None],
+) -> ValueType | None:
+    """Return the common element type of a bound written/parameter list, if knowable."""
+    element_types: tuple[ValueType | None, ...]
+    if isinstance(subject, ListExpression):
+        element_types = tuple(
+            _bound_pulse_expression_type(
+                element,
+                static_types,
+                parameters,
+                owner=owner,
+                _resolved=resolved,
+            )
+            for element in subject.elements
+        )
+    elif isinstance(subject, (Literal, Parameter)):
+        value = (
+            subject.value if isinstance(subject, Literal) else parameters[subject.name]
+        )
+        if not isinstance(value, (list, tuple)):
+            return None
+        element_types = tuple(
+            _bound_value_type(subject, element, owner=owner) for element in value
+        )
+    else:
+        return None
+    if not element_types or any(value_type is None for value_type in element_types):
+        return None
+    common = element_types[0]
+    assert common is not None  # narrowed by the guard above
+    for value_type in element_types[1:]:
+        assert value_type is not None  # narrowed by the guard above
+        common, _normalise = union_common_type(0, common, value_type)
+    return common
 
 
 def _required_bound_expression_type(
@@ -4520,12 +4782,346 @@ def _required_bound_expression_type(
     )
     if value_type is not None:
         return value_type
-    message = f"The plan left the type of {expression.describe()} in {owner} unresolved."
+    message = (
+        f"The plan left the type of {expression.describe()} in {owner} unresolved."
+    )
     raise GrafxPlanError(
         message,
         field="expression",
         value=expression.describe(),
     )
+
+
+def _bound_union_columns(
+    plan: PlannedQuery, parameters: Mapping[str, object]
+) -> tuple[bool, ...]:
+    """Prove the two branches agree about every column, and say which ones must widen.
+
+    Run once, before the first row, because a pair that disagrees about a column disagrees
+    whether or not anything matched: discovering it mid-stream would mean a caller had already
+    read rows from a result that was never coherent.
+
+    The compatibility rule lives in :func:`union_common_type`, so planning and bound parameters
+    cannot drift: an identical pair keeps its type, NULL takes the other side's, and INT64 beside
+    DOUBLE widens to DOUBLE. Anything else is refused -- notably BOOL beside INT64, which some
+    dialects treat as one family and this one does not.
+    """
+    static_types = {
+        id(expression): value_type
+        for expression, value_type in plan.pulse_expression_types
+    }
+    if plan.union_columns and len(plan.union_unwind_sources) != 2:
+        raise GrafxPlanError(
+            "A UNION plan carries the UNWIND source metadata of exactly two branches.",
+            field="plan",
+            value="union_unwind_sources",
+        )
+    unwind_carriers = tuple(
+        None
+        if unwind is None
+        else _bound_unwind_carrier(
+            unwind[1],
+            parameters,
+            owner="a UNION branch",
+        )
+        for unwind in plan.union_unwind_sources
+    )
+    coercions: list[bool] = []
+    for position, left, _left_type, right, _right_type in plan.union_columns:
+        owner = f"column {position + 1} of a UNION"
+        # The same door the rest of the engine uses to turn a planned type into a bound one,
+        # and the same refusal when the bind cannot finish it. Asking it here is what makes the
+        # parameter case work without this function knowing anything about parameters.
+        resolved: list[ValueType] = []
+        for expression, unwind, carrier in zip(
+            (left, right),
+            plan.union_unwind_sources,
+            unwind_carriers,
+            strict=True,
+        ):
+            resolved.append(
+                _required_bound_union_branch_type(
+                    expression,
+                    static_types,
+                    parameters,
+                    unwind=unwind,
+                    carrier=carrier,
+                    owner=owner,
+                )
+            )
+        first, second = resolved
+        _common, normalise_double = union_common_type(position, first, second)
+        coercions.append(normalise_double)
+    return tuple(coercions)
+
+
+def _bound_unwind_carrier(
+    source: Expression,
+    parameters: Mapping[str, object],
+    *,
+    owner: str,
+) -> tuple[object, ...] | None:
+    """Materialise the finite binder vocabulary for one UNWIND source, validating its shape."""
+    if not _binder_resolvable(source):
+        # A row-independent literal/function shape may already have a static type in the plan.
+        # This helper materialises only the binder's deliberately finite postfix vocabulary.
+        return None
+    carrier = _bound_postfix_value(source, parameters, owner=owner)
+    if not isinstance(carrier, (list, tuple)):
+        named = "null" if carrier is None else type(carrier).__name__
+        raise GrafxPlanError(
+            f"UNWIND reads a list or tuple; got {named}.",
+            field="unwind",
+            value=named,
+        )
+    return tuple(carrier)
+
+
+def _required_bound_union_branch_type(
+    expression: Expression,
+    static_types: Mapping[int, ValueType | None],
+    parameters: Mapping[str, object],
+    *,
+    unwind: tuple[str, Expression] | None,
+    carrier: tuple[object, ...] | None,
+    owner: str,
+) -> ValueType:
+    """Resolve one branch column, using each UNWIND element only when the column reads it."""
+    if unwind is None or carrier is None:
+        return _required_bound_expression_type(
+            expression,
+            static_types,
+            parameters,
+            owner=owner,
+        )
+    alias, _source = unwind
+    if not _union_output_depends_on_alias(expression, alias, static_types):
+        return _required_bound_expression_type(
+            expression,
+            static_types,
+            parameters,
+            owner=owner,
+        )
+    if not carrier:
+        # An invariant outer type such as ``x IS NULL`` remains provable without a row.  A bare
+        # ``x`` stays unresolved and therefore fail-closed, since an empty carrier supplies no
+        # evidence about the column's type.
+        return _required_bound_expression_type(
+            expression,
+            static_types,
+            parameters,
+            owner=owner,
+        )
+
+    output_types: list[ValueType] = []
+    for element in carrier:
+        typed_expression = _replace_bound_unwind_alias(
+            expression,
+            alias=alias,
+            element=element,
+        )
+        output_types.append(
+            _required_bound_expression_type(
+                typed_expression,
+                static_types,
+                parameters,
+                owner=owner,
+            )
+        )
+    common = output_types[0]
+    for value_type in output_types[1:]:
+        common, _normalise = union_common_type(0, common, value_type)
+    return common
+
+
+def _union_output_depends_on_alias(
+    expression: Expression,
+    alias: str,
+    static_types: Mapping[int, ValueType | None],
+) -> bool:
+    """Whether this column's ValueType still needs the runtime UNWIND element."""
+    static_type = static_types.get(id(expression))
+    if isinstance(expression, Variable):
+        return expression.name == alias and static_type is None
+    if isinstance(expression, (Property, Subscript)):
+        return static_type is None and any(
+            isinstance(node, Variable) and node.name == alias
+            for node in walk(expression.subject)
+        )
+    if isinstance(expression, NullCheck):
+        return False
+    if isinstance(expression, UnaryOperation):
+        return expression.operator != "NOT" and _union_output_depends_on_alias(
+            expression.operand,
+            alias,
+            static_types,
+        )
+    if isinstance(expression, BinaryOperation):
+        invariant = expression.operator in (
+            "AND",
+            "OR",
+            "XOR",
+            "=",
+            "<>",
+            "<",
+            "<=",
+            ">",
+            ">=",
+            "IN",
+            "STARTS WITH",
+            "ENDS WITH",
+            "CONTAINS",
+        )
+        return not invariant and (
+            _union_output_depends_on_alias(expression.left, alias, static_types)
+            or _union_output_depends_on_alias(expression.right, alias, static_types)
+        )
+    if isinstance(expression, (ListExpression, MapExpression)):
+        return False
+    if isinstance(expression, CaseExpression):
+        return any(
+            _union_output_depends_on_alias(result, alias, static_types)
+            for result in expression.result_expressions()
+        )
+    if isinstance(expression, FunctionCall):
+        fixed = expression.name.upper() in (
+            STRING_SPLIT_FUNCTION,
+            LABEL_FUNCTION,
+            TIMESTAMP_FUNCTION,
+            SIZE_FUNCTION,
+            SIMILARITY_FUNCTION,
+            SIMILARITY_SCORE_FUNCTION,
+            "COUNT",
+            "AVG",
+            "SUM",
+            "COLLECT",
+        )
+        return not fixed and any(
+            _union_output_depends_on_alias(child, alias, static_types)
+            for child in expression.children()
+        )
+    return False
+
+
+def _replace_bound_unwind_alias(
+    expression: Expression,
+    *,
+    alias: str,
+    element: object,
+) -> Expression:
+    """Substitute one UNWIND element into a non-executable branch typing expression."""
+    if isinstance(expression, Variable):
+        return Literal(value=element) if expression.name == alias else expression
+
+    def substituted(child: Expression) -> Expression:
+        return _replace_bound_unwind_alias(child, alias=alias, element=element)
+
+    if isinstance(expression, Property):
+        subject = substituted(expression.subject)
+        return (
+            expression
+            if subject is expression.subject
+            else replace(expression, subject=subject)
+        )
+    if isinstance(expression, UnaryOperation):
+        operand = substituted(expression.operand)
+        return (
+            expression
+            if operand is expression.operand
+            else replace(expression, operand=operand)
+        )
+    if isinstance(expression, BinaryOperation):
+        left = substituted(expression.left)
+        right = substituted(expression.right)
+        if left is expression.left and right is expression.right:
+            return expression
+        return replace(expression, left=left, right=right)
+    if isinstance(expression, NullCheck):
+        operand = substituted(expression.operand)
+        return (
+            expression
+            if operand is expression.operand
+            else replace(expression, operand=operand)
+        )
+    if isinstance(expression, Subscript):
+        subject = substituted(expression.subject)
+        index = substituted(expression.index)
+        if subject is expression.subject and index is expression.index:
+            return expression
+        return replace(expression, subject=subject, index=index)
+    if isinstance(expression, FunctionCall):
+        arguments = tuple(substituted(argument) for argument in expression.arguments)
+        named_arguments = tuple(
+            argument
+            if (value := substituted(argument.value)) is argument.value
+            else replace(argument, value=value)
+            for argument in expression.named_arguments
+        )
+        if all(
+            new is old for new, old in zip(arguments, expression.arguments, strict=True)
+        ) and all(
+            new is old
+            for new, old in zip(
+                named_arguments, expression.named_arguments, strict=True
+            )
+        ):
+            return expression
+        return replace(
+            expression,
+            arguments=arguments,
+            named_arguments=named_arguments,
+        )
+    if isinstance(expression, ListExpression):
+        elements = tuple(substituted(item) for item in expression.elements)
+        if all(
+            new is old for new, old in zip(elements, expression.elements, strict=True)
+        ):
+            return expression
+        return replace(expression, elements=elements)
+    if isinstance(expression, MapExpression):
+        entries = tuple(
+            entry
+            if (value := substituted(entry.value)) is entry.value
+            else replace(entry, value=value)
+            for entry in expression.entries
+        )
+        if all(
+            new is old for new, old in zip(entries, expression.entries, strict=True)
+        ):
+            return expression
+        return replace(expression, entries=entries)
+    if isinstance(expression, CaseExpression):
+        operand = (
+            None if expression.operand is None else substituted(expression.operand)
+        )
+        alternatives = []
+        for alternative in expression.alternatives:
+            condition = substituted(alternative.condition)
+            result = substituted(alternative.result)
+            alternatives.append(
+                alternative
+                if condition is alternative.condition and result is alternative.result
+                else replace(alternative, condition=condition, result=result)
+            )
+        fallback = (
+            None if expression.fallback is None else substituted(expression.fallback)
+        )
+        if (
+            operand is expression.operand
+            and fallback is expression.fallback
+            and all(
+                new is old
+                for new, old in zip(alternatives, expression.alternatives, strict=True)
+            )
+        ):
+            return expression
+        return replace(
+            expression,
+            operand=operand,
+            alternatives=tuple(alternatives),
+            fallback=fallback,
+        )
+    return expression
 
 
 def _bound_case_types(
@@ -4626,9 +5222,7 @@ def _validate_bound_subscript_types(
             # and the list are both bound, so an out-of-range subscript is already wrong
             # whether or not the pattern matches anything.  The value is discarded; only the
             # refusal inside _subscript_value matters.
-            _bound_postfix_value(
-                expression, parameters, owner=expression.describe()
-            )
+            _bound_postfix_value(expression, parameters, owner=expression.describe())
 
 
 _TIMESTAMP_EPOCH_ORDINAL = 719_163
@@ -4947,9 +5541,7 @@ def _timestamp_bindable(expression: Expression) -> bool:
     if isinstance(expression, ListExpression):
         return all(_timestamp_bindable(item) for item in expression.elements)
     if isinstance(expression, MapExpression):
-        return all(
-            _timestamp_bindable(entry.value) for entry in expression.entries
-        )
+        return all(_timestamp_bindable(entry.value) for entry in expression.entries)
     if isinstance(expression, Property):
         return _timestamp_bindable(expression.subject)
     if isinstance(expression, Subscript):
@@ -4960,9 +5552,7 @@ def _timestamp_bindable(expression: Expression) -> bool:
         return expression.name.upper() in (
             COALESCE_FUNCTION,
             STRING_SPLIT_FUNCTION,
-        ) and all(
-            _timestamp_bindable(argument) for argument in expression.arguments
-        )
+        ) and all(_timestamp_bindable(argument) for argument in expression.arguments)
     if isinstance(expression, CaseExpression):
         compared = (
             tuple(alternative.condition for alternative in expression.alternatives)
@@ -5025,9 +5615,9 @@ def _validate_bound_label_arguments(
 
 def _bound_coalesce_types(
     plan: PlannedQuery, parameters: Mapping[str, object]
-) -> dict[FunctionCall, ValueType | None]:
+) -> dict[int, ValueType | None]:
     """Resolve parameter types and refuse incompatible COALESCE calls before row production."""
-    resolved: dict[FunctionCall, ValueType | None] = {}
+    resolved: dict[int, ValueType | None] = {}
     for expression, planned_types in plan.coalesce_argument_types:
         argument_types: list[ValueType | None] = []
         for argument, planned_type in zip(
@@ -5037,9 +5627,7 @@ def _bound_coalesce_types(
                 argument_types.append(planned_type)
                 continue
             if not isinstance(argument, Parameter):
-                message = (
-                    f"{expression.name} could not resolve the type of {argument.describe()}."
-                )
+                message = f"{expression.name} could not resolve the type of {argument.describe()}."
                 raise GrafxPlanError(
                     message,
                     field="function",
@@ -5048,17 +5636,19 @@ def _bound_coalesce_types(
             argument_types.append(
                 _coalesce_value_type(expression, parameters[argument.name])
             )
-        resolved[expression] = coalesce_result_type(expression.name, argument_types)
+        resolved[id(expression)] = coalesce_result_type(expression.name, argument_types)
     return resolved
 
 
 def _coalesce(expression: FunctionCall, row: _Row, context: _Context) -> object:
     """Return the first non-null scalar after eagerly evaluating every argument."""
-    values = tuple(_evaluate(argument, row, context) for argument in expression.arguments)
+    values = tuple(
+        _evaluate(argument, row, context) for argument in expression.arguments
+    )
     selected = next((value for value in values if value is not None), None)
     if selected is None:
         return None
-    result_type = context.coalesce_types.get(expression)
+    result_type = context.coalesce_types.get(id(expression))
     if result_type is None:
         runtime_types = tuple(
             _coalesce_value_type(expression, value) for value in values
@@ -5091,9 +5681,7 @@ def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
             )
         if not separator:
             if not text:
-                message = (
-                    f"{expression.name} cannot split an empty string with an empty separator."
-                )
+                message = f"{expression.name} cannot split an empty string with an empty separator."
                 raise GrafxPlanError(
                     message,
                     field="function",
@@ -5148,7 +5736,9 @@ def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
         try:
             return len(value)
         except TypeError as exc:
-            message = f"{expression.name} could not measure this {type(value).__name__}."
+            message = (
+                f"{expression.name} could not measure this {type(value).__name__}."
+            )
             raise GrafxPlanError(
                 message,
                 field="function",
@@ -5241,7 +5831,10 @@ def _freeze(value: object) -> object:
     if isinstance(value, (list, tuple)):
         return ("list", tuple(_freeze(item) for item in value))
     if isinstance(value, dict):
-        return ("map", tuple(sorted((str(key), _freeze(item)) for key, item in value.items())))
+        return (
+            "map",
+            tuple(sorted((str(key), _freeze(item)) for key, item in value.items())),
+        )
     return ("scalar", type(value).__name__, value)
 
 

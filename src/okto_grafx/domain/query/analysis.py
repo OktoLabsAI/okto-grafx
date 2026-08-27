@@ -47,6 +47,7 @@ from okto_grafx.domain.query.ast import (
     Query,
     RelationshipPattern,
     ReturnClause,
+    UnionQuery,
     ReturnItem,
     SetClause,
     Statement,
@@ -244,7 +245,9 @@ def polymorphic_node_refusal(query: Query) -> tuple[str, str] | None:
 def _polymorphic_shape_reason(query: Query, driver: NodePattern) -> str | None:
     """Return what this statement does that the one shape does not allow, or None."""
     if driver.variable is None:
-        return "This one carries no name, so nothing below it could read what it matched."
+        return (
+            "This one carries no name, so nothing below it could read what it matched."
+        )
     if driver.properties is not None:
         return (
             "This one carries an inline property map, and which column that matches depends "
@@ -258,7 +261,9 @@ def _polymorphic_shape_reason(query: Query, driver: NodePattern) -> str | None:
     if len(pattern) != 1:
         return f"This MATCH carries {len(pattern)} patterns."
     if pattern[0].relationships:
-        return "This one is an end of a relationship, which names the table at each end."
+        return (
+            "This one is an end of a relationship, which names the table at each end."
+        )
     if query.updating_clauses:
         return "This query writes, and a write needs one table to write into."
     if query.return_clause is None:
@@ -302,7 +307,12 @@ def hop_range_refusal(query: Query) -> tuple[str, str] | None:
                 "A hop range counts whole hops; its upper bound is an integer.",
                 "max_hops",
             )
-        if not 1 <= relationship.min_hops <= relationship.max_hops <= MAX_TRAVERSAL_HOPS:
+        if (
+            not 1
+            <= relationship.min_hops
+            <= relationship.max_hops
+            <= MAX_TRAVERSAL_HOPS
+        ):
             return (
                 "A hop range runs from at least one hop to at most "
                 f"{MAX_TRAVERSAL_HOPS}, and starts at or below where it ends.",
@@ -334,6 +344,100 @@ def _relationships_of(query: Query) -> Iterator[RelationshipPattern]:
             written = (clause.pattern,)
         for pattern in written:
             yield from pattern.relationships
+
+
+def union_refusal(statement: UnionQuery) -> tuple[str, str] | None:
+    """Return the refusal a union earns outside the one admitted shape, or None.
+
+    Asked wherever a union is about to be given a meaning, and for a tree nobody parsed as
+    readily as for one that was. The parser can only build the admitted shape, so for parsed
+    text this asks a question already answered; a caller who hands ``analyze`` or ``build_plan``
+    a statement of its own has answered nothing.
+
+    Nothing is interpolated into the message. A branch of a forged type would be asked to render
+    itself while the refusal was being built, and a refusal that raises reports nothing at all.
+    """
+    for branch in (statement.left, statement.right):
+        if type(branch) is not Query:
+            return (
+                "A UNION joins two reading queries; each branch is a query.",
+                "branch",
+            )
+    for branch in (statement.left, statement.right):
+        if branch.updating_clauses:
+            return (
+                "A UNION joins two queries that only read; neither branch may write.",
+                "branch",
+            )
+        if any(clause.optional for clause in branch.match_clauses):
+            return (
+                "An OPTIONAL MATCH is not composed with UNION in this subset.",
+                "branch",
+            )
+        if branch.return_clause is None:
+            return (
+                "Each branch of a UNION ends with RETURN, because a union is made of rows.",
+                "branch",
+            )
+    left = statement.left.return_clause
+    right = statement.right.return_clause
+    if left is None or right is None:  # pragma: no cover - the loop above settled this
+        return (
+            "Each branch of a UNION ends with RETURN, because a union is made of rows.",
+            "branch",
+        )
+    if len(left.items) != len(right.items):
+        # The arity is the first thing a reader of the result relies on, and two branches that
+        # disagree about it cannot be reconciled by any rule about types: there is no column to
+        # compare against.
+        return (
+            "Both branches of a UNION return the same number of columns.",
+            "columns",
+        )
+    return None
+
+
+def _union_parameters(statement: UnionQuery) -> tuple[str, ...]:
+    """Return every parameter either branch reads, left to right, each named once.
+
+    One list, because there is one call and one binding: a parameter both branches read is
+    supplied once and means the same value in both, which is what makes the pair a single
+    statement rather than two that happen to run together.
+    """
+    seen: list[str] = []
+    for branch in (statement.left, statement.right):
+        for name in _Analyzer(branch).run().parameters:
+            if name not in seen:
+                if len(seen) >= MAX_PARAMETERS:
+                    raise GrafxPlanError(
+                        f"A query may reference at most {MAX_PARAMETERS} parameters.",
+                        field="parameters",
+                        value=MAX_PARAMETERS,
+                    )
+                seen.append(name)
+    return tuple(seen)
+
+
+def analyze_union(statement: UnionQuery) -> QueryAnalysis:
+    """Return what a union means, refusing one this engine cannot answer.
+
+    Each branch is analysed on its own, because each is a whole query: its own bindings, its own
+    grouping, its own similarity. What the UNION contributes is what survives it -- the column
+    names of the left branch and the parameters of both -- and nothing else does. No variable
+    crosses the boundary, so the combined analysis binds none: a name that meant a matched row
+    inside a branch has no meaning above the union, and carrying it up would say otherwise.
+    """
+    refusal = union_refusal(statement)
+    if refusal is not None:
+        message, value = refusal
+        raise GrafxPlanError(message, field="union", value=value)
+    left = _Analyzer(statement.left).run()
+    _Analyzer(statement.right).run()
+    return QueryAnalysis(
+        statement=statement,
+        parameters=_union_parameters(statement),
+        output_columns=left.output_columns,
+    )
 
 
 def optional_match_refusal(query: Query) -> tuple[str, str] | None:
@@ -537,7 +641,11 @@ def analyze(statement: Statement) -> QueryAnalysis:
         statement,
         (CreateNodeTableStatement, CreateRelTableStatement, CreateVectorSpaceStatement),
     ):
-        return QueryAnalysis(statement=statement, parameters=_parameters_of_schema(statement))
+        return QueryAnalysis(
+            statement=statement, parameters=_parameters_of_schema(statement)
+        )
+    if type(statement) is UnionQuery:
+        return analyze_union(statement)
     if not isinstance(statement, Query):
         raise GrafxPlanError(
             f"A statement of type {type(statement).__name__} cannot be planned.",
@@ -1128,9 +1236,7 @@ class _Analyzer:
     def _check_positional_call(self, call: FunctionCall, *, arguments: int) -> None:
         """Require one scalar function's exact positional-only signature."""
         if call.distinct or call.star:
-            message = (
-                f"{call.name} is a scalar function, so it takes neither DISTINCT nor a star."
-            )
+            message = f"{call.name} is a scalar function, so it takes neither DISTINCT nor a star."
             raise self._refuse(
                 message,
                 field="function",
@@ -1174,7 +1280,9 @@ class _Analyzer:
                 value=call.name,
             )
         subject = call.arguments[0]
-        if not isinstance(subject, Property) or not isinstance(subject.subject, Variable):
+        if not isinstance(subject, Property) or not isinstance(
+            subject.subject, Variable
+        ):
             raise self._refuse(
                 f"The first argument of {call.name} names the stored vector as a property of a "
                 f"matched variable, as in n.embedding; got {subject.describe()}.",
