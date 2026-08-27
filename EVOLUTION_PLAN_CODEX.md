@@ -182,9 +182,11 @@ adiados e non-goals — não apenas seus resumos executivos:
 Esta incorporação obedece às seguintes regras vinculantes:
 
 1. primeiro são fechados e publicados os gaps de integração com o Pulse, incluindo os gates
-   M-PULSE-2 a M-PULSE-7; nenhum item dos roadmaps complementares amplia retroativamente um
-   sublote Pulse já congelado;
-2. depois do gate Pulse, o roadmap técnico deste documento continua sendo a autoridade para
+   M-PULSE-2 a M-PULSE-7; em seguida ocorre o run integrado real, a auditoria completa e a
+   publicação conjunta do Grafx `0.0.1` no PyPI. Nenhum item dos roadmaps complementares amplia
+   retroativamente um sublote Pulse já congelado;
+2. somente depois de `0.0.1` estar publicado e reinstalado com sucesso a partir do PyPI, o roadmap
+   técnico deste documento continua como linha `0.0.2` e autoridade para
    integridade, recovery, concorrência, performance, lifecycle, backup/migração e capacidades já
    planejadas; os dois anexos entram como backlog obrigatório adicional, respeitando suas
    dependências explícitas;
@@ -1534,6 +1536,24 @@ Antes da execução, o trace de 10.000 operações é congelado com fixture, dis
 fingerprints esperados, cobertura de cada família de mutação e pontos de crash. “Representativo”
 sozinho não pode ser usado para mudar o gate durante a rodada.
 
+#### RELEASE-0.0.1 — run integrado, auditoria e publicação conjunta
+
+1. executar o Pulse com o bundle Grafx efetivamente ativo, cobrindo os fluxos de board e Global
+   Discovery certificados em M-PULSE-6 e o roteiro congelado de M-PULSE-7;
+2. executar as suítes completas do Grafx e as suítes Core/Community aplicáveis ao bundle, além dos
+   gates de crash/reopen, conformance, diferencial e integridade já congelados — sem criar novos
+   critérios durante a auditoria;
+3. auditar o SHA candidato completo contra os contratos versionados, registrando somente blockers
+   reproduzíveis de correção, corrupção, segurança, estabilidade ou incompatibilidade;
+4. construir `sdist` e wheel de `0.0.1`, validar metadata/conteúdo e instalar o wheel em ambiente
+   limpo para repetir o smoke integrado;
+5. pausar com SHA e hashes dos artefatos aprovados. A publicação no PyPI será feita em checkpoint
+   interativo com o usuário; depois dela, reinstalar do PyPI e repetir import, versão e smoke.
+
+**Gate de release:** SHA e artefatos imutáveis, todas as provas acima verdes, zero blocker aberto e
+`okto-grafx==0.0.1` instalável do PyPI. Nenhum item `GX-CAP-*`, `GX-AGENT-*` ou `AGENT-*` começa
+antes desse gate. A evolução complementar subsequente pertence à versão `0.0.2`.
+
 ### 9.5 Política para evitar breaking changes no Pulse
 
 1. o compatibility descriptor `pulse-1` e os DTOs do adapter são a fronteira estável. Esse
@@ -1568,6 +1588,8 @@ uma mudança de formato ou semântica fica concentrado no Grafx, no adapter Comm
 - O scaffold do provider/router/harness de M-PULSE-6 pode iniciar após M-PULSE-1; sua certificação
   final depende dos gates M-PULSE-0 a M-PULSE-5.
 - M-PULSE-7 é apenas rollout; não pode ser usado para descobrir semântica básica faltante.
+- `RELEASE-0.0.1` sucede M-PULSE-7 e bloqueia todo roadmap complementar; a publicação externa é
+  feita junto com o usuário, nunca automaticamente. Os itens pós-Pulse começam na linha `0.0.2`.
 
 Cada milestone deve ter branch, commit e push próprios, suíte direcionada, suíte global verde,
 revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
@@ -1613,7 +1635,7 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-3B — layout lógico de relações | concluído e publicado; provider ainda inativo | Pulse Community `milestone/grafx-mpulse3-logical-relationships@c4b1f37ad3a4cd08a1e2f5249db25c33ddbecd45` → `feature/v0.3.3`; código `067b82c` + hardening `c4b1f37` | Manifesto fechado e imutável de 16 tipos/69 pares/69 nomes, codec bijetivo e reverse pelo manifesto; introspecção valida kind/endpoints e oculta nomes físicos. Unknown/collision/mismatch, shapes malformados e representação hostil falham tipados. Gate focado 15/15; regressão selecionada completa 146/146 contra Core limpo `ab61b9a`; Ruff/format/diff-check e duas auditorias independentes PASS. DDL/bootstrap, ativação, query rewrite e os gaps de supersedence continuam explicitamente fora |
 | M-PULSE-3C — manifesto e bootstrap do schema atual | concluído, verificado e publicado; provider ainda inativo | Pulse Community `milestone/grafx-mpulse3-schema-bootstrap@7e126a7130090c00891f8d1d35bd44819afe7a7a` → `feature/v0.3.3`; Core pinado `ab61b9a785f2018312fc91541a580877fd068bbb`; auditoria Nexus `hof_7240f7ad38f64538adc5b500bd3ea1a7` concluída/verificada/PASS | Schema `0.5.0` materializado em 11 nodes de 44 propriedades, `BoardMeta`, 69 relações e 11 spaces únicos 384/cosine/normalized=false/float64. Preflight fail-closed precede qualquer write; ausentes são criados numa única transação, o catálogo é recapturado/validado e somente então `BoardMeta` é gravado em transação separada. Fingerprint lógico canônico `4a7b425bf4b8c4864be633c1a87f034e5f7f641019dc029015b7d3ca786deb81`; no-op preserva catálogo/txn/LSN/WAL e bytes. Gates M3C 33/33 e regressão selecionada 73/73 no Core correto; Ruff/format/diff-check focados PASS; outputs Kuzu têm digest `18a8b1a1b9459d92d61670d734087a4212af29fa4039b0825d6e966ffa181e0e`, `kg.py`/`composition.py` mantêm os blobs congelados. Staging dos 92 DDLs mediu aproximadamente 101 s neste ambiente: risco de performance registrado para otimização posterior, sem alterar o gate funcional. ALTER/upgrade, provider, rewrite e paridade vetorial permanecem fora |
 | M-PULSE-3D — rebuild do predecessor `0.3.12` | concluído, verificado, publicado e integrado; provider ainda inativo | spec Pulse Community `milestone/grafx-mpulse3-schema-evolution@703ad83c43b286e7c90fe2b0a29de0982929d4de`; código final `237f3bf7fa2a65a108db4f558932d429ec6696ce` em `milestone/grafx-mpulse3-schema-evolution-impl` e `feature/v0.3.3`; revisão Nexus final `hof_3df4987f6eef4611bfd9486409b91227` concluída/verificada/PASS | Reconstrução fora do lugar para candidato durável não vinculado, sem mudança no formato físico Grafx, `CATALOG_FORMAT_VERSION` ou upgrade in-place. Fonte em snapshot inerte; 11 nodes, 59 relações predecessoras, duplicatas/paralelas/self-loop, NULLs e vetores são preservados; dez relações novas nascem vazias. Catálogo, fingerprints, contagens e 161 índices são provados hot+cold; marker/commit ambíguo, checkpoint/recovery, close/lock, matriz finita de falhas e no-op zero-write são fail-closed. Gate rápido `122 passed, 1 deselected`, suíte completa real `122 passed` no mesmo código de produção, regressão M3A/B/C 56/56 e checks estáticos PASS. O único blocker factual da primeira revisão — `PermissionError` cru em `Path.exists()` — foi reproduzido no SHA antigo, corrigido e provado por teste discriminante no final |
-| Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até o fechamento M-PULSE-2 a 7 | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
+| Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um
