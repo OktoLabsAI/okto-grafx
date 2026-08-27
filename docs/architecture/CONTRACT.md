@@ -1087,6 +1087,12 @@ list values remain tuples; the Pulse provider performs its narrow tuple-to-list 
 [`PULSE-PATH-VALUE-1.0.md`](../specs/PULSE-PATH-VALUE-1.0.md) freezes the differential oracle,
 key order, identity correlations and public Pulse layer rewrites.
 
+Because those maps have structural keys, this projection refuses a `Decision` property named
+`_ID` or `_LABEL`, or a `supersedes` property named `_SRC`, `_DST`, `_LABEL` or `_ID`, during
+planning and before any row streams. The names remain legal for schemas outside this projection;
+the physical relationship endpoint columns `_from` and `_to` are not user properties and remain
+accepted and omitted from the public map.
+
 Every other read of a path name -- another name, label, relationship type or direction, a
 property/function, `WHERE`, `ORDER BY`, alias, additional item or clause, map, written range,
 multiple hop, write, or `UNION` branch -- is refused before streaming. Decorative paths keep

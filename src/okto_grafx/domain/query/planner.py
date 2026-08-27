@@ -161,6 +161,8 @@ so an anonymous binding can never be shadowed by, or shadow, something the calle
 
 _PATH_PROJECTION_NODE_TABLE: str = "Decision"
 _PATH_PROJECTION_RELATIONSHIP_TABLE: str = "supersedes"
+_PATH_PROJECTION_NODE_KEYS = frozenset({"_ID", "_LABEL"})
+_PATH_PROJECTION_RELATIONSHIP_KEYS = frozenset({"_SRC", "_DST", "_LABEL", "_ID"})
 """The catalog declaration required by the one projected path."""
 
 SCORE_COLUMN: str = "similarity score"
@@ -2602,8 +2604,7 @@ class _Planner:
             target_variable,
         )
 
-    @staticmethod
-    def _require_path_projection_schema(table: TableDef) -> None:
+    def _require_path_projection_schema(self, table: TableDef) -> None:
         """Require the exact relationship declaration the projected path was frozen against.
 
         The ordinary traversal checks the table at its starting end. Its labelled target is
@@ -2612,20 +2613,38 @@ class _Planner:
         ``b:Decision`` while the edge actually lands in another table would encode a path the
         query did not match. The literal form therefore closes both ends before any row streams.
         """
-        if (
+        if not (
             table.name == _PATH_PROJECTION_RELATIONSHIP_TABLE
             and table.from_table == _PATH_PROJECTION_NODE_TABLE
             and table.to_table == _PATH_PROJECTION_NODE_TABLE
         ):
-            return
-        raise GrafxPlanError(
-            "The projected path reads a 'supersedes' relationship declared from Decision to "
-            "Decision; the catalog declaration does not match that frozen endpoint pair.",
-            field="endpoint",
-            value=table.name,
-            from_table=table.from_table,
-            to_table=table.to_table,
-        )
+            raise GrafxPlanError(
+                "The projected path reads a 'supersedes' relationship declared from Decision "
+                "to Decision; the catalog declaration does not match that frozen endpoint pair.",
+                field="endpoint",
+                value=table.name,
+                from_table=table.from_table,
+                to_table=table.to_table,
+            )
+
+        node_table = self._table_named(_PATH_PROJECTION_NODE_TABLE, "label")
+        self._require_path_property_keys(node_table, _PATH_PROJECTION_NODE_KEYS)
+        self._require_path_property_keys(table, _PATH_PROJECTION_RELATIONSHIP_KEYS)
+
+    @staticmethod
+    def _require_path_property_keys(
+        table: TableDef, reserved_keys: frozenset[str]
+    ) -> None:
+        """Refuse properties that would replace structural keys in the public path value."""
+        for column in table.property_columns:
+            if column.name in reserved_keys:
+                raise GrafxPlanError(
+                    f"Table {table.name!r} declares path-reserved property {column.name!r}; "
+                    "the projected path reserves that key for structural metadata.",
+                    field="column",
+                    value=column.name,
+                    table=table.name,
+                )
 
     def _require_endpoint(
         self, source: str, table: TableDef, direction: Direction

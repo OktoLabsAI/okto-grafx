@@ -53,6 +53,7 @@ from okto_grafx.domain.query.plan import (
     TraverseRelationship,
 )
 from okto_grafx.domain.query.planner import build_plan
+from okto_grafx.engine.query_engine import QueryEngine
 
 ADMITTED = "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path"
 
@@ -81,6 +82,40 @@ def _catalog() -> Catalog:
                 ColumnDef(name="layer", type=ValueType.STRING),
                 ColumnDef(name="note", type=ValueType.STRING),
             ),
+            from_table="Decision",
+            to_table="Decision",
+        )
+    )
+    return catalog
+
+
+def _catalog_with_path_reserved_property(
+    table_name: str, property_name: str
+) -> Catalog:
+    """Return the frozen schema with one otherwise-legal property that shadows path metadata."""
+    node_columns = [
+        ColumnDef(name="id", type=ValueType.STRING, nullable=False),
+    ]
+    relationship_columns = [ColumnDef(name="layer", type=ValueType.STRING)]
+    destination = node_columns if table_name == "Decision" else relationship_columns
+    destination.append(ColumnDef(name=property_name, type=ValueType.STRING))
+
+    catalog = Catalog()
+    catalog.add_table(
+        TableDef(
+            table_id=1,
+            name="Decision",
+            kind="node",
+            columns=tuple(node_columns),
+            primary_key="id",
+        )
+    )
+    catalog.add_table(
+        TableDef(
+            table_id=2,
+            name="supersedes",
+            kind="rel",
+            columns=tuple(relationship_columns),
             from_table="Decision",
             to_table="Decision",
         )
@@ -295,6 +330,83 @@ def test_projected_path_refuses_a_catalog_with_the_wrong_target_endpoint() -> No
         "from_table": "Decision",
         "to_table": "Bug",
     }
+
+
+@pytest.mark.parametrize(
+    ("table_name", "property_name"),
+    (
+        ("Decision", "_ID"),
+        ("Decision", "_LABEL"),
+        ("supersedes", "_SRC"),
+        ("supersedes", "_DST"),
+        ("supersedes", "_LABEL"),
+        ("supersedes", "_ID"),
+    ),
+)
+def test_projected_path_refuses_properties_that_shadow_structural_keys_before_stream(
+    table_name: str, property_name: str
+) -> None:
+    catalog = _catalog_with_path_reserved_property(table_name, property_name)
+
+    with pytest.raises(GrafxPlanError) as raised:
+        build_plan(parse(ADMITTED), catalog=catalog)
+
+    assert raised.value.details == {
+        "field": "column",
+        "value": property_name,
+        "table": table_name,
+    }
+    assert property_name in str(raised.value)
+
+
+def test_physical_relationship_endpoints_do_not_shadow_path_keys() -> None:
+    catalog = _catalog()
+    relationship = catalog.table("supersedes")
+
+    assert tuple(column.name for column in relationship.endpoint_columns) == (
+        "_from",
+        "_to",
+    )
+    planned = build_plan(parse(ADMITTED), catalog=catalog)
+    assert any(
+        type(node) is TraverseRelationship and node.path_variable == "path"
+        for node in planned.root.walk()
+    )
+
+
+def test_public_execute_reports_a_reserved_path_property_as_a_plan_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = okto_grafx.connect(tmp_path / "reserved-path-property", page_size=512)
+    try:
+        with database.begin("write") as schema:
+            schema.execute(
+                "CREATE NODE TABLE Decision(id STRING, _ID STRING, PRIMARY KEY(id))"
+            )
+            schema.execute(
+                "CREATE REL TABLE supersedes(FROM Decision TO Decision, reason STRING)"
+            )
+        with database.begin("write") as seed:
+            seed.execute("CREATE (:Decision {id: 'd1', _ID: 'user-one'})")
+            seed.execute("CREATE (:Decision {id: 'd2', _ID: 'user-two'})")
+            seed.execute(
+                "MATCH (a:Decision {id: 'd1'}), (b:Decision {id: 'd2'}) "
+                "CREATE (a)-[:supersedes {reason: 'newer'}]->(b)"
+            )
+
+        def fail_if_run(*_args: object, **_kwargs: object) -> object:
+            pytest.fail("query execution was reached after the planning refusal")
+
+        monkeypatch.setattr(QueryEngine, "_run", fail_if_run)
+        with pytest.raises(GrafxPlanError) as raised:
+            database.execute(ADMITTED)
+        assert raised.value.details == {
+            "field": "column",
+            "value": "_ID",
+            "table": "Decision",
+        }
+    finally:
+        database.close()
 
 
 def test_no_edge_is_an_empty_result_not_a_null_path(tmp_path: Path) -> None:

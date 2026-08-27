@@ -90,6 +90,13 @@ M-PULSE-6 is responsible for the narrow recursive tuple-to-list conversion when 
 Ladybug-compatible HTTP result. Changing every Grafx list value to a mutable list is explicitly
 out of scope.
 
+The structural names cannot also be user properties of the projected tables: `Decision` may not
+declare `_ID` or `_LABEL`, and `supersedes` may not declare `_SRC`, `_DST`, `_LABEL`, or `_ID` for
+this query. Those identifiers remain legal in the general schema; only this path projection
+refuses their collision, as a typed planning error before any row streams. The relationship
+layout columns `_from` and `_to` remain valid physical endpoints and are omitted from the public
+property map.
+
 The single accepted AST has one non-optional `MATCH`, one named outgoing hop with exactly the
 names and schema identifiers in the statement above, and one unaliased `RETURN path`. Every
 other path projection remains refused before streaming, including aliases, additional return
