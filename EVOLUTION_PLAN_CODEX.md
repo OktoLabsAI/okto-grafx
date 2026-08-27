@@ -1308,6 +1308,58 @@ auditorias independentes deram PASS. Permanecem fora, conforme o freeze, DDL/boo
 ativação do provider, rewrite de queries, dez gaps de supersedence e a divergência normativa de
 `EXPLAIN_CONSTRAINT_ORIGINS`.
 
+O próximo sublote fixo M-PULSE-3C cobre **somente** o manifesto completo do schema Pulse atual
+`0.5.0`, seu bootstrap Grafx idempotente e a validação/fingerprint lógico. A autoridade permanece
+no Core (`NODE_TYPES`, `STABLE_NODE_PROPERTIES`, `REL_TYPES`, `MULTI_REL_TYPES`,
+`EDGE_METADATA_COLUMNS`, `VECTOR_INDEX_TYPES`, `SCHEMA_VERSION`) e no DDL Community já usado em
+produção. O manifesto Grafx materializa exatamente 11 node tables com 44 propriedades ordenadas,
+`id STRING` como primary key não nullable e `embedding VECTOR(...)` nullable; uma `BoardMeta` com
+`board_id STRING` primary key, `schema_version STRING`, `bootstrapped_at TIMESTAMP`,
+`embedding_model STRING` e `embedding_dimension INT64`; e as 69 tabelas físicas de relação do
+M-PULSE-3B, cada uma com os dois endpoints não nullable e as propriedades ordenadas
+`confidence DOUBLE`, `created_by_session_id STRING`, `created_at TIMESTAMP`, `layer STRING`, `rule_id STRING`,
+`created_by STRING` e `fallback_reason STRING`. Tipos, ordem, nullability, primary key e endpoints
+são parte do contrato e não podem ser inferidos por presença nominal apenas.
+
+Cada um dos 11 node types recebe um space físico próprio, em ordem de `NODE_TYPES`, nomeado pela
+autoridade estável `vector_index_name(node_type)`, com dimensão 384, métrica cosine,
+`normalized=false` e storage `float64`. Spaces distintos são necessários porque o Grafx mantém a
+resolução vetorial por `space_name`; compartilhar um space entre tabelas sobrescreveria o índice
+resolvido. O DDL atual do Grafx anexa um índice derivado a cada coluna `VECTOR`, portanto surgem
+11 índices físicos. Isso não declara paridade vetorial: o fingerprint M-PULSE-3C exclui índices
+derivados e a capability Pulse continua expondo somente os nove tipos de `VECTOR_INDEX_TYPES`.
+M-PULSE-4 deve medir o overhead dos dois aceleradores não expostos e decidir mantê-los ou evitá-los
+antes da ativação, sem mudar coluna, space, fingerprint ou dados persistidos.
+
+O bootstrap recebe explicitamente `database`, `board_id`, `bootstrapped_at`,
+`embedding_model | None` e `embedding_dimension=384`. Antes de qualquer write ele captura um único
+catálogo público e valida todo objeto esperado já existente e qualquer objeto inesperado; kind,
+primary key, colunas completas, ordem, tipo, nullability, vector-space, endpoints e configuração
+do space divergentes falham na taxonomia Core com `backend=okto_grafx` e sem DDL/WAL. Em catálogo
+vazio ou parcial contendo somente um subconjunto correto, cria somente os objetos ausentes em uma
+única transação write; após o commit, recaptura e valida o schema completo. Somente depois dessa
+validação grava a row `BoardMeta` do board em uma transação separada. Falha de criação ou validação
+deixa a versão ausente; retry converge. Uma row já presente precisa ter `SCHEMA_VERSION` e metadata
+de embedding compatíveis; schema completo + row compatível retorna sem DDL, mutation ou avanço de
+WAL/LSN.
+
+O fingerprint usa JSON canônico e SHA-256 sobre a visão lógica validada: versão, 11 nodes e suas
+colunas, 16 relações e 69 pares, propriedades de relação, `BoardMeta` e os 11 spaces. Ele exclui
+table/space IDs, LSN/CSN, paths, timestamps de criação, nomes físicos das 69 relações e nomes de
+arquivos/índices; o reopen precisa produzir o mesmo valor. M-PULSE-3C não implementa `ALTER`,
+evolve ou upgrade de schema anterior, não ativa provider, não altera `kg.py`/`composition.py`, não
+reescreve queries lógicas, não fecha os dez gaps de supersedence, não muda gramática/formato Grafx
+e não reivindica os gates de M-PULSE-4.
+
+O gate fixo de M-PULSE-3C é: bootstrap vazio produz 11 nodes + `BoardMeta`, 69 relações e 11
+spaces exatos; segunda execução é no-op comprovado por catálogo, LSN e WAL; catálogo parcial
+correto converge criando somente ausentes; cada divergência de kind/PK/ordem/nome/tipo/nullability,
+endpoint, dimensão/métrica/normalização/dtype/state e objeto inesperado falha antes de write;
+falha durante bootstrap nunca grava versão; metadata/version incompatível não é sobrescrita;
+cold reopen mantém fingerprint e `database.verify("all")` sem findings; os builders Kuzu e
+`kg.py`/`composition.py` permanecem byte a byte invariantes. Upgrade aditivo continua um sublote
+posterior de M-PULSE-3, sem mover este gate retroativamente.
+
 #### M-PULSE-4 — paridade vetorial
 
 1. mapear os nove espaços de board e os quatro de Global Discovery para espaços Grafx;
@@ -1453,9 +1505,10 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-2G — node scan polimórfico | concluído e publicado | código final `6e4f1d5e91878395f9736a95b855296f69e2e248`; branch `milestone/pulse-query-polymorphic-node`; handoff Nexus `hof_a28be7ad2f584fd693c3ef9cbaec75e8` concluído/verificado/PASS | Um único `AllNodesScan` une somente node tables e mantém filtro, agregação, `DISTINCT`, ordem e janela globais. A visão transacional é owner-only; propriedade ausente lê `NULL`, conflito de tipo recusa pré-stream e o DTO destacado `{label, properties}` não expõe identidade. Corpus digest `ac19e6735a90e5fe9831fdca67a80de1a3f4fffadd54b81151d9e343a7bd0d7a`, raw 71/16, oito débitos e entries 80/15; exatamente 1 probe/7 entries mudaram, com I01/I02 e os demais gaps intactos. Query 1.088/1.088, dedicado+corpus 73/73, fronteiras públicas 158/158, `--check`, Ruff e diff-check PASS; formatter 250/250 contra a base; três auditorias independentes PASS |
 | M-PULSE-2H — endpoint inference tipada | concluído e publicado | código `a516c64`; formatação do código novo `42078ca`; branch `milestone/pulse-query-typed-endpoints`; handoff Nexus `hof_8ceb3eb19622472bbd50a83c81921015` concluído/verificado/PASS | I01/I02 planejam somente a forma bounded `MATCH (a)-[r:TYPE]->(b)` por `NodeScan -> TraverseRelationship`, inferindo source/target do `from_table`/`to_table` declarado. Relações paralelas, `NULL`, filtro I02, owner-only, rollback, wrong-kind, AST/análise injetada e os 16 tipos têm regressões; ranges escritos e demais shapes excluídos recusam antes do stream. Corpus digest `2fec52e0f033c3674aa8558fc5cca4aec05dacc7eae82e111bc2819864873e36`, raw 71/16, oito débitos e entries 82/13; somente I01/I02 mudaram. Query 1.141/1.141, corpus 45/45, focado pós-formatação 388/388 e fronteiras públicas 158/158; `--check`, Ruff e diff-check PASS; formatter 250/250 contra a base; três auditorias independentes PASS |
 | M-PULSE-2I — named path decorativo | concluído e publicado | código `1c728cc` + hardening `edf6efd`; branch `milestone/pulse-query-named-path`; integrado à `main`; handoff Nexus `hof_a3e5645c9d4b437bbf75841a20872c13` concluído/verificado/PASS | Aceita somente `MATCH path = (a:A)-[r:TYPE]->(b:B) ... RETURN ...` com um hop tipado e nome jamais lido. Analyzer e planner repetem o gate sobre AST/análise fornecida; path projection permanece recusado pre-stream. Corpus digest `e792ded751eeffbe597a4e37d9110b30943e3d0fa69bd22027ad09778fc24f1c`, raw 72/15, sete débitos e entries 82/13; exatamente dois objetos raw e nenhuma entry mudaram. Dedicado 60/60, relacionadas 539/539, corpus 45/45, query completa exit 0, `--check`, Ruff e diff-check PASS; formatter 250/250; duas auditorias independentes PASS |
-| M-PULSE-2J — upper bound implícito | escopo congelado; implementação não iniciada | baseline `main@4dc2b6564bc90d83d312345c77fdfa5d61a020a1` | Somente `*`, `*..` e `*n..` recebem upper 20, como o contrato Pulse; máximo explícito 30 permanece. AST/análise fornecida não pode contornar tipos/ordem/teto. Ratchet esperado: raw 73/14, seis débitos, somente `unbounded variable length` muda; 97 entries seguem 82/13. Demais seis gaps e toda superfície pública/persistida ficam invariantes |
+| M-PULSE-2J — upper bound implícito | escopo congelado; implementação em validação | baseline/freeze `main@7ba767a956cc1f20643dbaf04bd670adef8324d5`; branch `milestone/pulse-query-implicit-bounds`; handoff Nexus `hof_30fc02bfaca34762a46d90ffe143e162` | Somente `*`, `*..` e `*n..` recebem upper 20, como o contrato Pulse; máximo explícito 30 permanece. AST/análise fornecida não pode contornar tipos/ordem/teto nem esconder range atrás de `hop_range_written=false`. Ratchet esperado: raw 73/14, seis débitos, somente `unbounded variable length` muda; 97 entries seguem 82/13; digest alvo independente `ded258c21bb0d58b93f36e3b641a13ee421f90a3b234951c0ebe871cb59811c4`. Demais seis gaps e toda superfície pública/persistida ficam invariantes |
 | M-PULSE-3A — propriedades de node | concluído e publicado no branch Pulse atual; helper ainda inativo | Pulse Community `milestone/grafx-mpulse3-node-properties@4aae27eca9c0a2d1d14a3334b03e6c57976dea75` → `feature/v0.3.3`; revisão Nexus `hof_cad849ee19e542eb862930f64054724d` concluída/PASS | labels desconhecidas retornam vazio sem tocar backend; label conhecida ausente/wrong-kind e DB fechado falham tipado; ordem de catálogo, snapshot, reopen e fronteiras públicas cobertos; 8/8, Ruff default/TRY/I/BLE e format PASS. A resolução `board_id → Database` fica no provider/composição, sem ativação parcial |
 | M-PULSE-3B — layout lógico de relações | concluído e publicado; provider ainda inativo | Pulse Community `milestone/grafx-mpulse3-logical-relationships@c4b1f37ad3a4cd08a1e2f5249db25c33ddbecd45` → `feature/v0.3.3`; código `067b82c` + hardening `c4b1f37` | Manifesto fechado e imutável de 16 tipos/69 pares/69 nomes, codec bijetivo e reverse pelo manifesto; introspecção valida kind/endpoints e oculta nomes físicos. Unknown/collision/mismatch, shapes malformados e representação hostil falham tipados. Gate focado 15/15; regressão selecionada completa 146/146 contra Core limpo `ab61b9a`; Ruff/format/diff-check e duas auditorias independentes PASS. DDL/bootstrap, ativação, query rewrite e os gaps de supersedence continuam explicitamente fora |
+| M-PULSE-3C — manifesto e bootstrap do schema atual | escopo congelado; implementação iniciada em worktree isolado | baseline Pulse Community `c4b1f37ad3a4cd08a1e2f5249db25c33ddbecd45`; branch `milestone/grafx-mpulse3-schema-bootstrap` | Contrato finito: schema `0.5.0`, 11 nodes/44 propriedades, `BoardMeta`, 69 relações, 11 spaces únicos 384/cosine/float64; preflight antes de write, criação somente de ausentes, version stamp pós-validação, no-op real e fingerprint lógico estável. ALTER/upgrade, provider, rewrite e paridade vetorial permanecem fora |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até o fechamento M-PULSE-2 a 7 | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
