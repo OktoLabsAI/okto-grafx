@@ -1033,8 +1033,10 @@ undirected hop, an anonymous relationship, a written or implicit range, an inlin
 different source or target name, another label or none, a target carrying a label, a `WHERE`, a
 second pattern or `MATCH`, a named path, and any `RETURN` other than the single unaliased
 `a.id`. The form is a whole top-level query and never a `UNION` branch. Analysis and planner each
-decide it from the statement itself, so a supplied tree or a supplied analysis cannot widen it,
-and the deciding fields are checked for their exact types before their values are read.
+retain their existing safety gates; the recognizer lives in the analysis layer, and the planner
+applies it directly to the statement before recomputing the statement's analysis. A supplied
+analysis therefore cannot widen the form, and the deciding fields are checked for their exact
+types before their values are read.
 
 `MATCH (n)` -- a node that names no label -- matches every node table, and `AllNodesScan` reads
 them in table_id order under one name. It is one operator over the union rather than one scan per

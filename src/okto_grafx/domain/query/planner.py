@@ -2481,10 +2481,9 @@ class _Planner:
         for table in tables:
             # Every candidate's landing table is resolved BEFORE the operator is built, and by
             # the same door the typed route uses. A catalog can name an endpoint it does not
-            # hold, and this route would otherwise walk the tables it can and answer as if that
-            # were the whole result -- a partial answer nobody asked for and nobody could see
-            # was partial. Refusing is the only honest reading, and it matches what a typed hop
-            # over the same broken table already does.
+            # hold; admitting that plan would defer a schema defect until execution while the
+            # typed route refuses it during planning. Refusing here keeps both routes fail-fast
+            # at the same public boundary and with the same typed error.
             self._table_named(table.to_table, "to")
         named = target_pattern.variable
         target = named if named is not None else self._anonymous()
