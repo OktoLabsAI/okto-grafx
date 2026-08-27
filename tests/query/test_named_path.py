@@ -177,11 +177,16 @@ def test_the_refusal_says_the_path_is_unreadable_rather_than_unbound(
     ],
 )
 def test_a_path_name_may_not_be_a_name_something_else_answers_to(query: str) -> None:
+    """Structural, not incidental: the gate compares the names, never the expressions.
+
+    A rule that noticed the collision only because the name happened to appear in a RETURN
+    would miss `MATCH r = (a:A)-[r:R]->(b:B) RETURN a.id`, where nothing reads r at all.
+    """
     with pytest.raises(GrafxPlanError) as raised:
         analyze(parse(query))
 
-    assert raised.value.details["field"] == "variable"
-    assert "path" in str(raised.value)
+    assert raised.value.details["field"] == "pattern"
+    assert "not the name of a" in str(raised.value)
 
 
 # --- the one shape, and only it ----------------------------------------------------------------
@@ -326,6 +331,239 @@ def test_the_analysis_refuses_the_same_trees_on_its_own() -> None:
     with pytest.raises(GrafxPlanError) as raised:
         analyze(statement)
     assert raised.value.details["field"] == "pattern"
+
+
+@pytest.mark.parametrize(
+    ("name", "query", "columns"),
+    [
+        (
+            "the projection itself",
+            "MATCH path = (a:A)-[r:R]->(b:B) RETURN path",
+            ("path",),
+        ),
+        (
+            "a read in the predicate",
+            "MATCH path = (a:A)-[r:R]->(b:B) WHERE path IS NULL RETURN a.id",
+            ("a.id",),
+        ),
+        (
+            "a read in the ordering",
+            "MATCH path = (a:A)-[r:R]->(b:B) RETURN a.id ORDER BY path",
+            ("a.id",),
+        ),
+    ],
+)
+def test_a_supplied_analysis_cannot_smuggle_a_read_of_the_name_past_the_planner(
+    catalog: object, indexes: tuple, name: str, query: str, columns: tuple
+) -> None:
+    """The analysis refuses these per site; the planner refuses them again, and must.
+
+    ``build_plan`` takes an analysis from its caller, and an analysis that never looked is an
+    analysis that never refused. Without this the shape gate alone would let a forged analysis
+    project a path -- the shape is legal; what is not legal is reading the name inside it.
+    """
+    statement = parse(query)
+    forged = QueryAnalysis(
+        statement=statement,
+        bindings=(
+            Binding(name="a", entity="node", labels=("A",), created=False),
+            Binding(name="b", entity="node", labels=("B",), created=False),
+            Binding(name="r", entity="relationship", labels=("R",), created=False),
+        ),
+        output_columns=columns,
+    )
+
+    with pytest.raises(GrafxPlanError) as raised:
+        build_plan(statement, catalog=catalog, indexes=indexes, analysis=forged)
+
+    assert raised.value.details["field"] == "variable", name
+    assert "never read" in str(raised.value), name
+
+
+@pytest.mark.parametrize("collides", ["a", "r", "b"])
+def test_a_supplied_analysis_meets_the_collision_rule_too(
+    catalog: object, indexes: tuple, collides: str
+) -> None:
+    """None of these reads the name, so only a structural comparison can catch them."""
+    statement = parse(f"MATCH {collides} = (a:A)-[r:R]->(b:B) RETURN a.id")
+    forged = QueryAnalysis(
+        statement=statement,
+        bindings=(
+            Binding(name="a", entity="node", labels=("A",), created=False),
+            Binding(name="b", entity="node", labels=("B",), created=False),
+            Binding(name="r", entity="relationship", labels=("R",), created=False),
+        ),
+        output_columns=("a.id",),
+    )
+
+    with pytest.raises(GrafxPlanError) as raised:
+        build_plan(statement, catalog=catalog, indexes=indexes, analysis=forged)
+    assert raised.value.details["field"] == "pattern"
+
+
+@pytest.mark.parametrize(
+    ("name", "variable"),
+    [
+        ("empty", ""),
+        ("an integer", 0),
+        ("a boolean", True),
+        ("a name with a space", "not safe"),
+        ("a name past the lexer's ceiling", "x" * 200),
+        ("a name carrying a back quote", "we`ird"),
+        ("a name starting with a digit", "1path"),
+        ("a name carrying punctuation", "path!"),
+    ],
+)
+def test_a_name_the_parser_could_not_have_written_is_refused(
+    name: str, variable: object
+) -> None:
+    """`describe()` writes a path name back bare, so a name needing quotes would not re-read.
+
+    The question is put to the LEXER rather than answered again here, which is also what keeps
+    the ceiling on a name's length in one place.
+    """
+    statement = Query(
+        match_clauses=(
+            MatchClause(
+                patterns=(
+                    PatternPath(
+                        nodes=(
+                            NodePattern(variable="a", labels=("A",)),
+                            NodePattern(variable="b", labels=("B",)),
+                        ),
+                        relationships=(
+                            RelationshipPattern(variable="r", types=("R",)),
+                        ),
+                        variable=variable,  # type: ignore[arg-type]
+                    ),
+                )
+            ),
+        ),
+        return_clause=_returns_id(),
+    )
+
+    with pytest.raises(GrafxPlanError) as raised:
+        analyze(statement)
+    assert raised.value.details["field"] == "pattern", name
+
+
+class _HostileName(str):
+    """A str subclass whose indexing raises, which is not what the parser ever produces."""
+
+    def __getitem__(self, item: object) -> str:  # noqa: D105 - the raising is the point
+        raise RuntimeError("this name refuses to be read")
+
+
+def test_a_name_that_is_not_a_builtin_string_is_refused_before_it_is_touched() -> None:
+    """Checked by exact type, not isinstance: a subclass could carry an exception out.
+
+    A tokenizer handed a str whose __getitem__ raises would surface a RuntimeError where a
+    typed refusal belongs, and a caller cannot act on that.
+    """
+    statement = Query(
+        match_clauses=(
+            MatchClause(
+                patterns=(
+                    PatternPath(
+                        nodes=(
+                            NodePattern(variable="a", labels=("A",)),
+                            NodePattern(variable="b", labels=("B",)),
+                        ),
+                        relationships=(
+                            RelationshipPattern(variable="r", types=("R",)),
+                        ),
+                        variable=_HostileName("path"),
+                    ),
+                )
+            ),
+        ),
+        return_clause=_returns_id(),
+    )
+
+    with pytest.raises(GrafxPlanError) as raised:
+        analyze(statement)
+    assert raised.value.details["field"] == "pattern"
+
+
+@pytest.mark.parametrize(
+    ("name", "nodes", "relationships"),
+    [
+        ("one node and one hop", 1, 1),
+        ("two nodes and two hops", 2, 2),
+        ("no nodes at all", 0, 0),
+    ],
+)
+def test_a_malformed_path_is_refused_rather_than_crashing_its_own_message(
+    catalog: object, name: str, nodes: int, relationships: int
+) -> None:
+    """The detail cannot walk a tree already judged malformed, so it does not try.
+
+    `describe()` on a path with one node and one hop indexes past its own nodes. A refusal that
+    raises while building its own message reports nothing and hides what it found.
+    """
+    node = NodePattern(variable="a", labels=("A",))
+    hop = RelationshipPattern(variable="r", types=("R",))
+    statement = Query(
+        match_clauses=(
+            MatchClause(
+                patterns=(
+                    PatternPath(
+                        nodes=tuple(node for _ in range(nodes)),
+                        relationships=tuple(hop for _ in range(relationships)),
+                        variable="path",
+                    ),
+                )
+            ),
+        ),
+        return_clause=_returns_id(),
+    )
+
+    with pytest.raises(GrafxPlanError) as raised:
+        analyze(statement)
+    assert raised.value.details["field"] == "pattern", name
+
+    with pytest.raises(GrafxPlanError):
+        build_plan(
+            statement,
+            catalog=catalog,
+            analysis=QueryAnalysis(
+                statement=statement,
+                bindings=(
+                    Binding(name="a", entity="node", labels=("A",), created=False),
+                ),
+                output_columns=("a.id",),
+            ),
+        )
+
+
+def test_an_alias_may_carry_the_path_name_because_it_reads_nothing() -> None:
+    """Adjudicated scope: an alias DEFINES a column, and defining is not reading.
+
+    Refusing it would widen the batch past what the freeze pins, which is reads of the path
+    and collisions with the nodes and relationships of the pattern.
+    """
+    analysis = analyze(parse("MATCH path = (a:A)-[r:R]->(b:B) RETURN a.id AS path"))
+
+    assert analysis.output_columns == ("path",)
+
+
+def test_the_valid_form_still_plans_under_a_supplied_analysis(
+    catalog: object, indexes: tuple
+) -> None:
+    """The control for the four above: the door refuses reads, not the form itself."""
+    statement = parse("MATCH path = (a:Person)-[r:Knows]->(b:Person) RETURN a.id")
+    supplied = QueryAnalysis(
+        statement=statement,
+        bindings=(
+            Binding(name="a", entity="node", labels=("Person",), created=False),
+            Binding(name="b", entity="node", labels=("Person",), created=False),
+            Binding(name="r", entity="relationship", labels=("Knows",), created=False),
+        ),
+        output_columns=("a.id",),
+    )
+
+    planned = build_plan(statement, catalog=catalog, indexes=indexes, analysis=supplied)
+    assert "TraverseRelationship" in tuple(node.label for node in planned.root.walk())
 
 
 def test_a_named_path_never_becomes_the_typed_endpoint_form(

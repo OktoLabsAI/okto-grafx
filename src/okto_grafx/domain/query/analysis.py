@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from okto_grafx.domain.errors import GrafxPlanError
+from okto_grafx.domain.errors import GrafxParseError, GrafxPlanError
 from okto_grafx.domain.query.ast import (
     CaseExpression,
     CreateClause,
@@ -54,8 +54,10 @@ from okto_grafx.domain.query.ast import (
     free_variables,
     walk,
 )
+from okto_grafx.domain.query.lexer import tokenize
 from okto_grafx.domain.query.limits import MAX_PARAMETERS
 from okto_grafx.domain.query.tokens import (
+    TokenKind,
     AGGREGATE_FUNCTIONS,
     COALESCE_FUNCTION,
     SIMILARITY_FUNCTION,
@@ -283,6 +285,53 @@ def named_path(query: Query) -> PatternPath | None:
     return None
 
 
+def _is_written_path_name(value: object) -> bool:
+    """Whether the parser could have produced this as the name of a path.
+
+    Asked of the LEXER rather than described again here: what a name may contain, and the
+    ceiling on how long it may be, already live there, and a second copy would eventually be a
+    second answer.
+
+    A BARE identifier, deliberately, and not the back-quoted spelling the parser also accepts
+    elsewhere. ``describe()`` writes a path name back without quotes, so a name that needed
+    them would be put back as text nothing can read; the round trip is what makes the name
+    decorative rather than merely ignored, and this subset keeps it by refusing the spelling
+    that would break it.
+
+    A tree built by hand can carry anything in this field. A field the parser could not have
+    written is not a name to ignore; it is a tree to refuse.
+
+    The type is checked EXACTLY, not by isinstance: a subclass of str is not what the parser
+    produces, and one whose ``__getitem__`` raises would carry that exception out through the
+    tokenizer as something other than a refusal. What cannot be judged is refused.
+    """
+    if type(value) is not str or not value:
+        return False
+    try:
+        tokens = tokenize(value)
+    except GrafxParseError:
+        return False
+    written = tuple(token for token in tokens if token.kind is not TokenKind.END)
+    return (
+        len(written) == 1
+        and written[0].kind is TokenKind.NAME
+        and not written[0].quoted
+        and written[0].text == value
+    )
+
+
+def _named_path_detail(named: PatternPath) -> str:
+    """Return a refusal detail that is safe on a tree already known to be malformed.
+
+    The pattern is NOT written back here. By the time this is asked the shape has already been
+    judged wrong, and a wrong shape is exactly the one ``describe()`` cannot walk: a path with
+    one node and one relationship indexes past its own nodes. A refusal that raises while
+    building its own message is worse than the mistake it was reporting.
+    """
+    variable = named.variable
+    return variable if _is_written_path_name(variable) else "a named path"
+
+
 def named_path_refusal(query: Query) -> tuple[str, str] | None:
     """Return the refusal a named path earns outside its one shape, or None.
 
@@ -300,12 +349,20 @@ def named_path_refusal(query: Query) -> tuple[str, str] | None:
     return (
         "A named path is written and never read in this subset, and it is admitted in exactly "
         f"one shape: {NAMED_PATH_SHAPE}. {reason}",
-        named.describe(),
+        _named_path_detail(named),
     )
 
 
 def _named_path_shape_reason(query: Query, named: PatternPath) -> str | None:
     """Return what this statement does that the one shape does not allow, or None."""
+    if not _is_written_path_name(named.variable):
+        return "A path is named with a name the parser could have written."
+    for node in named.nodes:
+        if node.variable == named.variable:
+            return "The name of a path is not the name of a node in it."
+    for relationship in named.relationships:
+        if relationship.variable == named.variable:
+            return "The name of a path is not the name of a relationship in it."
     if query.unwind_clause is not None:
         return "This one follows an UNWIND."
     if query.with_clauses:
@@ -619,13 +676,9 @@ class _Analyzer:
         name = pattern.variable
         if name is None:
             return
-        if self._binding(name) is not None or name in self._path_names:
-            raise self._refuse(
-                f"The name {name!r} is already used in this query, so it cannot also name a "
-                "path.",
-                field="variable",
-                value=name,
-            )
+        # A name shared with a node or a relationship is refused by the shape gate, over the
+        # STATEMENT and before any of this runs, so that a caller supplying its own analysis
+        # meets the same rule. Recording the name here is what makes reading it refusable.
         self._path_names.add(name)
 
     def _bind_pattern(self, pattern: PatternPath, *, created: bool) -> None:
@@ -784,13 +837,6 @@ class _Analyzer:
         """Record one binding, refusing a name already bound to a different kind of thing."""
         if name is None:
             return
-        if name in self._path_names:
-            raise self._refuse(
-                f"The name {name!r} names a path in this query, so it cannot also name a "
-                f"{entity}.",
-                field="variable",
-                value=name,
-            )
         existing = self._binding(name)
         if existing is None:
             self._bindings.append(

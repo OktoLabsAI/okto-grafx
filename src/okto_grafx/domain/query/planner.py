@@ -45,6 +45,7 @@ from okto_grafx.domain.query.analysis import (
     QueryAnalysis,
     SimilarityUse,
     analyze,
+    named_path,
     named_path_refusal,
     polymorphic_node_refusal,
 )
@@ -706,6 +707,7 @@ class _Planner:
         if refusal is not None:
             message, value = refusal
             raise GrafxPlanError(message, field="pattern", value=value)
+        self._refuse_named_path_reads(statement)
         refusal = polymorphic_node_refusal(statement)
         if refusal is not None:
             message, value = refusal
@@ -771,6 +773,32 @@ class _Planner:
             # filters for the same reason: the names it reads exist only above this operator.
             pipeline = FilterRows(child=pipeline, predicate=clause.predicate)
         return pipeline
+
+    def _refuse_named_path_reads(self, statement: Query) -> None:
+        """Refuse a read of a path name, for a caller that supplied its own analysis.
+
+        The analysis refuses each of these where it is written, and says which clause asked.
+        This repeats the rule rather than the message, because ``build_plan`` accepts an
+        ANALYSIS from its caller, and an analysis that never looked is an analysis that never
+        refused. The shape gate above is not enough on its own: it decides what a query may
+        LOOK like, and this decides what the name inside it may be used for.
+
+        It also catches the collision case, and correctly: when the path shares a name with a
+        node, a read of that name cannot be told from a read of the path, so neither is allowed
+        to reach a row.
+        """
+        named = named_path(statement)
+        if named is None or named.variable is None:
+            return
+        for expression in self._query_expressions(statement):
+            for node in walk(expression):
+                if isinstance(node, Variable) and node.name == named.variable:
+                    raise GrafxPlanError(
+                        f"The path {named.variable!r} is written and never read in this "
+                        "subset, so nothing may project it or filter on it.",
+                        field="variable",
+                        value=named.variable,
+                    )
 
     def _record_coalesce_types(self, statement: Query) -> None:
         """Resolve every COALESCE argument whose type the bound schema makes knowable."""
