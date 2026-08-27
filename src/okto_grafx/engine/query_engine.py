@@ -49,7 +49,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -4613,17 +4612,272 @@ def _validate_bound_subscript_types(
             )
 
 
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-_ONE_MICROSECOND = timedelta(microseconds=1)
+_TIMESTAMP_EPOCH_ORDINAL = 719_163
+_TIMESTAMP_MAX_ORDINAL = 3_652_059
+_TIMESTAMP_MICROS_PER_SECOND = 1_000_000
+_TIMESTAMP_MICROS_PER_MINUTE = 60 * _TIMESTAMP_MICROS_PER_SECOND
+_TIMESTAMP_MICROS_PER_HOUR = 60 * _TIMESTAMP_MICROS_PER_MINUTE
+_TIMESTAMP_MICROS_PER_DAY = 24 * _TIMESTAMP_MICROS_PER_HOUR
+_TIMESTAMP_DAYS_BEFORE_MONTH = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+_TIMESTAMP_FRACTION_SCALES = (1_000_000, 100_000, 10_000, 1_000, 100, 10, 1)
+
+
+def _timestamp_ascii_integer(text: str, start: int, length: int) -> int | None:
+    """Read one fixed-width ASCII integer without accepting Unicode lookalikes."""
+
+    end = start + length
+    if end > len(text):
+        return None
+    answer = 0
+    for index in range(start, end):
+        digit = ord(text[index]) - ord("0")
+        if digit < 0 or digit > 9:
+            return None
+        answer = answer * 10 + digit
+    return answer
+
+
+def _timestamp_is_leap_year(year: int) -> bool:
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+
+def _timestamp_calendar_ordinal(year: int, month: int, day: int) -> int | None:
+    """Return the proleptic-Gregorian ordinal for one valid calendar date."""
+
+    if year < 1 or year > 9_999 or month < 1 or month > 12 or day < 1:
+        return None
+    month_days = (
+        29
+        if month == 2 and _timestamp_is_leap_year(year)
+        else (28 if month == 2 else (30 if month in (4, 6, 9, 11) else 31))
+    )
+    if day > month_days:
+        return None
+    years = year - 1
+    ordinal = (
+        years * 365
+        + years // 4
+        - years // 100
+        + years // 400
+        + _TIMESTAMP_DAYS_BEFORE_MONTH[month - 1]
+        + day
+    )
+    if month > 2 and _timestamp_is_leap_year(year):
+        ordinal += 1
+    return ordinal
+
+
+def _timestamp_iso_week_ordinal(year: int, week: int, weekday: int) -> int | None:
+    """Return the calendar ordinal for one valid ISO week date."""
+
+    if year < 1 or year > 9_999 or week < 1 or weekday < 1 or weekday > 7:
+        return None
+    january_first = _timestamp_calendar_ordinal(year, 1, 1)
+    january_fourth = _timestamp_calendar_ordinal(year, 1, 4)
+    if january_first is None or january_fourth is None:
+        return None
+    january_first_weekday = (january_first - 1) % 7
+    weeks = (
+        53
+        if january_first_weekday == 3
+        or (january_first_weekday == 2 and _timestamp_is_leap_year(year))
+        else 52
+    )
+    if week > weeks:
+        return None
+    week_one_monday = january_fourth - (january_fourth - 1) % 7
+    ordinal = week_one_monday + (week - 1) * 7 + weekday - 1
+    if ordinal < 1 or ordinal > _TIMESTAMP_MAX_ORDINAL:
+        return None
+    return ordinal
+
+
+def _timestamp_date_ordinal(text: str) -> int | None:
+    """Read the finite calendar-date and ISO-week forms accepted by Grafx."""
+
+    year = _timestamp_ascii_integer(text, 0, 4)
+    if year is None:
+        return None
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        month = _timestamp_ascii_integer(text, 5, 2)
+        day = _timestamp_ascii_integer(text, 8, 2)
+        if month is None or day is None:
+            return None
+        return _timestamp_calendar_ordinal(year, month, day)
+    if len(text) == 8 and text[4] not in ("W", "-"):
+        month = _timestamp_ascii_integer(text, 4, 2)
+        day = _timestamp_ascii_integer(text, 6, 2)
+        if month is None or day is None:
+            return None
+        return _timestamp_calendar_ordinal(year, month, day)
+
+    week: int | None = None
+    weekday = 1
+    if len(text) in (7, 8) and text[4] == "W":
+        week = _timestamp_ascii_integer(text, 5, 2)
+        if len(text) == 8:
+            parsed_weekday = _timestamp_ascii_integer(text, 7, 1)
+            if parsed_weekday is None:
+                return None
+            weekday = parsed_weekday
+    elif len(text) == 8 and text[4:6] == "-W":
+        week = _timestamp_ascii_integer(text, 6, 2)
+    elif len(text) == 10 and text[4:6] == "-W" and text[8] == "-":
+        week = _timestamp_ascii_integer(text, 6, 2)
+        parsed_weekday = _timestamp_ascii_integer(text, 9, 1)
+        if parsed_weekday is None:
+            return None
+        weekday = parsed_weekday
+    if week is None:
+        return None
+    return _timestamp_iso_week_ordinal(year, week, weekday)
+
+
+def _timestamp_fraction_micros(text: str, start: int) -> int | None:
+    """Read a non-empty decimal fraction, truncating deterministically to microseconds."""
+
+    if start == len(text):
+        return None
+    micros = 0
+    used = 0
+    for index in range(start, len(text)):
+        digit = ord(text[index]) - ord("0")
+        if digit < 0 or digit > 9:
+            return None
+        if used < 6:
+            micros = micros * 10 + digit
+            used += 1
+    return micros * _TIMESTAMP_FRACTION_SCALES[used]
+
+
+def _timestamp_clock_parts(
+    text: str, *, allow_empty_fraction: bool = False
+) -> tuple[int, int, int, int] | None:
+    """Read the shared local-time/offset clock grammar."""
+
+    fraction_at: int | None = None
+    for index, character in enumerate(text):
+        if character in (".", ","):
+            fraction_at = index
+            break
+    base = text if fraction_at is None else text[:fraction_at]
+    if fraction_at is None:
+        fraction = 0
+    elif allow_empty_fraction and fraction_at + 1 == len(text):
+        fraction = 0
+    else:
+        fraction = _timestamp_fraction_micros(text, fraction_at + 1)
+    if fraction is None:
+        return None
+
+    hour = _timestamp_ascii_integer(base, 0, 2)
+    minute: int | None = 0
+    second: int | None = 0
+    if len(base) == 2:
+        pass
+    elif len(base) == 4:
+        minute = _timestamp_ascii_integer(base, 2, 2)
+    elif len(base) == 5 and base[2] == ":":
+        minute = _timestamp_ascii_integer(base, 3, 2)
+    elif len(base) == 6:
+        minute = _timestamp_ascii_integer(base, 2, 2)
+        second = _timestamp_ascii_integer(base, 4, 2)
+    elif len(base) == 8 and base[2] == ":" and base[5] == ":":
+        minute = _timestamp_ascii_integer(base, 3, 2)
+        second = _timestamp_ascii_integer(base, 6, 2)
+    else:
+        return None
+    if hour is None or minute is None or second is None:
+        return None
+    return hour, minute, second, fraction
+
+
+def _timestamp_time_micros(text: str) -> int | None:
+    """Read one time and optional zone as UTC-relative microseconds within its date."""
+
+    zone_at: int | None = None
+    for index, character in enumerate(text):
+        if character in ("Z", "+", "-"):
+            zone_at = index
+            break
+    local_text = text if zone_at is None else text[:zone_at]
+    local = _timestamp_clock_parts(local_text, allow_empty_fraction=zone_at is not None)
+    if local is None:
+        return None
+    hour, minute, second, fraction = local
+    if hour > 23 or minute > 59 or second > 59:
+        return None
+    local_micros = (
+        hour * _TIMESTAMP_MICROS_PER_HOUR
+        + minute * _TIMESTAMP_MICROS_PER_MINUTE
+        + second * _TIMESTAMP_MICROS_PER_SECOND
+        + fraction
+    )
+    if zone_at is None:
+        return local_micros
+
+    zone_mark = text[zone_at]
+    zone_text = text[zone_at + 1 :]
+    if zone_mark == "Z":
+        return local_micros if not zone_text else None
+    offset = _timestamp_clock_parts(zone_text)
+    if offset is None:
+        return None
+    offset_hour, offset_minute, offset_second, offset_fraction = offset
+    integer_offset_seconds = offset_hour * 3_600 + offset_minute * 60 + offset_second
+    # Keep CPython's effective zero-offset rule: a fractional remainder is discarded when
+    # every whole offset component is zero (for example +00:00:00.5 is UTC).
+    if integer_offset_seconds == 0:
+        offset_fraction = 0
+    offset_micros = (
+        integer_offset_seconds * _TIMESTAMP_MICROS_PER_SECOND + offset_fraction
+    )
+    if offset_micros >= _TIMESTAMP_MICROS_PER_DAY:
+        return None
+    return (
+        local_micros - offset_micros
+        if zone_mark == "+"
+        else local_micros + offset_micros
+    )
+
+
+def _timestamp_text_micros(text: str) -> int | None:
+    """Read Grafx's deterministic ISO/Gregorian subset without mechanism imports."""
+
+    # The old reader let this one CPython form through before its ten-character separator
+    # guard: compact ISO week + one arbitrary separator + hours. Keep that effective surface
+    # so restoring the pure boundary is not also a parsing break.
+    if len(text) == 10:
+        ordinal = _timestamp_date_ordinal(text[:7])
+        time_micros = _timestamp_time_micros(text[8:])
+        if ordinal is not None and time_micros is not None:
+            return (
+                ordinal - _TIMESTAMP_EPOCH_ORDINAL
+            ) * _TIMESTAMP_MICROS_PER_DAY + time_micros
+    if len(text) <= 10:
+        ordinal = _timestamp_date_ordinal(text)
+        return (
+            None
+            if ordinal is None
+            else (ordinal - _TIMESTAMP_EPOCH_ORDINAL) * _TIMESTAMP_MICROS_PER_DAY
+        )
+    if text[10] not in ("T", " "):
+        return None
+    ordinal = _timestamp_date_ordinal(text[:10])
+    time_micros = _timestamp_time_micros(text[11:])
+    if ordinal is None or time_micros is None:
+        return None
+    return (
+        ordinal - _TIMESTAMP_EPOCH_ORDINAL
+    ) * _TIMESTAMP_MICROS_PER_DAY + time_micros
 
 
 def _timestamp_of(function_name: str, value: object) -> Timestamp | None:
     """Read one ISO-8601 instant, or refuse it.
 
     The single place the conversion lives, so the binder and the evaluator cannot answer
-    differently for the same text.  Whole microseconds come from integer division of a
-    timedelta rather than from seconds-as-float, because a float loses the last digits of a
-    microsecond reading and a timestamp is stored to the microsecond.
+    differently for the same text. The parser uses only integer Gregorian/ISO-week
+    arithmetic: it neither depends on machine time nor crosses the pure-core boundary.
     """
 
     if value is None:
@@ -4642,30 +4896,15 @@ def _timestamp_of(function_name: str, value: object) -> Timestamp | None:
             field="function",
             value=function_name,
         )
-    # ``datetime.fromisoformat`` deliberately accepts any single Unicode character between
-    # the date and time.  The public Grafx contract is narrower: a date-time uses exactly
-    # ``T`` or a space (while a ten-character date remains valid on its own).
-    if len(value) > 10 and value[10] not in ("T", " "):
+    micros = _timestamp_text_micros(value)
+    if micros is None:
         message = f"{function_name} could not read {value!r} as an ISO-8601 instant."
         raise GrafxPlanError(
             message,
             field="function",
             value=function_name,
         )
-    try:
-        moment = datetime.fromisoformat(value)
-    except ValueError as exc:
-        message = f"{function_name} could not read {value!r} as an ISO-8601 instant."
-        raise GrafxPlanError(
-            message,
-            field="function",
-            value=function_name,
-        ) from exc
-    if moment.tzinfo is None:
-        # A reading with no zone is UTC by contract, rather than the machine's local time,
-        # so the same text means the same instant wherever it is read.
-        moment = moment.replace(tzinfo=timezone.utc)
-    return Timestamp(micros=(moment - _EPOCH) // _ONE_MICROSECOND)
+    return Timestamp(micros=micros)
 
 
 def _timestamp_bindable(expression: Expression) -> bool:
