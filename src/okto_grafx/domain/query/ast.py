@@ -488,13 +488,61 @@ class MatchClause:
 
     patterns: tuple[PatternPath, ...]
     predicate: Expression | None = None
+    optional: bool = False
+    """Whether the clause was written ``OPTIONAL MATCH``.
+
+    Declared last, and defaulted, so ``MatchClause(patterns, predicate)`` still means what it
+    meant before an optional match existed. The flag says only what was WRITTEN; what an
+    omitted match then produces is decided by the planner, and only for the one shape
+    :func:`~okto_grafx.domain.query.analysis.optional_match_refusal` admits.
+    """
 
     def describe(self) -> str:
         """Return the clause as it would be written back."""
         body = ", ".join(pattern.describe() for pattern in self.patterns)
+        keyword = "OPTIONAL MATCH" if self.optional is True else "MATCH"
         if self.predicate is None:
-            return f"MATCH {body}"
-        return f"MATCH {body} WHERE {self.predicate.describe()}"
+            return f"{keyword} {body}"
+        return f"{keyword} {body} WHERE {self.predicate.describe()}"
+
+
+def optional_clause_defect(clause: MatchClause) -> tuple[str, str] | None:
+    """Return what stops a clause from being readable as an OPTIONAL MATCH, or None.
+
+    The rule lives beside the clause because two passes need it and neither owns it. The parser
+    asks while the text is still being read, so every shape that earned a parse refusal before
+    an optional match existed keeps earning one -- moving a refusal from the parser to the
+    analysis would change the phase a caller sees for text nobody asked to change. The analysis
+    asks again, for a tree the parser never wrote.
+
+    Only the shape of ONE clause is decided here. Whether a query may carry such a clause at all
+    -- one of them, first, reading only -- belongs to the query and is decided in
+    :func:`~okto_grafx.domain.query.analysis.optional_match_refusal`.
+
+    Nothing is interpolated into the message: a forged field asked to render itself while the
+    refusal is being built would turn the refusal into a crash.
+    """
+    if len(clause.patterns) != 1:
+        return ("An OPTIONAL MATCH reads exactly one pattern.", "pattern")
+    pattern = clause.patterns[0]
+    if pattern.relationships or len(pattern.nodes) != 1:
+        return ("An OPTIONAL MATCH reads one node and no relationship.", "pattern")
+    if pattern.variable is not None:
+        return ("An OPTIONAL MATCH gives its pattern no name.", "pattern")
+    node = pattern.nodes[0]
+    if type(node.variable) is not str or not node.variable:
+        return (
+            "The node an OPTIONAL MATCH reads carries a name, as in OPTIONAL MATCH (v:Label).",
+            "variable",
+        )
+    if len(node.labels) != 1 or type(node.labels[0]) is not str:
+        return ("The node an OPTIONAL MATCH reads carries exactly one label.", "labels")
+    if node.properties is not None:
+        return (
+            "The node an OPTIONAL MATCH reads carries no inline map; write the test in WHERE.",
+            "properties",
+        )
+    return None
 
 
 class UpdatingClause:

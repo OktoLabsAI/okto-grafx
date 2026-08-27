@@ -48,6 +48,7 @@ from okto_grafx.domain.query.analysis import (
     hop_range_refusal,
     named_path,
     named_path_refusal,
+    optional_match_refusal,
     polymorphic_node_refusal,
 )
 from okto_grafx.domain.query.ast import (
@@ -104,6 +105,7 @@ from okto_grafx.domain.query.plan import (
     LimitRows,
     MergePattern,
     NodeScan,
+    OptionalRows,
     PlanNode,
     ProduceResults,
     ProjectRows,
@@ -717,6 +719,10 @@ class _Planner:
         if refusal is not None:
             message, value = refusal
             raise GrafxPlanError(message, field="pattern", value=value)
+        refusal = optional_match_refusal(statement)
+        if refusal is not None:
+            message, value = refusal
+            raise GrafxPlanError(message, field="clause", value=value)
         self.typed_endpoint_form = self._is_typed_endpoint_form(statement)
         pipeline: PlanNode = SingleRow()
         if statement.unwind_clause is not None:
@@ -732,6 +738,16 @@ class _Planner:
             pipeline, deferred = self._match_clause(pipeline, clause)
             similarity_terms.extend(deferred)
         pipeline = self._similarity(pipeline, statement, similarity_terms)
+        optional = [clause for clause in statement.match_clauses if clause.optional]
+        if optional:
+            # Above every filter of the clause, residual and deferred alike: the WHERE belongs
+            # to the OPTIONAL, so "no rows" has to mean no rows AFTER all of it. The gate above
+            # has already proved the shape, which is why one node of one pattern can be read
+            # here without asking again.
+            pipeline = OptionalRows(
+                child=pipeline,
+                alias=optional[0].patterns[0].nodes[0].variable,
+            )
         for clause in statement.with_clauses:
             pipeline = self._with_clause(pipeline, clause)
         for clause in statement.updating_clauses:

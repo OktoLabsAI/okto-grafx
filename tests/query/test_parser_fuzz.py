@@ -81,6 +81,7 @@ ALPHABET: str = ASCII_ALPHABET + BEYOND_ASCII
 
 WORDS: tuple[str, ...] = (
     "MATCH",
+    "OPTIONAL",
     "RETURN",
     "WHERE",
     "CREATE",
@@ -163,6 +164,7 @@ WORDS: tuple[str, ...] = (
 
 VALID: tuple[str, ...] = (
     "MATCH (p:Person) RETURN p.name",
+    "OPTIONAL MATCH (p:Person) RETURN p.name",
     "MATCH (p:Person) WHERE p.id = $id RETURN p.name AS n ORDER BY n DESC SKIP 1 LIMIT 5",
     "MATCH (a:Person)-[:Knows*1..3]->(b:Person) WHERE a.age >= 18 RETURN DISTINCT b.name",
     "MATCH (n:Chunk)-[:BELONGS_TO]->(d:Doc) WHERE n.layer = $layer AND d.active = true "

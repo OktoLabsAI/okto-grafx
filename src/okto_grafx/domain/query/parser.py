@@ -67,6 +67,7 @@ from okto_grafx.domain.query.ast import (
     UpdatingClause,
     Variable,
     WithClause,
+    optional_clause_defect,
 )
 from okto_grafx.domain.query.lexer import tokenize
 from okto_grafx.domain.query.limits import (
@@ -394,6 +395,7 @@ class _Parser:
         updating_clauses: list[UpdatingClause] = []
         return_clause: ReturnClause | None = None
         clauses = 0
+        optional_root = False
         while self._current.kind is not TokenKind.END and not self._at_symbol(";"):
             clauses += 1
             if clauses > MAX_CLAUSES:
@@ -401,6 +403,16 @@ class _Parser:
                     f"A query may chain at most {MAX_CLAUSES} clauses",
                     field="clauses",
                     value=MAX_CLAUSES,
+                )
+            if optional_root and not self._at_keyword("RETURN"):
+                # WHERE was already taken by the clause itself, so RETURN is the only word that
+                # may follow an OPTIONAL MATCH here. One guard answers every trailing clause at
+                # once -- a second MATCH, a WITH, an UNWIND, anything that writes -- and answers
+                # it where the text is read, which is where each of them was refused before.
+                raise self._refuse(
+                    "An OPTIONAL MATCH is followed only by WHERE and RETURN in this subset",
+                    field="clause",
+                    value="OPTIONAL MATCH",
                 )
             if self._at_keyword("UNWIND"):
                 if clauses != 1:
@@ -410,6 +422,27 @@ class _Parser:
                         value="UNWIND",
                     )
                 unwind_clause = self._unwind_clause()
+                continue
+            if (
+                clauses == 1
+                and self._at_keyword("OPTIONAL")
+                and self._at_keyword("MATCH", ahead=1)
+            ):
+                # Deliberately the NARROWEST recognition that can read the admitted form: the
+                # word is only a keyword as the FIRST clause and only immediately before MATCH.
+                # Anything else -- OPTIONAL after a MATCH, a second OPTIONAL MATCH, OPTIONAL
+                # before some other word -- falls through to the clause dispatch below and earns
+                # exactly the refusal it earned before this milestone, down to the message. That
+                # matters beyond taste: the corpus records the error text of every refused probe,
+                # so a refusal reworded here would move objects this milestone must not touch.
+                self._advance()
+                clause = self._match_clause(optional=True)
+                defect = optional_clause_defect(clause)
+                if defect is not None:
+                    message, value = defect
+                    raise self._refuse(message, field="pattern", value=value)
+                optional_root = True
+                match_clauses.append(clause)
                 continue
             if self._at_keyword("MATCH"):
                 if with_clauses:
@@ -541,14 +574,22 @@ class _Parser:
             return self._delete_clause()
         raise self._unexpected("a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN")
 
-    def _match_clause(self) -> MatchClause:
-        """Parse ``MATCH patterns [WHERE predicate]``."""
+    def _match_clause(self, *, optional: bool = False) -> MatchClause:
+        """Parse ``[OPTIONAL] MATCH patterns [WHERE predicate]``.
+
+        The caller has already consumed ``OPTIONAL`` when there was one, because whether that
+        word may appear at all is an ordering question and the clause loop is where ordering is
+        decided.
+        """
         self._take_keyword("MATCH")
         patterns = self._pattern_list(named=True)
         predicate: Expression | None = None
         if self._match_keyword("WHERE"):
+            # The predicate belongs to the clause, optional or not. For an OPTIONAL MATCH that
+            # is the whole difference between "matched nothing" and "matched and then filtered
+            # everything away": both are no rows, and both take the null extension.
             predicate = self._expression()
-        return MatchClause(patterns=patterns, predicate=predicate)
+        return MatchClause(patterns=patterns, predicate=predicate, optional=optional)
 
     def _set_clause(self) -> SetClause:
         """Parse ``SET n.property = expression [, ...]``."""

@@ -253,8 +253,8 @@
       "RETURN"
     ],
     "probe_count": 87,
-    "engine_accepted": 73,
-    "engine_refused": 14,
+    "engine_accepted": 74,
+    "engine_refused": 13,
     "contract_refused": 13,
     "contract_error_codes": {
       "unsafe_cypher": 10,
@@ -744,9 +744,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "parse_error",
-        "engine_verdict": "refused",
-        "error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'OPTIONAL' (line 1, column 1). [code=parse_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "root",
@@ -7752,5 +7752,5 @@
       }
     }
   ],
-  "digest": "ded258c21bb0d58b93f36e3b641a13ee421f90a3b234951c0ebe871cb59811c4"
+  "digest": "db3802aa449dc6a0204680c822027f8a8c6b0eeddef71afc350528b3c2d89e05"
 }

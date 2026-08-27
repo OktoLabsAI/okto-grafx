@@ -106,24 +106,26 @@ Each probe carries two independent answers. `contract_disposition` is what the *
 endpoint** admits; `engine_verdict` is what **this engine** does with the same text. They
 differ on purpose: the contract blacklists writes, while the engine accepts writes because
 the internal port needs them. Today the contract allows 74 probes and refuses 13 (10
-`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 73 and refuses 14. The
-intersection that matters to the public endpoint is the 6 allowed probes the engine still
+`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 74 and refuses 13. The
+intersection that matters to the public endpoint is the 5 allowed probes the engine still
 refuses.
 
 ### What M-PULSE-2 owes
 
-These 6 constructs are admitted by the public contract and refused by the engine:
+These 5 constructs are admitted by the public contract and refused by the engine:
 
 | Construct | Category | Refused at |
 | --- | --- | --- |
-| `OPTIONAL MATCH` | root | parse error |
 | `UNION` | clause | parse error |
 | `untyped relationship` | pattern | plan error |
 | `root operation as a homoglyph` | security | parse error |
 | `unsupported clause after a supported root` | taxonomy | parse error |
 | `path projection` | result | analysis error |
 
-`unbounded variable length` left this table in M-PULSE-2J: an omitted upper bound is read
+`OPTIONAL MATCH` left this table in M-PULSE-2K. The admitted form is deliberately limited to
+one named, labelled node as the first and only MATCH clause of a read-only query; an empty scan
+or a WHERE that removes every candidate produces one null-extended row. Wider optional patterns
+remain refused. `unbounded variable length` left this table in M-PULSE-2J: an omitted upper bound is read
 as the twenty hops the endpoint already rewrites it to, so the engine and the endpoint agree
 about what the omission means. `named path` left it in M-PULSE-2I. `path projection` stayed, and moved from the
 parser to the analysis in the same batch: the syntax it is written in now parses, so what
