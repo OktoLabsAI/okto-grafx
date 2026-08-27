@@ -150,6 +150,9 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
         "DatabaseIdentity",
         "PortRegistry",
         "QueryResult",
+        "ScanCursorV1",
+        "ScanPageV1",
+        "ScanRowV1",
         "Timestamp",
         "Transaction",
         "VectorValue",
@@ -162,6 +165,9 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
         assert hasattr(okto_grafx, name), f"__all__ exports {name!r}, which does not resolve"
     assert okto_grafx.Timestamp.__module__ == "okto_grafx.domain.model.value"
     assert okto_grafx.VectorValue.__module__ == "okto_grafx.domain.model.value"
+    assert okto_grafx.ScanCursorV1.__module__ == "okto_grafx.engine.database"
+    assert okto_grafx.ScanPageV1.__module__ == "okto_grafx.engine.database"
+    assert okto_grafx.ScanRowV1.__module__ == "okto_grafx.engine.database"
 
 
 def test_the_public_package_exposes_the_facade() -> None:

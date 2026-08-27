@@ -251,6 +251,23 @@ class SnapshotLike(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class _HeapScanPosition:
+    """Internal physical continuation for one bounded heap scan.
+
+    The public API wraps this value in an opaque transaction-owned token.  Keeping the physical
+    location here lets a page resume without sorting, replaying earlier pages or retaining a
+    generator (and therefore engine capabilities) across calls.  ``chain_limit`` is captured at
+    the first page so a corrupt cycle still terminates even when it crosses page boundaries in
+    separate calls.
+    """
+
+    page: PageIndex
+    slot: SlotId
+    pages_walked: int
+    chain_limit: int
+
+
+@dataclass(frozen=True, slots=True)
 class TableExtent:
     """Where the pages of one table are: the first, the last, and how many there are."""
 
@@ -772,6 +789,115 @@ class HeapStore:
             if not snapshot.visible(header.xmin, header.xmax):
                 continue
             yield ref, self._decode_version(table, content)
+
+    def scan_page(
+        self,
+        table: TableDef,
+        snapshot: SnapshotLike,
+        *,
+        limit: int,
+        position: _HeapScanPosition | None = None,
+    ) -> tuple[
+        tuple[tuple[RecordRef, HeapVersion], ...],
+        _HeapScanPosition | None,
+    ]:
+        """Return at most ``limit`` visible rows and a physical continuation.
+
+        Unlike :meth:`scan`, this door retains no generator and no growing visited-page set
+        between calls.  It decodes at most ``limit`` row payloads.  Headers beyond the boundary
+        may be inspected to locate the next visible row, so a non-terminal page never requires an
+        empty follow-up call, but that look-ahead does not decode the row's values.
+        """
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise GrafxConfigurationError(
+                "A heap scan page limit must be a positive integer.",
+                field="limit",
+                value=repr(limit),
+            )
+        if position is not None and type(position) is not _HeapScanPosition:
+            raise GrafxConfigurationError(
+                "A heap scan continuation must be an internal scan position.",
+                field="position",
+                value=type(position).__name__,
+            )
+
+        extent = self._find_extent(table.table_id)
+        if extent is None:
+            return (), None
+
+        if position is None:
+            index = extent.first_page
+            start_slot = FIRST_RECORD_SLOT
+            pages_walked = 1
+            chain_limit = self._chain_limit()
+        else:
+            index = position.page
+            start_slot = position.slot
+            pages_walked = position.pages_walked
+            chain_limit = position.chain_limit
+            current_chain_limit = self._chain_limit()
+            if (
+                type(index) is not int
+                or type(start_slot) is not int
+                or type(pages_walked) is not int
+                or type(chain_limit) is not int
+                or index == NO_PAGE
+                or index <= HEADER_PAGE_INDEX
+                or start_slot < FIRST_RECORD_SLOT
+                or pages_walked <= 0
+                or chain_limit <= 0
+                or pages_walked > chain_limit
+                or chain_limit > current_chain_limit
+                or index >= current_chain_limit - 1
+            ):
+                raise GrafxConfigurationError(
+                    "A heap scan continuation carries an invalid physical position.",
+                    field="position",
+                    page=index,
+                    slot=start_slot,
+                    pages_walked=pages_walked,
+                    chain_limit=chain_limit,
+                )
+
+        selected: list[tuple[RecordRef, bytes]] = []
+        next_position: _HeapScanPosition | None = None
+        while index != NO_PAGE:
+            self._refuse_endless_chain(table, pages_walked, chain_limit)
+            with self._pool.pinned(self._file, index) as page:
+                self._require_table_page(page, table)
+                following = page.next_page
+                for slot, content in page.iter_slots():
+                    if slot < max(start_slot, FIRST_RECORD_SLOT):
+                        continue
+                    header = RecordHeader.decode(content)
+                    if not snapshot.visible(header.xmin, header.xmax):
+                        continue
+                    if len(selected) == limit:
+                        next_position = _HeapScanPosition(
+                            page=index,
+                            slot=slot,
+                            pages_walked=pages_walked,
+                            chain_limit=chain_limit,
+                        )
+                        break
+                    selected.append((RecordRef(page=index, slot=slot), content))
+
+            if next_position is not None:
+                break
+
+            if following == NO_PAGE:
+                break
+            index = following
+            start_slot = FIRST_RECORD_SLOT
+            pages_walked += 1
+
+        # Decoding can follow overflow chains, so it happens only after every data-page pin above
+        # has been released. ``selected`` contains at most ``limit`` payloads.
+        rows = tuple(
+            (ref, self._decode_version(table, content)) for ref, content in selected
+        )
+        return rows, next_position
 
     def scan_all(self, table: TableDef) -> Iterator[tuple[RecordRef, HeapVersion]]:
         """Yield every stored version of the table, visible or not.

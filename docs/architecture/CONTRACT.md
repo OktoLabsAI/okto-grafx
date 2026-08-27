@@ -1173,6 +1173,9 @@ Every metric here MUST appear in a `dashboards/*.json` panel (OR-5/OR-3) — the
 from okto_grafx import (
     Database,
     QueryResult,
+    ScanCursorV1,
+    ScanPageV1,
+    ScanRowV1,
     Timestamp,
     Transaction,
     VectorValue,
@@ -1194,6 +1197,16 @@ db.close()
 with an open transaction aborts it and never corrupts. Every public method has an en-US docstring.
 `Timestamp` and `VectorValue` are the supported parameter/result value types for temporal and
 vector columns; integrations must not import their definitions through `okto_grafx.domain`.
+
+`Transaction.scan_rows_v1(table, *, limit, cursor=None) -> ScanPageV1` is the bounded physical
+transfer door. It is valid only on an active read transaction and therefore reuses that
+transaction's fixed MVCC snapshot. `ScanRowV1.values` follows `TableDef.columns`; relationship
+rows include `_from` and `_to` first and retain one row per physical occurrence. `ScanCursorV1` is
+opaque, process-local, non-serializable and scoped to the database, transaction and table that
+minted it. Each call decodes at most `limit` rows and retains at most those payloads plus one pinned
+page; it does not use `QueryResult`, sorting or traversal. The DTOs remain detached after the
+transaction closes. This V1 door is not a logical archive, a second snapshot lifecycle or bulk
+import API.
 
 **P2.5 / Fase 1.6 — concrete facade result types (CLOSED).** The detached objects returned at the
 public boundary are named exactly: `Database.recovery_report -> RecoveryReport | None`,

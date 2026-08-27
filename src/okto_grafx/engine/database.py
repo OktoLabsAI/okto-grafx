@@ -47,7 +47,7 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.index.entry import IndexEntry
-from okto_grafx.domain.model.value import VectorValue
+from okto_grafx.domain.model.value import Value, VectorValue
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.page.file_header import (
     HEADER_PAGE_INDEX,
@@ -79,7 +79,7 @@ from okto_grafx.domain.verify.findings import VerificationReport
 from okto_grafx.domain.wal.replay import RecycleReport
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.catalog_store import CatalogStore
-from okto_grafx.engine.heap_store import HeapStore
+from okto_grafx.engine.heap_store import HeapStore, _HeapScanPosition
 from okto_grafx.engine.metrics_catalog import metric
 from okto_grafx.engine.public_views import (
     BufferPoolView,
@@ -126,6 +126,7 @@ from okto_grafx.engine.public_views import (
     _query_plan_view,
     _query_result_view,
     _query_text_snapshot,
+    _query_value_snapshot,
     _record_id_filter_snapshot,
     _recycle_report_view,
     _queries_view,
@@ -160,6 +161,9 @@ __all__ = [
     "Database",
     "DatabaseIdentity",
     "MetaStore",
+    "ScanCursorV1",
+    "ScanPageV1",
+    "ScanRowV1",
     "Transaction",
 ]
 
@@ -605,6 +609,130 @@ def _public_snapshot(value: Snapshot) -> Snapshot:
     return Snapshot(_builtin_int(_domain_field(value, Snapshot, "read_lsn")))
 
 
+@dataclass(frozen=True, slots=True)
+class ScanRowV1:
+    """One detached stored row in table-column order."""
+
+    record_id: int
+    values: tuple[Value, ...]
+
+
+class ScanCursorV1:
+    """Opaque, process-local continuation minted by :meth:`Transaction.scan_rows_v1`.
+
+    A cursor is deliberately neither serializable nor constructible by callers.  It names a
+    physical continuation only inside the read transaction that minted it; the next page checks
+    that ownership again before reaching the catalog or heap.
+    """
+
+    __slots__ = (
+        "_owner",
+        "_position",
+        "_schema_version",
+        "_table_id",
+        "_table_name",
+    )
+
+    def __init__(self) -> None:
+        raise GrafxConfigurationError(
+            "A scan cursor is created only by Transaction.scan_rows_v1().",
+            field="cursor",
+            value="caller_constructed",
+        )
+
+    @classmethod
+    def _create(
+        cls,
+        *,
+        owner: object,
+        table_name: str,
+        table_id: int,
+        schema_version: int,
+        position: _HeapScanPosition,
+    ) -> ScanCursorV1:
+        cursor = object.__new__(cls)
+        object.__setattr__(cursor, "_owner", owner)
+        object.__setattr__(cursor, "_table_name", table_name)
+        object.__setattr__(cursor, "_table_id", table_id)
+        object.__setattr__(cursor, "_schema_version", schema_version)
+        object.__setattr__(cursor, "_position", position)
+        return cursor
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("ScanCursorV1 is immutable")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        raise TypeError("ScanCursorV1 is process-local and cannot be serialized")
+
+    def __repr__(self) -> str:
+        return "ScanCursorV1(<opaque>)"
+
+
+@dataclass(frozen=True, slots=True)
+class ScanPageV1:
+    """One bounded page of detached rows and its optional continuation."""
+
+    rows: tuple[ScanRowV1, ...]
+    next_cursor: ScanCursorV1 | None
+
+
+def _scan_cursor_payload(
+    value: object,
+    *,
+    owner: object,
+    table_name: str,
+) -> tuple[int, int, _HeapScanPosition]:
+    """Validate and unwrap one exact cursor without invoking caller-defined behavior."""
+
+    if type(value) is not ScanCursorV1:
+        raise GrafxConfigurationError(
+            "A scan continuation must be an exact ScanCursorV1 returned by this transaction.",
+            field="cursor",
+            value=_builtin_type_name(value),
+        )
+    try:
+        observed_owner = object.__getattribute__(value, "_owner")
+        observed_name = object.__getattribute__(value, "_table_name")
+        observed_table_id = object.__getattribute__(value, "_table_id")
+        observed_schema_version = object.__getattribute__(value, "_schema_version")
+        observed_position = object.__getattribute__(value, "_position")
+    except AttributeError as failure:
+        raise GrafxConfigurationError(
+            "A scan continuation is incomplete and was not minted by this transaction.",
+            field="cursor",
+            value="malformed",
+        ) from failure
+    if observed_owner is not owner:
+        raise GrafxTransactionStateError(
+            "A scan continuation cannot cross transaction or database boundaries.",
+            operation="scan_rows_v1",
+            field="cursor_owner",
+        )
+    if type(observed_name) is not str or observed_name != table_name:
+        raise GrafxTransactionStateError(
+            "A scan continuation cannot be used for a different table.",
+            operation="scan_rows_v1",
+            field="cursor_table",
+            value=(
+                observed_name
+                if type(observed_name) is str
+                else _builtin_type_name(observed_name)
+            ),
+            table=table_name,
+        )
+    if (
+        type(observed_table_id) is not int
+        or type(observed_schema_version) is not int
+        or type(observed_position) is not _HeapScanPosition
+    ):
+        raise GrafxConfigurationError(
+            "A scan continuation carries malformed internal fields.",
+            field="cursor",
+            value="malformed",
+        )
+    return observed_table_id, observed_schema_version, observed_position
+
+
 class Transaction:
     """One open transaction, as CONTRACT.md section 10 hands it to a caller.
 
@@ -618,7 +746,14 @@ class Transaction:
     closing path hides the reason the block is being left at all.
     """
 
-    __slots__ = ("_database", "_context", "_report", "_finished", "__weakref__")
+    __slots__ = (
+        "_database",
+        "_context",
+        "_report",
+        "_finished",
+        "_scan_owner",
+        "__weakref__",
+    )
 
     def __init__(self, database: Database, context: TransactionContext) -> None:
         """Adopt a transaction context the manager of ``database`` has just opened."""
@@ -626,6 +761,7 @@ class Transaction:
         self._context: TransactionContext = context
         self._report: CommitReport | None = None
         self._finished: bool = False
+        self._scan_owner: object = object()
 
     @property
     def mode(self) -> str:
@@ -665,6 +801,47 @@ class Transaction:
         """
         self._require_active()
         return self._database._run_statement(self._context, text, parameters)
+
+    def scan_rows_v1(
+        self,
+        table: str,
+        *,
+        limit: int,
+        cursor: ScanCursorV1 | None = None,
+    ) -> ScanPageV1:
+        """Read one bounded page of physical rows under this transaction's fixed snapshot.
+
+        Values follow ``TableDef.columns`` exactly. Relationship rows therefore expose ``_from``
+        and ``_to`` in their first two positions and preserve every physical occurrence. The
+        cursor is process-local and valid only for this transaction and table.
+        """
+
+        self._require_active()
+        if self._context.mode is not TransactionMode.READ:
+            raise GrafxTransactionStateError(
+                "scan_rows_v1 requires a read transaction.",
+                txn_id=self._context.txn_id,
+                mode=self._context.mode.value,
+                operation="scan_rows_v1",
+            )
+        table_name = _builtin_text(table, field="table", empty=False)
+        page_limit = _require_positive_integer("limit", limit)
+        payload = (
+            None
+            if cursor is None
+            else _scan_cursor_payload(
+                cursor,
+                owner=self._scan_owner,
+                table_name=table_name,
+            )
+        )
+        return self._database._scan_rows_v1(
+            self._context,
+            table=table_name,
+            limit=page_limit,
+            cursor_payload=payload,
+            cursor_owner=self._scan_owner,
+        )
 
     def commit(self) -> CommitReport:
         """Commit this transaction and return the report of CONTRACT.md section 8.5.
@@ -1523,6 +1700,97 @@ class Database:
             # after leaving page access, while _public_operation still translates ordinary host
             # failures and deliberately lets process-control signals pass unchanged.
             return _query_result_view(raw_result)
+
+    def _scan_rows_v1(
+        self,
+        context: TransactionContext,
+        *,
+        table: str,
+        limit: int,
+        cursor_payload: tuple[int, int, _HeapScanPosition] | None,
+        cursor_owner: object,
+    ) -> ScanPageV1:
+        """Serve the bounded scan door after its public arguments have been canonicalised."""
+
+        with self._public_operation("scan_rows_v1"):
+            self._require_open()
+            with self._transactions.page_access_section():
+                self._require_open()
+                if not context.active:
+                    raise GrafxTransactionStateError(
+                        f"Transaction {context.txn_id} is {context.state.value} and cannot scan "
+                        "another page.",
+                        txn_id=context.txn_id,
+                        state=context.state.value,
+                        operation="scan_rows_v1",
+                    )
+                if context.mode is not TransactionMode.READ:
+                    raise GrafxTransactionStateError(
+                        "scan_rows_v1 requires a read transaction.",
+                        txn_id=context.txn_id,
+                        mode=context.mode.value,
+                        operation="scan_rows_v1",
+                    )
+                table_def = self._catalog.catalog.table(table)
+                position: _HeapScanPosition | None = None
+                if cursor_payload is not None:
+                    cursor_table_id, cursor_schema_version, position = cursor_payload
+                    if (
+                        cursor_table_id != table_def.table_id
+                        or cursor_schema_version != table_def.schema_version
+                    ):
+                        raise GrafxTransactionStateError(
+                            "A scan continuation no longer names the same table definition.",
+                            operation="scan_rows_v1",
+                            field="cursor_table",
+                            table=table,
+                            cursor_table_id=cursor_table_id,
+                            current_table_id=table_def.table_id,
+                            cursor_schema_version=cursor_schema_version,
+                            current_schema_version=table_def.schema_version,
+                        )
+                raw_rows, next_position = self._heap.scan_page(
+                    table_def,
+                    context.snapshot,
+                    limit=limit,
+                    position=position,
+                )
+
+            # Heap values are decoded into owned objects, but maps are mutable and every public
+            # door promises detachment. Rebuild all leaves after page access so no frame, store or
+            # collaborator capability can cross the boundary.
+            active: set[int] = set()
+            rows: list[ScanRowV1] = []
+            for row_position, (_ref, version) in enumerate(raw_rows):
+                rows.append(
+                    ScanRowV1(
+                        record_id=_builtin_int(
+                            version.record_id,
+                            field=f"scan.rows[{row_position}].record_id",
+                        ),
+                        values=tuple(
+                            _query_value_snapshot(
+                                value,
+                                field=f"scan.rows[{row_position}].values[{value_position}]",
+                                depth=0,
+                                active=active,
+                            )
+                            for value_position, value in enumerate(version.values)
+                        ),
+                    )
+                )
+            next_cursor = (
+                None
+                if next_position is None
+                else ScanCursorV1._create(
+                    owner=cursor_owner,
+                    table_name=table,
+                    table_id=table_def.table_id,
+                    schema_version=table_def.schema_version,
+                    position=next_position,
+                )
+            )
+            return ScanPageV1(rows=tuple(rows), next_cursor=next_cursor)
 
     def search_vectors(
         self,

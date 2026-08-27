@@ -305,6 +305,29 @@ finally:
     reader.rollback()
 ```
 
+### Bounded physical scans
+
+Integrations that need a lossless logical export can page stored rows without materializing an
+`ORDER BY` query. The cursor stays inside one active read transaction, so every page observes the
+same MVCC snapshot:
+
+```python
+with db.begin("read") as txn:
+    cursor = None
+    while True:
+        page = txn.scan_rows_v1("Chunk", limit=256, cursor=cursor)
+        for row in page.rows:
+            print(row.record_id, row.values)  # values follow TableDef.columns
+        cursor = page.next_cursor
+        if cursor is None:
+            break
+```
+
+Relationship values start with `_from` and `_to`, and duplicate/parallel occurrences are returned
+separately. `ScanCursorV1` is opaque, non-serializable and cannot cross a transaction, table or
+database. This is a physical scan primitive for adapters, not a portable backup format or bulk
+import API.
+
 ### Safe observations
 
 Properties such as `db.catalog`, `db.indexes`, `db.wal`, `db.storage` and `db.metrics` are frozen

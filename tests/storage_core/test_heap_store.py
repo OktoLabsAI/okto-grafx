@@ -1504,6 +1504,26 @@ def test_scan_refuses_a_cycle_rather_than_walking_it(
 
 
 @pytest.mark.parametrize("shape", CYCLE_SHAPES)
+def test_paged_scan_carries_its_cycle_bound_across_continuations(
+    pool: BufferPool, heap_store: HeapStore, person_table: TableDef, shape: str
+) -> None:
+    """A physical cursor must not reset the termination guard on every page call."""
+    plant_cycle(pool, heap_store, person_table, shape)
+    position = None
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        for _attempt in range(MAX_SETUP_INSERTS):
+            _rows, position = heap_store.scan_page(
+                person_table,
+                at(1000),
+                limit=1,
+                position=position,
+            )
+            assert position is not None, "a cyclic chain cannot report exhaustion"
+        pytest.fail("the paged scan did not apply its cross-page cycle bound")
+    assert raised.value.details["field"] == "chain_length"
+
+
+@pytest.mark.parametrize("shape", CYCLE_SHAPES)
 def test_the_append_walk_refuses_a_cycle_rather_than_walking_it(
     pool: BufferPool, heap_store: HeapStore, person_table: TableDef, shape: str
 ) -> None:
