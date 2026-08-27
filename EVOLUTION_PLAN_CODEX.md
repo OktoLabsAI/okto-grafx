@@ -1463,6 +1463,13 @@ determinística e scores usam tolerâncias absoluta/relativa congeladas no fixtu
 bitwise entre backends. ANN atende o recall congelado pelo harness e nunca retorna item inelegível
 por board/layer/supersedence.
 
+O contrato pré-código finito desta etapa foi congelado no Pulse Community em
+`docs/grafx-vector-parity.md`, branch `milestone/grafx-mpulse4-vector-parity`, SHA
+`6a2ec1a2283b95cb3455b70212f9081b7cd1a515` (publicado no `origin` em 2026-08-27). Ele fixa os
+nove espaços públicos de board, os quatro espaços de Global Discovery, normalização de score,
+ordenação/tolerâncias, rebuild público, matriz V1–V7 e não objetivos. Achados posteriores só podem
+corrigir defeito reproduzível desse contrato; não ampliam o milestone.
+
 #### M-PULSE-5 — export/import, backup e recovery portável
 
 1. formato lógico versionado;
