@@ -70,9 +70,9 @@ This keeps an unsupported family useful: closing the language gap must change th
 ## Counts at `pulse-1`
 
 `97` entries, digest
-`ac19e6735a90e5fe9831fdca67a80de1a3f4fffadd54b81151d9e343a7bd0d7a`.
+`e792ded751eeffbe597a4e37d9110b30943e3d0fa69bd22027ad09778fc24f1c`.
 
-The engine currently classifies 80 entries as `already_supported` and 15 as `generic_gap`;
+The engine currently classifies 82 entries as `already_supported` and 13 as `generic_gap`;
 the duplicate and declared fragment remain separate classifications.
 
 **Internal families** — 68 closed families over the audited originators, 47 read and

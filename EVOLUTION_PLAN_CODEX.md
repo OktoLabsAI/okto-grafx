@@ -124,6 +124,9 @@
   Em paralelo, a primeira capacidade M-PULSE-3A de propriedades de node foi integrada no Pulse
   Community `feature/v0.3.3@4aae27eca9c0a2d1d14a3334b03e6c57976dea75`, ainda inativa até a
   composição do provider completo.
+  O próximo sublote fixo M-PULSE-2J cobre somente relationship traversal cujo upper bound foi
+  omitido e que o Pulse já normaliza para 20 hops. O ratchet deve mover exatamente um probe raw,
+  de 72/15 para 73/14 e de sete para seis débitos, sem alterar nenhuma das 97 entries.
   O registro verificável está em 9.7.
 
 ## Governança dos roadmaps complementares pós-Pulse
@@ -1226,6 +1229,31 @@ permaneceu 250/250 contra a base. Duas auditorias finais independentes reproduzi
 incluindo AST/análise forjada, colisões e cardinalidades malformadas, e o handoff Nexus
 `hof_a3e5645c9d4b437bbf75841a20872c13` foi concluído/verificado/PASS.
 
+O próximo sublote fixo M-PULSE-2J aceita somente um relationship traversal com upper bound
+omitido nas três grafias que o contrato Pulse já normaliza: `*`, `*..` e `*n..`. A forma bare e
+`*..` tornam-se `1..20`; `*n..` preserva o lower escrito e recebe upper 20. O teto 20 vem de
+`MAX_TRAVERSAL_DEPTH` do Pulse e é distinto de `MAX_TRAVERSAL_HOPS=30`, que continua sendo apenas
+o maior upper explícito aceito pelo Grafx. O AST permanece o mesmo e registra
+`hop_range_written=True`; `describe()` pode canonicalizar a forma aceita para o range explícito.
+Planner e executor existentes continuam recebendo um traversal finito.
+
+Ranges com upper explícito, inclusive `*1..21` até o máximo 30, não mudam; `*n` continua sendo
+range exato; lower zero, lower maior que 20 depois do default, upper explícito maior que 30,
+valores não inteiros e shapes malformados continuam recusados. `OPTIONAL MATCH`, `UNION`, relação
+sem tipo, homoglyph na raiz, trailing clause, path projection, novos operadores/DTOs/APIs,
+schema/provider, catálogo e formato persistido ficam fora. Analyzer e planner repetem sobre AST
+fornecida a validação estrutural `type(min_hops) is int`, `type(max_hops) is int`,
+`1 <= min_hops <= max_hops <= 30` e `type(hop_range_written) is bool`, antes de qualquer plano ou
+stream; isso impede que uma árvore forjada transforme o novo default finito em trabalho sem teto.
+
+O ratchet diferencial é exato: contrato raw permanece 74/13 sobre 87 probes; engine raw passa de
+72/15 para 73/14 e o débito de sete para seis; somente o objeto `unbounded variable length` passa
+de refused/parse_error para accepted/planned. Os outros 86 objetos raw e todas as 97 entries
+permanecem byte a byte iguais, com entries em 82/13. Parser/`describe`, análise/planner com AST
+forjada, equivalência com o range explícito, ciclos, relationship isomorphism, budget/cancelamento,
+corpus completo + `--check`, suíte query, Ruff, formatter e diff-check formam o gate. O novo digest
+só é registrado depois da regeneração e do diferencial full-object.
+
 1. gerar um corpus versionado a partir do contrato e das queries reais read-only e write do Pulse;
 2. implementar clauses/expressões/funções ausentes;
 3. traduzir mutations internas para primitives estruturados quando isso evitar copiar DDL/procedures
@@ -1425,6 +1453,7 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-2G — node scan polimórfico | concluído e publicado | código final `6e4f1d5e91878395f9736a95b855296f69e2e248`; branch `milestone/pulse-query-polymorphic-node`; handoff Nexus `hof_a28be7ad2f584fd693c3ef9cbaec75e8` concluído/verificado/PASS | Um único `AllNodesScan` une somente node tables e mantém filtro, agregação, `DISTINCT`, ordem e janela globais. A visão transacional é owner-only; propriedade ausente lê `NULL`, conflito de tipo recusa pré-stream e o DTO destacado `{label, properties}` não expõe identidade. Corpus digest `ac19e6735a90e5fe9831fdca67a80de1a3f4fffadd54b81151d9e343a7bd0d7a`, raw 71/16, oito débitos e entries 80/15; exatamente 1 probe/7 entries mudaram, com I01/I02 e os demais gaps intactos. Query 1.088/1.088, dedicado+corpus 73/73, fronteiras públicas 158/158, `--check`, Ruff e diff-check PASS; formatter 250/250 contra a base; três auditorias independentes PASS |
 | M-PULSE-2H — endpoint inference tipada | concluído e publicado | código `a516c64`; formatação do código novo `42078ca`; branch `milestone/pulse-query-typed-endpoints`; handoff Nexus `hof_8ceb3eb19622472bbd50a83c81921015` concluído/verificado/PASS | I01/I02 planejam somente a forma bounded `MATCH (a)-[r:TYPE]->(b)` por `NodeScan -> TraverseRelationship`, inferindo source/target do `from_table`/`to_table` declarado. Relações paralelas, `NULL`, filtro I02, owner-only, rollback, wrong-kind, AST/análise injetada e os 16 tipos têm regressões; ranges escritos e demais shapes excluídos recusam antes do stream. Corpus digest `2fec52e0f033c3674aa8558fc5cca4aec05dacc7eae82e111bc2819864873e36`, raw 71/16, oito débitos e entries 82/13; somente I01/I02 mudaram. Query 1.141/1.141, corpus 45/45, focado pós-formatação 388/388 e fronteiras públicas 158/158; `--check`, Ruff e diff-check PASS; formatter 250/250 contra a base; três auditorias independentes PASS |
 | M-PULSE-2I — named path decorativo | concluído e publicado | código `1c728cc` + hardening `edf6efd`; branch `milestone/pulse-query-named-path`; integrado à `main`; handoff Nexus `hof_a3e5645c9d4b437bbf75841a20872c13` concluído/verificado/PASS | Aceita somente `MATCH path = (a:A)-[r:TYPE]->(b:B) ... RETURN ...` com um hop tipado e nome jamais lido. Analyzer e planner repetem o gate sobre AST/análise fornecida; path projection permanece recusado pre-stream. Corpus digest `e792ded751eeffbe597a4e37d9110b30943e3d0fa69bd22027ad09778fc24f1c`, raw 72/15, sete débitos e entries 82/13; exatamente dois objetos raw e nenhuma entry mudaram. Dedicado 60/60, relacionadas 539/539, corpus 45/45, query completa exit 0, `--check`, Ruff e diff-check PASS; formatter 250/250; duas auditorias independentes PASS |
+| M-PULSE-2J — upper bound implícito | escopo congelado; implementação não iniciada | baseline `main@4dc2b6564bc90d83d312345c77fdfa5d61a020a1` | Somente `*`, `*..` e `*n..` recebem upper 20, como o contrato Pulse; máximo explícito 30 permanece. AST/análise fornecida não pode contornar tipos/ordem/teto. Ratchet esperado: raw 73/14, seis débitos, somente `unbounded variable length` muda; 97 entries seguem 82/13. Demais seis gaps e toda superfície pública/persistida ficam invariantes |
 | M-PULSE-3A — propriedades de node | concluído e publicado no branch Pulse atual; helper ainda inativo | Pulse Community `milestone/grafx-mpulse3-node-properties@4aae27eca9c0a2d1d14a3334b03e6c57976dea75` → `feature/v0.3.3`; revisão Nexus `hof_cad849ee19e542eb862930f64054724d` concluída/PASS | labels desconhecidas retornam vazio sem tocar backend; label conhecida ausente/wrong-kind e DB fechado falham tipado; ordem de catálogo, snapshot, reopen e fronteiras públicas cobertos; 8/8, Ruff default/TRY/I/BLE e format PASS. A resolução `board_id → Database` fica no provider/composição, sem ativação parcial |
 | M-PULSE-3B — layout lógico de relações | concluído e publicado; provider ainda inativo | Pulse Community `milestone/grafx-mpulse3-logical-relationships@c4b1f37ad3a4cd08a1e2f5249db25c33ddbecd45` → `feature/v0.3.3`; código `067b82c` + hardening `c4b1f37` | Manifesto fechado e imutável de 16 tipos/69 pares/69 nomes, codec bijetivo e reverse pelo manifesto; introspecção valida kind/endpoints e oculta nomes físicos. Unknown/collision/mismatch, shapes malformados e representação hostil falham tipados. Gate focado 15/15; regressão selecionada completa 146/146 contra Core limpo `ab61b9a`; Ruff/format/diff-check e duas auditorias independentes PASS. DDL/bootstrap, ativação, query rewrite e os gaps de supersedence continuam explicitamente fora |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até o fechamento M-PULSE-2 a 7 | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
