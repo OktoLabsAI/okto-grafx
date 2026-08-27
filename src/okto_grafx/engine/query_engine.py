@@ -141,6 +141,7 @@ from okto_grafx.domain.query.plan import (
     LimitRows,
     MergePattern,
     NodeScan,
+    OptionalRows,
     PlanNode,
     ProduceResults,
     ProjectRows,
@@ -2412,6 +2413,23 @@ def _eager_rows(
     yield from tuple(engine._rows(node.child, context))
 
 
+def _optional_rows(
+    engine: QueryEngine, node: OptionalRows, context: _Context
+) -> Iterator[_Row]:
+    """Yield the child's rows, or one row binding the name to null when there were none.
+
+    The flag is set on the first row rather than counted, because the operator streams: a query
+    with a LIMIT above it must not have to draw the whole match to learn that the match was not
+    empty.
+    """
+    matched = False
+    for row in engine._rows(node.child, context):
+        matched = True
+        yield row
+    if not matched:
+        yield _Row(bindings={node.alias: None})
+
+
 def _distinct_rows(
     engine: QueryEngine, node: DistinctRows, context: _Context
 ) -> Iterator[_Row]:
@@ -3718,6 +3736,7 @@ _HANDLERS: dict[type, _Handler] = {
     AggregateRows: _aggregate_rows,  # type: ignore[dict-item]
     ProjectRows: _project_rows,  # type: ignore[dict-item]
     DistinctRows: _distinct_rows,  # type: ignore[dict-item]
+    OptionalRows: _optional_rows,  # type: ignore[dict-item]
     EagerRows: _eager_rows,  # type: ignore[dict-item]
     SortRows: _sort_rows,  # type: ignore[dict-item]
     SkipRows: _skip_rows,  # type: ignore[dict-item]

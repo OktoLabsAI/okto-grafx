@@ -903,7 +903,7 @@ class QueryEngine:
 ```
 Cypher subset (openCypher, Kùzu dialect): `CREATE NODE TABLE` / `CREATE REL TABLE` /
 `CREATE VECTOR SPACE`, `CREATE`, `MATCH` (+ variable-length `-[:R*1..3]->`, and `-[:R*]->`
-for the default bound), `WHERE`, `RETURN`
+for the default bound), the narrow root `OPTIONAL MATCH (v:Label)`, `WHERE`, `RETURN`
 (`DISTINCT`, aliases), one leading `UNWIND`, non-aggregating `WITH` stages, `ORDER BY`, `SKIP`, `LIMIT`, `SET`, `DELETE`, `MERGE`, parameters `$name`,
 aggregates `count/sum/avg/min/max/collect`, the scalar functions `coalesce(value, ...)`,
 `string_split(text, separator)` and `size(value)`, and the similarity extension. `coalesce`
@@ -978,6 +978,18 @@ stage after it. Aggregation, `DISTINCT`, `ORDER BY`, `SKIP` and `LIMIT` inside a
 after one, a `WITH` after a clause that writes, and `UNWIND` combined with `WITH` are all refused.
 `WithRows` is streaming -- one row in, one row out -- and participates once, through the common
 operator wrapper, in `max_intermediate_rows`.
+
+`OPTIONAL MATCH (v:Label) [WHERE ...] RETURN ...` is admitted only as the first and only match
+clause of a read-only query, with one named node, exactly one label, no inline map, no path,
+relationship or second pattern. Every predicate of that clause, including a deferred similarity
+term, runs before `OptionalRows`: if the complete match produces no row, that operator emits one
+row binding `v` to null; if it produces rows, it forwards only those rows and adds nothing.
+Consequently `v.property` and `label(v)` answer null, `count(v)` is zero and `count(*)` is one on
+the extension. The scan remains the ordinary owner-only snapshot view, and the synthetic row is
+subject to the ordinary result and intermediate-row budgets. A chained optional, one following
+`MATCH`, `WITH` or `UNWIND`, any write, an anonymous/unlabelled/multi-labelled/map node, a path,
+relationship or multiple pattern is refused before streaming. Parser, analysis and planner each
+repeat the structural gate so supplied trees or supplied analysis cannot widen the form.
 
 `MATCH (n)` -- a node that names no label -- matches every node table, and `AllNodesScan` reads
 them in table_id order under one name. It is one operator over the union rather than one scan per

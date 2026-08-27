@@ -54,6 +54,7 @@ from okto_grafx.domain.query.ast import (
     Variable,
     WithClause,
     free_variables,
+    optional_clause_defect,
     walk,
 )
 from okto_grafx.domain.query.lexer import tokenize
@@ -335,6 +336,60 @@ def _relationships_of(query: Query) -> Iterator[RelationshipPattern]:
             yield from pattern.relationships
 
 
+def optional_match_refusal(query: Query) -> tuple[str, str] | None:
+    """Return the refusal an OPTIONAL MATCH earns outside the one admitted shape, or None.
+
+    The admitted shape is narrow on purpose: the first and only clause of a read-only query,
+    one pattern, one named node, one label, no inline map. Everything a wider OPTIONAL MATCH
+    would need -- a null-extended traversal, a second clause deciding what "no match" means for
+    names bound above it -- is a different milestone, and answering those forms half-way would
+    be worse than refusing them.
+
+    Asked at both doors, and for EVERY query rather than only the ones the parser marked. A tree
+    built by hand reaches ``analyze`` and a caller's own analysis reaches ``build_plan``, and the
+    flag this guards decides whether a query with no matches answers nothing or answers a row of
+    nulls. A forged ``optional`` is not a wrong answer; it is a row the caller never asked for.
+
+    Nothing here is interpolated into the message. A hostile object in these fields would be
+    asked to render itself while the refusal was being built, and a refusal that raises reports
+    nothing at all.
+    """
+    for clause in query.match_clauses:
+        if type(clause.optional) is not bool:
+            return (
+                "A MATCH clause records whether it was written OPTIONAL as a boolean.",
+                "optional",
+            )
+    optional = [clause for clause in query.match_clauses if clause.optional]
+    if not optional:
+        return None
+    if len(query.match_clauses) != 1:
+        return (
+            "An OPTIONAL MATCH is the only pattern clause of a query in this subset; it may "
+            "not be chained with another MATCH.",
+            "clause",
+        )
+    if (
+        query.unwind_clause is not None
+        or query.with_clauses
+        or query.updating_clauses
+    ):
+        return (
+            "An OPTIONAL MATCH begins a query that only reads: no UNWIND, WITH or writing "
+            "clause may accompany it.",
+            "clause",
+        )
+    if query.return_clause is None:
+        # The admitted form is a query that ANSWERS. A statement that only reads and returns
+        # nothing has no rows to extend, and admitting it would make the extension a write the
+        # caller never sees rather than a row it reads.
+        return (
+            "An OPTIONAL MATCH belongs to a query that ends with RETURN.",
+            "clause",
+        )
+    return optional_clause_defect(optional[0])
+
+
 def named_path(query: Query) -> PatternPath | None:
     """Return the path this query gives a name to, or None when it names none."""
     for clause in query.match_clauses:
@@ -555,6 +610,10 @@ class _Analyzer:
         if refusal is not None:
             message, value = refusal
             raise self._refuse(message, field="pattern", value=value)
+        refusal = optional_match_refusal(self._query)
+        if refusal is not None:
+            message, value = refusal
+            raise self._refuse(message, field="clause", value=value)
         if self._query.unwind_clause is not None and self._query.with_clauses:
             # The parser refuses this text, but the parser is one door and not the only one:
             # a tree handed straight to analyze() never passed it, and the meaning of a

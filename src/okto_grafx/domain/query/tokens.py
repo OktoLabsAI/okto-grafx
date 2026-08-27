@@ -141,6 +141,7 @@ KEYWORDS: frozenset[str] = frozenset(
         "NODE",
         "NOT",
         "NULL",
+        "OPTIONAL",
         "OR",
         "ORDER",
         "PRIMARY",

@@ -60,6 +60,7 @@ __all__ = [
     "LimitRows",
     "MergePattern",
     "NodeScan",
+    "OptionalRows",
     "PlanNode",
     "ProduceResults",
     "ProjectRows",
@@ -486,6 +487,34 @@ class EagerRows(PlanNode):
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator whose rows are drawn in full."""
         return (self.child,)
+
+
+@dataclass(frozen=True, slots=True)
+class OptionalRows(PlanNode):
+    """Rows of the child, or one row binding a name to null when the child had none.
+
+    The operator sits ABOVE every filter the clause carries, deferred similarity terms
+    included, because the WHERE belongs to the OPTIONAL MATCH. A query that matched rows and
+    then filtered all of them away matched nothing, and has to answer the same single null row
+    as one whose scan was empty; wrapping the scan instead would let a filter above delete the
+    extension it was supposed to protect.
+
+    Binding the name to null rather than leaving it unbound is what makes the extension
+    readable: ``v.prop`` and ``label(v)`` already answer null for a null subject, an unbound
+    name refuses instead, and the difference between those two is the whole point of the
+    clause.
+    """
+
+    child: PlanNode
+    alias: str
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Return the operator whose rows are extended when it produces none."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Return the name bound to null when nothing matched."""
+        return {"alias": self.alias}
 
 
 @dataclass(frozen=True, slots=True)

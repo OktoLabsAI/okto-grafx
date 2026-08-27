@@ -652,9 +652,10 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
     # M-PULSE-2C closes the standalone list-index and both CASE grammar probes, M-PULSE-2D
     # closes the last two functions, M-PULSE-2E closes the one leading UNWIND source,
     # M-PULSE-2F closes the leading WITH and M-PULSE-2G closes the label-free node, which
-    # takes the six all-node templates and I19 with it.  The two UNWIND probes with identical text remain
-    # distinct grammar keys, so both have to ratchet beside map access rather than being
-    # deduplicated by their spelling.
+    # takes the six all-node templates and I19 with it. M-PULSE-2I adds the decorative path,
+    # M-PULSE-2J bounds the otherwise unbounded traversal, and M-PULSE-2K adds the narrow root
+    # OPTIONAL MATCH. The two UNWIND probes with identical text remain distinct grammar keys,
+    # so both have to ratchet beside map access rather than being deduplicated by their spelling.
     for name in (
         "list index",
         "CASE searched",
@@ -666,6 +667,7 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         "polymorphic node",
         "named path",
         "unbounded variable length",
+        "OPTIONAL MATCH",
         "map batch",
         "map access",
     ):
@@ -680,13 +682,13 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         probe for probe in raw["probes"] if probe["engine_verdict"] == "accepted"
     ]
     refused = [probe for probe in raw["probes"] if probe["engine_verdict"] == "refused"]
-    # M-PULSE-2H moved two ENTRIES and no probe; M-PULSE-2I moves two PROBES and no entry.
-    # Both shapes are expected from here, and saying so keeps a later reader from mistaking
-    # either for a missed ratchet: `named path` plans, and `path projection` stays refused
-    # while its refusal moves from the parser to the analysis, because the syntax now parses.
-    assert len(accepted) == 73
-    assert len(refused) == 14
-    assert len(owed) == 6
+    # M-PULSE-2H moved two ENTRIES and no probe; M-PULSE-2I moved two PROBES and no entry;
+    # M-PULSE-2J and 2K each move one more probe. The expected shapes are explicit so a later
+    # reader cannot mistake a missed ratchet for intentional debt: `named path` plans while
+    # `path projection` remains refused, and only the root one-node OPTIONAL plans here.
+    assert len(accepted) == 74
+    assert len(refused) == 13
+    assert len(owed) == 5
 
     assert frozen["counts"]["classification:already_supported"] == 82
     assert frozen["counts"]["classification:generic_gap"] == 13
