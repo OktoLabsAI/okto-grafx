@@ -224,6 +224,7 @@
         "unsafe_cypher",
         "unsupported_operation"
       ],
+      "publicly_unsupported_tokens_authority": "_CYPHER_PUBLICLY_UNSUPPORTED_TOKENS",
       "execute_steps": [
         "clamp_max_rows",
         "_normalize_unicode",
@@ -252,15 +253,19 @@
       "WITH",
       "RETURN"
     ],
+    "publicly_unsupported_tokens": [
+      "CALL",
+      "YIELD"
+    ],
     "probe_count": 87,
-    "engine_accepted": 74,
-    "engine_refused": 13,
-    "contract_refused": 13,
+    "engine_accepted": 76,
+    "engine_refused": 11,
+    "contract_refused": 14,
     "contract_error_codes": {
       "unsafe_cypher": 10,
-      "unsupported_operation": 3
+      "unsupported_operation": 4
     },
-    "note": "contract_disposition is what the public raw endpoint admits, computed from the pinned commit; engine_verdict is what this engine does with the same text. A write is refused by the contract and accepted by the engine, because the internal port needs it.",
+    "note": "contract_disposition is what the public raw endpoint admits, computed from the pinned commit; engine_verdict is what this engine does with the NFKC-normalized text the public endpoint delivers. A write is refused by the contract and may be accepted by the engine, because the internal port needs it.",
     "behaviour": {
       "groups": [
         "schema_domain",
@@ -421,47 +426,13 @@
         },
         {
           "group": "schema_domain",
-          "name": "clause vocabulary is published but not enforced",
-          "statement": "CYPHER_SUPPORTED_CLAUSES is published in the contract document and bound to CYPHER_WHITELIST, but validate_cypher_read_only consults only the blacklist and the root operation. A clause outside this list is admitted unless it is the root token or a blacklisted word.",
+          "name": "publicly unsupported trailing tokens",
+          "statement": "After the blacklist and root checks, the public raw boundary rejects CALL and YIELD tokens that appear later in the query. Internal provider procedures use their own explicit route and are not described by this public fence.",
           "evidence_kind": "constant",
-          "evidence_symbol": "CYPHER_SUPPORTED_CLAUSES",
+          "evidence_symbol": "_CYPHER_PUBLICLY_UNSUPPORTED_TOKENS",
           "value": [
-            "MATCH",
-            "WHERE",
-            "RETURN",
-            "WITH",
-            "ORDER",
-            "BY",
-            "LIMIT",
-            "UNWIND",
-            "OPTIONAL",
-            "UNION",
-            "AS",
-            "AND",
-            "OR",
-            "NOT",
-            "IN",
-            "IS",
-            "NULL",
-            "TRUE",
-            "FALSE",
-            "CONTAINS",
-            "STARTS",
-            "ENDS",
-            "DISTINCT",
-            "COUNT",
-            "COLLECT",
-            "SUM",
-            "AVG",
-            "MIN",
-            "MAX",
-            "CASE",
-            "WHEN",
-            "THEN",
-            "ELSE",
-            "END",
-            "DESC",
-            "ASC"
+            "CALL",
+            "YIELD"
           ]
         },
         {
@@ -1448,9 +1419,9 @@
         "contract_disposition": "refused",
         "contract_error_code": "unsafe_cypher",
         "contract_reason": "blacklisted keyword DELETE",
-        "acceptance_phase": "parse_error",
-        "engine_verdict": "refused",
-        "error": "GrafxParseError: An unquoted name may hold ASCII letters, digits and underscores only; write it between back quotes to use other characters (line 1, column 20) [code=parse_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "security",
@@ -1459,9 +1430,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "parse_error",
-        "engine_verdict": "refused",
-        "error": "GrafxParseError: An unquoted name may hold ASCII letters, digits and underscores only; write it between back quotes to use other characters (line 1, column 1) [code=parse_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "security",
@@ -1500,9 +1471,9 @@
         "category": "taxonomy",
         "construct": "unsupported clause after a supported root",
         "probe": "MATCH (n:Decision) CALL db.index() YIELD value RETURN value",
-        "contract_disposition": "allowed",
-        "contract_error_code": null,
-        "contract_reason": null,
+        "contract_disposition": "refused",
+        "contract_error_code": "unsupported_operation",
+        "contract_reason": "unsupported public token CALL",
         "acceptance_phase": "parse_error",
         "engine_verdict": "refused",
         "error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'CALL' (line 1, column 20). [code=parse_error retryable=False]"
@@ -1693,7 +1664,7 @@
     },
     "core": {
       "path_env": "PULSE_CORE_BASELINE",
-      "sha": "ab61b9a785f2018312fc91541a580877fd068bbb"
+      "sha": "f602c7cc2f6a9f5ef446d4c991309196bd4667c7"
     }
   },
   "counts": {
@@ -7752,5 +7723,5 @@
       }
     }
   ],
-  "digest": "db3802aa449dc6a0204680c822027f8a8c6b0eeddef71afc350528b3c2d89e05"
+  "digest": "905b29bdb503d77c9ad56878d50586866e1c013e31a00dfbd8793bf9293c484c"
 }
