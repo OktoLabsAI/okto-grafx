@@ -41,6 +41,7 @@ from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
     GrafxError,
+    GrafxIndexError,
     GrafxSchemaVersionMismatch,
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
@@ -71,6 +72,7 @@ from okto_grafx.domain.txn.context import (
     TransactionMode,
     TransactionState,
 )
+from okto_grafx.domain.txn.partitions import page_partition
 from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.domain.verify.findings import VerificationReport
@@ -97,6 +99,7 @@ from okto_grafx.engine.public_views import (
     StorageView,
     TransactionManagerView,
     VectorEngineView,
+    VectorIndexView,
     VectorMathView,
     WalView,
     _builtin_bool,
@@ -834,6 +837,10 @@ class Maintenance:
         """Delegate recovery to :meth:`Database.recover`."""
         return self._database.recover()
 
+    def rebuild_vector_index(self, space: str) -> VectorIndexView:
+        """Delegate the repair to :meth:`Database.rebuild_vector_index`."""
+        return self._database.rebuild_vector_index(space)
+
     def publish_metrics(self) -> None:
         """Delegate explicit metric publication to :meth:`Database.publish_metrics`."""
         self._database.publish_metrics()
@@ -1305,26 +1312,37 @@ class Database:
         """
         with self._public_transition():
             self._require_open()
-            vectors = self._require_component(
-                "vectors", self._vectors, "the vector engine (C9)"
+            return self._vectors_view_now()
+
+    def _vectors_view_now(self) -> VectorEngineView:
+        """Capture the vector view from components a caller already holds a section over.
+
+        Split out of :attr:`vectors` so an operation running inside the facade section can take
+        the same snapshot without re-asking whether the database is open. The flag flips the
+        moment a close is REQUESTED, while the section defers the release that would actually
+        take these components apart -- so re-entering the public accessor would make a door
+        refuse its own result for a teardown that has not happened yet.
+        """
+        vectors = self._require_component(
+            "vectors", self._vectors, "the vector engine (C9)"
+        )
+        # A catalog refresh can read/evict pages and publish telemetry, so it happens before
+        # the participant section. _catalog_snapshot validates the page epoch under that
+        # section; validate it once more beside the vector registry so a DDL commit cannot
+        # land in the small gap and produce spaces from one side with indexes from the other.
+        while True:
+            catalog, epoch = self._catalog_snapshot()
+            tables = frozenset(
+                table.table_id for table in catalog.catalog.table_definitions
             )
-            # A catalog refresh can read/evict pages and publish telemetry, so it happens before
-            # the participant section. _catalog_snapshot validates the page epoch under that
-            # section; validate it once more beside the vector registry so a DDL commit cannot
-            # land in the small gap and produce spaces from one side with indexes from the other.
-            while True:
-                catalog, epoch = self._catalog_snapshot()
-                tables = frozenset(
-                    table.table_id for table in catalog.catalog.table_definitions
-                )
-                spaces = catalog.catalog.space_definitions
-                with self._transactions._participant_section():
-                    if (
-                        _builtin_int(self._catalog._view_epoch(), field="catalog.epoch")
-                        != epoch
-                    ):
-                        continue
-                    return _vectors_view(vectors, spaces, tables)
+            spaces = catalog.catalog.space_definitions
+            with self._transactions._participant_section():
+                if (
+                    _builtin_int(self._catalog._view_epoch(), field="catalog.epoch")
+                    != epoch
+                ):
+                    continue
+                return _vectors_view(vectors, spaces, tables)
 
     @property
     def queries(self) -> QueryEngineView:
@@ -1629,6 +1647,206 @@ class Database:
                 verifier = factory()  # type: ignore[operator]
                 report = verifier.verify(wanted_scope)  # type: ignore[attr-defined]
                 return _verification_report_view(report, requested_scope=wanted_scope)
+
+    def rebuild_vector_index(self, space: str) -> VectorIndexView:
+        """Re-derive one vector index from the heap, and report it only once it is healthy.
+
+        Nothing repairs an index at open, and a stale proximity index is the dangerous
+        kind: it answers from its own entries without consulting the heap, so it returns a
+        plausible, confidently ordered top-k that silently omits rows. This is the door an
+        operator asks for that repair through, without reaching past the public surface.
+
+        The transaction is opened here and belongs to this call. A caller's transaction is
+        not accepted and not reused: the pass stages a reset followed by one record per
+        committed version, so sharing it would publish an operator's repair inside somebody
+        else's commit, and would make the fixed target position depend on work this door
+        never saw.
+
+        A refusal before the commit barrier rolls back and leaves the index stale, which is
+        the state that keeps readers honest. A failure that escapes after the barrier has
+        already won is not the same thing: the durable outcome is recovered and verified
+        first, and this door refuses to call an index ready rather than certify one it
+        could not prove.
+        """
+        with self._public_operation("rebuild_vector_index"):
+            self._require_open()
+            self._require_writable("rebuild a vector index")
+            return self._rebuild_vector_index_inside_guard(space)
+
+    def _rebuild_vector_index_inside_guard(self, space: str) -> VectorIndexView:
+        """Run the repair with the public facade section already entered.
+
+        The guard is taken by the door above and held across everything here, including the
+        window after the transaction has stopped participating -- clearing the stale mark,
+        refreshing the cache an operator reads and proving the view. That window is the one
+        that mattered: a close arriving in it would otherwise take components apart while this
+        operation was still using them, and the caller would meet a half-dismantled database
+        instead of either a result or a refusal.
+        """
+        # Resolution by space is the public one, so an unknown space, a name that is not a
+        # vector index and a target this database never attached all refuse identically,
+        # before a transaction exists to roll back.
+        target = self.vectors.index(space)
+        name = target.name
+        manager = self._require_component(
+            "indexes", self._indexes, "the index manager (C4)"
+        )
+        transaction = self.begin("write")
+        # An index stages through `txn_id` and `stage_record`, and the public wrapper
+        # deliberately exposes neither; the context behind it is the staging transaction.
+        context = transaction._context
+        through = _builtin_int(transaction.snapshot.read_lsn)
+        # A transaction that stages durable work and claims no partition could never be
+        # refused by optimistic validation, so a concurrent commit could replace what it
+        # wrote. The page this pass rewrites is the index header that carries the stale
+        # mark and the built-through position, and naming it is what makes two rebuilds of
+        # one index conflict instead of silently overwriting each other. Concurrency
+        # against the HEAP is not this declaration's job: the durable rebuild generation
+        # already refuses a superseded reset, and later commits stage their own entries.
+        context.note_write(page_partition(target.file, HEADER_PAGE_INDEX))
+        try:
+            manager.rebuild(name, context, through)  # type: ignore[attr-defined]
+        except BaseException as staging_failure:
+            # Nothing reached the log. The claim left the index stale and that is exactly
+            # what a reader must keep seeing -- in the cache an operator reads as well as
+            # in the view.
+            try:
+                transaction.rollback()
+            except BaseException as cleanup:
+                _note_cleanup_failure(staging_failure, cleanup)
+            self._remember_stale_index(name, staging_failure)
+            raise
+        try:
+            transaction.commit()
+        except BaseException as commit_failure:
+            report = transaction.report
+            if report is None or not report.durable:
+                try:
+                    transaction.rollback()
+                except BaseException as cleanup:
+                    _note_cleanup_failure(commit_failure, cleanup)
+                self._remember_stale_index(name, commit_failure)
+                raise
+            self._settle_vector_rebuild_past_barrier(name, commit_failure)
+        try:
+            manager.clear_stale(name, through)  # type: ignore[attr-defined]
+            self._forget_stale_index(name)
+            return self._require_rebuilt_vector_index(space, through)
+        except BaseException as unproved:
+            # The name was dropped from the cache on the way to a proof that did not
+            # arrive. Put it back: an operator reading status must see the index this
+            # door could not certify.
+            self._remember_stale_index(name, unproved)
+            raise
+
+    def _settle_vector_rebuild_past_barrier(
+        self, name: str, failure: BaseException
+    ) -> None:
+        """Settle a durable-but-unreported rebuild, and refuse to certify it from here.
+
+        The commit barrier won before the failure escaped, so the rebuild is probably on
+        disk -- probably is not a word this door may answer with. Recovery settles the log
+        and verification walks the index against the heap, because leaving an ambiguous
+        outcome unsettled is worse than either verdict.
+
+        Readiness is still not claimed. The frozen contract wants a COLD proof before an
+        ambiguous outcome may be called ready, and a walk on the handle that just failed is
+        not one: it shares the caches, the pool and the process whose outcome is in doubt.
+        There is no safe cold reopen inside this door, so the smallest provable behaviour is
+        the fail-closed one -- settle what can be settled, keep the index visibly stale, and
+        re-raise the original failure. Certification is left to a reopen and to status.
+        """
+        try:
+            self._recover_in_transition()
+            report = self.verify("all")
+        except BaseException as settle_failure:
+            _note_cleanup_failure(failure, settle_failure)
+            self._remember_stale_index(name, failure)
+            raise failure
+        findings = tuple(getattr(report, "findings", ()))
+        if findings:
+            _note_cleanup_failure(
+                failure,
+                GrafxIndexError(
+                    f"Verification after the barrier reported {len(findings)} finding(s).",
+                    field="rebuild_unproved",
+                    index=name,
+                ),
+            )
+        self._remember_stale_index(name, failure)
+        raise failure
+
+    def _require_rebuilt_vector_index(
+        self, space: str, through: int
+    ) -> VectorIndexView:
+        """Return the rebuilt index only when its own view proves the generation claimed.
+
+        Returning the view the caller would have fetched anyway is not the point: the point
+        is that this door never hands back a view that still says stale, or one built
+        through a position behind the target the rebuild fixed.
+        """
+        view = self._vectors_view_now().index(space)
+        if view.stale or view.stale_reason is not None:
+            raise GrafxIndexError(
+                f"Index {view.name!r} is still stale after its rebuild committed.",
+                field="rebuild_incomplete",
+                index=view.name,
+                stale_reason=view.stale_reason,
+            )
+        built_through = view.built_through_lsn
+        if built_through is None:
+            # The position is read from page zero and is absent when that page is not resident.
+            # Absent is not "fine": it is the absence of the one number that would prove which
+            # generation this call completed, and a door that returned the view anyway would be
+            # certifying a rebuild it could not read the receipt for.
+            raise GrafxIndexError(
+                f"Index {view.name!r} does not report the position it was built through, so "
+                "the generation this rebuild completed cannot be proved.",
+                field="rebuild_position_unproved",
+                index=view.name,
+                target=through,
+            )
+        if built_through < through:
+            raise GrafxIndexError(
+                f"Index {view.name!r} reports position {built_through}, behind "
+                f"the {through} its rebuild targeted.",
+                field="rebuild_behind_target",
+                index=view.name,
+                built_through=built_through,
+                target=through,
+            )
+        return view
+
+    def _remember_stale_index(self, name: str, primary: BaseException) -> None:
+        """Publish one stale name in the cache without disturbing the others.
+
+        The rebuild pass makes the generation durably stale before it stages anything, so
+        every failure after that point leaves an index the view already refuses. The cache
+        an operator reads through ``maintenance.status()`` has to agree with that view; a
+        rebuild that failed and left the name out would invite a caller to trust an index
+        the engine will not answer from.
+
+        A failure to refresh is diagnostic and must never replace the failure that caused
+        the unwind -- that failure is the one the caller has to act on.
+        """
+        try:
+            current = self._stale_indexes
+            if name in current:
+                return
+            self._stale_indexes = (*current, name)
+        except BaseException as refresh_failure:  # pragma: no cover - defensive
+            _note_cleanup_failure(primary, refresh_failure)
+
+    def _forget_stale_index(self, name: str) -> None:
+        """Drop one name from the cache :attr:`stale_indexes` publishes, keeping the rest.
+
+        The cache is what an operator reads to decide what still needs repairing, so a
+        rebuild that left its own name in it would invite the same repair forever.
+        """
+        current = self._stale_indexes
+        if name not in current:
+            return
+        self._stale_indexes = tuple(item for item in current if item != name)
 
     def recover(self) -> RecoveryReport:
         """Run a recovery pass and return its report (SPEC-M1 FR-8).

@@ -13,7 +13,7 @@ from okto_grafx.domain.recovery.report import RecoveryReport
 from okto_grafx.domain.verify.findings import VerificationReport
 from okto_grafx.domain.wal.replay import RecycleReport
 from okto_grafx.engine.database import Maintenance
-from okto_grafx.engine.public_views import MaintenanceStatus
+from okto_grafx.engine.public_views import MaintenanceStatus, VectorIndexView
 
 
 def test_maintenance_surface_and_annotations_are_exact() -> None:
@@ -24,7 +24,14 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
         if not name.startswith("_") and callable(member)
     )
     assert public_methods == frozenset(
-        {"status", "checkpoint", "verify", "recover", "publish_metrics"}
+        {
+            "status",
+            "checkpoint",
+            "verify",
+            "recover",
+            "publish_metrics",
+            "rebuild_vector_index",
+        }
     )
 
     maintenance_getter = Database.maintenance.fget
@@ -35,6 +42,7 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
     assert get_type_hints(Maintenance.verify)["return"] is VerificationReport
     assert get_type_hints(Maintenance.recover)["return"] is RecoveryReport
     assert get_type_hints(Maintenance.publish_metrics)["return"] is type(None)
+    assert get_type_hints(Maintenance.rebuild_vector_index)["return"] is VectorIndexView
 
 
 def test_status_reports_only_last_observed_available_values() -> None:
