@@ -21,7 +21,8 @@
 - **Próximo gate:** concluir C13 e o censo de retornos públicos tipados, integrar serialmente no
   branch M1, executar a suíte completa e publicar um SHA imutável. M2 inicia identity-range leasing
   somente depois desse gate.
-- **Compatibilidade Okto Pulse: M-PULSE-1 e M-PULSE-2 concluídos; M-PULSE-3 em execução.**
+- **Compatibilidade Okto Pulse: M-PULSE-1, M-PULSE-2 e M-PULSE-3 concluídos; M-PULSE-4 é o
+  próximo gate.**
   M-PULSE-0 foi concluído em
   `5b7551b40dba2facb28c46770f166ab3ac9daecc`. A fundação de identidades pendentes do
   M-PULSE-1 entrou em `d487ac9312229e0376ad8e65625213af111d9c9c`; o overlay owner-only de nós
@@ -156,11 +157,12 @@
   Ruff, format, compileall e diff-check. A primeira revisão Nexus
   `hof_99fa41ce71fe49f6b0a5830d16826cfc` encontrou uma colisão tardia de chaves estruturais; ela
   foi corrigida como recusa tipada pré-stream e o delta final foi concluído/verificado/PASS em
-  `hof_0ddbaa8ea5214a3a9ada8163c98ddbd4`, sem ampliar a gramática. O próximo alvo já existente é
-  o sublote M-PULSE-3D para evolução aditiva do schema anterior até o manifesto 0.5.0. Seu contrato
-  fora do lugar foi congelado antes do código no Pulse Community em
-  `milestone/grafx-mpulse3-schema-evolution@703ad83c43b286e7c90fe2b0a29de0982929d4de`, sem inventar
-  uma nova designação nem alterar retroativamente os gates concluídos.
+  `hof_0ddbaa8ea5214a3a9ada8163c98ddbd4`, sem ampliar a gramática. M-PULSE-3D foi concluído no
+  código final `237f3bf7fa2a65a108db4f558932d429ec6696ce`, publicado tanto em
+  `milestone/grafx-mpulse3-schema-evolution-impl` quanto em `feature/v0.3.3`; seu contrato fora do
+  lugar havia sido congelado antes do código em
+  `milestone/grafx-mpulse3-schema-evolution@703ad83c43b286e7c90fe2b0a29de0982929d4de`. O próximo
+  alvo já existente é M-PULSE-4, sem nova designação nem alteração retroativa dos gates concluídos.
   O registro verificável está em 9.7.
 
 ## Governança dos roadmaps complementares pós-Pulse
@@ -1434,6 +1436,19 @@ offset pode repetir scans/sorts completos: `batch_size` limita linhas devolvidas
 enquanto os budgets reais de query são `max_result_rows`/`max_intermediate_rows` e os de bytes de
 write são `max_transaction_bytes`/`max_wal_batch_bytes`; cursor/bulk permanece em M-PULSE-5.
 
+A implementação final está em
+`237f3bf7fa2a65a108db4f558932d429ec6696ce`: `aece7d1` implementou o rebuild, `121e264` fechou a
+fronteira de erro de `Path.exists()` e a matriz finita de falhas, e `237f3bf` completou a prova do
+checkpoint de recovery ambíguo sem mudança adicional em produção. O gate rápido terminou com
+`122 passed, 1 deselected`; a suíte completa com o fixture real terminou com `122 passed` em
+`121e264`, cujo código de
+produção é byte a byte idêntico ao SHA final. A regressão M-PULSE-3A/B/C passou 56/56; Ruff,
+format, `py_compile` e diff-check passaram. A revisão Nexus
+`hof_3df4987f6eef4611bfd9486409b91227` foi concluída, verificada e PASS no SHA final, incluindo
+prova discriminante de que o teste de `PermissionError` falha no commit defeituoso e passa no
+corrigido. Fonte inerte, cópia de duplicatas/paralelas/self-loop/NULL/vetores, catálogo e 161
+índices exatos, no-op zero-write, commit ambíguo, close/lock e cold reopen estão cobertos.
+
 #### M-PULSE-4 — paridade vetorial
 
 1. mapear os nove espaços de board e os quatro de Global Discovery para espaços Grafx;
@@ -1477,7 +1492,11 @@ nós cognitivos sem fonte SQL, e permite rollback para a geração anterior.
    e o filtro canônico que o endpoint injeta, mantendo distintos os envelopes
    `canonical_only` e `canonical_and_working`, sem ampliar a gramática do engine;
 6. revalidar fencing em toda mutação e imediatamente antes do commit/cutover;
-7. adicionar suíte diferencial por port e por fluxo de negócio.
+7. adicionar suíte diferencial por port e por fluxo de negócio;
+8. validar no admission do provider a geometria persistida antes de bootstrap/rebuild: o manifesto
+   Pulse atual precisa de capacidade para pelo menos 81 extents no heap único. No formato físico
+   vigente isso exige `page_size >= 4096`; a configuração padrão de 8192 é segura e valores menores
+   devem ser recusados de forma tipada, sem tentar ativação parcial.
 
 Backend+geração são resolvidos uma vez no `begin/open` e ficam imutavelmente pinados até o scope
 fechar. Cutover por CAS aguarda scopes ativos ou os invalida por fencing; uma chamada individual
@@ -1593,7 +1612,7 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-3A — propriedades de node | concluído e publicado no branch Pulse atual; helper ainda inativo | Pulse Community `milestone/grafx-mpulse3-node-properties@4aae27eca9c0a2d1d14a3334b03e6c57976dea75` → `feature/v0.3.3`; revisão Nexus `hof_cad849ee19e542eb862930f64054724d` concluída/PASS | labels desconhecidas retornam vazio sem tocar backend; label conhecida ausente/wrong-kind e DB fechado falham tipado; ordem de catálogo, snapshot, reopen e fronteiras públicas cobertos; 8/8, Ruff default/TRY/I/BLE e format PASS. A resolução `board_id → Database` fica no provider/composição, sem ativação parcial |
 | M-PULSE-3B — layout lógico de relações | concluído e publicado; provider ainda inativo | Pulse Community `milestone/grafx-mpulse3-logical-relationships@c4b1f37ad3a4cd08a1e2f5249db25c33ddbecd45` → `feature/v0.3.3`; código `067b82c` + hardening `c4b1f37` | Manifesto fechado e imutável de 16 tipos/69 pares/69 nomes, codec bijetivo e reverse pelo manifesto; introspecção valida kind/endpoints e oculta nomes físicos. Unknown/collision/mismatch, shapes malformados e representação hostil falham tipados. Gate focado 15/15; regressão selecionada completa 146/146 contra Core limpo `ab61b9a`; Ruff/format/diff-check e duas auditorias independentes PASS. DDL/bootstrap, ativação, query rewrite e os gaps de supersedence continuam explicitamente fora |
 | M-PULSE-3C — manifesto e bootstrap do schema atual | concluído, verificado e publicado; provider ainda inativo | Pulse Community `milestone/grafx-mpulse3-schema-bootstrap@7e126a7130090c00891f8d1d35bd44819afe7a7a` → `feature/v0.3.3`; Core pinado `ab61b9a785f2018312fc91541a580877fd068bbb`; auditoria Nexus `hof_7240f7ad38f64538adc5b500bd3ea1a7` concluída/verificada/PASS | Schema `0.5.0` materializado em 11 nodes de 44 propriedades, `BoardMeta`, 69 relações e 11 spaces únicos 384/cosine/normalized=false/float64. Preflight fail-closed precede qualquer write; ausentes são criados numa única transação, o catálogo é recapturado/validado e somente então `BoardMeta` é gravado em transação separada. Fingerprint lógico canônico `4a7b425bf4b8c4864be633c1a87f034e5f7f641019dc029015b7d3ca786deb81`; no-op preserva catálogo/txn/LSN/WAL e bytes. Gates M3C 33/33 e regressão selecionada 73/73 no Core correto; Ruff/format/diff-check focados PASS; outputs Kuzu têm digest `18a8b1a1b9459d92d61670d734087a4212af29fa4039b0825d6e966ffa181e0e`, `kg.py`/`composition.py` mantêm os blobs congelados. Staging dos 92 DDLs mediu aproximadamente 101 s neste ambiente: risco de performance registrado para otimização posterior, sem alterar o gate funcional. ALTER/upgrade, provider, rewrite e paridade vetorial permanecem fora |
-| M-PULSE-3D — rebuild do predecessor `0.3.12` | especificação congelada e publicada; implementação em execução | Pulse Community `milestone/grafx-mpulse3-schema-evolution@703ad83c43b286e7c90fe2b0a29de0982929d4de`; auditorias independentes sem blocker e handoff Nexus `hof_7fe9ee4eeb364f939248a05da9b36471` concluído/verificado/PASS | Reconstrução fora do lugar para candidato durável não vinculado; nenhuma mudança no formato físico Grafx, `CATALOG_FORMAT_VERSION` ou upgrade in-place. Contrato fecha path/lock/estado de candidato, snapshot da fonte, cópia sem perda, marker atômico, codec de fingerprint com golden `9d112337...`, validação terminal + cold reopen, no-op lógico e taxonomia fail-closed. Implementação e gates ainda não são reivindicados nesta linha |
+| M-PULSE-3D — rebuild do predecessor `0.3.12` | concluído, verificado, publicado e integrado; provider ainda inativo | spec Pulse Community `milestone/grafx-mpulse3-schema-evolution@703ad83c43b286e7c90fe2b0a29de0982929d4de`; código final `237f3bf7fa2a65a108db4f558932d429ec6696ce` em `milestone/grafx-mpulse3-schema-evolution-impl` e `feature/v0.3.3`; revisão Nexus final `hof_3df4987f6eef4611bfd9486409b91227` concluída/verificada/PASS | Reconstrução fora do lugar para candidato durável não vinculado, sem mudança no formato físico Grafx, `CATALOG_FORMAT_VERSION` ou upgrade in-place. Fonte em snapshot inerte; 11 nodes, 59 relações predecessoras, duplicatas/paralelas/self-loop, NULLs e vetores são preservados; dez relações novas nascem vazias. Catálogo, fingerprints, contagens e 161 índices são provados hot+cold; marker/commit ambíguo, checkpoint/recovery, close/lock, matriz finita de falhas e no-op zero-write são fail-closed. Gate rápido `122 passed, 1 deselected`, suíte completa real `122 passed` no mesmo código de produção, regressão M3A/B/C 56/56 e checks estáticos PASS. O único blocker factual da primeira revisão — `PermissionError` cru em `Path.exists()` — foi reproduzido no SHA antigo, corrigido e provado por teste discriminante no final |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até o fechamento M-PULSE-2 a 7 | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
