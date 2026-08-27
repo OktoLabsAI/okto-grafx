@@ -69,6 +69,7 @@ __all__ = [
     "SingleRow",
     "SkipRows",
     "SortRows",
+    "TraverseAnyRelationship",
     "TraverseRelationship",
     "UnionRows",
     "UnwindRows",
@@ -330,6 +331,42 @@ class TraverseRelationship(PlanNode):
             "direction": self.direction.value,
             "hops": f"{self.min_hops}..{self.max_hops}",
             "target_bound": self.target_bound,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TraverseAnyRelationship(PlanNode):
+    """One outgoing hop that names no type, walked across every table it could live in.
+
+    A typed hop names its table and :class:`TraverseRelationship` walks it. An untyped hop names
+    none, and the honest answer is not to pick one: it is every relationship table that leaves
+    the source's label, walked in a fixed order so the same query answers the same way twice.
+
+    The tables are ordered by ``table_id``, which is the order the catalog assigned them and the
+    only order that does not depend on how a name happens to sort. Multiplicity is preserved
+    both ways -- a row appears once per edge, and parallel edges between the same two nodes are
+    separate rows -- because the pair a caller asked for is the edge, not the neighbour.
+
+    One operator rather than a union of traversals, so the rows it produces meet the
+    intermediate-row budget at ONE admission point and the child is drawn once.
+    """
+
+    child: PlanNode
+    source: str
+    target: str
+    relationship: str
+    tables: tuple[TableDef, ...]
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Return the operator this traversal expands from."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Return the endpoints and the tables this hop may live in, in walk order."""
+        return {
+            "source": self.source,
+            "target": self.target,
+            "tables": ", ".join(table.name for table in self.tables),
         }
 
 

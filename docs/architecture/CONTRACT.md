@@ -1012,6 +1012,32 @@ supplied analysis. The same bounded expression-depth and parameter-count limits 
 combined statement; alias expansion used only for type proof is memoized and never rewrites the
 executable branch AST.
 
+`MATCH (a:Decision)-[r]->(b) RETURN a.id` is admitted literally, and it is the only untyped hop
+this engine reads. Those names and that label are part of the form: a relationship that names no
+type names no table, so the answer is defined only where the tables it could live in are, and
+they are the relationship tables whose `from_table` is `Decision`. They are enumerated in
+table_id order, and multiplicity is preserved in both directions -- two parallel edges between
+the same pair are two rows, and a second table adds rows of its own -- because the pair a caller
+asked for is the edge and not the neighbour. A label with no relationship table leaving it
+answers no rows rather than failing: the shape was admitted, so it answers.
+
+The physical shape is one `TraverseAnyRelationship` over the source scan. The child is drawn once
+and each row expands across the tables, so the statement keeps one execution context, transaction
+and snapshot, and the operator owns a single intermediate-row admission point for the whole
+fan-out. A candidate whose `to_table` the catalog does not hold fails before streaming, through
+the same door a typed hop uses; it is not filtered out, because filtering would answer with the
+sound tables and give no sign the answer was partial.
+
+Every other untyped spelling keeps the refusal and the message it already had: an incoming or
+undirected hop, an anonymous relationship, a written or implicit range, an inline map, a
+different source or target name, another label or none, a target carrying a label, a `WHERE`, a
+second pattern or `MATCH`, a named path, and any `RETURN` other than the single unaliased
+`a.id`. The form is a whole top-level query and never a `UNION` branch. Analysis and planner each
+retain their existing safety gates; the recognizer lives in the analysis layer, and the planner
+applies it directly to the statement before recomputing the statement's analysis. A supplied
+analysis therefore cannot widen the form, and the deciding fields are checked for their exact
+types before their values are read.
+
 `MATCH (n)` -- a node that names no label -- matches every node table, and `AllNodesScan` reads
 them in table_id order under one name. It is one operator over the union rather than one scan per
 table, so a predicate, `label(n)`, an aggregate, `DISTINCT`, an `ORDER BY` and a window each apply

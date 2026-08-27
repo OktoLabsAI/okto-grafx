@@ -107,17 +107,24 @@ endpoint** admits; `engine_verdict` is what **this engine** does with the NFKC-n
 that endpoint actually delivers. They differ on purpose: the contract blacklists writes,
 while the engine accepts writes because the internal port needs them. Today the contract
 allows 73 probes and refuses 14 (10 `unsafe_cypher`, 4 `unsupported_operation`); the engine
-accepts 77 and refuses 10. The intersection that matters to the public endpoint is the 2
-allowed probes the engine still refuses.
+accepts 78 and refuses 9. The intersection that matters to the public endpoint is the 1
+allowed probe the engine still refuses.
 
 ### What M-PULSE-2 owes
 
-These 2 constructs are admitted by the public contract and refused by the engine:
+This 1 construct is admitted by the public contract and refused by the engine:
 
 | Construct | Category | Refused at |
 | --- | --- | --- |
-| `untyped relationship` | pattern | plan error |
 | `path projection` | result | analysis error |
+
+M-PULSE-2N removed `untyped relationship` from this table with one literal form: exactly
+`MATCH (a:Decision)-[r]->(b) RETURN a.id`, those names and that label. A hop that names no type
+names no table, so the answer is every relationship table leaving `Decision`, enumerated by
+`table_id` and walked in that order, preserving multiplicity across both tables and parallel
+edges. Every other untyped spelling -- incoming, undirected, anonymous, ranged, mapped, other
+names or labels, a different `RETURN` -- keeps the planning refusal it already had, and a label
+with no relationship table leaving it answers no rows rather than failing.
 
 M-PULSE-2M removed `UNION` from this table with one deliberately closed form: exactly two
 top-level read-only branches ending in `RETURN`, equal arity, names from the left branch and a
@@ -218,8 +225,9 @@ By execution, not by judgement.
    `analyze` and `build_plan` against the closed Pulse catalog. Only a query accepted by all
    three is `already_supported`; the last phase reached is recorded in `acceptance_phase`.
    Parsing alone is not accepting: an unknown function becomes a generic call node and is
-   only caught by `analyze`. An eligible standalone polymorphic node now plans; label-free path
-   endpoints and untyped relationships retain their planning refusals.
+   only caught by `analyze`. An eligible standalone polymorphic node now plans, and so does the
+   one literal untyped hop M-PULSE-2N admits; label-free path endpoints, and every other untyped
+   spelling, retain their planning refusals.
 3. Materialization happens **twice**: once filling holes with identifiers, once with the
    empty string. A hole is not always an identifier — some carry an optional clause — and
    filling a clause hole with an identifier produces text that was never sent. If either
