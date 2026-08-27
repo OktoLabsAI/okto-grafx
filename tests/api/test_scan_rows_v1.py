@@ -62,8 +62,15 @@ def test_pages_stay_on_one_snapshot_while_a_writer_commits_between_them(
             assert tuple(row.values[0] for row in first.rows) == (1, 2)
             assert first.next_cursor is not None
 
-            # This commit happens while ``reader`` remains active and between its two pages.
-            _insert_items(database, 5)
+            # This commit happens while ``reader`` remains active and between its two pages.  The
+            # large values force several new heap pages: the continuation must stop at the
+            # physical ceiling captured by its first page, not misdiagnose the append as a cycle.
+            with database.begin("write") as writer:
+                for identity in range(5, 25):
+                    writer.execute(
+                        "CREATE (:Item {id: $id, label: $label})",
+                        {"id": identity, "label": "x" * 180},
+                    )
 
             second = reader.scan_rows_v1("Item", limit=2, cursor=first.next_cursor)
             assert tuple(row.values[0] for row in second.rows) == (3, 4)
@@ -85,7 +92,7 @@ def test_pages_stay_on_one_snapshot_while_a_writer_commits_between_them(
                 2,
                 3,
                 4,
-                5,
+                *range(5, 25),
             )
 
 
@@ -258,6 +265,11 @@ def test_scan_is_read_only_and_cursors_are_nominal_scoped_capabilities(
             source.scan_rows_v1(
                 "Item", limit=1, cursor=subtype_instance  # type: ignore[arg-type]
             )
+
+        continued = source.scan_rows_v1("Item", limit=1, cursor=cursor)
+        assert tuple(row.values[0] for row in continued.rows) == (2,)
+        with pytest.raises(GrafxTransactionStateError, match="cannot be reused"):
+            source.scan_rows_v1("Item", limit=1, cursor=cursor)
 
         source.rollback()
         with pytest.raises(GrafxTransactionStateError):

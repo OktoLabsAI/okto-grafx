@@ -324,9 +324,9 @@ with db.begin("read") as txn:
 ```
 
 Relationship values start with `_from` and `_to`, and duplicate/parallel occurrences are returned
-separately. `ScanCursorV1` is opaque, non-serializable and cannot cross a transaction, table or
-database. This is a physical scan primitive for adapters, not a portable backup format or bulk
-import API.
+separately. `ScanCursorV1` is opaque, non-serializable, single-use and cannot cross a transaction,
+table or database. This is a physical scan primitive for adapters, not a portable backup format
+or bulk import API.
 
 ### Safe observations
 

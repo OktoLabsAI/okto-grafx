@@ -257,8 +257,9 @@ class _HeapScanPosition:
     The public API wraps this value in an opaque transaction-owned token.  Keeping the physical
     location here lets a page resume without sorting, replaying earlier pages or retaining a
     generator (and therefore engine capabilities) across calls.  ``chain_limit`` is captured at
-    the first page so a corrupt cycle still terminates even when it crosses page boundaries in
-    separate calls.
+    the first page.  It both bounds a corrupt cycle across calls and fixes the physical end of
+    this scan: pages appended by a writer after the first result cannot contain a version visible
+    to the reader's older snapshot, so the continuation must not follow them.
     """
 
     page: PageIndex
@@ -849,6 +850,7 @@ class HeapStore:
                 or chain_limit <= 0
                 or pages_walked > chain_limit
                 or chain_limit > current_chain_limit
+                or index >= chain_limit - 1
                 or index >= current_chain_limit - 1
             ):
                 raise GrafxConfigurationError(
@@ -887,6 +889,25 @@ class HeapStore:
                 break
 
             if following == NO_PAGE:
+                break
+            if following >= chain_limit - 1:
+                current_page_ceiling = self._chain_limit() - 1
+                if following >= current_page_ceiling:
+                    raise GrafxCorruptionDetected(
+                        f"The page chain of table {table.name!r} in {self._file!r} points to "
+                        f"page {following}, outside a file with {current_page_ceiling} pages.",
+                        file=self._file,
+                        table=table.name,
+                        page=following,
+                        field="next_page",
+                        page_count=current_page_ceiling,
+                    )
+                # The allocator is append-only: an index beyond the ceiling captured by the
+                # first page was linked by a later writer.  Such a page cannot hold a version
+                # visible to this scan's older snapshot, so this is its stable physical end.  It
+                # must still be a real page of this table; growth never excuses a corrupt link.
+                with self._pool.pinned(self._file, following) as appended_page:
+                    self._require_table_page(appended_page, table)
                 break
             index = following
             start_slot = FIRST_RECORD_SLOT

@@ -626,6 +626,7 @@ class ScanCursorV1:
     """
 
     __slots__ = (
+        "_consumed",
         "_owner",
         "_position",
         "_schema_version",
@@ -651,6 +652,7 @@ class ScanCursorV1:
         position: _HeapScanPosition,
     ) -> ScanCursorV1:
         cursor = object.__new__(cls)
+        object.__setattr__(cursor, "_consumed", False)
         object.__setattr__(cursor, "_owner", owner)
         object.__setattr__(cursor, "_table_name", table_name)
         object.__setattr__(cursor, "_table_id", table_id)
@@ -681,7 +683,7 @@ def _scan_cursor_payload(
     *,
     owner: object,
     table_name: str,
-) -> tuple[int, int, _HeapScanPosition]:
+) -> tuple[int, int, _HeapScanPosition, ScanCursorV1]:
     """Validate and unwrap one exact cursor without invoking caller-defined behavior."""
 
     if type(value) is not ScanCursorV1:
@@ -692,6 +694,7 @@ def _scan_cursor_payload(
         )
     try:
         observed_owner = object.__getattribute__(value, "_owner")
+        observed_consumed = object.__getattribute__(value, "_consumed")
         observed_name = object.__getattribute__(value, "_table_name")
         observed_table_id = object.__getattribute__(value, "_table_id")
         observed_schema_version = object.__getattribute__(value, "_schema_version")
@@ -724,13 +727,14 @@ def _scan_cursor_payload(
         type(observed_table_id) is not int
         or type(observed_schema_version) is not int
         or type(observed_position) is not _HeapScanPosition
+        or type(observed_consumed) is not bool
     ):
         raise GrafxConfigurationError(
             "A scan continuation carries malformed internal fields.",
             field="cursor",
             value="malformed",
         )
-    return observed_table_id, observed_schema_version, observed_position
+    return observed_table_id, observed_schema_version, observed_position, value
 
 
 class Transaction:
@@ -1707,7 +1711,7 @@ class Database:
         *,
         table: str,
         limit: int,
-        cursor_payload: tuple[int, int, _HeapScanPosition] | None,
+        cursor_payload: tuple[int, int, _HeapScanPosition, ScanCursorV1] | None,
         cursor_owner: object,
     ) -> ScanPageV1:
         """Serve the bounded scan door after its public arguments have been canonicalised."""
@@ -1734,7 +1738,9 @@ class Database:
                 table_def = self._catalog.catalog.table(table)
                 position: _HeapScanPosition | None = None
                 if cursor_payload is not None:
-                    cursor_table_id, cursor_schema_version, position = cursor_payload
+                    cursor_table_id, cursor_schema_version, position, cursor_token = (
+                        cursor_payload
+                    )
                     if (
                         cursor_table_id != table_def.table_id
                         or cursor_schema_version != table_def.schema_version
@@ -1749,6 +1755,18 @@ class Database:
                             cursor_schema_version=cursor_schema_version,
                             current_schema_version=table_def.schema_version,
                         )
+                    # The transaction manager's participant section serialises this claim.  A
+                    # cursor is a one-shot continuation: consuming it before page access prevents
+                    # duplicate transfer if a caller accidentally submits the same page twice,
+                    # and a storage refusal cannot turn it back into a replay token.
+                    if object.__getattribute__(cursor_token, "_consumed"):
+                        raise GrafxTransactionStateError(
+                            "A scan continuation cannot be reused.",
+                            operation="scan_rows_v1",
+                            field="cursor_state",
+                            value="consumed",
+                        )
+                    object.__setattr__(cursor_token, "_consumed", True)
                 raw_rows, next_position = self._heap.scan_page(
                     table_def,
                     context.snapshot,
