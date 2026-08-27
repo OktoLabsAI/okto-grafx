@@ -49,6 +49,7 @@ from okto_grafx.domain.query.analysis import (
     named_path,
     named_path_refusal,
     optional_match_refusal,
+    untyped_one_hop_source,
     union_refusal,
     polymorphic_node_refusal,
 )
@@ -116,6 +117,7 @@ from okto_grafx.domain.query.plan import (
     SingleRow,
     SkipRows,
     SortRows,
+    TraverseAnyRelationship,
     TraverseRelationship,
     UnionRows,
     UnwindRows,
@@ -460,6 +462,7 @@ class _Planner:
     multi_hop_variables: set[str] = field(default_factory=set)
     polymorphic_variables: set[str] = field(default_factory=set)
     typed_endpoint_form: bool = False
+    untyped_one_hop_label: str | None = None
     unwind_alias: str | None = None
     unwind_source: Expression | None = None
     alias_definitions: dict[str, Expression] = field(default_factory=dict)
@@ -1224,6 +1227,17 @@ class _Planner:
             message, value = refusal
             raise GrafxPlanError(message, field="clause", value=value)
         self.typed_endpoint_form = self._is_typed_endpoint_form(statement)
+        untyped_source = untyped_one_hop_source(statement)
+        self.untyped_one_hop_label = (
+            None if untyped_source is None else untyped_source.labels[0]
+        )
+        if untyped_source is not None:
+            # The recogniser judged the STATEMENT, and from here the pipeline is built from the
+            # analysis -- which a caller may have supplied. A supplied summary that claims an
+            # aggregation gets one: _result reads `aggregated` and inserts AggregateRows over a
+            # statement that aggregates nothing. So the analysis this plan is built from and
+            # published with is recomputed from the statement the gate actually approved.
+            self.analysis = analyze(statement)
         pipeline: PlanNode = SingleRow()
         if statement.unwind_clause is not None:
             self._require_batch_shape(statement)
@@ -2442,6 +2456,52 @@ class _Planner:
             and value.subject.name == self.unwind_alias
         )
 
+    def _traverse_untyped(
+        self,
+        pipeline: PlanNode,
+        source: str,
+        relationship: RelationshipPattern,
+        target_pattern: NodePattern,
+    ) -> tuple[PlanNode, str]:
+        """Plan the one untyped hop this engine reads, across every table it could live in.
+
+        Reached only when the WHOLE statement is the admitted shape, which is decided once in
+        :func:`~okto_grafx.domain.query.analysis.untyped_one_hop_source` and not re-derived here.
+        Every other untyped relationship falls through to the refusal it has always earned.
+        """
+        label = self.untyped_one_hop_label
+        tables = tuple(
+            table
+            for table in sorted(self.catalog.tables(), key=lambda item: item.table_id)
+            if table.kind == "rel" and table.from_table == label
+        )
+        # A label with nothing leaving it is not a shape defect; it is a query whose answer is
+        # no rows, and the operator below produces exactly that from an empty table list.
+        # Refusing here would turn a fact about the schema into a fault in the query.
+        for table in tables:
+            # Every candidate's landing table is resolved BEFORE the operator is built, and by
+            # the same door the typed route uses. A catalog can name an endpoint it does not
+            # hold, and this route would otherwise walk the tables it can and answer as if that
+            # were the whole result -- a partial answer nobody asked for and nobody could see
+            # was partial. Refusing is the only honest reading, and it matches what a typed hop
+            # over the same broken table already does.
+            self._table_named(table.to_table, "to")
+        named = target_pattern.variable
+        target = named if named is not None else self._anonymous()
+        # Deliberately NOT recorded in self.tables: the landing table differs per relationship
+        # table, so there is no single answer to "which table is b". Nothing in the admitted
+        # shape reads b, and a name bound to one table would be a claim this hop cannot make.
+        return (
+            TraverseAnyRelationship(
+                child=pipeline,
+                source=source,
+                target=target,
+                relationship=relationship.variable or "",
+                tables=tables,
+            ),
+            target,
+        )
+
     def _traverse(
         self,
         pipeline: PlanNode,
@@ -2450,6 +2510,10 @@ class _Planner:
         target_pattern: NodePattern,
     ) -> tuple[PlanNode, str]:
         """Plan one relationship hop, or a bounded range of them."""
+        if self.untyped_one_hop_label is not None and not relationship.types:
+            return self._traverse_untyped(
+                pipeline, source, relationship, target_pattern
+            )
         if len(relationship.types) != 1:
             raise GrafxPlanError(
                 "A matched relationship names exactly one type, because a relationship lives in "

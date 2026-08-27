@@ -258,8 +258,8 @@
       "YIELD"
     ],
     "probe_count": 87,
-    "engine_accepted": 77,
-    "engine_refused": 10,
+    "engine_accepted": 78,
+    "engine_refused": 9,
     "contract_refused": 14,
     "contract_error_codes": {
       "unsafe_cypher": 10,
@@ -1298,9 +1298,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "plan_error",
-        "engine_verdict": "refused",
-        "error": "GrafxPlanError: A matched relationship names exactly one type, because a relationship lives in exactly one table; got -[r]->. [code=plan_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "pattern",
@@ -7723,5 +7723,5 @@
       }
     }
   ],
-  "digest": "8963b64ab073d13f84d216cd58ce7f1c683c74b1a1e8dfdcd4897c3c6fd8002f"
+  "digest": "905aa0baeb0d78d61858a1d4b5dc2da44003b966a065cbae2994340f9e83bb1a"
 }

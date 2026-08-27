@@ -150,6 +150,7 @@ from okto_grafx.domain.query.plan import (
     SingleRow,
     SkipRows,
     SortRows,
+    TraverseAnyRelationship,
     TraverseRelationship,
     UnionRows,
     UnwindRows,
@@ -2126,6 +2127,89 @@ def _traverse(
                 break
 
 
+def _traverse_any(
+    engine: QueryEngine, node: TraverseAnyRelationship, context: _Context
+) -> Iterator[_Row]:
+    """Expand one untyped hop across every table it could live in, in table order.
+
+    The child is drawn ONCE and each of its rows is expanded across the tables, rather than the
+    child being redrawn per table: the rows a caller receives are the same either way, but the
+    work and the budget are not, and the freeze asks for one admission point.
+
+    A single hop cannot revisit an edge, so the isomorphism bookkeeping a range needs is absent
+    here by construction rather than by omission.
+    """
+    catalog = context.schema()
+    ended = _ended_by_this_transaction(context)
+    dirty_tables = _intent_table_ids(context.txn)
+    nodes_by_id: dict[int, dict[int, tuple[object, HeapVersion]]] = {}
+
+    def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
+        """Return the version of one node its owner can see, indexing each table once."""
+        found = nodes_by_id.get(table.table_id)
+        if found is None:
+            found = _owner_nodes(engine, context, table, ended)
+            nodes_by_id[table.table_id] = found
+        return found.get(identity)  # type: ignore[arg-type]
+
+    walkers = []
+    for table in node.tables:
+        changes: Mapping[object, tuple[Value, ...] | None] = {}
+        pending: tuple[tuple[object, HeapVersion], ...] = ()
+        if table.table_id in dirty_tables:
+            changes, pending = _owner_edges(context, table)
+        walkers.append(
+            (
+                table,
+                _edge_steps(
+                    engine,
+                    context,
+                    table,
+                    catalog.table(table.from_table),
+                    catalog.table(table.to_table),
+                    True,
+                    False,
+                    ended,
+                    changes,
+                    pending,
+                ),
+            )
+        )
+
+    for row in engine._rows(node.child, context):
+        start = row.bindings.get(node.source)
+        if not isinstance(start, RowBinding):
+            raise GrafxPlanError(
+                f"The traversal from {node.source!r} found no bound row to start from.",
+                field="variable",
+                value=node.source,
+            )
+        identity = _overlay_identity(start)
+        for table, steps in walkers:
+            for ref, version, next_table, next_id in steps(identity):
+                landing = node_at(next_table, next_id)
+                if landing is None:
+                    continue
+                landing_ref, landing_version = landing
+                bindings = dict(row.bindings)
+                bindings[node.target] = RowBinding(
+                    variable=node.target,
+                    table=next_table,
+                    ref=landing_ref,
+                    version=landing_version,
+                )
+                bindings[node.relationship] = RowBinding(
+                    variable=node.relationship,
+                    table=table,
+                    ref=ref,
+                    version=version,
+                )
+                context.count("rows_scanned")
+                yield _Row(
+                    bindings=bindings, computed=row.computed, columns=row.columns
+                )
+
+
 def _filter_rows(
     engine: QueryEngine, node: FilterRows, context: _Context
 ) -> Iterator[_Row]:
@@ -3822,6 +3906,7 @@ _HANDLERS: dict[type, _Handler] = {
     AllNodesScan: _all_nodes_scan,  # type: ignore[dict-item]
     NodeScan: _node_scan,  # type: ignore[dict-item]
     IndexSeek: _index_seek,  # type: ignore[dict-item]
+    TraverseAnyRelationship: _traverse_any,  # type: ignore[dict-item]
     TraverseRelationship: _traverse,  # type: ignore[dict-item]
     FilterRows: _filter_rows,  # type: ignore[dict-item]
     VectorSearch: _vector_search,  # type: ignore[dict-item]

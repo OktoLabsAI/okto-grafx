@@ -1033,9 +1033,11 @@ def _pulse_catalog(sources: dict[str, str]) -> Any:
     """A minimal closed Pulse schema, built once in memory, so queries can be planned.
 
     Parsing says the text is well formed and analysis says the vocabulary is known; neither
-    says this engine can answer the query.  ``MATCH (n)`` and an untyped relationship parse
-    and analyse cleanly and are refused by the PLANNER, so a corpus that stopped earlier
-    called the two broadest public reads supported.
+    says this engine can answer the query.  ``MATCH (n)`` parses and analyses cleanly and is
+    refused by the PLANNER, so a corpus that stopped earlier called the broadest public read
+    supported.  An untyped relationship is the same story everywhere except the one literal
+    statement M-PULSE-2N admits, which the planner now answers by walking every relationship
+    table leaving the source label.
 
     One relationship table per LOGICAL type, on its first declared endpoint pair: the plan
     verdict is about whether the construct can be planned at all, not about which endpoint
@@ -2706,9 +2708,11 @@ def _contract_verdict(text: str, sources: dict[str, str]) -> dict[str, Any]:
 # different questions and the matrix must not blur them: the raw endpoint refuses every
 # write, while the engine accepts writes because the internal port needs them.
 # (category, construct, probe, contract_disposition).  The disposition is the PUBLIC
-# contract's answer; the verdict beside it is this ENGINE's.  Every probe but the one
-# ABOUT untyped relationships names a type from a triple the catalog really carries, so
-# each measures its own construct instead of re-measuring the untyped-relationship gap.
+# contract's answer; the verdict beside it is this ENGINE's.  Every probe but the one ABOUT
+# untyped relationships names a type from a triple the catalog really carries, so each
+# measures its own construct rather than re-measuring the untyped hop.  That one probe is
+# deliberately the literal statement M-PULSE-2N froze, so it measures exactly what was
+# admitted and nothing that merely resembles it.
 RAW_CONTRACT_PROBES: tuple[tuple[str, str, str, str], ...] = (
     ("root", "MATCH", "MATCH (n:Decision) RETURN n.id", "allowed"),
     (
