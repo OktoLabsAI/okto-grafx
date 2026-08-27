@@ -1163,6 +1163,16 @@ todas as 97 entries permanecem integrais em 82/13. Parser/AST/`describe`, zero/u
 owner-only/rollback, colisões, exclusões, AST/análise forjada, diferencial full-object, corpus
 `--check`, Ruff e diff-check formam o gate; o digest novo só é registrado depois da regeneração.
 
+M-PULSE-2I está implementado e entregue para verificação, ainda NÃO concluído. O corpus foi
+regenerado e o gate diferencial fechou exatamente como o parágrafo previa: mudaram DOIS objetos
+raw e nenhum outro — `named path` de refused/parse_error para accepted/planned, e `path
+projection` continuando refused com a fase migrando de `parse_error` para `analysis_error`,
+porque com a sintaxe reconhecida quem recusa `RETURN path` passa a ser a análise. Os outros 85
+objetos raw ficam íntegros, as 97 entries ficam íntegras em 82/13, engine raw passa a 72/15 com
+sete débitos, e o contrato permanece invariável em 74/13 sobre 87 probes. O corpus regenerado tem
+digest `e792ded751eeffbe597a4e37d9110b30943e3d0fa69bd22027ad09778fc24f1c`. A conclusão do sublote
+depende da verificação do Codex sobre os commits entregues.
+
 1. gerar um corpus versionado a partir do contrato e das queries reais read-only e write do Pulse;
 2. implementar clauses/expressões/funções ausentes;
 3. traduzir mutations internas para primitives estruturados quando isso evitar copiar DDL/procedures

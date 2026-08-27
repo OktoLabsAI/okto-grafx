@@ -253,8 +253,8 @@
       "RETURN"
     ],
     "probe_count": 87,
-    "engine_accepted": 71,
-    "engine_refused": 16,
+    "engine_accepted": 72,
+    "engine_refused": 15,
     "contract_refused": 13,
     "contract_error_codes": {
       "unsafe_cypher": 10,
@@ -1382,9 +1382,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "parse_error",
-        "engine_verdict": "refused",
-        "error": "GrafxParseError: Expected '(' but found name 'path' (line 1, column 7). [code=parse_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "limits",
@@ -1569,9 +1569,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "parse_error",
+        "acceptance_phase": "analysis_error",
         "engine_verdict": "refused",
-        "error": "GrafxParseError: Expected '(' but found name 'path' (line 1, column 7). [code=parse_error retryable=False]"
+        "error": "GrafxPlanError: The path 'path' is written and never read in this subset, so a RETURN item cannot ask what it contains. [code=plan_error retryable=False]"
       },
       {
         "category": "forbidden_write",
@@ -7752,5 +7752,5 @@
       }
     }
   ],
-  "digest": "2fec52e0f033c3674aa8558fc5cca4aec05dacc7eae82e111bc2819864873e36"
+  "digest": "e792ded751eeffbe597a4e37d9110b30943e3d0fa69bd22027ad09778fc24f1c"
 }

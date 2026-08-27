@@ -1009,6 +1009,16 @@ answers unambiguously only where the direction fixes which end is which. `*1..1`
 the other ranges even though it matches a single hop: what the form excludes is a written range,
 and the pattern records that a `*` was typed rather than inferring it from the hop counts.
 
+A path may also be NAMED, in `MATCH path = (a:A)-[r:T]->(b:B) [WHERE ...] RETURN ...`, and the
+name is decorative: it is written, it is checked, and nothing may read it. The plan is byte for
+byte the plan of the same query without the name, which is the whole of what the feature claims.
+Reading the name anywhere -- in `RETURN`, in `WHERE`, in `ORDER BY`, as the subject of a property
+or the argument of a function -- is refused by the analysis, and so is a name a node or a
+relationship of the same query already answers to. The form is exact: one `MATCH` of one pattern,
+one named outgoing hop of one type with no written range and no inline map, both ends named and
+carrying exactly one label, and a `RETURN`. `name =` is read only inside a `MATCH`, so a written
+pattern cannot carry one; every other shape keeps the refusal it had.
+
 ```
 MATCH (n:Chunk)-[:BELONGS_TO]->(d:Doc)
 WHERE n.layer = $layer AND d.active = true

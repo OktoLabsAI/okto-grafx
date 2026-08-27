@@ -664,6 +664,7 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         "UNWIND",
         "WITH",
         "polymorphic node",
+        "named path",
         "map batch",
         "map access",
     ):
@@ -678,11 +679,13 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         probe for probe in raw["probes"] if probe["engine_verdict"] == "accepted"
     ]
     refused = [probe for probe in raw["probes"] if probe["engine_verdict"] == "refused"]
-    # M-PULSE-2H moves two ENTRIES and no probe: the raw matrix is unchanged on purpose, and
-    # saying so here is what keeps a later reader from mistaking it for a missed ratchet.
-    assert len(accepted) == 71
-    assert len(refused) == 16
-    assert len(owed) == 8
+    # M-PULSE-2H moved two ENTRIES and no probe; M-PULSE-2I moves two PROBES and no entry.
+    # Both shapes are expected from here, and saying so keeps a later reader from mistaking
+    # either for a missed ratchet: `named path` plans, and `path projection` stays refused
+    # while its refusal moves from the parser to the analysis, because the syntax now parses.
+    assert len(accepted) == 72
+    assert len(refused) == 15
+    assert len(owed) == 7
 
     assert frozen["counts"]["classification:already_supported"] == 82
     assert frozen["counts"]["classification:generic_gap"] == 13

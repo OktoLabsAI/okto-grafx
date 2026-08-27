@@ -543,7 +543,7 @@ class _Parser:
     def _match_clause(self) -> MatchClause:
         """Parse ``MATCH patterns [WHERE predicate]``."""
         self._take_keyword("MATCH")
-        patterns = self._pattern_list()
+        patterns = self._pattern_list(named=True)
         predicate: Expression | None = None
         if self._match_keyword("WHERE"):
             predicate = self._expression()
@@ -643,7 +643,7 @@ class _Parser:
 
     # --- patterns ----------------------------------------------------------------------------
 
-    def _pattern_list(self) -> tuple[PatternPath, ...]:
+    def _pattern_list(self, *, named: bool = False) -> tuple[PatternPath, ...]:
         """Parse one or more comma-separated patterns."""
         patterns: list[PatternPath] = []
         while True:
@@ -653,13 +653,22 @@ class _Parser:
                     field="patterns",
                     value=MAX_PATTERNS_PER_CLAUSE,
                 )
-            patterns.append(self._pattern())
+            patterns.append(self._pattern(named=named))
             if not self._match_symbol(","):
                 break
         return tuple(patterns)
 
-    def _pattern(self) -> PatternPath:
-        """Parse one connected path of nodes and relationships."""
+    def _pattern(self, *, named: bool = False) -> PatternPath:
+        """Parse one connected path of nodes and relationships.
+
+        ``named`` is true only where a MATCH is being read. A path name is a way of REFERRING
+        to what was matched, and nothing else in this subset reads one, so accepting it where
+        a pattern is written rather than matched would invent a meaning for it.
+        """
+        variable: str | None = None
+        if named and self._current.kind is TokenKind.NAME and self._at_symbol("=", 1):
+            variable = self._advance().text
+            self._take_symbol("=")
         nodes = [self._node_pattern()]
         relationships: list[RelationshipPattern] = []
         while self._at_symbol("-") or self._at_symbol("<"):
@@ -671,7 +680,11 @@ class _Parser:
                 )
             relationships.append(self._relationship_pattern())
             nodes.append(self._node_pattern())
-        return PatternPath(nodes=tuple(nodes), relationships=tuple(relationships))
+        return PatternPath(
+            nodes=tuple(nodes),
+            relationships=tuple(relationships),
+            variable=variable,
+        )
 
     def _node_pattern(self) -> NodePattern:
         """Parse ``(variable:Label {properties})`` with every part optional."""

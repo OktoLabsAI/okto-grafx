@@ -45,6 +45,7 @@ from okto_grafx.domain.query.analysis import (
     QueryAnalysis,
     SimilarityUse,
     analyze,
+    named_path_refusal,
     polymorphic_node_refusal,
 )
 from okto_grafx.domain.query.ast import (
@@ -701,6 +702,10 @@ class _Planner:
 
     def _query(self, statement: Query) -> PlannedQuery:
         """Plan a reading and updating query."""
+        refusal = named_path_refusal(statement)
+        if refusal is not None:
+            message, value = refusal
+            raise GrafxPlanError(message, field="pattern", value=value)
         refusal = polymorphic_node_refusal(statement)
         if refusal is not None:
             message, value = refusal
@@ -1628,6 +1633,10 @@ class _Planner:
         if len(patterns) != 1:
             return False
         pattern = patterns[0]
+        if pattern.variable is not None:
+            # A named path is its own frozen form, with LABELLED ends. Reading the near end
+            # from the relationship here would mix the two and admit a shape neither froze.
+            return False
         if len(pattern.relationships) != 1 or len(pattern.nodes) != 2:
             return False
         relationship = pattern.relationships[0]

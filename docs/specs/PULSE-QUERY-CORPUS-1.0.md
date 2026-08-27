@@ -150,6 +150,14 @@ changes at all, because the probe for a label-free path writes a relationship wi
 refused for that. A batch that moves entries and no probe is the expected shape here, not a
 missed ratchet.
 
+M-PULSE-2I is the mirror of that and worth reading beside it: it moves two PROBES and no entry.
+The named path is decorative -- written, checked, never read -- so `named path` moves to
+`planned` while `path projection` stays refused. Its recorded refusal nonetheless moves from
+`parse_error` to `analysis_error`, and it HAS to: once `MATCH path = ...` parses, the query that
+projects the name is no longer stopped by the parser, and the analysis is what refuses it. A
+recognised syntax changes where its neighbours fail, which is why the differential is read over
+whole objects rather than over verdicts.
+
 ### The behavioural contract beside the grammar
 
 The raw payload also freezes 36 code-derived behaviours in seven groups:

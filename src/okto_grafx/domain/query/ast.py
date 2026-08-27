@@ -445,6 +445,14 @@ class PatternPath:
 
     nodes: tuple[NodePattern, ...]
     relationships: tuple[RelationshipPattern, ...] = ()
+    variable: str | None = None
+    """The name a MATCH gave this path, when it gave one.
+
+    Declared last, and defaulted, so every positional construction of a pattern keeps meaning
+    what it meant. The name is DECORATIVE in this subset: it is written, it is checked for
+    collisions, and nothing may read it -- so it changes what a query may SAY without changing
+    anything a query DOES.
+    """
 
     def describe(self) -> str:
         """Return the whole path as it would be written back."""
@@ -452,7 +460,8 @@ class PatternPath:
         for position, relationship in enumerate(self.relationships):
             parts.append(relationship.describe())
             parts.append(self.nodes[position + 1].describe())
-        return "".join(parts)
+        body = "".join(parts)
+        return body if self.variable is None else f"{self.variable} = {body}"
 
 
 @dataclass(frozen=True, slots=True)

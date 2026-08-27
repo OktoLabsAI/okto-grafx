@@ -68,6 +68,7 @@ from okto_grafx.domain.query.tokens import (
 
 __all__ = [
     "ENTITY_NODE",
+    "NAMED_PATH_SHAPE",
     "POLYMORPHIC_NODE_SHAPE",
     "ENTITY_RELATIONSHIP",
     "ENTITY_PROJECTED",
@@ -79,6 +80,8 @@ __all__ = [
     "analyze",
     "contains_aggregate",
     "is_aggregate",
+    "named_path",
+    "named_path_refusal",
     "polymorphic_node",
     "polymorphic_node_refusal",
 ]
@@ -255,6 +258,90 @@ def _polymorphic_shape_reason(query: Query, driver: NodePattern) -> str | None:
     return None
 
 
+NAMED_PATH_SHAPE: str = (
+    "one MATCH of one named path over one named outgoing hop of one type, both ends named and "
+    "carrying exactly one label, no inline map and no written range, and a RETURN"
+)
+"""The only shape a named path is admitted in."""
+
+
+def named_path(query: Query) -> PatternPath | None:
+    """Return the path this query gives a name to, or None when it names none."""
+    for clause in query.match_clauses:
+        for pattern in clause.patterns:
+            if pattern.variable is not None:
+                return pattern
+    for clause in query.updating_clauses:
+        written: tuple[PatternPath, ...] = ()
+        if isinstance(clause, CreateClause):
+            written = clause.patterns
+        elif isinstance(clause, MergeClause):
+            written = (clause.pattern,)
+        for pattern in written:
+            if pattern.variable is not None:
+                return pattern
+    return None
+
+
+def named_path_refusal(query: Query) -> tuple[str, str] | None:
+    """Return the refusal a named path earns outside its one shape, or None.
+
+    One function, asked by the analysis and asked again by the planner: a tree that never
+    passed the parser reaches the first, and a caller's own analysis walks past it to the
+    second. The name is decorative, so admitting it in one written form costs nothing at
+    runtime -- and admitting it anywhere else would mean deciding what READING one means.
+    """
+    named = named_path(query)
+    if named is None:
+        return None
+    reason = _named_path_shape_reason(query, named)
+    if reason is None:
+        return None
+    return (
+        "A named path is written and never read in this subset, and it is admitted in exactly "
+        f"one shape: {NAMED_PATH_SHAPE}. {reason}",
+        named.describe(),
+    )
+
+
+def _named_path_shape_reason(query: Query, named: PatternPath) -> str | None:
+    """Return what this statement does that the one shape does not allow, or None."""
+    if query.unwind_clause is not None:
+        return "This one follows an UNWIND."
+    if query.with_clauses:
+        return "This query carries a WITH."
+    if query.updating_clauses:
+        return "This query writes, and a pattern being written is not one to refer back to."
+    if query.return_clause is None:
+        return "This query has no RETURN."
+    if len(query.match_clauses) != 1:
+        return f"This query has {len(query.match_clauses)} MATCH clauses."
+    patterns = query.match_clauses[0].patterns
+    if len(patterns) != 1:
+        return f"This MATCH carries {len(patterns)} patterns."
+    if patterns[0] is not named:
+        return "The named path is not the pattern this MATCH reads."
+    if len(named.relationships) != 1 or len(named.nodes) != 2:
+        return "A named path here spans exactly one hop between two nodes."
+    relationship = named.relationships[0]
+    if relationship.variable is None or len(relationship.types) != 1:
+        return "The hop of a named path is named and carries exactly one type."
+    if relationship.direction is not Direction.OUTGOING:
+        return "A named path points one way, from its first node to its second."
+    if relationship.variable_length or relationship.hop_range_written:
+        return "A named path spans one hop, so it carries no range."
+    if relationship.properties is not None:
+        return "The hop of a named path carries no inline property map."
+    for node in named.nodes:
+        if node.variable is None:
+            return "Both ends of a named path are named."
+        if len(node.labels) != 1:
+            return "Both ends of a named path name exactly one label."
+        if node.properties is not None:
+            return "Neither end of a named path carries an inline property map."
+    return None
+
+
 def is_aggregate(expression: Expression) -> bool:
     """Return True when this expression is itself a call to one of the six aggregates."""
     return (
@@ -310,6 +397,7 @@ class _Analyzer:
         "_query",
         "_bindings",
         "_discarded",
+        "_path_names",
         "_parameters",
         "_similarity",
         "_scores",
@@ -321,12 +409,19 @@ class _Analyzer:
         # The names a WITH stopped carrying, kept only so that reading one below it
         # is refused for what it is rather than as a variable nothing ever bound.
         self._discarded: set[str] = set()
+        # The paths this query names. They are recorded so a collision is a refusal,
+        # and they are never readable, so nothing below can ask what one contains.
+        self._path_names: set[str] = set()
         self._parameters: list[str] = []
         self._similarity: SimilarityUse | None = None
         self._scores = False
 
     def run(self) -> QueryAnalysis:
         """Analyse the whole query and return what the planner needs."""
+        refusal = named_path_refusal(self._query)
+        if refusal is not None:
+            message, value = refusal
+            raise self._refuse(message, field="pattern", value=value)
         refusal = polymorphic_node_refusal(self._query)
         if refusal is not None:
             message, value = refusal
@@ -375,6 +470,8 @@ class _Analyzer:
 
     def _match_clause(self, clause: MatchClause) -> None:
         """Bind the variables of a MATCH clause and check its predicate."""
+        for pattern in clause.patterns:
+            self._name_path(pattern)
         for pattern in clause.patterns:
             self._bind_pattern(pattern, created=False)
         if clause.predicate is not None:
@@ -516,6 +613,20 @@ class _Analyzer:
         )
 
     # --- patterns ----------------------------------------------------------------------------
+
+    def _name_path(self, pattern: PatternPath) -> None:
+        """Record the name a path was given, refusing one something else already answers to."""
+        name = pattern.variable
+        if name is None:
+            return
+        if self._binding(name) is not None or name in self._path_names:
+            raise self._refuse(
+                f"The name {name!r} is already used in this query, so it cannot also name a "
+                "path.",
+                field="variable",
+                value=name,
+            )
+        self._path_names.add(name)
 
     def _bind_pattern(self, pattern: PatternPath, *, created: bool) -> None:
         """Record every variable a pattern binds and check its inline property maps."""
@@ -673,6 +784,13 @@ class _Analyzer:
         """Record one binding, refusing a name already bound to a different kind of thing."""
         if name is None:
             return
+        if name in self._path_names:
+            raise self._refuse(
+                f"The name {name!r} names a path in this query, so it cannot also name a "
+                f"{entity}.",
+                field="variable",
+                value=name,
+            )
         existing = self._binding(name)
         if existing is None:
             self._bindings.append(
@@ -964,6 +1082,13 @@ class _Analyzer:
         """Refuse a variable no pattern bound."""
         if self._binding(name) is not None:
             return
+        if name in self._path_names:
+            raise self._refuse(
+                f"The path {name!r} is written and never read in this subset, so {where} "
+                "cannot ask what it contains.",
+                field="variable",
+                value=name,
+            )
         if name in self._discarded:
             raise self._refuse(
                 f"The variable {name!r} used in {where} was dropped by a WITH "
