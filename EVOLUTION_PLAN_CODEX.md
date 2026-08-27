@@ -126,6 +126,48 @@
   composição do provider completo.
   O registro verificável está em 9.7.
 
+## Governança dos roadmaps complementares pós-Pulse
+
+Os dois documentos abaixo ficam incorporados por referência, em sua íntegra, a este plano. Eles
+devem permanecer versionados no repositório; a referência inclui todos os capítulos, decisões,
+contratos, APIs propostas, milestones, gates, matrizes de teste, instruções de execução, itens
+adiados e non-goals — não apenas seus resumos executivos:
+
+- [`GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md`](GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md):
+  trilha database-first `GX-CAP-0` a `GX-CAP-11` e integrações opcionais `GX-AGENT-0/1`;
+- [`AGENT_FIRST_EVOLUTION_PLAN_CODEX.md`](AGENT_FIRST_EVOLUTION_PLAN_CODEX.md): detalhamento
+  obrigatório da camada agent-first `AGENT-0` a `AGENT-8`, incluindo workspace/scopes,
+  identidade, proveniência, idempotência, memory/claims/evidence, MCP, policies, segurança,
+  observabilidade e conformance.
+
+Esta incorporação obedece às seguintes regras vinculantes:
+
+1. primeiro são fechados e publicados os gaps de integração com o Pulse, incluindo os gates
+   M-PULSE-2 a M-PULSE-7; nenhum item dos roadmaps complementares amplia retroativamente um
+   sublote Pulse já congelado;
+2. depois do gate Pulse, o roadmap técnico deste documento continua sendo a autoridade para
+   integridade, recovery, concorrência, performance, lifecycle, backup/migração e capacidades já
+   planejadas; os dois anexos entram como backlog obrigatório adicional, respeitando suas
+   dependências explícitas;
+3. em capacidades sobrepostas, o plano database-first define ownership e ordem no core, enquanto
+   o plano agent-first preserva os requisitos detalhados e os gates da camada opcional. Deve ser
+   atendido o conjunto compatível mais estrito; nenhum requisito exclusivo de qualquer um dos
+   arquivos pode ser descartado silenciosamente;
+4. a declaração interna do plano database-first de que ele substitui a proposta isolada
+   agent-first não retira o segundo documento do roadmap: por decisão posterior registrada aqui,
+   ambos permanecem autoridades. Ela vale apenas para evitar que a semântica agentic contamine o
+   core ou duplique uma capability genérica;
+5. conflito material entre os anexos exige ADR/decisão explícita antes do código. Não é permitido
+   resolver conflito por omissão, reinterpretar um gate depois da implementação ou elevar a barra
+   exploratória de um milestone em andamento;
+6. o registro de execução de 9.7 deve mapear cada milestone pós-Pulse ao documento e seção de
+   origem, SHA imutável, testes, auditoria e débitos aceitos. Alterações futuras nesses anexos são
+   diffs versionados e não movem retroativamente um gate já congelado.
+
+Assim, manter os documentos separados não perde informação: o texto integral de ambos é parte
+normativa deste plano, enquanto esta seção fixa precedência, momento de execução e resolução de
+sobreposição sem criar uma terceira cópia divergente.
+
 ## 1. Resumo executivo
 
 O Okto Grafx possui fundamentos muito bons para um banco de dados de grafo embutido e local-first:
@@ -1385,6 +1427,7 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-2I — named path decorativo | concluído e publicado | código `1c728cc` + hardening `edf6efd`; branch `milestone/pulse-query-named-path`; integrado à `main`; handoff Nexus `hof_a3e5645c9d4b437bbf75841a20872c13` concluído/verificado/PASS | Aceita somente `MATCH path = (a:A)-[r:TYPE]->(b:B) ... RETURN ...` com um hop tipado e nome jamais lido. Analyzer e planner repetem o gate sobre AST/análise fornecida; path projection permanece recusado pre-stream. Corpus digest `e792ded751eeffbe597a4e37d9110b30943e3d0fa69bd22027ad09778fc24f1c`, raw 72/15, sete débitos e entries 82/13; exatamente dois objetos raw e nenhuma entry mudaram. Dedicado 60/60, relacionadas 539/539, corpus 45/45, query completa exit 0, `--check`, Ruff e diff-check PASS; formatter 250/250; duas auditorias independentes PASS |
 | M-PULSE-3A — propriedades de node | concluído e publicado no branch Pulse atual; helper ainda inativo | Pulse Community `milestone/grafx-mpulse3-node-properties@4aae27eca9c0a2d1d14a3334b03e6c57976dea75` → `feature/v0.3.3`; revisão Nexus `hof_cad849ee19e542eb862930f64054724d` concluída/PASS | labels desconhecidas retornam vazio sem tocar backend; label conhecida ausente/wrong-kind e DB fechado falham tipado; ordem de catálogo, snapshot, reopen e fronteiras públicas cobertos; 8/8, Ruff default/TRY/I/BLE e format PASS. A resolução `board_id → Database` fica no provider/composição, sem ativação parcial |
 | M-PULSE-3B — layout lógico de relações | concluído e publicado; provider ainda inativo | Pulse Community `milestone/grafx-mpulse3-logical-relationships@c4b1f37ad3a4cd08a1e2f5249db25c33ddbecd45` → `feature/v0.3.3`; código `067b82c` + hardening `c4b1f37` | Manifesto fechado e imutável de 16 tipos/69 pares/69 nomes, codec bijetivo e reverse pelo manifesto; introspecção valida kind/endpoints e oculta nomes físicos. Unknown/collision/mismatch, shapes malformados e representação hostil falham tipados. Gate focado 15/15; regressão selecionada completa 146/146 contra Core limpo `ab61b9a`; Ruff/format/diff-check e duas auditorias independentes PASS. DDL/bootstrap, ativação, query rewrite e os gaps de supersedence continuam explicitamente fora |
+| Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até o fechamento M-PULSE-2 a 7 | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um
