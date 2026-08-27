@@ -45,6 +45,7 @@ from okto_grafx.domain.query.analysis import (
     QueryAnalysis,
     SimilarityUse,
     analyze,
+    exact_path_projection,
     hop_range_refusal,
     named_path,
     named_path_refusal,
@@ -157,6 +158,12 @@ ANONYMOUS_VARIABLE_PREFIX: str = "anonymous pattern element "
 It carries spaces on purpose. A user variable is an ASCII identifier and can never contain one,
 so an anonymous binding can never be shadowed by, or shadow, something the caller wrote.
 """
+
+_PATH_PROJECTION_NODE_TABLE: str = "Decision"
+_PATH_PROJECTION_RELATIONSHIP_TABLE: str = "supersedes"
+_PATH_PROJECTION_NODE_KEYS = frozenset({"_ID", "_LABEL"})
+_PATH_PROJECTION_RELATIONSHIP_KEYS = frozenset({"_SRC", "_DST", "_LABEL", "_ID"})
+"""The catalog declaration required by the one projected path."""
 
 SCORE_COLUMN: str = "similarity score"
 """The row key the similarity operator writes its score under, for the same reason."""
@@ -462,6 +469,7 @@ class _Planner:
     multi_hop_variables: set[str] = field(default_factory=set)
     polymorphic_variables: set[str] = field(default_factory=set)
     typed_endpoint_form: bool = False
+    path_projection: PatternPath | None = None
     untyped_one_hop_label: str | None = None
     unwind_alias: str | None = None
     unwind_source: Expression | None = None
@@ -1209,6 +1217,7 @@ class _Planner:
 
     def _query(self, statement: Query) -> PlannedQuery:
         """Plan a reading and updating query."""
+        projected_path = exact_path_projection(statement)
         refusal = hop_range_refusal(statement)
         if refusal is not None:
             message, value = refusal
@@ -1217,7 +1226,7 @@ class _Planner:
         if refusal is not None:
             message, value = refusal
             raise GrafxPlanError(message, field="pattern", value=value)
-        self._refuse_named_path_reads(statement)
+        self._refuse_named_path_reads(statement, projected_path=projected_path)
         refusal = polymorphic_node_refusal(statement)
         if refusal is not None:
             message, value = refusal
@@ -1227,16 +1236,17 @@ class _Planner:
             message, value = refusal
             raise GrafxPlanError(message, field="clause", value=value)
         self.typed_endpoint_form = self._is_typed_endpoint_form(statement)
+        self.path_projection = projected_path
         untyped_source = untyped_one_hop_source(statement)
         self.untyped_one_hop_label = (
             None if untyped_source is None else untyped_source.labels[0]
         )
-        if untyped_source is not None:
-            # The recogniser judged the STATEMENT, and from here the pipeline is built from the
-            # analysis -- which a caller may have supplied. A supplied summary that claims an
-            # aggregation gets one: _result reads `aggregated` and inserts AggregateRows over a
-            # statement that aggregates nothing. So the analysis this plan is built from and
-            # published with is recomputed from the statement the gate actually approved.
+        if untyped_source is not None or projected_path is not None:
+            # Each literal recogniser judged the STATEMENT, while the pipeline below also reads
+            # the analysis -- which a caller may have supplied. A supplied summary that claims
+            # an aggregation gets one: _result inserts AggregateRows over a statement that
+            # aggregates nothing. Recompute from the statement the gate actually approved so
+            # neither literal can be widened through its analysis argument.
             self.analysis = analyze(statement)
         pipeline: PlanNode = SingleRow()
         if statement.unwind_clause is not None:
@@ -1310,8 +1320,10 @@ class _Planner:
             pipeline = FilterRows(child=pipeline, predicate=clause.predicate)
         return pipeline
 
-    def _refuse_named_path_reads(self, statement: Query) -> None:
-        """Refuse a read of a path name, for a caller that supplied its own analysis.
+    def _refuse_named_path_reads(
+        self, statement: Query, *, projected_path: PatternPath | None
+    ) -> None:
+        """Refuse every path-name read except the one exact projected path.
 
         The analysis refuses each of these where it is written, and says which clause asked.
         This repeats the rule rather than the message, because ``build_plan`` accepts an
@@ -1326,9 +1338,24 @@ class _Planner:
         named = named_path(statement)
         if named is None or named.variable is None:
             return
+        if named is projected_path:
+            # The exact recogniser has checked every expression-bearing site and proved that
+            # the sole occurrence is the one unaliased RETURN item. Nothing wider is skipped.
+            return
         for expression in self._query_expressions(statement):
             for node in walk(expression):
-                if isinstance(node, Variable) and node.name == named.variable:
+                if not isinstance(node, Variable):
+                    continue
+                if type(node.name) is not str:
+                    # ``build_plan`` accepts a caller-supplied analysis, so this AST boundary
+                    # must be checked independently.  Do it before equality: a hand-built
+                    # ``str`` subclass can make comparison execute arbitrary code.
+                    raise GrafxPlanError(
+                        "A variable is named with a name the parser could have written.",
+                        field="variable",
+                        value="a variable name",
+                    )
+                if node.name == named.variable:
                     raise GrafxPlanError(
                         f"The path {named.variable!r} is written and never read in this "
                         "subset, so nothing may project it or filter on it.",
@@ -2117,7 +2144,13 @@ class _Planner:
         for position, relationship in enumerate(pattern.relationships):
             target_pattern = pattern.nodes[position + 1]
             pipeline, source = self._traverse(
-                pipeline, source, relationship, target_pattern
+                pipeline,
+                source,
+                relationship,
+                target_pattern,
+                path_variable=(
+                    pattern.variable if pattern is self.path_projection else None
+                ),
             )
             if target_pattern.properties is not None:
                 # The inline map on a TARGET node is the same shorthand it is on the first node,
@@ -2507,6 +2540,8 @@ class _Planner:
         source: str,
         relationship: RelationshipPattern,
         target_pattern: NodePattern,
+        *,
+        path_variable: str | None = None,
     ) -> tuple[PlanNode, str]:
         """Plan one relationship hop, or a bounded range of them."""
         if self.untyped_one_hop_label is not None and not relationship.types:
@@ -2521,6 +2556,8 @@ class _Planner:
                 value=relationship.describe(),
             )
         table = self._relationship_table(relationship)
+        if path_variable is not None:
+            self._require_path_projection_schema(table)
         if relationship.properties is not None:
             raise GrafxPlanError(
                 "A matched relationship carries no inline property map in this dialect; write "
@@ -2562,9 +2599,52 @@ class _Planner:
                 max_hops=relationship.max_hops,
                 target_table=target_table,
                 target_bound=already_bound,
+                path_variable=path_variable,
             ),
             target_variable,
         )
+
+    def _require_path_projection_schema(self, table: TableDef) -> None:
+        """Require the exact relationship declaration the projected path was frozen against.
+
+        The ordinary traversal checks the table at its starting end. Its labelled target is
+        otherwise resolved from the label the query wrote, without proving that label is the
+        relationship's declared ``to_table``. That is insufficient for a path value: publishing
+        ``b:Decision`` while the edge actually lands in another table would encode a path the
+        query did not match. The literal form therefore closes both ends before any row streams.
+        """
+        if not (
+            table.name == _PATH_PROJECTION_RELATIONSHIP_TABLE
+            and table.from_table == _PATH_PROJECTION_NODE_TABLE
+            and table.to_table == _PATH_PROJECTION_NODE_TABLE
+        ):
+            raise GrafxPlanError(
+                "The projected path reads a 'supersedes' relationship declared from Decision "
+                "to Decision; the catalog declaration does not match that frozen endpoint pair.",
+                field="endpoint",
+                value=table.name,
+                from_table=table.from_table,
+                to_table=table.to_table,
+            )
+
+        node_table = self._table_named(_PATH_PROJECTION_NODE_TABLE, "label")
+        self._require_path_property_keys(node_table, _PATH_PROJECTION_NODE_KEYS)
+        self._require_path_property_keys(table, _PATH_PROJECTION_RELATIONSHIP_KEYS)
+
+    @staticmethod
+    def _require_path_property_keys(
+        table: TableDef, reserved_keys: frozenset[str]
+    ) -> None:
+        """Refuse properties that would replace structural keys in the public path value."""
+        for column in table.property_columns:
+            if column.name in reserved_keys:
+                raise GrafxPlanError(
+                    f"Table {table.name!r} declares path-reserved property {column.name!r}; "
+                    "the projected path reserves that key for structural metadata.",
+                    field="column",
+                    value=column.name,
+                    table=table.name,
+                )
 
     def _require_endpoint(
         self, source: str, table: TableDef, direction: Direction

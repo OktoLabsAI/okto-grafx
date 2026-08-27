@@ -258,8 +258,8 @@
       "YIELD"
     ],
     "probe_count": 87,
-    "engine_accepted": 78,
-    "engine_refused": 9,
+    "engine_accepted": 79,
+    "engine_refused": 8,
     "contract_refused": 14,
     "contract_error_codes": {
       "unsafe_cypher": 10,
@@ -1540,9 +1540,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "analysis_error",
-        "engine_verdict": "refused",
-        "error": "GrafxPlanError: The path 'path' is written and never read in this subset, so a RETURN item cannot ask what it contains. [code=plan_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "forbidden_write",
@@ -7723,5 +7723,5 @@
       }
     }
   ],
-  "digest": "905aa0baeb0d78d61858a1d4b5dc2da44003b966a065cbae2994340f9e83bb1a"
+  "digest": "b29334edf6e7c1e6b9419a4f3add84ede4baad94fdeaecb0c679261a78f241cc"
 }

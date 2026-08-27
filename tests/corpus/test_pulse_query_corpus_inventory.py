@@ -683,6 +683,7 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         "OPTIONAL MATCH",
         "UNION",
         "untyped relationship",
+        "path projection",
         "map batch",
         "map access",
     ):
@@ -700,12 +701,11 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
     # M-PULSE-2H moved two ENTRIES and no probe; M-PULSE-2I moved two PROBES and no entry;
     # M-PULSE-2J and 2K each move one more probe. M-PULSE-2L then makes the engine verdict
     # follow the public NFKC execution path and closes the unsupported trailing-clause hole in
-    # the Core authority, and M-PULSE-2M moves UNION. M-PULSE-2N then moves the untyped hop,
-    # leaving one debt: path projection. That last one is an engine capability, not boundary
-    # drift.
-    assert len(accepted) == 78
-    assert len(refused) == 9
-    assert set(owed) == {"path projection"}
+    # the Core authority, and M-PULSE-2M moves UNION. M-PULSE-2N then moves the untyped hop and
+    # M-PULSE-2O moves the one exact path projection, closing the finite raw-contract debt.
+    assert len(accepted) == 79
+    assert len(refused) == 8
+    assert owed == []
     assert raw["contract_refused"] == 14
     assert raw["contract_error_codes"] == {
         "unsafe_cypher": 10,

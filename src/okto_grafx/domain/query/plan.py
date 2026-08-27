@@ -317,6 +317,8 @@ class TraverseRelationship(PlanNode):
     max_hops: int
     target_table: TableDef | None = None
     target_bound: bool = False
+    path_variable: str | None = None
+    """The exact named path this hop binds, when the frozen path projection asks for one."""
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator this traversal expands from."""
@@ -324,7 +326,7 @@ class TraverseRelationship(PlanNode):
 
     def details(self) -> Mapping[str, object]:
         """Return the endpoints, the relationship table and the hop range."""
-        return {
+        details: dict[str, object] = {
             "source": self.source,
             "target": self.target,
             "table": self.table.name,
@@ -332,6 +334,9 @@ class TraverseRelationship(PlanNode):
             "hops": f"{self.min_hops}..{self.max_hops}",
             "target_bound": self.target_bound,
         }
+        if self.path_variable is not None:
+            details["path"] = self.path_variable
+        return details
 
 
 @dataclass(frozen=True, slots=True)

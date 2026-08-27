@@ -77,6 +77,7 @@ from okto_grafx.domain.query.tokens import (
 
 __all__ = [
     "ENTITY_NODE",
+    "ENTITY_PATH",
     "NAMED_PATH_SHAPE",
     "POLYMORPHIC_NODE_SHAPE",
     "ENTITY_RELATIONSHIP",
@@ -91,11 +92,14 @@ __all__ = [
     "is_aggregate",
     "named_path",
     "named_path_refusal",
+    "exact_path_projection",
     "polymorphic_node",
     "polymorphic_node_refusal",
 ]
 
 ENTITY_NODE: str = "node"
+ENTITY_PATH: str = "path"
+"""The one exact named path this subset projects as a result value."""
 ENTITY_RELATIONSHIP: str = "relationship"
 ENTITY_UNWOUND: str = "unwound value"
 """What UNWIND binds: one element of a list, which is a value and not a matched row."""
@@ -389,6 +393,15 @@ def union_refusal(statement: UnionQuery) -> tuple[str, str] | None:
                 "as a branch of a UNION.",
                 "branch",
             )
+        if exact_path_projection(branch) is not None:
+            # Path projection is admitted only as the whole frozen query.  A branch is planned
+            # by a planner of its own, which otherwise sees the branch as a whole statement and
+            # would admit a composition this milestone never measured.
+            return (
+                "A path is projected as a whole query in this subset, not as a branch of a "
+                "UNION.",
+                "branch",
+            )
         if branch.return_clause is None:
             return (
                 "Each branch of a UNION ends with RETURN, because a union is made of rows.",
@@ -582,6 +595,114 @@ def untyped_one_hop_source(query: Query) -> NodePattern | None:
     return source
 
 
+_PATH_PROJECTION_NAME = "path"
+_PATH_PROJECTION_SOURCE = "a"
+_PATH_PROJECTION_RELATIONSHIP = "r"
+_PATH_PROJECTION_TARGET = "b"
+_PATH_PROJECTION_NODE_LABEL = "Decision"
+_PATH_PROJECTION_RELATIONSHIP_TYPE = "supersedes"
+"""Every identifier fixed by the one path projection this subset reads."""
+
+
+def exact_path_projection(query: Query) -> PatternPath | None:
+    """Return the path when ``query`` is the one literal path projection, else None.
+
+    The admitted statement is exactly ``MATCH path = (a:Decision)-[r:supersedes]->``
+    ``(b:Decision) RETURN path`` at the AST boundary.  Lexical trivia the parser discards --
+    whitespace, keyword case and a trailing semicolon -- is deliberately not reconstructed.
+    Every semantic field, class, container, flag and identifier is checked exactly so a tree a
+    caller built cannot turn this one measured query into a family of unmeasured path reads.
+
+    This recognises and never refuses.  A miss reaches the pre-existing named-path refusal, which
+    preserves the error surface for every other reading of a path name.
+    """
+    if type(query) is not Query or query.unwind_clause is not None:
+        return None
+    for container in (query.match_clauses, query.with_clauses, query.updating_clauses):
+        if type(container) is not tuple:
+            return None
+    if query.with_clauses or query.updating_clauses:
+        return None
+    if len(query.match_clauses) != 1:
+        return None
+    clause = query.match_clauses[0]
+    if type(clause) is not MatchClause:
+        return None
+    if type(clause.optional) is not bool or clause.optional:
+        return None
+    if clause.predicate is not None:
+        return None
+    if type(clause.patterns) is not tuple or len(clause.patterns) != 1:
+        return None
+    pattern = clause.patterns[0]
+    if type(pattern) is not PatternPath:
+        return None
+    if type(pattern.variable) is not str or pattern.variable != _PATH_PROJECTION_NAME:
+        return None
+    if type(pattern.nodes) is not tuple or len(pattern.nodes) != 2:
+        return None
+    if type(pattern.relationships) is not tuple or len(pattern.relationships) != 1:
+        return None
+    source, target = pattern.nodes
+    hop = pattern.relationships[0]
+    if type(source) is not NodePattern or type(target) is not NodePattern:
+        return None
+    if type(hop) is not RelationshipPattern:
+        return None
+    for node, variable in (
+        (source, _PATH_PROJECTION_SOURCE),
+        (target, _PATH_PROJECTION_TARGET),
+    ):
+        if type(node.variable) is not str or node.variable != variable:
+            return None
+        if type(node.labels) is not tuple or len(node.labels) != 1:
+            return None
+        if (
+            type(node.labels[0]) is not str
+            or node.labels[0] != _PATH_PROJECTION_NODE_LABEL
+        ):
+            return None
+        if node.properties is not None:
+            return None
+    if type(hop.variable) is not str or hop.variable != _PATH_PROJECTION_RELATIONSHIP:
+        return None
+    if type(hop.types) is not tuple or len(hop.types) != 1:
+        return None
+    if (
+        type(hop.types[0]) is not str
+        or hop.types[0] != _PATH_PROJECTION_RELATIONSHIP_TYPE
+    ):
+        return None
+    if hop.direction is not Direction.OUTGOING or hop.properties is not None:
+        return None
+    if type(hop.hop_range_written) is not bool or hop.hop_range_written:
+        return None
+    if type(hop.min_hops) is not int or type(hop.max_hops) is not int:
+        return None
+    if hop.min_hops != 1 or hop.max_hops != 1:
+        return None
+    returned = query.return_clause
+    if type(returned) is not ReturnClause:
+        return None
+    if type(returned.distinct) is not bool or returned.distinct:
+        return None
+    if type(returned.sort_items) is not tuple or returned.sort_items:
+        return None
+    if returned.skip is not None or returned.limit is not None:
+        return None
+    if type(returned.items) is not tuple or len(returned.items) != 1:
+        return None
+    item = returned.items[0]
+    if type(item) is not ReturnItem or item.alias is not None:
+        return None
+    expression = item.expression
+    if type(expression) is not Variable or type(expression.name) is not str:
+        return None
+    if expression.name != _PATH_PROJECTION_NAME:
+        return None
+    return pattern
+
+
 def optional_match_refusal(query: Query) -> tuple[str, str] | None:
     """Return the refusal an OPTIONAL MATCH earns outside the one admitted shape, or None.
 
@@ -723,9 +844,16 @@ def _named_path_shape_reason(query: Query, named: PatternPath) -> str | None:
     if not _is_written_path_name(named.variable):
         return "A path is named with a name the parser could have written."
     for node in named.nodes:
+        if node.variable is not None and type(node.variable) is not str:
+            return "A node of a named path is named with a name the parser could have written."
         if node.variable == named.variable:
             return "The name of a path is not the name of a node in it."
     for relationship in named.relationships:
+        if relationship.variable is not None and type(relationship.variable) is not str:
+            return (
+                "A relationship of a named path is named with a name the parser could have "
+                "written."
+            )
         if relationship.variable == named.variable:
             return "The name of a path is not the name of a relationship in it."
     if query.unwind_clause is not None:
@@ -823,6 +951,7 @@ class _Analyzer:
         "_query",
         "_bindings",
         "_discarded",
+        "_projected_path",
         "_path_names",
         "_parameters",
         "_similarity",
@@ -835,8 +964,9 @@ class _Analyzer:
         # The names a WITH stopped carrying, kept only so that reading one below it
         # is refused for what it is rather than as a variable nothing ever bound.
         self._discarded: set[str] = set()
-        # The paths this query names. They are recorded so a collision is a refusal,
-        # and they are never readable, so nothing below can ask what one contains.
+        self._projected_path = exact_path_projection(query)
+        # Every other path name is recorded so a collision is a refusal and a read earns the
+        # established path-specific error rather than looking like an ordinary unbound name.
         self._path_names: set[str] = set()
         self._parameters: list[str] = []
         self._similarity: SimilarityUse | None = None
@@ -1052,6 +1182,12 @@ class _Analyzer:
         """Record the name a path was given, refusing one something else already answers to."""
         name = pattern.variable
         if name is None:
+            return
+        if pattern is self._projected_path:
+            # The exact recogniser proved both the whole statement and that this name cannot be
+            # read anywhere except its sole RETURN item.  Giving it a real binding keeps the
+            # published analysis honest without making any decorative named path readable.
+            self._bind(name, ENTITY_PATH, (), created=False)
             return
         # A name shared with a node or a relationship is refused by the shape gate, over the
         # STATEMENT and before any of this runs, so that a caller supplying its own analysis
@@ -1496,6 +1632,15 @@ class _Analyzer:
 
     def _binding(self, name: str) -> Binding | None:
         """Return the binding of one variable, or None."""
+        if type(name) is not str:
+            # A parser-produced variable name is always a builtin ``str``.  Check that
+            # boundary before equality: a hand-built subclass may override ``__eq__`` and a
+            # malformed tree must earn a typed refusal rather than execute that callback.
+            raise self._refuse(
+                "A variable is named with a name the parser could have written.",
+                field="variable",
+                value="a variable name",
+            )
         for candidate in self._bindings:
             if candidate.name == name:
                 return candidate

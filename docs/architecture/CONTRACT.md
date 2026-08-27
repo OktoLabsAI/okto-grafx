@@ -1069,15 +1069,37 @@ answers unambiguously only where the direction fixes which end is which. `*1..1`
 the other ranges even though it matches a single hop: what the form excludes is a written range,
 and the pattern records that a `*` was typed rather than inferring it from the hop counts.
 
-A path may also be NAMED, in `MATCH path = (a:A)-[r:T]->(b:B) [WHERE ...] RETURN ...`, and the
-name is decorative: it is written, it is checked, and nothing may read it. The plan is byte for
-byte the plan of the same query without the name, which is the whole of what the feature claims.
-Reading the name anywhere -- in `RETURN`, in `WHERE`, in `ORDER BY`, as the subject of a property
-or the argument of a function -- is refused by the analysis, and so is a name a node or a
-relationship of the same query already answers to. The form is exact: one `MATCH` of one pattern,
-one named outgoing hop of one type with no written range and no inline map, both ends named and
-carrying exactly one label, and a `RETURN`. `name =` is read only inside a `MATCH`, so a written
-pattern cannot carry one; every other shape keeps the refusal it had.
+A path may also be NAMED, in `MATCH path = (a:A)-[r:T]->(b:B) [WHERE ...] RETURN ...`. Ordinarily
+the name is decorative: it is written and checked but not read, and the plan is the plan of the
+same query without the name. There is one closed Pulse compatibility exception that reads it:
+
+```
+MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path
+```
+
+That exact AST returns one one-hop path value for every matching relationship, preserving
+parallel-edge multiplicity. The map carries `_NODES` and `_RELS`; nodes carry `_ID`, `_LABEL`
+and every catalog property, while the relationship carries `_SRC`, `_DST`, `_LABEL`, `_ID` and
+every user property. Endpoint identities equal the corresponding node identities. The numbers
+are opaque backend-local integers, and owner-visible pending rows use detached synthetic
+integers: no record reference, pending token, version or table object is public. Native Grafx
+list values remain tuples; the Pulse provider performs its narrow tuple-to-list conversion.
+[`PULSE-PATH-VALUE-1.0.md`](../specs/PULSE-PATH-VALUE-1.0.md) freezes the differential oracle,
+key order, identity correlations and public Pulse layer rewrites.
+
+Because those maps have structural keys, this projection refuses a `Decision` property named
+`_ID` or `_LABEL`, or a `supersedes` property named `_SRC`, `_DST`, `_LABEL` or `_ID`, during
+planning and before any row streams. The names remain legal for schemas outside this projection;
+the physical relationship endpoint columns `_from` and `_to` are not user properties and remain
+accepted and omitted from the public map.
+
+Every other read of a path name -- another name, label, relationship type or direction, a
+property/function, `WHERE`, `ORDER BY`, alias, additional item or clause, map, written range,
+multiple hop, write, or `UNION` branch -- is refused before streaming. Decorative paths keep
+their existing exact form: one `MATCH` of one pattern, one named outgoing hop of one type with no
+written range or inline map, both ends named with exactly one label, and a `RETURN` that never
+reads the path. A path name that collides with a node or relationship name is also refused.
+`name =` is read only inside a `MATCH`, so a written pattern cannot carry one.
 
 `MATCH (a:A)-[r:T*]->(b:B)` writes no upper bound, and does not mean an unbounded walk. The
 public endpoint rewrites `*` to twenty hops from its own `MAX_TRAVERSAL_DEPTH` before a query
