@@ -82,6 +82,7 @@ from okto_grafx.domain.model.schema import (
 )
 from okto_grafx.domain.model.value import (
     INT64_MAX,
+    INT64_MIN,
     Timestamp,
     Value,
     ValueType,
@@ -280,6 +281,42 @@ class RowBinding:
     def describe(self) -> str:
         """Return a short en-US rendering of this binding."""
         return f"({self.variable}:{self.table.name} #{self.record_id})"
+
+
+@dataclass(frozen=True, slots=True)
+class _PathIdentity:
+    """One capability-free, opaque identity carried by a projected path."""
+
+    offset: int
+    table: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PathNodeValue:
+    """One detached node inside the engine's private path result marker."""
+
+    identity: _PathIdentity
+    label: str
+    properties: tuple[tuple[str, Value], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PathRelationshipValue:
+    """One detached relationship inside the engine's private path result marker."""
+
+    source: _PathIdentity
+    target: _PathIdentity
+    label: str
+    identity: _PathIdentity
+    properties: tuple[tuple[str, Value], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PathValue:
+    """A nominal one-hop path marker consumed only by the public result snapshot."""
+
+    nodes: tuple[_PathNodeValue, _PathNodeValue]
+    relationships: tuple[_PathRelationshipValue]
 
 
 @dataclass(frozen=True, slots=True)
@@ -525,6 +562,8 @@ class _Context:
     cancelled_insert_tokens: set[int] = field(default_factory=set)
     ends_held: set[object] = field(default_factory=set)
     _ends_staged: frozenset[object] | None = None
+    path_identities: dict[tuple[object, ...], int] = field(default_factory=dict)
+    path_identities_issued: int = 0
 
     def already_ended(self, reference: object) -> bool:
         """Answer whether this exact version has already been told to stop.
@@ -2016,6 +2055,25 @@ def _traverse(
     ``MATCH (a), (b) ... (a)-[]->(b)`` -- is a filter: the path counts only when it lands on that
     very row.
     """
+    path_variable = node.path_variable
+    if path_variable is not None:
+        if type(path_variable) is not str or not path_variable:
+            raise GrafxPlanError(
+                "A projected path needs one non-empty exact variable name.",
+                field="path_variable",
+                value=repr(path_variable),
+            )
+        if (
+            node.min_hops != 1
+            or node.max_hops != 1
+            or node.direction is not Direction.OUTGOING
+            or node.relationship is None
+        ):
+            raise GrafxPlanError(
+                "A projected path is exactly one named, typed, outgoing relationship hop.",
+                field="path_variable",
+                value=path_variable,
+            )
     catalog = context.schema()
     relationship = node.table
     dirty_tables = _intent_table_ids(context.txn)
@@ -2106,17 +2164,28 @@ def _traverse(
                     ):
                         continue
                     bindings = dict(row.bindings)
-                    bindings[node.target] = RowBinding(
+                    target_binding = RowBinding(
                         variable=node.target,
                         table=next_table,
                         ref=landing_ref,
                         version=landing_version,
                     )
+                    bindings[node.target] = target_binding
                     if node.relationship is not None:
                         bindings[node.relationship] = (
                             edge
                             if node.max_hops == 1 and node.min_hops == 1
                             else extended
+                        )
+                    if path_variable is not None:
+                        if path_variable in bindings:
+                            raise GrafxPlanError(
+                                "A projected path cannot reuse a node or relationship variable.",
+                                field="path_variable",
+                                value=path_variable,
+                            )
+                        bindings[path_variable] = _one_hop_path_value(
+                            context, start, edge, target_binding
                         )
                     context.count("rows_scanned")
                     yield _Row(
@@ -5872,6 +5941,102 @@ def _binding_identity(binding: RowBinding) -> tuple[object, ...]:
     return ("stored", binding.table.table_id, binding.record_id)
 
 
+def _path_identity(context: _Context, binding: RowBinding) -> _PathIdentity:
+    """Return a public-shaped opaque identity without exposing a pending reference.
+
+    Durable identities already fit the query value domain in ordinary databases and remain
+    stable across executions. A pending row has only a transaction-private negative token, and
+    a theoretical durable u64 above the signed query domain cannot be published directly. Both
+    receive a collision-free negative identity allocated from this execution's context. The
+    allocation depends only on encounter order; it neither copies nor transforms the private
+    token.
+    """
+    if (
+        not isinstance(binding.ref, PendingRowRef)
+        and 1 <= binding.record_id <= INT64_MAX
+    ):
+        offset = binding.record_id
+    else:
+        logical = _binding_identity(binding)
+        offset = context.path_identities.get(logical)
+        if offset is None:
+            context.path_identities_issued += 1
+            offset = INT64_MIN + context.path_identities_issued - 1
+            context.path_identities[logical] = offset
+    return _PathIdentity(offset=offset, table=binding.table.table_id)
+
+
+def _path_properties(binding: RowBinding) -> tuple[tuple[str, Value], ...]:
+    """Return every user property in schema order, padding an old short version with nulls."""
+    first = ENDPOINT_COLUMN_COUNT if binding.table.kind == "rel" else 0
+    values = binding.version.values
+    return tuple(
+        (
+            column.name,
+            values[position] if position < len(values) else None,
+        )
+        for position, column in enumerate(binding.table.columns)
+        if position >= first
+    )
+
+
+def _one_hop_path_value(
+    context: _Context,
+    source: RowBinding,
+    relationship: RowBinding,
+    target: RowBinding,
+) -> _PathValue:
+    """Detach the exact visible hop into a nominal, capability-free result marker."""
+    if source.table.kind != "node" or target.table.kind != "node":
+        raise GrafxPlanError(
+            "A projected path begins and ends at node tables.",
+            field="path",
+            value="non_node_endpoint",
+        )
+    if relationship.table.kind != "rel":
+        raise GrafxPlanError(
+            "A projected path carries a relationship table between its nodes.",
+            field="path",
+            value="non_relationship_hop",
+        )
+    if (
+        relationship.table.from_table != source.table.name
+        or relationship.table.to_table != target.table.name
+    ):
+        raise GrafxPlanError(
+            "A projected outgoing path must preserve its relationship table's endpoints.",
+            field="path",
+            value=relationship.table.name,
+        )
+
+    source_identity = _path_identity(context, source)
+    target_identity = _path_identity(context, target)
+    relationship_identity = _path_identity(context, relationship)
+    return _PathValue(
+        nodes=(
+            _PathNodeValue(
+                identity=source_identity,
+                label=source.table.name,
+                properties=_path_properties(source),
+            ),
+            _PathNodeValue(
+                identity=target_identity,
+                label=target.table.name,
+                properties=_path_properties(target),
+            ),
+        ),
+        relationships=(
+            _PathRelationshipValue(
+                source=source_identity,
+                target=target_identity,
+                label=relationship.table.name,
+                identity=relationship_identity,
+                properties=_path_properties(relationship),
+            ),
+        ),
+    )
+
+
 def _as_value(value: object) -> Value:
     """Detach bindings recursively so no private pending reference reaches a result value.
 
@@ -5892,6 +6057,10 @@ def _as_value(value: object) -> Value:
                 },
             }
         return value.record_id
+    if type(value) is _PathValue:
+        # The public result snapshot recognizes this exact nominal marker and rebuilds it into
+        # ordinary maps and tuples after page access has ended.
+        return value  # type: ignore[return-value]
     if isinstance(value, (list, tuple)):
         return tuple(_as_value(item) for item in value)
     if isinstance(value, dict):

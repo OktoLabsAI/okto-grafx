@@ -8,7 +8,9 @@ Cypher is in use. M-PULSE-2B added `coalesce`, `string_split` and `size`; M-PULS
 and simple `CASE` plus list subscripts; M-PULSE-2D added `label` and `timestamp`; M-PULSE-2E added
 the leading `UNWIND` batch source and map access; M-PULSE-2F added non-aggregating `WITH`; and
 M-PULSE-2G added the read-only polymorphic node scan `MATCH (n)`; and M-PULSE-2H read the near
-end of a typed hop from the relationship that declares it. The remaining gaps stay explicit.
+end of a typed hop from the relationship that declares it. M-PULSE-2M added the closed binary
+`UNION`, M-PULSE-2N the one exact untyped hop, and M-PULSE-2O the one exact path projection. The
+finite public raw-contract debt is now closed; wider grammar remains explicitly refused.
 
 The scanner and JSON do not widen the public endpoint or execute Pulse code. Engine changes
 are reviewed in their own commits, and regenerating this corpus makes each accepted/refused
@@ -70,7 +72,7 @@ This keeps an unsupported family useful: closing the language gap must change th
 ## Counts at `pulse-1`
 
 `97` entries, digest
-`8963b64ab073d13f84d216cd58ce7f1c683c74b1a1e8dfdcd4897c3c6fd8002f`.
+`b29334edf6e7c1e6b9419a4f3add84ede4baad94fdeaecb0c679261a78f241cc`.
 
 The engine currently classifies 82 entries as `already_supported` and 13 as `generic_gap`;
 the duplicate and declared fragment remain separate classifications.
@@ -107,16 +109,20 @@ endpoint** admits; `engine_verdict` is what **this engine** does with the NFKC-n
 that endpoint actually delivers. They differ on purpose: the contract blacklists writes,
 while the engine accepts writes because the internal port needs them. Today the contract
 allows 73 probes and refuses 14 (10 `unsafe_cypher`, 4 `unsupported_operation`); the engine
-accepts 78 and refuses 9. The intersection that matters to the public endpoint is the 1
-allowed probe the engine still refuses.
+accepts 79 and refuses 8. The intersection that matters to the public endpoint is empty.
 
 ### What M-PULSE-2 owes
 
-This 1 construct is admitted by the public contract and refused by the engine:
+No construct in the frozen raw matrix is both admitted by the public contract and refused by the
+engine. This closes the finite Pulse query-language debt; it is not a claim that Grafx implements
+arbitrary Cypher outside that matrix.
 
-| Construct | Category | Refused at |
-| --- | --- | --- |
-| `path projection` | result | analysis error |
+M-PULSE-2O removed the final `path projection` row with one literal form: exactly
+`MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path`. It returns one row per edge
+with `_NODES`/`_RELS`, schema-ordered properties, opaque integer identities and correlated
+endpoints. Every wider path read stays refused before streaming. The differential Ladybug/Pulse
+shape and the separation between native Grafx tuples and adapter-owned Pulse lists are frozen in
+[`PULSE-PATH-VALUE-1.0.md`](PULSE-PATH-VALUE-1.0.md).
 
 M-PULSE-2N removed `untyped relationship` from this table with one literal form: exactly
 `MATCH (a:Decision)-[r]->(b) RETURN a.id`, those names and that label. A hop that names no type
