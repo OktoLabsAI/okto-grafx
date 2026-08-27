@@ -70,6 +70,7 @@ from okto_grafx.domain.query.ast import (
 )
 from okto_grafx.domain.query.lexer import tokenize
 from okto_grafx.domain.query.limits import (
+    DEFAULT_TRAVERSAL_HOPS,
     MAX_CLAUSES,
     MAX_COLUMN_DEFINITIONS,
     MAX_EXPRESSION_DEPTH,
@@ -757,37 +758,32 @@ class _Parser:
         return variable, tuple(types), min_hops, max_hops, properties, starred
 
     def _hop_range(self) -> tuple[int, int]:
-        """Parse ``*``, ``*n``, ``*n..m`` or ``*..m``, refusing anything without an upper bound.
+        """Parse ``*``, ``*n``, ``*n..``, ``*..`` or ``*n..m``, always ending with a bound.
 
-        An unbounded traversal is refused rather than defaulted, and that is a deliberate
-        difference from a dialect that supplies its own ceiling. A bare ``*`` over a graph with a
-        cycle is the shape that does not terminate, and CONTRACT.md section 13 item 3 makes a
-        hang a blocking defect; a refusal that names the ceiling costs the caller one character
-        and can never be the wrong answer.
+        A traversal is never unbounded here: a bare ``*`` over a cyclic graph is the shape that
+        does not terminate, and CONTRACT.md section 13 item 3 makes a hang a blocking defect. An
+        OMITTED upper bound is not unbounded, though -- the public endpoint rewrites it to
+        twenty hops before any engine sees it, so the omission already has one meaning, and this
+        reads it the same way instead of refusing text the caller was told is legal.
+
+        The lower bound written beside an omitted upper is kept: ``*3..`` means three to twenty,
+        and if the lower is larger than the default the range is empty and refused below, which
+        is the same answer ``*3..2`` gets.
         """
         self._take_symbol("*")
         lower: int | None = None
         if self._current.kind is TokenKind.INTEGER:
             lower = self._hop_count()
         if self._match_symbol(".."):
-            if self._current.kind is not TokenKind.INTEGER:
-                raise self._refuse(
-                    f"A variable-length relationship needs an upper bound of at most "
-                    f"{MAX_TRAVERSAL_HOPS} hops, as in -[:Knows*1..3]->",
-                    field="max_hops",
-                    value=MAX_TRAVERSAL_HOPS,
-                )
-            upper = self._hop_count()
+            if self._current.kind is TokenKind.INTEGER:
+                upper = self._hop_count()
+            else:
+                upper = DEFAULT_TRAVERSAL_HOPS
             lower = 1 if lower is None else lower
         elif lower is not None:
             upper = lower
         else:
-            raise self._refuse(
-                f"A variable-length relationship needs an upper bound of at most "
-                f"{MAX_TRAVERSAL_HOPS} hops, as in -[:Knows*1..3]->",
-                field="max_hops",
-                value=MAX_TRAVERSAL_HOPS,
-            )
+            lower, upper = 1, DEFAULT_TRAVERSAL_HOPS
         if lower > upper:
             raise self._refuse(
                 f"A hop range starts at or below its upper bound; got {lower}..{upper}",

@@ -22,6 +22,7 @@ exists to forbid.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from okto_grafx.domain.errors import GrafxParseError, GrafxPlanError
@@ -44,6 +45,7 @@ from okto_grafx.domain.query.ast import (
     PatternPath,
     Property,
     Query,
+    RelationshipPattern,
     ReturnClause,
     ReturnItem,
     SetClause,
@@ -55,7 +57,10 @@ from okto_grafx.domain.query.ast import (
     walk,
 )
 from okto_grafx.domain.query.lexer import tokenize
-from okto_grafx.domain.query.limits import MAX_PARAMETERS
+from okto_grafx.domain.query.limits import (
+    MAX_PARAMETERS,
+    MAX_TRAVERSAL_HOPS,
+)
 from okto_grafx.domain.query.tokens import (
     TokenKind,
     AGGREGATE_FUNCTIONS,
@@ -267,6 +272,69 @@ NAMED_PATH_SHAPE: str = (
 """The only shape a named path is admitted in."""
 
 
+def hop_range_refusal(query: Query) -> tuple[str, str] | None:
+    """Return the refusal a hop range earns when it is not what the parser writes, or None.
+
+    The parser can only produce whole counts inside the bounds, so for parsed text this asks a
+    question that is already answered. It is asked anyway, at both doors, because a tree built
+    by hand reaches ``analyze`` and a caller's own analysis reaches ``build_plan`` -- and the
+    field this guards decides how far a traversal walks. A forged ``max_hops`` is not a wrong
+    answer; it is unbounded work, which is the one thing the bound exists to prevent.
+
+    Nothing here is interpolated into the message. A hostile object in these fields would be
+    asked to render itself while the refusal was being built, and a refusal that raises reports
+    nothing at all.
+    """
+    for relationship in _relationships_of(query):
+        if type(relationship.hop_range_written) is not bool:
+            return (
+                "A relationship records whether a hop range was written as a boolean.",
+                "hop_range_written",
+            )
+        if type(relationship.min_hops) is not int:
+            return (
+                "A hop range counts whole hops; its lower bound is an integer.",
+                "min_hops",
+            )
+        if type(relationship.max_hops) is not int:
+            return (
+                "A hop range counts whole hops; its upper bound is an integer.",
+                "max_hops",
+            )
+        if not 1 <= relationship.min_hops <= relationship.max_hops <= MAX_TRAVERSAL_HOPS:
+            return (
+                "A hop range runs from at least one hop to at most "
+                f"{MAX_TRAVERSAL_HOPS}, and starts at or below where it ends.",
+                "hops",
+            )
+        if not relationship.hop_range_written and (
+            relationship.min_hops != 1 or relationship.max_hops != 1
+        ):
+            # The counts say "many hops" and the flag says no range was written. One of the
+            # two is a lie, and the pair is how a forged tree would walk a range while looking
+            # like the single hop nothing checks.
+            return (
+                "A relationship that records no written hop range spans exactly one hop.",
+                "hop_range_written",
+            )
+    return None
+
+
+def _relationships_of(query: Query) -> Iterator[RelationshipPattern]:
+    """Yield every relationship pattern the statement carries, matched or written."""
+    for clause in query.match_clauses:
+        for pattern in clause.patterns:
+            yield from pattern.relationships
+    for clause in query.updating_clauses:
+        written: tuple[PatternPath, ...] = ()
+        if isinstance(clause, CreateClause):
+            written = clause.patterns
+        elif isinstance(clause, MergeClause):
+            written = (clause.pattern,)
+        for pattern in written:
+            yield from pattern.relationships
+
+
 def named_path(query: Query) -> PatternPath | None:
     """Return the path this query gives a name to, or None when it names none."""
     for clause in query.match_clauses:
@@ -475,6 +543,10 @@ class _Analyzer:
 
     def run(self) -> QueryAnalysis:
         """Analyse the whole query and return what the planner needs."""
+        refusal = hop_range_refusal(self._query)
+        if refusal is not None:
+            message, value = refusal
+            raise self._refuse(message, field="hops", value=value)
         refusal = named_path_refusal(self._query)
         if refusal is not None:
             message, value = refusal
