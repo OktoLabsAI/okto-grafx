@@ -411,16 +411,34 @@ def test_an_integer_one_past_the_range_is_refused_when_it_carries_no_sign() -> N
     assert failure.value.details["field"] == "integer"
 
 
-def test_an_unbounded_hop_range_is_refused() -> None:
-    with pytest.raises(GrafxParseError) as failure:
+def test_an_omitted_upper_bound_is_read_as_the_default_rather_than_as_none() -> None:
+    # The guarantee these two cases were written for -- a traversal is never unbounded -- is
+    # kept by giving the omission the bound the public endpoint already gives it, rather than
+    # by refusing the text. What would break the guarantee is an absent upper, and there is
+    # none: the pattern carries one either way.
+    hop = (
         parse("MATCH (a:Person)-[:Knows*]->(b:Person) RETURN a.id")
-    assert failure.value.details["field"] == "max_hops"
+        .match_clauses[0]
+        .patterns[0]
+        .relationships[0]
+    )
+    assert (hop.min_hops, hop.max_hops) == (1, 20)
 
 
-def test_a_hop_range_with_no_upper_bound_is_refused() -> None:
-    with pytest.raises(GrafxParseError) as failure:
+def test_a_hop_range_with_no_upper_bound_keeps_the_lower_one_it_wrote() -> None:
+    hop = (
         parse("MATCH (a:Person)-[:Knows*2..]->(b:Person) RETURN a.id")
-    assert failure.value.details["field"] == "max_hops"
+        .match_clauses[0]
+        .patterns[0]
+        .relationships[0]
+    )
+    assert (hop.min_hops, hop.max_hops) == (2, 20)
+
+
+def test_a_lower_bound_above_the_default_is_an_empty_range_and_refused() -> None:
+    with pytest.raises(GrafxParseError) as failure:
+        parse("MATCH (a:Person)-[:Knows*25..]->(b:Person) RETURN a.id")
+    assert failure.value.details["field"] == "min_hops"
 
 
 def test_a_hop_range_beyond_the_ceiling_is_refused() -> None:

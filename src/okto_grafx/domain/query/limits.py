@@ -73,11 +73,23 @@ MAX_PATTERN_ELEMENTS: int = 64
 """Nodes and relationships one pattern may chain, so a path cannot be arbitrarily long."""
 
 MAX_TRAVERSAL_HOPS: int = 30
-"""The largest upper bound a variable-length relationship may declare.
+"""The largest upper bound a variable-length relationship may DECLARE.
 
-The dialect requires an explicit upper bound: ``-[:Knows*1..3]->`` is expressible and a bare
-``*`` is not, because an unbounded traversal over a cyclic graph is exactly the shape that does
-not terminate. Thirty is the same ceiling the reference dialect applies when a query omits one.
+A traversal is always bounded, because an unbounded walk over a cyclic graph is exactly the
+shape that does not terminate. What a query may write explicitly reaches thirty; what it gets
+when it writes no upper bound at all is :data:`DEFAULT_TRAVERSAL_HOPS`, which is smaller. The
+two numbers answer different questions and are deliberately not the same one.
+"""
+
+DEFAULT_TRAVERSAL_HOPS: int = 20
+"""The upper bound a variable-length relationship takes when it omits one.
+
+Twenty, because that is what the public endpoint already applies: it rewrites ``*`` textually to
+``*..20`` from ``MAX_TRAVERSAL_DEPTH`` before a query reaches any engine -- a range whose own
+lower bound is still omitted, and which therefore means one to twenty. So a caller who omits the
+upper bound has been getting twenty hops all along. Adopting the same number is what makes the omission mean
+one thing rather than two, and it is a canonicalisation rather than a guess -- the accepted form
+is written back as the explicit range it became.
 """
 
 MAX_PROJECTION_ITEMS: int = 256

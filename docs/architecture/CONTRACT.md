@@ -902,7 +902,8 @@ class QueryEngine:
     def explain(self, text: str) -> "PlanNode"     # single operator tree, inspectable (AC-7)
 ```
 Cypher subset (openCypher, Kùzu dialect): `CREATE NODE TABLE` / `CREATE REL TABLE` /
-`CREATE VECTOR SPACE`, `CREATE`, `MATCH` (+ variable-length `-[:R*1..3]->`), `WHERE`, `RETURN`
+`CREATE VECTOR SPACE`, `CREATE`, `MATCH` (+ variable-length `-[:R*1..3]->`, and `-[:R*]->`
+for the default bound), `WHERE`, `RETURN`
 (`DISTINCT`, aliases), one leading `UNWIND`, non-aggregating `WITH` stages, `ORDER BY`, `SKIP`, `LIMIT`, `SET`, `DELETE`, `MERGE`, parameters `$name`,
 aggregates `count/sum/avg/min/max/collect`, the scalar functions `coalesce(value, ...)`,
 `string_split(text, separator)` and `size(value)`, and the similarity extension. `coalesce`
@@ -1018,6 +1019,23 @@ relationship of the same query already answers to. The form is exact: one `MATCH
 one named outgoing hop of one type with no written range and no inline map, both ends named and
 carrying exactly one label, and a `RETURN`. `name =` is read only inside a `MATCH`, so a written
 pattern cannot carry one; every other shape keeps the refusal it had.
+
+`MATCH (a:A)-[r:T*]->(b:B)` writes no upper bound, and does not mean an unbounded walk. The
+public endpoint rewrites `*` to twenty hops from its own `MAX_TRAVERSAL_DEPTH` before a query
+reaches any engine, so the omission already had one meaning; the engine reads it the same way.
+`*` and `*..` become `1..20`, `*n..` keeps the lower bound it wrote and takes twenty as its
+upper, and the accepted form is written back as the explicit range it became -- Pulse Core
+materialises `*..20`, which is the same traversal as `1..20`. A range that WRITES its upper
+bound is untouched and still reaches thirty, `MAX_TRAVERSAL_HOPS`, which is a different number
+from the default and answers a different question: what a query may ask for, rather than what it
+gets when it asks for nothing. `*25..` is refused, because twenty-five to twenty is an empty
+range, and so are a zero lower bound, an upper past thirty and a lower above its upper.
+
+A hop range that arrives in a tree the parser did not write is checked before anything walks it,
+at the analysis and again at the planner: the counts must be whole numbers, the range must run
+from one to thirty with the lower no greater than the upper, and a relationship that records no
+written range must span exactly one hop. A forged upper bound is not a wrong answer; it is
+unbounded work, which is what the bound exists to prevent.
 
 ```
 MATCH (n:Chunk)-[:BELONGS_TO]->(d:Doc)

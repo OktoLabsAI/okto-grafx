@@ -45,6 +45,7 @@ from okto_grafx.domain.query.analysis import (
     QueryAnalysis,
     SimilarityUse,
     analyze,
+    hop_range_refusal,
     named_path,
     named_path_refusal,
     polymorphic_node_refusal,
@@ -703,6 +704,10 @@ class _Planner:
 
     def _query(self, statement: Query) -> PlannedQuery:
         """Plan a reading and updating query."""
+        refusal = hop_range_refusal(statement)
+        if refusal is not None:
+            message, value = refusal
+            raise GrafxPlanError(message, field="hops", value=value)
         refusal = named_path_refusal(statement)
         if refusal is not None:
             message, value = refusal
