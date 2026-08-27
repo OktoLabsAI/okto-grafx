@@ -34,12 +34,14 @@ from okto_grafx.domain.query.limits import (
 )
 from okto_grafx.domain.query.ast import Literal, ReturnItem
 from okto_grafx.domain.query.plan import (
+    DistinctRows,
     FilterRows,
     NodeScan,
     PlanNode,
     ProduceResults,
     ProjectRows,
     SingleRow,
+    UnionRows,
     VectorSearch,
 )
 from okto_grafx.engine.database import Database, Transaction
@@ -92,7 +94,9 @@ class _ObservedSequence(Sequence[object]):
         return iter(self._values)
 
 
-def test_input_callbacks_finish_before_page_access_and_the_engine_gets_exact_values() -> None:
+def test_input_callbacks_finish_before_page_access_and_the_engine_gets_exact_values() -> (
+    None
+):
     events: list[tuple[str, bool]] = []
 
     class HostileText(str):
@@ -107,9 +111,7 @@ def test_input_callbacks_finish_before_page_access_and_the_engine_gets_exact_val
         values = _ObservedSequence((1,), observe)
         parameters = _ObservedMapping({"values": values}, observe)
         reader = database.begin("read")
-        result = reader.execute(
-            HostileText("RETURN 1 IN $values AS found"), parameters
-        )
+        result = reader.execute(HostileText("RETURN 1 IN $values AS found"), parameters)
         reader.rollback()
 
     assert result.rows == ((True,),)
@@ -234,7 +236,9 @@ def test_parameter_callback_failures_are_contained_but_process_signals_pass(
         def __getitem__(self, _key: str) -> object:
             return 1
 
-    expected = GrafxConfigurationError if isinstance(signal, Exception) else KeyboardInterrupt
+    expected = (
+        GrafxConfigurationError if isinstance(signal, Exception) else KeyboardInterrupt
+    )
     with connect(":memory:") as database:
         reader = database.begin("read")
         with pytest.raises(expected):
@@ -294,8 +298,14 @@ def test_list_map_string_and_parameter_limits_have_live_edges() -> None:
         "x": 1,
     }
     with connect(":memory:") as database:
-        assert len(database.execute("RETURN $x AS x", {"x": accepted_list}).rows[0][0]) == 1024
-        assert len(database.execute("RETURN $x AS x", {"x": accepted_map}).rows[0][0]) == 256
+        assert (
+            len(database.execute("RETURN $x AS x", {"x": accepted_list}).rows[0][0])
+            == 1024
+        )
+        assert (
+            len(database.execute("RETURN $x AS x", {"x": accepted_map}).rows[0][0])
+            == 256
+        )
         assert database.execute(
             "RETURN $x AS x", {"x": "s" * MAX_STRING_CHARACTERS}
         ).rows == (("s" * 16384,),)
@@ -329,9 +339,7 @@ def test_value_depth_limit_has_a_live_edge() -> None:
         )
         assert accepted.rows
         with pytest.raises(GrafxConfigurationError):
-            database.execute(
-                "RETURN $x AS x", {"x": _nested_list(MAX_VALUE_DEPTH + 1)}
-            )
+            database.execute("RETURN $x AS x", {"x": _nested_list(MAX_VALUE_DEPTH + 1)})
 
 
 def test_cycles_capabilities_and_canonical_key_collisions_are_refused() -> None:
@@ -452,11 +460,7 @@ def test_query_result_plan_callback_failures_have_stable_taxonomy(
         def children(self) -> tuple[PlanNode, ...]:
             raise failure
 
-    expected = (
-        GrafxPlanError
-        if isinstance(failure, Exception)
-        else type(failure)
-    )
+    expected = GrafxPlanError if isinstance(failure, Exception) else type(failure)
     with pytest.raises(expected) as caught:
         QueryResult(plan=HostilePlan())
     if isinstance(failure, GrafxPlanError) or not isinstance(failure, Exception):
@@ -569,7 +573,9 @@ def test_hostile_oversized_result_columns_and_statistics_are_refused_without_dis
             object.__setattr__(forged, "columns", columns)
             object.__setattr__(forged, "rows", rows)
             object.__setattr__(forged, "statistics", statistics)
-            monkeypatch.setattr(QueryEngine, "execute", lambda *_args, **_kwargs: forged)
+            monkeypatch.setattr(
+                QueryEngine, "execute", lambda *_args, **_kwargs: forged
+            )
             with pytest.raises(GrafxPlanError):
                 reader.execute("RETURN 1 AS x")
         reader.rollback()
@@ -699,6 +705,86 @@ def test_exact_plan_nodes_are_rebuilt_with_exact_scalar_tuple_and_schema_leaves(
     assert type(scan.table.columns) is tuple
     assert type(scan.table.columns[0]) is ColumnDef
     assert type(scan.table.columns[0].name) is str
+
+
+def test_union_operator_is_rebuilt_as_an_owned_exact_public_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_union = UnionRows(
+        left=SingleRow(),
+        right=SingleRow(),
+        columns=("value",),
+    )
+    raw = ProduceResults(
+        child=DistinctRows(child=raw_union),
+        columns=("value",),
+    )
+    monkeypatch.setattr(QueryEngine, "explain", lambda *_args: raw)
+
+    with connect(":memory:") as database:
+        observed = database.explain("RETURN 1 AS value")
+
+    assert type(observed) is ProduceResults
+    assert observed is not raw
+    distinct = observed.child
+    assert type(distinct) is DistinctRows
+    union = distinct.child
+    assert type(union) is UnionRows
+    assert union is not raw_union
+    assert union.left is not raw_union.left
+    assert union.right is not raw_union.right
+    assert union.columns == ("value",)
+
+
+@pytest.mark.parametrize("shape", ("shared", "cyclic"))
+def test_public_union_refuses_a_plan_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    shared = SingleRow()
+    union = UnionRows(left=shared, right=shared, columns=("value",))
+    if shape == "cyclic":
+        object.__setattr__(union, "left", union)
+    raw = ProduceResults(child=DistinctRows(child=union), columns=("value",))
+    monkeypatch.setattr(QueryEngine, "explain", lambda *_args: raw)
+
+    with connect(":memory:") as database:
+        with pytest.raises(GrafxPlanError):
+            database.explain("RETURN 1 AS value")
+
+
+def test_hostile_oversized_union_column_is_refused_without_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class HostileText(str):
+        def __str__(self) -> str:
+            events.append("text.__str__")
+            return str.__str__(self)
+
+        def __len__(self) -> int:
+            events.append("text.__len__")
+            return str.__len__(self)
+
+    raw = ProduceResults(
+        child=DistinctRows(
+            child=UnionRows(
+                left=SingleRow(),
+                right=SingleRow(),
+                columns=(HostileText("c" * (MAX_RENDERED_QUERY_CHARACTERS + 1)),),
+            )
+        ),
+        columns=("value",),
+    )
+    events.clear()
+    monkeypatch.setattr(QueryEngine, "explain", lambda *_args: raw)
+
+    with connect(":memory:") as database:
+        with pytest.raises(GrafxPlanError):
+            database.explain("RETURN 1 AS value")
+
+    assert events == []
 
 
 def test_hostile_oversized_plan_column_is_refused_without_dispatch(

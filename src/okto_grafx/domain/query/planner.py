@@ -33,7 +33,7 @@ Each is a refusal with a message that names the rule, never a silent partial ans
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from okto_grafx.domain.errors import GrafxEmbeddingSpaceMismatch, GrafxPlanError
 from okto_grafx.domain.index.definition import IndexDefinition
@@ -49,6 +49,7 @@ from okto_grafx.domain.query.analysis import (
     named_path,
     named_path_refusal,
     optional_match_refusal,
+    union_refusal,
     polymorphic_node_refusal,
 )
 from okto_grafx.domain.query.ast import (
@@ -82,6 +83,7 @@ from okto_grafx.domain.query.ast import (
     Statement,
     Subscript,
     UnaryOperation,
+    UnionQuery,
     UpdatingClause,
     Variable,
     WithClause,
@@ -115,11 +117,13 @@ from okto_grafx.domain.query.plan import (
     SkipRows,
     SortRows,
     TraverseRelationship,
+    UnionRows,
     UnwindRows,
     VectorSearch,
     WithRows,
     validate_plan,
 )
+from okto_grafx.domain.query.limits import MAX_EXPRESSION_DEPTH
 from okto_grafx.domain.query.tokens import (
     AGGREGATE_FUNCTIONS,
     COALESCE_FUNCTION,
@@ -345,6 +349,10 @@ class PlannedQuery:
         tuple[Subscript, tuple[ValueType | None, ValueType | None]], ...
     ] = ()
     pulse_expression_types: tuple[tuple[Expression, ValueType | None], ...] = ()
+    union_columns: tuple[
+        tuple[int, Expression, ValueType | None, Expression, ValueType | None], ...
+    ] = ()
+    union_unwind_sources: tuple[tuple[str, Expression] | None, ...] = ()
     label_calls: tuple[FunctionCall, ...] = ()
     timestamp_calls: tuple[FunctionCall, ...] = ()
 
@@ -384,6 +392,39 @@ def _conjoin(terms: Sequence[Expression]) -> Expression | None:
     return combined
 
 
+def union_common_type(
+    position: int, left: ValueType, right: ValueType
+) -> tuple[ValueType, bool]:
+    """Return the type one union column publishes, and whether to normalise ints to doubles.
+
+    ONE statement of the rule, asked twice: once here at planning, for a pair whose types are
+    both already proven, so ``build_plan`` and ``explain`` refuse an impossible union without
+    anyone running it; and once after the bind, for a pair that had a parameter in it and could
+    not be judged earlier. Two copies of this would be two places for the rule to drift, and the
+    drift would be silent -- a plan that accepts what execution rejects, or the reverse.
+
+    An identical pair keeps its type. NULL takes the other side, because a column that is null
+    on one side says nothing about what the column IS. INT64 beside DOUBLE widens to DOUBLE, and
+    the integers are normalised before the duplicates are removed, because 1 and 1.0 are one row
+    of a widened column and two rows of an unwidened one. Everything else is refused, notably
+    BOOL beside INT64: some dialects read those as one family and this one does not.
+    """
+    if left is right:
+        return left, left is ValueType.DOUBLE
+    if left is ValueType.NULL:
+        return right, right is ValueType.DOUBLE
+    if right is ValueType.NULL:
+        return left, left is ValueType.DOUBLE
+    numeric = (ValueType.INT64, ValueType.DOUBLE)
+    if left in numeric and right in numeric:
+        return ValueType.DOUBLE, True
+    message = (
+        f"Column {position + 1} of a UNION is {left.name} on the left and {right.name} on "
+        "the right, and this engine does not read those as one type."
+    )
+    raise GrafxPlanError(message, field="union", value="columns")
+
+
 def build_plan(
     statement: Statement,
     *,
@@ -420,12 +461,13 @@ class _Planner:
     polymorphic_variables: set[str] = field(default_factory=set)
     typed_endpoint_form: bool = False
     unwind_alias: str | None = None
+    unwind_source: Expression | None = None
     alias_definitions: dict[str, Expression] = field(default_factory=dict)
     label_calls: list[FunctionCall] = field(default_factory=list)
     timestamp_calls: list[FunctionCall] = field(default_factory=list)
-    coalesce_argument_types: dict[FunctionCall, tuple[ValueType | None, ...]] = field(
-        default_factory=dict
-    )
+    coalesce_argument_types: dict[
+        int, tuple[FunctionCall, tuple[ValueType | None, ...]]
+    ] = field(default_factory=dict)
     case_comparison_types: dict[
         int, tuple[CaseExpression, tuple[ValueType | None, ...]]
     ] = field(default_factory=dict)
@@ -436,6 +478,14 @@ class _Planner:
         int,
         tuple[Subscript, tuple[ValueType | None, ValueType | None]],
     ] = field(default_factory=dict)
+    union_columns: list[
+        tuple[int, Expression, ValueType | None, Expression, ValueType | None]
+    ] = field(default_factory=list)
+    union_type_aliases: dict[str, Expression] = field(default_factory=dict)
+    union_type_alias_depths: dict[str, int] = field(default_factory=dict)
+    union_unwind_sources: list[tuple[str, Expression] | None] = field(
+        default_factory=list
+    )
     pulse_expression_types: dict[int, tuple[Expression, ValueType | None]] = field(
         default_factory=dict
     )
@@ -451,6 +501,8 @@ class _Planner:
             return self._planned(self._rel_table(statement), writes=True)
         if isinstance(statement, CreateVectorSpaceStatement):
             return self._planned(self._vector_space(statement), writes=True)
+        if type(statement) is UnionQuery:
+            return self._union(statement)
         if isinstance(statement, Query):
             return self._query(statement)
         raise GrafxPlanError(
@@ -458,6 +510,452 @@ class _Planner:
             field="statement",
             value=type(statement).__name__,
         )
+
+    def _union(self, statement: UnionQuery) -> PlannedQuery:
+        """Plan two branches as one result, under the left branch's names.
+
+        Each branch is planned as the whole query it is, by a planner of its own reading its
+        own analysis, and then loses its ProduceResults: what a branch published to a caller is
+        exactly what the pair now consumes. Planning them through one shared planner instead
+        would let one branch's tables and aliases answer for the other's.
+
+        What the sub-planners LEARNED is kept, because binding happens once for the pair: the
+        types they proved, the calls they recorded, the metadata the engine reads before the
+        first row. Dropping it would leave the engine binding half a statement.
+        """
+        refusal = union_refusal(statement)
+        if refusal is not None:
+            message, value = refusal
+            raise GrafxPlanError(message, field="union", value=value)
+
+        # A caller may supply QueryAnalysis directly to build_plan.  That is an optimisation,
+        # never an authority: an incomplete object must not make the combined statement forget
+        # parameters or output columns from either branch.  Rebuild the small, catalog-free
+        # union summary after the planner's independent shape gate, so binding still covers the
+        # whole statement even when the supplied analysis was validly typed but incomplete.
+        self.analysis = analyze(statement)
+        pipelines: list[PlanNode] = []
+        branch_types: list[tuple[ValueType | None, ...]] = []
+        branch_type_expressions: list[tuple[Expression, ...]] = []
+        for branch in (statement.left, statement.right):
+            sub = _Planner(
+                catalog=self.catalog,
+                indexes=self.indexes,
+                analysis=analyze(branch),
+            )
+            root = sub.run(branch).root
+            if not isinstance(root, ProduceResults):
+                raise GrafxPlanError(
+                    "A branch of a UNION is a query that produces results; got "
+                    f"{root.label}.",
+                    field="union",
+                    value="branch",
+                )
+            pipelines.append(root.child)
+            # The types come from the branch's OWN planner, because that is where the tables
+            # of that branch are resolved: n.id is a STRING only to a planner that knows which
+            # table bound n, and the pair's planner never bound anything.
+            type_expressions = tuple(
+                sub._union_type_expression(item.expression)
+                for item in branch.return_clause.items
+            )
+            branch_type_expressions.append(type_expressions)
+            branch_types.append(
+                sub._projected_column_types(branch, expressions=type_expressions)
+            )
+            self.union_unwind_sources.append(
+                None
+                if sub.unwind_alias is None or sub.unwind_source is None
+                else (sub.unwind_alias, sub.unwind_source)
+            )
+            self._absorb(sub)
+        columns = statement.left.return_clause.column_names()
+        left_expressions, right_expressions = branch_type_expressions
+        for position, (left_type, right_type) in enumerate(
+            zip(branch_types[0], branch_types[1], strict=True)
+        ):
+            if left_type is not None and right_type is not None:
+                # Both sides are already proven, so the pair can be judged NOW: a union that
+                # could never produce a coherent column is refused by build_plan and by
+                # explain, without anyone having to run it.
+                union_common_type(position, left_type, right_type)
+            self.union_columns.append(
+                (
+                    position,
+                    left_expressions[position],
+                    left_type,
+                    right_expressions[position],
+                    right_type,
+                )
+            )
+        return self._planned(
+            ProduceResults(
+                child=DistinctRows(
+                    child=UnionRows(
+                        left=pipelines[0], right=pipelines[1], columns=columns
+                    )
+                ),
+                columns=columns,
+            ),
+            columns=columns,
+        )
+
+    def _absorb(self, other: "_Planner") -> None:
+        """Take over what a branch planner proved, so one bind covers the pair."""
+        self.coalesce_argument_types.update(other.coalesce_argument_types)
+        self.case_comparison_types.update(other.case_comparison_types)
+        self.case_result_types.update(other.case_result_types)
+        self.subscript_types.update(other.subscript_types)
+        self.pulse_expression_types.update(other.pulse_expression_types)
+        self.label_calls.extend(other.label_calls)
+        self.timestamp_calls.extend(other.timestamp_calls)
+
+    def _projected_column_types(
+        self,
+        statement: Query,
+        *,
+        expressions: tuple[Expression, ...] | None = None,
+    ) -> tuple[ValueType | None, ...]:
+        """Return the provable type of each column this branch returns, position by position.
+
+        ``None`` means "not provable HERE", and it is deliberately not an error: a parameter is
+        unknown until the call supplies it, and the bind that follows is where the pair finds
+        out. What this must never do is guess -- a column whose type nobody can prove is one the
+        two branches cannot be shown to agree about, and saying they agree is how a union starts
+        answering a string where the caller was promised a number.
+        """
+        returned = statement.return_clause
+        if returned is None:  # pragma: no cover - union_refusal settled this
+            return ()
+        selected = (
+            tuple(item.expression for item in returned.items)
+            if expressions is None
+            else expressions
+        )
+        if len(selected) != len(
+            returned.items
+        ):  # pragma: no cover - internal invariant
+            raise GrafxPlanError(
+                "A UNION branch must carry one typing expression per returned column.",
+                field="plan",
+                value="union_columns",
+            )
+        types: list[ValueType | None] = []
+        for position, expression in enumerate(selected):
+            owner = f"column {position + 1} of a UNION"
+            if self._union_output_contains_matched_row(expression):
+                message = (
+                    f"The value of {owner} contains a matched node or relationship, whose "
+                    "identity cannot be compared across UNION branches."
+                )
+                raise GrafxPlanError(message, field="union", value="columns")
+            try:
+                types.append(self._pulse_expression_type(expression, owner=owner))
+            except GrafxPlanError as unprovable:
+                # The one type engine already answers for labels, instants, aggregates and the
+                # scalar expressions; what it cannot type at all is a column the two branches
+                # could never be shown to agree about -- an entity or a path, which have no
+                # ValueType to compare. Translate the refusal rather than growing a second
+                # opinion beside it.
+                message = (
+                    f"The type of {owner} cannot be proven before rows are produced, so the "
+                    "two branches cannot be shown to agree about it."
+                )
+                raise GrafxPlanError(
+                    message, field="union", value="columns"
+                ) from unprovable
+        return tuple(types)
+
+    def _union_output_contains_matched_row(self, expression: Expression) -> bool:
+        """Return whether the published value can retain an owner-private row binding.
+
+        UNION eliminates duplicates before public values are detached.  Letting a binding hide
+        inside a list, map or aggregate would therefore compare its private table/record identity
+        and could publish two equal values afterwards.  Scalar consumers such as ``label(n)``,
+        ``n.id`` and ``size([n])`` are safe because their RESULT no longer contains the binding.
+        """
+        if isinstance(expression, Variable):
+            return self._matched_row(expression.name) or (
+                expression.name in self.multi_hop_variables
+            )
+        if isinstance(expression, (Literal, Parameter)):
+            return False
+        if isinstance(expression, Property):
+            selected = self._static_postfix_target(expression)
+            if selected is not expression:
+                return self._union_output_contains_matched_row(selected)
+            subject = expression.subject
+            if isinstance(subject, Variable) and self._matched_row(subject.name):
+                return False
+            if isinstance(subject, MapExpression):
+                entry = subject.entry(expression.key)
+                return (
+                    False
+                    if entry is None
+                    else self._union_output_contains_matched_row(entry)
+                )
+            return self._union_output_contains_matched_row(subject)
+        if isinstance(expression, Subscript):
+            selected = self._static_postfix_target(expression)
+            if selected is not expression:
+                return self._union_output_contains_matched_row(selected)
+            subject = expression.subject
+            if isinstance(subject, ListExpression):
+                index = expression.index
+                if (
+                    isinstance(index, Literal)
+                    and isinstance(index.value, int)
+                    and not isinstance(index.value, bool)
+                    and index.value != 0
+                ):
+                    offset = index.value - 1 if index.value > 0 else index.value
+                    if -len(subject.elements) <= offset < len(subject.elements):
+                        return self._union_output_contains_matched_row(
+                            subject.elements[offset]
+                        )
+                return any(
+                    self._union_output_contains_matched_row(element)
+                    for element in subject.elements
+                )
+            return self._union_output_contains_matched_row(subject)
+        if isinstance(expression, (NullCheck, UnaryOperation, BinaryOperation)):
+            return False
+        if isinstance(expression, FunctionCall):
+            name = expression.name.upper()
+            if name in {
+                STRING_SPLIT_FUNCTION,
+                LABEL_FUNCTION,
+                TIMESTAMP_FUNCTION,
+                SIZE_FUNCTION,
+                SIMILARITY_FUNCTION,
+                SIMILARITY_SCORE_FUNCTION,
+                "COUNT",
+                "SUM",
+                "AVG",
+            }:
+                return False
+            return any(
+                self._union_output_contains_matched_row(argument)
+                for argument in expression.arguments
+            ) or any(
+                self._union_output_contains_matched_row(argument.value)
+                for argument in expression.named_arguments
+            )
+        if isinstance(expression, ListExpression):
+            return any(
+                self._union_output_contains_matched_row(element)
+                for element in expression.elements
+            )
+        if isinstance(expression, MapExpression):
+            return any(
+                self._union_output_contains_matched_row(entry.value)
+                for entry in expression.entries
+            )
+        if isinstance(expression, CaseExpression):
+            return any(
+                self._union_output_contains_matched_row(alternative.result)
+                for alternative in expression.alternatives
+            ) or (
+                expression.fallback is not None
+                and self._union_output_contains_matched_row(expression.fallback)
+            )
+        return False
+
+    def _union_type_expression(
+        self,
+        expression: Expression,
+        *,
+        active_aliases: frozenset[str] = frozenset(),
+        typing_depth: int = 0,
+    ) -> Expression:
+        """Return a non-executable expression that exposes WITH aliases to UNION typing.
+
+        A branch still executes its original RETURN expression against the row projected by
+        ``WITH``.  The pre-stream type proof has a different need: postfix access such as
+        ``WITH $map AS m RETURN m.key`` must be seen as ``$map.key`` so the ordinary binder can
+        inspect the supplied map before either branch is read.  Rebuilding only nodes whose
+        children change preserves every schema-derived type attached to untouched AST nodes.
+        """
+        if typing_depth > MAX_EXPRESSION_DEPTH:
+            raise GrafxPlanError(
+                f"A UNION typing expression may nest at most {MAX_EXPRESSION_DEPTH} "
+                "levels after WITH aliases are resolved.",
+                field="depth",
+                value=MAX_EXPRESSION_DEPTH,
+            )
+        if isinstance(expression, Variable):
+            definition = self.alias_definitions.get(expression.name)
+            if definition is None:
+                return expression
+            cached = self.union_type_aliases.get(expression.name)
+            if cached is not None:
+                if (
+                    typing_depth + self.union_type_alias_depths[expression.name]
+                    > MAX_EXPRESSION_DEPTH
+                ):
+                    raise GrafxPlanError(
+                        f"A UNION typing expression may nest at most "
+                        f"{MAX_EXPRESSION_DEPTH} levels after WITH aliases are resolved.",
+                        field="depth",
+                        value=MAX_EXPRESSION_DEPTH,
+                    )
+                return cached
+            if expression.name in active_aliases:
+                raise GrafxPlanError(
+                    "A UNION branch contains a cyclic WITH alias definition.",
+                    field="plan",
+                    value=expression.name,
+                )
+            resolved = self._union_type_expression(
+                definition,
+                active_aliases=active_aliases | {expression.name},
+                typing_depth=typing_depth,
+            )
+            # One immutable node may stand behind every occurrence of an alias.  Keeping that
+            # sharing turns a chain such as ``aN = aN-1 + aN-1`` into a linear DAG instead of
+            # materialising an exponentially large typing tree.
+            self.union_type_aliases[expression.name] = resolved
+            self.union_type_alias_depths[expression.name] = self._expression_depth(
+                resolved
+            )
+            return resolved
+
+        def expanded(child: Expression) -> Expression:
+            return self._union_type_expression(
+                child,
+                active_aliases=active_aliases,
+                typing_depth=typing_depth + 1,
+            )
+
+        if isinstance(expression, Property):
+            subject = expanded(expression.subject)
+            return (
+                expression
+                if subject is expression.subject
+                else replace(expression, subject=subject)
+            )
+        if isinstance(expression, UnaryOperation):
+            operand = expanded(expression.operand)
+            return (
+                expression
+                if operand is expression.operand
+                else replace(expression, operand=operand)
+            )
+        if isinstance(expression, BinaryOperation):
+            left = expanded(expression.left)
+            right = expanded(expression.right)
+            if left is expression.left and right is expression.right:
+                return expression
+            return replace(expression, left=left, right=right)
+        if isinstance(expression, NullCheck):
+            operand = expanded(expression.operand)
+            return (
+                expression
+                if operand is expression.operand
+                else replace(expression, operand=operand)
+            )
+        if isinstance(expression, Subscript):
+            subject = expanded(expression.subject)
+            index = expanded(expression.index)
+            if subject is expression.subject and index is expression.index:
+                return expression
+            return replace(expression, subject=subject, index=index)
+        if isinstance(expression, FunctionCall):
+            arguments = tuple(expanded(argument) for argument in expression.arguments)
+            named_arguments = tuple(
+                argument
+                if (value := expanded(argument.value)) is argument.value
+                else replace(argument, value=value)
+                for argument in expression.named_arguments
+            )
+            if all(
+                new is old
+                for new, old in zip(arguments, expression.arguments, strict=True)
+            ) and all(
+                new is old
+                for new, old in zip(
+                    named_arguments, expression.named_arguments, strict=True
+                )
+            ):
+                return expression
+            return replace(
+                expression,
+                arguments=arguments,
+                named_arguments=named_arguments,
+            )
+        if isinstance(expression, ListExpression):
+            elements = tuple(expanded(element) for element in expression.elements)
+            if all(
+                new is old
+                for new, old in zip(elements, expression.elements, strict=True)
+            ):
+                return expression
+            return replace(expression, elements=elements)
+        if isinstance(expression, MapExpression):
+            entries = tuple(
+                entry
+                if (value := expanded(entry.value)) is entry.value
+                else replace(entry, value=value)
+                for entry in expression.entries
+            )
+            if all(
+                new is old for new, old in zip(entries, expression.entries, strict=True)
+            ):
+                return expression
+            return replace(expression, entries=entries)
+        if isinstance(expression, CaseExpression):
+            operand = (
+                None if expression.operand is None else expanded(expression.operand)
+            )
+            alternatives_list = []
+            for alternative in expression.alternatives:
+                condition = expanded(alternative.condition)
+                result = expanded(alternative.result)
+                alternatives_list.append(
+                    alternative
+                    if condition is alternative.condition
+                    and result is alternative.result
+                    else replace(alternative, condition=condition, result=result)
+                )
+            alternatives = tuple(alternatives_list)
+            fallback = (
+                None if expression.fallback is None else expanded(expression.fallback)
+            )
+            if (
+                operand is expression.operand
+                and fallback is expression.fallback
+                and all(
+                    new is old
+                    for new, old in zip(
+                        alternatives, expression.alternatives, strict=True
+                    )
+                )
+            ):
+                return expression
+            return replace(
+                expression,
+                operand=operand,
+                alternatives=alternatives,
+                fallback=fallback,
+            )
+        return expression
+
+    @staticmethod
+    def _expression_depth(expression: Expression) -> int:
+        """Return the longest child path in one already-bounded immutable expression DAG."""
+        depths: dict[int, int] = {}
+
+        def depth(node: Expression) -> int:
+            marker = id(node)
+            known = depths.get(marker)
+            if known is not None:
+                return known
+            children = node.children()
+            answer = 0 if not children else 1 + max(depth(child) for child in children)
+            depths[marker] = answer
+            return answer
+
+        return depth(expression)
 
     def _planned(
         self, root: PlanNode, *, columns: tuple[str, ...] = (), writes: bool = False
@@ -468,11 +966,13 @@ class _Planner:
             analysis=self.analysis,
             columns=columns,
             writes=writes,
-            coalesce_argument_types=tuple(self.coalesce_argument_types.items()),
+            coalesce_argument_types=tuple(self.coalesce_argument_types.values()),
             case_comparison_types=tuple(self.case_comparison_types.values()),
             case_result_types=tuple(self.case_result_types.values()),
             subscript_types=tuple(self.subscript_types.values()),
             pulse_expression_types=tuple(self.pulse_expression_types.values()),
+            union_columns=tuple(self.union_columns),
+            union_unwind_sources=tuple(self.union_unwind_sources),
             label_calls=tuple(self.label_calls),
             timestamp_calls=tuple(self.timestamp_calls),
         )
@@ -728,6 +1228,7 @@ class _Planner:
         if statement.unwind_clause is not None:
             self._require_batch_shape(statement)
             self.unwind_alias = statement.unwind_clause.alias
+            self.unwind_source = statement.unwind_clause.expression
             pipeline = UnwindRows(
                 child=pipeline,
                 alias=statement.unwind_clause.alias,
@@ -834,7 +1335,11 @@ class _Planner:
                     for argument in node.arguments
                 )
                 coalesce_result_type(node.name, types)
-                self.coalesce_argument_types[node] = types
+                # FunctionCall is a frozen dataclass, so two separately parsed calls with the
+                # same text compare equal.  Their schema context need not be equal: UNION
+                # branches may deliberately reuse ``n`` for different tables.  Metadata is
+                # therefore owned by the AST occurrence, never by structural equality.
+                self.coalesce_argument_types[id(node)] = (node, types)
 
     def _require_batch_shape(self, statement: Query) -> None:
         """Refuse any tail this batch subset does not carry.
@@ -1097,8 +1602,15 @@ class _Planner:
             if definition is not None:
                 # An alias is exactly as knowable as what it was projected from.
                 return self._pulse_expression_type(definition, owner=owner)
+            if expression.name == self.unwind_alias:
+                return self._unwind_static_element_type(owner=owner)
         if isinstance(expression, Property):
+            target = self._static_postfix_target(expression)
+            if target is not expression:
+                return self._pulse_expression_type(target, owner=owner)
             if isinstance(expression.subject, Variable):
+                if expression.subject.name == self.unwind_alias:
+                    return self._unwind_static_postfix_type(expression, owner=owner)
                 if expression.subject.name in self.polymorphic_variables:
                     return self._polymorphic_property_type(expression.key, owner)
                 table = self.tables.get(expression.subject.name)
@@ -1120,6 +1632,11 @@ class _Planner:
                         value=expression.key,
                     )
                 return column.type
+            if (
+                isinstance(expression.subject, Literal)
+                and expression.subject.value is None
+            ):
+                return ValueType.NULL
             if isinstance(expression.subject, MapExpression):
                 entry = expression.subject.entry(expression.key)
                 if entry is None:
@@ -1208,7 +1725,13 @@ class _Planner:
                 return ValueType.INT64
             if name in (SIMILARITY_FUNCTION, SIMILARITY_SCORE_FUNCTION, "AVG"):
                 return ValueType.DOUBLE
-            if name in ("SUM", "MIN", "MAX"):
+            if name == "SUM":
+                # The accumulator keeps a floating total and the public engine already returns
+                # SUM as DOUBLE (including for INT64 inputs).  Advertising the argument type
+                # made UNION leave an integer peer unwidened, so 1.0 and 1 survived one global
+                # DISTINCT as two rows.
+                return ValueType.DOUBLE
+            if name in ("MIN", "MAX"):
                 return self._pulse_expression_type(expression.arguments[0], owner=owner)
             if name == "COLLECT":
                 return ValueType.LIST
@@ -1224,6 +1747,8 @@ class _Planner:
         if isinstance(expression, MapExpression):
             return ValueType.MAP
         if isinstance(expression, Subscript):
+            if self._unwind_postfix_rooted(expression):
+                return self._unwind_static_postfix_type(expression, owner=owner)
             target = self._static_postfix_target(expression)
             if target is not expression:
                 return self._pulse_expression_type(target, owner=owner)
@@ -1266,6 +1791,16 @@ class _Planner:
             planned = self.case_result_types.get(id(expression))
             if planned is not None:
                 return case_result_type(expression, planned[1])
+            # UNION typing may carry a non-executable clone whose WITH aliases have been
+            # expanded.  Its executable CASE was already validated when the branch plan was
+            # built, but metadata is identity-keyed to that original node.  Infer the clone's
+            # result arms directly so the separate pre-stream proof does not depend on an id
+            # that deliberately changed.
+            result_types = tuple(
+                self._pulse_expression_type(result, owner=owner)
+                for result in expression.result_expressions()
+            )
+            return case_result_type(expression, result_types)
         message = (
             f"{owner} needs a scalar expression whose type is known; got "
             f"{expression.describe()}."
@@ -1276,6 +1811,86 @@ class _Planner:
             value=expression.describe(),
         )
 
+    def _unwind_static_element_type(self, *, owner: str) -> ValueType | None:
+        """Return the common type of every written UNWIND element, when knowable."""
+        source = self.unwind_source
+        if isinstance(source, FunctionCall) and (
+            source.name.upper() == STRING_SPLIT_FUNCTION
+        ):
+            return ValueType.STRING
+        if not isinstance(source, ListExpression) or not source.elements:
+            return None
+        element_types = tuple(
+            self._pulse_expression_type(element, owner=owner)
+            for element in source.elements
+        )
+        if any(value_type is None for value_type in element_types):
+            return None
+        common = element_types[0]
+        assert common is not None  # narrowed by the guard above
+        for value_type in element_types[1:]:
+            assert value_type is not None  # narrowed by the guard above
+            common, _normalise = union_common_type(0, common, value_type)
+        return common
+
+    def _unwind_static_postfix_type(
+        self,
+        expression: Expression,
+        *,
+        owner: str,
+    ) -> ValueType | None:
+        """Type one postfix selection over every written element of an UNWIND list."""
+        source = self.unwind_source
+        if not isinstance(source, ListExpression) or not source.elements:
+            return None
+        selected_types = tuple(
+            self._pulse_expression_type(
+                self._replace_unwind_alias(expression, element),
+                owner=owner,
+            )
+            for element in source.elements
+        )
+        if any(value_type is None for value_type in selected_types):
+            return None
+        common = selected_types[0]
+        assert common is not None  # narrowed by the guard above
+        for value_type in selected_types[1:]:
+            assert value_type is not None  # narrowed by the guard above
+            common, _normalise = union_common_type(0, common, value_type)
+        return common
+
+    def _replace_unwind_alias(
+        self,
+        expression: Expression,
+        replacement: Expression,
+    ) -> Expression:
+        """Replace the root UNWIND alias in one typing-only postfix expression."""
+        if isinstance(expression, Variable):
+            return replacement if expression.name == self.unwind_alias else expression
+        if isinstance(expression, Property):
+            subject = self._replace_unwind_alias(expression.subject, replacement)
+            return (
+                expression
+                if subject is expression.subject
+                else replace(expression, subject=subject)
+            )
+        if isinstance(expression, Subscript):
+            subject = self._replace_unwind_alias(expression.subject, replacement)
+            return (
+                expression
+                if subject is expression.subject
+                else replace(expression, subject=subject)
+            )
+        return expression
+
+    def _unwind_postfix_rooted(self, expression: Expression) -> bool:
+        """Whether one postfix chain starts at this query's UNWIND alias."""
+        if isinstance(expression, Variable):
+            return expression.name == self.unwind_alias
+        if isinstance(expression, (Property, Subscript)):
+            return self._unwind_postfix_rooted(expression.subject)
+        return False
+
     def _alias_definition(self, expression: Expression) -> Expression:
         """Resolve a WITH alias to the expression it was projected from, or leave it alone."""
         if not isinstance(expression, Variable):
@@ -1285,18 +1900,15 @@ class _Planner:
 
     def _static_postfix_target(self, expression: Expression) -> Expression:
         """Resolve map-dot and literal-list postfixes when their target is written in the AST."""
-        if isinstance(expression, Property) and isinstance(
-            expression.subject, MapExpression
-        ):
-            entry = expression.subject.entry(expression.key)
-            return entry if entry is not None else expression
+        if isinstance(expression, Property):
+            subject = self._static_postfix_target(expression.subject)
+            if isinstance(subject, MapExpression):
+                entry = subject.entry(expression.key)
+                return entry if entry is not None else expression
+            return expression
         if not isinstance(expression, Subscript):
             return expression
         subject = self._static_postfix_target(expression.subject)
-        if isinstance(subject, Property) and isinstance(subject.subject, MapExpression):
-            entry = subject.subject.entry(subject.key)
-            if entry is not None:
-                subject = entry
         if not isinstance(subject, ListExpression):
             return expression
         if not isinstance(expression.index, Literal):

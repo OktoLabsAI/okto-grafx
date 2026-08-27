@@ -64,6 +64,7 @@ from okto_grafx.domain.query.ast import (
     Subscript,
     UnaryOperation,
     UnwindClause,
+    UnionQuery,
     UpdatingClause,
     Variable,
     WithClause,
@@ -119,7 +120,17 @@ divergence rather than a silent one.
 """
 
 COLUMN_TYPE_NAMES: frozenset[str] = frozenset(
-    {"INT64", "STRING", "DOUBLE", "BOOL", "BOOLEAN", "BLOB", "UUID", "TIMESTAMP", VECTOR_TYPE_NAME}
+    {
+        "INT64",
+        "STRING",
+        "DOUBLE",
+        "BOOL",
+        "BOOLEAN",
+        "BLOB",
+        "UUID",
+        "TIMESTAMP",
+        VECTOR_TYPE_NAME,
+    }
 )
 """The column types the DDL accepts, folded to upper case."""
 
@@ -281,7 +292,58 @@ class _Parser:
                 return self._create_rel_table()
             if self._at_keyword("VECTOR", 1) and self._at_keyword("SPACE", 2):
                 return self._create_vector_space()
-        return self._query()
+        left = self._query()
+        if not self._at_keyword("UNION"):
+            return left
+        return self._union(left)
+
+    def _union(self, left: Query) -> UnionQuery:
+        """Parse ``UNION right``, having already read the left branch.
+
+        The left branch stopped at the word rather than consuming it, because whether UNION may
+        appear at all is a question about the STATEMENT and the clause loop only knows about
+        clauses.
+        """
+        self._take_keyword("UNION")
+        if self._at_keyword("ALL"):
+            # Refused by name rather than by falling through to a puzzling word: UNION ALL is
+            # the form that keeps duplicates, and this subset has exactly one union and it
+            # deduplicates. A caller who wrote ALL asked for the other one.
+            raise self._refuse(
+                "UNION in this subset removes duplicates; UNION ALL is not supported",
+                field="clause",
+                value="UNION ALL",
+            )
+        right = self._query()
+        for branch in (left, right):
+            if any(clause.optional for clause in branch.match_clauses):
+                # The narrow root OPTIONAL form deliberately excludes composition with UNION.
+                # Keep that old parser-phase refusal even though UNION itself now has a tree.
+                raise self._refuse(
+                    "An OPTIONAL MATCH is not composed with UNION in this subset",
+                    field="clause",
+                    value="UNION",
+                )
+            if branch.updating_clauses:
+                # Refused HERE and not only by the union gate above, because this text earned a
+                # parse refusal before a union could be written at all: moving it to the
+                # analysis would change the phase a caller sees for a query nobody asked to
+                # change.
+                raise self._refuse(
+                    "A UNION joins two queries that only read; neither branch may write",
+                    field="clause",
+                    value="UNION",
+                )
+        if self._at_keyword("UNION"):
+            # The third branch is refused HERE, where the word is, rather than by the statement
+            # gate above: a message that points at the second UNION is the one a caller can act
+            # on, and the recursion this avoids is what would otherwise nest.
+            raise self._refuse(
+                "A UNION in this subset joins exactly two queries",
+                field="clause",
+                value="UNION",
+            )
+        return UnionQuery(left=left, right=right)
 
     def _create_node_table(self) -> CreateNodeTableStatement:
         """Parse ``CREATE NODE TABLE name(columns, PRIMARY KEY(column))``."""
@@ -396,7 +458,11 @@ class _Parser:
         return_clause: ReturnClause | None = None
         clauses = 0
         optional_root = False
-        while self._current.kind is not TokenKind.END and not self._at_symbol(";"):
+        while (
+            self._current.kind is not TokenKind.END
+            and not self._at_symbol(";")
+            and not self._at_keyword("UNION")
+        ):
             clauses += 1
             if clauses > MAX_CLAUSES:
                 raise self._refuse(
@@ -914,10 +980,15 @@ class _Parser:
             if token.text in _SUM_SYMBOLS:
                 return _Operator(text=token.text, precedence=PRECEDENCE_SUM, tokens=1)
             if token.text in _PRODUCT_SYMBOLS:
-                return _Operator(text=token.text, precedence=PRECEDENCE_PRODUCT, tokens=1)
+                return _Operator(
+                    text=token.text, precedence=PRECEDENCE_PRODUCT, tokens=1
+                )
             if token.text == "^":
                 return _Operator(
-                    text="^", precedence=PRECEDENCE_POWER, tokens=1, right_associative=True
+                    text="^",
+                    precedence=PRECEDENCE_POWER,
+                    tokens=1,
+                    right_associative=True,
                 )
             return None
         if token.kind is not TokenKind.NAME or token.quoted:
@@ -932,11 +1003,17 @@ class _Parser:
         if word == "IN":
             return _Operator(text="IN", precedence=PRECEDENCE_COMPARISON, tokens=1)
         if word == "CONTAINS":
-            return _Operator(text="CONTAINS", precedence=PRECEDENCE_COMPARISON, tokens=1)
+            return _Operator(
+                text="CONTAINS", precedence=PRECEDENCE_COMPARISON, tokens=1
+            )
         if word == "STARTS" and self._at_keyword("WITH", 1):
-            return _Operator(text="STARTS WITH", precedence=PRECEDENCE_COMPARISON, tokens=2)
+            return _Operator(
+                text="STARTS WITH", precedence=PRECEDENCE_COMPARISON, tokens=2
+            )
         if word == "ENDS" and self._at_keyword("WITH", 1):
-            return _Operator(text="ENDS WITH", precedence=PRECEDENCE_COMPARISON, tokens=2)
+            return _Operator(
+                text="ENDS WITH", precedence=PRECEDENCE_COMPARISON, tokens=2
+            )
         return None
 
     def _prefix(self) -> Expression:

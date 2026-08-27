@@ -83,6 +83,7 @@ WORDS: tuple[str, ...] = (
     "MATCH",
     "OPTIONAL",
     "RETURN",
+    "UNION",
     "WHERE",
     "CREATE",
     "MERGE",
@@ -222,7 +223,11 @@ def _mutate(generator: SplitMix64, text: str) -> str:
     if choice == 1:
         return text[:position] + text[position] + text[position:]
     if choice == 2:
-        return text[:position] + ALPHABET[generator.next_below(len(ALPHABET))] + text[position + 1 :]
+        return (
+            text[:position]
+            + ALPHABET[generator.next_below(len(ALPHABET))]
+            + text[position + 1 :]
+        )
     if position + 1 >= len(text):
         return text
     return text[:position] + text[position + 1] + text[position] + text[position + 2 :]
@@ -239,7 +244,9 @@ def _check(text: str, label: str) -> None:
             f"{label} escaped the parser as {type(failure).__name__}: {failure!r}\n"
             f"text={text!r}"
         ) from failure
-    assert isinstance(statement, Statement), f"{label} produced {type(statement).__name__}"
+    assert isinstance(statement, Statement), (
+        f"{label} produced {type(statement).__name__}"
+    )
 
 
 def _check_downstream(text: str, label: str) -> None:
@@ -303,7 +310,9 @@ def test_mutated_queries_never_escape_the_taxonomy_downstream(seed: int) -> None
 
 
 @pytest.mark.parametrize("text", VALID, ids=range(len(VALID)))
-def test_every_truncation_of_a_valid_query_is_answered_in_the_taxonomy(text: str) -> None:
+def test_every_truncation_of_a_valid_query_is_answered_in_the_taxonomy(
+    text: str,
+) -> None:
     for cut in range(len(text) + 1):
         _check(text[:cut], f"truncation at {cut}")
 
@@ -338,13 +347,22 @@ ATTACKS: tuple[tuple[str, str], ...] = (
     ("many tokens", "RETURN " + "+" * 60000),
     ("many commas", "RETURN 1" + ",1" * 20000),
     ("many patterns", "MATCH " + ",".join(["(p:Person)"] * 5000) + " RETURN 1"),
-    ("long pattern chain", "MATCH (a:Person)" + "-[:Knows]->(b:Person)" * 3000 + " RETURN 1"),
+    (
+        "long pattern chain",
+        "MATCH (a:Person)" + "-[:Knows]->(b:Person)" * 3000 + " RETURN 1",
+    ),
     ("deep property chain", "MATCH (p:Person) RETURN p" + ".a" * 20000),
     ("null bytes", "RETURN " + "\x00" * 1000),
     ("carriage returns", "RETURN 1" + "\r\n" * 20000),
-    ("high code points", "RETURN " + "".join(chr(0x1F600 + index % 32) for index in range(2000))),
+    (
+        "high code points",
+        "RETURN " + "".join(chr(0x1F600 + index % 32) for index in range(2000)),
+    ),
     ("surrogate escapes", "RETURN '" + r"\ud800" * 2000 + "'"),
-    ("at the length ceiling", "RETURN " + "1 + " * ((MAX_QUERY_CHARACTERS - 8) // 4) + "1"),
+    (
+        "at the length ceiling",
+        "RETURN " + "1 + " * ((MAX_QUERY_CHARACTERS - 8) // 4) + "1",
+    ),
     ("past the length ceiling", "x" * (MAX_QUERY_CHARACTERS + 1)),
     ("only whitespace", " \t\r\n" * 5000),
     ("only comments", "// nothing\n" * 5000),
@@ -357,7 +375,10 @@ ATTACKS: tuple[tuple[str, str], ...] = (
     ("an astral character inside a name", "RETURN abc" + chr(0x1F600)),
     ("a combining mark after a name", "RETURN abc" + chr(0x0301)),
     ("a right-to-left mark in a predicate", "RETURN 1 " + chr(0x200F) + "= 1"),
-    ("a line separator in a string", "RETURN " + chr(39) + chr(0x2028) * 2000 + chr(39)),
+    (
+        "a line separator in a string",
+        "RETURN " + chr(39) + chr(0x2028) * 2000 + chr(39),
+    ),
     ("an astral back-quoted name", "RETURN `" + chr(0x1F600) * 200 + "`"),
     ("an unterminated astral string", "RETURN " + chr(39) + chr(0x1F600) * 20000),
     ("the last code point, repeated", "RETURN " + chr(0x10FFFF) * 2000),
@@ -366,12 +387,16 @@ ATTACKS: tuple[tuple[str, str], ...] = (
 
 
 @pytest.mark.parametrize("label,text", ATTACKS, ids=[label for label, _ in ATTACKS])
-def test_a_structured_attack_is_answered_rather_than_survived(label: str, text: str) -> None:
+def test_a_structured_attack_is_answered_rather_than_survived(
+    label: str, text: str
+) -> None:
     _check(text, f"attack {label}")
 
 
 @pytest.mark.parametrize("label,text", ATTACKS, ids=[label for label, _ in ATTACKS])
-def test_a_structured_attack_is_answered_by_the_planner_too(label: str, text: str) -> None:
+def test_a_structured_attack_is_answered_by_the_planner_too(
+    label: str, text: str
+) -> None:
     _check_downstream(text, f"attack {label}")
 
 

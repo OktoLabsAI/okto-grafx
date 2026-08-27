@@ -70,7 +70,7 @@ This keeps an unsupported family useful: closing the language gap must change th
 ## Counts at `pulse-1`
 
 `97` entries, digest
-`905b29bdb503d77c9ad56878d50586866e1c013e31a00dfbd8793bf9293c484c`.
+`8963b64ab073d13f84d216cd58ce7f1c683c74b1a1e8dfdcd4897c3c6fd8002f`.
 
 The engine currently classifies 82 entries as `already_supported` and 13 as `generic_gap`;
 the duplicate and declared fragment remain separate classifications.
@@ -107,18 +107,24 @@ endpoint** admits; `engine_verdict` is what **this engine** does with the NFKC-n
 that endpoint actually delivers. They differ on purpose: the contract blacklists writes,
 while the engine accepts writes because the internal port needs them. Today the contract
 allows 73 probes and refuses 14 (10 `unsafe_cypher`, 4 `unsupported_operation`); the engine
-accepts 76 and refuses 11. The intersection that matters to the public endpoint is the 3
+accepts 77 and refuses 10. The intersection that matters to the public endpoint is the 2
 allowed probes the engine still refuses.
 
 ### What M-PULSE-2 owes
 
-These 3 constructs are admitted by the public contract and refused by the engine:
+These 2 constructs are admitted by the public contract and refused by the engine:
 
 | Construct | Category | Refused at |
 | --- | --- | --- |
-| `UNION` | clause | parse error |
 | `untyped relationship` | pattern | plan error |
 | `path projection` | result | analysis error |
+
+M-PULSE-2M removed `UNION` from this table with one deliberately closed form: exactly two
+top-level read-only branches ending in `RETURN`, equal arity, names from the left branch and a
+single global distinct. `UNION ALL`, chaining, nesting and writing branches remain explicit
+refusals. Both branches share one bind, transaction, snapshot and execution budget; `INT64`
+beside `DOUBLE` widens before duplicate removal, while incompatible or unprovable column types
+are refused before either stream is read.
 
 M-PULSE-2L removed two false gaps without widening the Grafx grammar. The Core public boundary
 now refuses trailing `CALL`/`YIELD` as `unsupported_operation`, while keeping blacklist writes

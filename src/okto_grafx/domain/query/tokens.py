@@ -155,6 +155,7 @@ KEYWORDS: frozenset[str] = frozenset(
         "THEN",
         "TO",
         "TRUE",
+        "UNION",
         "UNWIND",
         "VECTOR",
         "WHERE",

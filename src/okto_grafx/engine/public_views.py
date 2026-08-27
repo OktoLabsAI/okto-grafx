@@ -119,6 +119,7 @@ from okto_grafx.domain.query.plan import (
     SkipRows,
     SortRows,
     TraverseRelationship,
+    UnionRows,
     UnwindRows,
     VectorSearch,
     WithRows,
@@ -1628,7 +1629,9 @@ def _query_parameters_snapshot(
     for position, (raw_name, raw_value) in enumerate(
         _bounded_mapping_pairs(value, limit=MAX_PARAMETERS, field="parameters")
     ):
-        name = _builtin_text(raw_name, field=f"parameters[{position}].name", empty=False)
+        name = _builtin_text(
+            raw_name, field=f"parameters[{position}].name", empty=False
+        )
         if len(name) > MAX_NAME_CHARACTERS:
             raise GrafxConfigurationError(
                 f"A parameter name may carry at most {MAX_NAME_CHARACTERS} characters.",
@@ -1888,6 +1891,7 @@ _QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
         SkipRows,
         SortRows,
         TraverseRelationship,
+        UnionRows,
         UnwindRows,
         VectorSearch,
         WithRows,
@@ -2039,7 +2043,10 @@ def _query_plan_dataclass_snapshot(
             field="plan",
             value="cycle",
         )
-    if expected in _QUERY_PLAN_EXPRESSION_TYPES and expression_depth > MAX_EXPRESSION_DEPTH:
+    if (
+        expected in _QUERY_PLAN_EXPRESSION_TYPES
+        and expression_depth > MAX_EXPRESSION_DEPTH
+    ):
         raise GrafxPlanError(
             f"A plan expression may nest at most {MAX_EXPRESSION_DEPTH} levels deep.",
             field="expression",
@@ -2078,7 +2085,8 @@ def _query_plan_dataclass_snapshot(
                 string_limit=(
                     MAX_RENDERED_QUERY_CHARACTERS
                     if (
-                        expected is ProduceResults and declared.name == "columns"
+                        expected in (ProduceResults, UnionRows)
+                        and declared.name == "columns"
                     )
                     or (expected is ReturnItem and declared.name == "alias")
                     else None
@@ -2086,7 +2094,9 @@ def _query_plan_dataclass_snapshot(
             )
         if expected is ProduceResults:
             columns = arguments["columns"]
-            if type(columns) is not tuple:  # pragma: no cover - grammar proves this above
+            if (
+                type(columns) is not tuple
+            ):  # pragma: no cover - grammar proves this above
                 raise AssertionError("ProduceResults.columns did not clone to a tuple")
             seen_columns: set[str] = set()
             for column in columns:
@@ -2234,7 +2244,10 @@ def _query_plan_field_snapshot(
                 value=_builtin_type_name(value),
             )
         return annotation(value.value)
-    if annotation in _QUERY_PLAN_AUXILIARY_TYPES or annotation in _QUERY_PLAN_EXPRESSION_TYPES:
+    if (
+        annotation in _QUERY_PLAN_AUXILIARY_TYPES
+        or annotation in _QUERY_PLAN_EXPRESSION_TYPES
+    ):
         return _query_plan_dataclass_snapshot(
             value,
             expected=annotation,  # type: ignore[arg-type]

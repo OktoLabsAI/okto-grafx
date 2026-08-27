@@ -70,6 +70,7 @@ __all__ = [
     "SkipRows",
     "SortRows",
     "TraverseRelationship",
+    "UnionRows",
     "UnwindRows",
     "VectorSearch",
     "WithRows",
@@ -515,6 +516,38 @@ class OptionalRows(PlanNode):
     def details(self) -> Mapping[str, object]:
         """Return the name bound to null when nothing matched."""
         return {"alias": self.alias}
+
+
+@dataclass(frozen=True, slots=True)
+class UnionRows(PlanNode):
+    """The rows of two pipelines, one after the other, under the left branch's column names.
+
+    The only operator here with two children, and the reason the tree stays a tree: each branch
+    was planned as a whole query and then had its own ProduceResults taken off, so what arrives
+    is two streams of projected columns that no longer know they were separate.
+
+    Renaming happens HERE rather than in either branch. The right branch may have written
+    different aliases -- a caller reading the result never sees them -- and rewriting its
+    projection to use the left branch's names would make the branch a lie about the text that
+    produced it. The operator maps position by position instead, which is also the only reading
+    that works when both branches return the same name for different things.
+
+    Deduplication is NOT here. A single DistinctRows sits above, because the pair is one result
+    and duplicates across branches are duplicates: removing them inside each branch would leave
+    a row that appears once on each side appearing twice.
+    """
+
+    left: PlanNode
+    right: PlanNode
+    columns: tuple[str, ...]
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Return the two pipelines, left branch first, which is evaluation order."""
+        return (self.left, self.right)
+
+    def details(self) -> Mapping[str, object]:
+        """Return the column names the pair publishes."""
+        return {"columns": ", ".join(self.columns)}
 
 
 @dataclass(frozen=True, slots=True)
