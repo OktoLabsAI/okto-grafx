@@ -15,7 +15,11 @@ from typing import Any
 import pytest
 
 from okto_grafx import Database, connect
-from okto_grafx.domain.errors import GrafxIndexError, GrafxUnsupportedOperation
+from okto_grafx.domain.errors import (
+    GrafxError,
+    GrafxIndexError,
+    GrafxUnsupportedOperation,
+)
 from okto_grafx.domain.model.value import VectorValue
 from okto_grafx.domain.page.file_header import HEADER_PAGE_INDEX
 from okto_grafx.domain.txn.partitions import page_partition
@@ -64,6 +68,45 @@ def seeded(tmp_path: Path) -> Any:
     finally:
         if not database.closed:
             database.close()
+
+
+def _assert_search_refused(database: Database) -> None:
+    """Assert the index will not answer a similarity search."""
+    space_id = database.vectors.index(SPACE).space_id
+    query = VectorValue(
+        values=(1.0, 0.0, 0.0, 0.0), space_ref=space_id, dtype="float64"
+    )
+    with pytest.raises(GrafxIndexError):
+        with database.begin("read") as reader:
+            reader.execute(
+                "MATCH (n:Note) "
+                f"WHERE similarity(n.embedding, $query, space => '{SPACE}') > -1.5 "
+                "RETURN n.id",
+                {"query": query},
+            )
+
+
+def _assert_refused_and_still_refused_cold(database: Database) -> None:
+    """Assert the refusal is physical here AND survives the reopen it is deferred to.
+
+    The contract leaves certification of an unproved rebuild to a reopen. That is only safe if
+    the refusal itself is durable: an index that came back healthy from cold would hand the
+    next process exactly the confident short answer this door declined to give.
+    """
+    view = database.vectors.index(SPACE)
+    assert view.stale is True
+    assert view.stale_reason is not None
+    _assert_search_refused(database)
+
+    path = database.path
+    database.checkpoint()
+    database.close()
+    with connect(path, page_size=PAGE_SIZE) as reopened:
+        cold = reopened.vectors.index(SPACE)
+        assert cold.stale is True
+        assert cold.stale_reason is not None
+        assert cold.name in reopened.stale_indexes
+        _assert_search_refused(reopened)
 
 
 def test_the_door_returns_a_healthy_view_of_the_generation_it_completed(
@@ -224,6 +267,88 @@ def test_a_close_arriving_in_the_post_commit_window_waits_for_the_door(
     assert view.stale is False
     assert view.stale_reason is None
     assert view.built_through_lsn is not None
+
+
+INTERLEAVINGS: tuple[str, ...] = ("target_row", "vector_ddl", "checkpoint")
+
+
+@pytest.mark.parametrize("interleaving", INTERLEAVINGS)
+def test_work_landing_between_staging_and_the_barrier_never_wedges_the_database(
+    seeded: Database, monkeypatch: pytest.MonkeyPatch, interleaving: str
+) -> None:
+    """A rebuild must lose before the barrier, never leave a redo nobody can complete.
+
+    The claim makes the index durably stale before anything is staged, so work that advances
+    the generation in the window that follows is fatal in a specific way: the RESET reaches
+    the log durably and then refuses to apply. That is a committed redo with no way forward --
+    recovery required, checkpoint refused, and a database that will not reopen. Measured, not
+    imagined: without the fence below, a single row written to the target table produced
+    exactly that.
+
+    Reading every partition of the target table turns it into an ordinary optimistic refusal
+    before the barrier. Only that table is fenced, so unrelated commits still commit.
+    """
+    space_id = seeded.vectors.index(SPACE).space_id
+    manager = seeded._indexes
+    original = type(manager).rebuild
+    fired: list[str] = []
+
+    def intrude() -> None:
+        if interleaving == "target_row":
+            with seeded.begin("write") as writer:
+                writer.execute(
+                    "CREATE (n:Note {id: $id, embedding: $embedding})",
+                    {
+                        "id": "intruder",
+                        "embedding": VectorValue(
+                            values=(1.0, 9.0, 0.0, 0.0),
+                            space_ref=space_id,
+                            dtype="float64",
+                        ),
+                    },
+                )
+        elif interleaving == "vector_ddl":
+            with seeded.begin("write") as ddl:
+                ddl.execute(
+                    "CREATE VECTOR SPACE other_embedding_idx "
+                    "{dimension: 4, metric: 'cosine', normalized: false, "
+                    "storage_dtype: 'float64'}"
+                )
+        else:
+            seeded.checkpoint()
+
+    def stage_then_intrude(self: Any, name: str, txn: Any, through_lsn: int) -> int:
+        staged = original(self, name, txn, through_lsn)
+        if not fired:
+            fired.append(name)
+            intrude()
+        return staged
+
+    monkeypatch.setattr(type(manager), "rebuild", stage_then_intrude)
+    outcome: GrafxError | None = None
+    try:
+        seeded.maintenance.rebuild_vector_index(SPACE)
+    except GrafxError as refused:
+        outcome = refused
+        details = getattr(refused, "details", {}) or {}
+        # Losing is allowed. Losing AFTER the barrier is not.
+        assert details.get("durable") is not True
+        assert details.get("committed") is not True
+    monkeypatch.undo()
+
+    if interleaving == "target_row":
+        # This one is not allowed to succeed quietly: without the fence it commits durably and
+        # then cannot replay, which is the wedge this test exists for.
+        assert outcome is not None
+        assert outcome.retryable is True
+
+    assert fired == [seeded.vectors.index(SPACE).name]
+    assert seeded.transactions.recovery_required is False
+    seeded.checkpoint()
+    seeded.close()
+
+    with connect(seeded.path, page_size=PAGE_SIZE) as reopened:
+        assert not reopened.verify("all").findings
 
 
 def test_the_door_refuses_a_space_this_database_does_not_index(
@@ -398,6 +523,10 @@ def test_an_outcome_past_the_barrier_is_settled_but_never_certified_here(
     assert verified == ["all"]
     assert name in seeded.maintenance.status().stale_indexes
 
+    # Status agreeing is not enough: the physical authority has to refuse too, and it has to
+    # still refuse from cold, because that reopen is where certification was deferred to.
+    _assert_refused_and_still_refused_cold(seeded)
+
 
 def test_the_door_refuses_to_report_ready_without_the_position_it_completed(
     seeded: Database, monkeypatch: pytest.MonkeyPatch
@@ -437,6 +566,7 @@ def test_the_door_refuses_to_report_ready_without_the_position_it_completed(
     monkeypatch.undo()
 
     assert refused.value.details["field"] == "rebuild_position_unproved"
+    _assert_refused_and_still_refused_cold(seeded)
 
 
 def test_the_door_refuses_to_report_ready_when_the_view_still_says_stale(
@@ -472,3 +602,4 @@ def test_the_door_refuses_to_report_ready_when_the_view_still_says_stale(
     monkeypatch.undo()
 
     assert refused.value.details["field"] == "rebuild_incomplete"
+    _assert_refused_and_still_refused_cold(seeded)

@@ -72,7 +72,7 @@ from okto_grafx.domain.txn.context import (
     TransactionMode,
     TransactionState,
 )
-from okto_grafx.domain.txn.partitions import page_partition
+from okto_grafx.domain.txn.partitions import page_partition, partition_key
 from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.domain.verify.findings import VerificationReport
@@ -1704,6 +1704,20 @@ class Database:
         # against the HEAP is not this declaration's job: the durable rebuild generation
         # already refuses a superseded reset, and later commits stage their own entries.
         context.note_write(page_partition(target.file, HEADER_PAGE_INDEX))
+        # The header alone only fences rebuild against rebuild. The claim makes the index
+        # durably stale BEFORE anything is staged, and a row written to the target table in
+        # the window that follows advances the very generation this pass is rebuilding: the
+        # RESET then reaches the log durably and refuses to apply, which leaves a committed
+        # redo nobody can complete -- recovery_required, checkpoint refused, and a database
+        # that will not reopen. Reading every partition of the target table turns that into
+        # an ordinary optimistic refusal BEFORE the barrier, because a row write already
+        # publishes its key partition. Only this table is fenced, so unrelated commits are
+        # untouched.
+        table_id = _builtin_int(
+            manager.index(name).definition.table_id  # type: ignore[attr-defined]
+        )
+        for partition in range(self._identity.partitions_per_table):
+            context.note_read(partition_key(table_id, partition))
         try:
             manager.rebuild(name, context, through)  # type: ignore[attr-defined]
         except BaseException as staging_failure:
@@ -1733,9 +1747,12 @@ class Database:
             self._forget_stale_index(name)
             return self._require_rebuilt_vector_index(space, through)
         except BaseException as unproved:
-            # The name was dropped from the cache on the way to a proof that did not
-            # arrive. Put it back: an operator reading status must see the index this
-            # door could not certify.
+            # `clear_stale` has already run by the time the proof is taken, so an index whose
+            # proof refuses is sitting there durably healthy and answering searches from a
+            # generation this door could not certify. Refuse it physically FIRST -- the same
+            # fail-closed rule the ambiguous branch follows -- and only then put the name back
+            # in the cache an operator reads.
+            self._refuse_unproved_vector_index(name, unproved)
             self._remember_stale_index(name, unproved)
             raise
 
@@ -1759,21 +1776,26 @@ class Database:
         try:
             self._recover_in_transition()
             report = self.verify("all")
+            findings = tuple(getattr(report, "findings", ()))
+            if findings:
+                _note_cleanup_failure(
+                    failure,
+                    GrafxIndexError(
+                        f"Verification after the barrier reported {len(findings)} finding(s).",
+                        field="rebuild_unproved",
+                        index=name,
+                    ),
+                )
         except BaseException as settle_failure:
             _note_cleanup_failure(failure, settle_failure)
+        finally:
+            # Whatever settling achieved, the refusal is published either way, and the
+            # PHYSICAL mark goes first: a cache is not an authority. An index whose durable
+            # mark still says healthy keeps answering searches from entries this door could
+            # not prove, and status agreeing that it is stale changes nothing for the caller
+            # who is querying it.
+            self._refuse_unproved_vector_index(name, failure)
             self._remember_stale_index(name, failure)
-            raise failure
-        findings = tuple(getattr(report, "findings", ()))
-        if findings:
-            _note_cleanup_failure(
-                failure,
-                GrafxIndexError(
-                    f"Verification after the barrier reported {len(findings)} finding(s).",
-                    field="rebuild_unproved",
-                    index=name,
-                ),
-            )
-        self._remember_stale_index(name, failure)
         raise failure
 
     def _require_rebuilt_vector_index(
@@ -1816,6 +1838,35 @@ class Database:
                 target=through,
             )
         return view
+
+    def _refuse_unproved_vector_index(self, name: str, primary: BaseException) -> None:
+        """Make an index this door could not prove refuse durably, not just in the cache.
+
+        A rebuild whose outcome is in doubt must stop answering. The stale mark is the only
+        thing readers consult, so it is the mark that has to move: without it the view keeps
+        reporting healthy and similarity searches keep returning entries nobody verified, while
+        ``maintenance.status()`` quietly says otherwise. Persisting it also survives the reopen
+        that the contract leaves the certification to.
+        """
+        try:
+            manager = self._require_component(
+                "indexes", self._indexes, "the index manager (C4)"
+            )
+            # The refusal has to be persisted, and persisting it moves the durable generation.
+            # A RESET this rebuild already committed is still in the log until a checkpoint
+            # covers it, and replaying that RESET under a NEWER generation refuses -- which is
+            # the same unreplayable-redo wedge the pre-barrier fence exists to prevent, arriving
+            # by the other door. Checkpointing first retires the record, so the generation may
+            # move without stranding it.
+            self.checkpoint()
+            index = manager.index(name)  # type: ignore[attr-defined]
+            index.mark_stale(
+                f"A rebuild of {name!r} did not prove its generation; it will not answer."
+            )
+        except BaseException as refusal_failure:
+            # Failing to publish the refusal is worth recording, never worth replacing the
+            # failure the caller has to act on.
+            _note_cleanup_failure(primary, refusal_failure)
 
     def _remember_stale_index(self, name: str, primary: BaseException) -> None:
         """Publish one stale name in the cache without disturbing the others.
