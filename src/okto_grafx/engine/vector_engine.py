@@ -1037,10 +1037,24 @@ class VectorHnswIndex(ProximityIndex):
         super().mark_stale(reason, persist=persist)
         self.invalidate_graph()
 
-    def clear_stale(self, built_through: Lsn) -> None:
-        """Declare the index rebuilt, and rebuild the graph from what it now holds."""
-        super().clear_stale(built_through)
+    def clear_stale(
+        self,
+        built_through: Lsn,
+        *,
+        advance_to: Lsn | None = None,
+        rebuild_token: int = 0,
+    ) -> None:
+        """Declare the index rebuilt, and rebuild the graph from what it now holds.
+
+        The graph is dropped BEFORE the clear, not after. The clear is a commit point, and a
+        fallible call placed after one can only turn a confirmed physical success into a
+        reported failure. Dropping first is safe in the other direction: a clear that then
+        fails leaves no graph, and the next reader derives one from whatever the index holds.
+        """
         self.invalidate_graph()
+        super().clear_stale(
+            built_through, advance_to=advance_to, rebuild_token=rebuild_token
+        )
 
     # --- searching ---------------------------------------------------------------------------
 
@@ -1074,7 +1088,9 @@ class VectorHnswIndex(ProximityIndex):
         predicate = _require_snapshot(snapshot)
         read_lsn = self._require_exact_read_lsn(predicate)
 
-        def traverse(certificate: object) -> tuple[tuple[ScoredEntry, ...], TraversalStats]:
+        def traverse(
+            certificate: object,
+        ) -> tuple[tuple[ScoredEntry, ...], TraversalStats]:
             """Search one graph and companion heap view under a durable certificate."""
             self._refresh_companion(certificate)
             width = self._ef_search if ef is None else ef

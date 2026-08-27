@@ -1691,11 +1691,28 @@ class Database:
         manager = self._require_component(
             "indexes", self._indexes, "the index manager (C4)"
         )
-        transaction = self.begin("write")
-        # An index stages through `txn_id` and `stage_record`, and the public wrapper
-        # deliberately exposes neither; the context behind it is the staging transaction.
-        context = transaction._context
-        through = _builtin_int(transaction.snapshot.read_lsn)
+        # The claim moves the durable generation, so it happens under the commit section with
+        # the redo it would otherwise strand already retired, and the token it returns is what
+        # the staging pass uses instead of claiming a second time. It happens BEFORE this
+        # door's own transaction exists, because the retiring half is a checkpoint and a
+        # checkpoint taken inside our own open write transaction is refused.
+        claim_reason = f"Index {name!r} is being rebuilt."
+        claimed = self._transactions.checkpoint_and_claim_index_rebuild(
+            manager.index(name),  # type: ignore[attr-defined]
+            claim_reason,
+        )
+        # Everything from here to the barrier runs under one cleanup, because the claim above
+        # has ALREADY made the index stale. A failure opening the transaction, resolving the
+        # table or declaring interest would otherwise leave a stale index with no name in the
+        # cache an operator reads, and possibly an open transaction nobody finishes.
+        transaction: Transaction | None = None
+        through = 0
+        try:
+            transaction = self.begin("write")
+            # An index stages through `txn_id` and `stage_record`, and the public wrapper
+            # deliberately exposes neither; the context behind it is the staging transaction.
+            context = transaction._context
+            through = _builtin_int(transaction.snapshot.read_lsn)
         # A transaction that stages durable work and claims no partition could never be
         # refused by optimistic validation, so a concurrent commit could replace what it
         # wrote. The page this pass rewrites is the index header that carries the stale
@@ -1703,7 +1720,7 @@ class Database:
         # one index conflict instead of silently overwriting each other. Concurrency
         # against the HEAP is not this declaration's job: the durable rebuild generation
         # already refuses a superseded reset, and later commits stage their own entries.
-        context.note_write(page_partition(target.file, HEADER_PAGE_INDEX))
+            context.note_write(page_partition(target.file, HEADER_PAGE_INDEX))
         # The header alone only fences rebuild against rebuild. The claim makes the index
         # durably stale BEFORE anything is staged, and a row written to the target table in
         # the window that follows advances the very generation this pass is rebuilding: the
@@ -1713,22 +1730,28 @@ class Database:
         # an ordinary optimistic refusal BEFORE the barrier, because a row write already
         # publishes its key partition. Only this table is fenced, so unrelated commits are
         # untouched.
-        table_id = _builtin_int(
-            manager.index(name).definition.table_id  # type: ignore[attr-defined]
-        )
-        for partition in range(self._identity.partitions_per_table):
-            context.note_read(partition_key(table_id, partition))
-        try:
-            manager.rebuild(name, context, through)  # type: ignore[attr-defined]
-        except BaseException as staging_failure:
+            table_id = _builtin_int(
+                manager.index(name).definition.table_id  # type: ignore[attr-defined]
+            )
+            for partition in range(self._identity.partitions_per_table):
+                context.note_read(partition_key(table_id, partition))
+            manager.rebuild(  # type: ignore[attr-defined]
+                name,
+                context,
+                through,
+                rebuild_token=claimed,
+                defer_clear=True,
+            )
+        except BaseException as preparation_failure:
             # Nothing reached the log. The claim left the index stale and that is exactly
             # what a reader must keep seeing -- in the cache an operator reads as well as
-            # in the view.
-            try:
-                transaction.rollback()
-            except BaseException as cleanup:
-                _note_cleanup_failure(staging_failure, cleanup)
-            self._remember_stale_index(name, staging_failure)
+            # in the view -- and no transaction may be left open behind us.
+            if transaction is not None:
+                try:
+                    transaction.rollback()
+                except BaseException as cleanup:
+                    _note_cleanup_failure(preparation_failure, cleanup)
+            self._remember_stale_index(name, preparation_failure)
             raise
         try:
             transaction.commit()
@@ -1742,19 +1765,35 @@ class Database:
                 self._remember_stale_index(name, commit_failure)
                 raise
             self._settle_vector_rebuild_past_barrier(name, commit_failure)
+        # Everything below happens while the index is STILL durably stale. The commit published
+        # the rebuilt buckets and deliberately left the refusal standing, so nothing here has to
+        # recreate a refusal after the fact -- which is what made every earlier version of this
+        # door fragile. A failure at any point simply leaves the claim's own mark in place.
         try:
-            manager.clear_stale(name, through)  # type: ignore[attr-defined]
-            self._forget_stale_index(name)
-            return self._require_rebuilt_vector_index(space, through)
+            prepared = self._prepared_rebuilt_vector_index(space, through, claim_reason)
         except BaseException as unproved:
-            # `clear_stale` has already run by the time the proof is taken, so an index whose
-            # proof refuses is sitting there durably healthy and answering searches from a
-            # generation this door could not certify. Refuse it physically FIRST -- the same
-            # fail-closed rule the ambiguous branch follows -- and only then put the name back
-            # in the cache an operator reads.
-            self._refuse_unproved_vector_index(name, unproved)
             self._remember_stale_index(name, unproved)
             raise
+        try:
+            # The last mutation, and the only one that lifts the refusal. It revalidates the
+            # same generation the claim published, so a claim that arrived in the meantime
+            # makes this refuse rather than certify.
+            self._transactions.checkpoint_and_clear_index_rebuild(
+                manager, name, through, claimed
+            )
+        except BaseException as unproved:
+            self._remember_stale_index(name, unproved)
+            raise
+        try:
+            self._forget_stale_index(name)
+        except Exception:  # noqa: BLE001 - the clear already landed on the device
+            # The cache is bookkeeping and the clear is done. Reporting a refusal for an index
+            # that is durably healthy would be the fail-open one door over; the next refresh
+            # corrects the name.
+            pass
+        # Nothing fallible runs after the clear: the answer was assembled before it, and the
+        # three fields the clear decides are exactly the ones it just wrote.
+        return prepared
 
     def _settle_vector_rebuild_past_barrier(
         self, name: str, failure: BaseException
@@ -1789,33 +1828,68 @@ class Database:
         except BaseException as settle_failure:
             _note_cleanup_failure(failure, settle_failure)
         finally:
-            # Whatever settling achieved, the refusal is published either way, and the
-            # PHYSICAL mark goes first: a cache is not an authority. An index whose durable
-            # mark still says healthy keeps answering searches from entries this door could
-            # not prove, and status agreeing that it is stale changes nothing for the caller
-            # who is querying it.
-            self._refuse_unproved_vector_index(name, failure)
+            # No refusal has to be published here. The commit deferred the clear, so the mark
+            # the claim made is still standing and is already the durable, cold, fail-closed
+            # authority. All that is left is to make the cache an operator reads agree with it.
             self._remember_stale_index(name, failure)
         raise failure
 
-    def _require_rebuilt_vector_index(
-        self, space: str, through: int
+    def _prepared_rebuilt_vector_index(
+        self, space: str, through: int, claim_reason: str
     ) -> VectorIndexView:
-        """Return the rebuilt index only when its own view proves the generation claimed.
+        """Assemble the answer while the index is still refusing, so nothing follows the clear.
 
-        Returning the view the caller would have fetched anyway is not the point: the point
-        is that this door never hands back a view that still says stale, or one built
-        through a position behind the target the rebuild fixed.
+        Every read here happens under the claim's own stale mark, which is what makes the
+        preparation safe to fail: the refusal it would have had to invent is already standing.
+        The three fields the clear decides -- the mark, its reason and the position -- are the
+        only ones this differs from what was read, and they are stated rather than re-read
+        because re-reading them would be fallible work after the last mutation.
         """
-        view = self._vectors_view_now().index(space)
-        if view.stale or view.stale_reason is not None:
+        observed = self._vectors_view_now().index(space)
+        if observed.stale and observed.stale_reason != claim_reason:
+            # Stale is expected here -- the claim put it there and the clear has not run. What
+            # is NOT expected is stale for some OTHER reason: that means the mark this door is
+            # about to lift is not the one it made, so lifting it would clear somebody else's
+            # refusal and certify a rebuild that never finished.
             raise GrafxIndexError(
-                f"Index {view.name!r} is still stale after its rebuild committed.",
+                f"Index {observed.name!r} is still stale after its rebuild committed.",
                 field="rebuild_incomplete",
-                index=view.name,
-                stale_reason=view.stale_reason,
+                index=observed.name,
+                stale_reason=observed.stale_reason,
             )
-        built_through = view.built_through_lsn
+        if observed.built_through_lsn is None:
+            # The position is read from page zero and is absent when that page is not resident.
+            # Absent is not "fine": it is the absence of the one number that says which
+            # generation this call is about to certify, and it is checked before anything else
+            # because a view that cannot show its position cannot support any later judgement.
+            raise GrafxIndexError(
+                f"Index {observed.name!r} does not report the position it was built through, "
+                "so the generation this rebuild completed cannot be proved.",
+                field="rebuild_position_unproved",
+                index=observed.name,
+                target=through,
+            )
+        if not observed.stale:
+            raise GrafxIndexError(
+                f"Index {observed.name!r} lifted its own refusal before this door proved the "
+                "rebuild; the generation it now serves is not the one that was claimed.",
+                field="rebuild_refusal_lost",
+                index=observed.name,
+            )
+        view = VectorIndexView(
+            observed.name,
+            observed.file,
+            observed.space_id,
+            observed.space_name,
+            observed.dimension,
+            observed.metric_of_space,
+            observed.storage_dtype,
+            observed.ef_search,
+            False,
+            None,
+            through,
+        )
+        built_through = observed.built_through_lsn
         if built_through is None:
             # The position is read from page zero and is absent when that page is not resident.
             # Absent is not "fine": it is the absence of the one number that would prove which
@@ -1828,45 +1902,12 @@ class Database:
                 index=view.name,
                 target=through,
             )
-        if built_through < through:
-            raise GrafxIndexError(
-                f"Index {view.name!r} reports position {built_through}, behind "
-                f"the {through} its rebuild targeted.",
-                field="rebuild_behind_target",
-                index=view.name,
-                built_through=built_through,
-                target=through,
-            )
+        # The position this rebuild reaches is NOT compared here. While the refusal still
+        # stands the header carries the old position by design, and the target is proved where
+        # it is enforced: the clear consumes an authority bound to exactly this position and
+        # refuses when it does not match. Comparing again here would only test the header the
+        # clear has not written yet.
         return view
-
-    def _refuse_unproved_vector_index(self, name: str, primary: BaseException) -> None:
-        """Make an index this door could not prove refuse durably, not just in the cache.
-
-        A rebuild whose outcome is in doubt must stop answering. The stale mark is the only
-        thing readers consult, so it is the mark that has to move: without it the view keeps
-        reporting healthy and similarity searches keep returning entries nobody verified, while
-        ``maintenance.status()`` quietly says otherwise. Persisting it also survives the reopen
-        that the contract leaves the certification to.
-        """
-        try:
-            manager = self._require_component(
-                "indexes", self._indexes, "the index manager (C4)"
-            )
-            # The refusal has to be persisted, and persisting it moves the durable generation.
-            # A RESET this rebuild already committed is still in the log until a checkpoint
-            # covers it, and replaying that RESET under a NEWER generation refuses -- which is
-            # the same unreplayable-redo wedge the pre-barrier fence exists to prevent, arriving
-            # by the other door. Checkpointing first retires the record, so the generation may
-            # move without stranding it.
-            self.checkpoint()
-            index = manager.index(name)  # type: ignore[attr-defined]
-            index.mark_stale(
-                f"A rebuild of {name!r} did not prove its generation; it will not answer."
-            )
-        except BaseException as refusal_failure:
-            # Failing to publish the refusal is worth recording, never worth replacing the
-            # failure the caller has to act on.
-            _note_cleanup_failure(primary, refusal_failure)
 
     def _remember_stale_index(self, name: str, primary: BaseException) -> None:
         """Publish one stale name in the cache without disturbing the others.

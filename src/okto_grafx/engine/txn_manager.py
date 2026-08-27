@@ -1053,6 +1053,88 @@ class TransactionManager:
         checkpoint allow together. A reader still pinned below the checkpoint holds the horizon
         back on its own account; nothing here evicts it.
         """
+        return self._checkpoint(None)[0]
+
+    def checkpoint_and_claim_index_rebuild(self, index: Any, reason: str) -> int:
+        """Retire the redo and claim a rebuild generation without leaving the section.
+
+        A claim MOVES the index's durable generation, and a RESET some other rebuild
+        already committed is replayable only while its own generation is current.
+        Claiming outside this section is therefore enough to wedge a database on its own:
+        measured, a claim that then failed its heap scan moved the header from 6 to 16 and
+        left a retained RESET at token 8 that no reopen could replay.
+        """
+        if not isinstance(reason, str) or not reason:
+            raise GrafxConfigurationError(
+                "Claiming an index rebuild needs a reason a reader can act on.",
+                field="reason",
+                value=repr(reason),
+            )
+        return self._checkpoint(lambda _published: index._claim_rebuild(reason))[1]
+
+    def checkpoint_and_clear_index_rebuild(
+        self, manager: Any, name: str, position: int, rebuild_token: int = 0
+    ) -> None:
+        """Finish a deferred rebuild: retire the redo, then clear under the same section.
+
+        The clear is this operation's commit point. It cannot run under a page fence
+        alone: a concurrent checkpoint can sit between a replayed RESET and its inserts,
+        and commits on the rebuilt table can land between the rebuild and the clear.
+
+        Two things are then true at once and both are kept. Physically the checkpoint
+        redid the log onto the index, so the header may record what it proved. Logically
+        the entries were derived at the scanned position, so this process must not answer
+        a newer snapshot from them -- and it does not, because the completion marker
+        fences reads there for as long as this handle holds it.
+        """
+        self._checkpoint(
+            lambda published: manager.clear_stale(
+                name, position, advance_to=published, rebuild_token=rebuild_token
+            ),
+            transition_is_commit_point=True,
+        )
+
+    def _checkpoint(
+        self,
+        transition: Callable[[int], Any] | None,
+        *,
+        transition_is_commit_point: bool = False,
+    ) -> tuple[RecycleReport, Any]:
+        """Run the checkpoint, keeping a completed commit point above its own cleanup.
+
+        The handler lives out here, OUTSIDE the participant section, because leaving that
+        section is itself work that can fail. A normal failure there after the commit point
+        completed is cleanup like any other: raising it would report a refusal for an index
+        that is durably healthy. Process control still passes.
+        """
+        state: dict[str, Any] = {"completed": False, "recycled": None, "outcome": None}
+        try:
+            return self._checkpoint_in_section(
+                transition, state, transition_is_commit_point
+            )
+        except BaseException as failure:
+            if (
+                transition_is_commit_point
+                and state["completed"]
+                and state["recycled"] is not None
+                and isinstance(failure, Exception)
+            ):
+                self._recovery_required = True
+                return state["recycled"], state["outcome"]
+            raise
+
+    def _checkpoint_in_section(
+        self,
+        transition: Callable[[int], Any] | None,
+        state: dict[str, Any],
+        transition_is_commit_point: bool,
+    ) -> tuple[RecycleReport, Any]:
+        """Run the checkpoint, running one index transition before the section is left.
+
+        Anything that moves an index's durable generation has to happen after the redo it
+        would strand has been retired, and before anything else can claim, so it belongs
+        inside this section rather than in a second call by the caller.
+        """
         self._require_not_closed("checkpoint")
         self._require_writable("checkpoint")
         with self._participant_section():
@@ -1065,19 +1147,19 @@ class TransactionManager:
                     COMMIT_SECTION, timeout=self._commit_lock_timeout
                 ):
                     self._validate_lease(lease)
-                    state = self._complete_committed_gap()
+                    published = self._complete_committed_gap()
                     with self._close_wait_hazard():
-                        self._pool.begin_read_view(state.last_committed_lsn)
+                        self._pool.begin_read_view(published.last_committed_lsn)
                     self._redo_onto_device(
-                        state.checkpoint_lsn, state.last_committed_lsn
+                        published.checkpoint_lsn, published.last_committed_lsn
                     )
                     with self._close_wait_hazard():
                         self._pool.checkpoint()
                     self._publish(
                         CommitState(
-                            last_committed_lsn=state.last_committed_lsn,
-                            last_csn=state.last_csn,
-                            checkpoint_lsn=state.last_committed_lsn,
+                            last_committed_lsn=published.last_committed_lsn,
+                            last_csn=published.last_csn,
+                            checkpoint_lsn=published.last_committed_lsn,
                         )
                     )
                     # Recycling belongs to the same stable-WAL picture as redo and checkpoint
@@ -1085,20 +1167,43 @@ class TransactionManager:
                     # recovery scan while segments were disappearing underneath it.
                     reader_present = self._reader_horizon() is not None
                     with self._close_wait_hazard():
-                        recycled = self._wal.recycle(
+                        state["recycled"] = self._wal.recycle(
                             self._recyclable_horizon_in_section(),
                             reader_present=reader_present,
                         )
+                    if transition is not None:
+                        # Inside the section, after redo, publication and recycle: the
+                        # RESET this checkpoint retired cannot be replayed any more, and
+                        # nothing else can move a generation between the two halves.
+                        state["outcome"] = transition(published.last_committed_lsn)
+                        state["completed"] = True
             except BaseException as failure:
                 cleanup_failure = self._drop_lease(lease)
                 if cleanup_failure is not None:
                     self._recovery_required = True
                     _note_cleanup_failure(failure, cleanup_failure)
+                if (
+                    transition_is_commit_point
+                    and state["completed"]
+                    and isinstance(failure, Exception)
+                ):
+                    # The commit point already happened on the device. Whatever failed
+                    # after it is cleanup, and reporting it as the operation's failure
+                    # would tell a caller the rebuild did not happen while leaving an
+                    # index that answers from it. The doubt is latched instead.
+                    # Process-control signals still pass: a store does not swallow those
+                    # because a page landed.
+                    self._recovery_required = True
+                    return state["recycled"], state["outcome"]
                 raise
             cleanup_failure = self._drop_lease(lease)
             if cleanup_failure is not None:
-                raise cleanup_failure
-        return recycled
+                if not (transition_is_commit_point and state["completed"]):
+                    raise cleanup_failure
+                # Same rule, the ordinary exit: the lease is in doubt but the commit
+                # point stands, so latch the doubt and return the success that happened.
+                self._recovery_required = True
+        return state["recycled"], state["outcome"]
 
     def _complete_committed_gap(self) -> CommitState:
         """Complete any durable WAL COMMIT another participant has not yet published.
@@ -1510,6 +1615,18 @@ class TransactionManager:
                                     txn
                                 )  # step 3.3, page half
                         if conflict is None:
+                            # AFTER ordinary validation cleared and immediately before
+                            # the records exist: a rebuild generation claimed since this
+                            # RESET was staged makes the record unreplayable, and this is
+                            # the only place to catch it without turning an honest write
+                            # conflict into an index error.
+                            validate_generations = getattr(
+                                self._index_manager,
+                                "validate_staged_rebuild_generations",
+                                None,
+                            )
+                            if callable(validate_generations):
+                                validate_generations(txn)
                             with self._close_wait_hazard():
                                 records, images, materialized_csn = self._build_records(
                                     txn, lease.epoch, rows
@@ -2589,7 +2706,9 @@ class TransactionManager:
         }
 
     def _refuse_reused_identities(
-        self, txn: TransactionContext, reserved: dict[int, tuple[object, frozenset[int]]]
+        self,
+        txn: TransactionContext,
+        reserved: dict[int, tuple[object, frozenset[int]]],
     ) -> None:
         """Refuse an identity a row of that table already carries, gap or no gap.
 

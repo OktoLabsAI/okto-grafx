@@ -9,6 +9,7 @@ declines to call ready.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -227,9 +228,9 @@ def test_the_door_delegates_to_the_existing_rebuild_generation_semantics(
     original = type(manager).rebuild
     seen: list[tuple[int, int]] = []
 
-    def spy(self: Any, name: str, txn: Any, through_lsn: int) -> int:
+    def spy(self: Any, name: str, txn: Any, through_lsn: int, **claimed: Any) -> int:
         seen.append((txn.txn_id, through_lsn))
-        return original(self, name, txn, through_lsn)
+        return original(self, name, txn, through_lsn, **claimed)
 
     monkeypatch.setattr(type(manager), "rebuild", spy)
     view = seeded.maintenance.rebuild_vector_index(SPACE)
@@ -317,8 +318,10 @@ def test_work_landing_between_staging_and_the_barrier_never_wedges_the_database(
         else:
             seeded.checkpoint()
 
-    def stage_then_intrude(self: Any, name: str, txn: Any, through_lsn: int) -> int:
-        staged = original(self, name, txn, through_lsn)
+    def stage_then_intrude(
+        self: Any, name: str, txn: Any, through_lsn: int, **claimed: Any
+    ) -> int:
+        staged = original(self, name, txn, through_lsn, **claimed)
         if not fired:
             fired.append(name)
             intrude()
@@ -349,6 +352,482 @@ def test_work_landing_between_staging_and_the_barrier_never_wedges_the_database(
 
     with connect(seeded.path, page_size=PAGE_SIZE) as reopened:
         assert not reopened.verify("all").findings
+
+
+def test_a_second_rebuild_cannot_finish_inside_the_first_ones_refusal(
+    seeded: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retiring the RESET and moving the generation must not be two separately-visible calls.
+
+    Persisting a refusal moves the index's durable generation, and a RESET another rebuild
+    committed is replayable only while ITS generation is current. As two public calls that is a
+    real window: measured on the previous revision, a rebuild B driven to completion from inside
+    A's checkpoint left token 16 against durable generation 20 -- a handle that looked fine hot
+    and a database that would not reopen.
+
+    The window is closed by the two halves being one operation, so this test hooks the separate
+    checkpoint door: if anything ever reintroduces it, B runs again and the reopen fails.
+    """
+    from okto_grafx.engine.database import Transaction
+
+    original_commit = Transaction.commit
+    original_checkpoint = Database.checkpoint
+    state = {"a_committed": False, "b_done": False}
+    intruded: list[str] = []
+
+    def commit_then_fail(self: Transaction) -> Any:
+        report = original_commit(self)
+        if not state["a_committed"]:
+            state["a_committed"] = True
+            raise GrafxIndexError(
+                "injected post-barrier failure", field="injected_a", index="note"
+            )
+        return report
+
+    def checkpoint_then_let_b_finish(self: Database) -> Any:
+        report = original_checkpoint(self)
+        if state["a_committed"] and not state["b_done"]:
+            state["b_done"] = True
+            monkeypatch.setattr(Transaction, "commit", original_commit)
+            try:
+                intruded.append(self.maintenance.rebuild_vector_index(SPACE).name)
+            finally:
+                monkeypatch.setattr(Transaction, "commit", commit_then_fail)
+        return report
+
+    monkeypatch.setattr(Transaction, "commit", commit_then_fail)
+    monkeypatch.setattr(Database, "checkpoint", checkpoint_then_let_b_finish)
+    with pytest.raises(GrafxIndexError) as refused:
+        seeded.maintenance.rebuild_vector_index(SPACE)
+    monkeypatch.undo()
+
+    assert refused.value.details["field"] == "injected_a"
+    # The separate checkpoint door is not on this path any more, so B never got its window.
+    assert intruded == []
+    assert seeded.transactions.recovery_required is False
+
+    # Deliberately NO extra checkpoint here. One taken after the mark would retire whatever
+    # the race stranded and hide the very wedge this test exists to catch, so the reopen has
+    # to happen on the log exactly as the door left it.
+    path = seeded.path
+    seeded.close()
+    with connect(path, page_size=PAGE_SIZE) as reopened:
+        cold = reopened.vectors.index(SPACE)
+        assert cold.stale is True
+        assert cold.name in reopened.stale_indexes
+        _assert_search_refused(reopened)
+
+
+def test_a_claim_landing_after_staging_refuses_before_the_record_exists(
+    seeded: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A RESET whose generation was superseded must never become a durable record.
+
+    The staged reset carries the generation that authorised it. If a claim lands between the
+    staging and the append, writing the record anyway produces a redo that refuses to apply --
+    on this handle and on every reopen after it. The refusal therefore happens inside the
+    commit section, after ordinary validation has already answered, and immediately before the
+    records exist.
+    """
+    manager = seeded._indexes
+    original = type(manager).rebuild
+    fired: list[str] = []
+
+    def stage_then_claim(
+        self: Any, name: str, txn: Any, through_lsn: int, **claimed: Any
+    ) -> int:
+        staged = original(self, name, txn, through_lsn, **claimed)
+        if not fired:
+            fired.append(name)
+            seeded._transactions.checkpoint_and_claim_index_rebuild(
+                self.index(name), "an intruding claim between staging and the barrier"
+            )
+        return staged
+
+    monkeypatch.setattr(type(manager), "rebuild", stage_then_claim)
+    with pytest.raises(GrafxIndexError) as refused:
+        seeded.maintenance.rebuild_vector_index(SPACE)
+    monkeypatch.undo()
+
+    assert fired != []
+    assert refused.value.details["field"] == "rebuild_superseded"
+    assert refused.value.details.get("durable") is not True
+    assert seeded.transactions.recovery_required is False
+    path = seeded.path
+    seeded.close()
+    with connect(path, page_size=PAGE_SIZE) as reopened:
+        assert reopened.vectors.index(SPACE).stale is True
+        assert not reopened.verify("all").findings
+
+
+def test_a_failure_right_after_the_claim_leaves_no_transaction_and_a_stale_index(
+    seeded: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The claim already made the index stale, so everything after it owes the same cleanup.
+
+    Opening the transaction, resolving the table and declaring interest all happen after the
+    generation has moved. A failure in any of them must still leave the name in the cache an
+    operator reads, no transaction open behind it, and a database that opens.
+    """
+    original_begin = Database.begin
+
+    def refuse_to_begin(self: Database, mode: str = "write") -> Any:
+        raise GrafxIndexError(
+            "injected begin failure", field="injected_begin", index="note"
+        )
+
+    monkeypatch.setattr(Database, "begin", refuse_to_begin)
+    with pytest.raises(GrafxIndexError) as refused:
+        seeded.maintenance.rebuild_vector_index(SPACE)
+    monkeypatch.setattr(Database, "begin", original_begin)
+
+    assert refused.value.details["field"] == "injected_begin"
+    name = seeded.vectors.index(SPACE).name
+    assert seeded.vectors.index(SPACE).stale is True
+    assert name in seeded.maintenance.status().stale_indexes
+    # Nothing was left open: an ordinary transaction still commits.
+    with seeded.begin("write") as writer:
+        writer.execute("MATCH (n:Note) RETURN n.id")
+    assert seeded.transactions.recovery_required is False
+    monkeypatch.undo()
+
+    path = seeded.path
+    seeded.close()
+    with connect(path, page_size=PAGE_SIZE) as reopened:
+        assert reopened.vectors.index(SPACE).stale is True
+        assert not reopened.verify("all").findings
+
+
+def test_a_refusal_that_cannot_be_lifted_simply_stays_standing(
+    seeded: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing has to republish a refusal that was never lifted.
+
+    The commit deferred the clear, so the claim's own durable mark is the authority for the
+    whole window. A finish that fails needs no repair at all -- which is the reason the halves
+    were split, and the difference from the shape that tried to recreate the refusal after the
+    fact and could fail while doing it.
+    """
+
+    def refuse_to_finish(
+        self: Any, manager: Any, name: str, position: int, token: int = 0
+    ) -> None:
+        raise GrafxIndexError(
+            "injected finish failure", field="injected_finish", index="note"
+        )
+
+    monkeypatch.setattr(
+        type(seeded._transactions),
+        "checkpoint_and_clear_index_rebuild",
+        refuse_to_finish,
+    )
+    with pytest.raises(GrafxIndexError) as refused:
+        seeded.maintenance.rebuild_vector_index(SPACE)
+    monkeypatch.undo()
+
+    assert refused.value.details["field"] == "injected_finish"
+    _assert_refused_and_still_refused_cold(seeded)
+
+
+def test_a_lifted_refusal_before_the_proof_is_refused(
+    seeded: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The proof is only worth taking while the refusal it relies on is still standing."""
+    original = type(seeded.vectors).index
+    healthy = seeded.vectors.index(SPACE)
+    lifted = VectorIndexView(
+        healthy.name,
+        healthy.file,
+        healthy.space_id,
+        healthy.space_name,
+        healthy.dimension,
+        healthy.metric_of_space,
+        healthy.storage_dtype,
+        healthy.ef_search,
+        False,
+        None,
+        healthy.built_through_lsn,
+    )
+    calls: list[int] = []
+
+    def sometimes_lifted(self: Any, space_name: str) -> VectorIndexView:
+        calls.append(1)
+        if len(calls) > 1:
+            return lifted
+        return original(self, space_name)
+
+    monkeypatch.setattr(type(seeded.vectors), "index", sometimes_lifted)
+    with pytest.raises(GrafxIndexError) as refused:
+        seeded.maintenance.rebuild_vector_index(SPACE)
+    monkeypatch.undo()
+
+    assert refused.value.details["field"] == "rebuild_refusal_lost"
+
+
+def test_the_door_refuses_to_report_ready_without_the_position_it_completed(
+    seeded: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An absent built-through position is the absence of proof, not a benign unknown.
+
+    The number is read from page zero and is reported as ``None`` when that page is not
+    resident. Returning the view anyway would certify a generation whose receipt this door
+    never managed to read, so it refuses instead.
+    """
+    original = type(seeded.vectors).index
+    healthy = seeded.vectors.index(SPACE)
+    silent = VectorIndexView(
+        healthy.name,
+        healthy.file,
+        healthy.space_id,
+        healthy.space_name,
+        healthy.dimension,
+        healthy.metric_of_space,
+        healthy.storage_dtype,
+        healthy.ef_search,
+        False,
+        None,
+        None,
+    )
+    calls: list[int] = []
+
+    def sometimes_silent(self: Any, space_name: str) -> VectorIndexView:
+        calls.append(1)
+        if len(calls) > 1:
+            return silent
+        return original(self, space_name)
+
+    monkeypatch.setattr(type(seeded.vectors), "index", sometimes_silent)
+    with pytest.raises(GrafxIndexError) as refused:
+        seeded.maintenance.rebuild_vector_index(SPACE)
+    monkeypatch.undo()
+
+    assert refused.value.details["field"] == "rebuild_position_unproved"
+    _assert_refused_and_still_refused_cold(seeded)
+
+
+def test_the_door_refuses_to_report_ready_when_the_view_still_says_stale(
+    seeded: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Returning the view is not a formality: it is the proof, and it is checked."""
+    original = type(seeded.vectors).index
+    healthy = seeded.vectors.index(SPACE)
+    lying = VectorIndexView(
+        healthy.name,
+        healthy.file,
+        healthy.space_id,
+        healthy.space_name,
+        healthy.dimension,
+        healthy.metric_of_space,
+        healthy.storage_dtype,
+        healthy.ef_search,
+        True,
+        "injected stale verdict",
+        healthy.built_through_lsn,
+    )
+    calls: list[int] = []
+
+    def sometimes_lying(self: Any, space_name: str) -> VectorIndexView:
+        calls.append(1)
+        if len(calls) > 1:
+            return lying
+        return original(self, space_name)
+
+    monkeypatch.setattr(type(seeded.vectors), "index", sometimes_lying)
+    with pytest.raises(GrafxIndexError) as refused:
+        seeded.maintenance.rebuild_vector_index(SPACE)
+    monkeypatch.undo()
+
+    assert refused.value.details["field"] == "rebuild_incomplete"
+    _assert_refused_and_still_refused_cold(seeded)
+
+
+@pytest.mark.parametrize("preopen", (False, True))
+def test_the_finish_absorbs_a_target_write_made_inside_the_deferred_window(
+    seeded: Database, monkeypatch: pytest.MonkeyPatch, preopen: bool
+) -> None:
+    """A commit landing between the deferred commit and the finish must not move page 0.
+
+    The retained RESET is bound to the generation the claim published, and the finish has to
+    replay it. A writer that touched the header on the way past -- even one whose own position
+    did not move -- shifted that clock and the finish then refused a reset it had to apply. The
+    handle that writes matters too: one opened BEFORE the claim still believes the index is
+    healthy, so believing is not enough and the device has to be asked.
+    """
+    path = seeded.path
+    space_id = seeded.vectors.index(SPACE).space_id
+    early = connect(path, page_size=PAGE_SIZE) if preopen else None
+    original = type(seeded._transactions).checkpoint_and_clear_index_rebuild
+    intruded: list[str] = []
+
+    def write_then_finish(
+        self: Any, manager: Any, name: str, position: int, token: int = 0
+    ) -> None:
+        if not intruded:
+            intruded.append(name)
+            writer = early if early is not None else connect(path, page_size=PAGE_SIZE)
+            try:
+                with writer.begin("write") as inside:
+                    inside.execute(
+                        "CREATE (n:Note {id: $id, embedding: $embedding})",
+                        {
+                            "id": "inside-the-window",
+                            "embedding": VectorValue(
+                                values=(1.0, 5.0, 0.0, 0.0),
+                                space_ref=space_id,
+                                dtype="float64",
+                            ),
+                        },
+                    )
+            finally:
+                if early is None:
+                    writer.close()
+        return original(self, manager, name, position, token)
+
+    monkeypatch.setattr(
+        type(seeded._transactions),
+        "checkpoint_and_clear_index_rebuild",
+        write_then_finish,
+    )
+    try:
+        view = seeded.maintenance.rebuild_vector_index(SPACE)
+    finally:
+        monkeypatch.undo()
+        if early is not None:
+            early.close()
+
+    assert intruded != []
+    assert view.stale is False
+    assert seeded.transactions.recovery_required is False
+    assert not seeded.verify("all").findings
+
+    seeded.close()
+    with connect(path, page_size=PAGE_SIZE) as reopened:
+        assert not reopened.verify("all").findings
+
+
+def test_a_clear_that_landed_and_then_raised_is_reported_as_the_success_it_is(
+    seeded: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A confirmed physical clear must not be reported as a refusal by its own cleanup.
+
+    Everything after the commit point is housekeeping. Turning a housekeeping failure into the
+    operation's failure tells a caller the rebuild did not happen and leaves an index that
+    answers from it -- the fail-open one door over. The doubt is latched instead.
+    """
+    manager = seeded._transactions
+    original_drop = type(manager)._drop_lease
+    original_finish = type(manager).checkpoint_and_clear_index_rebuild
+    finishing: list[bool] = []
+
+    def note_finishing(
+        self: Any, mgr: Any, name: str, position: int, token: int = 0
+    ) -> None:
+        finishing.append(True)
+        return original_finish(self, mgr, name, position, token)
+
+    def fail_after_the_clear(self: Any, lease: Any) -> Any:
+        outcome = original_drop(self, lease)
+        if finishing:
+            # Only the finish is a commit point. The claim's own checkpoint is ordinary work
+            # and must keep failing normally, or this test would prove the wrong thing.
+            return RuntimeError("injected lease release failure")
+        return outcome
+
+    monkeypatch.setattr(
+        type(manager), "checkpoint_and_clear_index_rebuild", note_finishing
+    )
+    monkeypatch.setattr(type(manager), "_drop_lease", fail_after_the_clear)
+    view = seeded.maintenance.rebuild_vector_index(SPACE)
+    monkeypatch.undo()
+
+    assert finishing != []
+
+    assert view.stale is False
+    assert seeded.vectors.index(SPACE).stale is False
+
+
+def test_a_rebuild_completed_by_someone_else_is_not_reported_as_this_ones_success(
+    seeded: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Names are not identity: a healthy header at the finish belongs to whoever finished it.
+
+    A pauses at its finish, B runs an entire rebuild of the same index, and A resumes. Both
+    used the same claim reason -- it is built from the index name -- so the reason cannot tell
+    them apart. Only the generation can. Without that check A meets a healthy header, takes the
+    fast path and reports B's completion as its own result.
+    """
+    manager = seeded._transactions
+    original = type(manager).checkpoint_and_clear_index_rebuild
+    ran_b: list[str] = []
+
+    def let_b_finish_first(
+        self: Any, mgr: Any, name: str, position: int, token: int = 0
+    ) -> None:
+        if not ran_b:
+            ran_b.append(name)
+            monkeypatch.setattr(
+                type(manager), "checkpoint_and_clear_index_rebuild", original
+            )
+            try:
+                seeded.maintenance.rebuild_vector_index(SPACE)
+            finally:
+                monkeypatch.setattr(
+                    type(manager),
+                    "checkpoint_and_clear_index_rebuild",
+                    let_b_finish_first,
+                )
+        return original(self, mgr, name, position, token)
+
+    monkeypatch.setattr(
+        type(manager), "checkpoint_and_clear_index_rebuild", let_b_finish_first
+    )
+    with pytest.raises(GrafxIndexError) as refused:
+        seeded.maintenance.rebuild_vector_index(SPACE)
+    monkeypatch.undo()
+
+    assert ran_b != []
+    assert refused.value.details["field"] == "rebuild_superseded"
+    assert seeded.transactions.recovery_required is False
+    assert not seeded.verify("all").findings
+
+
+def test_a_failure_leaving_the_section_after_the_clear_is_not_the_doors_failure(
+    seeded: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leaving the participant section is work too, and it happens after the commit point.
+
+    A normal failure there would otherwise escape past a clear that already landed, telling a
+    caller the rebuild failed while the index answers from it. The handler therefore sits
+    outside that section rather than inside it.
+    """
+    manager = seeded._transactions
+    original_section = type(manager)._participant_section
+    original_finish = type(manager).checkpoint_and_clear_index_rebuild
+    finishing: list[bool] = []
+
+    def note_finishing(
+        self: Any, mgr: Any, name: str, position: int, token: int = 0
+    ) -> None:
+        finishing.append(True)
+        return original_finish(self, mgr, name, position, token)
+
+    @contextmanager
+    def failing_exit(self: Any) -> Any:
+        with original_section(self):
+            yield
+        if finishing:
+            raise RuntimeError("injected participant section exit failure")
+
+    monkeypatch.setattr(
+        type(manager), "checkpoint_and_clear_index_rebuild", note_finishing
+    )
+    monkeypatch.setattr(type(manager), "_participant_section", failing_exit)
+    view = seeded.maintenance.rebuild_vector_index(SPACE)
+    monkeypatch.undo()
+
+    assert finishing != []
+    assert view.stale is False
+    assert seeded.vectors.index(SPACE).stale is False
 
 
 def test_the_door_refuses_a_space_this_database_does_not_index(
@@ -428,7 +907,15 @@ def test_a_staging_failure_rolls_back_and_leaves_the_index_stale(
 
     assert refused.value.details["field"] == "injected"
     monkeypatch.undo()
-    assert seeded.vectors.index(SPACE).stale is False
+
+    # The generation is claimed under the commit section BEFORE anything is staged, so a
+    # staging refusal leaves the index visibly stale rather than quietly healthy. That is the
+    # fail-closed direction: the index stops answering, and the same door repairs it.
+    assert seeded.vectors.index(SPACE).stale is True
+    assert seeded.vectors.index(SPACE).name in seeded.maintenance.status().stale_indexes
+    repaired = seeded.maintenance.rebuild_vector_index(SPACE)
+    assert repaired.stale is False
+    assert not seeded.verify("all").findings
 
 
 def test_a_commit_refusal_before_the_barrier_leaves_the_index_stale(
@@ -525,81 +1012,4 @@ def test_an_outcome_past_the_barrier_is_settled_but_never_certified_here(
 
     # Status agreeing is not enough: the physical authority has to refuse too, and it has to
     # still refuse from cold, because that reopen is where certification was deferred to.
-    _assert_refused_and_still_refused_cold(seeded)
-
-
-def test_the_door_refuses_to_report_ready_without_the_position_it_completed(
-    seeded: Database, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An absent built-through position is the absence of proof, not a benign unknown.
-
-    The number is read from page zero and is reported as ``None`` when that page is not
-    resident. Returning the view anyway would certify a generation whose receipt this door
-    never managed to read, so it refuses instead.
-    """
-    original = type(seeded.vectors).index
-    healthy = seeded.vectors.index(SPACE)
-    silent = VectorIndexView(
-        healthy.name,
-        healthy.file,
-        healthy.space_id,
-        healthy.space_name,
-        healthy.dimension,
-        healthy.metric_of_space,
-        healthy.storage_dtype,
-        healthy.ef_search,
-        False,
-        None,
-        None,
-    )
-    calls: list[int] = []
-
-    def sometimes_silent(self: Any, space_name: str) -> VectorIndexView:
-        calls.append(1)
-        if len(calls) > 1:
-            return silent
-        return original(self, space_name)
-
-    monkeypatch.setattr(type(seeded.vectors), "index", sometimes_silent)
-    with pytest.raises(GrafxIndexError) as refused:
-        seeded.maintenance.rebuild_vector_index(SPACE)
-    monkeypatch.undo()
-
-    assert refused.value.details["field"] == "rebuild_position_unproved"
-    _assert_refused_and_still_refused_cold(seeded)
-
-
-def test_the_door_refuses_to_report_ready_when_the_view_still_says_stale(
-    seeded: Database, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Returning the view is not a formality: it is the proof, and it is checked."""
-    original = type(seeded.vectors).index
-    healthy = seeded.vectors.index(SPACE)
-    lying = VectorIndexView(
-        healthy.name,
-        healthy.file,
-        healthy.space_id,
-        healthy.space_name,
-        healthy.dimension,
-        healthy.metric_of_space,
-        healthy.storage_dtype,
-        healthy.ef_search,
-        True,
-        "injected stale verdict",
-        healthy.built_through_lsn,
-    )
-    calls: list[int] = []
-
-    def sometimes_lying(self: Any, space_name: str) -> VectorIndexView:
-        calls.append(1)
-        if len(calls) > 1:
-            return lying
-        return original(self, space_name)
-
-    monkeypatch.setattr(type(seeded.vectors), "index", sometimes_lying)
-    with pytest.raises(GrafxIndexError) as refused:
-        seeded.maintenance.rebuild_vector_index(SPACE)
-    monkeypatch.undo()
-
-    assert refused.value.details["field"] == "rebuild_incomplete"
     _assert_refused_and_still_refused_cold(seeded)

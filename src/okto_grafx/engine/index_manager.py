@@ -213,6 +213,14 @@ class _Staged:
 
     txn_id: int
     changes: list[IndexChange] = field(default_factory=list)
+    defer_clear: bool = False
+    """Whether this transaction's RESET leaves the stale refusal standing for its caller.
+
+    Process-local on purpose. The record format reserves ``ref.slot`` for a reset, and replay
+    never completes a rebuild -- only ``commit`` and ``clear_stale`` do -- so a recovered
+    database already ends stale without being told. A durable flag would change a frozen record
+    to express something the recovery path never has to read.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -637,6 +645,25 @@ class IndexStore:
                 field="index_view_unavailable",
                 index=self.name,
                 file=self.file,
+                seq=certificate.seq,
+                retryable=True,
+            )
+        fenced_through = self._completed_rebuild_through
+        if fenced_through is not None and required_lsn > fenced_through:
+            # A rebuild this handle completed derived its entries at ``fenced_through``. The
+            # header may legitimately record a later position -- the checkpoint that finished
+            # the rebuild proved the device that far -- but those later effects were not in the
+            # scan, so answering a newer snapshot from these entries could omit a row. The
+            # marker is process-local and a kept live commit clears it; a reopen never sees it
+            # and reads the header the checkpoint proved.
+            raise GrafxIndexError(
+                f"Index {self.name!r} was rebuilt through position {fenced_through}, before "
+                f"the snapshot at {required_lsn}; a lookup could omit a row.",
+                field="index_view_unavailable",
+                index=self.name,
+                file=self.file,
+                built_through_lsn=fenced_through,
+                required_lsn=required_lsn,
                 seq=certificate.seq,
                 retryable=True,
             )
@@ -1073,8 +1100,16 @@ class IndexStore:
         built_through: Lsn,
         *,
         rebuild_token: int = 0,
+        defer_clear: bool = False,
     ) -> WalRecord:
-        """Stage a bucket reset bound to the durable stale generation that authorised it."""
+        """Stage a bucket reset bound to the durable stale generation that authorised it.
+
+        ``defer_clear`` asks the commit to publish the rebuilt buckets and STOP there,
+        leaving the stale refusal and its generation exactly as the claim left them. It
+        travels inside the record rather than beside the call because replay has to reach
+        the same conclusion as the live path; a deferral only the caller knew about would
+        make a crash between the commit and the clear recover into a different state.
+        """
         certificate = self._require_durable_stale_for_reset()
         if rebuild_token and certificate.seq != rebuild_token:
             raise GrafxIndexError(
@@ -1088,6 +1123,10 @@ class IndexStore:
                 retryable=True,
             )
         token = certificate.seq if rebuild_token == 0 else rebuild_token
+        if defer_clear:
+            self._staged.setdefault(
+                self._require_txn(txn), _Staged(txn_id=self._require_txn(txn))
+            ).defer_clear = True
         return self._stage(
             txn,
             IndexChange(
@@ -1268,23 +1307,45 @@ class IndexStore:
             applied += 1
         self._staged.pop(txn_id, None)
         if reset is not None:
-            self._complete_rebuild(reset.csn)
+            self._complete_rebuild(reset.csn, defer=staged.defer_clear)
         elif self._short_commit == txn_id:
             # Keep the durable refusal in place while the repaired buckets are published, then
             # clear+advance page 0 as the final certificate.
             self._pool.flush(self.file)
             self._lift_short_commit_mark(stamp)
         else:
-            self._advance(stamp)
-            if moved_any:
-                # Even when the payload position was already at ``stamp``, changed buckets need
-                # a new durable clock. Touching page 0 after them puts it at the LRU tail so the
-                # existing flush boundary publishes the certificate last.
-                self._touch_header()
+            # A commit that lands while a rebuild is deferred must not move page 0. This handle
+            # can believe the index is healthy and still be wrong: the claim may have been made
+            # by another handle, or after this one opened. Asking the device settles it, and a
+            # durable STALE mark means the entries go to their buckets while the header keeps
+            # the generation the retained RESET is bound to -- otherwise the clock moves, the
+            # token no longer matches, and the final checkpoint refuses a reset it must replay.
+            durably_stale = self._stale_reason is not None
+            if not durably_stale:
+                certificate = self._fresh_certificate()
+                if certificate.header.flags & INDEX_FLAG_STALE:
+                    durably_stale = True
+                    self._stale_reason = (
+                        f"Index {self.name!r} is durably stale under a rebuild this handle "
+                        "did not claim."
+                    )
+                    self._stale_device_seq = certificate.seq
+            if not durably_stale:
+                self._advance(stamp)
+                if moved_any:
+                    # Even when the payload position was already at ``stamp``, changed buckets
+                    # need a new durable clock. Touching page 0 after them puts it at the LRU
+                    # tail so the existing flush boundary publishes the certificate last.
+                    self._touch_header()
             # The exact read fence certifies the durable header, not this process's dirty frame.
             # Publish bucket changes before page 0 (the _advance read moved it to the LRU tail)
             # so a fresh certificate never advertises a position whose entries are process-local.
             self._pool.flush(self.file)
+            if not durably_stale:
+                # Only now: a commit that reached the device is later work this index really
+                # took, so the rebuild fence no longer describes what it can answer. Releasing
+                # it before the flush would let any failure along the way lift the fence too.
+                self._completed_rebuild_through = None
         if self._metrics.enabled and self._definition.versioned:
             self._metrics.set_gauge(TOMBSTONE_BACKLOG, float(self._tombstone_backlog()))
         return applied
@@ -1313,7 +1374,13 @@ class IndexStore:
         self._pool.flush(self.file)
         self._remember_local_certificate()
 
-    def clear_stale(self, built_through: Lsn) -> None:
+    def clear_stale(
+        self,
+        built_through: Lsn,
+        *,
+        advance_to: Lsn | None = None,
+        rebuild_token: int = 0,
+    ) -> None:
         """Declare this index rebuilt through a position, so it may answer lookups again.
 
         The position is not optional and it is not derived. A stale index refuses to move the
@@ -1326,6 +1393,22 @@ class IndexStore:
         with self._pool.page_write_fence(self.file, HEADER_PAGE_INDEX):
             certificate = self._fresh_certificate()
             if not certificate.header.flags & INDEX_FLAG_STALE:
+                if rebuild_token:
+                    # A tokenised caller is finishing ITS rebuild, and a healthy header means
+                    # the refusal it was going to lift has already been consumed by someone
+                    # else's completion. Returning here would report that completion as this
+                    # caller's success. The untokenised operator/recovery door keeps the
+                    # idempotent fast path below, because it is asserting rather than claiming.
+                    raise GrafxIndexError(
+                        f"Index {self.name!r} is already healthy, so rebuild generation "
+                        f"{rebuild_token} was completed by something else.",
+                        field="rebuild_superseded",
+                        index=self.name,
+                        file=self.file,
+                        rebuild_token=rebuild_token,
+                        device_seq=certificate.seq,
+                        retryable=True,
+                    )
                 if certificate.header.built_through_lsn < position:
                     raise GrafxIndexError(
                         f"Index {self.name!r} is healthy only through "
@@ -1361,7 +1444,23 @@ class IndexStore:
                     retryable=True,
                 )
             if self._rebuild_authority is not None:
-                self._complete_rebuild(position)
+                if rebuild_token and self._rebuild_authority.token != rebuild_token:
+                    # The generation being finished is not the one the caller claimed. Names
+                    # are not identity: another rebuild of the SAME index can hold a perfectly
+                    # valid authority, and clearing it here would certify somebody else's work
+                    # as this call's result.
+                    raise GrafxIndexError(
+                        f"Index {self.name!r} holds rebuild generation "
+                        f"{self._rebuild_authority.token}, not the {rebuild_token} this "
+                        "caller claimed.",
+                        field="rebuild_superseded",
+                        index=self.name,
+                        file=self.file,
+                        rebuild_token=rebuild_token,
+                        device_seq=self._rebuild_authority.token,
+                        retryable=True,
+                    )
+                self._complete_rebuild(position, advance_to=advance_to)
                 return
             # Backward-compatible operator/recovery door. With no RESET authority this is an
             # explicit assertion that repair happened outside this store. Holding the page-0
@@ -1395,8 +1494,25 @@ class IndexStore:
         # may answer is worse than either verdict.
         # The transition helper makes the clear durable before this process lifts its refusal.
 
-    def _complete_rebuild(self, built_through: Lsn) -> None:
-        """Publish rebuilt buckets, then consume exactly their stale-generation authority."""
+    def _complete_rebuild(
+        self,
+        built_through: Lsn,
+        *,
+        defer: bool = False,
+        advance_to: Lsn | None = None,
+    ) -> None:
+        """Publish rebuilt buckets, then consume exactly their stale-generation authority.
+
+        With ``defer`` the second half does not happen here. The buckets reach the device
+        and the authority is kept, so the index stays durably stale on exactly the
+        generation the claim published: page 0 is not written, the retained RESET stays
+        replayable under its own token, and a crash before the clear recovers to a stale
+        index rather than to one that answers from a rebuild nobody proved.
+
+        The clear is then somebody else's last act. Anything that fails between the two
+        halves needs no repair at all, because the refusal was never lifted -- which is
+        the whole reason the halves are split.
+        """
         position = _require_position("built_through", built_through)
         authority = self._rebuild_authority
         if authority is None or authority.through_lsn != position:
@@ -1444,11 +1560,24 @@ class IndexStore:
                 device_seq=after_flush.seq,
                 retryable=True,
             )
+        if defer:
+            # Buckets are durable and the refusal still stands. The authority is retained
+            # on purpose: the clear that consumes it revalidates this same generation, so
+            # a claim arriving in between makes that clear refuse instead of certify.
+            return
+        # One page-0 write, at the position the index may honestly claim. A caller finishing a
+        # deferred rebuild has just replayed the log onto this index, so that is the replayed
+        # position rather than the older one its scan read at -- and writing it inside this same
+        # transition keeps the clear a single act instead of a clear plus a second write that
+        # would leave page 0 dirty behind it.
+        covered = position if advance_to is None else _require_position(
+            "advance_to", advance_to
+        )
         try:
             self._publish_header_transition(
                 lambda header: _with_flags(
                     header, header.flags & ~INDEX_FLAG_STALE
-                ).advanced_to(position)
+                ).advanced_to(max(position, covered))
             )
         except BaseException as failure:
             # A device is allowed to complete a write and then report interruption. Preserve
@@ -1464,7 +1593,7 @@ class IndexStore:
             else:
                 if (
                     not completed.header.flags & INDEX_FLAG_STALE
-                    and completed.header.built_through_lsn >= position
+                    and completed.header.built_through_lsn >= max(position, covered)
                 ):
                     self._rebuild_authority = None
                     self._completed_rebuild_through = position
@@ -1472,12 +1601,31 @@ class IndexStore:
                     self._stale_device_seq = None
                     self._cache_certificate = completed
                     self._local_certificate = completed
+                    # The device completed the write and then reported interruption. A fresh
+                    # certificate says the healthy header landed with the coverage this clear
+                    # meant to publish, so this IS the success it looks like, and re-raising
+                    # would tell a caller the rebuild failed while leaving an index that
+                    # answers from it -- fail-open by way of a false refusal.
+                    #
+                    # Only for an ordinary failure, though. KeyboardInterrupt and SystemExit
+                    # are not the device disagreeing with itself, they are the process being
+                    # told to stop, and a store that swallowed them because a page happened to
+                    # land would be deciding something that was never its call.
+                    if isinstance(failure, Exception):
+                        return
             raise
         self._rebuild_authority = None
         self._completed_rebuild_through = position
         self._stale_reason = None
         self._stale_device_seq = None
-        self._remember_local_certificate()
+        try:
+            self._remember_local_certificate()
+        except Exception:  # noqa: BLE001 - the header is already healthy on the device
+            # Refreshing the cached certificate is the last thing here and it is not a
+            # mutation: the clear already landed. Failing the call for it would report a
+            # refusal for an index that is durably healthy. The cache is simply left for the
+            # next read to rebuild. Process-control signals are not caught.
+            self._cache_certificate = None
 
     def _advance(self, lsn: Lsn) -> None:
         """Raise the position this index claims to cover, unless it is known to be stale."""
@@ -3129,7 +3277,15 @@ class IndexManager:
         for index in self.indexes():
             index.note_reconciled(horizon)
 
-    def rebuild(self, name: str, txn: StagingTransaction, through_lsn: Lsn) -> int:
+    def rebuild(
+        self,
+        name: str,
+        txn: StagingTransaction,
+        through_lsn: Lsn,
+        *,
+        rebuild_token: int = 0,
+        defer_clear: bool = False,
+    ) -> int:
         """Re-derive every entry of an index from the heap, and return how many changes it staged.
 
         This is the repair of a stale index, and it is covered by the log like every other index
@@ -3152,11 +3308,17 @@ class IndexManager:
         # RESET can expose an empty/partial index while its replacement entries are staged and
         # applied. Publish the refusal first, even when an operator proactively rebuilds a
         # healthy index; a crash then leaves a durable stale verdict, never a short answer.
-        rebuild_token = index._claim_rebuild(
-            f"Index {index.name!r} is being rebuilt through position {position}."
-        )
+        if not rebuild_token:
+            # No token supplied: this call owns the claim, as it always did. A caller that
+            # claimed under the commit section passes its token instead, because claiming
+            # again here would move the generation a second time -- outside that section.
+            rebuild_token = index._claim_rebuild(
+                f"Index {index.name!r} is being rebuilt through position {position}."
+            )
         staged = 1
-        index.stage_reset(txn, position, rebuild_token=rebuild_token)
+        index.stage_reset(
+            txn, position, rebuild_token=rebuild_token, defer_clear=defer_clear
+        )
         for ref, version in self._heap.scan_all(table):
             if is_provisional_csn(version.xmin):
                 continue
@@ -3170,7 +3332,44 @@ class IndexManager:
                 staged += 1
         return staged
 
-    def clear_stale(self, name: str, through_lsn: Lsn) -> None:
+    def validate_staged_rebuild_generations(self, txn: StagingTransaction) -> None:
+        """Refuse a staged RESET whose generation another claim has already superseded.
+
+        A RESET carries the rebuild generation that authorised it. If something claimed a
+        newer one while this transaction was staging, the record can still be written and
+        will still be durable -- and will then refuse to apply, on this handle and on every
+        reopen after it. Catching it here costs a retryable refusal; not catching it costs
+        a database that will not open.
+        """
+        for index in tuple(self._indexes.values()):
+            for change in index.pending(txn):
+                if change.operation is not IndexOperation.RESET:
+                    continue
+                token = change.ref.page
+                if not token:
+                    continue
+                certificate = index._fresh_certificate()
+                if certificate.seq != token:
+                    raise GrafxIndexError(
+                        f"Index {index.name!r} staged a rebuild under generation {token}, "
+                        f"and the durable generation is now {certificate.seq}; the reset "
+                        "is refused before it can become an unreplayable record.",
+                        field="rebuild_superseded",
+                        index=index.name,
+                        file=index.file,
+                        rebuild_token=token,
+                        device_seq=certificate.seq,
+                        retryable=True,
+                    )
+
+    def clear_stale(
+        self,
+        name: str,
+        through_lsn: Lsn,
+        *,
+        advance_to: Lsn | None = None,
+        rebuild_token: int = 0,
+    ) -> None:
         """Declare an index rebuilt through a position, so it may answer lookups again.
 
         Called by the caller that committed the transaction a rebuild staged, with the same
@@ -3179,8 +3378,15 @@ class IndexManager:
         at staging time would answer from a structure the log had not yet accepted.
         """
         index = self.index(name)
-        index.clear_stale(through_lsn)
-        self._bind_local_heap_view(index)
+        index.clear_stale(
+            through_lsn, advance_to=advance_to, rebuild_token=rebuild_token
+        )
+        try:
+            self._bind_local_heap_view(index)
+        except Exception:  # noqa: BLE001 - the clear already landed on the device
+            # Rebinding the local view is derived state, not a mutation the caller is waiting
+            # on. Failing here would report a refusal for an index that is durably healthy.
+            pass
 
     # --- verification --------------------------------------------------------------------------
 
