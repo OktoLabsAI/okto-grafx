@@ -129,6 +129,7 @@ CONTRACT_BEHAVIOUR_VALUES = {
     "relationship domain": 16,
     "endpoint pairs": 69,
     "root operations": ["MATCH", "OPTIONAL", "UNWIND", "WITH", "RETURN"],
+    "publicly unsupported trailing tokens": ["CALL", "YIELD"],
     "related-context directions": ["both", "incoming", "outgoing"],
     "related-context depths": [1, 2],
     "graph layers": ["canonical", "working", "all"],
@@ -244,6 +245,18 @@ def test_the_digest_covers_the_entire_payload(frozen: dict) -> None:
         json.dumps(asserted, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
     assert frozen["digest"] == digest
+
+
+def test_only_public_raw_engine_probes_apply_the_pulse_nfkc_execution_step() -> None:
+    text = "ＭＡＴＣＨ (n:Decision) RETURN n.id"
+
+    internal_phase, internal_error = freezer._try_accept(text)
+    assert internal_phase == "parse_error"
+    assert internal_error is not None
+
+    public_phase, public_error = freezer._try_accept(text, normalize_unicode=True)
+    assert public_phase == "analysed_only"
+    assert public_error is None
 
 
 @requires_baselines
@@ -683,12 +696,17 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
     ]
     refused = [probe for probe in raw["probes"] if probe["engine_verdict"] == "refused"]
     # M-PULSE-2H moved two ENTRIES and no probe; M-PULSE-2I moved two PROBES and no entry;
-    # M-PULSE-2J and 2K each move one more probe. The expected shapes are explicit so a later
-    # reader cannot mistake a missed ratchet for intentional debt: `named path` plans while
-    # `path projection` remains refused, and only the root one-node OPTIONAL plans here.
-    assert len(accepted) == 74
-    assert len(refused) == 13
-    assert len(owed) == 5
+    # M-PULSE-2J and 2K each move one more probe. M-PULSE-2L then makes the engine verdict
+    # follow the public NFKC execution path and closes the unsupported trailing-clause hole in
+    # the Core authority. The three remaining debts are engine capabilities, not boundary drift.
+    assert len(accepted) == 76
+    assert len(refused) == 11
+    assert set(owed) == {"UNION", "untyped relationship", "path projection"}
+    assert raw["contract_refused"] == 14
+    assert raw["contract_error_codes"] == {
+        "unsafe_cypher": 10,
+        "unsupported_operation": 4,
+    }
 
     assert frozen["counts"]["classification:already_supported"] == 82
     assert frozen["counts"]["classification:generic_gap"] == 13
@@ -755,6 +773,10 @@ def test_the_raw_matrix_separates_security_normalization_and_error_codes(
         "unsafe_cypher"
     )
     assert probes["root operation as a homoglyph"]["contract_disposition"] == "allowed"
+    for construct in ("write keyword as a homoglyph", "root operation as a homoglyph"):
+        assert probes[construct]["engine_verdict"] == "accepted", construct
+        assert probes[construct]["acceptance_phase"] == "planned", construct
+        assert probes[construct]["error"] is None, construct
     assert probes["write keyword in a line comment"]["contract_disposition"] == (
         "allowed"
     )
@@ -772,11 +794,19 @@ def test_the_raw_matrix_separates_security_normalization_and_error_codes(
     )
     assert (
         probes["unsupported clause after a supported root"]["contract_disposition"]
-        == "allowed"
+        == "refused"
+    )
+    assert (
+        probes["unsupported clause after a supported root"]["contract_error_code"]
+        == "unsupported_operation"
     )
     assert probes["unsupported clause after a supported root"]["engine_verdict"] == (
         "refused"
     )
+    assert frozen["public_raw_contract"]["publicly_unsupported_tokens"] == [
+        "CALL",
+        "YIELD",
+    ]
 
     writes = {
         probe["construct"]: probe
@@ -1018,8 +1048,11 @@ def test_masking_makes_a_keyword_in_a_comment_or_a_literal_invisible() -> None:
     )
     for text_ in (
         "MATCH (n:Decision) RETURN n.id // DELETE everything",
+        "MATCH (n:Decision) RETURN n.id // CALL db.index() YIELD value",
         "MATCH (n:Decision) /* DROP TABLE */ RETURN n.id",
+        "MATCH (n:Decision) /* CALL YIELD */ RETURN n.id",
         "MATCH (n:Decision) WHERE n.title = 'DELETE' RETURN n.id",
+        "MATCH (n:Decision) WHERE n.title = 'CALL YIELD' RETURN n.id",
         "MATCH (n:Decision) WHERE n.deleted_at IS NULL RETURN n.id",
     ):
         assert freezer._contract_verdict(text_, sources)["admitted"], text_

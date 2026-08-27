@@ -21,7 +21,7 @@ The corpus describes two exact commits and nothing else.
 | Baseline | Repository | Pinned commit |
 | --- | --- | --- |
 | `community` | Pulse Community `feature/v0.3.3` | `befaf1e4f9da9d0cff7cfc0f4aee177ef0a3e595` |
-| `core` | Pulse Core `milestone/grafx-transaction-contract` | `ab61b9a785f2018312fc91541a580877fd068bbb` |
+| `core` | Pulse Core `milestone/grafx-query-authority` | `f602c7cc2f6a9f5ef446d4c991309196bd4667c7` |
 
 The Community milestone earlier reported `36c2fc6`. `befaf1e` is the branch's final head and
 its `src/` is byte-identical to `36c2fc6` — the delta is documentation and one test file,
@@ -70,7 +70,7 @@ This keeps an unsupported family useful: closing the language gap must change th
 ## Counts at `pulse-1`
 
 `97` entries, digest
-`e792ded751eeffbe597a4e37d9110b30943e3d0fa69bd22027ad09778fc24f1c`.
+`905b29bdb503d77c9ad56878d50586866e1c013e31a00dfbd8793bf9293c484c`.
 
 The engine currently classifies 82 entries as `already_supported` and 13 as `generic_gap`;
 the duplicate and declared fragment remain separate classifications.
@@ -103,24 +103,29 @@ queries. The raw endpoint is open by construction, so freezing texts would descr
 different endpoint from the one the contract publishes.
 
 Each probe carries two independent answers. `contract_disposition` is what the **public
-endpoint** admits; `engine_verdict` is what **this engine** does with the same text. They
-differ on purpose: the contract blacklists writes, while the engine accepts writes because
-the internal port needs them. Today the contract allows 74 probes and refuses 13 (10
-`unsafe_cypher`, 3 `unsupported_operation`); the engine accepts 74 and refuses 13. The
-intersection that matters to the public endpoint is the 5 allowed probes the engine still
-refuses.
+endpoint** admits; `engine_verdict` is what **this engine** does with the NFKC-normalized text
+that endpoint actually delivers. They differ on purpose: the contract blacklists writes,
+while the engine accepts writes because the internal port needs them. Today the contract
+allows 73 probes and refuses 14 (10 `unsafe_cypher`, 4 `unsupported_operation`); the engine
+accepts 76 and refuses 11. The intersection that matters to the public endpoint is the 3
+allowed probes the engine still refuses.
 
 ### What M-PULSE-2 owes
 
-These 5 constructs are admitted by the public contract and refused by the engine:
+These 3 constructs are admitted by the public contract and refused by the engine:
 
 | Construct | Category | Refused at |
 | --- | --- | --- |
 | `UNION` | clause | parse error |
 | `untyped relationship` | pattern | plan error |
-| `root operation as a homoglyph` | security | parse error |
-| `unsupported clause after a supported root` | taxonomy | parse error |
 | `path projection` | result | analysis error |
+
+M-PULSE-2L removed two false gaps without widening the Grafx grammar. The Core public boundary
+now refuses trailing `CALL`/`YIELD` as `unsupported_operation`, while keeping blacklist writes
+as `unsafe_cypher`, and the freezer asks the engine about the same NFKC-normalized text that the
+public endpoint executes. Therefore both fullwidth probes plan in the engine, `CALL` after a
+supported root is refused by the contract, internal transaction families remain byte-for-byte
+unchanged, and the library parser itself stays ASCII/fail-closed.
 
 `OPTIONAL MATCH` left this table in M-PULSE-2K. The admitted form is deliberately limited to
 one named, labelled node as the first and only MATCH clause of a read-only query; an empty scan

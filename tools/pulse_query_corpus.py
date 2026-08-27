@@ -60,7 +60,7 @@ BASELINES: dict[str, dict[str, Any]] = {
     "core": {
         "siblings": ("okto-pulse-core-grafx-contract", "okto-pulse-core"),
         "env": "PULSE_CORE_BASELINE",
-        "sha": "ab61b9a785f2018312fc91541a580877fd068bbb",
+        "sha": "f602c7cc2f6a9f5ef446d4c991309196bd4667c7",
     },
 }
 
@@ -1133,7 +1133,10 @@ def _pulse_catalog(sources: dict[str, str]) -> Any:
 
 
 def _try_accept(
-    text: str, sources: dict[str, str] | None = None
+    text: str,
+    sources: dict[str, str] | None = None,
+    *,
+    normalize_unicode: bool = False,
 ) -> tuple[str, str | None]:
     """Ask the engine every question it can answer, and stop at the first refusal.
 
@@ -1150,8 +1153,9 @@ def _try_accept(
     from okto_grafx.domain.query.parser import parse  # noqa: PLC0415 - same
     from okto_grafx.domain.query.planner import build_plan  # noqa: PLC0415 - same
 
+    executable_text = unicodedata.normalize("NFKC", text) if normalize_unicode else text
     try:
-        statement = parse(text)
+        statement = parse(executable_text)
     except Exception as exc:  # noqa: BLE001 - any refusal is evidence, whatever its shape
         return "parse_error", f"{type(exc).__name__}: {exc}"[:220]
     try:
@@ -2505,6 +2509,7 @@ _EXECUTE_STEPS: tuple[str, ...] = (
     "_rewrite_cypher_canonical_only",
 )
 _VALIDATOR_CODES: tuple[str, ...] = ("unsafe_cypher", "unsupported_operation")
+_PUBLIC_UNSUPPORTED_TOKENS_AUTHORITY = "_CYPHER_PUBLICLY_UNSUPPORTED_TOKENS"
 
 
 def _called_names(function: ast.AST) -> list[str]:
@@ -2584,6 +2589,19 @@ def _check_contract_pipeline(sources: dict[str, str]) -> dict[str, Any]:
         )
         raise FreezeError(message)
 
+    loaded_names = {
+        node.id
+        for node in ast.walk(validator)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    if _PUBLIC_UNSUPPORTED_TOKENS_AUTHORITY not in loaded_names:
+        message = (
+            "validate_cypher_read_only no longer consults "
+            f"{_PUBLIC_UNSUPPORTED_TOKENS_AUTHORITY}; the freezer cannot prove the public "
+            "CALL/YIELD fence it reproduces."
+        )
+        raise FreezeError(message)
+
     executor_calls = [
         name for name in _called_names(executor) if name in _EXECUTE_STEPS
     ]
@@ -2599,6 +2617,7 @@ def _check_contract_pipeline(sources: dict[str, str]) -> dict[str, Any]:
         "module": CONTRACT_MODULE,
         "validator_steps": list(_VALIDATOR_STEPS),
         "validator_error_codes": list(_VALIDATOR_CODES),
+        "publicly_unsupported_tokens_authority": _PUBLIC_UNSUPPORTED_TOKENS_AUTHORITY,
         "execute_steps": list(_EXECUTE_STEPS),
     }
 
@@ -2613,8 +2632,10 @@ def _contract_tokens(text: str) -> list[str]:
     return re.findall(r"[A-Z_]+", cleaned.upper())
 
 
-def _contract_vocabulary(sources: dict[str, str]) -> tuple[set[str], tuple[str, ...]]:
-    """The blacklist and the supported root operations, read at the pin."""
+def _contract_vocabulary(
+    sources: dict[str, str],
+) -> tuple[set[str], tuple[str, ...], tuple[str, ...]]:
+    """The blacklist, roots and public trailing-token fence read at the pin."""
 
     enforcement = _PureEvaluator(sources, CONTRACT_MODULE)
     blacklist = (
@@ -2627,20 +2648,31 @@ def _contract_vocabulary(sources: dict[str, str]) -> tuple[set[str], tuple[str, 
         )
         or []
     )
-    if not blacklist or not roots:
+    publicly_unsupported = (
+        enforcement._value(
+            enforcement._constants.get(_PUBLIC_UNSUPPORTED_TOKENS_AUTHORITY), {}
+        )
+        or []
+    )
+    if not blacklist or not roots or not publicly_unsupported:
         message = (
             "the raw contract vocabulary could not be read at the pinned commit "
-            f"(blacklist={len(blacklist)}, roots={len(roots)}). A verdict computed from an "
-            "empty vocabulary would admit everything."
+            f"(blacklist={len(blacklist)}, roots={len(roots)}, "
+            f"publicly_unsupported={len(publicly_unsupported)}). A verdict computed from "
+            "an empty authority would admit unsupported public clauses."
         )
         raise FreezeError(message)
-    return {str(item) for item in blacklist}, tuple(str(item) for item in roots)
+    return (
+        {str(item) for item in blacklist},
+        tuple(str(item) for item in roots),
+        tuple(str(item) for item in publicly_unsupported),
+    )
 
 
 def _contract_verdict(text: str, sources: dict[str, str]) -> dict[str, Any]:
     """What the PUBLIC raw endpoint does with this text, reproduced from the pinned commit."""
 
-    blacklist, roots = _contract_vocabulary(sources)
+    blacklist, roots, publicly_unsupported = _contract_vocabulary(sources)
     tokens = _contract_tokens(text)
     for token in tokens:
         if token in blacklist:
@@ -2656,6 +2688,13 @@ def _contract_verdict(text: str, sources: dict[str, str]) -> dict[str, Any]:
             "error_code": "unsupported_operation",
             "reason": f"root operation {root or '<empty>'}",
         }
+    for token in tokens[1:]:
+        if token in publicly_unsupported:
+            return {
+                "admitted": False,
+                "error_code": "unsupported_operation",
+                "reason": f"unsupported public token {token}",
+            }
     return {"admitted": True, "error_code": None, "reason": None}
 
 
@@ -2996,7 +3035,7 @@ RAW_CONTRACT_PROBES: tuple[tuple[str, str, str, str], ...] = (
         "taxonomy",
         "unsupported clause after a supported root",
         "MATCH (n:Decision) CALL db.index() YIELD value RETURN value",
-        "allowed",
+        "refused",
     ),
     # -- limits: what injection does and does not touch -------------------------------
     (
@@ -3282,16 +3321,15 @@ CONTRACT_BEHAVIOURS: tuple[tuple[str, str, str, str, str, Any], ...] = (
     ),
     (
         "schema_domain",
-        "clause vocabulary is published but not enforced",
+        "publicly unsupported trailing tokens",
         "constant",
-        "CYPHER_SUPPORTED_CLAUSES",
+        "_CYPHER_PUBLICLY_UNSUPPORTED_TOKENS",
         (
-            "CYPHER_SUPPORTED_CLAUSES is published in the contract document and bound to "
-            "CYPHER_WHITELIST, but validate_cypher_read_only consults only the blacklist and "
-            "the root operation. A clause outside this list is admitted unless it is the "
-            "root token or a blacklisted word."
+            "After the blacklist and root checks, the public raw boundary rejects CALL and "
+            "YIELD tokens that appear later in the query. Internal provider procedures use "
+            "their own explicit route and are not described by this public fence."
         ),
-        None,
+        ["CALL", "YIELD"],
     ),
     (
         "context_shape",
@@ -3811,7 +3849,7 @@ def _raw_contract(sources: dict[str, str]) -> dict[str, Any]:
     """
 
     pipeline = _check_contract_pipeline(sources)
-    blacklist, roots = _contract_vocabulary(sources)
+    blacklist, roots, publicly_unsupported = _contract_vocabulary(sources)
     evaluator = _PureEvaluator(sources, CONTRACT_VOCABULARY_MODULE)
     declared = {
         name: evaluator._value(evaluator._constants[name], {})
@@ -3829,7 +3867,7 @@ def _raw_contract(sources: dict[str, str]) -> dict[str, Any]:
                 f"{category}/{construct}: declared {disposition}, contract says {expected}"
                 f" ({verdict['reason']})"
             )
-        phase, error = _try_accept(probe, sources)
+        phase, error = _try_accept(probe, sources, normalize_unicode=True)
         probes.append(
             {
                 "category": category,
@@ -3866,6 +3904,7 @@ def _raw_contract(sources: dict[str, str]) -> dict[str, Any]:
         "enforcement": pipeline,
         "blacklist": sorted(blacklist),
         "root_operations": list(roots),
+        "publicly_unsupported_tokens": list(publicly_unsupported),
         "probe_count": len(probes),
         "engine_accepted": sum(
             1 for item in probes if item["engine_verdict"] == "accepted"
@@ -3879,9 +3918,9 @@ def _raw_contract(sources: dict[str, str]) -> dict[str, Any]:
         "contract_error_codes": dict(sorted(codes.items())),
         "note": (
             "contract_disposition is what the public raw endpoint admits, computed from the "
-            "pinned commit; engine_verdict is what this engine does with the same text. A "
-            "write is refused by the contract and accepted by the engine, because the "
-            "internal port needs it."
+            "pinned commit; engine_verdict is what this engine does with the NFKC-normalized "
+            "text the public endpoint delivers. A write is refused by the contract and may "
+            "be accepted by the engine, because the internal port needs it."
         ),
         "behaviour": _contract_behaviours(sources),
         "probes": probes,
