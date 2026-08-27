@@ -1472,21 +1472,60 @@ corrigir defeito reproduzível desse contrato; não ampliam o milestone.
 
 #### M-PULSE-5 — export/import, backup e recovery portável
 
-1. formato lógico versionado;
-2. exporter Ladybug consistente sob freeze/snapshot e importer Grafx em streaming;
-3. exporter Grafx e importer de retorno, ou journal lógico reversível enquanto rollback estiver
-   aberto;
-4. fingerprint lógico canônico e verificação pós-import;
-5. backup/restore consistente;
-6. adaptação das operações de lifecycle/recovery do Pulse sem nomes Ladybug.
+1. congelar o formato lógico `okto-pulse-logical-graph/1`, com manifesto de schema, features
+   obrigatórias, contagens, checksums e manifesto terminal;
+2. exportar Board e Global Discovery de Ladybug sob freeze/snapshot único e importar em batches
+   limitados para geração Grafx nova, vazia e não vinculada;
+3. exportar Grafx sob uma única transação MVCC read-only e importar em batches limitados para
+   geração Ladybug nova, vazia e não vinculada; este caminho bidirecional é a opção M-PULSE-5, não
+   um journal;
+4. preservar tipo lógico, chave, todas as propriedades, `absent` versus `NULL`, string vazia,
+   timestamps, direção, self-loop e uma entrada por ocorrência de relação, inclusive paralelas
+   idênticas;
+5. serializar vetores pelo `space_name` lógico e remapeá-los no destino; IDs físicos de space,
+   RecordIds, páginas, filenames, WAL/LSN e topologia HNSW não pertencem ao formato;
+6. calcular fingerprint canônico sobre schema e multiconjunto completo, reabrir o candidato a frio
+   e exigir schema, contagens, vetores, fingerprint e `verify()` iguais antes de emitir sucesso;
+7. publicar backup por temp + flush/fsync + verificação + replace atômico e restaurar sempre fora
+   do lugar, preservando a geração anterior;
+8. adaptar as operações públicas necessárias de lifecycle/recovery para nomes neutros;
+   aliases/configurações internos Ladybug/Kuzu existentes não são renomeados neste milestone.
 
-O `graph_export.py` atual do Pulse não serve como formato de cutover: ele exporta um subconjunto de
-campos, omite embeddings e várias propriedades e deduplica arestas por tipo/endpoints, perdendo
-propriedades e multiplicidade. Ele deve ser substituído/estendido pelo exporter full-fidelity do
-milestone, não reutilizado como prova de paridade.
+O escopo de Board é exatamente `BoardMeta`, 11 tipos de nó com 44 propriedades, 69 layouts
+relacionais com sete propriedades e 11 spaces. O escopo Global Discovery é exatamente quatro tipos
+de nó/spaces e sete relações. Nós cognitivos canônicos sem origem SQL fazem parte da mesma
+transferência, sem rebuild derivado.
 
-**Gate:** round-trip completo preserva 100% dos nós, arestas, propriedades e vetores, incluindo os
-nós cognitivos sem fonte SQL, e permite rollback para a geração anterior.
+O `graph_export.py` atual permanece uma exportação JSON-LD de exposição/proveniência e não é entrada
+válida do importador portátil: ele omite 35 propriedades de nó, seis propriedades de relação e
+embeddings, colapsa `NULL`/ausente e deduplica por tipo/endpoints, perdendo multiplicidade.
+
+No Grafx, a única superfície nova é `Transaction.scan_rows_v1(table, limit, cursor=None)`: ela usa o
+snapshot da transação read-only existente, devolve DTOs destacados na ordem física estável, inclui
+endpoints das relações e preserva uma row por ocorrência. O cursor é opaco, preso à identidade do
+banco, transação/snapshot e tabela, e não pode ser reutilizado. A implementação deve manter memória
+`O(limit + valores do lote)` e avançar a posição de storage sem `QueryResult`, sort ou traversal.
+Não há novo `Database.logical_snapshot()`, bulk import, archive, backup ou semântica Pulse no core.
+
+O Core Pulse possui apenas DTOs/codec/fingerprint, snapshot source, candidate sink e orquestração
+neutra. O Community possui adapters Ladybug/Grafx, arquivo atômico e operações de backup/restore.
+Nenhum tipo, path ou erro de backend entra no Core.
+
+**Gate finito:** codec golden e recusa de versão/feature desconhecida; Board Ladybug→Grafx; Board
+Grafx→Ladybug; Global Discovery nos dois sentidos; snapshot consistente sob writer concorrente;
+corrupção/falhas em write, import, checkpoint e reopen; memória limitada, nomes neutros e geração
+anterior intacta. Cada round-trip preserva 100% dos nós, relações, propriedades, vetores e
+multiplicidade. O scan Grafx prova continuação/snapshot, relações paralelas, bounded-memory, tokens
+inválidos e relação ainda física cujo endpoint foi removido.
+
+M-PULSE-5 não implementa provider/router, binding/CAS, shadow, canário, dual write, journal/outbox,
+troca de tráfego, migração in-place ou retomada de candidato parcial. Binding pertence a M-PULSE-6;
+journal e cutover pertencem a M-PULSE-7.
+
+O congelamento deste recorte foi revisado no Nexus em
+`hof_aa27cde687bd41bbaf57e0e74b09e7ef`, concluído, verificado e PASS: contagens Board/Global,
+perdas do exportador JSON-LD, necessidade do scan bounded-memory e fronteiras M6/M7 foram
+conferidas diretamente nas árvores Grafx/Pulse, sem blocker.
 
 #### M-PULSE-6 — providers Grafx e conformance end-to-end
 
@@ -1590,13 +1629,15 @@ uma mudança de formato ou semântica fica concentrado no Grafx, no adapter Comm
   permanece em M-PULSE-2.
 - Depois de M-PULSE-1, M-PULSE-2, M-PULSE-3 e M-PULSE-4 podem avançar em paralelo em arquivos e
   branches isolados.
-- O rascunho do formato lógico de M-PULSE-5 pode iniciar imediatamente; só é congelado depois dos
-  contratos de schema e vetor de M-PULSE-3/4.
-- O scaffold do provider/router/harness de M-PULSE-6 pode iniciar após M-PULSE-1; sua certificação
-  final depende dos gates M-PULSE-0 a M-PULSE-5.
-- M-PULSE-7 é apenas rollout; não pode ser usado para descobrir semântica básica faltante.
-- `RELEASE-0.0.1` sucede M-PULSE-7 e bloqueia todo roadmap complementar; a publicação externa é
-  feita junto com o usuário, nunca automaticamente. Os itens pós-Pulse começam na linha `0.0.2`.
+- Com os contratos M-PULSE-3/4 fechados, M-PULSE-5 é o próximo gate serial de compatibilidade.
+- O scaffold de M-PULSE-6 pode existir, mas sua certificação final depende de M-PULSE-0 a
+  M-PULSE-5.
+- M-PULSE-7 começa somente depois da certificação M-PULSE-6 e é exclusivamente rollout/cutover;
+  não pode descobrir semântica básica faltante.
+- A sequência vinculante é M-PULSE-5 → M-PULSE-6 → M-PULSE-7 → run integrado e auditoria →
+  build/install limpo → checkpoint interativo, publicação e reinstalação de
+  `okto-grafx==0.0.1` no PyPI → somente então linha `0.0.2`.
+- Nenhum `GX-CAP-*`, `GX-AGENT-*` ou `AGENT-*` começa antes desse gate de release.
 
 Cada milestone deve ter branch, commit e push próprios, suíte direcionada, suíte global verde,
 revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
