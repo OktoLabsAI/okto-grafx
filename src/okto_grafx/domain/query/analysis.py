@@ -369,11 +369,7 @@ def optional_match_refusal(query: Query) -> tuple[str, str] | None:
             "not be chained with another MATCH.",
             "clause",
         )
-    if (
-        query.unwind_clause is not None
-        or query.with_clauses
-        or query.updating_clauses
-    ):
+    if query.unwind_clause is not None or query.with_clauses or query.updating_clauses:
         return (
             "An OPTIONAL MATCH begins a query that only reads: no UNWIND, WITH or writing "
             "clause may accompany it.",
