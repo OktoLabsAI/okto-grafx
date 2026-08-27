@@ -1332,16 +1332,18 @@ M-PULSE-4 deve medir o overhead dos dois aceleradores não expostos e decidir ma
 antes da ativação, sem mudar coluna, space, fingerprint ou dados persistidos.
 
 O bootstrap recebe explicitamente `database`, `board_id`, `bootstrapped_at`,
-`embedding_model | None` e `embedding_dimension=384`. Antes de qualquer write ele captura um único
+`embedding_model | None` e `embedding_dimension | None`. Metadata de embedding é um par: ambos
+`None`, ou model não vazio com dimensão exatamente 384. Antes de qualquer write ele captura um único
 catálogo público e valida todo objeto esperado já existente e qualquer objeto inesperado; kind,
 primary key, colunas completas, ordem, tipo, nullability, vector-space, endpoints e configuração
 do space divergentes falham na taxonomia Core com `backend=okto_grafx` e sem DDL/WAL. Em catálogo
 vazio ou parcial contendo somente um subconjunto correto, cria somente os objetos ausentes em uma
 única transação write; após o commit, recaptura e valida o schema completo. Somente depois dessa
 validação grava a row `BoardMeta` do board em uma transação separada. Falha de criação ou validação
-deixa a versão ausente; retry converge. Uma row já presente precisa ter `SCHEMA_VERSION` e metadata
-de embedding compatíveis; schema completo + row compatível retorna sem DDL, mutation ou avanço de
-WAL/LSN.
+deixa a versão ausente; retry converge. Uma row já presente precisa ter `SCHEMA_VERSION`; metadata
+persistida é preservada quando o caller não oferece par, deve ser idêntica quando oferece, e pode
+ser preenchida uma única vez se ainda estiver ausente. Schema completo + row compatível retorna
+sem DDL, mutation ou avanço de WAL/LSN.
 
 O fingerprint usa JSON canônico e SHA-256 sobre a visão lógica validada: versão, 11 nodes e suas
 colunas, 16 relações e 69 pares, propriedades de relação, `BoardMeta` e os 11 spaces. Ele exclui
