@@ -7,7 +7,7 @@
 **Ambiente principal:** Windows, Python 3.13.1
 **Escopo:** integridade, recuperação, concorrência, estabilidade, performance, API, configuração e novas capacidades.
 
-## Estado de execução — 2026-08-27
+## Estado de execução — 2026-08-28
 
 - **M0 estabilização: concluído e publicado** em
   `milestone/m0-stabilization@e2d6a22da8ec2571127fc9d1533995d40330c632`. Os cinco P0
@@ -21,8 +21,8 @@
 - **Próximo gate:** concluir C13 e o censo de retornos públicos tipados, integrar serialmente no
   branch M1, executar a suíte completa e publicar um SHA imutável. M2 inicia identity-range leasing
   somente depois desse gate.
-- **Compatibilidade Okto Pulse: M-PULSE-1 a M-PULSE-4 concluídos; fundações Core/scan de
-  M-PULSE-5 concluídas e integradas.**
+- **Compatibilidade Okto Pulse: M-PULSE-1 a M-PULSE-4 concluídos; M-PULSE-5 em execução com
+  seus componentes intermediários já concluídos, publicados e auditados conforme o quadro 9.7.**
   M-PULSE-4 foi aceito e promovido no Pulse Community em
   `feature/v0.3.3@d3ef4afdf263e7b6da70b6705b31950cfe07986e`. O gate final passou 56/56; o recall público
   foi `0.9546875` e a evidência direcional sem SLO dos espaços não públicos registrou build/ingest
@@ -34,7 +34,12 @@
   revisados no Nexus
   `hof_2373b761002c42aeb519e53617e56ec8` e integrados por fast-forward em
   `okto-pulse-core/feature/v0.3.3@098a346b0988d7b39e417e7de7ed8d57d06b9795`; a validação
-  independente passou 318/318, Ruff, compileall, diff-check e a auditoria de fronteiras 4/4.
+  independente passou 318/318, Ruff, compileall, diff-check e a auditoria de fronteiras 4/4. No
+  Pulse Community, o arquivo lógico atômico foi publicado em `cb74da0f135cf8429cd9c35f399cd10ed0bd7ed6`,
+  o source físico Grafx em `cb75ac60b74310a6af2de7f151286af1bfa307bd` e o sink candidato Grafx em
+  `445043666530862300221783ece480e63c7086ac`; os três passaram revisão independente. A integração
+  serial com a fundação Board/Global e os adapters Ladybug, seguida da matriz congelada de 8 testes
+  parametrizados/32 casos, continua pendente e é o único próximo alvo de M-PULSE-5.
   M-PULSE-0 foi concluído em
   `5b7551b40dba2facb28c46770f166ab3ac9daecc`. A fundação de identidades pendentes do
   M-PULSE-1 entrou em `d487ac9312229e0376ad8e65625213af111d9c9c`; o overlay owner-only de nós
@@ -1734,6 +1739,10 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-4 — paridade vetorial | concluído, verificado, publicado e integrado | Pulse Community `milestone/grafx-mpulse4-accepted@d3ef4afdf263e7b6da70b6705b31950cfe07986e` → `feature/v0.3.3`; evidência não pública `milestone/grafx-mpulse4-vector-recall@fcfbf215b151aac4603978e02900ef323cb1b898` | Matriz V1–V7, exact/ANN, filtros, ordenação, rebuild/churn e cold reopen fechados. Gate final 56/56; recall@10 público `0.9546875`. `Alternative`/`Assumption`: 8192 linhas e 128 commits cada, build/ingest `1279.6239901 s`/`1415.9925527 s`, persistido `794624 B`/`802816 B`, verify limpo e cold/reopen 10/10. Artefato SHA-256 `e010ef6fb4a46b9e7a7bb770c9d4f6007b5b1af6415efb9952e3b7c369a0bede`; sem SLO; auditoria independente PASS |
 | M-PULSE-5 — scan físico bounded-memory no Grafx | concluído, revisado, integrado e revalidado | Grafx `milestone/mpulse5-scan-v1@f132190207b562eb9794e7e4d752c41c9fdb7504` → `main`; validação pós-integração 254/254, Ruff, compileall e diff-check PASS | `Transaction.scan_rows_v1` percorre o snapshot read-only na ordem física estável, devolve DTOs destacados, preserva uma ocorrência por relação e usa cursor opaco, preso ao banco/transação/snapshot/tabela e de uso único. Continuação, writer concorrente, relações paralelas, token inválido e bounded-memory foram revisados sem blocker; nenhuma semântica Pulse, arquivo ou backup entrou no core Grafx |
 | M-PULSE-5 — formato e transferência lógica no Pulse Core | concluído, verificado e integrado | Pulse Core `milestone/grafx-mpulse5-logical-transfer-core@098a346b0988d7b39e417e7de7ed8d57d06b9795` → `feature/v0.3.3`; revisão Nexus `hof_2373b761002c42aeb519e53617e56ec8` concluída/verificada/PASS | Formato `okto-pulse-logical-graph/1`, DTOs frozen, schema Board/Global representável, mapping propriedade→space, geometria vetorial, identidade tripla de layouts, codec canônico incremental, fingerprint multiconjunto, ports e transferência candidata neutra. Corrupção, não-finitos, wire/features, schema-record, batches e certificação cold-reopen falham tipados na matriz finita. Validação independente final: 318/318, Ruff, compileall, diff-check, remoto exato e auditoria de fronteiras 4/4 PASS. Adapters, arquivo atômico e round-trips físicos permanecem no Community, como já congelado |
+| M-PULSE-5 — arquivo lógico atômico no Community | concluído, publicado e auditado; integração serial pendente | Pulse Community `milestone/grafx-mpulse5-logical-artifact@cb74da0f135cf8429cd9c35f399cd10ed0bd7ed6` | Publicação por arquivo temporário, flush/fsync, verificação e replace atômico; matriz congelada `success/write/fsync/verify/replace` 5/5, geração anterior preservada nas falhas e nenhuma operação posterior ao replace; auditoria PASS |
+| M-PULSE-5 — source físico Grafx | concluído, publicado e auditado; integração serial pendente | Pulse Community `milestone/grafx-mpulse5-grafx-adapter@cb75ac60b74310a6af2de7f151286af1bfa307bd` | Snapshot Grafx único, projeção integral do schema fixo, `None → LOGICAL_NULL`, mapa temporário SQLite `(node_table, record_id) → logical_key`, scan bounded-memory e cleanup em sucesso/falha; contrato de endpoints `success/scan_failure/dangling_endpoint` 3/3 e checks estáticos PASS |
+| M-PULSE-5 — sink candidato Grafx | concluído, publicado e auditado; integração serial pendente | Pulse Community `milestone/grafx-mpulse5-grafx-sink@445043666530862300221783ece480e63c7086ac` | Geração nova e não vinculada, schema esperado exato, recusa de propriedade ausente, batches transacionais, checkpoint, close, cold reopen, `verify("all")`, contagens/fingerprint e abort seguro sem tocar a geração anterior; falhas de import/checkpoint/reopen e checks estáticos cobertos |
+| M-PULSE-5 — integração e aceite final | em execução | fundação/factories Board e Global e adapters Ladybug ainda pendentes no Pulse Community | Integrar serialmente os componentes concluídos e executar a matriz já congelada de 8 testes parametrizados/32 casos: A1 2, A2 3, B1 4, C1 4, C2 2, D1 8, D2 5 e D3 4; depois publicar o SHA Community imutável em `feature/v0.3.3` |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
