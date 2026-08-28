@@ -17,6 +17,7 @@ import pytest
 
 import okto_grafx
 from okto_grafx.domain.errors import (
+    GrafxParseError,
     GrafxPlanError,
     GrafxQueryBudgetExceeded,
 )
@@ -46,6 +47,7 @@ from okto_grafx.domain.query.ast import (
 from okto_grafx.domain.query.parser import parse
 from okto_grafx.domain.query.plan import (
     AggregateRows,
+    LimitRows,
     NodeScan,
     ProduceResults,
     ProjectRows,
@@ -855,9 +857,120 @@ NEAR_MISSES = (
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN DISTINCT path",
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path ORDER BY a.id",
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path SKIP 0",
-    "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path LIMIT 1",
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) SET a.title = 'changed'",
 )
+
+# A row bound written as a literal non-negative integer is part of the admitted
+# shape. It is the only thing about this projection a caller may vary, and
+# refusing it made the projection unreachable for any client that appends LIMIT
+# to every read.
+ADMITTED_ROW_BOUNDS = (
+    f"{ADMITTED} LIMIT 0",
+    f"{ADMITTED} LIMIT 1",
+    f"{ADMITTED} LIMIT 1000",
+    f"{ADMITTED} limit 7",
+    f"{ADMITTED} LIMIT 2;",
+)
+
+# Everything a row bound could be written as that this recogniser cannot read as
+# a number, plus every clause the bound does not drag in with it.
+REFUSED_ROW_BOUNDS = (
+    f"{ADMITTED} LIMIT 1.5",
+    f"{ADMITTED} LIMIT true",
+    f"{ADMITTED} LIMIT false",
+    f"{ADMITTED} LIMIT -1",
+    f"{ADMITTED} LIMIT $n",
+    f"{ADMITTED} LIMIT 2+3",
+    f"{ADMITTED} LIMIT '2'",
+    f"{ADMITTED} LIMIT NULL",
+    f"{ADMITTED} SKIP 1 LIMIT 2",
+    f"{ADMITTED} SKIP 0 LIMIT 1",
+    "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) "
+    "RETURN DISTINCT path LIMIT 1",
+    "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) "
+    "RETURN path ORDER BY a.id LIMIT 1",
+    "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) "
+    "RETURN path AS p LIMIT 1",
+    "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) "
+    "WHERE a.id = 'd1' RETURN path LIMIT 1",
+)
+
+
+@pytest.mark.parametrize("text", ADMITTED_ROW_BOUNDS)
+def test_a_literal_row_bound_is_part_of_the_admitted_shape(text: str) -> None:
+    statement = parse(text)
+    pattern = exact_path_projection(statement)
+
+    assert pattern is statement.match_clauses[0].patterns[0]
+    # The bound reaches the plan rather than being recognised and dropped.
+    assert statement.return_clause.limit is not None
+
+
+@pytest.mark.parametrize("text", REFUSED_ROW_BOUNDS)
+def test_a_bound_this_subset_cannot_read_stays_refused(text: str) -> None:
+    try:
+        statement = parse(text)
+    except GrafxParseError:
+        return
+    assert exact_path_projection(statement) is None
+
+
+def test_the_engine_applies_the_bound_rather_than_the_caller(
+    database: object,
+) -> None:
+    """The point of admitting LIMIT: the engine stops, nothing trims afterwards."""
+
+    with database.begin("write") as writer:
+        writer.execute("CREATE (:Decision {id: 'd3', title: 'third'})")
+        writer.execute("CREATE (:Decision {id: 'd4', title: 'fourth'})")
+        for source, target in (("d2", "d3"), ("d3", "d4")):
+            writer.execute(
+                f"MATCH (a:Decision {{id: '{source}'}}), "
+                f"(b:Decision {{id: '{target}'}}) "
+                "CREATE (a)-[:supersedes "
+                "{layer: 'canonical', note: 'chain'}]->(b)"
+            )
+
+    def count(text: str) -> int:
+        result = database.execute(text)
+        assert result.columns == ("path",)
+        return len(tuple(result.rows))
+
+    assert count(ADMITTED) == 3
+    assert count(f"{ADMITTED} LIMIT 1000") == 3
+    assert count(f"{ADMITTED} LIMIT 2") == 2
+    assert count(f"{ADMITTED} LIMIT 1") == 1
+    # Zero is a bound a caller can mean, so it answers no rows instead of all.
+    assert count(f"{ADMITTED} LIMIT 0") == 0
+
+
+def test_a_bounded_path_is_the_same_value_as_an_unbounded_one(
+    database: object,
+) -> None:
+    unbounded = _paths(database)
+    bounded = tuple(row[0] for row in database.execute(f"{ADMITTED} LIMIT 1").rows)
+
+    assert len(bounded) == 1
+    # The bound decides how many rows arrive and nothing about what a row is.
+    assert bounded[0] == unbounded[0]
+    _assert_path(
+        bounded[0],
+        source=("d1", "source"),
+        target=("d2", "target"),
+        relationship=("canonical", "primary"),
+    )
+
+
+def test_the_bound_becomes_a_limit_in_the_plan(database: object) -> None:
+    """The bound is planned, so the engine stops rather than the caller trimming."""
+
+    bounded = database.explain(f"{ADMITTED} LIMIT 2")
+    unbounded = database.explain(ADMITTED)
+
+    assert any(type(node) is LimitRows for node in bounded.walk())
+    assert not any(type(node) is LimitRows for node in unbounded.walk())
+    # The rest of the plan is the one this milestone froze, bound or not.
+    assert any(type(node) is TraverseRelationship for node in bounded.walk())
 
 
 @pytest.mark.parametrize("text", NEAR_MISSES)
