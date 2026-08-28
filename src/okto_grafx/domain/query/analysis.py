@@ -604,11 +604,34 @@ _PATH_PROJECTION_RELATIONSHIP_TYPE = "supersedes"
 """Every identifier fixed by the one path projection this subset reads."""
 
 
+def _is_literal_row_count(value: object) -> bool:
+    """True for a row count written as a literal non-negative integer, else False.
+
+    A LIMIT is admitted on this one projection because the row bound is the only
+    thing about it a caller may vary, and because refusing it made the projection
+    unreachable in practice: a client that appends ``LIMIT`` to every read -- as
+    Pulse Tier Power does whenever the caller wrote none -- could never send the
+    one statement this subset admits.
+
+    Everything else stays out. A parameter or an arithmetic expression is not a
+    number until something evaluates it, and a bound this recogniser cannot read
+    is a bound it cannot claim to have checked. ``bool`` is refused explicitly
+    because it is an ``int`` subclass in Python and ``LIMIT TRUE`` is not a row
+    count anybody wrote on purpose. A negative count is refused rather than
+    clamped, so a caller learns what it asked for.
+    """
+    if type(value) is not Literal:
+        return False
+    count = value.value
+    return type(count) is int and count >= 0
+
+
 def exact_path_projection(query: Query) -> PatternPath | None:
     """Return the path when ``query`` is the one literal path projection, else None.
 
     The admitted statement is exactly ``MATCH path = (a:Decision)-[r:supersedes]->``
-    ``(b:Decision) RETURN path`` at the AST boundary.  Lexical trivia the parser discards --
+    ``(b:Decision) RETURN path`` at the AST boundary, optionally followed by ``LIMIT`` and a
+    literal non-negative integer.  Lexical trivia the parser discards --
     whitespace, keyword case and a trailing semicolon -- is deliberately not reconstructed.
     Every semantic field, class, container, flag and identifier is checked exactly so a tree a
     caller built cannot turn this one measured query into a family of unmeasured path reads.
@@ -688,7 +711,9 @@ def exact_path_projection(query: Query) -> PatternPath | None:
         return None
     if type(returned.sort_items) is not tuple or returned.sort_items:
         return None
-    if returned.skip is not None or returned.limit is not None:
+    if returned.skip is not None:
+        return None
+    if returned.limit is not None and not _is_literal_row_count(returned.limit):
         return None
     if type(returned.items) is not tuple or len(returned.items) != 1:
         return None
