@@ -37,9 +37,12 @@
   independente passou 318/318, Ruff, compileall, diff-check e a auditoria de fronteiras 4/4. No
   Pulse Community, o arquivo lógico atômico foi publicado em `cb74da0f135cf8429cd9c35f399cd10ed0bd7ed6`,
   o source físico Grafx em `cb75ac60b74310a6af2de7f151286af1bfa307bd` e o sink candidato Grafx em
-  `445043666530862300221783ece480e63c7086ac`; os três passaram revisão independente. A integração
-  serial com a fundação Board/Global e os adapters Ladybug, seguida da matriz congelada de 8 testes
-  parametrizados/32 casos, continua pendente e é o único próximo alvo de M-PULSE-5.
+  `445043666530862300221783ece480e63c7086ac`; os três passaram revisão independente. As operações
+  neutras streaming de backup/restore foram publicadas no milestone de integração em
+  `6fe93a6e2586decc94081778f4f2bbb7425c07a0`, com revisão independente e 5/5 testes focados. A
+  aceitação da fundação Board/Global e dos adapters Ladybug, a integração serial e a matriz
+  congelada de 8 testes parametrizados/32 casos continuam pendentes e formam o único próximo alvo
+  de M-PULSE-5.
   M-PULSE-0 foi concluído em
   `5b7551b40dba2facb28c46770f166ab3ac9daecc`. A fundação de identidades pendentes do
   M-PULSE-1 entrou em `d487ac9312229e0376ad8e65625213af111d9c9c`; o overlay owner-only de nós
@@ -1742,7 +1745,8 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-5 — arquivo lógico atômico no Community | concluído, publicado e auditado; integração serial pendente | Pulse Community `milestone/grafx-mpulse5-logical-artifact@cb74da0f135cf8429cd9c35f399cd10ed0bd7ed6` | Publicação por arquivo temporário, flush/fsync, verificação e replace atômico; matriz congelada `success/write/fsync/verify/replace` 5/5, geração anterior preservada nas falhas e nenhuma operação posterior ao replace; auditoria PASS |
 | M-PULSE-5 — source físico Grafx | concluído, publicado e auditado; integração serial pendente | Pulse Community `milestone/grafx-mpulse5-grafx-adapter@cb75ac60b74310a6af2de7f151286af1bfa307bd` | Snapshot Grafx único, projeção integral do schema fixo, `None → LOGICAL_NULL`, mapa temporário SQLite `(node_table, record_id) → logical_key`, scan bounded-memory e cleanup em sucesso/falha; contrato de endpoints `success/scan_failure/dangling_endpoint` 3/3 e checks estáticos PASS |
 | M-PULSE-5 — sink candidato Grafx | concluído, publicado e auditado; integração serial pendente | Pulse Community `milestone/grafx-mpulse5-grafx-sink@445043666530862300221783ece480e63c7086ac` | Geração nova e não vinculada, schema esperado exato, recusa de propriedade ausente, batches transacionais, checkpoint, close, cold reopen, `verify("all")`, contagens/fingerprint e abort seguro sem tocar a geração anterior; falhas de import/checkpoint/reopen e checks estáticos cobertos |
-| M-PULSE-5 — integração e aceite final | em execução | fundação/factories Board e Global e adapters Ladybug ainda pendentes no Pulse Community | Integrar serialmente os componentes concluídos e executar a matriz já congelada de 8 testes parametrizados/32 casos: A1 2, A2 3, B1 4, C1 4, C2 2, D1 8, D2 5 e D3 4; depois publicar o SHA Community imutável em `feature/v0.3.3` |
+| M-PULSE-5 — backup/restore neutro streaming | concluído, publicado e auditado; quatro células D3 físicas pendentes no gate final | Pulse Community `milestone/grafx-mpulse5-integration@6fe93a6e2586decc94081778f4f2bbb7425c07a0` | Backup consome um único snapshot em batches, fecha-o antes do manifesto/verificação/replace atômico e não materializa o grafo; restore lê um único handle verificado para candidato novo e não vinculado. Revisão independente e 5/5 testes focados PASS; a matriz final conserva D3 `[ladybug,grafx] × [clean,corrupt]` |
+| M-PULSE-5 — integração e aceite final | em execução | fundação/factories Board e Global e adapters Ladybug em correção/revisão no Pulse Community; integração base já reúne arquivo e adapters Grafx em `6fe93a6` | Aceitar o lote Ladybug sem os blockers reproduzidos, integrar serialmente os componentes concluídos e executar a matriz já congelada de 8 testes parametrizados/32 casos: A1 2, A2 3, B1 4, C1 4, C2 2, D1 8, D2 5 e D3 4; depois publicar o SHA Community imutável em `feature/v0.3.3` |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
