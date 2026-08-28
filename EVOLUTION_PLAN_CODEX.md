@@ -21,9 +21,9 @@
 - **Próximo gate:** concluir C13 e o censo de retornos públicos tipados, integrar serialmente no
   branch M1, executar a suíte completa e publicar um SHA imutável. M2 inicia identity-range leasing
   somente depois desse gate.
-- **Compatibilidade Okto Pulse: M-PULSE-1 a M-PULSE-4 concluídos; M-PULSE-5 em execução com
-  seus componentes intermediários já concluídos, publicados e auditados conforme o quadro 9.7.**
-  M-PULSE-4 foi aceito e promovido no Pulse Community em
+- **Compatibilidade Okto Pulse: M-PULSE-1 a M-PULSE-5 concluídos, publicados e auditados conforme
+  o quadro 9.7; M-PULSE-6 é o próximo gate serial.** M-PULSE-4 foi aceito e promovido no Pulse
+  Community em
   `feature/v0.3.3@d3ef4afdf263e7b6da70b6705b31950cfe07986e`. O gate final passou 56/56; o recall público
   foi `0.9546875` e a evidência direcional sem SLO dos espaços não públicos registrou build/ingest
   de `1279.6239901 s`/`1415.9925527 s` e footprint persistido de `794624 B`/`802816 B` para
@@ -43,9 +43,14 @@
   fundação Board/Global e os adapters Ladybug foram aceitos no handoff Nexus
   `hof_2a6e059c010049a9b218345e8db663b7` pelo código
   `b7b76acd3912041b973cc5691c946ed20d887ab6` e integrados no milestone Community em
-  `c980737126118f44115fe199e17cec1ea6371c0e`; a composição passou 111/111 testes focados. Restam
-  somente as factories compartilhadas e a matriz congelada de 8 testes parametrizados/32 casos
-  para encerrar M-PULSE-5.
+  `c980737126118f44115fe199e17cec1ea6371c0e`; a composição passou 111/111 testes focados. As
+  factories compartilhadas foram publicadas em `f73cdf4e1e5a64c48e285f514f27d16a2d913853` e
+  integradas em `a4a5ec11bc20490fef7395066647a2152651291f`. A matriz final foi commitada em
+  `d61f3a875952cf6fbf9bb4be177c9a98a98d83d0`, integrada e publicada no milestone
+  `08e4fa71dce08d3d3a99929ed0c68a44fc260631` e promovida por fast-forward para Pulse Community
+  `feature/v0.3.3@e73a446a954e039fb038f8fa329236b51104504a`. O gate congelado passou 32/32 e a
+  regressão consolidada M5 passou 189/189, com Ruff, Black, compileall e diff-check verdes; a árvore
+  promovida é idêntica à árvore testada. M-PULSE-6 começa somente a partir desse fechamento.
   M-PULSE-0 foi concluído em
   `5b7551b40dba2facb28c46770f166ab3ac9daecc`. A fundação de identidades pendentes do
   M-PULSE-1 entrou em `d487ac9312229e0376ad8e65625213af111d9c9c`; o overlay owner-only de nós
@@ -1586,6 +1591,25 @@ O congelamento deste recorte foi revisado no Nexus em
 perdas do exportador JSON-LD, necessidade do scan bounded-memory e fronteiras M6/M7 foram
 conferidas diretamente nas árvores Grafx/Pulse, sem blocker.
 
+**Fechamento executado em 2026-08-28:** as factories Board/Global dos dois backends foram
+publicadas em `f73cdf4e1e5a64c48e285f514f27d16a2d913853` e integradas em
+`a4a5ec11bc20490fef7395066647a2152651291f`. A matriz final permaneceu exatamente com oito testes
+parametrizados e 32 casos — A1 2, A2 3, B1 4, C1 4, C2 2, D1 8, D2 5 e D3 4 — no commit
+`d61f3a875952cf6fbf9bb4be177c9a98a98d83d0`. A primeira execução encontrou cinco falhas Grafx de
+um único baseline temporal: o digest incluía `control/` antes de o caller abrir a conexão
+read-only, cujo contrato admite criar apenas `control/txn-*.lock` vazio. A prova por arquivo mostrou
+zero alteração em catálogo, heap, metadata, WAL ou índices; mover os dois baselines para depois do
+open do caller e antes da factory/transfer preservou a exigência byte a byte dentro da fronteira M5.
+Os cinco casos afetados passaram 5/5, a matriz integrada passou 32/32 em 1.239,02 s e a regressão
+consolidada dos nove módulos M5 passou 189/189 em 1.341,70 s, sempre com o Pulse Core explicitamente
+pinado no worktree `098a346b0988d7b39e417e7de7ed8d57d06b9795`. Ruff, Black nos 19 arquivos,
+compileall e diff-check passaram. A auditoria independente Nexus
+`hof_2b2ca8a48e4b472abe9f51e92c765138` executou novamente os 32 casos no commit exato, terminou
+32/32 e foi concluída/verificada/PASS, sem mutação nos worktrees. O milestone Community imutável
+`08e4fa71dce08d3d3a99929ed0c68a44fc260631` foi promovido para
+`feature/v0.3.3@e73a446a954e039fb038f8fa329236b51104504a`; os tree hashes da integração testada e da
+promoção são idênticos (`76b9bd8979f9345aa05d9c613716291eeb2ee95b`).
+
 #### M-PULSE-6 — providers Grafx e conformance end-to-end
 
 1. criar o bundle coerente `CommunityGrafx*` no Pulse;
@@ -1748,9 +1772,9 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-5 — arquivo lógico atômico no Community | concluído, publicado, auditado e integrado no milestone M5 | Pulse Community `milestone/grafx-mpulse5-logical-artifact@cb74da0f135cf8429cd9c35f399cd10ed0bd7ed6` → integração `c980737126118f44115fe199e17cec1ea6371c0e` | Publicação por arquivo temporário, flush/fsync, verificação e replace atômico; matriz congelada `success/write/fsync/verify/replace` 5/5, geração anterior preservada nas falhas e nenhuma operação posterior ao replace; auditoria PASS |
 | M-PULSE-5 — source físico Grafx | concluído, publicado, auditado e integrado no milestone M5 | Pulse Community `milestone/grafx-mpulse5-grafx-adapter@cb75ac60b74310a6af2de7f151286af1bfa307bd` → integração `c980737126118f44115fe199e17cec1ea6371c0e` | Snapshot Grafx único, projeção integral do schema fixo, `None → LOGICAL_NULL`, mapa temporário SQLite `(node_table, record_id) → logical_key`, scan bounded-memory e cleanup em sucesso/falha; contrato de endpoints `success/scan_failure/dangling_endpoint` 3/3 e checks estáticos PASS |
 | M-PULSE-5 — sink candidato Grafx | concluído, publicado, auditado e integrado no milestone M5 | Pulse Community `milestone/grafx-mpulse5-grafx-sink@445043666530862300221783ece480e63c7086ac` → integração `c980737126118f44115fe199e17cec1ea6371c0e` | Geração nova e não vinculada, schema esperado exato, recusa de propriedade ausente, batches transacionais, checkpoint, close, cold reopen, `verify("all")`, contagens/fingerprint e abort seguro sem tocar a geração anterior; falhas de import/checkpoint/reopen e checks estáticos cobertos |
-| M-PULSE-5 — backup/restore neutro streaming | concluído, publicado e auditado; quatro células D3 físicas pendentes no gate final | Pulse Community `milestone/grafx-mpulse5-integration@6fe93a6e2586decc94081778f4f2bbb7425c07a0` | Backup consome um único snapshot em batches, fecha-o antes do manifesto/verificação/replace atômico e não materializa o grafo; restore lê um único handle verificado para candidato novo e não vinculado. Revisão independente e 5/5 testes focados PASS; a matriz final conserva D3 `[ladybug,grafx] × [clean,corrupt]` |
+| M-PULSE-5 — backup/restore neutro streaming | concluído, publicado, auditado e aceito na matriz final | Pulse Community `milestone/grafx-mpulse5-integration@6fe93a6e2586decc94081778f4f2bbb7425c07a0` → integração final `08e4fa71dce08d3d3a99929ed0c68a44fc260631` | Backup consome um único snapshot em batches, fecha-o antes do manifesto/verificação/replace atômico e não materializa o grafo; restore lê um único handle verificado para candidato novo e não vinculado. Revisão independente e 5/5 testes focados PASS; D3 `[ladybug,grafx] × [clean,corrupt]` fechou 4/4 na matriz final, preservando a geração anterior |
 | M-PULSE-5 — adapters Ladybug Board/Global | concluídos, publicados, auditados e integrados no milestone M5 | código `b7b76acd3912041b973cc5691c946ed20d887ab6`; handoff Nexus `hof_2a6e059c010049a9b218345e8db663b7` concluído/verificado/PASS; integração `c980737126118f44115fe199e17cec1ea6371c0e` | Schema e endpoints físicos exatos; Board 11 spaces/9 HNSW e Global 4/4; tipo/coluna/métrica/índice extra fail-closed; cold RO byte-idêntico; `graph.lbug`/`discovery.lbug` sem rename; snapshots e handles cold têm cleanup retentável. Gate Ladybug 92/92 e composição M5 111/111, sem blocker independente |
-| M-PULSE-5 — integração e aceite final | em execução; alvo restante fechado | integração Community `milestone/grafx-mpulse5-integration@c980737126118f44115fe199e17cec1ea6371c0e`; factories e matriz final em execução | Concluir somente as factories compartilhadas e executar a matriz já congelada de 8 testes parametrizados/32 casos: A1 2, A2 3, B1 4, C1 4, C2 2, D1 8, D2 5 e D3 4; depois publicar o SHA Community imutável em `feature/v0.3.3` |
+| M-PULSE-5 — integração e aceite final | concluído, verificado, publicado e promovido | factories `f73cdf4e1e5a64c48e285f514f27d16a2d913853` → `a4a5ec11bc20490fef7395066647a2152651291f`; matriz `d61f3a875952cf6fbf9bb4be177c9a98a98d83d0`; integração `milestone/grafx-mpulse5-integration@08e4fa71dce08d3d3a99929ed0c68a44fc260631`; Pulse Community `feature/v0.3.3@e73a446a954e039fb038f8fa329236b51104504a`; auditoria Nexus `hof_2b2ca8a48e4b472abe9f51e92c765138` concluída/verificada/PASS | Factories fail-closed compartilham a mesma autoridade Board 69/`graph.lbug` e Global 7/`discovery.lbug`. A matriz congelada A1/A2/B1/C1/C2/D1/D2/D3 passou 32/32, foi repetida 32/32 pelo Claude e a regressão consolidada passou 189/189; Ruff, Black, compileall e diff-check verdes. Core `098a346` foi pinado explicitamente para impedir import acidental do pacote instalado; árvore promovida e testada têm o mesmo tree hash `76b9bd8979f9345aa05d9c613716291eeb2ee95b` |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
