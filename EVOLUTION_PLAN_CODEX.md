@@ -22,8 +22,9 @@
   branch M1, executar a suíte completa e publicar um SHA imutável. M2 inicia identity-range leasing
   somente depois desse gate.
 - **Compatibilidade Okto Pulse: M-PULSE-1 a M-PULSE-5 concluídos, publicados e auditados conforme
-  o quadro 9.7; M-PULSE-6 é o próximo gate serial.** M-PULSE-4 foi aceito e promovido no Pulse
-  Community em
+  o quadro 9.7; M-PULSE-6 está em fechamento, com bundle integral, recovery e certificação
+  instalável publicados e somente a regressão longa congelada ainda pendente.** M-PULSE-4 foi
+  aceito e promovido no Pulse Community em
   `feature/v0.3.3@d3ef4afdf263e7b6da70b6705b31950cfe07986e`. O gate final passou 56/56; o recall público
   foi `0.9546875` e a evidência direcional sem SLO dos espaços não públicos registrou build/ingest
   de `1279.6239901 s`/`1415.9925527 s` e footprint persistido de `794624 B`/`802816 B` para
@@ -84,10 +85,19 @@
   ainda não possui chave de idempotência ponta a ponta. O quinto checkpoint acrescentou o
   lifecycle Board roteado, com uma única aquisição de snapshot por operação, callbacks físicos
   `*_unguarded`, revalidação da fence do writer antes de mutações e nenhuma inicialização implícita;
-  a regressão independente desse pacote passou 130/130. Global roteado, composição integral,
-  provenance e demais bypasses, conformance/end-to-end e regressão longa continuam
-  abertos; portanto este SHA
-  não é release, não está na `main` e não autoriza M-PULSE-7.
+  a regressão independente desse pacote passou 130/130. Esse era o estado do quinto checkpoint.
+  O fechamento posterior foi publicado em `milestone/grafx-mpulse6-assembly@09d46ae`: composição
+  integral Board+Global, startup, CLI, restore, shutdown, rebuild, provenance, conformance
+  diferencial, wheel instalado e recovery offline backend-neutral estão implementados e
+  revisados. A cobertura de interface confirmou 91/91 métodos nas 11 superfícies enumeradas; a
+  regressão roteada passou 232/232; o mesmo fluxo Core-facing passou com os bundles Ladybug e
+  Grafx reais; o smoke do wheel candidato `0.0.1` passou em venv isolado com `[accel]`,
+  `uv pip check`, bindings Board/Global e catálogos 81/11. O recovery-only passou 220/220 casos
+  aplicáveis e uma reauditoria fechou os blockers de compensação binding-aware Ladybug/Grafx e dos
+  sidecars `.wal`, `.shadow` e `.wal.checkpoint`. F13/AF21 passou 25/25, o gate curto
+  foundation/provenance/bypass passou 32/32 e o Pulse Core permanece com zero import de Grafx. A
+  regressão longa congelada continua aberta; portanto este SHA ainda não é release, não está na
+  `main` e não autoriza M-PULSE-7.
   O gap factual do inventário F13 também foi fechado no milestone do Core
   `milestone/grafx-mpulse6-logical-transfer-manifest@8d2dbcb`: o pacote público
   `okto_pulse.core.kg.logical_transfer` passou a constar no manifesto, com 311/311 testes, e o
@@ -1832,6 +1842,7 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-5 — adapters Ladybug Board/Global | concluídos, publicados, auditados e integrados no milestone M5 | código `b7b76acd3912041b973cc5691c946ed20d887ab6`; handoff Nexus `hof_2a6e059c010049a9b218345e8db663b7` concluído/verificado/PASS; integração `c980737126118f44115fe199e17cec1ea6371c0e` | Schema e endpoints físicos exatos; Board 11 spaces/9 HNSW e Global 4/4; tipo/coluna/métrica/índice extra fail-closed; cold RO byte-idêntico; `graph.lbug`/`discovery.lbug` sem rename; snapshots e handles cold têm cleanup retentável. Gate Ladybug 92/92 e composição M5 111/111, sem blocker independente |
 | M-PULSE-5 — integração e aceite final | concluído, verificado, publicado e promovido | factories `f73cdf4e1e5a64c48e285f514f27d16a2d913853` → `a4a5ec11bc20490fef7395066647a2152651291f`; matriz `d61f3a875952cf6fbf9bb4be177c9a98a98d83d0`; integração `milestone/grafx-mpulse5-integration@08e4fa71dce08d3d3a99929ed0c68a44fc260631`; Pulse Community `feature/v0.3.3@e73a446a954e039fb038f8fa329236b51104504a`; auditoria Nexus `hof_2b2ca8a48e4b472abe9f51e92c765138` concluída/verificada/PASS | Factories fail-closed compartilham a mesma autoridade Board 69/`graph.lbug` e Global 7/`discovery.lbug`. A matriz congelada A1/A2/B1/C1/C2/D1/D2/D3 passou 32/32, foi repetida 32/32 pelo Claude e a regressão consolidada passou 189/189; Ruff, Black, compileall e diff-check verdes. Core `098a346` foi pinado explicitamente para impedir import acidental do pacote instalado; árvore promovida e testada têm o mesmo tree hash `76b9bd8979f9345aa05d9c613716291eeb2ee95b` |
 | M-PULSE-6 — fundação, resolver, pinning e primeiro lote roteado | em execução; quinto checkpoint publicado, sem promoção | Pulse Community `origin/milestone/grafx-mpulse6-integration@c524813`; commits integrados `00247fc..c524813`; resolver `559647b` + hardening P0 `6d0dc2` (origem revisada `b346ddc`); pool/pinning `fb21702` + correção terminal `8f54dc1`, entrega Claude `hof_dba65f737770434aa705f6f25475349a` concluída/verificada/PASS; Board facades `789c07c`, directory quarantine/restore `0092e6b` + inventário terminal `87641f3`, recovery offline `3231eba`, `init` neutro `03e96da`/handoff `hof_0d3b77eb15cc4371979475eef450d64e` verificado/PASS, transação roteada `f154cb9`, pin de instalação `okto-grafx[accel]==0.0.1` em `fb18d53`, lifecycle Board roteado `171c6d2` e handshake do manifesto `c524813`; Core `milestone/grafx-mpulse6-logical-transfer-manifest@8d2dbcb`; engine LIMIT no Grafx `milestone/grafx-mpulse6-path-limit-claude@b3fd6e457505e18d1bdf30934d7fcf3767a9cd03` publicado apenas no branch de milestone | Além das provas anteriores, Board store/Cypher/schema/runtime/transação/lifecycle têm facades explícitas com snapshot imutável e revalidação física; o lifecycle não cria binding implicitamente, usa callbacks físicos `*_unguarded` e passou regressão independente 130/130. O manifesto Core/Community agora reconhece `logical_transfer`: Core 311/311 e auditoria cruzada 2/2, eliminando os 230 bridges de baseline. O diagnóstico de `init` consulta o runtime non-opening e não revela path/backend. Quarantine/restore move a geração Grafx completa e autentica o inventário terminal antes de aceitar retry/reconciliação. O lote anterior passou 127/127; 272 testes adicionais passaram e os dois failures restantes foram reproduzidos no baseline/harness antes do delta. Revisões independentes: diretório 23 + WAL 17, transação 13 + regressão 172, `init` 44 e lifecycle 130. Residual rastreado, não oculto: receipt pós-rename pode se perder sob crash, com bytes seguros. O gate permanece aberto somente para Global roteado, composição, provenance/bypasses restantes, conformance/end-to-end e regressão longa; nenhuma promoção é reivindicada por este checkpoint |
+| M-PULSE-6 — bundle integral, recovery e certificação instalável | em fechamento; checkpoint publicado, sem promoção; regressão longa congelada pendente | Pulse Community `milestone/grafx-mpulse6-assembly@09d46ae`; composição `d9105bd..f98fa22`; certificação `9fbb041`; recovery backend-neutral `ba7e3bd` + compensação binding-aware `f866003` + format `09d46ae`; Core `milestone/grafx-mpulse6-logical-transfer-manifest@8d2dbcb`; engine `milestone/grafx-mpulse6-path-limit-claude@b3fd6e4` | Bundle único Board+Global compartilha binding store, resolver e pool; startup, CLI, restore, shutdown e rebuild não fazem fallback silencioso. Auditoria de interface: 91/91 métodos em 11 superfícies; regressão roteada 232/232; conformance real Ladybug/Grafx 1/1; wheel Grafx `0.0.1` instalado isoladamente com `[accel]`, `uv pip check`, bindings Board/Global e catálogos 81/11; discriminante de wheels FINAL sem rebuild 1/1. Recovery-only 220/220 aplicáveis, discriminantes finais 5/5 e reauditoria independente PASS; F13/AF21 25/25, gate curto 32/32, checks estáticos verdes e zero import Grafx no Core. O gate não fecha até a regressão longa já congelada passar |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
