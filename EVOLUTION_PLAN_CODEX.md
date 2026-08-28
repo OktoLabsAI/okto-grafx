@@ -21,8 +21,20 @@
 - **Próximo gate:** concluir C13 e o censo de retornos públicos tipados, integrar serialmente no
   branch M1, executar a suíte completa e publicar um SHA imutável. M2 inicia identity-range leasing
   somente depois desse gate.
-- **Compatibilidade Okto Pulse: M-PULSE-1, M-PULSE-2 e M-PULSE-3 concluídos; M-PULSE-4 é o
-  próximo gate.**
+- **Compatibilidade Okto Pulse: M-PULSE-1 a M-PULSE-4 concluídos; fundações Core/scan de
+  M-PULSE-5 concluídas e integradas.**
+  M-PULSE-4 foi aceito e promovido no Pulse Community em
+  `feature/v0.3.3@d3ef4afdf263e7b6da70b6705b31950cfe07986e`. O gate final passou 56/56; o recall público
+  foi `0.9546875` e a evidência direcional sem SLO dos espaços não públicos registrou build/ingest
+  de `1279.6239901 s`/`1415.9925527 s` e footprint persistido de `794624 B`/`802816 B` para
+  `Alternative`/`Assumption`, ambos com `verify("all")` limpo e cold reopen 10/10. Em M-PULSE-5,
+  o scan público bounded-memory do Grafx foi integrado por fast-forward na `main` pelo código
+  `f132190207b562eb9794e7e4d752c41c9fdb7504` e revalidado em 254/254 testes focados. O formato
+  lógico, codec, fingerprint, ports e orquestração neutra do Pulse Core foram concluídos,
+  revisados no Nexus
+  `hof_2373b761002c42aeb519e53617e56ec8` e integrados por fast-forward em
+  `okto-pulse-core/feature/v0.3.3@098a346b0988d7b39e417e7de7ed8d57d06b9795`; a validação
+  independente passou 318/318, Ruff, compileall, diff-check e a auditoria de fronteiras 4/4.
   M-PULSE-0 foi concluído em
   `5b7551b40dba2facb28c46770f166ab3ac9daecc`. A fundação de identidades pendentes do
   M-PULSE-1 entrou em `d487ac9312229e0376ad8e65625213af111d9c9c`; o overlay owner-only de nós
@@ -1470,6 +1482,17 @@ nove espaços públicos de board, os quatro espaços de Global Discovery, normal
 ordenação/tolerâncias, rebuild público, matriz V1–V7 e não objetivos. Achados posteriores só podem
 corrigir defeito reproduzível desse contrato; não ampliam o milestone.
 
+Fechamento em 2026-08-27/28: o milestone aceito e `feature/v0.3.3` convergiram em
+`d3ef4afdf263e7b6da70b6705b31950cfe07986e`. A matriz final passou 56/56 em 267,06 s, além de
+Ruff, compileall, diff-check e format-check dos dez arquivos Python alterados. O recall@10 público
+foi `0.9546875` no fixture congelado 8192x384/256 queries/k=10. A medição não normativa dos índices
+`Alternative` e `Assumption` foi publicada em
+`milestone/grafx-mpulse4-vector-recall@fcfbf215b151aac4603978e02900ef323cb1b898`, artefato SHA-256
+`e010ef6fb4a46b9e7a7bb770c9d4f6007b5b1af6415efb9952e3b7c369a0bede`: 8192 linhas e 128
+commits por índice, build/ingest de `1279.6239901 s` e `1415.9925527 s`, tamanhos persistidos de
+`794624 B` e `802816 B`, `verify_findings=0` e cold/reopen 10/10. A auditoria independente conferiu
+branch/remoto, pins, JSON, metadata e relatório; a evidência permanece explicitamente sem SLO.
+
 #### M-PULSE-5 — export/import, backup e recovery portável
 
 1. congelar o formato lógico `okto-pulse-logical-graph/1`, com manifesto de schema, features
@@ -1479,9 +1502,13 @@ corrigir defeito reproduzível desse contrato; não ampliam o milestone.
 3. exportar Grafx sob uma única transação MVCC read-only e importar em batches limitados para
    geração Ladybug nova, vazia e não vinculada; este caminho bidirecional é a opção M-PULSE-5, não
    um journal;
-4. preservar tipo lógico, chave, todas as propriedades, `absent` versus `NULL`, string vazia,
-   timestamps, direção, self-loop e uma entrada por ocorrência de relação, inclusive paralelas
-   idênticas;
+4. preservar tipo lógico, chave, todas as propriedades, string vazia, timestamps, direção,
+   self-loop e uma entrada por ocorrência de relação, inclusive paralelas idênticas. O formato
+   Core preserva `absent` versus `NULL`; os adapters físicos Grafx/Ladybug, ambos de schema fixo,
+   projetam todas as colunas declaradas e convertem o único estado físico nulo em `LOGICAL_NULL`.
+   Eles não inventam ausência histórica: uma entrada com propriedade ausente que o destino físico
+   não represente deve ser recusada de forma tipada e o candidato abortado, nunca canonicalizada
+   silenciosamente como sucesso;
 5. serializar vetores pelo `space_name` lógico e remapeá-los no destino; IDs físicos de space,
    RecordIds, páginas, filenames, WAL/LSN e topologia HNSW não pertencem ao formato;
 6. calcular fingerprint canônico sobre schema e multiconjunto completo, reabrir o candidato a frio
@@ -1496,6 +1523,17 @@ relacionais com sete propriedades e 11 spaces. O escopo Global Discovery é exat
 de nó/spaces e sete relações. Nós cognitivos canônicos sem origem SQL fazem parte da mesma
 transferência, sem rebuild derivado.
 
+A correção de representabilidade congelada em 2026-08-27 não altera o wire nem reduz a prova do
+codec. Probes independentes após commit, close e cold reopen demonstraram que tanto Grafx quanto o
+`ladybug==0.16.0` pinado devolvem a mesma coluna `NULL` para propriedade omitida e para `NULL`
+explícito; nenhum deles persiste um bit de presença. Assim, o golden Core continua provando
+`absent != LOGICAL_NULL`, enquanto o round-trip físico prova a visão canônica efetivamente
+armazenável e a recusa fail-closed do ramo inalcançável. Um sidecar durável foi excluído deste
+milestone porque seria apenas prospectivo, não recuperaria a intenção dos bancos Pulse existentes
+e exigiria mudar todos os writers/runtime, ampliando M-PULSE-5 sem melhorar a migração atual. A
+auditoria Nexus `hof_2a9c3574a2e041e68ff2b137cf345afb` foi concluída/verificada/PASS após medir os
+dois backends e corrigir explicitamente a dependência/runtime usada no primeiro probe.
+
 O `graph_export.py` atual permanece uma exportação JSON-LD de exposição/proveniência e não é entrada
 válida do importador portátil: ele omite 35 propriedades de nó, seis propriedades de relação e
 embeddings, colapsa `NULL`/ausente e deduplica por tipo/endpoints, perdendo multiplicidade.
@@ -1507,6 +1545,13 @@ banco, transação/snapshot e tabela, e não pode ser reutilizado. A implementa�
 `O(limit + valores do lote)` e avançar a posição de storage sem `QueryResult`, sort ou traversal.
 Não há novo `Database.logical_snapshot()`, bulk import, archive, backup ou semântica Pulse no core.
 
+Como `_from/_to` são RecordIds físicos cujo domínio é a tabela de nó, o source Community Grafx
+constrói em streaming um mapa temporário disk-backed
+`(node_table, record_id) -> logical_key` antes de emitir relações. O mapa usa RAM `O(limit)`, disco
+`O(nós no escopo)`, lookup indexado por lote e cleanup em `finally` tanto no sucesso quanto na
+falha. RecordId sem tipo é inválido porque IDs colidem entre tabelas. Dict completo em RAM, rescan
+quadrático e nova API de lookup no Grafx ficam excluídos.
+
 O Core Pulse possui apenas DTOs/codec/fingerprint, snapshot source, candidate sink e orquestração
 neutra. O Community possui adapters Ladybug/Grafx, arquivo atômico e operações de backup/restore.
 Nenhum tipo, path ou erro de backend entra no Core.
@@ -1515,8 +1560,11 @@ Nenhum tipo, path ou erro de backend entra no Core.
 Grafx→Ladybug; Global Discovery nos dois sentidos; snapshot consistente sob writer concorrente;
 corrupção/falhas em write, import, checkpoint e reopen; memória limitada, nomes neutros e geração
 anterior intacta. Cada round-trip preserva 100% dos nós, relações, propriedades, vetores e
-multiplicidade. O scan Grafx prova continuação/snapshot, relações paralelas, bounded-memory, tokens
-inválidos e relação ainda física cujo endpoint foi removido.
+multiplicidade da visão física canônica. O codec prova separadamente `absent` versus `NULL`; o
+adapter de schema fixo prova `NULL -> LOGICAL_NULL` e recusa tipada, sem sucesso ou cutover, para
+ausência que o destino não consiga persistir. O scan Grafx prova continuação/snapshot, relações
+paralelas, bounded-memory, tokens inválidos e relação ainda física cujo endpoint foi removido; o
+source Community prova também o mapa temporário de endpoints sob RAM limitada e seu cleanup.
 
 M-PULSE-5 não implementa provider/router, binding/CAS, shadow, canário, dual write, journal/outbox,
 troca de tráfego, migração in-place ou retomada de candidato parcial. Binding pertence a M-PULSE-6;
@@ -1683,6 +1731,9 @@ revisão cruzada Codex/Claude e SHA imutável antes do merge serial em `main`.
 | M-PULSE-3B — layout lógico de relações | concluído e publicado; provider ainda inativo | Pulse Community `milestone/grafx-mpulse3-logical-relationships@c4b1f37ad3a4cd08a1e2f5249db25c33ddbecd45` → `feature/v0.3.3`; código `067b82c` + hardening `c4b1f37` | Manifesto fechado e imutável de 16 tipos/69 pares/69 nomes, codec bijetivo e reverse pelo manifesto; introspecção valida kind/endpoints e oculta nomes físicos. Unknown/collision/mismatch, shapes malformados e representação hostil falham tipados. Gate focado 15/15; regressão selecionada completa 146/146 contra Core limpo `ab61b9a`; Ruff/format/diff-check e duas auditorias independentes PASS. DDL/bootstrap, ativação, query rewrite e os gaps de supersedence continuam explicitamente fora |
 | M-PULSE-3C — manifesto e bootstrap do schema atual | concluído, verificado e publicado; provider ainda inativo | Pulse Community `milestone/grafx-mpulse3-schema-bootstrap@7e126a7130090c00891f8d1d35bd44819afe7a7a` → `feature/v0.3.3`; Core pinado `ab61b9a785f2018312fc91541a580877fd068bbb`; auditoria Nexus `hof_7240f7ad38f64538adc5b500bd3ea1a7` concluída/verificada/PASS | Schema `0.5.0` materializado em 11 nodes de 44 propriedades, `BoardMeta`, 69 relações e 11 spaces únicos 384/cosine/normalized=false/float64. Preflight fail-closed precede qualquer write; ausentes são criados numa única transação, o catálogo é recapturado/validado e somente então `BoardMeta` é gravado em transação separada. Fingerprint lógico canônico `4a7b425bf4b8c4864be633c1a87f034e5f7f641019dc029015b7d3ca786deb81`; no-op preserva catálogo/txn/LSN/WAL e bytes. Gates M3C 33/33 e regressão selecionada 73/73 no Core correto; Ruff/format/diff-check focados PASS; outputs Kuzu têm digest `18a8b1a1b9459d92d61670d734087a4212af29fa4039b0825d6e966ffa181e0e`, `kg.py`/`composition.py` mantêm os blobs congelados. Staging dos 92 DDLs mediu aproximadamente 101 s neste ambiente: risco de performance registrado para otimização posterior, sem alterar o gate funcional. ALTER/upgrade, provider, rewrite e paridade vetorial permanecem fora |
 | M-PULSE-3D — rebuild do predecessor `0.3.12` | concluído, verificado, publicado e integrado; provider ainda inativo | spec Pulse Community `milestone/grafx-mpulse3-schema-evolution@703ad83c43b286e7c90fe2b0a29de0982929d4de`; código final `237f3bf7fa2a65a108db4f558932d429ec6696ce` em `milestone/grafx-mpulse3-schema-evolution-impl` e `feature/v0.3.3`; revisão Nexus final `hof_3df4987f6eef4611bfd9486409b91227` concluída/verificada/PASS | Reconstrução fora do lugar para candidato durável não vinculado, sem mudança no formato físico Grafx, `CATALOG_FORMAT_VERSION` ou upgrade in-place. Fonte em snapshot inerte; 11 nodes, 59 relações predecessoras, duplicatas/paralelas/self-loop, NULLs e vetores são preservados; dez relações novas nascem vazias. Catálogo, fingerprints, contagens e 161 índices são provados hot+cold; marker/commit ambíguo, checkpoint/recovery, close/lock, matriz finita de falhas e no-op zero-write são fail-closed. Gate rápido `122 passed, 1 deselected`, suíte completa real `122 passed` no mesmo código de produção, regressão M3A/B/C 56/56 e checks estáticos PASS. O único blocker factual da primeira revisão — `PermissionError` cru em `Path.exists()` — foi reproduzido no SHA antigo, corrigido e provado por teste discriminante no final |
+| M-PULSE-4 — paridade vetorial | concluído, verificado, publicado e integrado | Pulse Community `milestone/grafx-mpulse4-accepted@d3ef4afdf263e7b6da70b6705b31950cfe07986e` → `feature/v0.3.3`; evidência não pública `milestone/grafx-mpulse4-vector-recall@fcfbf215b151aac4603978e02900ef323cb1b898` | Matriz V1–V7, exact/ANN, filtros, ordenação, rebuild/churn e cold reopen fechados. Gate final 56/56; recall@10 público `0.9546875`. `Alternative`/`Assumption`: 8192 linhas e 128 commits cada, build/ingest `1279.6239901 s`/`1415.9925527 s`, persistido `794624 B`/`802816 B`, verify limpo e cold/reopen 10/10. Artefato SHA-256 `e010ef6fb4a46b9e7a7bb770c9d4f6007b5b1af6415efb9952e3b7c369a0bede`; sem SLO; auditoria independente PASS |
+| M-PULSE-5 — scan físico bounded-memory no Grafx | concluído, revisado, integrado e revalidado | Grafx `milestone/mpulse5-scan-v1@f132190207b562eb9794e7e4d752c41c9fdb7504` → `main`; validação pós-integração 254/254, Ruff, compileall e diff-check PASS | `Transaction.scan_rows_v1` percorre o snapshot read-only na ordem física estável, devolve DTOs destacados, preserva uma ocorrência por relação e usa cursor opaco, preso ao banco/transação/snapshot/tabela e de uso único. Continuação, writer concorrente, relações paralelas, token inválido e bounded-memory foram revisados sem blocker; nenhuma semântica Pulse, arquivo ou backup entrou no core Grafx |
+| M-PULSE-5 — formato e transferência lógica no Pulse Core | concluído, verificado e integrado | Pulse Core `milestone/grafx-mpulse5-logical-transfer-core@098a346b0988d7b39e417e7de7ed8d57d06b9795` → `feature/v0.3.3`; revisão Nexus `hof_2373b761002c42aeb519e53617e56ec8` concluída/verificada/PASS | Formato `okto-pulse-logical-graph/1`, DTOs frozen, schema Board/Global representável, mapping propriedade→space, geometria vetorial, identidade tripla de layouts, codec canônico incremental, fingerprint multiconjunto, ports e transferência candidata neutra. Corrupção, não-finitos, wire/features, schema-record, batches e certificação cold-reopen falham tipados na matriz finita. Validação independente final: 318/318, Ruff, compileall, diff-check, remoto exato e auditoria de fronteiras 4/4 PASS. Adapters, arquivo atômico e round-trips físicos permanecem no Community, como já congelado |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
