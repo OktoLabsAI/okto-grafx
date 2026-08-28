@@ -2,8 +2,9 @@
 
 The capability is deliberately literal.  It is not a general path value implementation: the
 only admitted AST is ``MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path``.
-These tests freeze both halves of that statement: the narrow parser/analyser/planner gate and
-the Kuzu/Ladybug-compatible public value produced for each matching edge.
+It may carry only a terminal literal non-negative ``LIMIT``. These tests freeze both halves of
+that statement: the narrow parser/analyser/planner gate and the Kuzu/Ladybug-compatible public
+value produced for each matching edge.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from okto_grafx.domain.query.analysis import (
 from okto_grafx.domain.query.ast import (
     Direction,
     FunctionCall,
+    Literal,
     MatchClause,
     NodePattern,
     PatternPath,
@@ -889,8 +891,7 @@ REFUSED_ROW_BOUNDS = (
     "RETURN DISTINCT path LIMIT 1",
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) "
     "RETURN path ORDER BY a.id LIMIT 1",
-    "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) "
-    "RETURN path AS p LIMIT 1",
+    "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path AS p LIMIT 1",
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) "
     "WHERE a.id = 'd1' RETURN path LIMIT 1",
 )
@@ -942,6 +943,30 @@ def test_the_engine_applies_the_bound_rather_than_the_caller(
     assert count(f"{ADMITTED} LIMIT 1") == 1
     # Zero is a bound a caller can mean, so it answers no rows instead of all.
     assert count(f"{ADMITTED} LIMIT 0") == 0
+
+
+def test_limit_one_is_applied_before_the_public_result_budget(tmp_path: Path) -> None:
+    database = _open_database(tmp_path / "bounded-db", max_result_rows=1)
+    try:
+        with database.begin("write") as writer:
+            writer.execute("CREATE (:Decision {id: 'd3', title: 'third'})")
+            writer.execute("CREATE (:Decision {id: 'd4', title: 'fourth'})")
+            for source, target in (("d2", "d3"), ("d3", "d4")):
+                writer.execute(
+                    f"MATCH (a:Decision {{id: '{source}'}}), "
+                    f"(b:Decision {{id: '{target}'}}) "
+                    "CREATE (a)-[:supersedes "
+                    "{layer: 'canonical', note: 'chain'}]->(b)"
+                )
+
+        with pytest.raises(GrafxQueryBudgetExceeded):
+            database.execute(ADMITTED)
+        result = database.execute(f"{ADMITTED} LIMIT 1")
+
+        assert len(result.rows) == 1
+        assert result.columns == ("path",)
+    finally:
+        database.close()
 
 
 def test_a_bounded_path_is_the_same_value_as_an_unbounded_one(
@@ -1143,6 +1168,14 @@ def _hostile_trees() -> dict[str, Query]:
             statement, return_clause=replace(returned, sort_items=[])
         ),
         "distinct int": replace(statement, return_clause=replace(returned, distinct=0)),
+        "limit bool literal": replace(
+            statement,
+            return_clause=replace(returned, limit=Literal(value=True)),
+        ),
+        "limit variable": replace(
+            statement,
+            return_clause=replace(returned, limit=Variable(name="n")),
+        ),
         "return item subclass": replace(
             statement,
             return_clause=replace(returned, items=(_as_subclass(_SubItem, item),)),
