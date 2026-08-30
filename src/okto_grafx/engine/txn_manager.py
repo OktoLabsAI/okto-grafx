@@ -1143,8 +1143,11 @@ class TransactionManager:
             lease = self._hold_lease()
             try:
                 self._validate_lease(lease)
-                with self._coordinator_section(
-                    COMMIT_SECTION, timeout=self._commit_lock_timeout
+                with (
+                    self._coordinator_section(
+                        COMMIT_SECTION, timeout=self._commit_lock_timeout
+                    ),
+                    self._hold_wal_tail(),
                 ):
                     self._validate_lease(lease)
                     published = self._complete_committed_gap()
@@ -1567,11 +1570,15 @@ class TransactionManager:
                 # Step 2: the epoch is confirmed before any byte can reach the device (BR-7,
                 # AC-6), through the coordinator that granted this very lease (A74).
                 self._validate_lease(lease)
-                with self._coordinator_section(
-                    COMMIT_SECTION, timeout=self._commit_lock_timeout
+                with (
+                    self._coordinator_section(
+                        COMMIT_SECTION, timeout=self._commit_lock_timeout
+                    ),
+                    self._hold_wal_tail(),
                 ):
                     self._validate_lease(lease)  # step 3.1
-                    current = self._complete_committed_gap().last_committed_lsn
+                    durable = self._complete_committed_gap()
+                    current = durable.last_committed_lsn
                     # The commit decides against the picture as it is NOW, not as this pool last
                     # cached it. Optimistic validation reads the log, but everything else the commit
                     # consults -- the catalog, the pages a row will land on -- comes through the pool,
@@ -1699,7 +1706,7 @@ class TransactionManager:
                                 self._apply_index_changes(txn, committed)  # step 3.6
                             with self._close_wait_hazard():
                                 self._publish_commit_state(
-                                    current, committed
+                                    durable, committed
                                 )  # step 3.7
                         except BaseException as failure:
                             post_barrier_failure = failure
@@ -1707,7 +1714,7 @@ class TransactionManager:
                                 try:
                                     with self._close_wait_hazard():
                                         recovered = self._recover_post_barrier(
-                                            txn, current, committed, rows
+                                            txn, durable, committed, rows
                                         )
                                 except BaseException as recovery_failure:
                                     # Recovery is cleanup for the already-recorded failure.  It may
@@ -2380,7 +2387,7 @@ class TransactionManager:
     def _recover_post_barrier(
         self,
         txn: TransactionContext,
-        previous: Lsn,
+        previous: CommitState,
         committed: Csn,
         rows: Sequence[_RowWrite],
     ) -> bool:
@@ -2401,7 +2408,7 @@ class TransactionManager:
         """
         try:
             self._drop_index_changes(txn)
-            self._redo_onto_device(previous, committed)
+            self._redo_onto_device(previous.last_committed_lsn, committed)
             self._publish_commit_state(previous, committed)
             return True
         except BaseException:
@@ -3109,7 +3116,7 @@ class TransactionManager:
         for file in sorted(touched):
             self._pool.flush(file)
 
-    def _publish_commit_state(self, previous: Lsn, committed: Csn) -> None:
+    def _publish_commit_state(self, previous: CommitState, committed: Csn) -> None:
         """Publish the new commit state, preserving the checkpoint another component set.
 
         The checkpoint LSN is read and written back rather than replaced. It belongs to whoever
@@ -3125,14 +3132,14 @@ class TransactionManager:
         from the first is not defence in depth, it is a guarantee nobody can prove (A67, A83),
         so it is gone and the guard is the one answer.
 
-        ``previous`` stays in the signature because it is what the guard compared against and
-        what a reader of this method needs in order to see why no comparison is left here.
+        ``previous`` is the durable state read by :meth:`_complete_committed_gap` under this same
+        COMMIT_SECTION. Reusing it avoids a second control-record read and is safe because every
+        publisher of ``commit.state`` is serialised by that section.
         """
-        durable = self._read_commit_state()
         state = CommitState(
             last_committed_lsn=committed,
             last_csn=committed,
-            checkpoint_lsn=durable.checkpoint_lsn,
+            checkpoint_lsn=previous.checkpoint_lsn,
         )
         self._publish(state)
 
@@ -3256,6 +3263,18 @@ class TransactionManager:
         else:
             with self._close_wait_hazard():
                 section.__exit__(None, None, None)
+
+    @contextmanager
+    def _hold_wal_tail(self) -> Iterator[None]:
+        """Reuse one WAL-tail picture when the concrete WAL offers the CQ-1 capability."""
+        hold = getattr(self._wal, "hold_tail", None)
+        if not callable(hold):
+            # TransactionManager deliberately accepts narrow collaborator doubles and adapters.
+            # They remain compatible; the concrete WalManager takes the optimized path.
+            yield
+            return
+        with hold():
+            yield
 
     @contextmanager
     def _participant_section(self) -> Iterator[None]:
