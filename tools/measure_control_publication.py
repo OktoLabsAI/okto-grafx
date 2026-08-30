@@ -27,6 +27,7 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY / "src"))
 
 from okto_grafx.adapters.storage_local import LocalStorageDevice, _open_descriptor  # noqa: E402
+from okto_grafx.domain.page.layout import validate_page_size  # noqa: E402
 
 _TARGET = "control/state"
 _STAGING = "control/state.spike.tmp"
@@ -218,6 +219,119 @@ def _measure_two_slot(
     }
 
 
+def _measure_two_slot_cold(
+    root: Path,
+    warmups: int,
+    samples: int,
+    payload_size: int,
+    slot_size: int,
+) -> dict[str, Any]:
+    """Measure explicit open + positional write + fsync + close per publication."""
+    directory = root / "two-slot-cold"
+    directory.mkdir(parents=True)
+    path = directory / "control.state"
+    descriptor = _open_descriptor(str(path), create_new=True)
+    try:
+        os.ftruncate(descriptor, slot_size * 2)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    phases: dict[str, list[int]] = {
+        "open": [],
+        "write": [],
+        "barrier": [],
+        "close": [],
+    }
+    totals: list[int] = []
+    expected: dict[int, bytes] = {}
+    for iteration in range(warmups + samples):
+        slot = iteration % 2
+        payload = _payload(iteration, payload_size)
+        padded = payload + bytes(slot_size - len(payload))
+        opened: list[int] = []
+        started = time.perf_counter_ns()
+        open_ns = _timed(
+            lambda: opened.append(_open_descriptor(str(path), create_new=False))
+        )
+        descriptor = opened[0]
+        try:
+            write_ns = _timed(lambda: _write_at(descriptor, padded, slot * slot_size))
+            barrier_ns = _timed(lambda: os.fsync(descriptor))
+        finally:
+            close_ns = _timed(lambda: os.close(descriptor))
+        total = time.perf_counter_ns() - started
+        expected[slot] = padded
+        if iteration >= warmups:
+            totals.append(total)
+            phases["open"].append(open_ns)
+            phases["write"].append(write_ns)
+            phases["barrier"].append(barrier_ns)
+            phases["close"].append(close_ns)
+    descriptor = _open_descriptor(str(path), create_new=False)
+    try:
+        for slot, wanted in expected.items():
+            observed = _read_at(descriptor, slot_size, slot * slot_size)
+            if observed != wanted:
+                raise RuntimeError(f"cold two-slot readback differs in slot {slot}")
+    finally:
+        os.close(descriptor)
+    return {
+        "descriptor_policy": "open and close every publication",
+        "total": {"summary": summarize(totals), "samples_ns": totals},
+        "phases": {
+            name: {"summary": summarize(values), "samples_ns": values}
+            for name, values in phases.items()
+        },
+    }
+
+
+def _measure_two_slot_lru(
+    root: Path,
+    warmups: int,
+    samples: int,
+    payload_size: int,
+    slot_size: int,
+) -> dict[str, Any]:
+    """Measure write_page + barrier after real LocalStorageDevice LRU eviction."""
+    device = LocalStorageDevice(
+        root / "two-slot-lru", page_size=slot_size, max_open_files=1
+    )
+    control = "control/state"
+    churn = "data/churn"
+    totals: list[int] = []
+    expected: dict[int, bytes] = {}
+    try:
+        device.create(control, exclusive=True)
+        device.allocate(control, 2)
+        device.create(churn, exclusive=True)
+        device.allocate(churn, 1)
+        device.durable_barrier(None)
+        for iteration in range(warmups + samples):
+            # max_open_files=1 makes this read evict the control descriptor before timing.
+            device.read_page(churn, 0)
+            slot = iteration % 2
+            payload = _payload(iteration, payload_size)
+            padded = payload + bytes(slot_size - len(payload))
+            started = time.perf_counter_ns()
+            device.write_page(control, slot, padded)
+            device.durable_barrier(control)
+            total = time.perf_counter_ns() - started
+            expected[slot] = padded
+            if iteration >= warmups:
+                totals.append(total)
+        for slot, wanted in expected.items():
+            if device.read_page(control, slot) != wanted:
+                raise RuntimeError(f"LRU two-slot readback differs in slot {slot}")
+    finally:
+        device.close()
+    return {
+        "descriptor_policy": "real LocalStorageDevice eviction before every publication",
+        "max_open_files": 1,
+        "primitive": "write_page + durable_barrier(file)",
+        "total": {"summary": summarize(totals), "samples_ns": totals},
+    }
+
+
 def measure(
     root: Path,
     *,
@@ -232,19 +346,45 @@ def measure(
         raise ValueError("payload_size must be at least 8 bytes")
     if slot_size < payload_size:
         raise ValueError("slot_size must be at least payload_size")
-    if order not in {"atomic-first", "two-slot-first"}:
-        raise ValueError("order must be atomic-first or two-slot-first")
+    validate_page_size(slot_size)
+    if order not in {"atomic-first", "two-slot-first", "cold-first"}:
+        raise ValueError("order must be atomic-first, two-slot-first or cold-first")
     root.mkdir(parents=True, exist_ok=True)
-    if order == "atomic-first":
-        current = _measure_current(root, warmups, samples, payload_size)
-        two_slot = _measure_two_slot(root, warmups, samples, payload_size, slot_size)
-    else:
-        two_slot = _measure_two_slot(root, warmups, samples, payload_size, slot_size)
-        current = _measure_current(root, warmups, samples, payload_size)
+    runners: dict[str, Callable[[], dict[str, Any]]] = {
+        "atomic_replace": lambda: _measure_current(
+            root, warmups, samples, payload_size
+        ),
+        "two_slot": lambda: _measure_two_slot(
+            root, warmups, samples, payload_size, slot_size
+        ),
+        "two_slot_cold": lambda: _measure_two_slot_cold(
+            root, warmups, samples, payload_size, slot_size
+        ),
+        "two_slot_lru": lambda: _measure_two_slot_lru(
+            root, warmups, samples, payload_size, slot_size
+        ),
+    }
+    orders = {
+        "atomic-first": ("atomic_replace", "two_slot", "two_slot_cold", "two_slot_lru"),
+        "two-slot-first": (
+            "two_slot",
+            "two_slot_lru",
+            "atomic_replace",
+            "two_slot_cold",
+        ),
+        "cold-first": ("two_slot_cold", "two_slot_lru", "atomic_replace", "two_slot"),
+    }
+    results = {name: runners[name]() for name in orders[order]}
+    current = results["atomic_replace"]
+    two_slot = results["two_slot"]
+    two_slot_cold = results["two_slot_cold"]
+    two_slot_lru = results["two_slot_lru"]
     current_median = float(current["total"]["summary"]["median_ns"])
     two_slot_median = float(two_slot["total"]["summary"]["median_ns"])
+    cold_median = float(two_slot_cold["total"]["summary"]["median_ns"])
+    lru_median = float(two_slot_lru["total"]["summary"]["median_ns"])
     return {
-        "schema": "okto-grafx.ce1-publication-spike.v1",
+        "schema": "okto-grafx.ce1-publication-spike.v2",
         "scope": "exploratory primitive only; no production format or code change",
         "environment": {
             "python": sys.version,
@@ -262,7 +402,12 @@ def measure(
         },
         "atomic_replace": current,
         "two_slot": two_slot,
+        "two_slot_cold": two_slot_cold,
+        "two_slot_lru": two_slot_lru,
         "median_speedup": current_median / two_slot_median,
+        "median_speedup_warm": current_median / two_slot_median,
+        "median_speedup_cold": current_median / cold_median,
+        "median_speedup_lru": current_median / lru_median,
         "gates_remaining": [
             "on-disk format amendment and migration ADR",
             "independent crash/fault matrix proving one valid slot always survives",
@@ -282,7 +427,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--slot-size", type=_positive, default=4096)
     parser.add_argument(
         "--order",
-        choices=("atomic-first", "two-slot-first"),
+        choices=("atomic-first", "two-slot-first", "cold-first"),
         default="atomic-first",
         help="protocol execution order, recorded to expose order bias",
     )

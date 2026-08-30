@@ -36,18 +36,22 @@ def test_the_spike_runs_only_in_its_given_root_and_verifies_both_readbacks(
         warmups=1,
         samples=2,
         payload_size=16,
-        slot_size=64,
+        slot_size=512,
         order="two-slot-first",
     )
 
-    assert report["schema"] == "okto-grafx.ce1-publication-spike.v1"
+    assert report["schema"] == "okto-grafx.ce1-publication-spike.v2"
     assert report["parameters"]["samples"] == 2
     assert report["parameters"]["order"] == "two-slot-first"
     assert len(report["environment"]["tool_sha256"]) == 64
     assert report["atomic_replace"]["total"]["summary"]["count"] == 2
     assert report["two_slot"]["total"]["summary"]["count"] == 2
+    assert report["two_slot_cold"]["total"]["summary"]["count"] == 2
+    assert report["two_slot_lru"]["total"]["summary"]["count"] == 2
     assert (root / "atomic-replace" / "control" / "state").is_file()
-    assert (root / "two-slot" / "control.state").stat().st_size == 128
+    assert (root / "two-slot" / "control.state").stat().st_size == 1024
+    assert (root / "two-slot-cold" / "control.state").stat().st_size == 1024
+    assert (root / "two-slot-lru" / "control" / "state").stat().st_size == 1024
 
 
 def test_impossible_slot_layout_is_refused_before_opening_a_file(
