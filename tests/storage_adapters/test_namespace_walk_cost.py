@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import subprocess
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -223,6 +224,121 @@ def test_a_redirect_outside_the_prefix_is_the_full_walk_s_business(
     finally:
         if planted.is_symlink():
             planted.unlink()
+
+
+def test_entries_listed_outside_the_proved_directory_are_refused(
+    board: tuple[LocalStorageDevice, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    device, root = board
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "foreign.wal").write_bytes(b"victim segment")
+    real_scandir = os.scandir
+    target = os.path.normcase(str(root / "wal"))
+
+    def foreign_scandir(path=".", *args, **kwargs):  # type: ignore[no-untyped-def]
+        # Model a listing that came from somewhere else: the entries of the victim, delivered
+        # for the proved directory. The base resolved every entry's real path and refused
+        # them as an escape; the prefix walk must refuse them without that resolution.
+        if os.path.normcase(os.fspath(path)) == target:
+            return real_scandir(str(victim))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", foreign_scandir)
+    with pytest.raises(GrafxUnsupportedOperation) as raised:
+        device.list_files("wal/")
+    assert raised.value.details["reason"] == "path_escape"
+    assert raised.value.details["file"] == "wal/foreign.wal"
+
+
+def _windows_junction_or_skip(link: Path, target: Path) -> None:
+    """Create an NTFS junction (no privilege needed), or declare the host cannot."""
+    try:
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as failure:
+        pytest.skip(f"NTFS junction creation is unavailable: {failure}")
+    if created.returncode != 0:
+        pytest.skip(
+            "NTFS junction creation is unavailable: "
+            f"{created.stderr.strip() or created.stdout.strip()}"
+        )
+
+
+def _exchange_right_before_listing(
+    device: LocalStorageDevice,
+    root: Path,
+    victim: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_redirect: Callable[[Path, Path], None],
+) -> None:
+    """Exchange a proved directory for a redirect between its proof and its listing.
+
+    The listing then follows the redirect and returns the victim's entries under the stored
+    path, so only re-proving the directory AFTER the listing can refuse this. The directory is
+    one the device never opened a file in: Windows refuses to rename one holding a handle.
+    """
+    (victim / "planted.log").write_bytes(b"victim bytes")
+    spool = root / "spool"
+    spool.mkdir()
+    (spool / "000000000001.log").write_bytes(b"stored")
+    original = root / "spool-original"
+    real_scandir = os.scandir
+    target = os.path.normcase(str(spool))
+    swapped = False
+
+    def swapping_scandir(path=".", *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal swapped
+        if os.path.normcase(os.fspath(path)) == target and not swapped:
+            spool.rename(original)
+            make_redirect(spool, victim)
+            swapped = True
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", swapping_scandir)
+    try:
+        before = {entry.name: entry.read_bytes() for entry in victim.iterdir()}
+        with pytest.raises(GrafxUnsupportedOperation) as raised:
+            device.list_files("spool/")
+        assert raised.value.details["reason"] == "redirected_path"
+        assert raised.value.details["file"] == "spool"
+        assert swapped, "the exchange never happened, so nothing was proved"
+        assert {entry.name: entry.read_bytes() for entry in victim.iterdir()} == before
+    finally:
+        monkeypatch.setattr(os, "scandir", real_scandir)
+        if spool.is_symlink():
+            spool.unlink()
+        elif swapped and spool.exists():
+            os.rmdir(spool)  # an NTFS junction is removed as an entry, never followed
+        if original.exists():
+            original.rename(spool)
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name != "nt", reason="An NTFS junction exchange requires Windows.")
+def test_a_directory_exchanged_for_a_junction_right_before_its_listing_is_refused(
+    board: tuple[LocalStorageDevice, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    device, root = board
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    _exchange_right_before_listing(device, root, victim, monkeypatch, _windows_junction_or_skip)
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name == "nt", reason="The POSIX half of the pair uses a symlink.")
+def test_a_directory_exchanged_for_a_symlink_right_before_its_listing_is_refused(
+    board: tuple[LocalStorageDevice, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    device, root = board
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    _exchange_right_before_listing(device, root, victim, monkeypatch, _directory_symlink_or_skip)
 
 
 # --- B2: a warm descriptor hit checks identity, not the whole chain again ------------------
