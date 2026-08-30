@@ -32,6 +32,7 @@ CATALOG: tuple[tuple[str, LabelPlan], ...] = (
     ("oktografx_active_transactions", (("mode", frozenset({"read", "write"})),)),
     ("oktografx_fsync_duration_seconds", (("target", frozenset({"wal", "data"})),)),
     ("oktografx_barrier_failures_total", ()),
+    ("oktografx_read_view_drops_total", (("view_origin", frozenset({"own", "foreign"})),)),
     ("oktografx_wal_size_bytes", ()),
     ("oktografx_wal_segments", ()),
     ("oktografx_wal_truncation_lag_segments", (("reader_present", frozenset({"true", "false"})),)),
@@ -98,9 +99,9 @@ def _labels(plan: LabelPlan) -> tuple[LabelSpec, ...]:
 
 def test_the_transcription_has_the_size_the_contract_declares() -> None:
     # A guard on the transcription itself: section 9 lists 35 metrics over 12 label names.
-    assert len(CATALOG) == 35
-    assert len({name for name, _ in CATALOG}) == 35
-    assert len(CATALOG_LABEL_NAMES) == 12
+    assert len(CATALOG) == 36
+    assert len({name for name, _ in CATALOG}) == 36
+    assert len(CATALOG_LABEL_NAMES) == 13
     assert len(DURATION_METRICS) == 6
 
 

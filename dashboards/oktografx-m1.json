@@ -1298,6 +1298,66 @@
           "range": true
         }
       ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Read view drops by publication origin",
+      "description": "Read views begun over a moved commit token, split by who published it: own means the token moved only by this participant's commit and the pool kept its clean frames (CQ-2), foreign means everything was dropped and re-read. A mono-client workload should show own-only; foreign drops rising under a single writer means the exemption is not engaging.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 77
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (view_origin) (rate(oktografx_read_view_drops_total[5m]))",
+          "legendFormat": "{{view_origin}}",
+          "range": true
+        }
+      ]
     }
   ],
   "refresh": "30s",
