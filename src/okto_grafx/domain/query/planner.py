@@ -832,6 +832,7 @@ class _Planner:
             return resolved
 
         def expanded(child: Expression) -> Expression:
+            """Expand one child while carrying the active alias and typing depth."""
             return self._union_type_expression(
                 child,
                 active_aliases=active_aliases,
@@ -957,6 +958,7 @@ class _Planner:
         depths: dict[int, int] = {}
 
         def depth(node: Expression) -> int:
+            """Return and memoize the longest child path below ``node``."""
             marker = id(node)
             known = depths.get(marker)
             if known is not None:

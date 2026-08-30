@@ -35,6 +35,39 @@
   Todo ganho inferido serve apenas para ordenar: promoção exige delta RAW patch-a-patch mais os
   contadores discriminantes. A onda 0 versiona o harness H1-H8; QW-1 abriu a primeira frente segura
   em `perf/qw1-frontier-aware`, com suíte `tests/query` e Ruff verdes antes da medição oficial.
+- **Onda 0/H1-H8.1 concluída e publicada.** O harness está em Pulse Community
+  `perf/w0-harness-h1-h8@0dfb5269dd8531fd4db2679fc80b649c64bd9b09`, SHA-256 normalizado
+  `a50e9713c224424e706eae56dd72c2c27e5e8393c78ac0ef658571d3e6052c35`. A correção H3 usa
+  proxy apenas no harness para medir o dispatch real de scopes slotted, sem alterar classes de
+  produção. Os 13 testes dedicados, Ruff e um smoke real com timers de begin/execute/commit
+  disponíveis passaram; o digest lógico certificado permaneceu
+  `c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81`.
+- **QW-1 medido e aprovado para promoção.** O par sequencial, mesma máquina/janela, mesmo harness,
+  mesmo Community/Core, mesma forense e mesmo digest comparou
+  `4c474b56ac35cd3169f18ef416bc3d2ae906083c` com
+  `dd40c66ed1572f70ea8dd00c34785dedf1bcd224`. A soma das 12 medianas RAW caiu de
+  `14.284,03` para `7.375,84 ms` (`-48,4%`, razão contra Ladybug `14,72x -> 7,60x`). Os maiores
+  ganhos foram `delete_edges_by_session -63,7%`, `replace_node_payload -57,7%`,
+  `replace_with_source_deleted_tombstone -54,2%` e `reconcile_projection_active_set -53,5%`;
+  leituras frescas de `delete_edges` caíram de `8.834` para `2`, sem mudar page writes ou o
+  protocolo de commit. Artefatos: baseline SHA-256
+  `d4149c1234b22e18db31b902645c3511b28b476d0a46edaa7f6fb554bbbcad86`; QW-1 SHA-256
+  `86a5eaed615cb0febc5ea122a796be6ccde410879f7f10af7b7ef1dff038a540`. A revisão independente
+  Nexus `hof_bfa99be5471e4874871624e37ed7d137` foi verificada/PASS e concluiu `PROMOVER`; o parecer
+  `D:\Projetos\Techridy\claude-scratch\QW1-RAW-GATE-REVIEW.md` tem SHA-256
+  `3de0f0d47ab202abac5e0bd77280303ac2d5f3e61da7eb157cd4bd25c4b1c041`. A suíte completa chegou
+  a 100% com somente duas falhas AST de docstrings já existentes e sem falha funcional; as três
+  docstrings faltantes foram adicionadas em commit de higiene, o teste de documentação integral,
+  `tests/query + tests/test_language_surface.py` e Ruff terminaram com código `0`.
+- **CE-1 permanece condicionado, sem código de produção.** O spike `perf/w1-ce1-spike@fe9977d`
+  mediu o descritor persistente quente entre `93,33x` e `145,73x` mais rápido que o replace
+  atômico nas rodadas iniciais, mas esse número não foi extrapolado para commits. O instrumento
+  v2 agora mede também abertura fria e LRU real; essas rodadas ainda estão pendentes. A proposta de
+  formato/migração/crash matrix está em
+  `perf/w1-ce1-contract@7b83dcd8c89c991bac35273d099a7a79e982d227`, documento
+  `docs/architecture/CE1_TWO_SLOT_CONTROL_RECORD.md` SHA-256
+  `5d07dcebaeda8c33a5220846985b80b8a4353e2294659eb352e076ffbf973dd9`; status continua
+  `PROPOSED`, preservando multi-writer/multi-reader e bloqueando produção até todos os gates.
 - **Compatibilidade Okto Pulse: M-PULSE-1 a M-PULSE-6 concluídos e certificados conforme o quadro
   9.7; M-PULSE-7 está em execução e permanece o gate serial.** O primeiro trace representativo
   expôs um blocker de performance, não de semântica: no mesmo workload, Ladybug concluiu em

@@ -5206,6 +5206,7 @@ def _replace_bound_unwind_alias(
         return Literal(value=element) if expression.name == alias else expression
 
     def substituted(child: Expression) -> Expression:
+        """Substitute the bound UNWIND alias recursively in one child."""
         return _replace_bound_unwind_alias(child, alias=alias, element=element)
 
     if isinstance(expression, Property):
