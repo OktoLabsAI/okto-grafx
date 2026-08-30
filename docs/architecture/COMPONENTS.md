@@ -1447,11 +1447,12 @@ what an EXACT index over stored positions 0 and 1 answers.
 and DECLINING rather than failing a statement -- the same three rules as the primary key's index.
 The traversal expands a frontier node through them, with two deliberate qualifications:
 
-* **A fan limit** (`_EDGE_LOOKUP_FAN_LIMIT = 64` distinct start nodes) past which one grouped edge
-  scan takes over. The limit is a cost model, not a hedge: a lookup costs a few bucket probes
-  however large the edge table, so a bounded frontier wins by index; a whole-table frontier pays
-  one lookup per node, which past a point costs more than reading the edges ONCE -- measured, a
-  scan-shaped plan paid 1800 lookups for 1.83 s where the grouped scan pays 221 ms.
+* **A plan-shaped regime:** a source bound by `IndexSeek` (or by an unknown producer, fail-safe)
+  starts through endpoint indexes and retains `_EDGE_LOOKUP_FAN_LIMIT = 64`; a source bound by
+  `NodeScan`/`AllNodesScan` goes directly to one grouped edge scan. The result is identical, but the
+  known whole-table frontier no longer pays 64 speculative lookups before doing the scan it was
+  already guaranteed to need. `QueryResult.statistics` records `edge_lookups`/`edge_scans` so the
+  intended regime is now a regression assertion rather than an unobserved cost choice.
 * **A stale endpoint index is never consulted** -- same subset argument as the planner's rule --
   and the fallback groups the scan by endpoint, so even the no-index path stopped being
   O(frontier x edges).
@@ -1545,7 +1546,7 @@ half-suite runs for every survival claim):
 | M14/M32 (the staleness rule's narrowness) | SURVIVED, full scope -- the E3 counterfactual is the evidence, recorded |
 | M17 (advance loses its flush) | SURVIVED, full scope -- costs a rebuild, never a wrong answer, recorded |
 | M27/M30 (`_rows_carrying_key` guards) | SURVIVED, full scope -- recorded |
-| N01/N03 (traversal never indexed / fan limit 1) | SURVIVED, full scope -- correctness-neutral by construction, the recorded usage gap |
+| N01/N03 (traversal never indexed / fan limit 1) | Historical survivor closed by the frontier-regime statistics: seek must record lookup and plan-known scan must record one grouped scan |
 
 Every round-6 blocking fix therefore has a mutant that dies in its own regression, and every
 survivor is one already dispositioned in this punch list -- now confirmed against the whole suite

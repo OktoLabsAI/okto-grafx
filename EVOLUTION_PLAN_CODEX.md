@@ -21,6 +21,20 @@
 - **Próximo gate:** concluir C13 e o censo de retornos públicos tipados, integrar serialmente no
   branch M1, executar a suíte completa e publicar um SHA imutável. M2 inicia identity-range leasing
   somente depois desse gate.
+- **Pivot de performance autorizado em 2026-08-30.** Por ordem explícita do usuário, o gate
+  M-PULSE-7 em `Community@d44c821` foi interrompido sem receipt e sem alterar os repositórios; o
+  workspace foi preservado. O relatório
+  `D:\Projetos\Techridy\claude-scratch\GRAFX_PERFORMANCE_NEXT_STEPS.md` (564 linhas, SHA-256
+  `367a5f3abe6adcf4907a7e639558e844bdca8473181667edfaafdc7dcaf044c7`) foi lido integralmente e
+  criticado por Codex e Claude. O consenso verificável do handoff Nexus
+  `hof_13e2e4033b704687a1cb4051bc31988a` separa: (A) otimizações que preservam integralmente
+  multi-writer/multi-reader; (B) mudanças que preservam os invariantes, mas exigem emenda numerada;
+  e (C) hipóteses que estreitam contrato ou podem degradar concorrência e não serão iniciadas sem
+  decisão do usuário. ST-2, CM-1/2/3 como redigidas ficam fora da execução; CM-4 fica deferida.
+  CE-1 exige, antes do código de produção, spike NTFS, emenda de formato/porta e matriz de crash.
+  Todo ganho inferido serve apenas para ordenar: promoção exige delta RAW patch-a-patch mais os
+  contadores discriminantes. A onda 0 versiona o harness H1-H8; QW-1 abriu a primeira frente segura
+  em `perf/qw1-frontier-aware`, com suíte `tests/query` e Ruff verdes antes da medição oficial.
 - **Compatibilidade Okto Pulse: M-PULSE-1 a M-PULSE-6 concluídos e certificados conforme o quadro
   9.7; M-PULSE-7 está em execução e permanece o gate serial.** O primeiro trace representativo
   expôs um blocker de performance, não de semântica: no mesmo workload, Ladybug concluiu em

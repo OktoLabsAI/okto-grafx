@@ -9,9 +9,9 @@ question is exactly what an EXACT index over stored positions 0 and 1 answers.
 
 What these tests hold, in order: the indexes exist and cover the right positions; the commit
 populates them (through the same staging seam every index uses); the traversal answers the SAME
-rows through the index, through the grouped-scan fallback, and past the fan limit where the
-hybrid switches between them; a stale endpoint index is never consulted; and the accelerator
-declines rather than failing a statement, the same rule the primary key's index follows.
+rows through the index and through the grouped-scan fallback; a plan-known whole-table frontier
+never spends speculative endpoint probes; a stale endpoint index is never consulted; and the
+accelerator declines rather than failing a statement, the same rule the primary key's index follows.
 """
 
 from __future__ import annotations
@@ -80,6 +80,21 @@ def test_traversal_answers_the_same_rows_by_index_and_by_scan(database) -> None:
     assert indexed[1] == [(1,), (2,), (4,)]
 
 
+def test_seek_frontier_uses_endpoint_lookup_but_scan_frontier_does_not(database) -> None:
+    """The plan shape, not the number of rows observed so far, selects the traversal regime."""
+    _small_graph(database)
+
+    seek = database.execute("MATCH (a:A {id: 1})-[:E]->(b:B) RETURN b.id")
+    scan = database.execute("MATCH (a:A)-[:E]->(b:B) RETURN a.id, b.id")
+
+    assert sorted(seek.rows) == [(1,), (2,)]
+    assert seek.statistics.get("edge_lookups") == 1
+    assert seek.statistics.get("edge_scans", 0) == 0
+    assert len(scan.rows) == 6
+    assert scan.statistics.get("edge_lookups", 0) == 0
+    assert scan.statistics.get("edge_scans") == 1
+
+
 def test_endpoint_acceleration_crosses_the_central_exact_view_fence(
     database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -98,14 +113,14 @@ def test_endpoint_acceleration_crosses_the_central_exact_view_fence(
     assert edge_from_index_name("E") in crossed
 
 
-def test_the_hybrid_switches_past_the_fan_limit_and_the_answer_does_not_change(
+def test_a_whole_table_frontier_scans_without_spending_the_fan_limit_first(
     database,
 ) -> None:
-    """A whole-table frontier crosses the fan limit; the grouped scan takes over mid-query.
+    """A whole-table frontier performs one grouped scan from its first emitted node.
 
-    More distinct start nodes than the limit, and the total is asserted against arithmetic
-    (every A of the table has exactly one edge), so an answer that lost rows at the switch --
-    or double-served the starts that went through the index -- cannot pass.
+    More distinct start nodes than the former limit, and the total is asserted against arithmetic
+    (every A of the table has exactly one edge), so a scan that loses or duplicates rows cannot
+    pass. The statistics make the absence of speculative endpoint probes observable.
     """
     with database.begin("write") as txn:
         txn.execute("CREATE NODE TABLE A(id INT64, PRIMARY KEY(id))")
@@ -122,9 +137,11 @@ def test_the_hybrid_switches_past_the_fan_limit_and_the_answer_does_not_change(
                 "MATCH (a:A {id: $a}), (b:B {id: $b}) CREATE (a)-[:E {w: 1}]->(b)",
                 {"a": identity, "b": identity % 3 + 1},
             )
-    rows = database.execute("MATCH (a:A)-[:E]->(b:B) RETURN a.id, b.id").rows
-    assert len(rows) == 100
-    assert len(set(rows)) == 100
+    result = database.execute("MATCH (a:A)-[:E]->(b:B) RETURN a.id, b.id")
+    assert len(result.rows) == 100
+    assert len(set(result.rows)) == 100
+    assert result.statistics.get("edge_lookups", 0) == 0
+    assert result.statistics.get("edge_scans") == 1
 
 
 def test_a_deleted_landing_node_is_not_reached_through_its_edges(database) -> None:

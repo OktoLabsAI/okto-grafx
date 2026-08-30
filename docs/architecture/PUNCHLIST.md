@@ -1091,12 +1091,11 @@ carries this key". They stay because the doors are public.
   and W6-sized.
 - **The planner does not reorder a pattern to start from its seekable side.**
   `MATCH (c)-[:M]->(e {id: k})` walks from `c` -- a whole-table frontier -- when seeking `e` and
-  traversing INCOMING would touch a handful of rows. The traversal's fan limit caps the damage; the
-  ordering decision itself is planner work with its own review burden.
-- **Nothing asserts the traversal actually USES the index path.** The equality tests compare
-  index-vs-scan answers and the populate test walks entries, but a mutant that silently always took
-  the grouped scan would pass the suite -- correctness-neutral by construction, visible only in the
-  CF-17 measurement. Same survivor class as "re-adopt only the first table's index" was.
+  traversing INCOMING would touch a handful of rows. Frontier-aware execution now avoids the 64
+  speculative probes and scans immediately, but the ordering decision remains ST-1 planner work.
+- **CLOSED by QW-1 — the traversal regime is observable.** `QueryResult.statistics` records
+  `edge_lookups` and `edge_scans`; a discriminating regression requires a seek-bound frontier to
+  probe the endpoint index and a NodeScan-bound frontier to perform exactly one grouped scan.
 
 ## Schema transactionality after CF-16: residues (C10; recorded)
 

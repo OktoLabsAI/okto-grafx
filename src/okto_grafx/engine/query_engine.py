@@ -1842,13 +1842,12 @@ def _index_seek(
 
 
 _EDGE_LOOKUP_FAN_LIMIT: int = 64
-"""Distinct traversal start nodes served by index lookups before one grouped edge scan wins.
+"""Distinct starts from an unknown/bounded producer served before a grouped scan wins.
 
 Chosen from the shape of the two costs, not tuned to a machine: a lookup costs a few bucket-page
 reads however large the edge table is, and the grouped scan costs the whole edge table once.
-Sixty-four lookups are well under one scan of any edge table large enough for the difference to
-matter, and a frontier that crosses sixty-four distinct nodes is a whole-table walk, which is
-what the scan is for."""
+NodeScan and AllNodesScan frontiers bypass this limit and scan immediately because their plan
+already promises a whole-table walk. Unknown producers retain the conservative hybrid fallback."""
 
 
 def _edge_steps(
@@ -1862,10 +1861,12 @@ def _edge_steps(
     ended: frozenset[object] | set[object],
     changed: Mapping[object, tuple[Value, ...] | None],
     pending: Sequence[tuple[object, HeapVersion]] = (),
+    *,
+    bounded_frontier: bool = True,
 ) -> Callable[[object], Iterator[tuple[object, HeapVersion, TableDef, object]]]:
     """Return the function a traversal expands one frontier node with.
 
-    Two regimes, chosen once per traversal and the same answer from both.
+    Two regimes, chosen once per traversal and returning the same answer.
 
     **By index**, when every direction the pattern walks has its endpoint index present, owned
     by this table, and FRESH. A stored relationship row leads with its endpoints, so "the edges
@@ -1875,11 +1876,11 @@ def _edge_steps(
     Before this existed, a reverse hop into a well-referenced node of a 2500-node graph read all
     3600 edges and cost 1.46 s.
 
-    **By one scan**, otherwise -- no framework, no index, or a STALE one, which is a subset of
-    the heap and the one thing validation cannot repair. The scan is taken ONCE and grouped by
-    endpoint, so a frontier of F nodes costs O(E), not the O(F x E) the old per-node rescan
-    paid; slower than the index, and right, which is the same fallback rule the planner and the
-    uniqueness check follow.
+    **By one scan**, for a NodeScan/AllNodesScan frontier or when there is no usable index. A STALE
+    index is a subset of the heap and the one thing validation cannot repair. The scan is taken
+    ONCE and grouped by endpoint, so a frontier of F nodes costs O(E), not the O(F x E) the old
+    per-node rescan paid; slower than the index for a bounded seek, and right, which is the same
+    fallback rule the planner and the uniqueness check follow.
     """
     manager = engine._indexes
     lookup = getattr(manager, "lookup", None) if manager is not None else None
@@ -1944,6 +1945,7 @@ def _edge_steps(
     ) -> Iterator[tuple[object, HeapVersion, TableDef, object]]:
         """Yield the node's edges from the endpoint indexes, validated against the heap."""
         if outgoing:
+            context.count("edge_lookups")
             for ref in lookup(from_name, index_key((record_id, None), (0,)), snapshot):
                 if ref in ended:
                     continue
@@ -1953,6 +1955,7 @@ def _edge_steps(
                     continue
                 yield ref, version, to_table, version.values[1]
         if incoming:
+            context.count("edge_lookups")
             for ref in lookup(to_name, index_key((None, record_id), (1,)), snapshot):
                 if ref in ended:
                     continue
@@ -1967,6 +1970,7 @@ def _edge_steps(
     def grouped() -> tuple[dict, dict]:
         """Build the by-endpoint edge maps ONCE, on the first caller that needs them."""
         if not maps:
+            context.count("edge_scans")
             by_source: dict[object, list[tuple[object, HeapVersion]]] = {}
             by_target: dict[object, list[tuple[object, HeapVersion]]] = {}
             for ref, version in engine.heap.scan(relationship, snapshot):
@@ -2002,17 +2006,15 @@ def _edge_steps(
             for ref, version in by_target.get(record_id, ()):
                 yield ref, version, from_table, version.values[0]
 
-    if not indexed:
+    if not indexed or not bounded_frontier:
         return by_scan
 
-    # Indexed, WITH a fan limit -- and the limit is a cost model, not a hedge. One lookup
-    # answers one frontier node, so a bounded frontier (a seek, a bound endpoint, a short
-    # range) pays a handful of bucket probes and never reads the edge table. A frontier that
-    # keeps growing -- a scan traversing every node of a table -- pays one lookup per node,
-    # and past a point that costs more than reading the edges ONCE and grouping them. The
-    # switch is by DISTINCT start nodes seen, so it is deterministic for a given plan and
-    # data, and both regimes return the same tuples because the lookup validates against the
-    # same snapshot the scan reads under.
+    # Indexed, WITH a fan limit -- and the limit is a cost model, not a hedge. Known scan-shaped
+    # frontiers returned above without paying speculative probes. A seek or unknown producer pays
+    # a handful of bucket probes and retains the conservative transition to one grouped scan if
+    # it grows unexpectedly. The switch is by DISTINCT start nodes seen, so it is deterministic
+    # for a given plan and data, and both regimes return the same tuples because the lookup
+    # validates against the same snapshot the scan reads under.
     seen_starts: set[object] = set()
 
     def hybrid(
@@ -2035,6 +2037,24 @@ def _edge_steps(
         yield from by_scan(record_id)
 
     return hybrid
+
+
+def _frontier_is_bounded(root: PlanNode, variable: str) -> bool:
+    """Return whether ``root`` obtains ``variable`` without a whole-table node scan.
+
+    Endpoint lookups are profitable when a seek or an already-bound producer supplies a small
+    frontier. A NodeScan/AllNodesScan already promises to enumerate the table, so probing the
+    endpoint index once per emitted node merely delays the grouped relationship scan that wins
+    after the fan limit. Unknown producers deliberately keep the prior hybrid behaviour.
+    """
+    for planned in root.walk():
+        if getattr(planned, "variable", None) != variable:
+            continue
+        if isinstance(planned, IndexSeek):
+            return True
+        if isinstance(planned, (NodeScan, AllNodesScan)):
+            return False
+    return True
 
 
 def _planned_table_for_variable(root: PlanNode, variable: str) -> TableDef | None:
@@ -2128,6 +2148,7 @@ def _traverse(
         ended,
         relationship_changes,
         pending_edges,
+        bounded_frontier=_frontier_is_bounded(node.child, node.source),
     )
 
     for row in engine._rows(node.child, context):
@@ -2257,6 +2278,7 @@ def _traverse_any(
                     ended,
                     changes,
                     pending,
+                    bounded_frontier=_frontier_is_bounded(node.child, node.source),
                 ),
             )
         )

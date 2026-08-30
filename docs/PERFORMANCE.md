@@ -119,10 +119,12 @@ confirmed the direction on the same tool (1,128.6 → 319.2 ms under concurrent 
 loaded-machine datapoint, retained to show the spread).
 
 Every `CREATE REL TABLE` gets two EXACT indexes over its endpoints (`ef_`/`et_`). Traversal expands
-a bounded frontier by index lookup and switches to **one grouped edge scan** past 64 distinct start
-nodes — a cost model, not a hedge: a scan-shaped plan measured 1,830 ms paying 1,800 individual
-lookups where the grouped scan pays ~220 ms. The instrument also proves **index-vs-scan equality**
-on every run by staling the indexes and comparing answers.
+a seek/unknown frontier by index lookup, retaining the 64-start hybrid fallback, while a frontier
+known from its plan to be `NodeScan`/`AllNodesScan` performs **one grouped edge scan immediately**.
+The distinction avoids speculative probes on a scan-shaped plan, which previously measured
+1,830 ms for 1,800 lookups where the grouped scan paid ~220 ms. `QueryResult.statistics` exposes
+`edge_lookups` and `edge_scans`, and the instrument proves **index-vs-scan equality** by staling the
+indexes and comparing answers.
 
 **Known ceiling, recorded:** a traversal whose target is *unbound* resolves landings by one scan of
 the landing table per traversal (edges store record identities; identities carry no index yet) —
