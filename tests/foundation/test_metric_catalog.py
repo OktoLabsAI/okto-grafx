@@ -98,7 +98,7 @@ def _labels(plan: LabelPlan) -> tuple[LabelSpec, ...]:
 
 
 def test_the_transcription_has_the_size_the_contract_declares() -> None:
-    # A guard on the transcription itself: section 9 lists 35 metrics over 12 label names.
+    # A guard on the transcription itself: section 9 lists 36 metrics over 13 label names.
     assert len(CATALOG) == 36
     assert len({name for name, _ in CATALOG}) == 36
     assert len(CATALOG_LABEL_NAMES) == 13
