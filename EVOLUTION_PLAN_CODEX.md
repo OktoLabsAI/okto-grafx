@@ -59,6 +59,19 @@
   a 100% com somente duas falhas AST de docstrings já existentes e sem falha funcional; as três
   docstrings faltantes foram adicionadas em commit de higiene, o teste de documentação integral,
   `tests/query + tests/test_language_surface.py` e Ruff terminaram com código `0`.
+- **CQ-3/QW-2 medido e aprovado para promoção.** O carry one-shot reutiliza somente o certificado
+  obtido no pós-read durável da leitura exata anterior; a prova otimista pós-leitura continua
+  obrigatória, qualquer recusa cai no caminho fresco e todo publicador local de page 0 invalida o
+  carry. O F4 in-process e com processo spawnado prova que uma marca stale estrangeira entre
+  lookups continua sendo observada e recusada fail-closed. Origem revisada/pushed:
+  `perf/w1-cq3-certificate-carry@e68a15098345a5d68e8d2e44e78a3a49caf6aef2`; integração sobre
+  o main corrente: `ce1c747`. O gate Nexus `hof_79e50ac8a243463ab8d3d3778dd9557f` foi
+  verificado/PASS. O par com QW-1 manteve digest/harness/Community/Core e page writes idênticos;
+  a soma RAW caiu de `7.375,84` para `6.801,17 ms` (`-7,8%`). `read_fresh_page` caiu, por exemplo,
+  de `32 -> 17` em projection, `18 -> 10` em lineage e `12 -> 7` em replace; o JSON CQ-3 tem
+  SHA-256 `acc672c32d7d91d05e4b4bcf13c16c329fb0f66ae5e752f44565df8e767c5c6f`. Red-first 4/4,
+  mutantes do pós-read/fallback/invalidação mortos, 262 testes focados e multiprocesso reproduzidos
+  pelo Codex e Ruff passaram; a mesma bateria passou novamente no SHA integrado.
 - **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`
