@@ -59,10 +59,16 @@
   a 100% com somente duas falhas AST de docstrings já existentes e sem falha funcional; as três
   docstrings faltantes foram adicionadas em commit de higiene, o teste de documentação integral,
   `tests/query + tests/test_language_surface.py` e Ruff terminaram com código `0`.
-- **CE-1 permanece condicionado, sem código de produção.** O spike `perf/w1-ce1-spike@fe9977d`
-  mediu o descritor persistente quente entre `93,33x` e `145,73x` mais rápido que o replace
-  atômico nas rodadas iniciais, mas esse número não foi extrapolado para commits. O instrumento
-  v2 agora mede também abertura fria e LRU real; essas rodadas ainda estão pendentes. A proposta de
+- **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
+  `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
+  `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`
+  (`108,85x-158,01x`), o caso frio `1,00-7,16 ms` (`2,58x-14,95x`) e a LRU real com evicção
+  `3,00-4,37 ms` (`4,24x-4,98x`). Portanto o ganho se sustenta no cenário conservador de
+  descriptor evicto, sem extrapolá-lo ainda para commits reais. Artefatos v2: `run-10` SHA-256
+  `a41b645cf8d40abce0f46ff9cb3c8eb9d25c22c89f519bf6df4e1e33dd89af3c`, `run-11`
+  `63fc77475a39697924d3b8ff8613c458a579ae5fe2ed9a02e7cc2986bc350262` e `run-12`
+  `2e8e4e062734eb668b15ab74b350f7a5d20eb4b39ef18647354909b341118ff8`. Isso libera somente a
+  matriz de crash/fault; produção continua bloqueada. A proposta de
   formato/migração/crash matrix está em
   `perf/w1-ce1-contract@7b83dcd8c89c991bac35273d099a7a79e982d227`, documento
   `docs/architecture/CE1_TWO_SLOT_CONTROL_RECORD.md` SHA-256
