@@ -754,12 +754,18 @@ class TransactionManager:
             # participant commits and nowhere else. Without this, a transaction opened in a
             # participant that had already read a table answers from frames cached before
             # somebody else committed: no error, no missing file, just fewer rows than exist.
+            own_view = read_lsn == self._own_published_lsn
             with self._close_wait_hazard():
                 self._pool.begin_read_view(
                     read_lsn,
-                    own=(read_lsn == self._own_published_lsn),
+                    own=own_view,
                     unfenced_file=self._file_ids.catalog_file,
                 )
+            if not own_view:
+                # The token was met without provenance once; a later token that happens to
+                # return to the old own number (a foreign recovery can republish it) must
+                # not be met as own either. Only the next _publish_commit_state re-arms.
+                self._own_published_lsn = None
             self._require_not_closed("begin a transaction")
             transaction = TransactionContext(
                 txn_id=self._next_txn_id,
@@ -1596,12 +1602,15 @@ class TransactionManager:
                     # consults -- the catalog, the pages a row will land on -- comes through the pool,
                     # and a stale one makes a correct predicate decide against the wrong picture
                     # (defect E1, second half; LESSONS L22).
+                    own_view = current == self._own_published_lsn
                     with self._close_wait_hazard():
                         self._pool.begin_read_view(
                             current,
-                            own=(current == self._own_published_lsn),
+                            own=own_view,
                             unfenced_file=self._file_ids.catalog_file,
                         )
+                    if not own_view:
+                        self._own_published_lsn = None
                     # The rows go in BEFORE validation, because the pages they land on are
                     # part of what this commit will overwrite and therefore part of what it must
                     # declare. Nothing of them is durable yet, and a refusal below puts them
@@ -3165,7 +3174,14 @@ class TransactionManager:
         self._own_published_lsn = committed
 
     def _publish(self, state: CommitState) -> None:
-        """Write the state to a temporary of this participant and replace the published file."""
+        """Write the state to a temporary of this participant and replace the published file.
+
+        Every generic publication forfeits the own-view provenance FIRST: a gap completion or
+        a checkpoint can carry a foreign commit, and a number published here must never be met
+        by a later read view as "my own". _publish_commit_state re-marks it, after ITS publish
+        returned, for the one number this manager provably produced itself.
+        """
+        self._own_published_lsn = None
         with self._close_wait_hazard():
             self._commit_state_store.publish(state)
 
