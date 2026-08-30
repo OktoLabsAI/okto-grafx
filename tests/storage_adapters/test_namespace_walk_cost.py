@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from okto_grafx.adapters import storage_local
 from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.domain.errors import GrafxUnsupportedOperation
 
@@ -360,6 +361,241 @@ def test_a_warm_descriptor_hit_does_not_re_prove_the_path_chain(
     assert 2 <= counts["lstat"] <= 4, dict(counts)
     assert counts["stat"] == 1, dict(counts)
     assert counts["fstat"] <= 2, dict(counts)
+
+
+# --- QW-3: cold identity resolution inherits containment from proved parents ----------------
+
+
+def test_identity_namespace_doors_do_not_rederive_real_paths(
+    board: tuple[LocalStorageDevice, Path],
+) -> None:
+    device, _root = board
+
+    with _counting_syscalls() as exists_calls:
+        assert device.exists(CONTROL)
+    assert exists_calls["realpath"] == 0, dict(exists_calls)
+
+    staging = "control/qw3.next"
+    target = "control/qw3.state"
+    with _counting_syscalls() as create_calls:
+        device.create(staging)
+    assert create_calls["realpath"] == 0, dict(create_calls)
+    device.append_log(staging, b"state")
+
+    with _counting_syscalls() as replace_calls:
+        device.atomic_replace(staging, target)
+    assert replace_calls["realpath"] == 0, dict(replace_calls)
+
+    with _counting_syscalls() as remove_calls:
+        device.remove(target)
+    assert remove_calls["realpath"] == 0, dict(remove_calls)
+
+
+def test_a_cold_descriptor_miss_does_not_rederive_real_paths(
+    board: tuple[LocalStorageDevice, Path],
+) -> None:
+    _device, root = board
+    cold = LocalStorageDevice(root, page_size=PAGE_SIZE)
+    try:
+        with _counting_syscalls() as counts:
+            assert cold.read_page(HEAP, 0) == bytes([1]) * PAGE_SIZE
+        assert counts["realpath"] == 0, dict(counts)
+    finally:
+        cold.close()
+
+
+def _exchange_parent_after_its_entries_were_listed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_redirect: Callable[[Path, Path], None],
+) -> None:
+    """A child resolved from entries of an exchanged parent is never accepted."""
+    root = tmp_path / "database"
+    spool = root / "spool"
+    spool.mkdir(parents=True)
+    (spool / "state.bin").write_bytes(b"stored")
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    protected = victim / "state.bin"
+    protected.write_bytes(b"victim")
+    original = root / "spool-original"
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE, create_root=False)
+    real_listdir = storage_local.os.listdir
+    target = os.path.normcase(str(spool))
+    swapped = False
+
+    def swapping_listdir(path: str) -> list[str]:
+        nonlocal swapped
+        entries = real_listdir(path)
+        if os.path.normcase(os.fspath(path)) == target and not swapped:
+            spool.rename(original)
+            make_redirect(spool, victim)
+            swapped = True
+        return entries
+
+    monkeypatch.setattr(storage_local.os, "listdir", swapping_listdir)
+    try:
+        with pytest.raises(GrafxUnsupportedOperation) as raised:
+            device.exists("spool/state.bin")
+        assert raised.value.details["reason"] == "redirected_path"
+        assert swapped, "the parent was never exchanged after its listing"
+        assert protected.read_bytes() == b"victim"
+    finally:
+        device.close()
+        monkeypatch.setattr(storage_local.os, "listdir", real_listdir)
+        if spool.is_symlink():
+            spool.unlink()
+        elif swapped and spool.exists():
+            os.rmdir(spool)
+        if original.exists():
+            original.rename(spool)
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name != "nt", reason="An NTFS junction exchange requires Windows.")
+def test_a_parent_exchanged_for_a_junction_after_listing_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _exchange_parent_after_its_entries_were_listed(
+        tmp_path, monkeypatch, _windows_junction_or_skip
+    )
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name == "nt", reason="The POSIX half of the pair uses a symlink.")
+def test_a_parent_exchanged_for_a_symlink_after_listing_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _exchange_parent_after_its_entries_were_listed(
+        tmp_path, monkeypatch, _directory_symlink_or_skip
+    )
+
+
+def _exchange_parent_right_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_redirect: Callable[[Path, Path], None],
+) -> None:
+    """A parent exchanged after lstat but before open must never admit the foreign handle."""
+    root = tmp_path / "database"
+    spool = root / "spool"
+    spool.mkdir(parents=True)
+    (spool / "state.bin").write_bytes(b"stored")
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    protected = victim / "state.bin"
+    protected.write_bytes(b"victim")
+    original = root / "spool-original"
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE, create_root=False)
+    real_open = storage_local._open_descriptor
+    target = os.path.normcase(str(spool / "state.bin"))
+    swapped = False
+
+    def swapping_open(path: str, *, create_new: bool) -> int:
+        nonlocal swapped
+        if os.path.normcase(path) == target and not swapped:
+            spool.rename(original)
+            make_redirect(spool, victim)
+            swapped = True
+        return real_open(path, create_new=create_new)
+
+    monkeypatch.setattr(storage_local, "_open_descriptor", swapping_open)
+    try:
+        with pytest.raises(GrafxUnsupportedOperation) as raised:
+            device.read_log("spool/state.bin", 0, 6)
+        assert raised.value.details["reason"] == "redirected_path"
+        assert swapped, "the parent was never exchanged at the open boundary"
+        assert protected.read_bytes() == b"victim"
+    finally:
+        device.close()
+        monkeypatch.setattr(storage_local, "_open_descriptor", real_open)
+        if spool.is_symlink():
+            spool.unlink()
+        elif swapped and spool.exists():
+            os.rmdir(spool)
+        if original.exists():
+            original.rename(spool)
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name != "nt", reason="An NTFS junction exchange requires Windows.")
+def test_a_parent_exchanged_for_a_junction_between_resolution_and_open_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _exchange_parent_right_before_open(
+        tmp_path, monkeypatch, _windows_junction_or_skip
+    )
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name == "nt", reason="The POSIX half of the pair uses a symlink.")
+def test_a_parent_exchanged_for_a_symlink_between_resolution_and_open_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _exchange_parent_right_before_open(
+        tmp_path, monkeypatch, _directory_symlink_or_skip
+    )
+
+
+def _exchange_root_right_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_redirect: Callable[[Path, Path], None],
+) -> None:
+    """The opened root identity is rechecked after a cold descriptor has been obtained."""
+    root = tmp_path / "database"
+    root.mkdir()
+    (root / "state.bin").write_bytes(b"stored")
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    protected = victim / "state.bin"
+    protected.write_bytes(b"victim")
+    original = tmp_path / "database-original"
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE, create_root=False)
+    real_open = storage_local._open_descriptor
+    target = os.path.normcase(str(root / "state.bin"))
+    swapped = False
+
+    def swapping_open(path: str, *, create_new: bool) -> int:
+        nonlocal swapped
+        if os.path.normcase(path) == target and not swapped:
+            root.rename(original)
+            make_redirect(root, victim)
+            swapped = True
+        return real_open(path, create_new=create_new)
+
+    monkeypatch.setattr(storage_local, "_open_descriptor", swapping_open)
+    try:
+        with pytest.raises(GrafxUnsupportedOperation) as raised:
+            device.read_log("state.bin", 0, 6)
+        assert raised.value.details["reason"] == "redirected_root"
+        assert swapped, "the root was never exchanged at the open boundary"
+        assert protected.read_bytes() == b"victim"
+    finally:
+        device.close()
+        monkeypatch.setattr(storage_local, "_open_descriptor", real_open)
+        if root.is_symlink():
+            root.unlink()
+        elif swapped and root.exists():
+            os.rmdir(root)
+        if original.exists():
+            original.rename(root)
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name != "nt", reason="An NTFS junction exchange requires Windows.")
+def test_a_root_exchanged_for_a_junction_between_resolution_and_open_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _exchange_root_right_before_open(tmp_path, monkeypatch, _windows_junction_or_skip)
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name == "nt", reason="The POSIX half of the pair uses a symlink.")
+def test_a_root_exchanged_for_a_symlink_between_resolution_and_open_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _exchange_root_right_before_open(tmp_path, monkeypatch, _directory_symlink_or_skip)
 
 
 def test_a_control_file_published_by_another_participant_is_seen_on_a_warm_hit(

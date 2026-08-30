@@ -747,16 +747,20 @@ class LocalStorageDevice:
                 self._forget_deferred(name)
                 return
             self._require_directory_parents(name)
-            path = self._physical_path(name)
+            path = self._joined_path(name)
+            self._require_safe_path(name, prove_containment=False)
             if os.path.isdir(path):
                 raise refuse_not_a_file(name)
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
             except OSError as failure:
                 raise self._device_failure("create", name, failure) from failure
+            # A missing parent may have been created above. Prove the resulting exact-case
+            # chain before opening through it; containment is inherited from the held root.
+            self._require_directory_parents(name)
             self._acknowledge_namespace(path)
             self._forget_deferred(name)
-            descriptor = self._retry("create", name, lambda: _open_descriptor(path, create_new=True))
+            descriptor = self._open_named_descriptor(name, path, create_new=True)
             self._admit(name, descriptor, path)
             self._acknowledge(name)
             # Draining afterwards keeps this door an independent trigger for the deletion queue
@@ -772,7 +776,8 @@ class LocalStorageDevice:
                 raise refuse_missing_file(name, "remove")
             self._release(name)
             self._dirty.discard(name)
-            path = self._physical_path(name)
+            path = self._joined_path(name)
+            self._require_safe_path(name, prove_containment=False)
             self._retry("remove", name, lambda: _remove_file(path))
             self._acknowledge_namespace(path)
             self._forget_deferred(name)
@@ -825,18 +830,23 @@ class LocalStorageDevice:
             self._require_directory_parents(target_name)
             self._release(source_name)
             self._release(target_name)
-            source_path = self._physical_path(source_name)
-            target_path = self._physical_path(target_name)
+            source_path = self._joined_path(source_name)
+            target_path = self._joined_path(target_name)
+            self._require_safe_path(source_name, prove_containment=False)
+            self._require_safe_path(target_name, prove_containment=False)
             if os.path.isdir(target_path):
                 raise refuse_not_a_file(target_name)
             try:
                 os.makedirs(os.path.dirname(target_path), exist_ok=True)
             except OSError as failure:
                 raise self._device_failure("atomic_replace", target_name, failure) from failure
+            self._require_directory_parents(target_name)
+            self._require_safe_path(source_name, prove_containment=False)
             # _publish_over is the only move that overwrites an existing target on both
             # families: os.rename fails on Windows the moment the target exists, and os.replace
             # fails there whenever another participant holds the target open (CF-5).
             self._retry("atomic_replace", target_name, lambda: _publish_over(source_path, target_path))
+            self._require_safe_path(target_name, prove_containment=False)
             self._acknowledge_namespace(source_path)
             self._acknowledge_namespace(target_path)
             self._dirty.discard(source_name)
@@ -870,7 +880,9 @@ class LocalStorageDevice:
                 return True
             self._release(name)
             self._dirty.discard(name)
-            return self._free_the_name(name, self._physical_path(name))
+            path = self._joined_path(name)
+            self._require_safe_path(name, prove_containment=False)
+            return self._free_the_name(name, path)
 
     def pending_deletes(self) -> tuple[str, ...]:
         """Return the device relative names whose deletion the platform deferred, sorted."""
@@ -1255,9 +1267,18 @@ class LocalStorageDevice:
 
     def _physical_path(self, name: str) -> str:
         """Translate a logical name into the real path it denotes inside the database directory."""
-        path = os.path.join(self._root, *name.split("/"))
+        path = self._joined_path(name)
         self._require_safe_path(name)
         return path
+
+    def _joined_path(self, name: str) -> str:
+        """Join an already-normalized logical name below the opened root, without proving it.
+
+        Callers use this only immediately after the exact-case identity walk or while retaining
+        a proof made by that walk. Keeping the join separate from ``_physical_path`` prevents a
+        proved namespace door from paying for the legacy per-component realpath proof again.
+        """
+        return os.path.join(self._root, *name.split("/"))
 
     def _require_root_identity(self, name: str, *, prove_real_path: bool = True) -> None:
         """Refuse a root that was exchanged or redirected after this adapter opened it.
@@ -1351,12 +1372,20 @@ class LocalStorageDevice:
 
     def _require_directory_parents(self, name: str) -> None:
         """Refuse a name whose parent segment is itself a stored file, on both families alike."""
-        self._require_safe_path(name)
-        current = self._root
+        self._require_root_identity(name, prove_real_path=False)
+        directory = self._root
+        identity = self._root_identity
+        prefix = ""
         for segment in name.split("/")[:-1]:
-            current = os.path.join(current, segment)
-            if os.path.isfile(current):
-                raise refuse_not_a_directory(name, self._relative(current))
+            resolved = self._resolved_child(directory, identity, prefix, segment, name)
+            if resolved is None:
+                return
+            candidate, information = resolved
+            if not stat.S_ISDIR(information.st_mode):
+                raise refuse_not_a_directory(name, self._relative(candidate))
+            directory = candidate
+            identity = (information.st_dev, information.st_ino)
+            prefix += segment + "/"
 
     def _adopt_pending_deletes(self) -> None:
         """Take over the deferred deletions a previous run left behind, and keep serials unique."""
@@ -1370,28 +1399,56 @@ class LocalStorageDevice:
             if tail.isdigit():
                 self._pending_serial = max(self._pending_serial, int(tail))
 
-    def _entries(self, directory: str, name: str) -> tuple[str, ...]:
-        """Return the real entries of one directory, empty when the directory is not there."""
-        self._require_root_identity(name)
-        self._require_contained(name, directory)
-        if os.path.lexists(directory):
-            try:
-                information = os.lstat(directory)
-            except OSError as failure:
-                raise self._device_failure("inspect_path", name, failure) from failure
-            if _is_redirected_path(directory, information):
-                raise refuse_operation(
-                    "redirected_path",
-                    f"Logical file {name!r} crosses a symlink, junction or reparse point.",
-                    file=name,
-                    component=self._relative(directory),
-                )
+    def _resolved_child(
+        self,
+        directory: str,
+        identity: tuple[int, int],
+        prefix: str,
+        segment: str,
+        name: str,
+    ) -> tuple[str, os.stat_result] | None:
+        """Resolve one exact-case child while its parent keeps the proved identity.
+
+        The parent is checked before and after both the listing and the child's ``lstat``. Thus
+        a directory exchanged for a junction between either system call is refused without
+        resolving the real path of the child. A plain child inherits containment from that
+        proved parent exactly as entries of ``_walk`` do.
+        """
+        label = prefix[:-1] if prefix else self._root
+        self._require_directory_identity(label, directory, identity)
         try:
-            return tuple(os.listdir(directory))
+            entries = tuple(os.listdir(directory))
         except (FileNotFoundError, NotADirectoryError):
-            return ()
+            return None
         except OSError as failure:
             raise self._device_failure("list", name, failure) from failure
+
+        exact = segment in entries
+        conflict = None if exact else find_case_conflict(segment, entries)
+        candidate = os.path.join(directory, segment)
+        information: os.stat_result | None = None
+        if exact:
+            try:
+                information = os.lstat(candidate)
+            except (FileNotFoundError, NotADirectoryError):
+                information = None
+            except OSError as failure:
+                raise self._device_failure("inspect_path", name, failure) from failure
+            if information is not None:
+                self._refuse_foreign_component(name, candidate, information)
+        self._require_directory_identity(label, directory, identity)
+        if not exact:
+            if conflict is not None:
+                raise refuse_operation(
+                    "case_collision",
+                    f"File {name!r} differs only by case from the stored name {conflict!r}.",
+                    file=name,
+                    stored=conflict,
+                )
+            return None
+        if information is None:
+            return None
+        return candidate, information
 
     def _resolve_identity(self, name: str) -> bool:
         """Return True when the exact name exists; refuse a stored name that differs only by case.
@@ -1400,22 +1457,24 @@ class LocalStorageDevice:
         cannot make ``Wal/x.wal`` resolve to ``wal/x.wal`` behind the back of the engine. The
         answer is True only for a regular file: a directory is not part of the namespace.
         """
-        self._require_safe_path(name)
-        current = self._root
-        for segment in name.split("/"):
-            entries = self._entries(current, name)
-            if segment not in entries:
-                conflict = find_case_conflict(segment, entries)
-                if conflict is not None:
-                    raise refuse_operation(
-                        "case_collision",
-                        f"File {name!r} differs only by case from the stored name {conflict!r}.",
-                        file=name,
-                        stored=conflict,
-                    )
+        self._require_root_identity(name, prove_real_path=False)
+        directory = self._root
+        identity = self._root_identity
+        prefix = ""
+        segments = name.split("/")
+        for index, segment in enumerate(segments):
+            resolved = self._resolved_child(directory, identity, prefix, segment, name)
+            if resolved is None:
                 return False
-            current = os.path.join(current, segment)
-        return os.path.isfile(current)
+            candidate, information = resolved
+            if index == len(segments) - 1:
+                return stat.S_ISREG(information.st_mode)
+            if not stat.S_ISDIR(information.st_mode):
+                return False
+            directory = candidate
+            identity = (information.st_dev, information.st_ino)
+            prefix += segment + "/"
+        return False  # pragma: no cover - normalize_logical_name rejects an empty name
 
     def _walk(self, *, include_pending: bool = False, below: str = "") -> Iterable[str]:
         """Yield regular files without ever following or ignoring a redirected component.
@@ -1603,8 +1662,8 @@ class LocalStorageDevice:
             return cached
         if not self._resolve_identity(name):
             raise refuse_missing_file(name, "open")
-        path = self._physical_path(name)
-        descriptor = self._retry("open", name, lambda: _open_descriptor(path, create_new=False))
+        path = self._joined_path(name)
+        descriptor = self._open_named_descriptor(name, path, create_new=False)
         self._admit(name, descriptor, path)
         # A29: the name joins the unflushed set only now, once it is known to be valid and open.
         # A refused write that recorded a name would make every later global barrier fail, and
@@ -1612,6 +1671,62 @@ class LocalStorageDevice:
         if intent == "write":
             self._acknowledge(name)
         return descriptor
+
+    def _open_named_descriptor(self, name: str, path: str, *, create_new: bool) -> int:
+        """Open a proved name and accept only a descriptor that still names its exact file.
+
+        Resolution and open are separate kernel calls. Another participant may publish a file,
+        or an attacker may exchange a parent for a redirect, between them. The descriptor is
+        therefore checked against a fresh exact-case identity walk after open and is closed on
+        every refusal. Existing files get bounded retries for an ordinary atomic replacement;
+        an exclusive create cannot be repeated after it created the entry, so it fails closed.
+        """
+        attempts = 1 if create_new else self._retry_attempts
+        for attempt in range(attempts):
+            descriptor = self._retry(
+                "create" if create_new else "open",
+                name,
+                lambda: _open_descriptor(path, create_new=create_new),
+            )
+            try:
+                if self._opened_descriptor_still_names(name, path, descriptor):
+                    return descriptor
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+                raise
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            if attempt + 1 < attempts:
+                continue
+        raise refuse_operation(
+            "path_escape",
+            f"Logical file {name!r} changed while its descriptor was being opened.",
+            file=name,
+        )
+
+    def _opened_descriptor_still_names(self, name: str, path: str, descriptor: int) -> bool:
+        """Prove a just-opened descriptor is the current exact-case regular file at ``name``."""
+        try:
+            held = os.fstat(descriptor)
+        except OSError:
+            return False
+        if not self._resolve_identity(name):
+            return False
+        try:
+            current = os.stat(path)
+        except OSError:
+            return False
+        if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+            return False
+        # Bracket the followed stat with a final no-follow component proof. A parent or final
+        # entry exchanged for a redirect at the open boundary is refused here.
+        self._require_safe_path(name, prove_containment=False)
+        try:
+            current = os.stat(path)
+        except OSError:
+            return False
+        return (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino)
 
     def _acknowledge(self, name: str) -> None:
         """Record that this device is acknowledging bytes for a logical name (A26).

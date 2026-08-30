@@ -117,16 +117,11 @@ def test_a_database_root_exchanged_for_a_redirect_is_refused_without_touching_vi
             original.rename(root)
 
 
-@pytest.mark.platform_specific
-@pytest.mark.skipif(
-    not IS_WINDOWS,
-    reason="The transient extended-length spelling is emitted only by Windows realpath.",
-)
-def test_atomic_replacement_cannot_turn_an_equivalent_final_path_into_an_escape(
+def test_atomic_replacement_during_identity_resolution_remains_a_regular_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Model the exact two-syscall realpath race while another participant publishes a file."""
+    """A final-name publication may change identity without changing its safe parent chain."""
     root = tmp_path / "database"
     control = root / "control"
     control.mkdir(parents=True)
@@ -135,31 +130,26 @@ def test_atomic_replacement_cannot_turn_an_equivalent_final_path_into_an_escape(
     target.write_bytes(b"old lease")
     staging.write_bytes(b"new lease")
     device = LocalStorageDevice(root, page_size=PAGE_SIZE, create_root=False)
-    entered_realpath = threading.Event()
+    inspected_old_identity = threading.Event()
     replacement_finished = threading.Event()
     failures: list[BaseException] = []
     answers: list[bool] = []
-    real_realpath = storage_local.os.path.realpath
+    real_lstat = storage_local.os.lstat
     target_key = os.path.normcase(str(target))
     raced = [False]
 
-    def racing_realpath(path: Any) -> str:
-        resolved = real_realpath(path)
+    def racing_lstat(path: Any) -> os.stat_result:
+        information = real_lstat(path)
         if (
             threading.current_thread().name == "containment-reader"
             and os.path.normcase(os.fspath(path)) == target_key
             and not raced[0]
         ):
             raced[0] = True
-            entered_realpath.set()
+            inspected_old_identity.set()
             if not replacement_finished.wait(timeout=5.0):
                 raise AssertionError("the publisher did not replace the control record")
-            # CPython can expose the old file through NTFS's deleted namespace when its final
-            # path syscall races the replacement. That device path cannot be normalized safely:
-            # the adapter must resolve the logical name again and observe the new record.
-            drive, _tail = os.path.splitdrive(resolved)
-            return f"{drive}\\$Extend\\$Deleted\\atomic-replacement"
-        return resolved
+        return information
 
     def observe() -> None:
         try:
@@ -167,11 +157,11 @@ def test_atomic_replacement_cannot_turn_an_equivalent_final_path_into_an_escape(
         except BaseException as failure:
             failures.append(failure)
 
-    monkeypatch.setattr(storage_local.os.path, "realpath", racing_realpath)
+    monkeypatch.setattr(storage_local.os, "lstat", racing_lstat)
     reader = threading.Thread(target=observe, name="containment-reader")
     reader.start()
     try:
-        assert entered_realpath.wait(timeout=5.0)
+        assert inspected_old_identity.wait(timeout=5.0)
         os.replace(staging, target)
     finally:
         replacement_finished.set()
@@ -308,7 +298,10 @@ def test_a_device_namespace_spelling_is_never_normalized_into_the_database(
     monkeypatch.setattr(storage_local.os.path, "realpath", hostile_realpath)
     try:
         with pytest.raises(GrafxUnsupportedOperation) as raised:
-            device.exists("operator.evidence")
+            # Identity-only namespace doors deliberately avoid realpath. The durable barrier
+            # still uses this full physical proof, whose device-namespace rejection remains a
+            # required security invariant.
+            device._require_contained("operator.evidence", str(evidence))
         assert raised.value.details["reason"] == "path_escape"
         assert evidence.read_bytes() == b"authority"
     finally:
