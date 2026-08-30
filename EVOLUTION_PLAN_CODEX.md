@@ -117,6 +117,33 @@
   época. Artefato `cq4-959e911-pf5-h1h8_1.json`, SHA-256
   `c9b4add6296bf8ca140c80ab7f77b657785799d9b64fb50a1d00cef2ea028200`. Multi-writer/
   multi-reader permanece intacto: nenhuma lease, cerca, época, publicação ou regra D7 mudou.
+- **QW-3 medido, aprovado e integrado.** O storage local deixa de repetir `realpath` nas portas
+  de identidade do namespace depois que a raiz física já foi validada, substituindo-o por uma
+  prova segmentada de identidade: diretório pai e raiz são conferidos antes/depois da listagem,
+  o nome exato é exigido, cada segmento é inspecionado por `lstat` e redirects/reparse points e
+  entradas especiais continuam recusados. A abertura de descriptor ganhou prova pós-open e retry
+  limitado; criação, remoção, `atomic_replace`, recycle e cold miss usam a mesma fronteira. A prova
+  física completa continua obrigatória na construção da raiz, em `_walk` e na barreira durável de
+  diretório POSIX. Origem publicada:
+  `perf/w2-qw3-storage-identity@6a2b374a36965d9adaeb1a3ff4cc5c7984cbc268`; composição sobre
+  CQ-4: `0433d17`. O red-first falhou nos quatro casos esperados (dois skips de plataforma); as
+  regressões cobrem custo zero de `realpath` nas portas de identidade/cold miss, troca concorrente
+  de pai e raiz na listagem e no open, junction Windows/symlink POSIX e a prova física preservada
+  no namespace do device. Três mutantes discriminantes foram mortos: remover a prova pós-listagem,
+  confiar apenas na prova pré-open e restaurar `realpath` no caminho quente. As suítes de storage
+  adapters/core, Ruff e `diff --check` passaram no SHA integrado. A suíte global não encontrou
+  falha funcional; os únicos 11 erros iniciais eram precondições do corpus apontando para HEADs
+  Pulse diferentes dos pins declarados, e o corpus passou integralmente em worktrees detached nos
+  pins exatos, sem mudança de código entre as execuções. No gate H1-H8.1/pf5, 110 commits de setup
+  e 180 operações medidas concluíram 12/12 famílias, exit `0`; contra CQ-4, a soma RAW caiu de
+  `7.016,97` para `4.985,75 ms` (`-2.031,22 ms`, `-28,95%`) e todas as famílias melhoraram
+  (`-11,8%` a `-45,8%`). A mediana de `nt._getfinalpathname` caiu de `774-2.568` chamadas por
+  operação para `38-42` na maioria das famílias e `310` no caso pesado de delete de edges;
+  bytes persistidos, page writes e index writes permaneceram idênticos em cada família. Artefato
+  `qw3-6a2b374-pf5-h1h8_1.json`, SHA-256
+  `1e29cf39638e5ec1e974308fb888139106761e2dd1c876133785e41158d85990`, mesmo digest lógico,
+  harness e checkouts Pulse do CQ-4. Multi-writer/multi-reader permanece intacto: não houve mudança
+  de lease, época, publicação, recovery, visibilidade ou protocolo de commit.
 - **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`
