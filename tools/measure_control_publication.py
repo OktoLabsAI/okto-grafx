@@ -10,6 +10,7 @@ format, migration and crash/fault proofs remain separate gates.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -218,16 +219,28 @@ def _measure_two_slot(
 
 
 def measure(
-    root: Path, *, warmups: int, samples: int, payload_size: int, slot_size: int
+    root: Path,
+    *,
+    warmups: int,
+    samples: int,
+    payload_size: int,
+    slot_size: int,
+    order: str = "atomic-first",
 ) -> dict[str, Any]:
     """Run both protocols in isolated subdirectories and return an auditable report."""
     if payload_size < 8:
         raise ValueError("payload_size must be at least 8 bytes")
     if slot_size < payload_size:
         raise ValueError("slot_size must be at least payload_size")
+    if order not in {"atomic-first", "two-slot-first"}:
+        raise ValueError("order must be atomic-first or two-slot-first")
     root.mkdir(parents=True, exist_ok=True)
-    current = _measure_current(root, warmups, samples, payload_size)
-    two_slot = _measure_two_slot(root, warmups, samples, payload_size, slot_size)
+    if order == "atomic-first":
+        current = _measure_current(root, warmups, samples, payload_size)
+        two_slot = _measure_two_slot(root, warmups, samples, payload_size, slot_size)
+    else:
+        two_slot = _measure_two_slot(root, warmups, samples, payload_size, slot_size)
+        current = _measure_current(root, warmups, samples, payload_size)
     current_median = float(current["total"]["summary"]["median_ns"])
     two_slot_median = float(two_slot["total"]["summary"]["median_ns"])
     return {
@@ -238,12 +251,14 @@ def measure(
             "platform": platform.platform(),
             "os_name": os.name,
             "working_volume": str(root.resolve().anchor),
+            "tool_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         },
         "parameters": {
             "warmups": warmups,
             "samples": samples,
             "payload_size": payload_size,
             "slot_size": slot_size,
+            "order": order,
         },
         "atomic_replace": current,
         "two_slot": two_slot,
@@ -265,6 +280,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--samples", type=_positive, default=100)
     parser.add_argument("--payload-size", type=_positive, default=64)
     parser.add_argument("--slot-size", type=_positive, default=4096)
+    parser.add_argument(
+        "--order",
+        choices=("atomic-first", "two-slot-first"),
+        default="atomic-first",
+        help="protocol execution order, recorded to expose order bias",
+    )
     parser.add_argument("--output", type=Path, help="optional JSON output path")
     return parser
 
@@ -283,6 +304,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 samples=args.samples,
                 payload_size=args.payload_size,
                 slot_size=args.slot_size,
+                order=args.order,
             )
     else:
         report = measure(
@@ -291,6 +313,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             samples=args.samples,
             payload_size=args.payload_size,
             slot_size=args.slot_size,
+            order=args.order,
         )
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.output is not None:
