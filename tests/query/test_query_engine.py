@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,13 +19,16 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import Timestamp, ValueType
-from okto_grafx.domain.query.plan import ProduceResults, VectorSearch
+from okto_grafx.domain.query.plan import NodeScan, ProduceResults, SingleRow, VectorSearch
 from okto_grafx.engine.query_engine import (
     PHASE_EXECUTE,
     PHASE_PARSE,
     PHASE_PLAN,
     QueryEngine,
     QueryResult,
+    RowBinding,
+    _Row,
+    _node_scan,
 )
 from tests.query.stack import QueryStack, build_query_stack, vector
 
@@ -54,6 +58,69 @@ def run(stack: QueryStack, text: str, parameters: dict[str, object] | None = Non
 def names(result: QueryResult) -> list[object]:
     """Return the first column of every row."""
     return [row[0] for row in result.rows]
+
+
+def test_a_binding_uses_the_tables_precomputed_column_position() -> None:
+    class IndexedTable:
+        name = "Person"
+        column_positions = {"name": 1}
+
+        @property
+        def columns(self) -> object:
+            raise AssertionError("RowBinding.value scanned the table columns")
+
+    binding = RowBinding(
+        variable="p",
+        table=IndexedTable(),  # type: ignore[arg-type]
+        ref=object(),
+        version=SimpleNamespace(record_id=1, values=(1, "Ada")),  # type: ignore[arg-type]
+    )
+
+    assert binding.value("name") == "Ada"
+
+
+def test_a_scan_rooted_at_single_row_does_not_copy_its_empty_bindings() -> None:
+    table = build_query_stack().table("Person")
+    version = SimpleNamespace(record_id=1, values=(1, "Ada", 36, "London"))
+
+    class MustNotCopy(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise AssertionError(f"copied binding {key!r}")
+
+        def __iter__(self) -> Iterator[str]:
+            raise AssertionError("copied the SingleRow bindings")
+
+        def __len__(self) -> int:
+            raise AssertionError("measured the SingleRow bindings")
+
+    class Heap:
+        def scan(self, table: TableDef, snapshot: object) -> Iterator[tuple[object, object]]:
+            yield object(), version
+
+    class Engine:
+        heap = Heap()
+
+        def _rows(self, child: SingleRow, context: object) -> Iterator[_Row]:
+            yield _Row(bindings=MustNotCopy())  # type: ignore[arg-type]
+
+    class Context:
+        snapshot = object()
+        txn = SimpleNamespace(row_intents=())
+        staged_rows: tuple[()] = ()
+
+        def count(self, name: str, amount: int = 1) -> None:
+            return None
+
+    rows = tuple(
+        _node_scan(
+            Engine(),  # type: ignore[arg-type]
+            NodeScan(child=SingleRow(), variable="p", table=table),
+            Context(),  # type: ignore[arg-type]
+        )
+    )
+
+    assert len(rows) == 1
+    assert set(rows[0].bindings) == {"p"}
 
 
 # --- reading ----------------------------------------------------------------------------------

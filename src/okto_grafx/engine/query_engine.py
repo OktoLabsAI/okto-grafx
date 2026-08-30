@@ -263,11 +263,11 @@ class RowBinding:
         not declare is null here rather than a refusal -- refusing would make a query answer
         for one table and fail for the next one in the same scan.
         """
-        for position, column in enumerate(self.table.columns):
-            if column.name == key:
-                if position >= len(self.version.values):
-                    return None
-                return self.version.values[position]
+        position = self.table.column_positions.get(key)
+        if position is not None:
+            if position >= len(self.version.values):
+                return None
+            return self.version.values[position]
         if self.polymorphic:
             return None
         raise GrafxPlanError(
@@ -1747,6 +1747,7 @@ def _all_nodes_scan(
         (table, *_transaction_row_view(context, table, include_held=False))
         for table in node.tables
     ]
+    single_source = isinstance(node.child, SingleRow)
     for row in engine._rows(node.child, context):
         for table, changed, inserted in views:
             for ref, version in engine.heap.scan(table, snapshot):
@@ -1755,7 +1756,7 @@ def _all_nodes_scan(
                     if latest is None:
                         continue
                     version = replace(version, values=latest)
-                bindings = dict(row.bindings)
+                bindings = {} if single_source else dict(row.bindings)
                 bindings[node.variable] = RowBinding(
                     variable=node.variable,
                     table=table,
@@ -1766,7 +1767,7 @@ def _all_nodes_scan(
                 context.count("rows_scanned")
                 yield _Row(bindings=bindings)
             for reference, values in inserted:
-                bindings = dict(row.bindings)
+                bindings = {} if single_source else dict(row.bindings)
                 bindings[node.variable] = _pending_binding(
                     node.variable, table, values, reference=reference, polymorphic=True
                 )
@@ -1787,6 +1788,7 @@ def _node_scan(
     """
     snapshot = context.snapshot
     changed, inserted = _transaction_row_view(context, node.table, include_held=False)
+    single_source = isinstance(node.child, SingleRow)
     for row in engine._rows(node.child, context):
         for ref, version in engine.heap.scan(node.table, snapshot):
             if ref in changed:
@@ -1794,14 +1796,14 @@ def _node_scan(
                 if latest is None:
                     continue
                 version = replace(version, values=latest)
-            bindings = dict(row.bindings)
+            bindings = {} if single_source else dict(row.bindings)
             bindings[node.variable] = RowBinding(
                 variable=node.variable, table=node.table, ref=ref, version=version
             )
             context.count("rows_scanned")
             yield _Row(bindings=bindings)
         for reference, values in inserted:
-            bindings = dict(row.bindings)
+            bindings = {} if single_source else dict(row.bindings)
             bindings[node.variable] = _pending_binding(
                 node.variable, node.table, values, reference=reference
             )
@@ -1824,6 +1826,7 @@ def _index_seek(
     arity = len(node.table.columns)
     positions = tuple(node.table.column_index(name) for name in node.key_columns)
     ended = _ended_by_this_transaction(context)
+    single_source = isinstance(node.child, SingleRow)
     for row in engine._rows(node.child, context):
         template: list[Value] = [None] * arity
         for position, expression in zip(positions, node.key_values):
@@ -1833,7 +1836,7 @@ def _index_seek(
             if ref in ended:
                 continue  # ended by this transaction: the same rule the scan applies
             version = engine.heap.read(ref)
-            bindings = dict(row.bindings)
+            bindings = {} if single_source else dict(row.bindings)
             bindings[node.variable] = RowBinding(
                 variable=node.variable, table=node.table, ref=ref, version=version
             )

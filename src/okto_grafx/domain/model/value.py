@@ -124,6 +124,10 @@ class ValueType(IntEnum):
     UUID = 11
 
 
+_KIND_OF_TAG: tuple[ValueType, ...] = tuple(ValueType)
+"""Closed, positional decoder table for the durable one-byte type tags."""
+
+
 VECTOR_VALUE_TYPES: tuple[ValueType, ...] = (ValueType.VECTOR_F32, ValueType.VECTOR_F64)
 """The value types whose body is an embedding."""
 
@@ -476,15 +480,15 @@ def decode_value(buf: bytes, offset: int = 0, *, depth: int = 0) -> tuple[Value,
     _require(buf, offset, 1, "tag")
     tag = buf[offset]
     offset += 1
-    try:
-        kind = ValueType(tag)
-    except ValueError as failure:
+    if tag >= len(_KIND_OF_TAG) or int(_KIND_OF_TAG[tag]) != tag:
+        failure = ValueError(f"{tag} is not a valid ValueType")
         raise GrafxCorruptionDetected(
             f"A stored value carries the unknown type tag {tag}.",
             field="tag",
             value=tag,
             offset=offset - 1,
         ) from failure
+    kind = _KIND_OF_TAG[tag]
     if kind is ValueType.NULL:
         return None, offset
     if kind is ValueType.BOOL:

@@ -15,6 +15,8 @@ import math
 
 import pytest
 
+import okto_grafx.domain.model.value as value_module
+
 from okto_grafx.domain.errors import (
     GrafxCorruptionDetected,
     GrafxError,
@@ -68,6 +70,23 @@ ROUND_TRIP_CASES: tuple[tuple[str, object], ...] = (
     ("timestamp negative", Timestamp(-1)),
     ("uuid", Uuid(bytes(range(16)))),
 )
+
+
+def test_decode_uses_the_closed_tag_table_without_constructing_an_enum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = encode_value(42)
+
+    class NoEnumConstruction:
+        def __getattr__(self, name: str) -> object:
+            return getattr(ValueType, name)
+
+        def __call__(self, tag: int) -> ValueType:
+            raise AssertionError(f"ValueType({tag}) entered the decode hot path")
+
+    monkeypatch.setattr(value_module, "ValueType", NoEnumConstruction())
+
+    assert decode_value(raw) == (42, len(raw))
 """One case per shape the encoder must survive, edges included."""
 
 

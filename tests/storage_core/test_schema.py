@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import pytest
 
+import okto_grafx.domain.model.schema as schema_module
+
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxCorruptionDetected
 from okto_grafx.domain.model.errors import SchemaMismatchError
 from okto_grafx.domain.model.schema import (
@@ -112,6 +114,31 @@ def test_a_node_table_is_accepted_and_answers_about_its_columns() -> None:
         table.column("missing")
     with pytest.raises(GrafxConfigurationError):
         table.column_index("missing")
+
+
+def test_a_table_precomputes_immutable_column_positions_without_changing_value_semantics() -> None:
+    table = person_table()
+    same = person_table()
+
+    assert table.column_positions == {"id": 0, "name": 1, "score": 2}
+    assert table == same
+    assert hash(table) == hash(same)
+    with pytest.raises(TypeError):
+        table.column_positions["id"] = 2  # type: ignore[index]
+
+
+def test_decode_tuple_compares_the_stored_tag_without_reclassifying_valid_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = person_table()
+    payload = encode_tuple(table, (7, "Ada", 3.5))
+
+    def refuse_reclassification(value: object) -> ValueType:
+        raise AssertionError(f"reclassified {value!r}")
+
+    monkeypatch.setattr(schema_module, "value_type_of", refuse_reclassification)
+
+    assert decode_tuple(table, payload) == (7, "Ada", 3.5)
 
 
 def test_a_relationship_table_needs_both_endpoints() -> None:

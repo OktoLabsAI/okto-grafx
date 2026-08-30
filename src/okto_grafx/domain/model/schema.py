@@ -13,9 +13,10 @@ reader detect that the bytes were written under a different schema before it dec
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import isfinite
+from types import MappingProxyType
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxCorruptionDetected
 from okto_grafx.domain.ids import RecordId
@@ -166,8 +167,15 @@ class ColumnDef:
         return self.type in VECTOR_VALUE_TYPES
 
 
+class _TableDefColumnCache:
+    """Reserve a non-domain slot for the derived column lookup table."""
+
+    __slots__ = ("_column_positions",)
+    _column_positions: Mapping[str, int]
+
+
 @dataclass(frozen=True, slots=True)
-class TableDef:
+class TableDef(_TableDefColumnCache):
     """A node table or a relationship table, with its columns in their stored order."""
 
     table_id: int
@@ -235,6 +243,13 @@ class TableDef:
                     value=column.name,
                 )
             seen.add(column.name)
+        object.__setattr__(
+            self,
+            "_column_positions",
+            MappingProxyType(
+                {column.name: position for position, column in enumerate(self.columns)}
+            ),
+        )
         reserved_positions = {
             position
             for position, column in enumerate(self.columns)
@@ -379,20 +394,25 @@ class TableDef:
 
     def column(self, name: str) -> ColumnDef:
         """Return the column with that name."""
-        for column in self.columns:
-            if column.name == name:
-                return column
+        position = self.column_positions.get(name)
+        if position is not None:
+            return self.columns[position]
         raise GrafxConfigurationError(
             f"Table {self.name!r} has no column named {name!r}.",
             field="column",
             value=name,
         )
 
+    @property
+    def column_positions(self) -> Mapping[str, int]:
+        """Return the immutable, precomputed position of each stored column."""
+        return self._column_positions
+
     def column_index(self, name: str) -> int:
         """Return the position of the column with that name in the stored tuple."""
-        for position, column in enumerate(self.columns):
-            if column.name == name:
-                return position
+        position = self.column_positions.get(name)
+        if position is not None:
+            return position
         raise GrafxConfigurationError(
             f"Table {self.name!r} has no column named {name!r}.",
             field="column",
@@ -624,14 +644,15 @@ def decode_tuple(table: TableDef, buf: bytes) -> tuple[Value, ...]:
     values: list[Value] = []
     offset = 0
     for position, column in enumerate(table.columns):
+        tag_offset = offset
         value, offset = decode_value(buf, offset)
         if value is None:
             if not column.nullable:
                 raise _reject(table, column, position, "a null is not allowed in this column.")
             values.append(value)
             continue
-        observed = value_type_of(value)
-        if observed is not column.type:
+        if buf[tag_offset] != int(column.type):
+            observed = value_type_of(value)
             raise _reject(
                 table,
                 column,
