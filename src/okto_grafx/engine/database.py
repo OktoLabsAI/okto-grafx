@@ -1050,6 +1050,7 @@ class Database:
         "_coordinator",
         "_pool",
         "_catalog",
+        "_catalog_view_memo",
         "_heap",
         "_wal",
         "_transactions",
@@ -1134,6 +1135,16 @@ class Database:
         self._coordinator: ProcessCoordinator = coordinator
         self._pool: BufferPool = pool
         self._catalog: CatalogStore = catalog
+        # The last public catalog view this handle built, bound to the full identity of the
+        # generation it was built from: the persisted image bytes, the identity of the live
+        # catalog object, and shallow copies of its table/space content (CQ-4/QW-6). Reused
+        # only while all of them still match, so an unsaved in-place mutation with unchanged
+        # bytes/identity misses; every adopt()/bootstrap installs a new object and image, so
+        # the memo misses there too. Never persisted, never shared between handles.
+        self._catalog_view_memo: (
+            tuple[bytes, int, dict[int, object], dict[int, object], CatalogStoreView]
+            | None
+        ) = None
         self._heap: HeapStore = heap
         self._wal: WalManager = wal
         self._transactions: TransactionManager = transactions
@@ -2892,6 +2903,7 @@ class Database:
             before = _builtin_int(store._view_epoch(), field="catalog.epoch")
             observed: object | None = None
             snapshot: CatalogStoreView | None = None
+            reused = False
             failure: BaseException | None = None
             try:
                 if (
@@ -2901,7 +2913,28 @@ class Database:
                     observed = store._catalog
                 else:
                     observed = store.read_from_pages()
-                snapshot = _catalog_view_from(store, observed)
+                # CQ-4/QW-6: reuse the immutable view while the generation is provably the one
+                # it was built from -- same persisted image bytes, the very same live object,
+                # and the very same table/space content (compared against shallow copies taken
+                # when the memo was filled, so a live catalog mutated in place with unchanged
+                # bytes/identity is never answered from memory). The content comparison reads
+                # the slots directly and dispatches through no public Catalog method, because
+                # this is the same boundary _catalog_view_from defends: a hostile subclass's
+                # readers are callback doors and must not run here. The epoch proof below still
+                # runs on every access; only the reconstruction is skipped.
+                memo = self._catalog_view_memo
+                if (
+                    memo is not None
+                    and observed is store._catalog
+                    and memo[1] == id(observed)
+                    and memo[0] == store._persisted_image
+                    and memo[2] == observed._tables_by_id
+                    and memo[3] == observed._spaces_by_id
+                ):
+                    snapshot = memo[4]
+                    reused = True
+                else:
+                    snapshot = _catalog_view_from(store, observed)
             except BaseException as caught:  # noqa: BLE001 - preserve the original taxonomy
                 failure = caught
             after = _builtin_int(store._view_epoch(), field="catalog.epoch")
@@ -2924,6 +2957,20 @@ class Database:
                     # Pure in-memory publication after the epoch proof.  It prevents every later
                     # view/query from paying for the same refresh and runs no adapter callback.
                     store.adopt(observed)
+                if not reused and store._catalog is observed:
+                    # Memoize only after the epoch proof, and only a view of the ADOPTED
+                    # generation: an observation the store never adopted (a torn read the proof
+                    # rejected never reaches here; a foreign image the store does not hold yet
+                    # must not pre-bless later reads) stays unmemoized. The shallow dict copies
+                    # freeze the content the view was built from; any in-place mutation of the
+                    # live catalog afterwards makes the comparison above miss.
+                    self._catalog_view_memo = (
+                        store._persisted_image,
+                        id(observed),
+                        dict(observed._tables_by_id),
+                        dict(observed._spaces_by_id),
+                        snapshot,
+                    )
                 return snapshot, current
 
     def _require_writable(self, operation: str) -> None:
