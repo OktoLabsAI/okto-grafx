@@ -31,10 +31,19 @@ def test_the_spike_runs_only_in_its_given_root_and_verifies_both_readbacks(
 ) -> None:
     root = tmp_path / "isolated"
 
-    report = measure(root, warmups=1, samples=2, payload_size=16, slot_size=64)
+    report = measure(
+        root,
+        warmups=1,
+        samples=2,
+        payload_size=16,
+        slot_size=64,
+        order="two-slot-first",
+    )
 
     assert report["schema"] == "okto-grafx.ce1-publication-spike.v1"
     assert report["parameters"]["samples"] == 2
+    assert report["parameters"]["order"] == "two-slot-first"
+    assert len(report["environment"]["tool_sha256"]) == 64
     assert report["atomic_replace"]["total"]["summary"]["count"] == 2
     assert report["two_slot"]["total"]["summary"]["count"] == 2
     assert (root / "atomic-replace" / "control" / "state").is_file()
