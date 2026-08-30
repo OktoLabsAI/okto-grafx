@@ -270,7 +270,17 @@ def test_an_exact_lookup_is_observational_and_writes_no_page() -> None:
     assert tuple(database.device.write_calls) == writes_before
 
 
-def test_steady_exact_lookup_collects_exactly_two_fresh_page_zero_observations() -> None:
+def _page_zero_reads(database: object, index: IndexStore) -> int:
+    return sum(call == (index.file, 0) for call in database.device.read_calls)
+
+
+def test_exact_lookups_prove_the_view_with_one_fresh_page_zero_read_once_carried() -> None:
+    # Deliberate rewrite (CQ-3/QW-2) of the "exactly two fresh page-0 observations" pin. A
+    # lookup that starts from a carried certificate proves its view with ONE fresh read: the
+    # post-read, which is what certifies the traversal and never goes away. A handle without a
+    # carry -- its first durable read, or any read after a refusal -- still pays the fresh
+    # pre-read too. Registration of a cold participant already runs one durable read (the
+    # companion heap binding), so even the first lookup after a cold open is carried.
     database = build_database()
     _insert_exact(database, 1, "Ada", BORN, 1)
     reader = cold_view(database)
@@ -278,15 +288,104 @@ def test_steady_exact_lookup_collects_exactly_two_fresh_page_zero_observations()
     database.device.read_calls.clear()
 
     reader.manager.lookup(reader.exact.name, key, SnapshotDouble(BORN))
-    first_use = sum(
-        call == (reader.exact.file, 0) for call in database.device.read_calls
-    )
+    after_registration = _page_zero_reads(database, reader.exact)
     database.device.read_calls.clear()
     reader.manager.lookup(reader.exact.name, key, SnapshotDouble(BORN))
-    steady = sum(call == (reader.exact.file, 0) for call in database.device.read_calls)
+    steady = _page_zero_reads(database, reader.exact)
+    reader.exact._carried_certificate = None  # noqa: SLF001 - the uncarried regime
+    database.device.read_calls.clear()
+    reader.manager.lookup(reader.exact.name, key, SnapshotDouble(BORN))
+    uncarried = _page_zero_reads(database, reader.exact)
 
-    assert first_use == 2
-    assert steady == 2
+    assert (after_registration, steady, uncarried) == (1, 1, 2)
+
+
+def test_a_carried_certificate_that_cannot_cover_the_snapshot_falls_back_to_a_fresh_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The carry is a convenience, never an authority: a snapshot the carried header cannot
+    # cover is NOT a refusal. The handle drops the carry INSIDE the same begin and takes
+    # today's fresh path, which sees the foreign advance and answers -- without spending one
+    # of the bounded retries on a refusal the device never issued.
+    database = build_database()
+    first = _insert_exact(database, 1, "Ada", BORN, 1)
+    reader = cold_view(database)
+    assert reader.manager.lookup(
+        reader.exact.name, database.key(1, "Ada"), SnapshotDouble(BORN)
+    ) == (first,)
+
+    second = _insert_exact(database, 2, "Bob", LATER, 2)
+    database.pool.flush(database.heap.file)
+    original = HashIndex.begin_exact_read
+    begins = 0
+
+    def counting(self: HashIndex, required_lsn: int):
+        nonlocal begins
+        if self is reader.exact:
+            begins += 1
+        return original(self, required_lsn)
+
+    monkeypatch.setattr(HashIndex, "begin_exact_read", counting)
+    database.device.read_calls.clear()
+
+    assert reader.manager.lookup(
+        reader.exact.name, database.key(2, "Bob"), SnapshotDouble(LATER)
+    ) == (second,)
+    # One begin: the refused carry fell back within it. Today's rebase path, untouched: fresh
+    # pre-read, discard, fresh pre-read again, fresh post-read.
+    assert begins == 1
+    assert _page_zero_reads(database, reader.exact) == 3
+
+
+def test_a_foreign_stale_mark_between_lookups_is_caught_by_the_post_read_and_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # F4: another participant durably marks the index stale BETWEEN two lookups. The second
+    # lookup may start from the carried certificate, so the mark is observed by the fresh
+    # post-read (the carried view lost), and the retry's fresh pre-read refuses. Fail-closed
+    # behaviour is unchanged: the lookup refuses with index_view_unavailable, never answers.
+    database = build_database()
+    _insert_exact(database, 1, "Ada", BORN, 1)
+    reader = cold_view(database)
+    key = database.key(1, "Ada")
+    assert reader.manager.lookup(reader.exact.name, key, SnapshotDouble(BORN))
+    original = HashIndex.finish_exact_read
+    outcomes: list[bool] = []
+
+    def recording(self: HashIndex, before: object, required_lsn: int) -> bool:
+        stable = original(self, before, required_lsn)
+        if self is reader.exact:
+            outcomes.append(stable)
+        return stable
+
+    monkeypatch.setattr(HashIndex, "finish_exact_read", recording)
+    database.exact.mark_stale("foreign mark between two lookups")
+
+    with pytest.raises(GrafxIndexError) as refused:
+        reader.manager.lookup(reader.exact.name, key, SnapshotDouble(BORN))
+
+    assert refused.value.details["field"] == "index_view_unavailable"
+    # The carried pre-certificate let the traversal run; the post-read caught the foreign mark.
+    assert outcomes == [False]
+
+
+def test_a_local_page_zero_publication_drops_the_carried_certificate() -> None:
+    # Hygiene: every local page-0 write forgets the carry, including the writers that do not
+    # reassign the cached certificate (the reconciliation watermark is one of them). The next
+    # lookup must re-prove from the device through today's rebase path -- three fresh page-0
+    # reads and no retry. A carry that survived the write would be reused, lose at the
+    # post-read and spend a retry: four reads.
+    database = build_database()
+    _insert_exact(database, 1, "Ada", BORN, 1)
+    reader = cold_view(database)
+    key = database.key(1, "Ada")
+    assert reader.manager.lookup(reader.exact.name, key, SnapshotDouble(BORN))
+
+    reader.exact.note_reconciled(BORN)
+    database.device.read_calls.clear()
+
+    assert reader.manager.lookup(reader.exact.name, key, SnapshotDouble(BORN))
+    assert _page_zero_reads(database, reader.exact) == 3
 
 
 def test_repeated_certificate_changes_fail_closed_after_the_bounded_budget(
