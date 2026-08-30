@@ -655,6 +655,9 @@ class LocalStorageDevice:
         self._root = _validate_root(root)
         self._lock = threading.RLock()
         self._handles: dict[str, int] = {}
+        # The proved physical path each cached descriptor was opened through, so that a warm
+        # hit checks the entry's identity without proving the whole chain again (A63 warm test).
+        self._paths: dict[str, str] = {}
         self._dirty: set[str] = set()
         # File bytes and namespace entries have different durability authorities on POSIX.
         # ``_dirty`` records descriptors whose bytes still need fsync; this set records the
@@ -750,7 +753,7 @@ class LocalStorageDevice:
             self._acknowledge_namespace(path)
             self._forget_deferred(name)
             descriptor = self._retry("create", name, lambda: _open_descriptor(path, create_new=True))
-            self._admit(name, descriptor)
+            self._admit(name, descriptor, path)
             self._acknowledge(name)
             # Draining afterwards keeps this door an independent trigger for the deletion queue
             # without letting a pass destroy the very file the caller just asked about.
@@ -781,7 +784,13 @@ class LocalStorageDevice:
             )
         with self._lock:
             self._require_open()
-            return tuple(sorted(name for name in self._walk() if name.startswith(prefix)))
+            # Only the directory the prefix names is walked: ``"wal/"`` walks ``wal`` and
+            # ``"control/writer.lease."`` walks ``control``; a prefix without a slash walks
+            # the root as before. Names outside that directory cannot start with the prefix.
+            below = prefix.rpartition("/")[0]
+            return tuple(
+                sorted(name for name in self._walk(below=below) if name.startswith(prefix))
+            )
 
     def file_size(self, file: str) -> int:
         """Return the size of the named file in bytes."""
@@ -1115,6 +1124,7 @@ class LocalStorageDevice:
                 with contextlib.suppress(OSError):
                     os.close(descriptor)
             self._handles.clear()
+            self._paths.clear()
             self._closed = True
 
     def close_read_only(self) -> None:
@@ -1124,6 +1134,7 @@ class LocalStorageDevice:
                 with contextlib.suppress(OSError):
                     os.close(descriptor)
             self._handles.clear()
+            self._paths.clear()
             self._closed = True
 
     def __enter__(self) -> LocalStorageDevice:
@@ -1389,10 +1400,40 @@ class LocalStorageDevice:
             current = os.path.join(current, segment)
         return os.path.isfile(current)
 
-    def _walk(self, *, include_pending: bool = False) -> Iterable[str]:
-        """Yield regular files without ever following or ignoring a redirected component."""
+    def _walk(self, *, include_pending: bool = False, below: str = "") -> Iterable[str]:
+        """Yield regular files without ever following or ignoring a redirected component.
+
+        ``below`` names one stored directory (``"wal"``, ``"quarantine/a"``) and confines the
+        walk to it. The way down is proved as every logical name is proved -- root identity,
+        then each segment inspected without following it, refused when redirected or foreign,
+        and contained -- and a directory that is not there yields nothing.
+
+        Containment is inherited, not re-derived per entry. The root is proved by real path,
+        every directory is proved before it is entered, and an entry that ``lstat`` shows to be
+        a plain file or directory rather than a symlink, junction or reparse point cannot
+        resolve anywhere but under the directory that lists it. Resolving the real path of
+        every entry again was the dominant cost of every WAL discovery on a 346-file board
+        (fase 0a: 4.059 ``realpath`` calls per commit, ~2,1 s of a 2,6 s commit).
+        """
         self._require_root_identity(self._root)
-        pending: list[tuple[str, str]] = [(self._root, "")]
+        directory, prefix = self._root, ""
+        for segment in below.split("/") if below else ():
+            if not segment:
+                return  # no stored name has an empty segment, so nothing can match
+            name = prefix + segment
+            candidate = os.path.join(directory, segment)
+            try:
+                information = os.lstat(candidate)
+            except (FileNotFoundError, NotADirectoryError):
+                return  # nothing is stored below a directory that is not there
+            except OSError as failure:
+                raise self._device_failure("inspect_path", name, failure) from failure
+            self._refuse_foreign_component(name, candidate, information)
+            if not stat.S_ISDIR(information.st_mode):
+                return  # a stored file has nothing below it
+            self._require_contained(name, candidate)
+            directory, prefix = candidate, name + "/"
+        pending: list[tuple[str, str]] = [(directory, prefix)]
         while pending:
             directory, prefix = pending.pop()
             try:
@@ -1406,30 +1447,33 @@ class LocalStorageDevice:
                     information = entry.stat(follow_symlinks=False)
                 except OSError as failure:
                     raise self._device_failure("inspect_path", name, failure) from failure
-                if _is_redirected_path(entry.path, information):
-                    raise refuse_operation(
-                        "redirected_path",
-                        f"Stored namespace component {name!r} is a symlink, junction or "
-                        "reparse point and will not be followed or ignored.",
-                        file=name,
-                        component=name,
-                    )
-                self._require_contained(name, entry.path)
+                self._refuse_foreign_component(name, entry.path, information)
                 if stat.S_ISDIR(information.st_mode):
                     pending.append((entry.path, name + "/"))
-                elif stat.S_ISREG(information.st_mode) and (
-                    include_pending or not _is_pending_delete(entry.name)
-                ):
+                elif include_pending or not _is_pending_delete(entry.name):
                     yield name
-                elif not stat.S_ISREG(information.st_mode):
-                    raise refuse_operation(
-                        "unsupported_entry_type",
-                        f"Stored namespace component {name!r} is neither a regular file nor "
-                        "a directory and will not be opened or ignored.",
-                        file=name,
-                        component=name,
-                        mode=stat.S_IFMT(information.st_mode),
-                    )
+
+    def _refuse_foreign_component(
+        self, name: str, path: str, information: os.stat_result
+    ) -> None:
+        """Refuse a stored component that is redirected, or neither a file nor a directory."""
+        if _is_redirected_path(path, information):
+            raise refuse_operation(
+                "redirected_path",
+                f"Stored namespace component {name!r} is a symlink, junction or "
+                "reparse point and will not be followed or ignored.",
+                file=name,
+                component=name,
+            )
+        if not (stat.S_ISDIR(information.st_mode) or stat.S_ISREG(information.st_mode)):
+            raise refuse_operation(
+                "unsupported_entry_type",
+                f"Stored namespace component {name!r} is neither a regular file nor "
+                "a directory and will not be opened or ignored.",
+                file=name,
+                component=name,
+                mode=stat.S_IFMT(information.st_mode),
+            )
 
     def _descriptor(self, name: str, intent: str) -> int:
         """Return the cached descriptor of a file, opening and admitting it when it is not cached.
@@ -1465,7 +1509,7 @@ class LocalStorageDevice:
             raise refuse_missing_file(name, "open")
         path = self._physical_path(name)
         descriptor = self._retry("open", name, lambda: _open_descriptor(path, create_new=False))
-        self._admit(name, descriptor)
+        self._admit(name, descriptor, path)
         # A29: the name joins the unflushed set only now, once it is known to be valid and open.
         # A refused write that recorded a name would make every later global barrier fail, and
         # under FR-5 that means no commit on this device could ever succeed again.
@@ -1504,9 +1548,17 @@ class LocalStorageDevice:
                 return
             directory = parent
 
-    def _admit(self, name: str, descriptor: int) -> None:
-        """Cache one descriptor, evicting the least recently used one when the cache is full."""
+    def _admit(self, name: str, descriptor: int, path: str | None = None) -> None:
+        """Cache one descriptor, evicting the least recently used one when the cache is full.
+
+        ``path`` is the proved physical path the descriptor was opened through; a caller that
+        cannot vouch for one leaves it out, and the next warm hit proves the name again.
+        """
         self._handles[name] = descriptor
+        if path is None:
+            self._paths.pop(name, None)
+        else:
+            self._paths[name] = path
         while len(self._handles) > self._max_open_files:
             oldest = next(iter(self._handles))
             self._release(oldest)
@@ -1519,9 +1571,20 @@ class LocalStorageDevice:
         process shows a different identity even though the name is unchanged. A path that cannot
         be examined at all (gone, unreadable) is not the held file either, and the caller then
         re-resolves the name and refuses it honestly.
+
+        The path is the one the descriptor was opened through, proved when it was admitted.
+        Proving the whole chain again on every warm hit -- the root by real path, each segment
+        by ``lstat`` and real path -- cost ~2 ms per page read and 6,2 s of one 17-statement
+        operation on the acceptance board (fase 0a). A component redirected since admission
+        cannot make this ``stat`` agree with the held descriptor unless it leads to the very
+        same file, and any disagreement sends the caller through the full resolution, which
+        refuses the redirect.
         """
+        path = self._paths.get(name)
+        if path is None:
+            path = self._physical_path(name)  # admitted without a proved path: prove it now
         try:
-            current = os.stat(self._physical_path(name))
+            current = os.stat(path)
             held = os.fstat(descriptor)
         except OSError:
             return False
@@ -1535,6 +1598,7 @@ class LocalStorageDevice:
         still owes the file is remembered in the unflushed set, not in the descriptor cache.
         """
         descriptor = self._handles.pop(name, None)
+        self._paths.pop(name, None)
         if descriptor is not None:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
