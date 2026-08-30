@@ -93,7 +93,7 @@
   integrada WAL/commit/multiprocesso/API em 100%, além de Ruff e diff-check verdes. A premissa
   multi-writer/multi-reader permanece intacta: o reuso existe somente sob `COMMIT_SECTION`, não
   atravessa seções e não muda lease, época, publicação ou horizonte de leitores.
-- **CQ-4/QW-6 implementado e validado; promoção ao `main` aguarda somente o perfil RAW oficial.**
+- **CQ-4/QW-6 medido e aprovado para promoção.**
   O memo por handle reutiliza a `CatalogStoreView` imutável apenas quando a imagem persistida, a
   identidade do objeto vivo e cópias rasas do conteúdo de tabelas/espaços continuam iguais. A
   prova otimista de época sob a seção participante ainda ocorre em todo acesso; o memo só remove
@@ -108,8 +108,14 @@
   composta CQ-1+CQ-4, além de Ruff/diff-check. Duas micro-medições de 400 acessos com 17 tabelas
   mostraram `5,2x` na entrega (`232,1 us` contra `1.213,0 us`) e `3,1x` na reprodução
   (`208,8 us` contra `641,6 us`); page writes ficaram em zero e a reconstrução caiu para uma por
-  geração. Esses números são microbenchmarks, não o gate M7: antes do push em `main`, o candidato
-  composto ainda será comparado por H1-H8.1/pf5 contra o CQ-1 já publicado. Multi-writer/
+  geração. O gate H1-H8.1/pf5 composto concluiu 110 commits preparatórios e 180 operações
+  medidas, 12/12 famílias e exit `0`; contra o CQ-1 já publicado, a soma RAW caiu de
+  `7.376,78` para `7.016,97 ms` (`-359,80 ms`, `-4,88%`) com host em `9,6%/7,7%` antes/depois.
+  Digest lógico e harness permaneceram idênticos; page writes totais/de índice ficaram em
+  `72/43 -> 72/43`. No passe instrumentado, o custo inclusivo de `_catalog_snapshot` caiu
+  `224,0 ms` nas aberturas e `44,93 ms` nas operações, mantendo a mesma quantidade de provas de
+  época. Artefato `cq4-959e911-pf5-h1h8_1.json`, SHA-256
+  `c9b4add6296bf8ca140c80ab7f77b657785799d9b64fb50a1d00cef2ea028200`. Multi-writer/
   multi-reader permanece intacto: nenhuma lease, cerca, época, publicação ou regra D7 mudou.
 - **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
