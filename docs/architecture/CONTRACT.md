@@ -1141,7 +1141,8 @@ refusal leaves the transaction exactly as it entered the statement.
 M1: `oktografx_lease_wait_seconds`{outcome=granted|timeout|takeover} ·
 `oktografx_write_conflicts_total` · `oktografx_commit_retries_total` ·
 `oktografx_active_transactions`{mode=read|write} · `oktografx_fsync_duration_seconds`{target=wal|data} ·
-`oktografx_barrier_failures_total` · `oktografx_wal_size_bytes` · `oktografx_wal_segments` ·
+`oktografx_barrier_failures_total` · `oktografx_read_view_drops_total`{view_origin=own|foreign} ·
+`oktografx_wal_size_bytes` · `oktografx_wal_segments` ·
 `oktografx_wal_truncation_lag_segments`{reader_present=true|false} ·
 `oktografx_checksum_verifications_total`{kind=page|record} ·
 `oktografx_checksum_failures_total`{kind=page|record} · `oktografx_recovery_replays_total` ·
@@ -1601,7 +1602,7 @@ runtime result shape.
 * **A50** `LabelSpec` / `MetricDescriptor` validate MORE than §4.4 states: duplicate label names,
   non-snake_case unit, a description under two words or not en-US, non-monotonic or non-finite
   buckets, empty `allowed_values`, `allowed_values` larger than `max_cardinality`, and a
-  non-`frozenset` `allowed_values` are all refused. The full §9 catalog satisfies every one (35/35),
+  non-`frozenset` `allowed_values` are all refused. The full §9 catalog satisfies every one (36/36),
   so nothing real is rejected -- but a contract-legal descriptor could be. Declared rather than
   relaxed: a stricter declaration surface is the right default for a frozen catalog.
 * **A51** G7's enforcement column named `MetricRegistry.register()`, a symbol that exists in no

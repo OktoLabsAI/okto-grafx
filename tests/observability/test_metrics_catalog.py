@@ -52,6 +52,7 @@ EXPECTED_METRIC_NAMES: frozenset[str] = frozenset(
         # SPEC-M1 OR-2
         "oktografx_fsync_duration_seconds",
         "oktografx_barrier_failures_total",
+        "oktografx_read_view_drops_total",
         "oktografx_wal_size_bytes",
         "oktografx_wal_segments",
         "oktografx_wal_truncation_lag_segments",
@@ -113,6 +114,10 @@ EXPECTED_METRICS: dict[str, tuple[str, str]] = {
     'oktografx_barrier_failures_total': (
         'counter',
         'Durability barriers that failed.',
+    ),
+    'oktografx_read_view_drops_total': (
+        'counter',
+        'Read views begun over a moved commit token, by publication origin.',
     ),
     'oktografx_wal_size_bytes': (
         'gauge',
@@ -247,6 +252,7 @@ EXPECTED_LABELS: dict[str, tuple[str, ...]] = {
     "oktografx_wal_truncation_lag_segments": ("reader_present",),
     "oktografx_checksum_verifications_total": ("kind",),
     "oktografx_checksum_failures_total": ("kind",),
+    "oktografx_read_view_drops_total": ("view_origin",),
     "oktografx_recovery_discarded_records_total": ("origin_class",),
     "oktografx_ledger_depth": ("origin_class",),
     "oktografx_ledger_oldest_entry_age_seconds": ("origin_class",),
@@ -306,7 +312,7 @@ def test_the_catalog_holds_exactly_the_metrics_the_contract_freezes() -> None:
         "missing": sorted(EXPECTED_METRIC_NAMES - names),
         "unexpected": sorted(names - EXPECTED_METRIC_NAMES),
     }
-    assert len(METRIC_CATALOG) == len(EXPECTED_METRIC_NAMES) == 35
+    assert len(METRIC_CATALOG) == len(EXPECTED_METRIC_NAMES) == 36
 
 
 def test_the_catalog_matches_section_nine_of_the_contract_itself() -> None:
