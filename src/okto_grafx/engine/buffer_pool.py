@@ -55,6 +55,7 @@ __all__ = [
     "CHECKSUM_FAILURES_TOTAL",
     "FSYNC_DURATION_SECONDS",
     "BARRIER_FAILURES_TOTAL",
+    "READ_VIEW_DROPS_TOTAL",
     "BufferPool",
     "next_seq",
     "write_chain",
@@ -89,6 +90,7 @@ CHECKSUM_VERIFICATIONS_TOTAL: str = "oktografx_checksum_verifications_total"
 CHECKSUM_FAILURES_TOTAL: str = "oktografx_checksum_failures_total"
 FSYNC_DURATION_SECONDS: str = "oktografx_fsync_duration_seconds"
 BARRIER_FAILURES_TOTAL: str = "oktografx_barrier_failures_total"
+READ_VIEW_DROPS_TOTAL: str = "oktografx_read_view_drops_total"
 
 BUFFER_POOL_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
@@ -99,6 +101,7 @@ BUFFER_POOL_METRICS: tuple[MetricDescriptor, ...] = tuple(
         CHECKSUM_FAILURES_TOTAL,
         FSYNC_DURATION_SECONDS,
         BARRIER_FAILURES_TOTAL,
+        READ_VIEW_DROPS_TOTAL,
     )
 )
 """The descriptors the pool registers and emits, taken from the frozen catalog rather than
@@ -781,7 +784,13 @@ class BufferPool:
             raise
 
     @_guarded
-    def begin_read_view(self, token: object = None) -> bool:
+    def begin_read_view(
+        self,
+        token: object = None,
+        *,
+        own: bool = False,
+        unfenced_file: str | None = None,
+    ) -> bool:
         """Start a fresh read view over this database, and say whether anything was dropped.
 
         THE PROBLEM THIS EXISTS FOR. Every epoch this pool keeps is a PROCESS-LOCAL counter: it
@@ -806,11 +815,44 @@ class BufferPool:
 
         Dirty frames are written back before they are dropped, exactly as invalidate does: this
         forgets what was read, never what was written.
+
+        ``own`` is the caller SAYING the token moved only because this participant itself
+        published a commit (CQ-2/QW-4): the resident frames are the very committed state this
+        pool produced, so dropping them re-reads every page for no new information. The claim
+        is honoured only while it is provable from here -- a previous view existed and no frame
+        outside ``unfenced_file`` is dirty; anything else takes the full drop exactly as a
+        foreign token does. ``unfenced_file`` names the one file whose device state can move
+        without moving the token (the catalog has no page-0 sequence fence), so its frames are
+        dropped and its epoch bumped even in an own view; a foreign mutation that moves no LSN
+        anywhere else remains the business of the page-0 certificates, as it is today.
         """
         if token is not None and token == self._read_view_token:
             return False
+        previous = self._read_view_token
         self._read_view_token = token
+        if (
+            own
+            and previous is not None
+            and not any(
+                frame.page.dirty
+                for key, frame in self._frames.items()
+                if key[0] != unfenced_file
+            )
+        ):
+            if self._metrics.enabled:
+                self._metrics.increment(
+                    READ_VIEW_DROPS_TOTAL, 1.0, {"view_origin": "own"}
+                )
+            if unfenced_file is None:
+                return False
+            had_frames = any(key[0] == unfenced_file for key in self._frames)
+            self._invalidate(unfenced_file, doom_pinned=True)
+            return had_frames
         self._invalidate(None, doom_pinned=True)
+        if self._metrics.enabled:
+            self._metrics.increment(
+                READ_VIEW_DROPS_TOTAL, 1.0, {"view_origin": "foreign"}
+            )
         return True
 
     @_guarded

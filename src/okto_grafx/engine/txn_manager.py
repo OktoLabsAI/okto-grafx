@@ -245,6 +245,7 @@ class TransactionManager:
         "_open",
         "_pins",
         "_published_high_water",
+        "_own_published_lsn",
         "_recovery_required",
         "_page_staging_capability",
         "_mode_counts",
@@ -379,6 +380,13 @@ class TransactionManager:
         self._open: dict[TxnId, TransactionContext] = {}
         self._pins: dict[TxnId, _ReaderPin] = {}
         self._published_high_water: Lsn = NO_LSN
+        # The last commit number THIS manager published through step 3.7 (CQ-2/QW-4). Only
+        # _publish_commit_state remembers it: a gap completion or a checkpoint publishes
+        # through _publish and must never be remembered here, because their LSN can carry a
+        # foreign commit and an "own" read view over it would keep frames that predate it.
+        # Compared by equality only -- recovery can republish a smaller number and a foreign
+        # checkpoint republishes the same one.
+        self._own_published_lsn: Lsn | None = None
         self._recovery_required: bool = False
         self._closed: bool = False
         self._close_quiesced: bool = False
@@ -747,7 +755,11 @@ class TransactionManager:
             # participant that had already read a table answers from frames cached before
             # somebody else committed: no error, no missing file, just fewer rows than exist.
             with self._close_wait_hazard():
-                self._pool.begin_read_view(read_lsn)
+                self._pool.begin_read_view(
+                    read_lsn,
+                    own=(read_lsn == self._own_published_lsn),
+                    unfenced_file=self._file_ids.catalog_file,
+                )
             self._require_not_closed("begin a transaction")
             transaction = TransactionContext(
                 txn_id=self._next_txn_id,
@@ -1585,7 +1597,11 @@ class TransactionManager:
                     # and a stale one makes a correct predicate decide against the wrong picture
                     # (defect E1, second half; LESSONS L22).
                     with self._close_wait_hazard():
-                        self._pool.begin_read_view(current)
+                        self._pool.begin_read_view(
+                            current,
+                            own=(current == self._own_published_lsn),
+                            unfenced_file=self._file_ids.catalog_file,
+                        )
                     # The rows go in BEFORE validation, because the pages they land on are
                     # part of what this commit will overwrite and therefore part of what it must
                     # declare. Nothing of them is durable yet, and a refusal below puts them
@@ -3142,6 +3158,11 @@ class TransactionManager:
             checkpoint_lsn=previous.checkpoint_lsn,
         )
         self._publish(state)
+        # Remembered only here, and only after the publish landed: this is the one door that
+        # publishes a commit THIS manager produced (both the live step 3.7 and its post-barrier
+        # redo republication call it). The gap completion and the checkpoint publish through
+        # _publish directly and stay foreign to the read-view exemption.
+        self._own_published_lsn = committed
 
     def _publish(self, state: CommitState) -> None:
         """Write the state to a temporary of this participant and replace the published file."""
