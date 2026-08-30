@@ -164,6 +164,9 @@ _VECTOR_PHASE = LabelSpec(
 _QUERY_PHASE = LabelSpec(
     name="phase", allowed_values=frozenset({"parse", "plan", "execute"}), max_cardinality=3
 )
+_VIEW_ORIGIN = LabelSpec(
+    name="view_origin", allowed_values=frozenset({"own", "foreign"}), max_cardinality=2
+)
 _ERROR_CODE = LabelSpec(
     name="code",
     allowed_values=frozenset(
@@ -251,6 +254,12 @@ METRIC_CATALOG: tuple[MetricDescriptor, ...] = (
         name="oktografx_barrier_failures_total",
         kind=MetricKind.COUNTER,
         description="Durability barriers that failed.",
+    ),
+    MetricDescriptor(
+        name="oktografx_read_view_drops_total",
+        kind=MetricKind.COUNTER,
+        description="Read views begun over a moved commit token, by publication origin.",
+        labels=(_VIEW_ORIGIN,),
     ),
     MetricDescriptor(
         name="oktografx_wal_size_bytes",

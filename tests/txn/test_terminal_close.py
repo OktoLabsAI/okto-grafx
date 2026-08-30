@@ -148,10 +148,10 @@ def test_retry_open_failure_leaves_the_old_context_aborted_and_no_partial_pin(
     opening_bomb = SystemExit("successor read view bomb")
     original = BufferPool.begin_read_view
 
-    def fail_successor_open(pool: BufferPool, read_lsn: int) -> None:
+    def fail_successor_open(pool: BufferPool, read_lsn: int, **kwargs: object) -> None:
         if pool is stack.pool:
             raise opening_bomb
-        original(pool, read_lsn)
+        original(pool, read_lsn, **kwargs)
 
     monkeypatch.setattr(BufferPool, "begin_read_view", fail_successor_open)
 
