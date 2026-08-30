@@ -93,6 +93,24 @@
   integrada WAL/commit/multiprocesso/API em 100%, além de Ruff e diff-check verdes. A premissa
   multi-writer/multi-reader permanece intacta: o reuso existe somente sob `COMMIT_SECTION`, não
   atravessa seções e não muda lease, época, publicação ou horizonte de leitores.
+- **CQ-4/QW-6 implementado e validado; promoção ao `main` aguarda somente o perfil RAW oficial.**
+  O memo por handle reutiliza a `CatalogStoreView` imutável apenas quando a imagem persistida, a
+  identidade do objeto vivo e cópias rasas do conteúdo de tabelas/espaços continuam iguais. A
+  prova otimista de época sob a seção participante ainda ocorre em todo acesso; o memo só remove
+  reconstruções repetidas, é publicado depois da prova e nunca guarda uma observação não adotada.
+  Origem entregue/pushed: `perf/w2-cq4-catalog-view-memo@ae2f443697cb8e22fe53c16b16137477a6090719`;
+  composição sobre CQ-1 no branch de integração: `63dd813`. O handoff Nexus
+  `hof_2029bdda6c5b48d69c0c36ea55be6303` foi verificado/PASS pelo Codex. A entrega do Claude
+  passou 2.578 testes de foundation/API, 1.671 de query, 191 de memo+fronteiras hostis, 9 do
+  consumidor Pulse pinado e Ruff. A reprodução independente confirmou hashes, passou 270 testes
+  focados, matou os dois mutantes (`no_content_check`: 1 falha discriminante;
+  `no_invalidation`: 3), passou 9/9 no Pulse com origens pinadas e aprovou em 100% a bateria
+  composta CQ-1+CQ-4, além de Ruff/diff-check. Duas micro-medições de 400 acessos com 17 tabelas
+  mostraram `5,2x` na entrega (`232,1 us` contra `1.213,0 us`) e `3,1x` na reprodução
+  (`208,8 us` contra `641,6 us`); page writes ficaram em zero e a reconstrução caiu para uma por
+  geração. Esses números são microbenchmarks, não o gate M7: antes do push em `main`, o candidato
+  composto ainda será comparado por H1-H8.1/pf5 contra o CQ-1 já publicado. Multi-writer/
+  multi-reader permanece intacto: nenhuma lease, cerca, época, publicação ou regra D7 mudou.
 - **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`

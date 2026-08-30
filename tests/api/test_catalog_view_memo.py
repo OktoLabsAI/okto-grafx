@@ -77,8 +77,8 @@ def test_a_ddl_commit_invalidates_the_memo_and_the_next_view_sees_the_new_table(
 def test_an_unsaved_live_mutation_never_answers_from_the_memo(tmp_path: Path) -> None:
     # The pathological door: mutating the LIVE catalog object in place changes neither
     # id(store._catalog) nor the persisted image bytes. A memo keyed on those two alone would
-    # keep answering with the pre-mutation view; the clean-state guard (has_unsaved_changes,
-    # D7's own door) must send the access back to a fresh construction instead.
+    # keep answering with the pre-mutation view; the structural content guard must send the
+    # access back to a fresh construction without dispatching through public Catalog methods.
     database = connect(tmp_path / "db", page_size=512)
     try:
         with database.begin("write") as txn:
