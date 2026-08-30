@@ -19,7 +19,7 @@ Two rules decide everything else:
 from __future__ import annotations
 
 import struct
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol
 
@@ -792,7 +792,7 @@ class HeapStore:
         abandoned, unpublished attempts and therefore cannot raise the committed watermark.
         """
         high_water: Lsn = NO_LSN
-        for _ref, header, _content in self._walk(table):
+        for _ref, header, _content in self._walk(table, copy_content=False):
             if is_committed_csn(header.xmin):
                 high_water = max(high_water, header.xmin)
             elif header.xmin != NO_CSN and not is_provisional_csn(header.xmin):
@@ -831,10 +831,11 @@ class HeapStore:
         self, table: TableDef, snapshot: SnapshotLike
     ) -> Iterator[tuple[RecordRef, HeapVersion]]:
         """Yield every version of the table the snapshot can see, in storage order."""
-        for ref, header, content in self._walk(table):
-            if not snapshot.visible(header.xmin, header.xmax):
-                continue
-            yield ref, self._decode_version(table, content)
+        def visible(header: RecordHeader) -> bool:
+            return snapshot.visible(header.xmin, header.xmax)
+
+        for ref, header, content in self._walk(table, accept=visible):
+            yield ref, self._decode_version_with_header(table, header, content)
 
     def scan_page(
         self,
@@ -907,17 +908,18 @@ class HeapStore:
                     chain_limit=chain_limit,
                 )
 
-        selected: list[tuple[RecordRef, bytes]] = []
+        selected: list[tuple[RecordRef, RecordHeader, bytes]] = []
         next_position: _HeapScanPosition | None = None
         while index != NO_PAGE:
             self._refuse_endless_chain(table, pages_walked, chain_limit)
             with self._pool.pinned(self._file, index) as page:
                 self._require_table_page(page, table)
                 following = page.next_page
-                for slot, content in page.iter_slots():
+                for slot in page.live_slots():
                     if slot < max(start_slot, FIRST_RECORD_SLOT):
                         continue
-                    header = RecordHeader.decode(content)
+                    view = page.slot_view(slot)
+                    header = RecordHeader.decode(view)
                     if not snapshot.visible(header.xmin, header.xmax):
                         continue
                     if len(selected) == limit:
@@ -928,7 +930,7 @@ class HeapStore:
                             chain_limit=chain_limit,
                         )
                         break
-                    selected.append((RecordRef(page=index, slot=slot), content))
+                    selected.append((RecordRef(page=index, slot=slot), header, bytes(view)))
 
             if next_position is not None:
                 break
@@ -961,7 +963,8 @@ class HeapStore:
         # Decoding can follow overflow chains, so it happens only after every data-page pin above
         # has been released. ``selected`` contains at most ``limit`` payloads.
         rows = tuple(
-            (ref, self._decode_version(table, content)) for ref, content in selected
+            (ref, self._decode_version_with_header(table, header, content))
+            for ref, header, content in selected
         )
         return rows, next_position
 
@@ -971,19 +974,20 @@ class HeapStore:
         Recovery and verification need the whole truth of what is on the pages, which is exactly
         what a snapshot is designed to hide.
         """
-        for ref, _header, content in self._walk(table):
-            yield ref, self._decode_version(table, content)
+        for ref, header, content in self._walk(table):
+            yield ref, self._decode_version_with_header(table, header, content)
 
     def lookup(
         self, table: TableDef, record_id: RecordId, snapshot: SnapshotLike
     ) -> HeapVersion | None:
         """Return the version of that record the snapshot can see, or None when there is none."""
-        for _ref, header, content in self._walk(table):
-            if header.record_id != record_id:
-                continue
-            if not snapshot.visible(header.xmin, header.xmax):
-                continue
-            return self._decode_version(table, content)
+        def wanted(header: RecordHeader) -> bool:
+            return header.record_id == record_id and snapshot.visible(
+                header.xmin, header.xmax
+            )
+
+        for _ref, header, content in self._walk(table, accept=wanted):
+            return self._decode_version_with_header(table, header, content)
         return None
 
     def version_chain(self, ref: RecordRef) -> tuple[RecordRef, ...]:
@@ -1637,11 +1641,19 @@ class HeapStore:
             ended = header.ended_at(xmax, deleted=deleted)
             page.update_slot(ref.slot, ended.encode() + content[RECORD_HEADER_SIZE:])
 
-    def _walk(self, table: TableDef) -> Iterator[tuple[RecordRef, RecordHeader, bytes]]:
+    def _walk(
+        self,
+        table: TableDef,
+        *,
+        accept: Callable[[RecordHeader], bool] | None = None,
+        copy_content: bool = True,
+    ) -> Iterator[tuple[RecordRef, RecordHeader, bytes]]:
         """Yield every stored version of the table with its location and its raw content.
 
-        One page at a time is pinned and its slots are copied out before anything is decoded, so
-        following an overflow chain never needs a second frame while a data page is still held.
+        One page at a time is pinned. Every header is decoded from a read-only slot view, but only
+        accepted content is copied before the pin is released. Following an overflow chain never
+        needs a second frame while a data page is still held. Header-only callers may also suppress
+        every content copy.
         """
         extent = self._find_extent(table.table_id)
         if extent is None:
@@ -1663,23 +1675,32 @@ class HeapStore:
             seen.add(index)
             with self._pool.pinned(self._file, index) as page:
                 self._require_table_page(page, table)
-                items = tuple(
-                    (slot, payload)
-                    for slot, payload in page.iter_slots()
-                    if slot >= FIRST_RECORD_SLOT
-                )
+                items: list[tuple[SlotId, RecordHeader, bytes]] = []
+                for slot in page.live_slots():
+                    if slot < FIRST_RECORD_SLOT:
+                        continue
+                    view = page.slot_view(slot)
+                    header = RecordHeader.decode(view)
+                    if accept is not None and not accept(header):
+                        continue
+                    items.append((slot, header, bytes(view) if copy_content else b""))
                 following = page.next_page
-            for slot, content in items:
+            for slot, header, content in items:
                 yield (
                     RecordRef(page=index, slot=slot),
-                    RecordHeader.decode(content),
+                    header,
                     content,
                 )
             index = following
 
     def _decode_version(self, table: TableDef, content: bytes) -> HeapVersion:
         """Turn the raw content of a slot into a decoded version of the table."""
-        header = RecordHeader.decode(content)
+        return self._decode_version_with_header(table, RecordHeader.decode(content), content)
+
+    def _decode_version_with_header(
+        self, table: TableDef, header: RecordHeader, content: bytes
+    ) -> HeapVersion:
+        """Decode a version whose header the page walk has already validated."""
         if header.schema_version != table.schema_version:
             raise GrafxSchemaVersionMismatch(
                 f"A stored version of table {table.name!r} was written under schema version "

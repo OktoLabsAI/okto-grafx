@@ -63,6 +63,68 @@ that could never be read back is refused where it is written rather than where i
 _MAX_U64: int = 0xFFFFFFFFFFFFFFFF
 
 
+def _validated_image(
+    raw: bytes,
+) -> tuple[memoryview, int, int, int, bool]:
+    """Validate an entry image once and return its zero-copy view and decoded header fields."""
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        raise GrafxCorruptionDetected(
+            f"An index entry image must be bytes; got {type(raw).__name__}.",
+            field="entry",
+            value=type(raw).__name__,
+        )
+    if isinstance(raw, memoryview):
+        image = raw.cast("B") if raw.c_contiguous else memoryview(bytes(raw))
+    else:
+        image = memoryview(raw)
+    if len(image) < INDEX_ENTRY_HEADER_SIZE:
+        raise GrafxCorruptionDetected(
+            f"An index entry needs {INDEX_ENTRY_HEADER_SIZE} bytes of header; this one has "
+            f"{len(image)}.",
+            field="entry",
+            value=len(image),
+        )
+    flags, key_length, ref, born_csn, dead_csn = _ENTRY_STRUCT.unpack_from(image, 0)
+    expected = INDEX_ENTRY_HEADER_SIZE + key_length
+    if len(image) != expected:
+        raise GrafxCorruptionDetected(
+            f"An index entry declaring a key of {key_length} bytes occupies {expected} "
+            f"bytes; this slot holds {len(image)}.",
+            field="key_length",
+            value=key_length,
+            length=len(image),
+        )
+    if flags & ~ENTRY_FLAG_VERSIONED:
+        raise GrafxCorruptionDetected(
+            f"An index entry carries the unknown flag bits {flags:#04x}.",
+            field="flags",
+            value=flags,
+        )
+    versioned = bool(flags & ENTRY_FLAG_VERSIONED)
+    if born_csn == PROVISIONAL_CSN or dead_csn == PROVISIONAL_CSN:
+        field = "born_csn" if born_csn == PROVISIONAL_CSN else "dead_csn"
+        raise GrafxCorruptionDetected(
+            "A persisted index entry carries the stamp reserved for provisional heap "
+            f"versions in {field}.",
+            field=field,
+            value=PROVISIONAL_CSN,
+        )
+    if not versioned and born_csn != NO_CSN:
+        raise GrafxCorruptionDetected(
+            "An unversioned index entry carries a birth stamp, so it is not an image this "
+            f"encoder produced: born_csn={born_csn}.",
+            field="born_csn",
+            value=born_csn,
+        )
+    if versioned and born_csn == NO_CSN:
+        raise GrafxCorruptionDetected(
+            "A versioned index entry carries no birth stamp, so no snapshot could decide it.",
+            field="born_csn",
+            value=born_csn,
+        )
+    return image, ref, born_csn, dead_csn, versioned
+
+
 def _require_commit_number(field: str, value: object) -> int:
     """Return a commit number that fits its field, refusing anything that is not one."""
     if isinstance(value, bool) or not isinstance(value, int):
@@ -196,61 +258,28 @@ class IndexEntry:
     @classmethod
     def decode(cls, raw: bytes) -> IndexEntry:
         """Return the entry stored in these bytes, refusing an image that is not one."""
-        if not isinstance(raw, (bytes, bytearray, memoryview)):
-            raise GrafxCorruptionDetected(
-                f"An index entry image must be bytes; got {type(raw).__name__}.",
-                field="entry",
-                value=type(raw).__name__,
-            )
-        image = bytes(raw)
-        if len(image) < INDEX_ENTRY_HEADER_SIZE:
-            raise GrafxCorruptionDetected(
-                f"An index entry needs {INDEX_ENTRY_HEADER_SIZE} bytes of header; this one has "
-                f"{len(image)}.",
-                field="entry",
-                value=len(image),
-            )
-        flags, key_length, ref, born_csn, dead_csn = _ENTRY_STRUCT.unpack_from(image, 0)
-        expected = INDEX_ENTRY_HEADER_SIZE + key_length
-        if len(image) != expected:
-            raise GrafxCorruptionDetected(
-                f"An index entry declaring a key of {key_length} bytes occupies {expected} "
-                f"bytes; this slot holds {len(image)}.",
-                field="key_length",
-                value=key_length,
-                length=len(image),
-            )
-        if flags & ~ENTRY_FLAG_VERSIONED:
-            raise GrafxCorruptionDetected(
-                f"An index entry carries the unknown flag bits {flags:#04x}.",
-                field="flags",
-                value=flags,
-            )
-        versioned = bool(flags & ENTRY_FLAG_VERSIONED)
-        if born_csn == PROVISIONAL_CSN or dead_csn == PROVISIONAL_CSN:
-            field = "born_csn" if born_csn == PROVISIONAL_CSN else "dead_csn"
-            raise GrafxCorruptionDetected(
-                "A persisted index entry carries the stamp reserved for provisional heap "
-                f"versions in {field}.",
-                field=field,
-                value=PROVISIONAL_CSN,
-            )
-        if not versioned and born_csn != NO_CSN:
-            raise GrafxCorruptionDetected(
-                "An unversioned index entry carries a birth stamp, so it is not an image this "
-                f"encoder produced: born_csn={born_csn}.",
-                field="born_csn",
-                value=born_csn,
-            )
-        if versioned and born_csn == NO_CSN:
-            raise GrafxCorruptionDetected(
-                "A versioned index entry carries no birth stamp, so no snapshot could decide it.",
-                field="born_csn",
-                value=born_csn,
-            )
+        image, ref, born_csn, dead_csn, versioned = _validated_image(raw)
         return cls(
-            key=image[INDEX_ENTRY_HEADER_SIZE:],
+            key=bytes(image[INDEX_ENTRY_HEADER_SIZE:]),
             ref=RecordRef.decode(ref),
+            versioned=versioned,
+            born_csn=born_csn,
+            dead_csn=dead_csn,
+        )
+
+    @classmethod
+    def decode_if_matches(
+        cls, raw: bytes, key: bytes, ref: RecordRef | None = None
+    ) -> IndexEntry | None:
+        """Validate every image but materialize only one matching the requested key/reference."""
+        image, encoded_ref, born_csn, dead_csn, versioned = _validated_image(raw)
+        if image[INDEX_ENTRY_HEADER_SIZE:] != key:
+            return None
+        if ref is not None and encoded_ref != ref.encode():
+            return None
+        return cls(
+            key=bytes(image[INDEX_ENTRY_HEADER_SIZE:]),
+            ref=RecordRef.decode(encoded_ref),
             versioned=versioned,
             born_csn=born_csn,
             dead_csn=dead_csn,
