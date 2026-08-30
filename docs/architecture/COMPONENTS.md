@@ -285,16 +285,19 @@ is the first evidence that the composition root is real.
 
 ### CF-6 — RESOLVED, and it created a binding constraint on every WAL caller
 
-C4 re-derives the end of the log from the device at the top of `append_many`. Cost is pinned by
-tests, not merely intended: an unchanged log costs one `list_files` plus one `log_size` and **reads
-zero bytes**; a moved tail reads **only the new bytes** (the scan resumes at the last known record
-boundary, so cost is proportional to the other participant's work, not to the log); only a segment
-that **shrank** falls back to a full pass. It does not reintroduce P2a -- the re-derivation records
-`_damage` rather than raising, so the repair door stays reachable.
+C4 re-derives the end of the log from the device once on entry to the WAL-tail hold nested inside
+`coordinator.exclusive("commit")`. Every WAL door in that section reuses the resulting in-memory
+index; leaving the hold in `finally` makes the next section re-derive again. Cost is pinned by tests,
+not merely intended: an unchanged log costs one `list_files` plus one `log_size` and **reads zero
+bytes**; a moved tail reads **only the new bytes** (the scan resumes at the last known record boundary,
+so cost is proportional to the other participant's work, not to the log); only a segment that
+**shrank** falls back to a full pass. Recovery's forced range barrier still refreshes unconditionally.
+The re-derivation records `_damage` rather than raising, so the repair door stays reachable.
 
 **The new constraint, and it is load-bearing rather than advisory:**
 
-> The re-derivation is sound **because** `append_many` runs inside `coordinator.exclusive("commit")`.
+> Reusing the held tail is sound **because** `append_many` runs inside
+> `coordinator.exclusive("commit")`.
 > Called outside that section, another writer can append between the refresh and the write, and
 > **CF-6 returns**.
 

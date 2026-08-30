@@ -62,6 +62,7 @@ from __future__ import annotations
 import struct
 from bisect import bisect_right
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -361,6 +362,7 @@ class WalManager:
         "_unflushed",
         "_next_number",
         "_total_bytes",
+        "_tail_hold_depth",
     )
 
     def __init__(
@@ -394,6 +396,7 @@ class WalManager:
         self._unflushed: list[str] = []
         self._next_number: int = MIN_SEGMENT_NUMBER
         self._total_bytes: int = 0
+        self._tail_hold_depth: int = 0
         if self._metrics.enabled:
             for declared in WAL_METRICS:
                 self._metrics.register(declared)
@@ -432,7 +435,7 @@ class WalManager:
     def _refresh_if_open(self) -> None:
         """Re-derive the tail, unless this manager has not been opened yet."""
         if self._opened:
-            self._refresh_tail()
+            self._refresh_tail_if_needed()
 
     @property
     def damage(self) -> ScanFailure | None:
@@ -669,6 +672,34 @@ class WalManager:
         self._require_open()
         self._refresh_tail()
 
+    @contextmanager
+    def hold_tail(self) -> Iterator[None]:
+        """Reuse one freshly derived tail while an external exclusive section is held.
+
+        The outermost hold refreshes before it exposes the cached picture. WAL doors called
+        inside it then use the in-memory index, including changes appended through this manager.
+        ``finally`` always releases the picture, so the next independent section must observe a
+        foreign append before assigning another LSN. Nested holds share the same picture.
+
+        This is safe only while the caller prevents another writer from appending, normally by
+        owning ``COMMIT_SECTION``. Recovery durability proofs use their forced-refresh door and
+        deliberately bypass this optimisation.
+        """
+        self._require_open()
+        outermost = self._tail_hold_depth == 0
+        if outermost:
+            self._refresh_tail()
+        self._tail_hold_depth += 1
+        try:
+            yield
+        finally:
+            self._tail_hold_depth -= 1
+
+    def _refresh_tail_if_needed(self) -> None:
+        """Refresh unless the caller already holds the section's freshly derived tail."""
+        if self._tail_hold_depth == 0:
+            self._refresh_tail()
+
     def _refresh_tail(self) -> None:
         """Bring the index up to date with what the device now holds."""
         if not self._indexed:
@@ -819,7 +850,7 @@ class WalManager:
         instead of a batch whose payload names a different commit number.
         """
         self._require_open()
-        self._refresh_tail()
+        self._refresh_tail_if_needed()
         self._require_healthy()
         _batch, _body_length, _rolling, terminal = self._plan_batch(records)
         return terminal
@@ -842,11 +873,10 @@ class WalManager:
         group many appends behind a single barrier.
         """
         self._require_open()
-        # CF-6: the tail belongs to the log, not to this object. Another participant may have
-        # appended since this one last looked, and assigning a sequence number from a remembered
-        # tail is how two writers write the same number. This runs inside the commit section of
-        # CONTRACT.md section 8.5, so what it reads cannot move under it.
-        self._refresh_tail()
+        # CF-6: an unheld call re-derives the shared tail before assigning a sequence number. A
+        # commit that already owns COMMIT_SECTION may instead reuse the picture established by
+        # hold_tail(); no foreign append can move it until that context is released.
+        self._refresh_tail_if_needed()
         self._require_healthy()
         batch, _body_length, rolling, terminal = self._plan_batch(records)
         if expected_terminal_lsn is not None:
@@ -1274,7 +1304,7 @@ class WalManager:
         """
         self._require_open()
         start = _require_lsn("lsn", lsn)
-        self._refresh_tail()
+        self._refresh_tail_if_needed()
         return self._read_from(start)
 
     def _read_from(self, start: Lsn) -> Iterator[WalRecord]:
@@ -1341,7 +1371,7 @@ class WalManager:
         self._require_open()
         if not self._indexed:
             return self._index_pass(stop_at_damage=False)
-        self._refresh_tail()
+        self._refresh_tail_if_needed()
         return self._walk_registered()
 
     def _walk_registered(self) -> Iterator[ScanItem]:
@@ -1727,7 +1757,7 @@ class WalManager:
         segment removed from behind a segment that stayed would leave the log with a hole.
         """
         self._require_open()
-        self._refresh_tail()
+        self._refresh_tail_if_needed()
         horizon = _require_lsn("horizon_lsn", horizon_lsn)
         if not isinstance(reader_present, bool):
             raise GrafxConfigurationError(

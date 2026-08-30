@@ -26,6 +26,7 @@ from okto_grafx.domain.index import index_file
 from okto_grafx.domain.page import Page, PageType
 from okto_grafx.engine.database import Database
 from okto_grafx.engine.index_manager import primary_key_index_name
+from okto_grafx.engine.wal_manager import WalManager
 
 HEAP = "heap.dat"
 ROW = b"a durable row"
@@ -94,6 +95,34 @@ def test_a_commit_through_the_public_surface_is_durable_across_a_reopen(
         assert reopened.recovery_report.outcome == "clean"
         assert _payloads(reopened, 3) == (ROW,)
         assert reopened.transactions.published_lsn() == committed
+
+
+def test_commit_and_checkpoint_each_derive_one_wal_tail_picture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CQ-1 wiring: every concrete commit section pays for one tail refresh, not one per door."""
+    root = tmp_path / "db"
+    with connect(root, page_size=512, partitions_per_table=8) as db:
+        _grow_to(db, 3)
+        txn = db.begin("write")
+        txn._context.owner._stage_page_image(txn._context, HEAP, 3, _image(db, [ROW], 3))
+        txn._context.note_write(db.transactions.partition_of(1, ROW))
+
+        refreshes = 0
+        original = WalManager._refresh_tail
+
+        def counted(manager: WalManager) -> None:
+            nonlocal refreshes
+            refreshes += 1
+            original(manager)
+
+        monkeypatch.setattr(WalManager, "_refresh_tail", counted)
+        txn.commit()
+        assert refreshes == 1
+
+        refreshes = 0
+        db._transactions.checkpoint()
+        assert refreshes == 1
 
 
 def test_a_rolled_back_transaction_leaves_nothing_on_the_device(tmp_path: Path) -> None:

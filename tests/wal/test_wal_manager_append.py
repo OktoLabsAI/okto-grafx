@@ -12,7 +12,10 @@ device, and the test asserts the size of the file rather than the exception alon
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -665,6 +668,129 @@ def test_an_unchanged_log_is_not_read_again_on_every_append(
     assert [call for call in device.calls if call[0] == "read_log"] == []
     assert len([call for call in device.calls if call[0] == "list_files"]) == 1
     assert len([call for call in device.calls if call[0] == "log_size"]) <= 2
+
+
+def test_a_held_tail_is_refreshed_once_and_released_at_the_context_boundary(
+    make_wal: Callable[..., WalManager], memory_device: MemoryStorageDevice
+) -> None:
+    """CQ-1: one commit-section picture serves every WAL door, but never the next section."""
+    device = CallRecordingDevice(memory_device)
+    manager = make_wal(device)
+    manager.append(make_record(1))
+    manager.barrier()
+    assert manager.last_lsn > 0
+
+    device.calls.clear()
+    with manager.hold_tail():
+        planned = manager.planned_terminal_lsn((make_record(2),))
+        assert manager.append_many(
+            (make_record(2),), expected_terminal_lsn=planned
+        ) == planned
+        assert [record.lsn for record in manager.read_from(planned)] == [planned]
+        assert any(item.record is not None for item in manager.scan_all())
+        assert manager.total_bytes() > 0
+
+    listings = [call for call in device.calls if call[0] == "list_files"]
+    assert len(listings) == 1, "the held picture must pay for exactly one discovery"
+
+    assert manager.last_lsn == planned
+    listings = [call for call in device.calls if call[0] == "list_files"]
+    assert len(listings) == 2, "leaving the hold must restore the next door's refresh"
+
+
+def test_a_forced_barrier_refreshes_even_while_the_tail_is_held(
+    make_wal: Callable[..., WalManager], memory_device: MemoryStorageDevice
+) -> None:
+    """Recovery durability evidence never trusts the commit-path tail optimisation."""
+    first = make_wal(memory_device)
+    second = make_wal(memory_device)
+    first.append(make_record(1))
+    first.barrier()
+    assert second.last_lsn == first.last_lsn
+
+    with second.hold_tail():
+        foreign = first.append(make_record(2))
+        first.barrier()
+        assert second.force_barrier_range(foreign, foreign)
+        assert second.last_lsn == foreign
+
+
+def test_a_tail_hold_is_released_when_the_section_body_raises(
+    make_wal: Callable[..., WalManager], memory_device: MemoryStorageDevice
+) -> None:
+    """The finally clause must not let a failed commit hide the next participant's append."""
+    first = make_wal(memory_device)
+    second = make_wal(memory_device)
+    first.append(make_record(1))
+    first.barrier()
+    assert second.last_lsn == first.last_lsn
+
+    with pytest.raises(RuntimeError, match="section failed"):
+        with second.hold_tail():
+            raise RuntimeError("section failed")
+
+    foreign = first.append(make_record(2))
+    first.barrier()
+    assert second.append(make_record(3)) == foreign + 1
+
+
+@pytest.mark.multiprocess
+@pytest.mark.timeout(90)
+def test_a_foreign_process_append_between_tail_holds_cannot_duplicate_an_lsn(
+    make_wal: Callable[..., WalManager], local_device: Any
+) -> None:
+    """CF-6: a hold ends with its section, so the next section adopts a foreign append."""
+    manager = make_wal(local_device)
+    with manager.hold_tail():
+        first_planned = manager.planned_terminal_lsn((make_record(1),))
+        first = manager.append_many(
+            (make_record(1),), expected_terminal_lsn=first_planned
+        )
+        manager.barrier()
+
+    source_root = str(Path(__file__).resolve().parents[2] / "src")
+    child_source = "\n".join(
+        (
+            "import sys",
+            "sys.path.insert(0, sys.argv[1])",
+            "from okto_grafx.adapters.clock_system import SystemClock",
+            "from okto_grafx.adapters.metrics_noop import NoOpMetricsSink",
+            "from okto_grafx.adapters.storage_local import LocalStorageDevice",
+            "from okto_grafx.domain.wal import WalRecord, WalRecordType",
+            "from okto_grafx.engine.wal_manager import WalManager",
+            "device = LocalStorageDevice(sys.argv[2], page_size=512)",
+            "wal = WalManager(device, SystemClock(), NoOpMetricsSink(), "
+            "directory='wal', segment_bytes=4096, "
+            "descriptor='hash-v1;partitions_per_table=64')",
+            "wal.open()",
+            "lsn = wal.append(WalRecord(record_type=WalRecordType.WRITE_PAGE, "
+            "payload=bytes(16), epoch=1, txn_id=2))",
+            "wal.barrier()",
+            "print(lsn)",
+            "device.close()",
+        )
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", child_source, source_root, local_device.root],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    foreign = int(child.stdout.strip())
+
+    with manager.hold_tail():
+        second_planned = manager.planned_terminal_lsn((make_record(3),))
+        second = manager.append_many(
+            (make_record(3),), expected_terminal_lsn=second_planned
+        )
+        manager.barrier()
+
+    cold = make_wal(local_device)
+    lsns = [item.record.lsn for item in cold.scan_all() if item.record is not None]
+    assert first < foreign < second
+    assert len(lsns) == len(set(lsns))
+    assert lsns == list(range(1, second + 1))
 
 
 def test_only_the_new_bytes_are_read_when_another_participant_appended(

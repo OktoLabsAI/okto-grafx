@@ -33,6 +33,7 @@ from okto_grafx.domain.txn import (
 )
 from okto_grafx.domain.wal.record import WalRecord
 from okto_grafx.engine.buffer_pool import apply_page_image
+from okto_grafx.engine.commit_state_store import CommitStateStore
 from okto_grafx.engine.txn_manager import (
     ACTIVE_TRANSACTIONS,
     TRANSACTION_MANAGER_METRICS,
@@ -127,6 +128,51 @@ def test_the_published_state_is_replaced_only_after_every_page_is_in_place(
     writes = [index for index, (method, file, _s) in enumerate(methods) if method == "write_page" and file == HEAP]
     assert len(writes) >= 3
     assert max(writes) < publish
+
+
+def test_commit_reuses_the_state_read_inside_the_section_before_publishing(
+    database_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CQ-1: one state read preserves the checkpoint and publication stays under commit."""
+    stack = build_stack(database_root)
+    trail: list[str] = []
+    manager = TransactionManager(
+        stack.wal,
+        stack.pool,
+        stack.heap,
+        stack.catalog,
+        TracingCoordinator(stack.coordinator, trail),
+        stack.clock,
+        stack.metrics,
+        None,
+        partitions_per_table=8,
+        commit_lock_timeout=5.0,
+    )
+    txn = manager.begin("write")
+    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
+    txn.note_write(manager.partition_of(1, b"row"))
+
+    reads = 0
+    original_read = CommitStateStore.read
+    original_publish = CommitStateStore.publish
+
+    def counted_read(store: CommitStateStore) -> CommitState:
+        nonlocal reads
+        reads += 1
+        return original_read(store)
+
+    def traced_publish(store: CommitStateStore, state: CommitState) -> None:
+        trail.append("publish:commit.state")
+        original_publish(store, state)
+
+    monkeypatch.setattr(CommitStateStore, "read", counted_read)
+    monkeypatch.setattr(CommitStateStore, "publish", traced_publish)
+    trail.clear()
+    manager.commit(txn)
+
+    assert reads == 1
+    assert trail.index("enter:commit") < trail.index("publish:commit.state")
+    assert trail.index("publish:commit.state") < trail.index("leave:commit")
 
 
 def test_the_epoch_is_validated_before_any_byte_reaches_the_device(database_root: Path) -> None:
