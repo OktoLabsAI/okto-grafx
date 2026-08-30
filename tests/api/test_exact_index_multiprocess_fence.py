@@ -110,3 +110,68 @@ def test_spawned_stale_mark_between_traversal_and_validation_forces_refusal(
                 process.join(timeout=10)
             assert process.exitcode == 0
         database.close()
+
+
+@pytest.mark.multiprocess
+@pytest.mark.timeout(180)
+def test_spawned_stale_mark_between_two_lookups_is_caught_by_the_post_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F4 for the carried certificate (CQ-3/QW-2): a REAL spawned participant durably marks the
+    # PK index stale between two exact lookups of this process. The second lookup may begin
+    # from the certificate the first lookup's post-read carried, so the foreign mark is caught
+    # by the fresh post-read and the retry refuses from the device. Never a short answer.
+    root = tmp_path / "db"
+    database = connect(root, page_size=512)
+    context = multiprocessing.get_context("spawn")
+    first_lookup_done = context.Event()
+    mark_published = context.Event()
+    reports = context.Queue()
+    process = None
+    try:
+        with database.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")
+        with database.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 1})")
+        assert database.execute("MATCH (p:P) WHERE p.id = 1 RETURN p.id").rows == ((1,),)
+
+        original = HashIndex.finish_exact_read
+        outcomes: list[bool] = []
+
+        def recording(self: HashIndex, before: object, required_lsn: int) -> bool:
+            stable = original(self, before, required_lsn)
+            if self.name == primary_key_index_name("P"):
+                outcomes.append(stable)
+            return stable
+
+        monkeypatch.setattr(HashIndex, "finish_exact_read", recording)
+        process = context.Process(
+            target=_mark_stale_in_spawned_participant,
+            args=(str(root), first_lookup_done, mark_published, reports),
+        )
+        process.start()
+        first_lookup_done.set()
+        if not mark_published.wait(CHILD_TIMEOUT_SECONDS):
+            raise TimeoutError("the child never published its stale mark")
+        try:
+            report = reports.get(timeout=CHILD_TIMEOUT_SECONDS)
+        except queue_module.Empty as failure:
+            raise AssertionError("the spawned participant produced no report") from failure
+        assert report["ok"], report.get("traceback", report)
+        assert report["pid"] != os.getpid()
+
+        with pytest.raises(GrafxIndexError) as refused:
+            database.execute("MATCH (p:P) WHERE p.id = 1 RETURN p.id")
+        assert refused.value.details["field"] == "index_view_unavailable"
+        # The carried pre-certificate let one traversal run; its post-read saw the mark.
+        assert outcomes == [False]
+    finally:
+        first_lookup_done.set()
+        mark_published.set()
+        if process is not None:
+            process.join(timeout=CHILD_TIMEOUT_SECONDS)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+            assert process.exitcode == 0
+        database.close()

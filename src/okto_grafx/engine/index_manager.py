@@ -279,6 +279,7 @@ class IndexStore:
         "_short_commit",
         "_cache_certificate",
         "_local_certificate",
+        "_carried_certificate",
         "_rebuild_authority",
         "_completed_rebuild_through",
         "_replaying",
@@ -320,6 +321,11 @@ class IndexStore:
         # replaced by a foreign read rebase, so the manager can distinguish local dirty/current
         # companion heap frames from a genuinely foreign generation.
         self._local_certificate: _IndexReadCertificate | None = None
+        # The certificate the last successful exact read collected from the device AFTER its
+        # traversal (CQ-3/QW-2). The next lookup may start from it instead of a fresh pre-read;
+        # it is consumed one-shot, dropped by every local page-0 write and by every refusal,
+        # and it is never what certifies a traversal -- the fresh post-read still is.
+        self._carried_certificate: _IndexReadCertificate | None = None
         # Set only after RESET has re-proved the durable stale generation while holding the
         # file's page-0 write section. It is the authority required to publish healthy again.
         self._rebuild_authority: _RebuildAuthority | None = None
@@ -635,6 +641,7 @@ class IndexStore:
             certificate = _IndexReadCertificate(
                 seq=page.seq, header=self._decode_header_page(page)
             )
+        self._carried_certificate = None
         self._cache_certificate = certificate
         self._local_certificate = certificate
         return certificate
@@ -728,8 +735,29 @@ class IndexStore:
         return requested_lsn if high_water is None else min(requested_lsn, high_water)
 
     def begin_exact_read(self, required_lsn: Lsn) -> _IndexReadCertificate:
-        """Attach cached derived state to one fresh healthy durable certificate."""
+        """Attach cached derived state to one fresh healthy durable certificate.
+
+        The certificate carried from the previous lookup's post-read may stand in for the fresh
+        pre-read: it was collected from the device, it proved that whole view, and the resident
+        frames are still bound to it. It is consumed one-shot and reused ONLY while it still
+        names the cached generation, this handle holds no refusal, and it covers the requested
+        snapshot. Anything else drops it and takes the fresh path below -- the carry never turns
+        into a refusal of its own. What certifies the traversal is unchanged: the fresh post-read
+        of :meth:`finish_exact_read`. A foreign page-0 transition between two lookups is seen
+        there, costs one of the bounded retries, and the retry re-proves from the device.
+        """
         required_lsn = self._required_table_position(required_lsn)
+        carried = self._carried_certificate
+        if carried is not None:
+            self._carried_certificate = None
+            if self._stale_reason is None and carried == self._cache_certificate:
+                try:
+                    self._require_safe_certificate(carried, required_lsn)
+                except GrafxIndexError:
+                    # Fallback, never a verdict: the device decides below.
+                    pass
+                else:
+                    return carried
         certificate = self._fresh_certificate()
         recovering = self._foreign_healthy_replaces_stale(certificate, required_lsn)
         self._require_safe_certificate(certificate, required_lsn)
@@ -758,9 +786,13 @@ class IndexStore:
         after = self._fresh_certificate()
         if after == before:
             self._require_safe_certificate(after, required_lsn)
+            # The device-observed certificate that proved this view is the next lookup's
+            # pre-certificate; it stays bound to the resident frames it just certified.
+            self._carried_certificate = after
             return True
         # Do not carry any frame from the losing attempt into its retry. The discard is
         # zero-write and refuses dirty/pinned uncertainty rather than writing stale state back.
+        self._carried_certificate = None
         self._cache_certificate = None
         self._pool.discard_clean_file(self.file)
         self._cache_rebased()
@@ -768,6 +800,10 @@ class IndexStore:
 
     def _write_header(self, header: IndexHeader) -> None:
         """Replace the index header stored in slot 1 of the reserved header page."""
+        # Every local page-0 write goes through here, including the ones that leave
+        # ``_cache_certificate`` alone (position advance, reconciliation watermark); any of
+        # them makes a carried certificate a stale impression of the device.
+        self._carried_certificate = None
         with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
             self._require_file_header(page)
             page.update_slot(INDEX_HEADER_SLOT, header.encode())
@@ -850,6 +886,7 @@ class IndexStore:
             )
         self._completed_rebuild_through = None
         self._stale_reason = reason
+        self._carried_certificate = None
         if not persist:
             # A failed recovery may have changed an unknown prefix and must poison the current
             # handle without turning an otherwise non-mutating refusal into another device
@@ -1008,6 +1045,10 @@ class IndexStore:
             )
         certificate = self._fresh_certificate()
         header = certificate.header
+        if certificate != self._cache_certificate:
+            # The device moved since the carried certificate was collected; let the next
+            # lookup take the fresh path instead of spending a retry to learn the same thing.
+            self._carried_certificate = None
         if header.flags & INDEX_FLAG_STALE:
             if self._stale_reason is None:
                 self._stale_reason = f"Index {self.name!r} was recorded as stale and has not been rebuilt."
@@ -1055,6 +1096,7 @@ class IndexStore:
         if after != certificate:
             self._stale_device_seq = after.seq
             return True
+        self._carried_certificate = None
         self._cache_certificate = after
         self._stale_reason = None
         self._stale_device_seq = None
@@ -1473,6 +1515,7 @@ class IndexStore:
                 self._rebuild_authority = None
                 self._stale_reason = None
                 self._stale_device_seq = None
+                self._carried_certificate = None
                 self._cache_certificate = certificate
                 return
             if (
@@ -1646,6 +1689,7 @@ class IndexStore:
                     self._completed_rebuild_through = position
                     self._stale_reason = None
                     self._stale_device_seq = None
+                    self._carried_certificate = None
                     self._cache_certificate = completed
                     self._local_certificate = completed
                     # The device completed the write and then reported interruption. A fresh
@@ -1672,6 +1716,7 @@ class IndexStore:
             # mutation: the clear already landed. Failing the call for it would report a
             # refusal for an index that is durably healthy. The cache is simply left for the
             # next read to rebuild. Process-control signals are not caught.
+            self._carried_certificate = None
             self._cache_certificate = None
 
     def _advance(self, lsn: Lsn) -> None:
@@ -1828,6 +1873,7 @@ class IndexStore:
 
     def _discard_replay_frames(self, failure: BaseException) -> None:
         """Drop every local frame a refused rebuild replay could otherwise write later."""
+        self._carried_certificate = None
         for file, page_index in self._pool.modified_pages(self.file):
             if file != self.file:
                 continue
