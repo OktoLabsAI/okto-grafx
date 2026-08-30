@@ -6,17 +6,22 @@ older copy: in every case the structure is behind the heap, and the symptom is a
 returns fewer rows than it should. An empty answer and a short answer look identical to a caller,
 which is why the index must not answer at all.
 
-The detector is one comparison -- the position the file claims against the position the database
-has published -- and the gate on the read path is one durable flag. They are kept apart on
-purpose: a test can set the flag with no published position, and can move the published position
-with no flag already set, so neither can pass for the other (amendment A67).
+The detector compares the position the file claims with the committed physical history of its
+own table, under the database's published ceiling, and the gate on the read path is one durable
+flag. They are kept apart on purpose: a test can set the flag with no published position, and can
+move the required position with no flag already set, so neither can pass for the other
+(amendment A67).
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
-from okto_grafx.domain.errors import GrafxIndexError
+from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxIndexError
+from okto_grafx.domain.model.schema import ColumnDef, TableDef
+from okto_grafx.domain.model.value import ValueType
 from okto_grafx.engine.index_manager import INDEX_FLAG_STALE, HashIndex
 
 from .conftest import (
@@ -46,6 +51,7 @@ def _commit_row(database: Database, record_id: int, name: str, csn: int) -> obje
 
 def test_an_index_behind_the_published_position_is_marked_stale(database: Database) -> None:
     _commit_row(database, 1, "Ada", BORN)
+    database.insert(2, "Grace", BORN + 5)  # committed heap row omitted from both indexes
 
     stale = database.manager.open(BORN + 5)
 
@@ -60,6 +66,124 @@ def test_an_index_level_with_the_published_position_is_not_stale(database: Datab
     assert database.manager.open(BORN) == ()
     assert not database.exact.header.flags & INDEX_FLAG_STALE
     assert database.exact.stale_reason is None
+
+
+def test_a_commit_to_another_table_does_not_rewrite_or_stale_this_index(
+    database: Database,
+) -> None:
+    """The table watermark removes page-0 fanout without weakening the freshness gate."""
+    person = _commit_row(database, 1, "Ada", BORN)
+    assert database.manager.open(BORN) == ()
+    book = TableDef(
+        table_id=database.catalog.catalog.next_table_id(),
+        name="Book",
+        kind="node",
+        columns=(
+            ColumnDef(name="id", type=ValueType.INT64, nullable=False),
+            ColumnDef(name="title", type=ValueType.STRING),
+        ),
+        primary_key="id",
+    )
+    database.catalog.catalog.add_table(book)
+    database.catalog.save()
+    book_index = HashIndex(
+        exact_definition(book, name="book_by_title", columns=("title",)),
+        database.pool,
+        database.metrics,
+    )
+    database.manager.register(book_index)
+    exact_before = database.device.raw_page(database.exact.file, 0)
+    proximity_before = database.device.raw_page(database.proximity.file, 0)
+    database.device.write_calls.clear()
+
+    ref = database.heap.insert(book, 1, (1, "Graph Databases"), ENDED)
+    txn = TransactionDouble(txn_id=41)
+    txn.row_intents = (SimpleNamespace(table=book),)
+    database.manager.stage_row_insert(txn, book.table_id, ref, (1, "Graph Databases"), ENDED)
+    database.manager.commit(txn, ENDED)
+
+    assert database.device.raw_page(database.exact.file, 0) == exact_before
+    assert database.device.raw_page(database.proximity.file, 0) == proximity_before
+    assert all(
+        file not in {database.exact.file, database.proximity.file}
+        for file, _page in database.device.write_calls
+    )
+    assert database.exact.built_through_lsn == BORN
+    assert book_index.built_through_lsn == ENDED
+    assert database.manager.lookup(
+        database.exact.name, database.key(1, "Ada"), SnapshotDouble(ENDED)
+    ) == (person,)
+    assert database.manager.lookup(
+        database.proximity.name, database.key(1, "Ada"), SnapshotDouble(ENDED)
+    ) == (person,)
+    assert database.manager.open(ENDED) == ()
+
+
+def test_committed_heap_state_ahead_of_the_published_ceiling_fails_closed(
+    database: Database,
+) -> None:
+    database.insert(1, "Ada", ENDED)
+
+    with pytest.raises(GrafxCorruptionDetected) as refused:
+        database.manager.open(BORN)
+
+    assert refused.value.details["field"] == "table_high_water"
+    assert refused.value.details["table"] == "Person"
+    assert refused.value.details["value"] == ENDED
+
+
+def test_a_local_table_write_that_omits_its_indexes_refuses_immediately(
+    database: Database,
+) -> None:
+    """A missing observation durably refuses before this handle can answer short."""
+    _commit_row(database, 1, "Ada", BORN)
+    assert database.manager.open(BORN) == ()
+    database.insert(2, "Grace", ENDED)
+    defective = TransactionDouble(txn_id=42)
+    defective.row_intents = (SimpleNamespace(table=database.table),)
+
+    database.manager.commit(defective, ENDED)
+
+    with pytest.raises(GrafxIndexError) as refused:
+        database.manager.lookup(
+            database.exact.name,
+            database.key(2, "Grace"),
+            SnapshotDouble(ENDED),
+        )
+    assert refused.value.details["field"] == "stale"
+    assert header_on_device(database.device, database.exact.file).flags & INDEX_FLAG_STALE
+
+
+def test_a_foreign_live_reader_observes_a_durable_refusal_for_an_omitted_index(
+    database: Database,
+) -> None:
+    """A cached table watermark cannot hide another participant's short commit."""
+    _commit_row(database, 1, "Ada", BORN)
+    reader = cold_view(database)
+    assert reader.manager.open(BORN) == ()
+    database.insert(2, "Grace", ENDED)
+    defective = TransactionDouble(txn_id=43)
+    defective.row_intents = (SimpleNamespace(table=database.table),)
+
+    database.manager.commit(defective, ENDED)
+
+    assert not reader.exact.stale  # this handle still has its older in-memory verdict
+    with pytest.raises(GrafxIndexError) as refused:
+        reader.manager.lookup(
+            reader.exact.name,
+            database.key(2, "Grace"),
+            SnapshotDouble(ENDED),
+        )
+    assert refused.value.details["field"] == "index_view_unavailable"
+    assert header_on_device(database.device, database.exact.file).flags & INDEX_FLAG_STALE
+
+
+def test_an_untouched_table_does_not_become_stale_at_a_later_replay_floor(
+    database: Database,
+) -> None:
+    assert database.manager.check_replay_floor(ENDED) == ()
+    assert not database.exact.stale
+    assert not database.proximity.stale
 
 
 def test_an_index_ahead_of_the_published_position_is_marked_stale(
@@ -98,6 +222,7 @@ def test_a_stale_index_refuses_to_answer_rather_than_omitting_a_row(
     key = database.key(1, "Ada")
     assert database.manager.lookup("person_by_name", key, SnapshotDouble(BORN)) == (ref,)
 
+    database.insert(2, "Grace", BORN + 5)
     database.manager.open(BORN + 5)
 
     for name in ("person_by_name", "person_near_name"):
@@ -117,6 +242,7 @@ def test_a_stale_index_still_accepts_the_changes_of_new_transactions(
     index stays stale until it is rebuilt.
     """
     _commit_row(database, 1, "Ada", BORN)
+    database.insert(99, "Missing", BORN + 5)
     database.manager.open(BORN + 5)
 
     ref = _commit_row(database, 2, "Grace", BORN + 10)
@@ -133,6 +259,7 @@ def test_a_stale_index_does_not_stop_looking_stale_by_seeing_a_newer_commit(
     stop looking stale while still omitting every row it never received.
     """
     _commit_row(database, 1, "Ada", BORN)
+    database.insert(99, "Missing", BORN + 5)
     database.manager.open(BORN + 5)
     before = database.exact.built_through_lsn
 
@@ -355,6 +482,7 @@ def test_the_stale_flag_reaches_the_device_and_not_only_the_page_cache(
     flag, so no redo can put it back: if it is not on the device it does not exist.
     """
     _commit_row(database, 1, "Ada", BORN)
+    database.insert(2, "Grace", BORN + 5)
 
     database.manager.open(BORN + 5)
 
@@ -368,6 +496,7 @@ def test_the_stale_flag_reaches_the_device_and_not_only_the_page_cache(
 def test_another_participant_reads_the_refusal_off_the_device(database: Database) -> None:
     """The same property as the consequence a second process meets, through a cold cache."""
     ref = _commit_row(database, 1, "Ada", BORN)
+    database.insert(2, "Grace", BORN + 5)
     database.manager.open(BORN + 5)
 
     other = cold_view(database)
@@ -456,14 +585,14 @@ def test_clearing_the_mark_reaches_the_device_too(database: Database) -> None:
     because neither participant can tell that the other disagrees.
     """
     _commit_row(database, 1, "Ada", BORN)
-    database.manager.open(BORN + 5)
+    database.exact.mark_stale("operator-declared test refusal")
     assert header_on_device(database.device, database.exact.file).flags & INDEX_FLAG_STALE
 
-    database.manager.clear_stale("person_by_name", BORN + 5)
+    database.manager.clear_stale("person_by_name", BORN)
 
     stored = header_on_device(database.device, database.exact.file)
     assert not stored.flags & INDEX_FLAG_STALE
-    assert stored.built_through_lsn == BORN + 5
+    assert stored.built_through_lsn == BORN
     other = cold_view(database)
     assert not other.exact.stale
 
@@ -508,9 +637,9 @@ def test_a_reconciliation_horizon_reaches_the_device_so_verify_does_not_cry_wolf
 
 def test_clearing_the_stale_flag_lets_the_index_answer_again(database: Database) -> None:
     ref = _commit_row(database, 1, "Ada", BORN)
-    database.manager.open(BORN + 5)
+    database.exact.mark_stale("operator-declared test refusal")
 
-    database.manager.clear_stale("person_by_name", BORN + 5)
+    database.manager.clear_stale("person_by_name", BORN)
 
     assert not database.exact.header.flags & INDEX_FLAG_STALE
     assert database.manager.lookup(
@@ -523,7 +652,7 @@ def test_a_second_database_does_not_share_the_registry_of_the_first() -> None:
     first = build_database(name="first")
     second = build_database(name="second")
 
-    first.manager.open(999)
+    first.exact.mark_stale("first database only")
 
     assert first.exact.stale
     assert not second.exact.stale
@@ -543,7 +672,7 @@ def test_a_file_that_says_stale_refuses_before_any_freshness_check(
     which is exactly why it is the thing that survives a restart.
     """
     _commit_row(database, 1, "Ada", BORN)
-    database.manager.open(BORN + 5)
+    database.exact.mark_stale("durable test refusal")
 
     cold = HashIndex(
         exact_definition(database.table),

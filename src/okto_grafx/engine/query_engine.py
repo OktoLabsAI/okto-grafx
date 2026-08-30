@@ -1264,8 +1264,8 @@ class QueryEngine:
                     primary_key=node.primary_key,
                 )
             )
-            self._attach_primary_key_index(installed, statistics, undo)
-            self._attach_vector_columns(installed, statistics, catalog, undo)
+            self._attach_primary_key_index(installed, statistics, undo, txn)
+            self._attach_vector_columns(installed, statistics, catalog, undo, txn)
             statistics["tables_created"] = statistics.get("tables_created", 0) + 1
         elif isinstance(node, CreateRelTable):
             installed = catalog.add_table(
@@ -1278,7 +1278,7 @@ class QueryEngine:
                     to_table=node.to_table,
                 )
             )
-            self._attach_endpoint_indexes(installed, statistics, undo)
+            self._attach_endpoint_indexes(installed, statistics, undo, txn)
             statistics["tables_created"] = statistics.get("tables_created", 0) + 1
         else:  # pragma: no cover - the caller checked the type
             raise GrafxPlanError(
@@ -1397,7 +1397,11 @@ class QueryEngine:
         return tuple(sorted(self._skipped_indexes))
 
     def _attach_primary_key_index(
-        self, table: TableDef, statistics: dict[str, int], undo: list[tuple[str, str]]
+        self,
+        table: TableDef,
+        statistics: dict[str, int],
+        undo: list[tuple[str, str]],
+        txn: object,
     ) -> None:
         """Create the index covering the primary key of a table this statement just created.
 
@@ -1424,9 +1428,13 @@ class QueryEngine:
             if index is None:
                 return
             existed = self._pool.storage.exists(index.file)
-            self._indexes.register(
+            registered = self._indexes.register(
                 index, complete_through=self._published_lsn_for_new_index()
             )
+            # The table is empty, but the index still has to certify the commit that makes the
+            # table visible. Staging the empty observation binds that certificate to THIS schema
+            # transaction instead of letting an unrelated concurrent commit advance it.
+            registered.stage_empty_observation(txn)
             undo.append(("index", index.definition.name))
             if not existed:
                 undo.append(("file", index.file))
@@ -1455,7 +1463,11 @@ class QueryEngine:
         statistics["indexes_created"] = statistics.get("indexes_created", 0) + 1
 
     def _attach_endpoint_indexes(
-        self, table: TableDef, statistics: dict[str, int], undo: list[tuple[str, str]]
+        self,
+        table: TableDef,
+        statistics: dict[str, int],
+        undo: list[tuple[str, str]],
+        txn: object,
     ) -> None:
         """Create the two indexes covering the endpoints of a relationship table just declared.
 
@@ -1472,9 +1484,10 @@ class QueryEngine:
                 table, self._pool, self._metrics.sink
             ):
                 existed = self._pool.storage.exists(index.file)
-                self._indexes.register(
+                registered = self._indexes.register(
                     index, complete_through=self._published_lsn_for_new_index()
                 )
+                registered.stage_empty_observation(txn)
                 undo.append(("index", index.definition.name))
                 if not existed:
                     undo.append(("file", index.file))
@@ -1513,6 +1526,7 @@ class QueryEngine:
         statistics: dict[str, int],
         catalog: Catalog | None = None,
         undo: list[tuple[str, str]] | None = None,
+        txn: object | None = None,
     ) -> None:
         """Create the index of every embedding space a new table declares a column in.
 
@@ -1547,6 +1561,8 @@ class QueryEngine:
             )
         for space in spaces:
             attached = attach(table, space, catalog)
+            if txn is not None:
+                attached.stage_empty_observation(txn)
             if undo is not None:
                 undo.append(("index", attached.definition.name))
                 undo.append(("space", space))

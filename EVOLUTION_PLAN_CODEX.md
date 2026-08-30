@@ -7,7 +7,7 @@
 **Ambiente principal:** Windows, Python 3.13.1
 **Escopo:** integridade, recuperação, concorrência, estabilidade, performance, API, configuração e novas capacidades.
 
-## Estado de execução — 2026-08-28
+## Estado de execução — 2026-08-29
 
 - **M0 estabilização: concluído e publicado** em
   `milestone/m0-stabilization@e2d6a22da8ec2571127fc9d1533995d40330c632`. Os cinco P0
@@ -22,7 +22,22 @@
   branch M1, executar a suíte completa e publicar um SHA imutável. M2 inicia identity-range leasing
   somente depois desse gate.
 - **Compatibilidade Okto Pulse: M-PULSE-1 a M-PULSE-6 concluídos e certificados conforme o quadro
-  9.7; M-PULSE-7 é o próximo gate serial.** O fechamento M-PULSE-6 está publicado em
+  9.7; M-PULSE-7 está em execução e permanece o gate serial.** O primeiro trace representativo
+  expôs um blocker de performance, não de semântica: no mesmo workload, Ladybug concluiu em
+  aproximadamente `8m44s` (`~19,1 ops/s`) e Grafx em `16h10m58s` (`~0,172 ops/s`). A causa
+  dominante reproduzida foi a atualização/flush de page 0 de índices de tabelas não relacionadas
+  em cada commit, agravada por varreduras globais de namespace no Windows. O RUN #4 posterior foi
+  interrompido deliberadamente em 2026-08-29 e não produz verdict; ele será substituído por
+  medições limpas após a estabilização. A frente A1 em `perf/a-index-freshness` troca o piso global
+  pelo high-water físico da tabela coberta, preserva o teto publicado e a marca stale durável para
+  qualquer row intent sem observação do índice, inclusive para readers estrangeiros longevos. A
+  frente B está isolada em `perf/b-storage-namespace` pelo handoff Nexus
+  `hof_7a5be05b5b644b609b92b5e8c09fdeea`. O relatório Codex está congelado no commit
+  `aa3de79f`; o plano/harness conjunto continua em revisão no handoff
+  `hof_1ad44f9d92d04f58abbcfe4a6e316ba6` e só será aceito com árvore limpa e hashes finais. Isso
+  não cria novo gate: é a correção necessária para que o gate M-PULSE-7 já congelado termine no
+  limite externo de 30 segundos por operação sem enfraquecer durabilidade, recovery ou recusa de
+  respostas curtas. O fechamento M-PULSE-6 está publicado em
   Pulse Community `milestone/grafx-mpulse6-assembly@d1e988a`, Pulse Core
   `milestone/grafx-mpulse6-logical-transfer-manifest@ccc1f34` e Grafx `main@1bbb839`. A regressão
   oficial congelada passou `4890 passed, 3 skipped, 13 deselected` em `8150.11 s`, sem repetir
@@ -1798,11 +1813,9 @@ uma mudança de formato ou semântica fica concentrado no Grafx, no adapter Comm
 Cada milestone deve ter branch, commit e push próprios, suíte direcionada, suíte global verde,
 revisão independente por um segundo agente e SHA imutável antes do merge serial em `main`.
 
-Por orientação do usuário em 2026-08-28, Claude e Nexus estão suspensos da execução corrente até
-autorização explícita em contrário. Enquanto essa suspensão vigorar, a revisão independente é feita
-somente por agentes Codex, sem consulta, mensagem ou monitoramento no Nexus. Referências históricas
-a revisões Claude/Nexus permanecem neste registro como proveniência dos marcos já concluídos; elas
-não representam dependência operacional dos próximos gates.
+Por orientação posterior do usuário em 2026-08-29, Claude voltou a participar da execução pelo
+Nexus. A divisão corrente mantém implementação, revisão e medição em responsabilidades separadas;
+nenhum resultado delegado é integrado sem validação final do Codex e sem o gate do milestone.
 
 ### 9.7 Registro de execução e evidências
 
@@ -1857,6 +1870,7 @@ não representam dependência operacional dos próximos gates.
 | M-PULSE-5 — integração e aceite final | concluído, verificado, publicado e promovido | factories `f73cdf4e1e5a64c48e285f514f27d16a2d913853` → `a4a5ec11bc20490fef7395066647a2152651291f`; matriz `d61f3a875952cf6fbf9bb4be177c9a98a98d83d0`; integração `milestone/grafx-mpulse5-integration@08e4fa71dce08d3d3a99929ed0c68a44fc260631`; Pulse Community `feature/v0.3.3@e73a446a954e039fb038f8fa329236b51104504a`; auditoria Nexus `hof_2b2ca8a48e4b472abe9f51e92c765138` concluída/verificada/PASS | Factories fail-closed compartilham a mesma autoridade Board 69/`graph.lbug` e Global 7/`discovery.lbug`. A matriz congelada A1/A2/B1/C1/C2/D1/D2/D3 passou 32/32, foi repetida 32/32 pelo Claude e a regressão consolidada passou 189/189; Ruff, Black, compileall e diff-check verdes. Core `098a346` foi pinado explicitamente para impedir import acidental do pacote instalado; árvore promovida e testada têm o mesmo tree hash `76b9bd8979f9345aa05d9c613716291eeb2ee95b` |
 | M-PULSE-6 — fundação, resolver, pinning e primeiro lote roteado | checkpoint histórico concluído; supersedido pelo fechamento abaixo | Pulse Community `origin/milestone/grafx-mpulse6-integration@c524813`; commits integrados `00247fc..c524813`; resolver `559647b` + hardening P0 `6d0dc2` (origem revisada `b346ddc`); pool/pinning `fb21702` + correção terminal `8f54dc1`; Board facades `789c07c`, directory quarantine/restore `0092e6b` + inventário terminal `87641f3`, recovery offline `3231eba`, `init` neutro `03e96da`, transação roteada `f154cb9`, pin `okto-grafx[accel]==0.0.1` em `fb18d53`, lifecycle `171c6d2` e handshake `c524813`; Core inicial `8d2dbcb`; engine LIMIT originado em `b3fd6e4` e integrado em Grafx `main@1bbb839` | Board store/Cypher/schema/runtime/transação/lifecycle têm facades explícitas com snapshot imutável e revalidação física; o lifecycle não cria binding implicitamente e passou regressão independente 130/130. O manifesto Core/Community reconhece `logical_transfer`, eliminando os bridges do baseline. Quarantine/restore autentica a geração completa. Os gaps então abertos de Global, composição, provenance, conformance e regressão longa foram fechados no marco seguinte. O residual não corruptivo do receipt pós-rename permanece explicitamente rastreado para a auditoria de release; os bytes e o snapshot final permanecem seguros |
 | M-PULSE-6 — bundle integral, recovery e certificação instalável | concluído, certificado e publicado nos milestones; M-PULSE-7 autorizado | Pulse Community `milestone/grafx-mpulse6-assembly@d1e988a` (`b4e27ff`, `f42d2e9`, `d1e988a`); Pulse Core `milestone/grafx-mpulse6-logical-transfer-manifest@ccc1f34` (`a9cf33d`, `ccc1f34`); Grafx `main@1bbb839` (`55e025e`, `1bbb839`) | Bundle único Board+Global compartilha binding store, resolver e pool; startup, CLI, restore, shutdown e rebuild não fazem fallback silencioso. Auditoria de interface 91/91; regressão roteada 232/232; conformance real Ladybug/Grafx 1/1; wheel Grafx `0.0.1` isolado com `[accel]`, `uv pip check`, bindings Board/Global e catálogos 81/11; recovery-only 220/220 aplicáveis; F13/AF21 25/25; gate curto 32/32; checks estáticos verdes e zero import Grafx no Core. A execução oficial completa no estado commitado fechou as 36 falhas diagnósticas anteriores e terminou em `4890 passed, 3 skipped, 13 deselected, 5 warnings` em `8150.11 s`; JUnit SHA-256 `d4d5bfc33cb9aa5d22a03e8f078dbd5df97dc94f6a7821a89b15737a33f14498`. A freeze pré-publicação do `uv.lock` Community ainda não é resolvível pelo índice enquanto `okto-grafx==0.0.1` não existir no PyPI; regenerar o lock a partir do índice imediatamente após a publicação conjunta, sem inserir URL/path local fictício |
+| M-PULSE-7 — estabilização de performance A1/B | em execução; A1 certificada no branch, ainda sem SHA congelado; B delegada e isolada | base Grafx `6d9b7a1`; branch A1 `perf/a-index-freshness`; handoff B `hof_7a5be05b5b644b609b92b5e8c09fdeea`; plano/harness `hof_1ad44f9d92d04f58abbcfe4a6e316ba6`; relatório Codex `aa3de79f` | A1 remove o fan-out de page 0 entre tabelas, deriva high-water somente de headers do heap e mantém fail-closed local/reopen/cross-process para índice omitido. Gates no código final: regressão ampla 1.707/1.707, índices 202/202, query/public concurrency 311/311, nullable/vector visibility 29/29 e txn index-wiring/commit-protocol 65/65; Ruff e diff-check verdes. A sonda `e722a3d...` é QUARANTINED: árvore contaminada, 7/12 famílias e nenhum baseline/RC0 aceito; somente a atribuição direcional RC2/RC3 em arquivos não modificados é reutilizável. RUN #4 foi parado por decisão explícita e não tem verdict |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria

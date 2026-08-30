@@ -1,11 +1,12 @@
-"""M0B invariant 3: an index is never certified fresh behind the checkpoint or ahead of the published position.
+"""M0B invariant 3: index certification stays inside table history and publication.
 
 Freshness is a claim about a log position. An index AHEAD of the published position holds
 entries for a commit the published snapshot cannot see -- the shape a crash between the index
-flush and the ``commit.state`` publication leaves -- and an index BEHIND the checkpoint lacks
-entries every snapshot can see. Neither may be handed to the planner as fresh: either the
-published position is brought up to the log (P0.1 republishes ``commit.state`` in recovery) or
-the index is marked stale and rebuilt.
+flush and the ``commit.state`` publication leaves. An index BEHIND the committed physical
+high-water mark of its own table can omit a visible row. Neither may be handed to the planner as
+fresh: either the published position is brought up to the log (P0.1 republishes ``commit.state``
+in recovery) or the index is marked stale and rebuilt. Commits to unrelated tables do not raise
+this index's required floor.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ def test_an_index_ahead_of_the_published_position_is_never_certified_fresh() -> 
     release_ports(registry)
 
 
-def test_an_index_behind_the_checkpoint_is_stale_or_rebuilt_never_certified_as_it_stands(
+def test_an_index_missing_its_tables_checkpoint_state_is_stale_or_rebuilt(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "db"
@@ -55,12 +56,12 @@ def test_an_index_behind_the_checkpoint_is_stale_or_rebuilt_never_certified_as_i
     index_file = next(
         p for p in root.rglob("*") if p.is_file() and "pk_Person" in p.name
     )
-    index_file.unlink()  # the index is now infinitely behind the checkpoint
+    index_file.unlink()  # the replacement must cover the table state captured by the checkpoint
     with connect(root, page_size=512) as reopened:
         for index in reopened.indexes.indexes():
             if index.name != "pk_Person":
                 continue
             assert index.stale or index.built_through_lsn >= checkpoint, (
-                f"{index.name} certified fresh at {index.built_through_lsn} behind checkpoint "
-                f"{checkpoint}"
+                f"{index.name} was certified fresh at {index.built_through_lsn} after its "
+                f"checkpointed table state at {checkpoint} was removed"
             )

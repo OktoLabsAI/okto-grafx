@@ -48,9 +48,10 @@ def _rebuild(database: object, through: int, txn_id: int) -> None:
 def _two_row_rebuild_fixture():
     database = build_database()
     first = _insert_exact(database, 1, "Ada", BORN, 1)
-    second = database.insert(2, "Ada", LATER)
     database.pool.flush(database.heap.file)
     reader = cold_view(database)
+    second = database.insert(2, "Ada", LATER)
+    database.pool.flush(database.heap.file)
     key = database.key(1, "Ada")
     assert reader.manager.lookup(reader.exact.name, key, SnapshotDouble(BORN)) == (first,)
     return database, reader, key, first, second

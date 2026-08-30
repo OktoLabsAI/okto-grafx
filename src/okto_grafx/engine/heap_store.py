@@ -31,13 +31,17 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import (
+    NO_CSN,
+    NO_LSN,
     NO_PAGE,
     PROVISIONAL_CSN,
     Csn,
+    Lsn,
     PageIndex,
     RecordId,
     RecordRef,
     SlotId,
+    is_committed_csn,
     is_open_end_csn,
     is_provisional_csn,
 )
@@ -775,6 +779,47 @@ class HeapStore:
         self._end_version(table, ref, xmax, deleted=True)
 
     # --- reading ---------------------------------------------------------------------------
+
+    def committed_high_water(self, table: TableDef) -> Lsn:
+        """Return the highest committed birth or end stamp stored for ``table``.
+
+        Index freshness is a property of the table an index covers, not of unrelated commits
+        elsewhere in the database. This deliberately walks only record headers: payloads and
+        overflow chains are irrelevant to the watermark and decoding them would turn an
+        open-time integrity check into a full logical table scan.
+
+        ``NO_CSN`` means that no committed version or end is present. Provisional stamps are
+        abandoned, unpublished attempts and therefore cannot raise the committed watermark.
+        """
+        high_water: Lsn = NO_LSN
+        for _ref, header, _content in self._walk(table):
+            if is_committed_csn(header.xmin):
+                high_water = max(high_water, header.xmin)
+            elif header.xmin != NO_CSN and not is_provisional_csn(header.xmin):
+                raise GrafxCorruptionDetected(
+                    f"Record {header.record_id} of table {table.name!r} has invalid birth "
+                    f"stamp {header.xmin}.",
+                    file=self._file,
+                    table=table.name,
+                    table_id=table.table_id,
+                    record_id=header.record_id,
+                    field="xmin",
+                    value=header.xmin,
+                )
+            if is_committed_csn(header.xmax):
+                high_water = max(high_water, header.xmax)
+            elif header.xmax != NO_CSN and not is_provisional_csn(header.xmax):
+                raise GrafxCorruptionDetected(
+                    f"Record {header.record_id} of table {table.name!r} has invalid end "
+                    f"stamp {header.xmax}.",
+                    file=self._file,
+                    table=table.name,
+                    table_id=table.table_id,
+                    record_id=header.record_id,
+                    field="xmax",
+                    value=header.xmax,
+                )
+        return high_water
 
     def read(self, ref: RecordRef) -> HeapVersion:
         """Return the version stored at that location, whichever table it belongs to."""

@@ -35,13 +35,14 @@ lookups raise instead of answering with a set that might be missing a row. The r
 :meth:`IndexManager.rebuild`, which re-derives every entry from the heap inside a transaction, so
 the repair is itself covered by the log.
 
-The position moves only on a commit that had something for THAT index, which makes
-:meth:`IndexManager.open` an OPEN-TIME check rather than a running one: a database that has been
-committing to one table would otherwise find every other index behind the published position and
-call it stale. Recovery closes the gap with :meth:`IndexManager.mark_built_through`, which is the
-one thing an index cannot know for itself -- that the replay just finished was complete. The
-conservative direction is deliberate: an index never claims to cover a position it cannot show it
-covers, and the cost of being wrong that way is a rebuild rather than a missing row.
+The position moves only on a commit that had something for THAT index. At open time the claimed
+position is compared with the highest committed physical version of THAT index's table, while the
+database-wide published position remains the upper bound. A commit to another table therefore
+does not rewrite this index merely to keep a global clock level. Recovery closes a retained-WAL
+gap with :meth:`IndexManager.mark_built_through`, which is the one thing an index cannot know for
+itself -- that the replay just finished was complete. The conservative direction is deliberate:
+an index never claims to cover a position it cannot show it covers, and the cost of being wrong
+that way is a rebuild rather than a missing row.
 
 *Every walk over a derived structure terminates.* A bucket is a chain of pages, and every walk
 carries a visited set and a bound taken from the file's own page count, so damaged links fail
@@ -281,6 +282,7 @@ class IndexStore:
         "_rebuild_authority",
         "_completed_rebuild_through",
         "_replaying",
+        "_table_high_water",
     )
 
     def __init__(
@@ -325,6 +327,9 @@ class IndexStore:
         # ``clear_stale`` call cannot accidentally clear a newer foreign participant's mark.
         self._completed_rebuild_through: Lsn | None = None
         self._replaying: bool = False
+        # Bound by IndexManager after a table-aware open and advanced by local commits. ``None``
+        # preserves the standalone IndexStore contract, whose caller supplies the whole floor.
+        self._table_high_water: Lsn | None = None
         if metrics.enabled:
             for descriptor in INDEX_METRICS:
                 metrics.register(descriptor)
@@ -717,8 +722,14 @@ class IndexStore:
     def _cache_rebased(self) -> None:
         """Notify derived in-memory structures that their paged source was discarded."""
 
+    def _required_table_position(self, requested_lsn: Lsn) -> Lsn:
+        """Restrict a database snapshot to the covered table's committed history."""
+        high_water = self._table_high_water
+        return requested_lsn if high_water is None else min(requested_lsn, high_water)
+
     def begin_exact_read(self, required_lsn: Lsn) -> _IndexReadCertificate:
         """Attach cached derived state to one fresh healthy durable certificate."""
+        required_lsn = self._required_table_position(required_lsn)
         certificate = self._fresh_certificate()
         recovering = self._foreign_healthy_replaces_stale(certificate, required_lsn)
         self._require_safe_certificate(certificate, required_lsn)
@@ -743,6 +754,7 @@ class IndexStore:
         self, before: _IndexReadCertificate, required_lsn: Lsn
     ) -> bool:
         """Say whether traversal+heap validation stayed inside one durable index view."""
+        required_lsn = self._required_table_position(required_lsn)
         after = self._fresh_certificate()
         if after == before:
             self._require_safe_certificate(after, required_lsn)
@@ -939,15 +951,20 @@ class IndexStore:
         self,
         published_lsn: Lsn,
         *,
+        required_lsn: Lsn | None = None,
         persist: bool = True,
         allow_ahead: bool = False,
     ) -> bool:
-        """Compare the position this index claims against the one the database published.
+        """Check this index between its table's required floor and the published ceiling.
 
         This is the only detector of staleness in the component, and the flag it sets is the only
         gate the read path consults. Keeping detection and memory apart is what makes each of
         them testable on its own (amendment A67): a test can set the flag without a published
         position, and can move the published position without a flag already set.
+
+        Direct index callers that omit ``required_lsn`` retain the original global comparison.
+        The manager supplies the covered table's physical high-water mark so unrelated commits
+        neither stale this index nor force a page-0 rewrite.
         """
         if isinstance(published_lsn, bool) or not isinstance(published_lsn, int):
             raise GrafxIndexError(
@@ -964,6 +981,31 @@ class IndexStore:
                 value=published_lsn,
                 index=self.name,
             )
+        required = published_lsn if required_lsn is None else required_lsn
+        if isinstance(required, bool) or not isinstance(required, int):
+            raise GrafxIndexError(
+                f"A required index position must be an integer; got "
+                f"{type(required).__name__}.",
+                field="required_lsn",
+                value=repr(required),
+                index=self.name,
+            )
+        if required < NO_LSN:
+            raise GrafxIndexError(
+                f"A required index position must not be negative; got {required}.",
+                field="required_lsn",
+                value=required,
+                index=self.name,
+            )
+        if required > published_lsn and not allow_ahead:
+            raise GrafxIndexError(
+                f"Index {self.name!r} was given required position {required}, ahead of the "
+                f"database's published position {published_lsn}.",
+                field="required_lsn",
+                value=required,
+                published_lsn=published_lsn,
+                index=self.name,
+            )
         certificate = self._fresh_certificate()
         header = certificate.header
         if header.flags & INDEX_FLAG_STALE:
@@ -973,11 +1015,12 @@ class IndexStore:
             elif self._stale_device_seq is not None:
                 self._stale_device_seq = certificate.seq
             return True
-        if header.built_through_lsn < published_lsn:
+        if header.built_through_lsn < required:
             reason = (
                 f"Index {self.name!r} covers the log through position "
-                f"{header.built_through_lsn} and the database has published "
-                f"{published_lsn}, so a lookup could omit a row."
+                f"{header.built_through_lsn}, but its table requires coverage through "
+                f"{required} under database published position {published_lsn}, so a lookup "
+                "could omit a row."
             )
             if persist:
                 self.mark_stale(reason)
@@ -1187,6 +1230,10 @@ class IndexStore:
         """Return the changes this transaction has staged into this index, in order."""
         staged = self._staged.get(self._require_txn(txn))
         return () if staged is None else tuple(staged.changes)
+
+    def observed(self, txn: StagingTransaction) -> bool:
+        """Return whether this index observed its covered table in the transaction."""
+        return self._require_txn(txn) in self._staged
 
     def rollback(self, txn: StagingTransaction) -> int:
         """Drop everything this transaction staged, and return how many changes were dropped."""
@@ -2471,12 +2518,7 @@ class ProximityIndex(IndexStore):
 
 
 def _tables_written_by(txn: object) -> frozenset[int] | None:
-    """Return the ids of the tables this transaction wrote rows of, or None if it cannot say.
-
-    None is not "no tables". It means the transaction does not describe its row intents in a shape
-    this can read, and the caller must then assume the worst -- that any index may have been owed
-    an entry -- rather than granting freshness it cannot justify.
-    """
+    """Return row-intent table ids, or None when the transaction cannot prove them."""
     intents = getattr(txn, "row_intents", None)
     if intents is None:
         return None
@@ -2484,7 +2526,7 @@ def _tables_written_by(txn: object) -> frozenset[int] | None:
     for intent in intents:
         table_id = getattr(getattr(intent, "table", None), "table_id", None)
         if not isinstance(table_id, int) or isinstance(table_id, bool):
-            return None  # an intent whose table cannot be named makes the whole answer unsafe
+            return None
         tables.add(table_id)
     return frozenset(tables)
 
@@ -2619,6 +2661,7 @@ class IndexManager:
         "_metrics",
         "_indexes",
         "_published_lsn",
+        "_table_watermarks",
         "_heap_cache_certificates",
     )
 
@@ -2629,6 +2672,7 @@ class IndexManager:
         self._metrics: MetricsSink = metrics
         self._indexes: dict[str, IndexStore] = {}
         self._published_lsn: Lsn = NO_LSN
+        self._table_watermarks: dict[int, Lsn] = {}
         # Exact answers validate index candidates against heap pages.  The index certificate is
         # therefore also the clock for the heap cache used by that validation: every committed
         # row change of the covered table advances its maintained index page 0 before becoming
@@ -2704,9 +2748,46 @@ class IndexManager:
         # Startup registers durable files before recovery has loaded the authoritative published
         # ceiling into the manager. Being ahead of this provisional value is therefore allowed;
         # the final ``open`` checks both sides after recovery.
-        index.check_freshness(
-            self._published_lsn, persist=persist_stale, allow_ahead=True
-        )
+        cached_required = self._table_watermarks.get(index.definition.table_id)
+        if cached_required is not None:
+            index._table_high_water = cached_required
+            index.check_freshness(
+                max(self._published_lsn, cached_required),
+                required_lsn=cached_required,
+                persist=persist_stale,
+                allow_ahead=False,
+            )
+        elif self._published_lsn == NO_LSN:
+            # Composition registers durable files before recovery and DDL registers a new
+            # table's indexes before that table is installed in the transaction's catalog
+            # picture. At this provisional position the heap cannot be used as a final floor:
+            # retained WAL may still repair it, or the table may not be visible here yet. The
+            # replay-floor check and final open perform the authoritative table-aware checks.
+            index.check_freshness(
+                NO_LSN,
+                required_lsn=NO_LSN,
+                persist=persist_stale,
+                allow_ahead=True,
+            )
+        else:
+            try:
+                table = self._heap.catalog.catalog.table_by_id(index.definition.table_id)
+            except GrafxCorruptionDetected as failure:
+                if failure.details.get("field") != "table_id":
+                    raise
+                # A schema transaction can attach the accelerator before publishing the table.
+                # Its explicit complete_through certificate is the only floor available here;
+                # final open still refuses a genuinely orphaned definition.
+                required = NO_LSN
+            else:
+                required = self._heap.committed_high_water(table)
+                self._record_table_watermark(index.definition.table_id, required)
+            index.check_freshness(
+                self._published_lsn,
+                required_lsn=required,
+                persist=persist_stale,
+                allow_ahead=False,
+            )
         if not index.stale:
             try:
                 index._stable_view(
@@ -2774,6 +2855,32 @@ class IndexManager:
 
     # --- freshness --------------------------------------------------------------------------
 
+    def _table_high_waters(
+        self, indexes: Sequence[IndexStore]
+    ) -> dict[int, Lsn]:
+        """Read each covered table's committed physical watermark exactly once."""
+        high_waters: dict[int, Lsn] = {}
+        for index in indexes:
+            table_id = index.definition.table_id
+            if table_id in high_waters:
+                continue
+            table = self._heap.catalog.catalog.table_by_id(table_id)
+            high_waters[table_id] = self._heap.committed_high_water(table)
+        return high_waters
+
+    def _replace_table_watermarks(self, high_waters: Mapping[int, Lsn]) -> None:
+        """Bind every index to one open-time physical table-watermark picture."""
+        self._table_watermarks = dict(high_waters)
+        for index in self.indexes():
+            index._table_high_water = high_waters.get(index.definition.table_id)
+
+    def _record_table_watermark(self, table_id: int, lsn: Lsn) -> None:
+        """Advance one locally observed table floor and bind all of its indexes to it."""
+        position = max(self._table_watermarks.get(table_id, NO_LSN), lsn)
+        self._table_watermarks[table_id] = position
+        for index in self.indexes_for(table_id):
+            index._table_high_water = position
+
     @property
     def published_lsn(self) -> Lsn:
         """Return the log position this manager was last told the database had published."""
@@ -2792,12 +2899,33 @@ class IndexManager:
         between rebuilding them and running without them. Nothing is repaired here: a repair
         writes to the log and therefore belongs inside a transaction the caller owns.
         """
-        self._published_lsn = _require_position("published_lsn", published_lsn)
+        published = _require_position("published_lsn", published_lsn)
+        indexes = self.indexes()
+        high_waters = self._table_high_waters(indexes)
+        for index in indexes:
+            required = high_waters[index.definition.table_id]
+            if required > published:
+                table = self._heap.catalog.catalog.table_by_id(index.definition.table_id)
+                raise GrafxCorruptionDetected(
+                    f"Table {table.name!r} contains committed physical state through "
+                    f"position {required}, ahead of the database's published position "
+                    f"{published}.",
+                    file=self._heap.file,
+                    table=table.name,
+                    table_id=table.table_id,
+                    index=index.name,
+                    field="table_high_water",
+                    value=required,
+                    published_lsn=published,
+                )
+        self._replace_table_watermarks(high_waters)
+        self._published_lsn = published
         return tuple(
             index
-            for index in self.indexes()
+            for index in indexes
             if index.check_freshness(
                 self._published_lsn,
+                required_lsn=high_waters[index.definition.table_id],
                 persist=persist_stale,
                 allow_ahead=allow_ahead,
             )
@@ -2815,10 +2943,17 @@ class IndexManager:
         live handle.
         """
         floor = _require_position("checkpoint_lsn", checkpoint_lsn)
+        indexes = self.indexes()
+        high_waters = self._table_high_waters(indexes)
         return tuple(
             index
-            for index in self.indexes()
-            if index.check_freshness(floor, persist=persist_stale, allow_ahead=True)
+            for index in indexes
+            if index.check_freshness(
+                floor,
+                required_lsn=min(high_waters[index.definition.table_id], floor),
+                persist=persist_stale,
+                allow_ahead=True,
+            )
         )
 
     def mark_built_through(self, lsn: Lsn) -> None:
@@ -3108,32 +3243,46 @@ class IndexManager:
         """
         applied = 0
         touched: list[str] = []
-        written = _tables_written_by(txn)
-        for index in self.indexes():
+        written_tables = _tables_written_by(txn)
+        observed_tables: set[int] = set(written_tables or ())
+        indexes = self.indexes()
+        observations = {index.name: index.observed(txn) for index in indexes}
+        staged_tables = {
+            index.definition.table_id
+            for index in indexes
+            if observations[index.name]
+        }
+        for index in indexes:
+            observed = observations[index.name]
             moved = index.commit(txn, csn)
+            if observed:
+                observed_tables.add(index.definition.table_id)
+            elif (
+                written_tables is not None
+                and index.definition.table_id in written_tables
+            ) or (
+                written_tables is None
+                and index.definition.table_id in staged_tables
+            ):
+                # A row intent without even an empty observation is a short index, not an
+                # unrelated commit.  The table watermark below protects this handle and an
+                # open-time heap scan protects a reopened one; the durable mark is what protects
+                # a participant that already cached the older table watermark.  Every read takes
+                # a fresh page-0 certificate, so it observes this refusal without IPC or a
+                # database-wide page-0 fanout.
+                # A generic staging double may not expose row intents. In that compatibility
+                # shape, an observation on a sibling index is evidence that THIS table was
+                # processed; no observation anywhere is evidence of no index work, not of a
+                # hidden heap mutation.
+                index.mark_stale(
+                    f"Commit {csn} wrote table {index.definition.table_id}, but index "
+                    f"{index.name!r} staged no row observation and may omit a visible row."
+                )
             if moved:
                 applied += moved
                 touched.append(index.file)
-            elif written is not None and index.definition.table_id not in written:
-                # This commit staged nothing for this index BECAUSE it wrote no row of the table
-                # the index covers. The index has therefore seen everything there was to see
-                # through this position, and saying so is what keeps it from going stale for a
-                # commit that had nothing to do with it.
-                #
-                # Without this, an index went stale the moment ANY commit happened after it was
-                # created and before it received its first entry -- so "create the schema in one
-                # session, load the data in the next" left every index of that database
-                # permanently stale, and permanently is the right word: `_advance` refuses to move
-                # a stale index, so the loads that followed could never lift it and only a rebuild
-                # could. Reproduced on the vector index before any of this existed: create a table
-                # with a vector column, close, reopen -> stale, and inserting rows did not clear
-                # it.
-                #
-                # The condition is narrow ON PURPOSE. An index whose table WAS written and which
-                # staged nothing is exactly the shape of defect E3 -- a commit that populated no
-                # index at all -- and that case still goes stale, which is the alarm that found
-                # E3 in the first place. Advancing unconditionally here would have silenced it.
-                index.advance_built_through(csn)
+        for table_id in observed_tables:
+            self._record_table_watermark(table_id, csn)
         for file in touched:
             # A page applied into this process's pool is invisible to every other process until
             # it reaches the device, and the commit is about to publish a position that says the
@@ -3143,7 +3292,7 @@ class IndexManager:
         # These certificates name images published by THIS pool. Binding them does not discard
         # the dirty/current heap frames that supplied the same commit. A later foreign page-0
         # generation differs and takes the zero-write rebase path before validation.
-        for index in self.indexes():
+        for index in indexes:
             self._bind_local_heap_view(index)
         return applied
 

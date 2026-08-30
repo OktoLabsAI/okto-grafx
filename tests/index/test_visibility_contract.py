@@ -68,6 +68,10 @@ class CountingHeap:
         """Yield every stored version of the table, exactly as the real heap does."""
         return self._heap.scan_all(table)
 
+    def committed_high_water(self, table: TableDef) -> int:
+        """Delegate the header-only freshness scan without counting logical row reads."""
+        return self._heap.committed_high_water(table)
+
 
 def _insert(
     heap: HeapStore,
