@@ -181,14 +181,16 @@ def test_each_page_decodes_only_its_rows_and_continuation_does_not_restart(
         _node_schema(database)
         _insert_items(database, *range(1, 10))
         decoded: list[int] = []
-        original = HeapStore._decode_version
+        original = HeapStore._decode_version_with_header
 
-        def counted_decode(store: HeapStore, table: Any, content: bytes) -> Any:
-            version = original(store, table, content)
+        def counted_decode(
+            store: HeapStore, table: Any, header: Any, content: bytes
+        ) -> Any:
+            version = original(store, table, header, content)
             decoded.append(version.record_id)
             return version
 
-        monkeypatch.setattr(HeapStore, "_decode_version", counted_decode)
+        monkeypatch.setattr(HeapStore, "_decode_version_with_header", counted_decode)
         with database.begin("read") as reader:
             first = reader.scan_rows_v1("Item", limit=2)
             assert len(first.rows) == 2

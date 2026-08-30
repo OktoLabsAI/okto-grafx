@@ -1974,9 +1974,7 @@ class IndexStore:
         for page_index in self._bucket_pages(
             bucket_of(wanted, self._definition.bucket_count)
         ):
-            for entry in self._entries_on(page_index):
-                if entry.key == wanted:
-                    found.append(entry)
+            found.extend(self._matching_entries_on(page_index, wanted))
         return tuple(found)
 
     def walk(self) -> tuple[IndexEntry, ...]:
@@ -2005,6 +2003,19 @@ class IndexStore:
                 IndexEntry.decode(payload).located_at(page_index, slot)
                 for slot, payload in page.iter_slots()
             )
+
+    def _matching_entries_on(
+        self, page_index: PageIndex, key: bytes, ref: RecordRef | None = None
+    ) -> tuple[IndexEntry, ...]:
+        """Validate every slot on a page but materialize only entries matching this probe."""
+        found: list[IndexEntry] = []
+        with self._pool.pinned(self.file, page_index) as page:
+            self._require_index_page(page, page_index)
+            for slot in page.live_slots():
+                entry = IndexEntry.decode_if_matches(page.slot_view(slot), key, ref)
+                if entry is not None:
+                    found.append(entry.located_at(page_index, slot))
+        return tuple(found)
 
     # --- reconciliation ---------------------------------------------------------------------
 
@@ -2337,9 +2348,10 @@ class IndexStore:
     ) -> tuple[PageIndex, SlotId, IndexEntry] | None:
         """Return where the entry for this key and heap location lives, or None when it does not."""
         for page_index in pages:
-            for entry in self._entries_on(page_index):
-                if entry.matches(key, ref):
-                    return page_index, entry.slot, entry
+            entries = self._matching_entries_on(page_index, key, ref)
+            if entries:
+                entry = entries[0]
+                return page_index, entry.slot, entry
         return None
 
     def _require_index_page(self, page: Page, page_index: PageIndex) -> None:

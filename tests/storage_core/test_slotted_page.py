@@ -66,6 +66,19 @@ def test_inserting_returns_consecutive_slot_ids_and_reads_back() -> None:
     assert page.dirty
 
 
+def test_a_slot_view_is_read_only_and_names_the_live_payload_without_a_copy() -> None:
+    page = build()
+    slot = page.insert_slot(b"payload")
+
+    view = page.slot_view(slot)
+
+    assert isinstance(view, memoryview)
+    assert view.readonly
+    assert bytes(view) == b"payload"
+    with pytest.raises(TypeError):
+        view[0] = ord("P")
+
+
 def test_the_free_counters_follow_every_insertion() -> None:
     page = build()
     page.insert_slot(b"x" * 10)

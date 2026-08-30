@@ -270,6 +270,16 @@ class Page:
         offset, length = self._entry(slot)
         return bytes(self._data[offset : offset + length])
 
+    def slot_view(self, slot: SlotId) -> memoryview:
+        """Return a read-only view of a live slot without copying its payload.
+
+        The view is a short-lived decode aid: callers must consume it while they still own the
+        page pin and must not retain it across a page mutation.  Returning it read-only keeps a
+        decoder from bypassing the page's dirty tracking and slot geometry.
+        """
+        offset, length = self._entry(slot)
+        return memoryview(self._data)[offset : offset + length].toreadonly()
+
     def slot_length(self, slot: SlotId) -> int:
         """Return the payload length of the slot."""
         return self._entry(slot)[1]

@@ -295,6 +295,27 @@ def test_a_scan_shows_a_version_only_to_a_snapshot_that_can_see_it(
     assert len(list(heap_store.scan(person_table, at(1000)))) == 5
 
 
+def test_a_scan_decodes_each_stored_record_header_once(
+    heap_store: HeapStore,
+    person_table: TableDef,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for index in range(5):
+        heap_store.insert(person_table, index, (index, f"n{index}"), xmin=10 * (index + 1))
+    calls = 0
+    original = RecordHeader.decode
+
+    def counted(raw: bytes) -> RecordHeader:
+        nonlocal calls
+        calls += 1
+        return original(raw)
+
+    monkeypatch.setattr(RecordHeader, "decode", counted)
+
+    assert len(list(heap_store.scan(person_table, at(35)))) == 3
+    assert calls == 5, "every stored header is inspected, but visible rows must not decode it twice"
+
+
 def test_scan_all_shows_what_a_snapshot_hides(
     heap_store: HeapStore, person_table: TableDef
 ) -> None:

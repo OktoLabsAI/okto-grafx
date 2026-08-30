@@ -23,6 +23,7 @@ from okto_grafx.domain.index import (
     IndexEntry,
     IndexHeader,
     IndexVisibility,
+    bucket_of,
 )
 from okto_grafx.domain.page import (
     HEADER_PAGE_INDEX,
@@ -308,6 +309,78 @@ def test_an_entry_carrying_a_flag_bit_this_build_does_not_know_is_damage() -> No
 
     assert refused.value.details["field"] == "flags"
     assert refused.value.details["value"] == 0x80
+
+
+def test_candidate_and_exact_entry_search_materialize_only_matching_entries(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fill_bucket(database, 60)
+    entries = database.exact.walk()
+    crowded = max(
+        range(TEST_BUCKET_COUNT),
+        key=lambda bucket: sum(
+            len(database.exact._entries_on(page))
+            for page in database.exact._bucket_pages(bucket)
+        ),
+    )
+    in_bucket = tuple(
+        entry
+        for entry in entries
+        if bucket_of(entry.key, TEST_BUCKET_COUNT) == crowded
+    )
+    assert len(in_bucket) > 1
+    wanted = in_bucket[-1]
+    pages = database.exact._bucket_pages(crowded)
+    calls = 0
+    original = IndexEntry.located_at
+
+    def counted(self: IndexEntry, page: int, slot: int) -> IndexEntry:
+        nonlocal calls
+        calls += 1
+        return original(self, page, slot)
+
+    monkeypatch.setattr(IndexEntry, "located_at", counted)
+
+    assert database.exact._candidates_unchecked(wanted.key) == (wanted,)
+    assert calls == 1
+    calls = 0
+    assert database.exact._find_entry(pages, wanted.key, wanted.ref) == (
+        wanted.page,
+        wanted.slot,
+        wanted,
+    )
+    assert calls == 1
+
+
+def test_candidate_search_still_refuses_a_corrupt_non_matching_entry(
+    database: Database,
+) -> None:
+    _fill_bucket(database, 60)
+    entries = database.exact.walk()
+    crowded = max(
+        range(TEST_BUCKET_COUNT),
+        key=lambda bucket: sum(
+            len(database.exact._entries_on(page))
+            for page in database.exact._bucket_pages(bucket)
+        ),
+    )
+    in_bucket = tuple(
+        entry
+        for entry in entries
+        if bucket_of(entry.key, TEST_BUCKET_COUNT) == crowded
+    )
+    assert len(in_bucket) > 1
+    wanted, damaged = in_bucket[0], in_bucket[-1]
+    assert damaged.key != wanted.key
+    with database.pool.pinned(database.exact.file, damaged.page) as page:
+        image = bytearray(page.read_slot(damaged.slot))
+        image[0] |= 0x80
+        page.update_slot(damaged.slot, image)
+
+    with pytest.raises(GrafxCorruptionDetected) as refused:
+        database.exact._candidates_unchecked(wanted.key)
+
+    assert refused.value.details["field"] == "flags"
 
 
 def test_a_live_entry_is_the_one_no_commit_has_ended(database: Database) -> None:
