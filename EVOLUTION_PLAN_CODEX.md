@@ -72,6 +72,27 @@
   SHA-256 `acc672c32d7d91d05e4b4bcf13c16c329fb0f66ae5e752f44565df8e767c5c6f`. Red-first 4/4,
   mutantes do pós-read/fallback/invalidação mortos, 262 testes focados e multiprocesso reproduzidos
   pelo Codex e Ruff passaram; a mesma bateria passou novamente no SHA integrado.
+- **CQ-1/QW-7 aprovado por ganho causal e regressão, com wall temporal inconclusivo nesta
+  rodada.** A cauda do WAL agora é descoberta uma única vez dentro da seção exclusiva de commit;
+  refresh explícito, recovery e a barreira continuam forçando uma redescoberta, e a próxima seção
+  volta a observar anexos de outro processo. Origem revisada/pushed:
+  `perf/w2-cq1-wal-tail-hold@d46c46aea447e6f813b8fbf57d22d5181b3b1642`; integração sobre o
+  main corrente: `7d990bb`. Em todas as 12 famílias do perfil H1-H8.1, as medianas instrumentadas
+  de `WalManager._refresh_tail` e `WalManager._discover` caíram de `8 -> 1` por operação e
+  `LocalStorageDevice.list_files` de `9 -> 2`, enquanto page writes permaneceram idênticos. O
+  perfil concluiu 110 commits preparatórios e 180 operações medidas, 12/12 famílias, exit `0`,
+  com o mesmo digest lógico/harness dos perfis anteriores; artefato
+  `cq1-d46c46a-pf5-h1h8_1.json`, SHA-256
+  `f316c097df2096bb8148b54029bebbee63ef90a8308052ffed29b6365f661cd2`. A soma RAW foi
+  `7.376,78 ms`, contra `6.801,17 ms` na rodada CQ-3, mas a carga do host subiu de
+  `12,8%/8,5%` para `17,7%/22,1%` nas amostras antes/depois; como a alavanca prevista é de apenas
+  `75-160 ms`, esse wall não resolve o delta e não é apresentado como ganho temporal. A promoção
+  se apoia na remoção discriminante de 7 redescobertas/listagens por commit, sem page-write extra,
+  nos quatro mutantes mortos (hold ausente, barreira não-forçada, vazamento do hold por exceção e
+  releitura de `commit.state`), nos testes de append estrangeiro multiprocesso e na bateria
+  integrada WAL/commit/multiprocesso/API em 100%, além de Ruff e diff-check verdes. A premissa
+  multi-writer/multi-reader permanece intacta: o reuso existe somente sob `COMMIT_SECTION`, não
+  atravessa seções e não muda lease, época, publicação ou horizonte de leitores.
 - **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`
