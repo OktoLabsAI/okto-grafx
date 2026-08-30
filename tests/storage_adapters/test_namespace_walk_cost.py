@@ -263,16 +263,18 @@ def test_a_control_file_published_by_another_participant_is_seen_on_a_warm_hit(
     assert device.read_log(CONTROL, 0, 11) == b"published-2"
 
 
-POSIX_ONLY_REDIRECT_UNDER_HANDLE = pytest.mark.skipif(
-    os.name == "nt",
-    reason=(
-        "Windows refuses to rename a directory that holds an open handle, so a redirect cannot "
-        "appear under a cached descriptor there; on POSIX it can, and the warm hit must catch it."
-    ),
+# The three redirect-under-a-cached-descriptor tests run on POSIX only: Windows refuses to
+# rename a directory that holds an open handle, so the redirect cannot appear under a cached
+# descriptor there. Their Windows counterpart is the counting test above, which REQUIRES the
+# guard's lstat calls on every warm hit (G4: the skip is declared per test, marker and family).
+REDIRECT_UNDER_HANDLE_NEEDS_POSIX: str = (
+    "Windows refuses to rename a directory that holds an open handle, so a redirect cannot "
+    "appear under a cached descriptor there; on POSIX it can, and the warm hit must catch it."
 )
 
 
-@POSIX_ONLY_REDIRECT_UNDER_HANDLE
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name == "nt", reason=REDIRECT_UNDER_HANDLE_NEEDS_POSIX)
 def test_a_directory_redirected_to_its_own_original_is_still_refused_on_a_warm_hit(
     board: tuple[LocalStorageDevice, Path],
 ) -> None:
@@ -296,7 +298,8 @@ def test_a_directory_redirected_to_its_own_original_is_still_refused_on_a_warm_h
             original.rename(redirected)
 
 
-@POSIX_ONLY_REDIRECT_UNDER_HANDLE
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name == "nt", reason=REDIRECT_UNDER_HANDLE_NEEDS_POSIX)
 def test_a_root_redirected_to_its_own_original_is_still_refused_on_a_warm_hit(
     board: tuple[LocalStorageDevice, Path],
 ) -> None:
@@ -316,7 +319,8 @@ def test_a_root_redirected_to_its_own_original_is_still_refused_on_a_warm_hit(
             original.rename(root)
 
 
-@POSIX_ONLY_REDIRECT_UNDER_HANDLE
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name == "nt", reason=REDIRECT_UNDER_HANDLE_NEEDS_POSIX)
 def test_a_component_redirected_after_admission_is_refused_on_the_next_access(
     board: tuple[LocalStorageDevice, Path], tmp_path: Path
 ) -> None:
