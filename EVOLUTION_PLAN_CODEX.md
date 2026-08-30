@@ -144,6 +144,43 @@
   `1e29cf39638e5ec1e974308fb888139106761e2dd1c876133785e41158d85990`, mesmo digest lógico,
   harness e checkouts Pulse do CQ-4. Multi-writer/multi-reader permanece intacto: não houve mudança
   de lease, época, publicação, recovery, visibilidade ou protocolo de commit.
+- **CQ-2/QW-4 aprovado por remoção causal discriminante e fases; wall RAW inconclusivo.** O
+  `TransactionManager` arma `_own_published_lsn` somente depois de publicar com sucesso o próprio
+  commit e o invalida antes de qualquer publicação genérica ou observação sem proveniência. A
+  igualdade do token — nunca ordenação — permite ao `BufferPool` preservar apenas frames limpos
+  quando a view moveu pelo commit deste mesmo manager; token estrangeiro, frame sujo ou proveniência
+  ambígua mantém o drop integral. `catalog.dat` continua sempre descartado com bump de época no ramo
+  próprio, cobrindo DDL/espaços fora do movimento de LSN. Origem publicada:
+  `perf/w3-cq2-own-read-view@8ee02c7ff6dc135709bb6b6f8c58dd422f987a17`; integração sobre QW-3:
+  `99107a7` (`2c0b242`, `458f760`, `1df4bc1` e a correção documental `99107a7`). A revisão
+  independente reproduziu 19 testes discriminantes e verificou/PASS o handoff CQ-2
+  `hof_20d1e762b320467cb805815033cc7aa9`; os cenários spawnados cobrem commit estrangeiro,
+  `create_space`, checkpoint+redo+recycle, reopen/recovery e `mark_stale`. A primeira suíte global
+  composta QW-3+CQ-2 passou todo o código funcional e expôs sete falhas de contrato de
+  observabilidade: a métrica nova estava no catálogo, mas não no contrato/dashboard/pins. O
+  follow-up `hof_bd7edcd11a4346b285669eb01533c7c7` foi verificado/PASS: contrato e painel M1 agora
+  congelam `oktografx_read_view_drops_total{view_origin=own|foreign}` sem expor os contadores
+  internos do harness; 661 testes de observabilidade/foundation passaram na entrega e na reprodução,
+  além de Ruff e `diff --check`. Como esse follow-up só alterou contrato, dashboard e transcrições de
+  teste, o restante já verde da suíte global não foi repetido. No gate H1-H8.1/pf5, 110 commits de
+  setup e 180 operações concluíram 12/12 famílias, exit `0`, com host em `9,2%/9,0%`. Somadas as
+  12 famílias instrumentadas, `_read_page` caiu `1.228 -> 124` e `_still_names` `2.631 -> 1.528`;
+  exemplos: create `55 -> 5`, replace `159 -> 10`, projection `231 -> 25` e delete_edges
+  `287 -> 6` leituras. O custo inclusivo de `_read_page` caiu `486,9 ms`; `flush` manteve 55
+  chamadas e variou só `+1,4 ms`. O passe de fases caiu `5.613,44 -> 4.721,70 ms` (`-15,89%`),
+  concentrado em execute (`-20,45%`), e o instrumentado ficou em `+0,12%`. O RAW isolado ficou
+  `4.985,75 -> 5.324,61 ms` (`+6,8%`), mas é inconclusivo nesta janela: os três passes discordam
+  de sinal, o delta cabe na resolução pf5 e o diff não oferece mecanismo compatível com `+338,85`
+  ms enquanto elimina leituras e mantém bytes persistidos/page/index writes idênticos. Os alvos
+  absolutos antigos (~2.500 reads e `_still_names` 20-40) usavam a base anterior a QW-1/QW-3; no
+  denominador integrado, CQ-2 removeu praticamente todo o residual de delete_edges (`287 -> 6`).
+  Por consenso Codex/Claude e pelo critério pré-fixado do relatório (`aceitar por contagens`), não
+  foi feita repetição pf5 incapaz de arbitrar o ruído; uma reancoragem A/B/A ou pf10 fica para o fim
+  da onda, não como novo gate deste patch. Artefato `cq2-99107a7-pf5-h1h8_1.json`, SHA-256
+  `155663b67f3662119057de3fffcc648ef2b6ad63195d978dfcf51ed60e170c85`, mesmo digest lógico,
+  harness e checkouts Pulse. Multi-writer/multi-reader permanece intacto: qualquer publicação
+  estrangeira ou duvidosa conserva a invalidação fail-closed e nenhuma lease, época, horizonte de
+  leitores, recovery ou protocolo de commit foi removido.
 - **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`
