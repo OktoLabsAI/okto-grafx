@@ -120,16 +120,64 @@ def test_a_gap_completed_publication_is_never_own(
     assert not any(gap_token_calls)  # the foreign LSN is never own, wherever it is passed
 
 
-def test_a_checkpoint_does_not_remember_a_publication_as_own(
+def test_a_checkpoint_publication_forfeits_the_own_provenance(
     database_root: Path,
 ) -> None:
+    # Every generic _publish clears the remembered number; only the next
+    # _publish_commit_state re-arms it. A checkpoint therefore costs one full
+    # drop on the next begin -- provenance over thrift.
     stack = build_stack(database_root, wal_factory=_real_wal)
     committed = _commit_one(stack, 3)
     assert stack.manager._own_published_lsn == committed
 
     stack.manager.checkpoint()  # publishes checkpoint_lsn beside the same commit numbers
 
-    assert stack.manager._own_published_lsn == committed  # unchanged: only 3.7 remembers
+    assert stack.manager._own_published_lsn is None
+
+
+def test_a_token_returning_to_an_old_own_number_is_not_own(
+    database_root: Path, monkeypatch,
+) -> None:
+    # A foreign recovery can republish exactly the number this manager once produced. The
+    # provenance was forfeited the moment a view met a token without it, so the returning
+    # number must be met with own=False and a full drop.
+    stack = build_stack(database_root, owner_id="participant-a")
+    own_lsn = _commit_one(stack, 3, b"a-row")
+
+    foreign = build_stack(database_root, owner_id="participant-b")
+    _commit_one(foreign, 4, b"b-row")
+
+    calls: list[tuple[object, bool]] = []
+    original = BufferPool.begin_read_view
+
+    def recording(self, token=None, *args, **kwargs):
+        calls.append((token, bool(kwargs.get("own", False))))
+        return original(self, token, *args, **kwargs)
+
+    monkeypatch.setattr(BufferPool, "begin_read_view", recording)
+
+    txn = stack.manager.begin("read")  # foreign token: provenance forfeited here
+    stack.manager.rollback(txn)
+    assert stack.manager._own_published_lsn is None
+
+    # The foreign recovery republishes exactly the old own number.
+    durable = foreign.manager._read_commit_state()
+    foreign.manager._commit_state_store.publish(
+        CommitState(
+            last_committed_lsn=own_lsn,
+            last_csn=own_lsn,
+            checkpoint_lsn=durable.checkpoint_lsn,
+        )
+    )
+    _warm(stack, 3)
+    txn = stack.manager.begin("read")
+    try:
+        returning = [own for token, own in calls if token == own_lsn]
+        assert returning, "no view was taken over the returning token"
+        assert not any(returning)  # own=False: the old number has no provenance left
+        assert not stack.pool.is_resident(HEAP, 3)  # and the view dropped the frames
+    finally:
+        stack.manager.rollback(txn)
 
 
 def test_the_own_token_is_compared_by_equality_never_by_order(
