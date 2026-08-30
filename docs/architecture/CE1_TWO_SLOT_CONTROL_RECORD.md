@@ -41,7 +41,7 @@ Convenção: testes marcados **(a criar)** ainda não existem; testes sem marca 
 |---|---|---|
 | I1 | **Escritores serializam-se exatamente onde hoje**: a publicação de `commit.state` ocorre dentro de `COMMIT_SECTION` (§8.5 passo 3.7; `engine/txn_manager.py:1695-1703`), a da lease dentro de `LEASE_SECTION`; nenhuma seção nova, nenhum lock de SO adicional, nenhum guard que faça escritor esperar leitor. | `tests/txn/test_txn_multiprocess.py` (existente); **(a criar)** `tests/coordination/test_two_slot_publication_sections.py::test_two_publishers_in_two_processes_never_write_the_same_slot_file_concurrently` |
 | I2 | **Leitores são lock-free**: ler um registro = 2 `read_page` + validação; nunca toma `COMMIT_SECTION`, `LEASE_SECTION` nem `page0-*`; nunca bloqueia nem é bloqueado por um escritor (FR-2, `coordination_local.py:1173-1178` continuam válidos). | **(a criar)** `tests/coordination/test_two_slot_reader.py::test_reading_takes_no_section_and_never_waits` (instrumenta `exclusive()` e afirma 0 chamadas) |
-| I3 | **Sempre há pelo menos um slot válido** em `writer.lease` e `commit.state` depois do bootstrap (§5): o escritor só sobrescreve o slot **inválido ou de geração menor**, nunca o slot válido mais novo. | **(a criar)** `tests/storage_core/test_two_slot_control_record.py::test_writer_never_overwrites_the_newest_valid_slot` (property-based sobre sequências de publicações e falhas) |
+| I3 | **Sempre há pelo menos um slot com registro válido** (geração ≥ 1; um slot EMPTY é válido mas não é registro) em `writer.lease` e `commit.state` depois do bootstrap (§4.3): o escritor só sobrescreve o slot **inválido, EMPTY ou de geração menor**, nunca o slot válido mais novo. | **(a criar)** `tests/storage_core/test_two_slot_control_record.py::test_writer_never_overwrites_the_newest_valid_slot` (property-based sobre sequências de publicações e falhas) |
 | I4 | **Geração monotônica por arquivo** (u64, +1 por publicação); um leitor que já observou a geração g nunca aceita g' < g do mesmo arquivo sem re-leitura; regressão persistente é fail-closed. | **(a criar)** `…::test_generation_is_monotonic_and_regression_is_refused`; `…::test_generation_at_u64_max_refuses_to_publish` |
 | I5 | **Visível-antes-de-durável é seguro** (ver §4.4): o conteúdo publicado nunca está à frente da sua autoridade durável — `commit.state` só é publicado após `wal.barrier()` (3.5) e a aplicação das páginas (3.6); a lease só é **usada** pelo dono após o seu próprio `durable_barrier` retornar. | `tests/txn/test_isolation.py::test_no_instant_of_a_commit_offers_a_snapshot_of_half_of_it` (existente; continua verde); **(a criar)** `tests/coordination/test_two_slot_lease.py::test_lease_epoch_is_never_acted_on_before_its_barrier_returns` |
 | I6 | **Identidade e nomes inalterados**: `control/writer.lease`, `control/readers/<id>.reader`, `control/commit.state` (§6.1); ids de leitor continuam `owner-nonce-rNNNN` (`coordination_local.py:209-240`); `_still_names` continua a re-provar a identidade do descritor antes de todo uso (§7). | `tests/storage_adapters/test_durability_and_platform.py` (bloco `_still_names`, existente); **(a criar)** `…::test_pinned_control_descriptor_is_reproved_after_a_foreign_retirement` |
@@ -61,7 +61,7 @@ página 0  cabeçalho do arquivo de controle (page_type = 7 control_header, NOVO
 página 1  slot A
 página 2  slot B
 ```
-Tamanho fixo = `3 × page_size` (24 KiB no padrão). `page_size` mínimo 512 (`layout.py:65`) — o maior registro v1 (lease: 64 B de cabeçalho + ≤ 88 B de owner + 4 B de CRC = 156 B; leitor: 48 + ≤ 96 + 4 = 148 B; commit.state: 36 B, `domain/txn/commit_state.py:48-50`) cabe em qualquer `page_size` válido junto com os dois cabeçalhos abaixo (32 + 32 B). Teste **(a criar)** `…::test_every_v1_record_fits_in_the_smallest_page_size`.
+Tamanho fixo = `3 × page_size` (24 KiB no padrão). `page_size` mínimo 512 (`layout.py:65`) — o maior registro v1 (lease: 64 B de cabeçalho + ≤ 88 B de owner + 4 B de CRC = 156 B; leitor: 48 + ≤ 96 + 4 = 148 B; commit.state: 36 B, `domain/txn/commit_state.py:48-50`) cabe em qualquer `page_size` válido junto com os dois cabeçalhos abaixo (32 B de página + 56 B de slot + 4 B de CRC: 156 + 92 = 248 B < 512). Teste **(a criar)** `…::test_every_v1_record_fits_in_the_smallest_page_size`.
 
 ### 3.2 Cabeçalho de página (§6.3, 32 B, inalterado no formato) — como este arquivo o preenche
 
@@ -81,19 +81,22 @@ Tamanho fixo = `3 × page_size` (24 KiB no padrão). `page_size` mínimo 512 (`l
 |---|---|---|---|
 | 0 | 8 B | `magic` | ASCII `OKTOSLOT` |
 | 8 | u16 | `slot_format_version` | 1 |
-| 10 | u16 | `record_kind` | 1 = lease, 2 = reader, 3 = commit_state; qualquer outro valor = slot inválido |
-| 12 | u64 | `generation` | monotônica por arquivo; 0 reservado (= nunca publicado) |
-| 20 | u32 | `payload_length` | tamanho exato do payload v1 embutido; deve ser ≤ `page_size − 32 − 32 − 4` |
+| 10 | u16 | `record_kind` | 1 = lease, 2 = reader, 3 = commit_state; qualquer outro valor = slot inválido; tem de ser igual ao `record_kind` da página 0 do mesmo arquivo |
+| 12 | u64 | `generation` | monotônica por arquivo; **0 = slot EMPTY** (página canônica válida, sem registro, `payload_length` = 0 — é o estado do slot B após o bootstrap); ≥ 1 = registro publicado |
+| 20 | u32 | `payload_length` | tamanho exato do payload v1 embutido (0 no slot EMPTY); deve ser ≤ `page_size − 32 − 56 − 4` |
 | 24 | u32 | `reserved` | 0 |
-| 32 | bytes | `payload` | **bytes v1 inalterados**: `encode_lease_record` (64 B + owner + crc32), `encode_reader_record` (48 B + reader + crc32), `CommitState.encode()` (36 B, magic `OGCS`) — o parser v1 continua a ser a autoridade do conteúdo |
-| 32 + len | u32 | `slot_crc32c` | CRC-32C sobre `[0, 32 + payload_length)` do registro de slot |
+| 28 | 16 B | `database_uuid` | igual ao `database_uuid` de `grafx.meta` (§6.2) |
+| 44 | u64 | `file_nonce` | igual ao `file_nonce` da página 0 **deste** arquivo (cunhado no bootstrap, `os.urandom(8)`) |
+| 52 | u32 | `reserved2` | 0 |
+| 56 | bytes | `payload` | **bytes v1 inalterados** (vazio no slot EMPTY): `encode_lease_record` (64 B + owner + crc32), `encode_reader_record` (48 B + reader + crc32), `CommitState.encode()` (36 B, magic `OGCS`) — o parser v1 continua a ser a autoridade do conteúdo |
+| 56 + len | u32 | `slot_crc32c` | CRC-32C sobre `[0, 56 + payload_length)` do registro de slot — autentica magic, kind, geração, `database_uuid`, `file_nonce` e payload como um todo |
 | resto | bytes | preenchimento | zeros até `page_size − 32` |
 
-Dois checksums por desenho: o da página (§6.3) detecta torn write da página inteira; o do slot detecta um payload trocado por outro válido de página (por exemplo, restore de quarentena errado) e permite validar o registro sem recomputar o CRC da página. O CRC interno do payload v1 (crc32 zlib nos registros do coordinator, CRC-32C no commit.state) permanece e continua a ser verificado pelo decoder v1 — três camadas, cada uma com sua função. Teste **(a criar)** `…::test_slot_layout_offsets_match_the_contract_table` (afirma cada offset desta tabela contra o encoder).
+Por que dois checksums e um vínculo: o CRC da página (§6.3) detecta torn write da página inteira. O CRC do slot, sozinho, **não** protege contra uma página movida intacta de outro arquivo ou de outra base (page CRC e slot CRC continuariam válidos — correção do verificador); o que protege é o **vínculo** `database_uuid` + `file_nonce` + `record_kind`, e o slot CRC existe para que esse vínculo seja autenticado junto com o payload e para validar o registro sem recomputar o CRC da página. O CRC interno do payload v1 (crc32 zlib nos registros do coordinator, CRC-32C no commit.state) permanece e continua a ser verificado pelo decoder v1. Testes **(a criar)** `…::test_slot_layout_offsets_match_the_contract_table` (afirma cada offset desta tabela contra o encoder) e `…::test_an_intact_slot_page_moved_from_another_file_or_database_is_refused_by_nonce_and_uuid` (copia a página 1 de um arquivo v2 para outro arquivo/base: ambos os CRCs válidos, slot recusado).
 
 ### 3.4 Cabeçalho do arquivo (página 0, payload a partir do offset 32)
 
-`magic 8 B "OKTOCTRL" | slot_format_version u16 | record_kind u16 | page_size u32 | database_uuid 16 B | created_generation u64 | reserved 24 B | crc32c u32`. `database_uuid` = o de `grafx.meta` (§6.2): um arquivo de slots copiado de outra base é recusado (teste **(a criar)** `…::test_slot_file_from_another_database_is_refused`). A página 0 é escrita **uma vez** no bootstrap e nunca mais; um `page_type = 8` numa página que não seja a 0 é corrupção.
+`magic 8 B "OKTOCTRL" | slot_format_version u16 | record_kind u16 | page_size u32 | database_uuid 16 B | file_nonce u64 | created_generation u64 | reserved 16 B | crc32c u32`. `database_uuid` = o de `grafx.meta` (§6.2); `file_nonce` = 8 bytes de `os.urandom` cunhados no bootstrap e copiados para **todo** slot publicado neste arquivo (§3.3). Um arquivo de slots copiado de outra base é recusado pelo `database_uuid`; uma **página** de slot copiada de outro arquivo da mesma base é recusada pelo `file_nonce` (teste `…::test_an_intact_slot_page_moved_from_another_file_or_database_is_refused_by_nonce_and_uuid`). A página 0 é escrita **uma vez** no bootstrap e nunca mais; é lida uma vez por descritor aberto (o par uuid/nonce fica em memória) e re-lida sempre que `_still_names` detectar que o nome mudou de identidade (§7); um `page_type = 8` numa página que não seja a 0 é corrupção.
 
 ### 3.5 Wrap / overflow
 
@@ -109,12 +112,12 @@ Dois checksums por desenho: o da página (§6.3) detecta torn write da página i
 
 ```
 publish(file, kind, payload_v1):
-  1. a, b := read_slot(page 1), read_slot(page 2)          # §4.2, nunca levanta por UM slot inválido
-  2. current := o slot válido de maior geração (ou nenhum)
+  1. a, b := read_slot(page 1), read_slot(page 2)          # §4.2, nunca levanta por UM slot inválido; EMPTY é válido-sem-registro
+  2. current := o slot com registro válido (geração ≥ 1, vínculo uuid/nonce/kind ok) de maior geração (ou nenhum)
   3. exigir que, se existe current, current.generation < 2^64-1
-  4. alvo := a página cujo slot é inválido ou tem a geração menor (se ambos válidos e iguais: corrupção — geração é única)
+  4. alvo := a página cujo slot é inválido, EMPTY, ou tem a geração menor (se ambos válidos e iguais: corrupção — geração é única)
   5. g := (current.generation se existe senão 0) + 1
-  6. página := page_header(seq = (g*2) mod 2^32, type 7) + slot_record(kind, g, payload_v1) + zeros
+  6. página := page_header(seq = (g*2) mod 2^32, type 7) + slot_record(kind, g, uuid, file_nonce, payload_v1) + zeros
   7. storage.write_page(file, alvo, página)                  # UMA chamada: lseek+write no descritor cacheado
   8. storage.durable_barrier(file)                            # UM fsync
   9. retornar g
@@ -130,7 +133,11 @@ read_record(file, kind):
   1. se not exists(file): ABSENT                              # único probe de namespace; ver §7 sobre o descritor
   2. para tentativa em 1..R (R = 3):
        a := read_slot(page 1); b := read_slot(page 2)
-       válidos := [s for s in (a, b) if s.valid and s.kind == kind]
+       # read_slot: página com checksum válido + magic/versão/kind/length/slot_crc ok -> "válido";
+       # geração 0 -> EMPTY (válido, sem registro; NUNCA gasta as releituras do §6.3, pois a página é canônica);
+       # checksum/CRC/vínculo falhando -> "inválido" (nunca exceção por UM slot)
+       válidos := [s for s in (a, b) if s.valid and s.generation >= 1 and s.kind == kind
+                   and s.file_nonce == page0.file_nonce and s.database_uuid == meta.database_uuid]
        se válidos: escolhido := max(válidos, key=generation)
                    se escolhido.generation < último_visto[file]: continuar (regressão: releitura)
                    último_visto[file] := escolhido.generation; retornar decode_v1(escolhido.payload)
@@ -142,17 +149,33 @@ read_record(file, kind):
 
 ### 4.3 Bootstrap (criação do arquivo) e migração v1 → v2
 
-Um arquivo de slots **nunca** aparece com 0 páginas nem com 0 slots válidos sob o seu nome final:
+Um arquivo de slots **nunca** aparece com 0 páginas, com páginas de zeros nem com 0 slots válidos sob o seu nome final:
 ```
 bootstrap(file, kind, payload_v1):
   temp := f"{file}.{owner_id}.tmp"          # mesmo esquema de nome de hoje (commit_state_store.py:84-87)
   if exists(temp): remove(temp)
+  nonce := os.urandom(8)
   create(temp, exclusive=True); allocate(temp, 3)
-  write_page(temp, 0, header_page); write_page(temp, 1, slot(kind, g=1, payload_v1)); write_page(temp, 2, zeros)
+  write_page(temp, 0, header_page(kind, meta.database_uuid, nonce))
+  write_page(temp, 1, slot(kind, g=1, uuid, nonce, payload_v1))
+  write_page(temp, 2, EMPTY_slot(kind, uuid, nonce))        # página CANÔNICA: type 7, checksum válido, geração 0, payload_length 0
   durable_barrier(temp)
   atomic_replace(temp, file); durable_barrier(file)          # ÚNICA vez que este arquivo é renomeado
 ```
-Isto preserva, sem regra nova, a semântica atual "0 B" (`coordination_local.py:1503-1512`): um `.reader` de 0 B ou sem slot válido é ABSENT; uma `writer.lease`/`commit.state` que exista sem slot válido é corrupção (I7). Migração de uma base v1: sob `COMMIT_SECTION` + `LEASE_SECTION` (ordem auditada em `recovery_manager.py:844-853`), para cada arquivo de controle v1 presente: ler v1 → `bootstrap(kind, bytes v1)`; leitores v1 (`readers/*.reader`) são convertidos ou, se o seu heartbeat já venceu, podados como hoje; por fim `grafx.meta.format_version := 2` (§6). Cada passo é idempotente (um arquivo já em v2 é reconhecido pelo `page_type`/`magic`) — crash a meio da migração deixa uma mistura v1/v2 que o build novo lê e a próxima abertura completa. Testes **(a criar)** `tests/foundation/test_control_record_migration.py::test_migration_is_idempotent_and_survives_a_crash_after_each_file`, `…::test_migration_runs_under_both_sections_and_refuses_with_a_live_foreign_writer`.
+A página 2 **nunca** é escrita como zeros (correção do verificador): uma página de zeros falha o checksum do §6.3 e faria cada `read_page` gastar as 8 releituras e levantar corrupção; o slot EMPTY é uma página válida que o decoder reconhece como "sem registro". Isto preserva, sem regra nova, a semântica atual "0 B" (`coordination_local.py:1503-1512`): um `.reader` de 0 B ou sem registro válido é ABSENT; uma `writer.lease`/`commit.state` que exista sem registro válido é corrupção (I7).
+
+**Migração de uma base v1 (ordem crash-safe — correção do verificador):**
+```
+migrate(root):
+  1. sob COMMIT_SECTION + LEASE_SECTION (ordem auditada em recovery_manager.py:844-853): recusar se houver
+     lease de outro dono válida ou leitor estrangeiro vivo (a migração é de participante único)
+  2. publicar grafx.meta com format_version = 2 DURÁVEL — temp + write_page + durable_barrier + atomic_replace +
+     durable_barrier (operação única; o meta é uma página, §6.2) — ANTES de tocar qualquer arquivo de controle
+  3. para cada arquivo de controle v1 presente: ler v1 → bootstrap(kind, bytes v1); leitores v1 (readers/*.reader)
+     convertidos ou, se o heartbeat já venceu, podados como hoje
+  4. fim (nada a publicar no fim: o meta já é 2)
+```
+Consequência: depois do passo 2 um build v1 **recusa a base** (`GrafxSchemaVersionMismatch`) e nunca vê um arquivo v2 como corrupção; um build v2 abre uma mistura v1/v2 (arquivo v1 = registro cru ≤ 4096 B com magic `OKTOLEAS`/`OKTORDER`/`OGCS`; v2 = `page_type` 8 na página 0), lê ambas as formas e **retoma** a migração na abertura seguinte — cada passo é idempotente. A antiga ordem "converter e elevar o meta no fim" foi rejeitada: um crash a meio deixaria um build v1 abrir a base e tratar os arquivos v2 como corrupção. Testes **(a criar)** `tests/foundation/test_control_record_migration.py::test_meta_is_bumped_durably_before_the_first_v2_control_file`, `…::test_a_v1_build_refuses_a_database_crashed_mid_migration`, `…::test_migration_is_idempotent_and_survives_a_crash_after_each_file`, `…::test_migration_runs_under_both_sections_and_refuses_with_a_live_foreign_writer`.
 
 `_FIRST_OPEN_SECTION` (`api/assembly.py:120-124, 818, 888`) cobre só bases novas; a migração de bases existentes usa as duas seções acima — **não** a primeira abertura.
 
@@ -180,7 +203,7 @@ A docstring de `commit_state_store.py:3-6` e CONTRACT §8.5 passo 3.7 ("via `ato
 
 ## 6. Formato, compatibilidade e rollback
 
-* **Sinalização:** `grafx.meta.format_version` (`engine/database.py:183` `IDENTITY_FORMAT_VERSION = 1`; §6.2) sobe para **2** quando a base passa a usar arquivos de slots. Um build v1 recusa a base com `GrafxSchemaVersionMismatch` **antes** de ler qualquer arquivo de controle — é a única forma de impedir o "downgrade silencioso" que a leitura de `CommitState.decode` produziria: hoje `decode` checa **tamanho antes de versão** (`domain/txn/commit_state.py:110-116`), logo um build antigo lendo um `commit.state` de 24 KiB veria `GrafxCorruptionDetected("length")`, e a sua recuperação poderia quarentenar e republicar um v1 por cima. Teste I8.
+* **Sinalização:** `grafx.meta.format_version` (`engine/database.py:183` `IDENTITY_FORMAT_VERSION = 1`; §6.2) sobe para **2** e é publicado **durável antes do primeiro arquivo de slots** (§4.3, passo 2). Um build v1 recusa a base com `GrafxSchemaVersionMismatch` **antes** de ler qualquer arquivo de controle — é a única forma de impedir o "downgrade silencioso" que a leitura de `CommitState.decode` produziria: hoje `decode` checa **tamanho antes de versão** (`domain/txn/commit_state.py:110-116`), logo um build antigo lendo um `commit.state` de 24 KiB veria `GrafxCorruptionDetected("length")`, e a sua recuperação poderia quarentenar e republicar um v1 por cima. Teste I8.
 * **Build v2 lê v1 e v2**: dispatch pelo tamanho/magic (arquivo v1 = registro cru ≤ 4096 B começando por `OKTOLEAS`/`OKTORDER`/`OGCS`; v2 = `page_type` 8 na página 0). Necessário para a migração a meio e para bases só-leitura abertas por um build novo sem direito de escrever. Teste I8.
 * **Rollback (v2 → v1):** ferramenta offline `oktografx control downgrade <root>` (CLI, `cli/commands.py`), que (1) toma `COMMIT_SECTION` + `LEASE_SECTION`, (2) recusa se houver lease ativa de outro dono ou leitor vivo, (3) para cada arquivo de slots escreve o payload v1 do slot mais novo via temp+`atomic_replace` (o caminho v1 de sempre), (4) remove os arquivos `.reader` (todos os pins já venceram por (2)), (5) `grafx.meta.format_version := 1`. Round-trip v1 → v2 → v1 byte-idêntico nos registros v1 é o gate G5. Teste **(a criar)** `tests/cli/test_control_downgrade.py::test_v1_v2_v1_round_trip_is_byte_identical_for_every_control_record`.
 * **Nada muda** em heap, catálogo, índices, WAL, ledger, quarentena (§6.1 linhas 498-504).
@@ -208,7 +231,7 @@ A docstring de `commit_state_store.py:3-6` e CONTRACT §8.5 passo 3.7 ("via `ato
 | C6 | slot mais velho já rasgado (C4) **e** crash a meio da publicação seguinte (que reescreve exatamente esse slot) | o slot mais novo nunca foi tocado → servido; 1 slot válido sempre (I3) | `test_the_newest_slot_is_never_the_one_being_rewritten` |
 | C7 | **ambos** os slots inválidos (corrupção em repouso injetada após C4) | lease/commit_state → `GrafxCorruptionDetected`; porta de retirement da recuperação quarentena o arquivo de 3 páginas como uma geração (I9); reconstrução: `commit.state` a partir do WAL (último `COMMIT` durável), lease a partir da maior época vista no WAL + 1 (mesma regra de hoje para lease ausente), reader → ABSENT | `test_double_corruption_is_fail_closed_and_retired_as_one_generation` |
 | C8 | crash durante o **bootstrap** (temp existe, alvo ausente ou v1) | próxima abertura repete o bootstrap; temp órfão é removido (esquema `.tmp` de hoje) | `test_crash_during_bootstrap_is_repeated_on_the_next_open` |
-| C9 | crash durante a **migração** (alguns arquivos v2, `grafx.meta` ainda 1) | build novo lê a mistura; reabertura completa a migração; build antigo continua a abrir a base (meta 1) e vê os arquivos v2 como corrupção → **por isso a migração só começa depois de recusar escritores/leitores estrangeiros vivos** | `test_crash_mid_migration_is_completed_on_reopen_and_never_downgraded_silently` |
+| C9 | crash durante a **migração** (meta já em 2, alguns arquivos ainda v1) | build v2 lê a mistura e completa a migração na reabertura; build v1 **recusa a base** desde o passo 2 de §4.3 (nunca vê um arquivo v2 como corrupção); crash **antes** do passo 2 deixa a base intacta em v1 | `test_crash_mid_migration_is_completed_on_reopen_and_a_v1_build_refuses` |
 | C10 | kill −9 do **leitor** entre observar a geração g+1 e usá-la | sem efeito no arquivo; próximo leitor vê ≥ g+1 | `test_reader_death_between_observation_and_use_changes_nothing` |
 | C11 | evicção do descritor entre duas publicações (caminho frio) | publicação reabre o nome (`_open_descriptor`), `_still_names`, escreve, barrier; resultado idêntico ao quente | `test_cold_descriptor_publication_is_equivalent_to_warm` |
 | C12 | 2 processos tentam publicar o **mesmo** arquivo | impossível fora da seção: o segundo espera em `LEASE_SECTION`/`COMMIT_SECTION`; nunca dois `write_page` intercalados | `test_two_publishers_in_two_processes_never_write_the_same_slot_file_concurrently` (I1) |
@@ -233,7 +256,7 @@ A docstring de `commit_state_store.py:3-6` e CONTRACT §8.5 passo 3.7 ("via `ato
 | E-CE1-8 | `domain/ports/storage.py` §4.1 | **sem mudança** (é o argumento central deste ADR) |
 | E-CE1-9 | IDENTITY-LEASING-V7 §11.1 (:8132-8135) | sem mudança: `retain_lease=True` continua recusado; CE-1 não retém lease |
 
-Sem estas 7 emendas aprovadas pelos dois agentes (e, para E-CE1-1/3/5, pelo usuário como dono do contrato), **não há código de produção**.
+Sem estas 7 emendas aprovadas tecnicamente pelos dois agentes (Codex + Claude) e sem os gates G0–G7 (§10), **não há código de produção**. O usuário já autorizou operacionalizar o roadmap e pediu consulta prévia **apenas** se a premissa multi-writer/multi-reader mudar; CE-1 não a muda (I1, I2), logo nenhuma emenda desta lista é uma consulta ao usuário.
 
 ---
 
@@ -271,9 +294,16 @@ Sem estas 7 emendas aprovadas pelos dois agentes (e, para E-CE1-1/3/5, pelo usu�
 2. **[A MEDIR]** slot de `page_size` (8 KiB) vs 4 KiB: mesma fase `barrier`?
 3. **[A VERIFICAR]** `read_page` sob escrita ativa do outro slot: o orçamento de 8 releituras do §6.3 é suficiente para um leitor nunca ver 2 slots inválidos com 1 escritor a 10^3 publicações/s? (G3 responde.)
 4. **[A VERIFICAR]** a poda de leitores estrangeiros (`_reader_alive`, `:1456-1466`) usa `heartbeat_seq` — com heartbeats in-place o `seq` continua a avançar por publicação; confirmar que nenhum observador depende do `mtime`/tamanho do arquivo.
-5. **[DECISÃO do usuário]** E-CE1-1/3/5 (formato e passo 3.7) — o usuário é o dono do contrato congelado; nenhuma linha de produção antes do seu OK.
+5. **[APROVAÇÃO técnica Codex + Claude]** E-CE1-1/3/5 (formato e passo 3.7): aprovação registrada por ambos + G0–G7 verdes; não é consulta ao usuário (ele autorizou operacionalizar e pediu consulta só se a premissa mudar — CE-1 não a muda).
 6. **[DECISÃO codex/claude]** quem escreve cada gate (proposta: G1/G2 claude, G3/G6 codex — dono do instrumento e da janela ociosa —, G4/G5 quem implementar, G7 crítico cego).
 
 ---
 
 Registro: documento redigido sem abrir bancos, sem executar benchmarks ou gates, sem tocar `src/` nem `tests/`; único artefato desta branch. Todo número tem tag; os únicos [MEDIDO] são os do spike (quente) e os do rig D5/COMPONENTS citados com linha.
+
+### Revisão 2 (2026-08-30, correções obrigatórias do verificador codex, hof_35575263)
+1. **Migração crash-safe** (§4.3, §6, C9): `grafx.meta.format_version = 2` é publicado durável **antes** do primeiro arquivo v2; build v1 recusa desde então; build v2 lê a mistura e retoma. A ordem anterior (converter e elevar no fim) foi rejeitada.
+2. **Slot EMPTY canônico** (§3.3, §4.1, §4.2, §4.3, I3): a página 2 do bootstrap é uma página válida (checksum ok, geração 0, `payload_length` 0) reconhecida pelo decoder como "sem registro" — nunca zeros, que gastariam as 8 releituras do §6.3 e levantariam corrupção a cada leitura.
+3. **Vínculo autenticado** (§3.3, §3.4): cada slot carrega `database_uuid` + `file_nonce` (cunhado na página 0 no bootstrap) cobertos pelo `slot_crc32c`; a alegação de que o slot CRC protegia contra restore trocado foi retirada — uma página movida intacta preservaria ambos os CRCs; o que a recusa é o vínculo.
+4. **Aprovação** (§9, §12): "[DECISÃO do usuário]" substituído por aprovação técnica Codex + Claude + G0–G7; o usuário autorizou operacionalizar e pediu consulta só se a premissa mudar — CE-1 não a muda.
+Status permanece **PROPOSED / produção bloqueada**; todos os demais invariantes inalterados.
