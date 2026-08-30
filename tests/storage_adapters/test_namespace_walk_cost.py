@@ -157,6 +157,18 @@ def test_nested_names_below_the_prefix_directory_are_returned(
     assert device.list_files("quarantine/a/") == (NESTED,)
 
 
+def test_a_prefix_spelt_in_another_case_lists_nothing(
+    board: tuple[LocalStorageDevice, Path],
+) -> None:
+    device, _root = board
+    # Logical names are case sensitive whatever the volume does. On a case-insensitive volume
+    # a walk that descended by the caller's spelling would open the stored ``wal`` for ``Wal/``
+    # and yield fabricated ``Wal/...`` names; on a case-sensitive one this holds trivially.
+    assert device.list_files("Wal/") == ()
+    assert device.list_files("WAL/000000000001.wal") == ()
+    assert device.list_files("wal/") == WAL_SEGMENTS
+
+
 def test_a_prefix_without_a_directory_is_still_a_full_listing(
     board: tuple[LocalStorageDevice, Path],
 ) -> None:
@@ -224,10 +236,12 @@ def test_a_warm_descriptor_hit_does_not_re_prove_the_path_chain(
     with _counting_syscalls() as counts:
         assert device.read_page(HEAP, 0) == bytes([1]) * PAGE_SIZE
     # Identity is one stat of the name and one fstat of the held descriptor (plus the fstat
-    # that sizes the file). Before, the same hit re-proved the root by real path and every
-    # segment by lstat and real path: ~3 realpath and ~4 lstat for a two-segment name.
+    # that sizes the file). Before, the same hit re-proved the root and every segment by real
+    # path as well. The guard that stays -- one lstat of the root and one of each existing
+    # component, followed nowhere -- is REQUIRED here: a hit that skipped it would not refuse
+    # a root or a directory exchanged for a redirect after admission.
     assert counts["realpath"] == 0, dict(counts)
-    assert counts["lstat"] == 0, dict(counts)
+    assert 2 <= counts["lstat"] <= 4, dict(counts)
     assert counts["stat"] == 1, dict(counts)
     assert counts["fstat"] <= 2, dict(counts)
 
@@ -249,13 +263,60 @@ def test_a_control_file_published_by_another_participant_is_seen_on_a_warm_hit(
     assert device.read_log(CONTROL, 0, 11) == b"published-2"
 
 
-@pytest.mark.skipif(
+POSIX_ONLY_REDIRECT_UNDER_HANDLE = pytest.mark.skipif(
     os.name == "nt",
     reason=(
         "Windows refuses to rename a directory that holds an open handle, so a redirect cannot "
         "appear under a cached descriptor there; on POSIX it can, and the warm hit must catch it."
     ),
 )
+
+
+@POSIX_ONLY_REDIRECT_UNDER_HANDLE
+def test_a_directory_redirected_to_its_own_original_is_still_refused_on_a_warm_hit(
+    board: tuple[LocalStorageDevice, Path],
+) -> None:
+    device, root = board
+    assert device.read_log(CONTROL, 0, 11) == b"published-1"  # admitted and cached
+    original = root / "control-original"
+    redirected = root / "control"
+    redirected.rename(original)
+    try:
+        _directory_symlink_or_skip(redirected, original)
+        # The redirect leads back to the very same file, so the identity of the entry still
+        # agrees with the held descriptor: only inspecting the component itself, without
+        # following it, can refuse this. A hit that compared identities alone would answer.
+        with pytest.raises(GrafxUnsupportedOperation) as raised:
+            device.read_log(CONTROL, 0, 11)
+        assert raised.value.details["reason"] == "redirected_path"
+    finally:
+        if redirected.is_symlink():
+            redirected.unlink()
+        if original.exists():
+            original.rename(redirected)
+
+
+@POSIX_ONLY_REDIRECT_UNDER_HANDLE
+def test_a_root_redirected_to_its_own_original_is_still_refused_on_a_warm_hit(
+    board: tuple[LocalStorageDevice, Path],
+) -> None:
+    device, root = board
+    assert device.read_page(HEAP, 0) == bytes([1]) * PAGE_SIZE  # admitted and cached
+    original = root.parent / "database-original"
+    root.rename(original)
+    try:
+        _directory_symlink_or_skip(root, original)
+        with pytest.raises(GrafxUnsupportedOperation) as raised:
+            device.read_page(HEAP, 0)
+        assert raised.value.details["reason"] == "redirected_root"
+    finally:
+        if root.is_symlink():
+            root.unlink()
+        if original.exists():
+            original.rename(root)
+
+
+@POSIX_ONLY_REDIRECT_UNDER_HANDLE
 def test_a_component_redirected_after_admission_is_refused_on_the_next_access(
     board: tuple[LocalStorageDevice, Path], tmp_path: Path
 ) -> None:

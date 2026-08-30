@@ -587,9 +587,13 @@ def _is_redirected_path(path: str, information: os.stat_result | None = None) ->
         return False
     if stat.S_ISLNK(details.st_mode):
         return True
-    attributes = getattr(details, "st_file_attributes", 0)
-    if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
-        return True
+    attributes = getattr(details, "st_file_attributes", None)
+    if attributes is not None:
+        # Windows answers with the lstat itself: a junction IS a reparse point (its tag is
+        # IO_REPARSE_TAG_MOUNT_POINT) and shows in this attribute, so asking isjunction as well
+        # would repeat the lstat for the same answer. The fallback below serves a platform
+        # whose stat result carries no attributes.
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
     is_junction = getattr(os.path, "isjunction", None)
     if callable(is_junction):
         with contextlib.suppress(OSError):
@@ -1255,8 +1259,13 @@ class LocalStorageDevice:
         self._require_safe_path(name)
         return path
 
-    def _require_root_identity(self, name: str) -> None:
-        """Refuse a root that was exchanged or redirected after this adapter opened it."""
+    def _require_root_identity(self, name: str, *, prove_real_path: bool = True) -> None:
+        """Refuse a root that was exchanged or redirected after this adapter opened it.
+
+        Without ``prove_real_path`` the root is judged by its ``lstat`` alone -- identity and
+        reparse state -- which is what a warm descriptor hit re-checks; resolving the real path
+        again is the part that costs, and the identity already refuses an exchanged root.
+        """
         try:
             information = os.lstat(self._root)
         except OSError as failure:
@@ -1265,7 +1274,7 @@ class LocalStorageDevice:
         if (
             observed != self._root_identity
             or _is_redirected_path(self._root, information)
-            or _comparable_real_path(self._root) != self._root_real
+            or (prove_real_path and _comparable_real_path(self._root) != self._root_real)
         ):
             raise refuse_operation(
                 "redirected_root",
@@ -1296,9 +1305,15 @@ class LocalStorageDevice:
             component=self._relative(path),
         )
 
-    def _require_safe_path(self, name: str) -> None:
-        """Refuse every existing redirected component of one logical file path."""
-        self._require_root_identity(name)
+    def _require_safe_path(self, name: str, *, prove_containment: bool = True) -> None:
+        """Refuse every existing redirected component of one logical file path.
+
+        Without ``prove_containment`` no real path is resolved: every existing component is
+        still inspected without being followed and refused when redirected or foreign, but
+        containment is taken from the proof made when the name was first resolved. That is the
+        fast guard of a warm descriptor hit; a name being resolved anew always proves both.
+        """
+        self._require_root_identity(name, prove_real_path=prove_containment)
         current = self._root
         for segment in name.split("/"):
             current = os.path.join(current, segment)
@@ -1307,7 +1322,8 @@ class LocalStorageDevice:
             except (FileNotFoundError, NotADirectoryError):
                 # Missing suffixes are safe only while their eventual resolution stays under
                 # root; a preceding symlink was already met and refused above.
-                self._require_contained(name, current)
+                if prove_containment:
+                    self._require_contained(name, current)
                 continue
             except OSError as failure:
                 raise self._device_failure("inspect_path", name, failure) from failure
@@ -1330,7 +1346,8 @@ class LocalStorageDevice:
                     component=self._relative(current),
                     mode=stat.S_IFMT(information.st_mode),
                 )
-            self._require_contained(name, current)
+            if prove_containment:
+                self._require_contained(name, current)
 
     def _require_directory_parents(self, name: str) -> None:
         """Refuse a name whose parent segment is itself a stored file, on both families alike."""
@@ -1421,6 +1438,15 @@ class LocalStorageDevice:
             if not segment:
                 return  # no stored name has an empty segment, so nothing can match
             name = prefix + segment
+            # The segment must be present under EXACTLY this spelling: a case-insensitive
+            # volume would otherwise open the stored ``wal`` for ``Wal/`` and the names yielded
+            # below would carry the caller's spelling rather than the stored one.
+            try:
+                siblings = os.listdir(directory)
+            except OSError as failure:
+                raise self._device_failure("list", prefix or self._root, failure) from failure
+            if segment not in siblings:
+                return  # absent, or stored under another case: no stored name starts with it
             candidate = os.path.join(directory, segment)
             try:
                 information = os.lstat(candidate)
@@ -1499,6 +1525,7 @@ class LocalStorageDevice:
             # routed to C2; the CF-5 rename was only ever half of publication).
             with contextlib.suppress(OSError):
                 os.close(cached)
+            self._paths.pop(name, None)
             cached = None
         if cached is not None:
             self._handles[name] = cached
@@ -1575,14 +1602,18 @@ class LocalStorageDevice:
         The path is the one the descriptor was opened through, proved when it was admitted.
         Proving the whole chain again on every warm hit -- the root by real path, each segment
         by ``lstat`` and real path -- cost ~2 ms per page read and 6,2 s of one 17-statement
-        operation on the acceptance board (fase 0a). A component redirected since admission
-        cannot make this ``stat`` agree with the held descriptor unless it leads to the very
-        same file, and any disagreement sends the caller through the full resolution, which
-        refuses the redirect.
+        operation on the acceptance board (fase 0a). What a warm hit keeps is the part that
+        does not resolve anything: the root's identity and every existing component's kind are
+        inspected again without being followed, so a root or a directory exchanged for a
+        redirect since admission is refused even when the redirect leads back to the very same
+        file. Containment is not re-derived: it was proved at admission, and a plain component
+        cannot have left a root whose identity still holds.
         """
         path = self._paths.get(name)
         if path is None:
             path = self._physical_path(name)  # admitted without a proved path: prove it now
+        else:
+            self._require_safe_path(name, prove_containment=False)
         try:
             current = os.stat(path)
             held = os.fstat(descriptor)
