@@ -1433,7 +1433,7 @@ class LocalStorageDevice:
         (fase 0a: 4.059 ``realpath`` calls per commit, ~2,1 s of a 2,6 s commit).
         """
         self._require_root_identity(self._root)
-        directory, prefix = self._root, ""
+        directory, prefix, identity = self._root, "", self._root_identity
         for segment in below.split("/") if below else ():
             if not segment:
                 return  # no stored name has an empty segment, so nothing can match
@@ -1458,26 +1458,95 @@ class LocalStorageDevice:
             if not stat.S_ISDIR(information.st_mode):
                 return  # a stored file has nothing below it
             self._require_contained(name, candidate)
-            directory, prefix = candidate, name + "/"
-        pending: list[tuple[str, str]] = [(directory, prefix)]
+            directory, prefix, identity = (
+                candidate,
+                name + "/",
+                (information.st_dev, information.st_ino),
+            )
+        pending: list[tuple[str, str, tuple[int, int]]] = [(directory, prefix, identity)]
         while pending:
-            directory, prefix = pending.pop()
-            try:
-                with os.scandir(directory) as scan:
-                    entries = tuple(scan)
-            except OSError as failure:
-                raise self._device_failure("list", prefix or self._root, failure) from failure
-            for entry in entries:
-                name = prefix + entry.name
-                try:
-                    information = entry.stat(follow_symlinks=False)
-                except OSError as failure:
-                    raise self._device_failure("inspect_path", name, failure) from failure
-                self._refuse_foreign_component(name, entry.path, information)
-                if stat.S_ISDIR(information.st_mode):
-                    pending.append((entry.path, name + "/"))
-                elif include_pending or not _is_pending_delete(entry.name):
+            directory, prefix, identity = pending.pop()
+            for entry_name, path, child in self._list_proved_directory(
+                directory, prefix, identity
+            ):
+                name = prefix + entry_name
+                if child is not None:
+                    pending.append((path, name + "/", child))
+                elif include_pending or not _is_pending_delete(entry_name):
                     yield name
+
+    def _list_proved_directory(
+        self, directory: str, prefix: str, identity: tuple[int, int]
+    ) -> tuple[tuple[str, str, tuple[int, int] | None], ...]:
+        """Return the entries of a directory whose identity held before AND after the listing.
+
+        The directory was proved -- no reparse point, contained -- when it was reached, but the
+        listing is a separate system call, and the component can be exchanged for a redirect
+        in between. Resolving the real path of every entry used to catch that after the fact;
+        instead the directory's identity is checked immediately before the listing and again
+        after it, without following anything. Everything the walk will use -- each entry's
+        kind, and for a subdirectory the identity it will be held to -- is captured BETWEEN
+        those two checks, so it belongs to the proved directory; an exchange after the second
+        check is met by the subdirectory's own check before it is listed. Entries are
+        ``(name, path, identity)``, the identity being ``None`` for a file.
+        """
+        label = prefix[:-1] if prefix else self._root
+        self._require_directory_identity(label, directory, identity)
+        snapshot: list[tuple[str, str, tuple[int, int] | None]] = []
+        try:
+            with os.scandir(directory) as scan:
+                for entry in scan:
+                    name = prefix + entry.name
+                    if entry.path != os.path.join(directory, entry.name):
+                        raise refuse_operation(
+                            "path_escape",
+                            f"Logical file {name!r} was listed outside the directory proved "
+                            "for it.",
+                            file=name,
+                            component=self._relative(entry.path),
+                        )
+                    try:
+                        information = entry.stat(follow_symlinks=False)
+                    except OSError as failure:
+                        raise self._device_failure("inspect_path", name, failure) from failure
+                    self._refuse_foreign_component(name, entry.path, information)
+                    # A DirEntry carries no inode on Windows: a subdirectory's identity comes
+                    # from its own lstat, taken here while the parent is still the proved one.
+                    child = (
+                        self._directory_identity(name, entry.path)
+                        if stat.S_ISDIR(information.st_mode)
+                        else None
+                    )
+                    snapshot.append((entry.name, entry.path, child))
+        except OSError as failure:
+            raise self._device_failure("list", prefix or self._root, failure) from failure
+        self._require_directory_identity(label, directory, identity)
+        return tuple(snapshot)
+
+    def _require_directory_identity(
+        self, label: str, directory: str, identity: tuple[int, int]
+    ) -> None:
+        """Refuse a directory that is redirected, or no longer the one that was proved."""
+        if directory == self._root:
+            self._require_root_identity(self._root, prove_real_path=False)
+            return
+        if self._directory_identity(label, directory) != identity:
+            raise refuse_operation(
+                "path_escape",
+                f"Stored namespace component {label!r} was exchanged while it was being "
+                "listed, so its entries cannot be proved contained.",
+                file=label,
+                component=label,
+            )
+
+    def _directory_identity(self, label: str, directory: str) -> tuple[int, int]:
+        """Return the ``(st_dev, st_ino)`` of a directory, refusing a redirected one."""
+        try:
+            information = os.lstat(directory)
+        except OSError as failure:
+            raise self._device_failure("inspect_path", label, failure) from failure
+        self._refuse_foreign_component(label, directory, information)
+        return (information.st_dev, information.st_ino)
 
     def _refuse_foreign_component(
         self, name: str, path: str, information: os.stat_result
