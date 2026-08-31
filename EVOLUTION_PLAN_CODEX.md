@@ -291,6 +291,21 @@
   Ruff e `diff --check`. O gate global final do candidato corrigido coletou 10.831 casos,
   atravessou novamente toda a cauda vetorial e terminou em 100%/exit `0`, sem falhas; esse é o
   gate válido para promoção.
+- **Gate final ST-6/ST-7 concluído e aprovado com a limitação temporal registrada.** O perfil
+  H1-H8.1 em `Grafx@ef0de63`, `Community@64a9da6` e `Core@ccc1f345` concluiu 180/180 operações,
+  12/12 famílias e manteve exatamente o digest lógico certificado `c994255b...`. O setup de 110
+  commits caiu de `490,6 -> 397,7 s` (`-18,93%`), evidência do ganho no caminho de
+  abertura/replay ao qual ST-7 se destina. No hot path contínuo, que exclui da mediana a primeira
+  abertura de cada família, não houve ganho temporal nesta janela: RAW
+  `3.337,76 -> 3.401,74 ms` (`+1,92%`), fases `3.385,62 -> 3.456,28 ms` (`+2,09%`) e passe
+  instrumentado `7.724,27 -> 8.341,64 ms` (`+7,99%`). A promoção não credita esses números como
+  melhora nem cria novo alvo: apoia-se no ganho causal `advance_built_through 4 -> 0`, na queda
+  material do setup e no gate global de 10.831 casos; a variação marginal do RAW permanece
+  explicitamente registrada. A razão temporal desta janela contra a referência Ladybug é
+  `3.401,74 / 787,00 = 4,32x` (antes `4,24x`). Artefato
+  `w7-ef0de63-64a9da6-pf5-h1h8_1.json`, SHA-256
+  `2ce10d4200a9a420c75c081da9ae804001223cfb5f833aacdb91b854b68415c9`; check-only anterior,
+  mesmo conjunto lógico e checkouts limpos: `w7-ef0de63-64a9da6-check.json`.
 - **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`
