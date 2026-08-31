@@ -244,6 +244,27 @@
   `delete_nodes_by_session`, em `14,21x`. Artefato
   `ladybug-64a9da6-pf5-h1h8_1.json`, SHA-256
   `23314a1b2609e57518166ed81bdc6d8bc0a8a7f9a8b0b4f541d9ec27a3f0b653`.
+- **ST-6 implementado, auditado e integrado.** O memo de pouso vive somente na transação e na
+  tabela que o produziu; sua chave de validade compara por conteúdo a versão do schema, intents e
+  linhas staged da tabela, além da identidade do snapshot. Assim, savepoint que retorna à mesma
+  contagem, segundo update sem crescimento e update/delete no mesmo fluxo invalidam corretamente;
+  `require_endpoints` e `_incident_edges` continuam fora do memo. Origem publicada:
+  `perf/w6-st6-owner-node-memo@5daa502`; integração: `72671c0`. O red-first falhou nos 5 casos de
+  reutilização/invalidação esperados; depois, 9/9 focados, 1.693 testes de query, 99 de API/limites,
+  Ruff e `diff --check` passaram. A reprodução independente adicionou a família C10 de regressões
+  e terminou verde. O handoff Nexus `hof_60d0dad3d3164074a546532713f400f8` foi verificado/PASS.
+  O memo não atravessa transações, não altera WAL/storage/coordenação e não é usado no caminho de
+  verificação de endpoints; multi-writer/multi-reader permanece intacto.
+- **Gate global pós-ST-1/ST-6 concluído sem falhas.** A primeira execução coletou 10.756 casos e
+  isolou cinco bloqueios determinísticos: duas docstrings locais, a fronteira pura para
+  `types.MappingProxyType` e o materializador do corpus escolhendo o par inválido
+  `Decision-[:relates_to]->Decision` para a consulta I12. A correção manteve a validação estrita de
+  endpoints do Grafx e passou a tentar somente membros do domínio fechado de labels do Pulse
+  quando o representante padrão falha exclusivamente no planner; o corpus voltou a ser
+  reproduzido byte a byte, sem regeneração nem reclassificação. Após a higiene mínima, o gate
+  global completo terminou em 100%/exit `0`, além dos testes focados de imports, documentação,
+  ST-1, ST-6, corpus, Ruff e `diff --check`. Nenhuma regra de leitura, escrita ou concorrência foi
+  afrouxada para obter o resultado.
 - **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`

@@ -56,6 +56,7 @@ ALLOWED_STDLIB_MODULES: frozenset[str] = frozenset(
         "itertools",
         "math",
         "struct",
+        "types",
         "typing",
     }
 )
@@ -64,6 +65,10 @@ ALLOWED_STDLIB_MODULES: frozenset[str] = frozenset(
 ``bisect`` is an algorithm over a list the caller already holds -- no clock, no randomness,
 no device, no platform -- and the WALs LSN index rests on it (D5 item 1); it is pure in
 exactly the sense ``math`` and ``itertools`` are.
+
+``types.MappingProxyType`` gives derived domain lookup tables an immutable, O(1) view without
+introducing I/O, time, randomness or a dependency on a mechanism layer.  The module is therefore
+pure under the same criterion as ``dataclasses`` and ``collections``.
 
 ``uuid`` is deliberately absent: ``uuid4`` is unseeded randomness and ``uuid1`` reads the wall
 clock, both of which G2b and amendment A5 keep out of the domain. The identifier type is still

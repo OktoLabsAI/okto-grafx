@@ -832,6 +832,7 @@ class HeapStore:
     ) -> Iterator[tuple[RecordRef, HeapVersion]]:
         """Yield every version of the table the snapshot can see, in storage order."""
         def visible(header: RecordHeader) -> bool:
+            """Return whether this snapshot may observe the record header."""
             return snapshot.visible(header.xmin, header.xmax)
 
         for ref, header, content in self._walk(table, accept=visible):
@@ -982,6 +983,7 @@ class HeapStore:
     ) -> HeapVersion | None:
         """Return the version of that record the snapshot can see, or None when there is none."""
         def wanted(header: RecordHeader) -> bool:
+            """Return whether this version is the requested row visible to the snapshot."""
             return header.record_id == record_id and snapshot.visible(
                 header.xmin, header.xmax
             )

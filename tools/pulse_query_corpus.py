@@ -881,7 +881,12 @@ def _representative(source: str) -> str | None:
     return _DOMAIN_REPRESENTATIVES.get(_domain_of(source) or "")
 
 
-def _materialize(template: str, *, style: str) -> str:
+def _materialize(
+    template: str,
+    *,
+    style: str,
+    overrides: dict[str, str] | None = None,
+) -> str:
     """Give every hole a concrete filling so the parser judges the query, not the hole.
 
     Two fillings, because a hole is not one thing.  Some sit where an identifier goes -- a
@@ -893,13 +898,58 @@ def _materialize(template: str, *, style: str) -> str:
     counter = {"n": 0}
 
     def _fill(match: re.Match[str]) -> str:
-        representative = _representative(match.group(1))
+        source = match.group(1)
+        if overrides is not None and source in overrides:
+            return overrides[source]
+        representative = _representative(source)
         if representative is not None:
             return representative
         counter["n"] += 1
         return f"Placeholder{counter['n']}" if style == "identifier" else ""
 
     return _PLACEHOLDER.sub(_fill, template)
+
+
+def _try_materialized(
+    template: str,
+    *,
+    style: str,
+    sources: dict[str, str] | None,
+) -> tuple[str, str | None]:
+    """Try the default representative, then another closed-domain label if necessary.
+
+    A logical Pulse relationship may admit several endpoint pairs.  A template with one
+    runtime node-label hole therefore cannot always use the global ``Decision`` representative:
+    ``Decision-[:relates_to]->Decision`` is invalid, while the same runtime family with an
+    ``Alternative`` target is part of the schema.  The corpus judges whether that query form
+    can be planned, so after a planner-only refusal it retries each declared value for that
+    exact hole.  Parse and analysis refusals are left untouched, and holes are never filled
+    with values outside the pinned baseline's closed ontology.
+    """
+
+    phase, error = _try_accept(_materialize(template, style=style), sources)
+    if error is None or phase != "plan_error" or sources is None:
+        return phase, error
+    node_holes = tuple(
+        dict.fromkeys(
+            match.group(1)
+            for match in _PLACEHOLDER.finditer(template)
+            if _domain_of(match.group(1)) == "node_label"
+        )
+    )
+    for hole in node_holes:
+        for label in _node_types(sources):
+            if label == _REPRESENTATIVE_LABEL:
+                continue
+            candidate = _materialize(
+                template,
+                style=style,
+                overrides={hole: label},
+            )
+            candidate_phase, candidate_error = _try_accept(candidate, sources)
+            if candidate_error is None:
+                return candidate_phase, None
+    return phase, error
 
 
 # Node properties the corpus actually references, plus the vector payload.  A closed shape:
@@ -1187,15 +1237,19 @@ def _classify(finding: Finding, sources: dict[str, str] | None = None) -> None:
         # the effect already has a structured route, so no dialect is owed.
         finding.classification = "structured_primitive"
         return
-    phase_identifier, as_identifier = _try_accept(
-        _materialize(finding.template, style="identifier"), sources
+    phase_identifier, as_identifier = _try_materialized(
+        finding.template,
+        style="identifier",
+        sources=sources,
     )
     if as_identifier is None:
         finding.acceptance_phase = phase_identifier
         finding.classification = "already_supported"
         return
-    phase_empty, as_empty = _try_accept(
-        _materialize(finding.template, style="empty"), sources
+    phase_empty, as_empty = _try_materialized(
+        finding.template,
+        style="empty",
+        sources=sources,
     )
     if as_empty is None:
         finding.acceptance_phase = phase_empty

@@ -2356,6 +2356,7 @@ def _relationship_scan(
     nodes_by_id: dict[int, dict[object, tuple[object, HeapVersion]]] = {}
 
     def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
+        """Resolve one endpoint against the transaction-private landing view."""
         found = nodes_by_id.get(table.table_id)
         if found is None:
             found = _owner_landing_view(engine, context, table, ended)
