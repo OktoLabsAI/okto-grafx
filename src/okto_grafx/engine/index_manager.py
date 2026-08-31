@@ -560,9 +560,7 @@ class IndexStore:
             header = certificate.header
             if header.flags & INDEX_FLAG_STALE:
                 if self._stale_reason is None:
-                    self._stale_reason = (
-                        f"Index {definition.name!r} was recorded as stale and has not been rebuilt."
-                    )
+                    self._stale_reason = f"Index {definition.name!r} was recorded as stale and has not been rebuilt."
                     self._stale_device_seq = certificate.seq
                 elif self._stale_device_seq is not None:
                     self._stale_device_seq = certificate.seq
@@ -638,7 +636,9 @@ class IndexStore:
     def _fresh_certificate(self) -> _IndexReadCertificate:
         """Collect one detached, checksum-verified certificate directly from the device."""
         page = self._pool.read_fresh_page(self.file, HEADER_PAGE_INDEX)
-        return _IndexReadCertificate(seq=page.seq, header=self._decode_header_page(page))
+        return _IndexReadCertificate(
+            seq=page.seq, header=self._decode_header_page(page)
+        )
 
     def _remember_local_certificate(self) -> _IndexReadCertificate:
         """Bind resident derived state to the page-0 image this handle just published.
@@ -777,9 +777,7 @@ class IndexStore:
             # that finished before this lookup while old bucket frames remained resident.
             self._pool.discard_clean_file(self.file)
             certificate = self._fresh_certificate()
-            recovering = self._foreign_healthy_replaces_stale(
-                certificate, required_lsn
-            )
+            recovering = self._foreign_healthy_replaces_stale(certificate, required_lsn)
             self._require_safe_certificate(certificate, required_lsn)
             if recovering:
                 self._stale_reason = None
@@ -841,15 +839,16 @@ class IndexStore:
                 # device to discover which side won, rather than carrying dirty bytes forward.
                 try:
                     self._pool.discard(self.file, HEADER_PAGE_INDEX)
-                except BaseException as cleanup_failure:  # pragma: no cover - defensive note
+                except (
+                    BaseException
+                ) as cleanup_failure:  # pragma: no cover - defensive note
                     failure.add_note(
                         "Discarding the unconfirmed page-0 attempt also failed: "
                         f"{cleanup_failure!r}"
                     )
                 if (
                     not isinstance(failure, GrafxUnsupportedOperation)
-                    or
-                    failure.details.get("field") != "page_sequence_conflict"
+                    or failure.details.get("field") != "page_sequence_conflict"
                     or attempt >= INDEX_READ_RETRY_BUDGET
                 ):
                     raise
@@ -1474,6 +1473,39 @@ class IndexStore:
         self._pool.flush(self.file)
         self._remember_local_certificate()
 
+    def complete_built_through(self, lsn: Lsn, table_high_water: Lsn | None) -> None:
+        """Advance for a completed replay, unless the header already covers its table.
+
+        Eligibility to skip is proved by THIS call's own fresh device certificate and the
+        caller's current watermark photo, never by a remembered flag: a foreign participant may
+        persist STALE outside any commit section at any moment, and page 0 is the only place
+        that verdict lives (ST-7). Three proofs make a skip: the fresh certificate is healthy,
+        it agrees with the resident header (so no replayed work is waiting for a flush), and it
+        covers the table's committed high water -- which is the strongest position
+        :meth:`IndexManager.open` will ever require of it. The skip never writes; the worst a
+        wrong photo can cost is a rebuild nobody needed, never a wrong answer. Every other
+        state -- no photo for this table, a stale mark in either home, a rebuild in flight, a
+        disagreement between device and resident -- takes :meth:`advance_built_through` whole.
+        """
+        position = _require_position("lsn", lsn)
+        if (
+            table_high_water is None
+            or self._stale_reason is not None
+            or self._rebuild_authority is not None
+            or self._completed_rebuild_through is not None
+        ):
+            self.advance_built_through(position)
+            return
+        certificate = self._fresh_certificate()
+        resident = self._read_header()
+        if (
+            not certificate.header.flags & INDEX_FLAG_STALE
+            and certificate.header.built_through_lsn == resident.built_through_lsn
+            and certificate.header.built_through_lsn >= table_high_water
+        ):
+            return
+        self.advance_built_through(position)
+
     def clear_stale(
         self,
         built_through: Lsn,
@@ -1671,8 +1703,10 @@ class IndexStore:
         # position rather than the older one its scan read at -- and writing it inside this same
         # transition keeps the clear a single act instead of a clear plus a second write that
         # would leave page 0 dirty behind it.
-        covered = position if advance_to is None else _require_position(
-            "advance_to", advance_to
+        covered = (
+            position
+            if advance_to is None
+            else _require_position("advance_to", advance_to)
         )
         try:
             self._publish_header_transition(
@@ -1686,7 +1720,9 @@ class IndexStore:
             # already consumed: it would suppress the header clock on later same-LSN repairs.
             try:
                 completed = self._fresh_certificate()
-            except BaseException as observation_failure:  # pragma: no cover - diagnostic only
+            except (
+                BaseException
+            ) as observation_failure:  # pragma: no cover - diagnostic only
                 failure.add_note(
                     "Observing page 0 after the final rebuild publication also failed: "
                     f"{observation_failure!r}"
@@ -1786,7 +1822,10 @@ class IndexStore:
                 operation=change.operation.name,
             )
         position = lsn_of(record)
-        fenced = change.operation is IndexOperation.RESET or self._rebuild_authority is not None
+        fenced = (
+            change.operation is IndexOperation.RESET
+            or self._rebuild_authority is not None
+        )
         try:
             if fenced:
                 # A replay API offers one logical record at a time, so it cannot retain a lock
@@ -1890,7 +1929,9 @@ class IndexStore:
                 continue
             try:
                 self._pool.discard(file, page_index)
-            except BaseException as cleanup_failure:  # pragma: no cover - diagnostic only
+            except (
+                BaseException
+            ) as cleanup_failure:  # pragma: no cover - diagnostic only
                 failure.add_note(
                     f"Discarding replay frame {file!r}:{page_index} also failed: "
                     f"{cleanup_failure!r}"
@@ -2188,7 +2229,9 @@ class IndexStore:
                 f"Index {self.name!r} is durably healthy only through "
                 f"{certificate.header.built_through_lsn}; RESET through {change.csn} needs a "
                 "durable stale authority.",
-                field=("rebuild_superseded" if change.ref.page else "reset_requires_stale"),
+                field=(
+                    "rebuild_superseded" if change.ref.page else "reset_requires_stale"
+                ),
                 index=self.name,
                 file=self.file,
                 seq=certificate.seq,
@@ -2508,9 +2551,7 @@ class HashIndex(IndexStore):
         """
         read_lsn = self._require_exact_read_lsn(snapshot)
         wanted = self._require_key(key)
-        return tuple(
-            entry.ref for entry in self._stable_candidates(wanted, read_lsn)
-        )
+        return tuple(entry.ref for entry in self._stable_candidates(wanted, read_lsn))
 
     def candidates(self, key: bytes) -> tuple[IndexEntry, ...]:
         """Return a stable candidate superset at the index's current durable frontier.
@@ -2847,7 +2888,9 @@ class IndexManager:
             )
         else:
             try:
-                table = self._heap.catalog.catalog.table_by_id(index.definition.table_id)
+                table = self._heap.catalog.catalog.table_by_id(
+                    index.definition.table_id
+                )
             except GrafxCorruptionDetected as failure:
                 if failure.details.get("field") != "table_id":
                     raise
@@ -2931,9 +2974,7 @@ class IndexManager:
 
     # --- freshness --------------------------------------------------------------------------
 
-    def _table_high_waters(
-        self, indexes: Sequence[IndexStore]
-    ) -> dict[int, Lsn]:
+    def _table_high_waters(self, indexes: Sequence[IndexStore]) -> dict[int, Lsn]:
         """Read each covered table's committed physical watermark exactly once."""
         high_waters: dict[int, Lsn] = {}
         for index in indexes:
@@ -2943,6 +2984,16 @@ class IndexManager:
             table = self._heap.catalog.catalog.table_by_id(table_id)
             high_waters[table_id] = self._heap.committed_high_water(table)
         return high_waters
+
+    def table_watermark_photo(self) -> dict[int, Lsn]:
+        """Photograph each covered table's committed watermark once, for one recovery holder.
+
+        Valid only while the photographer holds the section and applies nothing: a caller that
+        replays pages or adopts a catalog re-photographs before asking again, and the boot-time
+        :meth:`open`, which runs after the section is released into the regime where foreign
+        commits move the heap, always takes its own (ST-7).
+        """
+        return self._table_high_waters(self.indexes())
 
     def _replace_table_watermarks(self, high_waters: Mapping[int, Lsn]) -> None:
         """Bind every index to one open-time physical table-watermark picture."""
@@ -2981,7 +3032,9 @@ class IndexManager:
         for index in indexes:
             required = high_waters[index.definition.table_id]
             if required > published:
-                table = self._heap.catalog.catalog.table_by_id(index.definition.table_id)
+                table = self._heap.catalog.catalog.table_by_id(
+                    index.definition.table_id
+                )
                 raise GrafxCorruptionDetected(
                     f"Table {table.name!r} contains committed physical state through "
                     f"position {required}, ahead of the database's published position "
@@ -3008,7 +3061,11 @@ class IndexManager:
         )
 
     def check_replay_floor(
-        self, checkpoint_lsn: Lsn, *, persist_stale: bool = True
+        self,
+        checkpoint_lsn: Lsn,
+        *,
+        persist_stale: bool = True,
+        watermarks: Mapping[int, Lsn] | None = None,
     ) -> tuple[IndexStore, ...]:
         """Flag indexes behind a WAL replay floor without changing the published ceiling.
 
@@ -3017,10 +3074,23 @@ class IndexManager:
         called stale yet. Unlike :meth:`open`, this diagnostic deliberately leaves
         ``published_lsn`` untouched so a refused operator recovery cannot regress the state of a
         live handle.
+
+        ``watermarks`` lets one holder of the recovery section reuse a photo it took itself
+        (:meth:`table_watermark_photo`) instead of walking the heap again for the same still
+        picture. A table the photo does not name -- newly adopted between the photo and this
+        pass -- is read fresh here, never guessed at (ST-7).
         """
         floor = _require_position("checkpoint_lsn", checkpoint_lsn)
         indexes = self.indexes()
-        high_waters = self._table_high_waters(indexes)
+        if watermarks is None:
+            high_waters = self._table_high_waters(indexes)
+        else:
+            high_waters = dict(watermarks)
+            for index in indexes:
+                table_id = index.definition.table_id
+                if table_id not in high_waters:
+                    table = self._heap.catalog.catalog.table_by_id(table_id)
+                    high_waters[table_id] = self._heap.committed_high_water(table)
         return tuple(
             index
             for index in indexes
@@ -3032,14 +3102,25 @@ class IndexManager:
             )
         )
 
-    def mark_built_through(self, lsn: Lsn) -> None:
-        """Declare that every log record up to this position has reached every index.
+    def mark_built_through(
+        self, lsn: Lsn, *, watermarks: Mapping[int, Lsn] | None = None
+    ) -> None:
+        """Declare a completed replay, writing only the headers that need the declaration.
 
         The caller must have replayed the whole log, or written every record itself. It exists
         because recovery knows something no index can: that the replay it just finished was
         complete. Without it, an index that no record of the final commits happened to touch
         would be indistinguishable from one that missed them, and every open after a crash would
         rebuild indexes that were never behind.
+
+        What the declaration certifies is completeness FOR EACH TABLE: :meth:`open` requires an
+        index to cover its table's committed high water, never a global number. So an index whose
+        fresh page-0 certificate already covers that high water, with nothing unflushed behind it
+        and no stale, claim or rebuild transition in play, is left exactly as it stands -- the
+        skip never writes, so it can never invent freshness (ST-7, reopening R3-do-plano; the
+        earlier semantics rewrote and flushed every header to the global position on every
+        open). Every state this door cannot vouch for takes the full advance as before. The
+        published position still rises for the manager as a whole.
 
         Call it BEFORE :meth:`open`. An index already marked stale refuses to move the position
         it claims -- that is what stops a broken index looking fresh again -- so declaring a
@@ -3049,8 +3130,14 @@ class IndexManager:
         out of the stale state.
         """
         position = _require_position("lsn", lsn)
-        for index in self.indexes():
-            index.advance_built_through(position)
+        indexes = self.indexes()
+        photo = (
+            dict(watermarks)
+            if watermarks is not None
+            else self._table_high_waters(indexes)
+        )
+        for index in indexes:
+            index.complete_built_through(position, photo.get(index.definition.table_id))
             self._bind_local_heap_view(index)
         self._published_lsn = max(self._published_lsn, position)
 
@@ -3254,7 +3341,9 @@ class IndexManager:
             if not definition.owes_entry(values):
                 index.stage_empty_observation(txn)
             else:
-                records.append(index.stage_insert(txn, definition.key_for(values), ref, csn))
+                records.append(
+                    index.stage_insert(txn, definition.key_for(values), ref, csn)
+                )
         return tuple(records)
 
     def stage_row_delete(
@@ -3272,7 +3361,9 @@ class IndexManager:
             if not definition.owes_entry(values):
                 index.stage_empty_observation(txn)
             else:
-                records.append(index.stage_delete(txn, definition.key_for(values), ref, csn))
+                records.append(
+                    index.stage_delete(txn, definition.key_for(values), ref, csn)
+                )
         return tuple(records)
 
     def stage_row_update(
@@ -3301,11 +3392,15 @@ class IndexManager:
                 index.stage_empty_observation(txn)
             elif owes_old:
                 records.append(
-                    index.stage_delete(txn, definition.key_for(old_values), old_ref, csn)
+                    index.stage_delete(
+                        txn, definition.key_for(old_values), old_ref, csn
+                    )
                 )
             if owes_new:
                 records.append(
-                    index.stage_insert(txn, definition.key_for(new_values), new_ref, csn)
+                    index.stage_insert(
+                        txn, definition.key_for(new_values), new_ref, csn
+                    )
                 )
         return tuple(records)
 
@@ -3324,9 +3419,7 @@ class IndexManager:
         indexes = self.indexes()
         observations = {index.name: index.observed(txn) for index in indexes}
         staged_tables = {
-            index.definition.table_id
-            for index in indexes
-            if observations[index.name]
+            index.definition.table_id for index in indexes if observations[index.name]
         }
         for index in indexes:
             observed = observations[index.name]
@@ -3337,8 +3430,7 @@ class IndexManager:
                 written_tables is not None
                 and index.definition.table_id in written_tables
             ) or (
-                written_tables is None
-                and index.definition.table_id in staged_tables
+                written_tables is None and index.definition.table_id in staged_tables
             ):
                 # A row intent without even an empty observation is a short index, not an
                 # unrelated commit.  The table watermark below protects this handle and an
@@ -3451,9 +3543,7 @@ class IndexManager:
 
         return index._stable_view(read_lsn, confirm)
 
-    def _prepare_heap_view(
-        self, index_file: str, certificate: object
-    ) -> None:
+    def _prepare_heap_view(self, index_file: str, certificate: object) -> None:
         """Attach clean heap frames to the durable index generation validating them."""
         if not isinstance(certificate, _IndexReadCertificate):
             raise GrafxIndexError(

@@ -1438,13 +1438,19 @@ class RecoveryManager:
             self._adopt_catalog(findings)
         if touched_catalog and self._index_sync is not None:
             self._index_sync()
+        watermarks = None
         if manager is not None and not state_was_damaged:
             # Startup could not register the persistent indexes until catalog page redo made
             # their definitions readable. Check those newly adopted files against the retained
-            # WAL floor before replay can certify them through the final target.
+            # WAL floor before replay can certify them through the final target. Page redo and
+            # adoption are DONE, index replay moves index files and never the heap, and this
+            # process still holds the section -- so this one photo answers both this pass and
+            # the completion mark below (ST-7).
+            watermarks = manager.table_watermark_photo()
             manager.check_replay_floor(
                 state.checkpoint_lsn,
                 persist_stale=self._policy != POLICY_REFUSE,
+                watermarks=watermarks,
             )
         index_result = self._redo_engine.apply(index_replay)
 
@@ -1460,7 +1466,10 @@ class RecoveryManager:
                     "Recovery has an index manager that cannot certify completed replay.",
                     field="index_manager",
                 )
-            marker(target)
+            if watermarks is not None:
+                marker(target, watermarks=watermarks)
+            else:
+                marker(target)
 
         # WAL remains the durability authority; publication below is the last visible act.
         if target > state.last_committed_lsn or state_was_damaged:
