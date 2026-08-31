@@ -65,6 +65,7 @@ __all__ = [
     "ProduceResults",
     "ProjectRows",
     "PropertyAssignment",
+    "RelationshipScan",
     "SetProperties",
     "SingleRow",
     "SkipRows",
@@ -373,6 +374,45 @@ class TraverseAnyRelationship(PlanNode):
             "target": self.target,
             "tables": ", ".join(table.name for table in self.tables),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class RelationshipScan(PlanNode):
+    """One pass over a relationship table, binding both endpoints of each surviving edge.
+
+    The edge-first shape of ST-1 (b): when neither end of a single typed hop is seekable and
+    the residual predicate reads only the relationship, driving the hop from a node scan pays
+    a whole node-table walk for information the edge rows already carry. This operator scans
+    the relationship table ONCE, evaluates the r-only predicate on a binding that holds
+    nothing but the edge, and resolves the two endpoints only for the rows that survive --
+    the same owner overlay, ended-row rule and landing-visibility rule the traversal applies.
+    """
+
+    child: PlanNode
+    from_variable: str
+    to_variable: str
+    relationship: str | None
+    table: TableDef
+    from_table: TableDef
+    to_table: TableDef
+    predicate: Expression | None = None
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Return the operator whose rows drive this scan."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Return the endpoints, the relationship table and the consumed predicate."""
+        details: dict[str, object] = {
+            "from": self.from_variable,
+            "to": self.to_variable,
+            "table": self.table.name,
+        }
+        if self.relationship is not None:
+            details["relationship"] = self.relationship
+        if self.predicate is not None:
+            details["predicate"] = self.predicate.describe()
+        return details
 
 
 @dataclass(frozen=True, slots=True)
