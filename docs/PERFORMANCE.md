@@ -64,6 +64,21 @@ torn rows, zero foreign exceptions, and clean `verify()` live and after reopen. 
 convoy-sensitive, so this single pair is evidence that CE-1 preserved read behaviour and improved
 the measured run, not a new throughput SLO.
 
+### CE-2 concurrency acceptance (2026-08-31)
+
+The unchanged instrument was repeated at integrated candidate `565ac37` after the reader-pin
+change. This is a correctness and regression gate, not a causal timing comparison with the earlier
+machine window.
+
+| elapsed | write throughput | point read median / p99 | read throughput | correctness |
+|---:|---:|---:|---:|---|
+| 46.6 s | 10.7 rows/s | 3.16 / 12.97 ms | 173.9 stmt/s | PASS |
+
+All 500/500 acknowledged disjoint rows and the 10 contended seeds survived. There were 152
+retryable conflicts, zero process crashes, foreign exceptions, duplicate/phantom rows or torn
+reads, and `verify("all")` was clean live and after reopen. The 2,700 reader rounds exercised a
+point read, aggregate and bounded ordered scan while four independent writer processes committed.
+
 ### Reads, under full write load
 
 | statement | n | median | p90 | p99 | max |
@@ -218,6 +233,35 @@ logical digest. Final artifact `ce1-final-75eac97-64a9da6-pf5-h1h8_1.json`, SHA-
 `4f943009c93ff8c85061519e578b08f0da85e677aa158e4b649f8701029c8d31`; first-run artifact
 `ce1-93a3ee3-64a9da6-pf5-h1h8_1.json`, SHA-256
 `e031cb4c7ede4859e6513d8614cb625db9fef38ffa0c30960a8852d1b0f2d2ae`.
+
+### CE-2 participant reader-pin gate (2026-08-31)
+
+`565ac37` retains one durable reader registration per open participant and advances its conservative
+LSN floor instead of publishing and removing a file for every transaction. The same H1-H8.1
+workload, checkouts, logical digest and forensic image were retained.
+
+| discriminator | CE-1 final `75eac97` | CE-2 `565ac37` | CE-2 vs CE-1 |
+|---|---:|---:|---:|
+| `_windows_posix_replace` per representative operation | 1 | **0** | per-transaction reader rename removed |
+| `os.fsync` per representative operation | 6 | **4** | -2 barriers |
+| `LocalStorageDevice.list_files` per operation | 2 | **2** | unchanged |
+| `_open_descriptor` after warm-up | 2 | **0** | no per-transaction control open |
+| seven simple-family RAW medians, sum | 1,289.48 ms | **975.79 ms** | **-24.33%** |
+| seven simple-family commit phase, sum | 406.52 ms | **319.20 ms** | **-21.48%** |
+| all 12 RAW medians, sum | 3,078.01 ms | **2,363.90 ms** | **-23.20%** |
+| all 12 instrumented medians, sum | 7,379.22 ms | **6,428.55 ms** | **-12.89%** |
+| all 12 phase medians, sum | 3,087.96 ms | **2,357.02 ms** | **-23.67%** |
+| setup, 110 commits | 443.6 s | **392.8 s** | -11.45%; no causal credit |
+
+The run completed 180/180 samples and 12/12 families with zero bad postconditions. Against the
+frozen 787.00 ms Ladybug reference, the aggregate RAW ratio is **3.00x**. Acceptance is anchored to
+the removed hot-path publications and the process-level WAL-retention proof, not to attributing all
+wall-clock movement to CE-2. Artifact `ce2-565ac37-64a9da6-pf5-h1h8_1.json`, SHA-256
+`bc305be2af31cd8769481f2ad4906ede3abc71f6e397a63cc3f993e0ad5fef14`. The dedicated three-scenario
+instrument and its 47/47 result are documented in
+`docs/architecture/CE2_READER_PARTICIPANT_PIN.md`. The final v8 artifact kept the long reader open
+for 90.00 s and has SHA-256
+`d0285b5197a1ac05133cac3c90ab02ae1bd021f86d2785ad6ad6ffa9c3d29b3e`.
 
 Also measured there: index maintenance costs ~**6.6%** of total suite runtime (572 s → 610 s on an
 idle machine; an earlier draft said 52% and was measuring a concurrent agent, kept as a lesson).
