@@ -211,7 +211,7 @@
   `59232c0f485aa696fc0e4593b666bb20de0e9efca8ebf5e8f9f4fda21fe8a9fb`, mesmo digest lógico e
   checkouts Pulse. Multi-writer/multi-reader permanece intacto: formato, WAL, lease, cerca,
   visibilidade, publicação, recovery e coordenação não mudaram.
-- **Onda QW-8/QW-9/QW-10 + ST-1 implementada e perfilada; promoção aguarda o gate agregado.**
+- **Onda QW-8/QW-9/QW-10 + ST-1 implementada e perfilada; QW-8/QW-10 passou o gate causal.**
   No Pulse Community, `perf/w5-qw8-qw10@64a9da6` troca as revalidações completas intermediárias
   do roteamento por um probe fail-closed de identidade do JSON de binding e do diretório físico;
   `begin`/`commit`, qualquer diferença e qualquer `OSError` continuam fazendo a prova completa.
@@ -236,6 +236,12 @@
   temporal a repetir no gate final, não como regressão aceita nem como alvo móvel. Artefato Grafx:
   `w5-f01b659-64a9da6-pf5-h1h8_1.json`, SHA-256
   `e5108fee403b6055a2902bc7b9524dc30313882538c4369cc77a4d3dd20f1ad8`.
+  O candidato Community `64a9da6` passou 122 focados e mais de 529 casos da suíte larga, com
+  Ruff/diff-check e worktree limpos. Falhas vetoriais observadas foram idênticas no Community
+  base `0dfb526` e no candidato, e desapareceram ao trocar somente o Grafx de `ef0de63` para o
+  pré-ST-7 `72671c0`; portanto QW-8/QW-10 não é causal. Handoff
+  `hof_167a02e301534ede9b3e5ba8c9d2b650` verificado pelo Codex; registro completo em
+  `claude-scratch/PULSE-QW8QW10-GATE.md`.
 - **Referência Ladybug reancorada após QW-8.** Como QW-8 altera código comum do adaptador, a
   referência anterior de `970,62 ms` foi invalidada e não é reutilizada. O novo perfil sequencial
   em `Community@64a9da6`, com o mesmo digest e 180/180 operações, mediu `787,00 ms`; portanto a
@@ -265,7 +271,8 @@
   global completo terminou em 100%/exit `0`, além dos testes focados de imports, documentação,
   ST-1, ST-6, corpus, Ruff e `diff --check`. Nenhuma regra de leitura, escrita ou concorrência foi
   afrouxada para obter o resultado.
-- **ST-7 implementado, auditado e integrado.** A abertura/recovery fotografa uma vez os
+- **ST-7 implementado e integrado; correção cross-repo vetorial em curso antes da próxima
+  promoção.** A abertura/recovery fotografa uma vez os
   watermarks por tabela após aplicar páginas e adotar o catálogo; a foto só é reutilizada dentro
   da mesma seção e qualquer tabela ausente é relida, enquanto a montagem final continua fazendo
   uma foto própria. O marcador de replay deixa intacto um header somente com certificado page-0
@@ -291,6 +298,13 @@
   Ruff e `diff --check`. O gate global final do candidato corrigido coletou 10.831 casos,
   atravessou novamente toda a cauda vetorial e terminou em 100%/exit `0`, sem falhas; esse é o
   gate válido para promoção.
+  O gate posterior do Pulse revelou uma lacuna que a suíte local não cobria: o skip por tabela
+  também alcançou índices vetoriais/proximity, mas o contrato Pulse exige que seu
+  `built_through_lsn` acompanhe a posição global. Com o mesmo Community/Core, a matriz vetorial
+  teve 6 erros, discovery 5 falhas e composição routed 2 falhas em `ef0de63`, contra
+  **8/8, 8/8 e 12/12** no pré-ST-7 `72671c0`. A correção mínima acordada preserva o skip e o ganho
+  para exact/hash, exclui vector/proximity e está delegada no handoff
+  `hof_c23df4f3e7124d98a2409b23a6354e3f`; main/CE-1 não serão promovidos antes desse gate.
 - **Gate final ST-6/ST-7 concluído e aprovado com a limitação temporal registrada.** O perfil
   H1-H8.1 em `Grafx@ef0de63`, `Community@64a9da6` e `Core@ccc1f345` concluiu 180/180 operações,
   12/12 famílias e manteve exatamente o digest lógico certificado `c994255b...`. O setup de 110
@@ -306,7 +320,8 @@
   `w7-ef0de63-64a9da6-pf5-h1h8_1.json`, SHA-256
   `2ce10d4200a9a420c75c081da9ae804001223cfb5f833aacdb91b854b68415c9`; check-only anterior,
   mesmo conjunto lógico e checkouts limpos: `w7-ef0de63-64a9da6-check.json`.
-- **CE-1 possui candidato de produção integrado; promoção aguarda somente G6/G7.** O spike
+- **CE-1 possui candidato de produção integrado; G6 passou e promoção aguarda G7 mais a correção
+  ST-7 × Pulse.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`
   (`108,85x-158,01x`), o caso frio `1,00-7,16 ms` (`2,58x-14,95x`) e a LRU real com evicção
@@ -327,8 +342,18 @@
   `perf/w1-ce1-contract@7b83dcd8c89c991bac35273d099a7a79e982d227`, documento
   `docs/architecture/CE1_TWO_SLOT_CONTROL_RECORD.md` SHA-256
   `5d07dcebaeda8c33a5220846985b80b8a4353e2294659eb352e076ffbf973dd9`; o ADR agora está
-  `IMPLEMENTED CANDIDATE`, preservando multi-writer/multi-reader e bloqueando promoção somente
-  até o benchmark same-code (G6) e a revisão crítica independente (G7).
+  `IMPLEMENTED CANDIDATE`, preservando multi-writer/multi-reader. O G6 H1-H8.1 concluiu 180/180
+  amostras e 12/12 famílias com digest `c994255b...`: rename `4 → 1`, fsync `9 → 6`, listagens
+  `9 → 2` e dois descriptors aquecidos. As sete famílias simples reduziram RAW
+  `1.586,60 → 1.482,21 ms` (`-6,58%`) e commit phase `674,81 → 455,90 ms` (`-32,44%`); o agregado
+  RAW das 12 variou `3.401,74 → 3.539,92 ms` (`+4,06%`) e não é creditado como ganho. Artefato
+  `ce1-93a3ee3-64a9da6-pf5-h1h8_1.json`, SHA-256
+  `e031cb4c7ede4859e6513d8614cb625db9fef38ffa0c30960a8852d1b0f2d2ae`.
+  O smoke pareado pré-CE-1/CE-1 preservou a leitura pontual (`4,15/15,31 → 4,34/16,05 ms`,
+  mediana/p99) e passou 4 writers + 3 readers com 500/500 linhas e `verify()` limpo. Após adaptar
+  três expectativas históricas ao novo formato, a suíte global terminou em **10.909 passed,
+  17 skipped, 0 failed** em `98e52dd`; Ruff e `diff --check` verdes. Resta G7, além do blocker
+  cross-repo ST-7 já explicitado acima.
 - **Compatibilidade Okto Pulse: M-PULSE-1 a M-PULSE-6 concluídos e certificados conforme o quadro
   9.7; M-PULSE-7 está em execução e permanece o gate serial.** O primeiro trace representativo
   expôs um blocker de performance, não de semântica: no mesmo workload, Ladybug concluiu em

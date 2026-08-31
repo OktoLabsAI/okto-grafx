@@ -47,6 +47,23 @@ The run only counts if correctness holds, and it held: **500/500 acknowledged ro
 duplicates, zero phantom rows, zero torn reads in 6,207 reader rounds, zero non-`Grafx*` escapes,
 `verify()` clean live and after reopen.**
 
+### CE-1 paired concurrency check (2026-08-31)
+
+The two-slot control-record candidate was compared immediately after its pre-CE-1 parent on the
+same host, with no other Python test process. This comparison is the CE-1 gate; the older absolute
+figures below remain the historical concurrency baseline and must not be mixed with this window.
+
+| build | elapsed | point read median / p99 | write throughput | read throughput | correctness |
+|---|---:|---:|---:|---:|---|
+| pre-CE-1 `78e05e9` | 68.6 s | 4.15 / 15.31 ms | 7.3 rows/s | 66.3 stmt/s | PASS |
+| CE-1 `93a3ee3` | 46.6 s | 4.34 / 16.05 ms | 10.7 rows/s | 86.1 stmt/s | PASS |
+
+Point-read median/p99 moved **+4.6%/+4.8%**, not the apparent 3x obtained by comparing different
+machine windows. Both runs stored 500/500 acknowledged rows and had zero duplicate, phantom or
+torn rows, zero foreign exceptions, and clean `verify()` live and after reopen. Write latency is
+convoy-sensitive, so this single pair is evidence that CE-1 preserved read behaviour and improved
+the measured run, not a new throughput SLO.
+
 ### Reads, under full write load
 
 | statement | n | median | p90 | p99 | max |
@@ -171,6 +188,30 @@ the source file is 11.4 ms), with fsync, locking and the directory itself ruled 
 It is the largest single item in W6 and the denominator behind §2's write latencies. The decision
 record — why the ceiling stands unamended — is in `docs/architecture/COMPONENTS.md` under the D5
 entry.
+
+### CE-1 same-code control-publication gate (2026-08-31)
+
+`93a3ee3` replaces the per-commit rename publication of `writer.lease` and `commit.state` with a
+crash-safe inactive-slot page write plus barrier. The H1-H8.1 run used the same Pulse checkouts,
+same `continuous/per_family=5` shape and the certified operation digest
+`c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81` as the preceding ST-7 run.
+
+| discriminator | pre-CE-1 | CE-1 | result |
+|---|---:|---:|---:|
+| `_windows_posix_replace` per instrumented operation | 4 | **1** | expected reader registration remains until CE-2 |
+| `os.fsync` per instrumented operation | 9 | **6** | gate `<= 6` met |
+| `LocalStorageDevice.list_files` per operation | 9 | **2** | gate `<= 7` met |
+| `_open_descriptor` after warm-up | — | **2** | gate `<= 3` met |
+| seven simple-family RAW medians, sum | 1,586.60 ms | **1,482.21 ms** | **-6.58%** |
+| seven simple-family commit phase, sum | 674.81 ms | **455.90 ms** | **-32.44%** |
+| all 12 RAW medians, sum | 3,401.74 ms | 3,539.92 ms | +4.06%; no gain credited |
+
+Six of the seven simple-family RAW medians improved; the source-deleted tombstone family moved
+`+17.98%`. The all-family instrumented and phase sums moved `+4.32%` and `+3.50%`, respectively,
+so CE-1 is credited only for the causal publication/commit reduction, not for an aggregate hot-path
+claim. Setup took 458.6 s (397.7 s in the preceding window). The report contains 180/180 samples;
+artifact `ce1-93a3ee3-64a9da6-pf5-h1h8_1.json`, SHA-256
+`e031cb4c7ede4859e6513d8614cb625db9fef38ffa0c30960a8852d1b0f2d2ae`.
 
 Also measured there: index maintenance costs ~**6.6%** of total suite runtime (572 s → 610 s on an
 idle machine; an earlier draft said 52% and was measuring a concurrent agent, kept as a lesson).

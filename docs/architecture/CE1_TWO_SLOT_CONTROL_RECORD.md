@@ -1,6 +1,6 @@
 # CE-1 — Registros de controle em dois slots (contrato / ADR executável)
 
-Status: **IMPLEMENTED CANDIDATE — promoção BLOQUEADA por G6/G7.** A implementação candidata preserva multi-writer/multi-reader e passou unidade, matriz de falhas, regressão por subsistema e rollback; nenhum ganho é creditado até a medição same-code e a revisão independente finais.
+Status: **IMPLEMENTED CANDIDATE — G6 PASS; promoção BLOQUEADA por G7 e pela correção cross-repo ST-7/Pulse.** A implementação candidata preserva multi-writer/multi-reader e passou unidade, matriz de falhas, regressão por subsistema, rollback, benchmark same-code, concorrência pareada e suíte global; nenhum merge ocorre antes da revisão independente final.
 
 Origem: `GRAFX_PERFORMANCE_NEXT_STEPS.md` §5b (CE-1 = ST-5 / RC1-C), `GRAFX-CONSENSUS-RESPONSE.md` (ACCEPT-B com portões), handoff `hof_35575263f735440abffb3e14a9fd79fa`. Base de leitura: Grafx `main@4c474b56`. Autor: claude-coder, 2026-08-30. Revisor esperado: codex (criador do handoff), depois o blind critic do processo C13.
 
@@ -267,10 +267,10 @@ Sem estas 7 emendas aprovadas tecnicamente pelos dois agentes (Codex + Claude) e
 | **G0 medição fria** (codex, em curso) | custo do primitivo com descritor frio e sob LRU realista | JSON no `ce1-spike` com fase `open`; decide §7 |
 | **G1 unidade** | §2 I3/I4/I7/I10, §3 layout, §4.1/4.2 | todos os testes **(a criar)** de `tests/storage_core/test_two_slot_control_record.py` verdes; property-based (Hypothesis) sobre sequências de publicação/falha com ≥ 10^4 exemplos |
 | **G2 matriz de falhas** | §8 C1–C14 | 14 testes verdes; C4 parametrizado em todas as fronteiras de 512 B do `page_size` padrão e em `MIN_PAGE_SIZE` |
-| **G3 multiprocesso** | I1, I2, I5, C12, C13 | 2 e 4 escritores × 1 e 3 leitores em processos reais (`spawn`), 10^5 publicações do mesmo arquivo com fault twin rasgando o slot inativo a cada offset e kill −9 a cada passo; 0 falhas de decode, gerações nunca regridem, época nunca regride; `verify('all')` limpo vivo e após reopen; `measure_concurrency.py` 4w+3r antes/depois: unit commit cai, mediana de 4 escritores move ~1× (não 3×: é a OCC de page 0 que a fixa — CN-1), leitura 1,52/5,74 ms inalterada |
+| **G3 multiprocesso — PASS** | I1, I2, I5, C12, C13 | matriz determinística de 10.000 publicações mais processos reais; smoke pareado 4w+3r com 500/500 linhas, zero decode/loss/duplicate/phantom/torn read/escape e `verify('all')` limpo vivo/reopen. Leitura pontual mediana/p99 `4,15/15,31 → 4,34/16,05 ms`; throughput de escrita `7,3 → 10,7 rows/s`. A separação executável dos regimes está na Revisão 3. |
 | **G4 regressão** | suites existentes | `tests/coordination`, `tests/txn`, `tests/recovery`, `tests/storage_adapters` verdes; `test_no_instant_of_a_commit_offers_a_snapshot_of_half_of_it` inalterado e verde; E-CE1-7 reescrito e verde; ruff limpo |
 | **G5 rollback** | §6 | round-trip v1 → v2 → v1 byte-idêntico; build v1 recusa v2 com `GrafxSchemaVersionMismatch`; build v2 abre v1 só-leitura sem migrar |
-| **G6 desempenho same-code** | ganho real, não inferido | harness h1-h8 (`okto-pulse-perf-harness`), base Etapa 0 em `4c474b56`, `--mode continuous --per-family 5`, digest `c994255b…` igual: hooks `_windows_posix_replace` 4 → 1/op (só o registro de leitor, até CE-2), `os.fsync` 9 → ≤ 6, `list_files` 9 → ≤ 7, `_open_descriptor` (H7) ≤ 3/op após aquecimento; RAW das 7 famílias simples e do D5 phase split neste rig com alvo "publicação ≤ 1 ms" **medido**, não assumido; só então a linha de ganho de CE-1 no roadmap é substituída por números [MEDIDO] |
+| **G6 desempenho same-code — PASS** | ganho real, não inferido | harness h1-h8 (`okto-pulse-perf-harness`), `--mode continuous --per-family 5`, digest `c994255b…` igual: `_windows_posix_replace` `4 → 1`, `os.fsync` `9 → 6`, `list_files` `9 → 2`, `_open_descriptor=2`; sete famílias simples RAW `-6,58%` e commit phase `-32,44%`. O agregado das 12 famílias variou `+4,06%` e não é creditado como ganho. Artefato/SHA em Revisão 4. |
 | **G7 crítico cego** | processo C13 | revisão independente de §4.4 (visível-antes-de-durável) e §7 (pin) antes do merge |
 
 ---
@@ -326,12 +326,32 @@ Status permanece **PROPOSED / produção bloqueada**; todos os demais invariante
 5. **G5 concluído:** `oktografx control downgrade PATH` toma COMMIT→LEASE, recusa lease ativa ou
    qualquer registro de leitor, converte os payloads lógicos byte a byte e publica meta v1 por
    último. O round-trip v2→v1 e a repetição idempotente passaram.
-6. **G3 parcialmente coberto, medição final pendente:** as suítes multiprocessos existentes de
-   dois writers + leitor e visibilidade longeva passaram. A parte 4 writers + 3 readers será
-   executada pelo instrumento `measure_concurrency.py`; a formulação original “fault twin +
+6. **G3 concluído:** as suítes multiprocessos existentes de dois writers + leitor e visibilidade
+   longeva passaram. O instrumento `measure_concurrency.py` executou 4 writers + 3 readers no
+   pré-CE-1 e no candidato, ambos com 500/500 linhas, zero perda/duplicação/phantom/torn read/escape
+   e `verify('all')` limpo vivo e após reopen. Leitura pontual pareada variou somente
+   `4,15/15,31 → 4,34/16,05 ms` (mediana/p99). A formulação original “fault twin +
    kill −9 em 10^5 publicações” misturava um double in-memory com processos reais e não é um único
    ensaio executável. O aceite foi separado em matriz determinística de 10.000 operações e carga
    real multiprocesso, sem reduzir as propriedades verificadas.
-7. **G6/G7 permanecem bloqueios de promoção:** benchmark H1-H8/concorrência e revisão crítica
-   independente ainda não concluídos. Portanto este documento ainda não declara CE-1 aceita nem
-   publica número de ganho em commits reais.
+7. **G6 concluído; G7 permanece bloqueio de promoção:** o benchmark e a suíte global estão verdes;
+   a revisão crítica independente ainda não concluiu. Portanto este documento ainda não declara
+   CE-1 aceita.
+
+### Revisão 4 (2026-08-31, G6 e gate global)
+
+1. **H1-H8.1:** 180/180 amostras, 12/12 famílias, digest lógico certificado idêntico. O artefato
+   `ce1-93a3ee3-64a9da6-pf5-h1h8_1.json` tem SHA-256
+   `e031cb4c7ede4859e6513d8614cb625db9fef38ffa0c30960a8852d1b0f2d2ae`.
+2. **Contadores causais:** rename `4 → 1`, fsync `9 → 6`, listagens `9 → 2` e dois descriptors
+   abertos após aquecimento. As sete famílias simples reduziram RAW em `6,58%` e commit phase em
+   `32,44%`; o agregado RAW das 12 variou `+4,06%`, registrado sem crédito de ganho.
+3. **Concorrência pareada:** pré-CE-1 `78e05e9` e CE-1 `93a3ee3` passaram o mesmo smoke 4w+3r. A
+   diferença de leitura pontual foi `+4,6%/+4,8%` em mediana/p99, compatível com a mesma janela;
+   throughput de escrita foi `7,3 → 10,7 rows/s` sem mudança de premissa.
+4. **Global:** três expectativas históricas ainda procuravam `atomic_replace(commit.state)` ou a
+   enumeração antiga de `PageType`; foram atualizadas para o `write_page` do slot e tipos 7/8,
+   sem mudança de produção. Resultado final em `98e52dd`: **10.909 passed, 17 skipped, 0 failed**
+   em `1.531,26 s`; Ruff `src tests` e `git diff --check` verdes.
+5. **Bloqueios restantes:** G7 e a correção mínima da regressão ST-7 × contrato vetorial do Pulse,
+   descoberta pelo gate QW-8/QW-10. Nenhum deles altera multi-writer/multi-reader.
