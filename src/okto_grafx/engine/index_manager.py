@@ -1480,8 +1480,9 @@ class IndexStore:
         caller's current watermark photo, never by a remembered flag: a foreign participant may
         persist STALE outside any commit section at any moment, and page 0 is the only place
         that verdict lives (ST-7). Three proofs make a skip: the fresh certificate is healthy,
-        it agrees with the resident header (so no replayed work is waiting for a flush), and it
-        covers the table's committed high water -- which is the strongest position
+        its built-through position agrees with the resident header (the only header field replay
+        advances, so no replayed work is waiting for a flush), and it covers the table's committed
+        high water -- which is the strongest position
         :meth:`IndexManager.open` will ever require of it. The skip never writes; the worst a
         wrong photo can cost is a rebuild nobody needed, never a wrong answer. Every other
         state -- no photo for this table, a stale mark in either home, a rebuild in flight, a

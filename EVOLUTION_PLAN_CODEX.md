@@ -265,6 +265,22 @@
   global completo terminou em 100%/exit `0`, além dos testes focados de imports, documentação,
   ST-1, ST-6, corpus, Ruff e `diff --check`. Nenhuma regra de leitura, escrita ou concorrência foi
   afrouxada para obter o resultado.
+- **ST-7 implementado, auditado e integrado.** A abertura/recovery fotografa uma vez os
+  watermarks por tabela após aplicar páginas e adotar o catálogo; a foto só é reutilizada dentro
+  da mesma seção e qualquer tabela ausente é relida, enquanto a montagem final continua fazendo
+  uma foto própria. O marcador de replay deixa intacto um header somente com certificado page-0
+  fresco e saudável, ausência de `stale`/claim/rebuild local, igualdade do
+  `built_through_lsn` residente (único campo avançado pelo replay) e cobertura do high-water da
+  tabela; qualquer desconhecido usa integralmente o caminho anterior. Uma gravação `STALE` por
+  processo spawnado continua observada no open seguinte e a consulta usa o scan correto.
+  Origem publicada: `perf/w7-st7-open-freshness@61ca9f5`; integração: `ef2d16e`; handoff Nexus
+  `hof_dcd0953d2fe345fcb76e2a0e0098723a` verificado/PASS. Medição discriminante:
+  `advance_built_through 4 -> 0` numa reabertura limpa, com as seis leituras de high-water
+  preservadas; o caso representativo remove flush/fsync de quatro headers, e o M7 de 161 índices
+  passa a escrever somente os realmente atrasados. Claude executou 7/7 ST-7, 33/33 staleness,
+  637 index+txn, 1.612 recovery+WAL+storage, 2.390 API/foundation e 1.693 query; a reprodução
+  independente passou os 40 testes críticos, inclusive o subprocesso real, Ruff e `diff --check`.
+  Nenhuma lease, WAL, publicação, seção de commit ou premissa multi-writer/multi-reader mudou.
 - **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`
