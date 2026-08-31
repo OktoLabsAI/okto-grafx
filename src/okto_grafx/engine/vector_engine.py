@@ -1272,6 +1272,7 @@ class VectorEngine:
         *,
         existing_only: bool = False,
         persist_stale: bool = True,
+        proved_present: bool = False,
     ) -> VectorHnswIndex:
         """Create and register the index of one embedding space over one table (TR-2).
 
@@ -1284,6 +1285,9 @@ class VectorEngine:
         table declared in the same transaction exist only there until the commit installs them.
         Resolving the space from the live catalog would refuse exactly the statement the quick
         start opens with.
+
+        ``proved_present`` transports the composition root's exact index-directory listing to
+        the shared registry; it does not bypass any header or freshness validation.
         """
         source = catalog if catalog is not None else self._catalog.catalog
         space = source.space(space_name)
@@ -1322,6 +1326,7 @@ class VectorEngine:
             ),
             existing_only=existing_only,
             persist_stale=persist_stale,
+            proved_present=proved_present,
         )
         self._by_space[space.name] = index
         self._maintained_at[space.name] = self._clock.monotonic()

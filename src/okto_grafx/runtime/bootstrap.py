@@ -384,6 +384,7 @@ def build_storage(context: PortContext) -> object:
     return LocalStorageDevice(
         config.path,
         page_size=config.page_size,
+        max_open_files=config.max_open_files,
         create_root=not config.read_only,
     )
 

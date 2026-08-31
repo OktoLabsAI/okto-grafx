@@ -27,6 +27,7 @@ __all__ = [
     "CORE_MAX_PAGE_SIZE",
     "MAX_PARTITIONS_PER_TABLE",
     "MAX_VECTOR_EF_SEARCH",
+    "DEFAULT_MAX_OPEN_FILES",
     "MINIMUM_STORE_FRAMES",
     "RECOVERY_POLICIES",
     "METRICS_SINKS",
@@ -57,6 +58,14 @@ MAX_PARTITIONS_PER_TABLE: int = 65535
 
 MAX_VECTOR_EF_SEARCH: int = MAX_EF_SEARCH
 """Largest HNSW base beam accepted from public database configuration."""
+
+DEFAULT_MAX_OPEN_FILES: int = 256
+"""Default descriptor-cache budget for a composed local database.
+
+The Windows UCRT available to the supported interpreter starts with 512 stdio descriptors.
+Keeping at most half for Grafx's storage cache leaves equal headroom for WAL, coordination,
+Pulse and the host process while avoiding the 64-entry churn on index-heavy databases.
+"""
 
 MINIMUM_STORE_FRAMES: int = max(CATALOG_FRAMES, HEAP_FRAMES)
 """Fewest pages the catalog and heap stores can operate over at once."""
@@ -237,6 +246,7 @@ class DatabaseConfig:
     page_size: int = 8192
     partitions_per_table: int = 64
     buffer_budget_bytes: int = 64 * 1024 * 1024
+    max_open_files: int = DEFAULT_MAX_OPEN_FILES
     recovery_policy: str = "replay"
     lease_ttl_seconds: float = 5.0
     lease_timeout_seconds: float = 10.0
@@ -293,6 +303,7 @@ class DatabaseConfig:
 
         for field in (
             "buffer_budget_bytes",
+            "max_open_files",
             "wal_segment_bytes",
             "checkpoint_interval_records",
         ):

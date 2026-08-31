@@ -9,6 +9,7 @@ from types import MappingProxyType
 import pytest
 
 from okto_grafx.api.assembly import assemble_database
+from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxDeviceFull,
@@ -46,6 +47,20 @@ def test_building_the_default_registry_fills_every_required_slot() -> None:
                 slot,
                 type(port),
             )
+    finally:
+        bootstrap.release_ports(registry)
+
+
+def test_the_local_storage_descriptor_budget_comes_from_database_config(
+    tmp_path: Path,
+) -> None:
+    registry = bootstrap.build_default_registry(
+        DatabaseConfig(path=str(tmp_path / "db"), max_open_files=73)
+    )
+    try:
+        storage = registry.get("storage")
+        assert type(storage) is LocalStorageDevice
+        assert storage._max_open_files == 73
     finally:
         bootstrap.release_ports(registry)
 

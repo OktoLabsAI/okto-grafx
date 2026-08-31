@@ -133,6 +133,29 @@ def test_register_existing_only_never_repairs_an_incomplete_file(database: Datab
     assert database.device.page_count(candidate.file) == 0
 
 
+def test_register_reuses_a_proved_directory_entry_without_rechecking_exists(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = HashIndex(
+        exact_definition(database.table, name="proved_present"),
+        database.pool,
+        database.metrics,
+    )
+    candidate.create()
+
+    def redundant_exists(file: str) -> bool:
+        raise AssertionError(f"rechecked the proved directory entry {file!r}")
+
+    monkeypatch.setattr(database.device, "exists", redundant_exists)
+
+    assert database.manager.register(
+        candidate,
+        existing_only=True,
+        persist_stale=False,
+        proved_present=True,
+    ) is candidate
+
+
 def test_registering_a_store_that_does_not_answer_the_contract_is_refused(
     database: Database, person_table: TableDef
 ) -> None:
