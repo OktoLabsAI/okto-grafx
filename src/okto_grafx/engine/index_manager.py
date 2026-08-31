@@ -683,9 +683,7 @@ class IndexStore:
             )
         fenced_through = self._completed_rebuild_through
         rebuild_required = (
-            required_lsn
-            if rebuild_required_lsn is None
-            else rebuild_required_lsn
+            required_lsn if rebuild_required_lsn is None else rebuild_required_lsn
         )
         if fenced_through is not None and rebuild_required > fenced_through:
             # A rebuild this handle completed derived its entries at ``fenced_through``. The
@@ -1541,8 +1539,18 @@ class IndexStore:
         state -- no photo for this table, dirty work, a stale mark in either home, a rebuild in
         flight, or a disagreement between device and resident -- takes
         :meth:`advance_built_through` whole.
+
+        Proximity-class indexes never skip. Their freshness is consumed OUTSIDE this repo
+        against the GLOBAL replay declaration -- the Pulse ANN contract reads
+        ``built_through_lsn`` versus the declared position, not versus the table's high water
+        (regression msg_179ada60) -- so for them the completion mark keeps its pre-ST-7
+        semantics whole. The open-time saving this door exists for is almost entirely
+        exact-class: they keep the table-local skip.
         """
         position = _require_position("lsn", lsn)
+        if self.visibility is IndexVisibility.PROXIMITY:
+            self.advance_built_through(position)
+            return
         if (
             table_high_water is None
             or self._stale_reason is not None
