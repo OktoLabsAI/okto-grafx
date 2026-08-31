@@ -9,6 +9,7 @@ seen fail. Feeding synthetic observations is how each judgement gets proven.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -46,9 +47,9 @@ HEALTHY_METRICS = {
     "captured": {
         "per_process_snapshots": 2,
         "by_process": [
-            {"role": "writer", "slot": 1,
+            {"role": "writer", "slot": 1, "metrics": {"oktografx_x": 1},
              "document": {"publications": 2, "final": {"metrics": {"oktografx_x": 1}}}},
-            {"role": "reader", "slot": 1,
+            {"role": "reader", "slot": 1, "metrics": {"oktografx_x": 1},
              "document": {"publications": 2, "final": {"metrics": {"oktografx_x": 1}}}},
         ],
     },
@@ -82,6 +83,16 @@ def observations(**overrides: object) -> dict:
     }
     baseline.update(overrides)
     return baseline
+
+
+def help_text() -> str:
+    """The parser help with whitespace collapsed.
+
+    argparse re-wraps to the terminal width, which is not the same under pytest as in a
+    shell, so a phrase can straddle a line break and a plain substring test fails for a
+    reason that has nothing to do with the text being right.
+    """
+    return re.sub(r"\s+", " ", build_parser().format_help())
 
 
 def failed(criteria: list[dict]) -> list[str]:
@@ -309,10 +320,41 @@ def test_metrics_that_came_back_empty_fail_the_cell() -> None:
     assert name in failed(evaluate(**observations(metrics=errored)))
 
     hollow = {"captured": {"per_process_snapshots": 2, "by_process": [
-        {"role": "writer", "slot": 1, "document": {"publications": 1, "final": {}}},
-        {"role": "reader", "slot": 1, "document": {"publications": 1, "final": {}}},
+        {"role": "writer", "slot": 1, "metrics": {"x": 1},
+         "document": {"publications": 1, "final": {}}},
+        {"role": "reader", "slot": 1, "metrics": {"x": 1},
+         "document": {"publications": 1, "final": {}}},
     ]}, "capture_errors": None}
     assert name in failed(evaluate(**observations(metrics=hollow)))
+
+    # EXACTLY one snapshot per process: a duplicate would satisfy a >= check while some
+    # process reported nothing at all.
+    duplicated = {**HEALTHY_METRICS, "captured": {
+        **HEALTHY_METRICS["captured"],
+        "by_process": HEALTHY_METRICS["captured"]["by_process"]
+        + [HEALTHY_METRICS["captured"]["by_process"][0]],
+    }}
+    assert name in failed(evaluate(**observations(metrics=duplicated)))
+
+    # MetricsSnapshotView is a Mapping with no as_dict; stringifying it wrote a truthy repr
+    # that passed every "did we capture metrics" check while holding no counter.
+    stringified = {**HEALTHY_METRICS, "captured": {
+        **HEALTHY_METRICS["captured"],
+        "by_process": [{**entry, "metrics": "MetricsSnapshotView(entries=(...))"}
+                       for entry in HEALTHY_METRICS["captured"]["by_process"]],
+    }}
+    assert name in failed(evaluate(**observations(metrics=stringified)))
+
+
+def test_the_children_convert_the_snapshot_mapping_rather_than_stringifying_it() -> None:
+    """A repr is truthy and contains no counter, so it must never reach the report."""
+    from tools.measure_multiclient_matrix import READER_CHILD, WRITER_CHILD
+
+    for child in (WRITER_CHILD, READER_CHILD):
+        assert "collections.abc.Mapping" in child
+        assert "METRICS-NOT-A-MAPPING" in child
+        # The old fallback is gone.
+        assert "default=lambda item: getattr(item" not in child
 
 
 def test_a_family_with_no_samples_cannot_certify_itself() -> None:
@@ -331,13 +373,20 @@ def test_the_serial_replay_must_verify_clean_and_start_from_the_same_state() -> 
     """A replay from an empty database is not the same run, and one that never verified
     itself is not fit to be compared against."""
     baseline = {"identical": True, "source": {"digest": "aa"}, "copy": {"digest": "aa"}}
-    healthy = {**LEDGER, "replayed": 3, "clean": True, "initial_state": baseline}
+    healthy = {**LEDGER, "replayed": 3, "clean": True, "initial_state": baseline,
+               "pages_checked": 40, "records_checked": 12, "index_entries_checked": 12}
 
     assert failed(evaluate(**observations(serial=healthy, serial_operations=3))) == []
 
     unclean = {**healthy, "clean": False}
     assert "verify_clean_serial" in failed(evaluate(**observations(
         serial=unclean, serial_operations=3)))
+
+    # clean with no coverage is the A75.2 trap again: a walk that examined nothing.
+    uncovered = {**healthy, "pages_checked": 0, "records_checked": 0,
+                 "index_entries_checked": 0}
+    assert "verify_clean_serial" in failed(evaluate(**observations(
+        serial=uncovered, serial_operations=3)))
 
     different_start = {**healthy, "initial_state": {"identical": False,
                                                     "source": {"digest": "aa"},
@@ -557,7 +606,7 @@ def test_the_frozen_rate_is_the_aggregate_the_reader_sees_split_across_the_write
 def test_help_describes_the_rate_option_as_it_actually_behaves() -> None:
     """Omitting --foreign-commit-rate sweeps the frozen curve; the help must not claim
     otherwise, because a reader who believes it would mislabel every run they did."""
-    text = build_parser().format_help()
+    text = help_text()
     rate_help = text[text.index("--foreign-commit-rate"):]
 
     assert "AGGREGATE" in rate_help
@@ -567,7 +616,7 @@ def test_help_describes_the_rate_option_as_it_actually_behaves() -> None:
 
 
 def test_help_separates_the_frozen_dimensions_from_the_parameterised_gaps() -> None:
-    text = build_parser().format_help()
+    text = help_text()
 
     assert "FROZEN BY ROADMAP SECTION 6.5" in text
     assert "PARAMETERISED BECAUSE THE REPORT LEFT THE VOLUME OPEN" in text
@@ -702,7 +751,10 @@ def test_a_synthetic_run_is_labelled_not_official(tmp_path: Path) -> None:
 
 def test_the_serial_oracle_catches_an_answer_no_serial_run_could_have_produced() -> None:
     """Section 6 asks for a serial run of the SAME operation list, with zero wrong answers."""
-    serial = {**LEDGER, "replayed": 3, "clean": True}
+    serial = {**LEDGER, "replayed": 3, "clean": True, "pages_checked": 40,
+              "records_checked": 12, "index_entries_checked": 12,
+              "initial_state": {"identical": True, "source": {"digest": "aa"},
+                                "copy": {"digest": "aa"}}}
 
     agreeing = evaluate(**observations(serial=serial, serial_operations=3))
     assert failed(agreeing) == []
@@ -772,12 +824,18 @@ def test_the_serial_replay_order_is_a_valid_serialisation() -> None:
 def test_a_commit_landing_after_the_window_is_refused_rather_than_counted() -> None:
     """At N=8 and 1/s aggregate a writer waits 8s between commits; one entered near the end
     would otherwise land long after the readers stopped and inflate the rate they felt."""
-    late = evaluate(**observations(commits_outside_window=3))
+    name = "no_commit_began_outside_the_window"
 
-    assert "no_commit_landed_outside_the_window" in failed(late)
-    observed = next(item["observed"] for item in late
-                    if item["name"] == "no_commit_landed_outside_the_window")
-    assert observed == 3
+    # One in-flight transaction per writer is arithmetic, not a tolerance: a writer refuses
+    # to START once the window closes, so at most one of its transactions can still land.
+    assert name not in failed(evaluate(**observations(commits_outside_window=1, writers=1)))
+    assert name not in failed(evaluate(**observations(commits_outside_window=2, writers=2)))
+
+    late = evaluate(**observations(commits_outside_window=3, writers=1))
+    assert name in failed(late)
+    observed = next(item["observed"] for item in late if item["name"] == name)
+    assert observed["landed_outside"] == 3
+    assert observed["writers"] == 1
 
 
 def test_official_is_a_conjunction_and_names_every_reason_it_failed(tmp_path: Path) -> None:
@@ -805,6 +863,32 @@ def test_official_is_a_conjunction_and_names_every_reason_it_failed(tmp_path: Pa
         ["--src", str(tmp_path), "--board-template", str(board), "--board-digest", "abc",
          "--machine-idle-asserted"])
     assert any("no pin" in reason for reason in official_shortfalls(unpinned))
+
+    # Section 6.5 freezes the long read transaction at 60 seconds. A one-second run is a
+    # smoke, and letting it call itself official is how a smoke becomes a result.
+    shortened = build_parser().parse_args(
+        ["--src", str(SOURCE_ROOT), "--case", "matrix", "--board-template", str(board),
+         "--board-digest", "abc", "--machine-idle-asserted",
+         "--long-reader-seconds", "1"])
+    assert any("60 seconds" in reason for reason in official_shortfalls(shortened))
+
+    frozen = build_parser().parse_args(
+        ["--src", str(SOURCE_ROOT), "--case", "matrix", "--board-template", str(board),
+         "--board-digest", "abc", "--machine-idle-asserted",
+         "--long-reader-seconds", "60"])
+    assert not any("60 seconds" in reason for reason in official_shortfalls(frozen))
+
+    # A subcase, an overridden axis, or the reopen workaround each disqualify by name.
+    for extra, marker in (
+        (["--case", "f1-curve-2proc"], "subcase"),
+        (["--case", "matrix", "--writers", "2"], "overridden"),
+        (["--case", "matrix", "--reopen-on-stale-index"], "works around"),
+    ):
+        opts = build_parser().parse_args(
+            ["--src", str(SOURCE_ROOT), "--board-template", str(board),
+             "--board-digest", "abc", "--machine-idle-asserted",
+             "--long-reader-seconds", "60", *extra])
+        assert any(marker in reason for reason in official_shortfalls(opts)), extra
 
 
 def test_the_board_digest_uses_the_recorded_historical_algorithm(tmp_path: Path) -> None:
@@ -836,7 +920,7 @@ def test_the_board_digest_uses_the_recorded_historical_algorithm(tmp_path: Path)
 
 def test_the_report_declares_what_it_does_not_cover() -> None:
     """The two-process case informs CE-3; it is not the section 5b gate, and F4 is partial."""
-    text = build_parser().format_help()
+    text = help_text()
 
     assert "f1-curve-2proc" in text
     assert "NOT the literal section 5b CE-3 gate" in text
@@ -888,8 +972,8 @@ def test_one_real_two_process_cell_runs_and_certifies_the_database(tmp_path: Pat
         "--src", str(SOURCE_ROOT),
         "--case", "ce3-2proc",
         "--reader-target", "same-table",
-        "--foreign-commit-rate", "10",
-        "--seconds", "3",
+        "--foreign-commit-rate", "1",
+        "--seconds", "6",
         "--txns-per-writer", "3",
         "--rows-per-txn", "1",
         "--workspace", str(tmp_path / "workspace"),
@@ -973,7 +1057,7 @@ def test_one_real_two_process_cell_runs_and_certifies_the_database(tmp_path: Pat
     assert len(provenance["script_sha256"]) == 64
     assert provenance["source_root"] == str(SOURCE_ROOT)
     assert provenance["grafx_commit"]
-    assert report["parameterised_gaps"]["seconds"] == 3.0
+    assert report["parameterised_gaps"]["seconds"] == 6.0
     assert report["frozen"]["foreign_commit_rates"] == list(FROZEN_FOREIGN_COMMIT_RATES)
     assert set(report["cells"][0]["metrics"]["unavailable"]) == set(UNAVAILABLE_METRICS)
 

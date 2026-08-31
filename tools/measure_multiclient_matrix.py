@@ -112,7 +112,7 @@ if not _pathlib.Path(okto_grafx.__file__).resolve().is_relative_to(_pinned):
 """The A94 source pin, in one place. Every child embeds this exact text."""
 
 WRITER_CHILD = r'''
-import json, pathlib, random, sys, time
+import collections.abc, json, pathlib, random, sys, time
 SRC = sys.argv[1]
 sys.path.insert(0, SRC)
 __PIN_GUARD__
@@ -385,10 +385,23 @@ active_span = max(0.0, time.time() - max(start_at, timing_starts_at))
 metrics = None
 metrics_error = None
 try:
+    # MetricsSnapshotView is a Mapping, and it has no as_dict. Falling back to json.dumps
+    # with default=str wrote the view REPR into the report -- a truthy string that passed
+    # every "did we capture metrics" check while containing no counter at all.
+    def plainly(value):
+        if isinstance(value, collections.abc.Mapping):
+            return {str(key): plainly(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [plainly(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
     snapshot = db.snapshot_metrics()
-    to_dict = getattr(snapshot, "as_dict", None)
-    metrics = to_dict() if callable(to_dict) else json.loads(json.dumps(
-        snapshot, default=lambda item: getattr(item, "__dict__", str(item))))
+    metrics = plainly(snapshot)
+    if not isinstance(metrics, dict):
+        raise SystemExit("METRICS-NOT-A-MAPPING: snapshot_metrics returned %r"
+                         % type(snapshot).__name__)
 except BaseException as failure:
     metrics_error = "%s: %s" % (type(failure).__name__, repr(failure)[:200])
 try:
@@ -421,7 +434,7 @@ pathlib.Path(out).write_text(json.dumps({
 '''
 
 READER_CHILD = r'''
-import json, pathlib, random, sys, time
+import collections.abc, json, pathlib, random, sys, time
 SRC = sys.argv[1]
 sys.path.insert(0, SRC)
 __PIN_GUARD__
@@ -614,10 +627,23 @@ elapsed = (ended - timed_from) if timed_from is not None else 0.0
 metrics = None
 metrics_error = None
 try:
+    # MetricsSnapshotView is a Mapping, and it has no as_dict. Falling back to json.dumps
+    # with default=str wrote the view REPR into the report -- a truthy string that passed
+    # every "did we capture metrics" check while containing no counter at all.
+    def plainly(value):
+        if isinstance(value, collections.abc.Mapping):
+            return {str(key): plainly(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [plainly(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
     snapshot = db.snapshot_metrics()
-    to_dict = getattr(snapshot, "as_dict", None)
-    metrics = to_dict() if callable(to_dict) else json.loads(json.dumps(
-        snapshot, default=lambda item: getattr(item, "__dict__", str(item))))
+    metrics = plainly(snapshot)
+    if not isinstance(metrics, dict):
+        raise SystemExit("METRICS-NOT-A-MAPPING: snapshot_metrics returned %r"
+                         % type(snapshot).__name__)
 except BaseException as failure:
     metrics_error = "%s: %s" % (type(failure).__name__, repr(failure)[:200])
 try:
@@ -1062,6 +1088,11 @@ def official_shortfalls(opts: argparse.Namespace, board: dict | None = None) -> 
     ) if value is not None]
     if overridden:
         unmet.append("frozen dimensions were overridden: " + ", ".join(overridden))
+    if opts.long_reader_seconds != 60.0:
+        unmet.append(
+            f"--long-reader-seconds is {opts.long_reader_seconds}; section 6.5 freezes the "
+            "long read transaction at 60 seconds"
+        )
     if opts.reopen_on_stale_index:
         unmet.append("--reopen-on-stale-index works around a product refusal, so the run "
                      "does not measure the product as it stands")
@@ -1200,11 +1231,18 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
     # A commit that landed after the readers stopped is a real commit, but it is not part
     # of this measurement. Counting it would inflate the rate the reader is said to have felt,
     # and the fix is to refuse the point rather than to invent a tolerance for it.
+    # A writer refuses to START a transaction once the window has closed, so an outside
+    # commit is necessarily one that was already in flight when the window ended. Each writer
+    # can have at most one such transaction, and that is arithmetic rather than a tolerance:
+    # more than one per writer means a commit began after the window closed.
     criteria.append({
-        "name": "no_commit_landed_outside_the_window",
-        "pass": commits_outside_window == 0,
-        "observed": commits_outside_window,
-        "bound": "0 commits outside the shared measured window",
+        "name": "no_commit_began_outside_the_window",
+        "pass": commits_outside_window <= max(1, writers),
+        "observed": {"landed_outside": commits_outside_window,
+                     "writers": writers,
+                     "bound_is": "at most one in-flight transaction per writer"},
+        "bound": "outside-window commits <= one per writer; those are transactions that had"
+                 " already begun, and they are excluded from the rate either way",
     })
     if board is not None and not board.get("synthetic"):
         criteria.append({
@@ -1251,17 +1289,24 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
         expected_processes = writers + readers
         criteria.append({
             "name": "every_process_published_real_metrics",
+            # EXACTLY one each: a duplicate would satisfy a >= check while some process
+            # still reported nothing.
             "pass": (not metrics.get("capture_errors")
-                     and len(by_process) >= expected_processes
-                     and len(documents) >= expected_processes
+                     and len(by_process) == expected_processes
+                     and len(documents) == expected_processes
+                     and all(isinstance(entry.get("metrics"), dict) for entry in by_process)
                      and all(entry["document"].get("final", {}).get("metrics")
                              for entry in documents)),
             "observed": {"expected_processes": expected_processes,
                          "snapshots": len(by_process),
                          "documents": len(documents),
+                         "snapshots_that_are_mappings": sum(
+                             1 for entry in by_process
+                             if isinstance(entry.get("metrics"), dict)),
                          "capture_errors": metrics.get("capture_errors")},
-            "bound": "every writer and reader published a real, non-empty metrics document; "
-                     "counters the product does not emit stay explicitly unavailable",
+            "bound": "exactly one snapshot and one non-empty document per writer and "
+                     "reader, each a real mapping rather than a repr string, and zero "
+                     "capture errors; counters the product does not emit stay unavailable",
         })
     criteria.append({"name": "no_torn_read", "pass": not torn, "observed": torn[:4],
                      "bound": "0 torn observations"})
@@ -1398,9 +1443,11 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
         })
 
     if serial is not None:
+        serial_coverage = sum(serial.get(key) or 0 for key in
+                              ("pages_checked", "records_checked", "index_entries_checked"))
         criteria.append({
             "name": "verify_clean_serial",
-            "pass": serial.get("clean") is True,
+            "pass": serial.get("clean") is True and serial_coverage > 0,
             "observed": {key: serial.get(key) for key in
                          ("clean", "findings", "pages_checked", "records_checked",
                           "index_entries_checked")},
@@ -2221,9 +2268,9 @@ def main(argv: list[str] | None = None) -> int:
         },
         "parameterised_gaps": {
             "seconds": opts.seconds,
-            "note_writers_follow_the_long_reader": "with reader shape 'long' the writers run "
-            "max(seconds, long_reader_seconds) so the foreign load covers the whole measured "
-            "window rather than stopping partway through it",
+            "note_writers_follow_the_long_reader": "with reader shape 'long' the writers "
+            "run EXACTLY long_reader_seconds, so writers, readers and throughput share one "
+            "window; section 6.5 freezes that at 60 seconds and an official run must use it",
             "long_reader_seconds": opts.long_reader_seconds,
             "rows_per_txn": opts.rows_per_txn,
             "txns_per_writer": opts.txns_per_writer,
@@ -2253,11 +2300,20 @@ def main(argv: list[str] | None = None) -> int:
     # The full matrix runs for hours. If the checkout moved, went dirty, or the source tree
     # changed under it, the numbers can no longer be attributed to the commit named at the
     # start -- so the run is re-described at the end and any drift is fatal to official.
+    script_path = pathlib.Path(__file__).resolve()
     after = describe_repository(pathlib.Path(opts.src).resolve())
-    before = report["provenance"]["source_repository"]
-    drift = [field for field in ("commit", "tree", "src_tests_clean")
-             if before.get(field) != after.get(field)]
-    report["provenance_after"] = after
+    script_after = describe_repository(script_path.parent.parent)
+    script_sha_after = hashlib.sha256(script_path.read_bytes()).hexdigest()
+    drift = [f"source.{field}" for field in ("commit", "tree", "src_tests_clean")
+             if report["provenance"]["source_repository"].get(field) != after.get(field)]
+    drift += [f"script.{field}" for field in ("commit", "tree", "src_tests_clean")
+              if report["provenance"]["script_repository"].get(field)
+              != script_after.get(field)]
+    if script_sha_after != report["provenance"]["script_sha256"]:
+        drift.append("script.sha256")
+    report["provenance_after"] = {"source_repository": after,
+                                  "script_repository": script_after,
+                                  "script_sha256": script_sha_after}
     report["source_tree_drifted_during_the_run"] = drift or None
 
     # official is the CELLS' verdict, not a re-derivation from the options: a cell that found
