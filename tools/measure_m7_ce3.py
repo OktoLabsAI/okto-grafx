@@ -9,7 +9,8 @@ The RAW and instrumented passes always use different copies.  Only the instrumen
 installs the versioned H8 hooks; RAW therefore contains no monkeypatch, profiler or phase timer.
 Every official input and every copy is authenticated, every operation is checked through the
 versioned harness postcondition, and every resulting database is cold-opened for ``verify(all)``.
-No measured handle is reopened.  A refusal is evidence of a failed scenario, never a retry.
+No measured handle is reopened.  A retryable, pre-durable ``GraphLockContention`` retries the
+whole logical operation in a fresh transaction on that same handle; every other refusal fails.
 
 The tool intentionally implements an instrument, not CE-3 itself.  It changes no engine code and
 does not decide whether WAL-directed invalidation should ship.
@@ -28,6 +29,7 @@ import json
 import multiprocessing
 import os
 import platform
+import random
 import shutil
 import statistics
 import subprocess
@@ -40,7 +42,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable, Mapping, Sequence
 
-SCHEMA = "okto-grafx.ce3-m7-multiprocess.v1"
+SCHEMA = "okto-grafx.ce3-m7-multiprocess.v2"
 PINNED_HARNESS_HEAD = "0dfb5269dd8531fd4db2679fc80b649c64bd9b09"
 PINNED_HARNESS_BLOB = "a02b86dce098ceec3fdbd10a820a4dd6f9e2a7b1"
 EXPECTED_OPERATION_SET_SHA256 = (
@@ -73,6 +75,24 @@ OFFICIAL_NUMPY_VERSION = "2.5.1"
 OFFICIAL_LADYBUG_VERSION = "0.16.0"
 RAW_HOOK_GUARD_SHA256 = "a1f1e7f4cdb544a0d74a99168a04790dd32810906c9a695c7cbcb48d24a9e870"
 TOOL_RELATIVE_PATH = "tools/measure_m7_ce3.py"
+MAX_OPERATION_ATTEMPTS = 60
+RETRY_BACKOFF_BASE_SECONDS = 0.08
+RETRY_BACKOFF_CAP_SECONDS = 0.35
+RETRY_POLICY = {
+    "kind": "whole_logical_operation_fresh_transaction",
+    "retryable_type": "GraphLockContention",
+    "required_backend": "okto_grafx",
+    "required_backend_type": "GrafxWriteConflict",
+    "required_backend_code": "write_conflict",
+    "requires_retryable_true": True,
+    "requires_pre_durable": True,
+    "requires_clean_rollback": True,
+    "max_attempts": MAX_OPERATION_ATTEMPTS,
+    "backoff": "deterministic_full_jitter_exponential",
+    "base_seconds": RETRY_BACKOFF_BASE_SECONDS,
+    "cap_seconds": RETRY_BACKOFF_CAP_SECONDS,
+    "handle_reopened": False,
+}
 
 
 class MeasurementRefused(RuntimeError):
@@ -454,6 +474,22 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _failure_payload(role: str, failure: BaseException) -> dict[str, Any]:
+    try:
+        chain = _failure_chain_evidence(failure)
+        retry_classification = {
+            "eligible": _retryable_contention(failure) is not None,
+            "required_contract": "typed_pre_durable_grafx_write_conflict",
+        }
+    except BaseException as evidence_failure:  # pragma: no cover - diagnostic fail-safe
+        chain = []
+        retry_classification = {
+            "eligible": False,
+            "required_contract": "typed_pre_durable_grafx_write_conflict",
+            "evidence_error": {
+                "type": type(evidence_failure).__name__,
+                "message": str(evidence_failure),
+            },
+        }
     return {
         "role": role,
         "status": "failed",
@@ -461,6 +497,8 @@ def _failure_payload(role: str, failure: BaseException) -> dict[str, Any]:
             "type": type(failure).__name__,
             "message": str(failure),
             "traceback": traceback.format_exc().splitlines()[-80:],
+            "chain": chain,
+            "retry_classification": retry_classification,
         },
     }
 
@@ -533,6 +571,201 @@ def _installed_required_hooks(hooks: Any) -> list[str]:
     return [hook for hook in REQUIRED_HOOKS if hook in installed]
 
 
+def _causes(failure: BaseException) -> Iterable[BaseException]:
+    """Yield one exception chain once, including explicit and implicit causes."""
+
+    current: BaseException | None = failure
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _failure_chain_evidence(failure: BaseException) -> list[dict[str, Any]]:
+    """Serialize the complete causal chain used by the retry classifier."""
+
+    evidence: list[dict[str, Any]] = []
+    for candidate in _causes(failure):
+        details = getattr(candidate, "details", None)
+        notes = getattr(candidate, "__notes__", ())
+        evidence.append(
+            {
+                "type": type(candidate).__name__,
+                "code": getattr(candidate, "code", None),
+                "retryable": getattr(candidate, "retryable", None),
+                "details": dict(details) if isinstance(details, Mapping) else None,
+                "notes": [str(note) for note in notes] if isinstance(notes, (list, tuple)) else [],
+                "message": str(candidate),
+            }
+        )
+    return evidence
+
+
+def _proves_pre_durable(details: Mapping[str, Any]) -> bool:
+    """Accept absent legacy evidence or the literal boolean False; reject ambiguity."""
+
+    return "commit_durable" not in details or details["commit_durable"] is False
+
+
+def _retryable_contention(failure: BaseException) -> BaseException | None:
+    """Return a fully corroborated pre-durable Grafx OCC refusal, or fail closed.
+
+    The Core surface alone is insufficient: other backends also use
+    ``GraphLockContention``.  CE-3 retries only when the causal chain includes the typed
+    ``GrafxWriteConflict`` and the adapter's machine-readable mapping agrees with it.
+    """
+
+    graph_errors = importlib.import_module(
+        "okto_pulse.core.kg.interfaces.graph_errors"
+    )
+    grafx_errors = importlib.import_module("okto_grafx.errors")
+    contention_type = graph_errors.GraphLockContention
+    write_conflict_type = grafx_errors.GrafxWriteConflict
+    chain = list(_causes(failure))
+    for candidate in chain:
+        details = getattr(candidate, "details", None)
+        if isinstance(details, Mapping) and (
+            details.get("field") == "index_view_unavailable"
+            or not _proves_pre_durable(details)
+        ):
+            return None
+        notes = getattr(candidate, "__notes__", ())
+        if isinstance(notes, (list, tuple)) and any(
+            "rollback also failed" in str(note).lower() for note in notes
+        ):
+            return None
+
+    contentions = [candidate for candidate in chain if isinstance(candidate, contention_type)]
+    write_conflicts = [
+        candidate for candidate in chain if isinstance(candidate, write_conflict_type)
+    ]
+    if len(contentions) != 1 or len(write_conflicts) != 1:
+        return None
+    contention = contentions[0]
+    write_conflict = write_conflicts[0]
+    details = getattr(contention, "details", None)
+    if not isinstance(details, Mapping):
+        return None
+    if (
+        getattr(contention, "code", None) != "graph_lock_contention"
+        or getattr(contention, "retryable", None) is not True
+        or details.get("backend") != "okto_grafx"
+        or details.get("backend_error_type") != "GrafxWriteConflict"
+        or details.get("backend_error_code") != "write_conflict"
+        or details.get("backend_retryable") is not True
+        or not _proves_pre_durable(details)
+        or getattr(write_conflict, "code", None) != "write_conflict"
+        or getattr(write_conflict, "retryable", None) is not True
+    ):
+        return None
+    return contention
+
+
+def _refusal_evidence(
+    refusal: BaseException,
+    attempt: int,
+    *,
+    failure: BaseException | None = None,
+) -> dict[str, Any]:
+    """Serialize the typed Core refusal without classifying by message text."""
+
+    details = getattr(refusal, "details", {})
+    return {
+        "attempt": attempt,
+        "attempt_scope": "fresh_transaction",
+        "type": type(refusal).__name__,
+        "code": getattr(refusal, "code", None),
+        "retryable": getattr(refusal, "retryable", None),
+        "details": dict(details) if isinstance(details, Mapping) else None,
+        "message": str(refusal),
+        "classification": "typed_pre_durable_grafx_write_conflict",
+        "chain": _failure_chain_evidence(failure or refusal),
+    }
+
+
+def _retry_randomizer(copy_id: object, role: str) -> random.Random:
+    """Give each spawned role a reproducible but distinct full-jitter stream."""
+
+    seed_bytes = hashlib.sha256(f"{copy_id}:{role}:ce3-v2".encode()).digest()[:8]
+    return random.Random(int.from_bytes(seed_bytes, "big"))
+
+
+async def _execute_with_retry(
+    runner: ModuleType,
+    backend: Any,
+    context: Any,
+    operation: Mapping[str, Any],
+    *,
+    randomizer: random.Random,
+    stop_event: Any | None = None,
+) -> dict[str, Any]:
+    """Execute one logical operation, inclusively timing its contractual retries.
+
+    ``runner._execute_operation`` opens and settles a new transaction scope on every call.  The
+    backend handle is deliberately kept unchanged.  This is the same whole-operation retry
+    boundary used by F1 and by Pulse's commit coordinator; retrying ``commit()`` on a refused
+    scope would compare the same stale snapshot forever.
+    """
+
+    retryable_refusals: list[dict[str, Any]] = []
+    operation_id = str(operation.get("operation_id", "unknown"))
+    for attempt_index in range(MAX_OPERATION_ATTEMPTS):
+        attempt = attempt_index + 1
+        try:
+            await runner._execute_operation(backend, context, operation)
+        except BaseException as failure:
+            refusal = _retryable_contention(failure)
+            if refusal is None:
+                raise
+            evidence = _refusal_evidence(refusal, attempt, failure=failure)
+            retryable_refusals.append(evidence)
+            if attempt >= MAX_OPERATION_ATTEMPTS:
+                raise MeasurementRefused(
+                    f"operation {operation_id} exhausted {MAX_OPERATION_ATTEMPTS} "
+                    "retryable contention attempts"
+                ) from failure
+            if stop_event is not None and stop_event.is_set():
+                return {
+                    "status": "window_closed",
+                    "attempts": attempt,
+                    "conflicts": len(retryable_refusals),
+                    "retries": len(retryable_refusals),
+                    "retryable_refusal_count": len(retryable_refusals),
+                    "retryable_refusals": retryable_refusals,
+                    "last_refusal": evidence,
+                }
+            ceiling = min(
+                RETRY_BACKOFF_BASE_SECONDS * (2 ** min(attempt_index, 4)),
+                RETRY_BACKOFF_CAP_SECONDS,
+            )
+            delay = randomizer.uniform(0.0, ceiling)
+            evidence["backoff_seconds"] = delay
+            if stop_event is None:
+                await asyncio.sleep(delay)
+            elif stop_event.wait(delay):
+                return {
+                    "status": "window_closed",
+                    "attempts": attempt,
+                    "conflicts": len(retryable_refusals),
+                    "retries": len(retryable_refusals),
+                    "retryable_refusal_count": len(retryable_refusals),
+                    "retryable_refusals": retryable_refusals,
+                    "last_refusal": evidence,
+                }
+            continue
+        return {
+            "status": "committed",
+            "attempts": attempt,
+            "conflicts": len(retryable_refusals),
+            "retries": len(retryable_refusals),
+            "retryable_refusal_count": len(retryable_refusals),
+            "retryable_refusals": retryable_refusals,
+            "last_refusal": retryable_refusals[-1] if retryable_refusals else None,
+        }
+    raise AssertionError("the bounded retry loop must return or raise")
+
+
 async def _run_process_a_async(
     config: Mapping[str, Any],
     workspace: Path,
@@ -549,6 +782,8 @@ async def _run_process_a_async(
     barrier_passed = False
     handle: dict[str, Any] = {}
     installed_hooks: list[str] = []
+    retryable_refusals: list[dict[str, Any]] = []
+    randomizer = _retry_randomizer(config["copy_id"], "A")
     try:
         if hooks is not None:
             hooks.install()
@@ -575,8 +810,18 @@ async def _run_process_a_async(
                 if hooks is not None:
                     hooks.reset()
                 started = time.perf_counter_ns()
-                await runner._execute_operation(backend, context, operation)
+                retry = await _execute_with_retry(
+                    runner,
+                    backend,
+                    context,
+                    operation,
+                    randomizer=randomizer,
+                )
                 ended = time.perf_counter_ns()
+                if retry["status"] != "committed":
+                    raise MeasurementRefused(
+                        f"A operation {operation['operation_id']} did not commit"
+                    )
                 hook_result = _extract_hooks(hooks.snapshot()) if hooks is not None else None
                 if hook_result is not None:
                     hook_result["applicability"] = {
@@ -598,10 +843,17 @@ async def _run_process_a_async(
                     "wall_ms": (ended - started) / 1e6,
                     "postcondition": postcondition["kind"],
                     "postcondition_status": "passed",
+                    "attempts": retry["attempts"],
+                    "conflicts": retry["conflicts"],
+                    "retries": retry["retries"],
+                    "retryable_refusal_count": retry["retryable_refusal_count"],
+                    "retryable_refusals": retry["retryable_refusals"],
+                    "last_refusal": retry["last_refusal"],
                 }
                 if hook_result is not None:
                     sample["hooks"] = hook_result
                 samples.append(sample)
+                retryable_refusals.extend(retry["retryable_refusals"])
         active_end = time.perf_counter_ns()
         stop_event.set()
         if not b_quiescent_event.wait(float(config["barrier_timeout_seconds"])):
@@ -643,6 +895,14 @@ async def _run_process_a_async(
             "families": list(plan_info["families"]),
             "samples": samples,
             "postconditions_passed": len(samples),
+            "retry_policy": dict(RETRY_POLICY),
+            "retryable_conflicts": len(retryable_refusals),
+            "retries": len(retryable_refusals),
+            "retryable_refusal_count": len(retryable_refusals),
+            "retryable_refusals": retryable_refusals,
+            "durable_refusals": [],
+            "nonretryable_refusals": [],
+            "retry_exhaustions": [],
             "refusals": [],
         }
     finally:
@@ -703,6 +963,9 @@ async def _run_process_b_async(
     barrier_passed = False
     session = f"ce3-b-{scenario.identifier}-{str(config['copy_id'])[:12]}"
     handle: dict[str, Any] = {}
+    retryable_refusals: list[dict[str, Any]] = []
+    interrupted_operation: dict[str, Any] | None = None
+    randomizer = _retry_randomizer(config["copy_id"], "B")
     try:
         backend, context, handle = await _open_warm(
             harness, runner, backends, workspace
@@ -732,8 +995,34 @@ async def _run_process_b_async(
                     "create_node", payload, "scope", 1_000_000 + sequence
                 )
                 started = time.perf_counter_ns()
-                await runner._execute_operation(backend, context, operation)
+                retry = await _execute_with_retry(
+                    runner,
+                    backend,
+                    context,
+                    operation,
+                    randomizer=randomizer,
+                    stop_event=stop_event,
+                )
                 ended = time.perf_counter_ns()
+                retryable_refusals.extend(retry["retryable_refusals"])
+                if retry["status"] == "window_closed":
+                    interrupted_operation = {
+                        "sequence": sequence,
+                        "node_id": node_id,
+                        "scheduled_at_ns": due,
+                        "started_at_ns": started,
+                        "ended_at_ns": ended,
+                        "wall_ms": (ended - started) / 1e6,
+                        "schedule_lag_ms": (started - due) / 1e6,
+                        "attempts": retry["attempts"],
+                        "conflicts": retry["conflicts"],
+                        "retries": retry["retries"],
+                        "retryable_refusal_count": retry["retryable_refusal_count"],
+                        "retryable_refusals": retry["retryable_refusals"],
+                        "last_refusal": retry["last_refusal"],
+                        "status": "window_closed_pre_durable",
+                    }
+                    break
                 commits.append(
                     {
                         "sequence": sequence,
@@ -743,6 +1032,12 @@ async def _run_process_b_async(
                         "ended_at_ns": ended,
                         "wall_ms": (ended - started) / 1e6,
                         "schedule_lag_ms": (started - due) / 1e6,
+                        "attempts": retry["attempts"],
+                        "conflicts": retry["conflicts"],
+                        "retries": retry["retries"],
+                        "retryable_refusal_count": retry["retryable_refusal_count"],
+                        "retryable_refusals": retry["retryable_refusals"],
+                        "last_refusal": retry["last_refusal"],
                     }
                 )
                 # Never burst to hide an unattainable target.  The effective rate is evidence.
@@ -783,11 +1078,20 @@ async def _run_process_b_async(
             "scenario": scenario.as_dict(),
             "session": session,
             "commits": commits,
+            "interrupted_operation": interrupted_operation,
             "effects": {
                 "expected_nodes": len(expected_ids),
                 "observed_nodes": len(observed_ids),
                 "status": "passed",
             },
+            "retry_policy": dict(RETRY_POLICY),
+            "retryable_conflicts": len(retryable_refusals),
+            "retries": len(retryable_refusals),
+            "retryable_refusal_count": len(retryable_refusals),
+            "retryable_refusals": retryable_refusals,
+            "durable_refusals": [],
+            "nonretryable_refusals": [],
+            "retry_exhaustions": [],
             "refusals": [],
         }
     finally:
@@ -1105,6 +1409,170 @@ def _environment_runtime_identity(value: object) -> dict[str, Any] | None:
     }
 
 
+def _mapping_or_empty(value: object) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _list_or_empty(value: object) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _nested_mapping(value: object, *keys: str) -> Mapping[str, Any]:
+    current = _mapping_or_empty(value)
+    for key in keys:
+        current = _mapping_or_empty(current.get(key))
+    return current
+
+
+def _retry_record_is_consistent(record: object, *, committed: bool) -> bool:
+    if not isinstance(record, Mapping):
+        return False
+    attempts = record.get("attempts")
+    conflicts = record.get("conflicts")
+    retries = record.get("retries")
+    refusal_count = record.get("retryable_refusal_count")
+    refusals = record.get("retryable_refusals")
+    if (
+        type(attempts) is not int
+        or attempts <= 0
+        or attempts > MAX_OPERATION_ATTEMPTS
+        or type(conflicts) is not int
+        or conflicts < 0
+        or type(retries) is not int
+        or retries != conflicts
+        or type(refusal_count) is not int
+        or refusal_count < 0
+        or refusal_count != conflicts
+        or not isinstance(refusals, list)
+        or len(refusals) != conflicts
+    ):
+        return False
+    if committed and attempts != conflicts + 1:
+        return False
+    if not committed and attempts != conflicts:
+        return False
+    if record.get("last_refusal") != (refusals[-1] if refusals else None):
+        return False
+    for expected_attempt, refusal in enumerate(refusals, start=1):
+        if not isinstance(refusal, Mapping):
+            return False
+        details = refusal.get("details")
+        chain = refusal.get("chain")
+        if (
+            refusal.get("type") != "GraphLockContention"
+            or refusal.get("code") != "graph_lock_contention"
+            or refusal.get("retryable") is not True
+            or not isinstance(details, Mapping)
+            or details.get("backend") != "okto_grafx"
+            or details.get("backend_error_type") != "GrafxWriteConflict"
+            or details.get("backend_error_code") != "write_conflict"
+            or details.get("backend_retryable") is not True
+            or not _proves_pre_durable(details)
+            or type(refusal.get("attempt")) is not int
+            or refusal.get("attempt") != expected_attempt
+            or refusal.get("attempt_scope") != "fresh_transaction"
+            or refusal.get("classification")
+            != "typed_pre_durable_grafx_write_conflict"
+            or not isinstance(refusal.get("message"), str)
+            or not isinstance(chain, list)
+        ):
+            return False
+        graph_entries = [
+            entry
+            for entry in chain
+            if isinstance(entry, Mapping) and entry.get("type") == "GraphLockContention"
+        ]
+        backend_entries = [
+            entry
+            for entry in chain
+            if isinstance(entry, Mapping) and entry.get("type") == "GrafxWriteConflict"
+        ]
+        if len(graph_entries) != 1 or len(backend_entries) != 1:
+            return False
+        graph = graph_entries[0]
+        backend = backend_entries[0]
+        chain_shape_is_valid = all(
+            isinstance(entry, Mapping)
+            and isinstance(entry.get("type"), str)
+            and isinstance(entry.get("message"), str)
+            and isinstance(entry.get("notes"), list)
+            for entry in chain
+        )
+        if (
+            not chain_shape_is_valid
+            or graph.get("code") != "graph_lock_contention"
+            or graph.get("retryable") is not True
+            or graph.get("details") != details
+            or backend.get("code") != "write_conflict"
+            or backend.get("retryable") is not True
+            or any(
+                isinstance(entry, Mapping)
+                and (
+                    isinstance(entry.get("details"), Mapping)
+                    and (
+                        entry["details"].get("field") == "index_view_unavailable"
+                        or not _proves_pre_durable(entry["details"])
+                    )
+                    or any(
+                        "rollback also failed" in str(note).lower()
+                        for note in (
+                            entry.get("notes")
+                            if isinstance(entry.get("notes"), list)
+                            else []
+                        )
+                    )
+                )
+                for entry in chain
+            )
+        ):
+            return False
+    return True
+
+
+def _retry_evidence_is_consistent(participant: object, records: object) -> bool:
+    if not isinstance(participant, Mapping) or not isinstance(records, list):
+        return False
+    if participant.get("retry_policy") != RETRY_POLICY:
+        return False
+    totals = (
+        participant.get("retryable_conflicts"),
+        participant.get("retries"),
+        participant.get("retryable_refusal_count"),
+    )
+    if any(type(total) is not int or total < 0 for total in totals):
+        return False
+    if any(
+        participant.get(name) != []
+        for name in (
+            "durable_refusals",
+            "nonretryable_refusals",
+            "retry_exhaustions",
+            "refusals",
+        )
+    ):
+        return False
+    flattened: list[dict[str, Any]] = []
+    for record in records:
+        if not _retry_record_is_consistent(record, committed=True):
+            return False
+        flattened.extend(record["retryable_refusals"])
+    interrupted = participant.get("interrupted_operation")
+    if interrupted is not None:
+        if (
+            not isinstance(interrupted, Mapping)
+            or interrupted.get("status") != "window_closed_pre_durable"
+            or not _retry_record_is_consistent(interrupted, committed=False)
+        ):
+            return False
+        flattened.extend(interrupted["retryable_refusals"])
+    return (
+        participant.get("retryable_conflicts") == len(flattened)
+        and participant.get("retries") == len(flattened)
+        and participant.get("retryable_refusal_count") == len(flattened)
+        and participant.get("retryable_refusals") == flattened
+    )
+
+
 def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
     """Fail-closed criteria; tests mutate each evidence surface independently."""
 
@@ -1156,6 +1624,10 @@ def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
         shortfalls.append("a_family_sample_counts_changed")
     if a.get("refusals") or b.get("refusals"):
         shortfalls.append("refusal_was_not_fail_closed")
+    if not _retry_evidence_is_consistent(a, list(a.get("samples", []))) or not _retry_evidence_is_consistent(
+        b, list(b.get("commits", []))
+    ):
+        shortfalls.append("retry_evidence_inconsistent")
     if any(
         result.get("process_exitcodes", {}).get(role) != 0
         for role in ("a", "b", "verifier")
@@ -1345,8 +1817,19 @@ def official_shortfalls(report: Mapping[str, Any]) -> list[str]:
     """Return every reason a report cannot be cited as the literal official CE-3 matrix."""
 
     shortfalls: list[str] = []
-    inputs = report.get("inputs", {})
-    provenance = report.get("provenance", {})
+    inputs = _mapping_or_empty(report.get("inputs"))
+    provenance = _mapping_or_empty(report.get("provenance"))
+    if report.get("run_failure"):
+        shortfalls.append("measurement_run_failed")
+    finalization = _mapping_or_empty(report.get("finalization"))
+    if finalization.get("status") != "passed":
+        shortfalls.append("finalization_incomplete")
+    finalization_errors_value = finalization.get("errors")
+    if not isinstance(finalization_errors_value, list):
+        shortfalls.append("finalization_errors_malformed")
+    for failure in _list_or_empty(finalization_errors_value):
+        if isinstance(failure, Mapping) and isinstance(failure.get("code"), str):
+            shortfalls.append(str(failure["code"]))
     if report.get("official_requested") is not True:
         shortfalls.append("official_not_requested")
     if report.get("check_only") is not False:
@@ -1355,9 +1838,9 @@ def official_shortfalls(report: Mapping[str, Any]) -> list[str]:
         shortfalls.append("per_family_not_pf5")
     if provenance.get("operation_set_sha256") != EXPECTED_OPERATION_SET_SHA256:
         shortfalls.append("logical_pf5_digest_mismatch")
-    identity = provenance.get("identity", {})
-    identity_start = identity.get("start", {})
-    identity_end = identity.get("end", {})
+    identity = _mapping_or_empty(provenance.get("identity"))
+    identity_start = _mapping_or_empty(identity.get("start"))
+    identity_end = _mapping_or_empty(identity.get("end"))
     identity_start_stable = _identity_stable_payload(identity_start)
     identity_end_stable = _identity_stable_payload(identity_end)
     if (
@@ -1376,8 +1859,8 @@ def official_shortfalls(report: Mapping[str, Any]) -> list[str]:
     expected_tool_commit = inputs.get("tool_commit")
     expected_tool_blob = inputs.get("tool_blob")
     for capture in (identity_start, identity_end):
-        tool = capture.get("tool", {})
-        guard = tool.get("raw_hook_guard", {})
+        tool = _mapping_or_empty(capture.get("tool"))
+        guard = _mapping_or_empty(tool.get("raw_hook_guard"))
         if (
             not expected_tool_commit
             or tool.get("commit") != expected_tool_commit
@@ -1391,24 +1874,26 @@ def official_shortfalls(report: Mapping[str, Any]) -> list[str]:
             or guard.get("expected_sha256") != RAW_HOOK_GUARD_SHA256
         ):
             shortfalls.append("launcher_blob_commit_or_raw_guard_not_pinned")
-        executor = capture.get("executor", {})
+        executor = _mapping_or_empty(capture.get("executor"))
         if (
             not executor.get("sha256")
             or executor.get("python_release") != OFFICIAL_PYTHON_VERSION
         ):
             shortfalls.append("executor_identity_not_pinned")
-    harness = provenance.get("harness", {})
+    harness = _mapping_or_empty(provenance.get("harness"))
     if harness.get("head") != PINNED_HARNESS_HEAD or harness.get("profile_blob") != PINNED_HARNESS_BLOB:
         shortfalls.append("harness_pin_mismatch")
-    source = provenance.get("source_workspace", {})
+    source = _mapping_or_empty(provenance.get("source_workspace"))
     if not source.get("expected_sha256") or source.get("sha256") != source.get("expected_sha256"):
         shortfalls.append("source_workspace_not_authenticated")
-    source_provenance = provenance.get("source_provenance", {})
+    source_provenance = _mapping_or_empty(provenance.get("source_provenance"))
+    semantic_checks = _mapping_or_empty(source_provenance.get("semantic_checks"))
     if (
         not source_provenance.get("expected_sha256")
         or source_provenance.get("sha256") != source_provenance.get("expected_sha256")
         or source_provenance.get("semantic_status") != "passed"
-        or not all(source_provenance.get("semantic_checks", {}).values())
+        or not semantic_checks
+        or not all(semantic_checks.values())
     ):
         shortfalls.append("source_provenance_not_authenticated")
     if report.get("source_unchanged_after_run") is not True:
@@ -1417,39 +1902,48 @@ def official_shortfalls(report: Mapping[str, Any]) -> list[str]:
         name: source.get(name) for name in ("sha256", "files", "bytes")
     }:
         shortfalls.append("source_after_digest_mismatch")
-    if report.get("machine", {}).get("machine_idle_asserted") is not True:
+    machine = _mapping_or_empty(report.get("machine"))
+    machine_before = _mapping_or_empty(machine.get("before"))
+    if machine.get("machine_idle_asserted") is not True:
         shortfalls.append("machine_idle_not_asserted")
-    before_cpu = report.get("machine", {}).get("before", {}).get("cpu_percent")
+    before_cpu = machine_before.get("cpu_percent")
     maximum_cpu = inputs.get("maximum_initial_cpu_percent")
     if before_cpu is None or maximum_cpu is None or float(before_cpu) > float(maximum_cpu):
         shortfalls.append("machine_idle_sample_failed")
-    checkouts = provenance.get("checkouts", {})
+    checkouts = _mapping_or_empty(provenance.get("checkouts"))
     if checkouts != identity_start.get("checkouts"):
         shortfalls.append("checkout_identity_not_bound_to_launcher_capture")
     for name in ("grafx", "community", "core"):
-        checkout = checkouts.get(name, {})
+        checkout = _mapping_or_empty(checkouts.get(name))
         if checkout.get("status") != "clean":
             shortfalls.append(f"{name}_checkout_not_clean")
         if not checkout.get("expected_head") or checkout.get("head") != checkout.get("expected_head"):
             shortfalls.append(f"{name}_checkout_pin_mismatch")
-    environment = provenance.get("environment", {})
+    environment = _mapping_or_empty(provenance.get("environment"))
     if environment.get("accel_ready") is not True:
         shortfalls.append("accel_environment_not_proved")
     if not _official_environment_matches(environment):
         shortfalls.append("official_environment_baseline_mismatch")
-    results = report.get("results", [])
+    results = [
+        _mapping_or_empty(result) for result in _list_or_empty(report.get("results"))
+    ]
     expected_keys = {
         (pass_name, scenario.identifier)
         for pass_name in ("raw", "instrumented")
         for scenario in SCENARIOS
     }
-    actual_keys = {(result.get("pass"), result.get("scenario", {}).get("id")) for result in results}
+    actual_keys = {
+        (result.get("pass"), _mapping_or_empty(result.get("scenario")).get("id"))
+        for result in results
+    }
     if actual_keys != expected_keys or len(results) != len(expected_keys):
         shortfalls.append("raw_instrumented_matrix_incomplete")
     copy_ids = [result.get("copy_id") for result in results]
     if len(set(copy_ids)) != len(copy_ids) or None in copy_ids:
         shortfalls.append("raw_and_instrumented_copies_not_distinct")
-    launcher_executor_sha256 = identity_start.get("executor", {}).get("sha256")
+    launcher_executor_sha256 = _mapping_or_empty(
+        identity_start.get("executor")
+    ).get("sha256")
     launcher_environment_identity = _environment_runtime_identity(environment)
     if (
         launcher_environment_identity is None
@@ -1458,46 +1952,52 @@ def official_shortfalls(report: Mapping[str, Any]) -> list[str]:
     ):
         shortfalls.append("launcher_environment_not_bound_to_executor")
     if not launcher_executor_sha256 or any(
-        participant.get("handle", {})
-        .get("environment", {})
-        .get("python_executable_sha256")
+        _nested_mapping(participant, "handle", "environment").get(
+            "python_executable_sha256"
+        )
         != launcher_executor_sha256
         for result in results
         for participant in (
-            result.get("process_a", {}),
-            result.get("process_b", {}),
-            result.get("verifier", {}),
+            _mapping_or_empty(result.get("process_a")),
+            _mapping_or_empty(result.get("process_b")),
+            _mapping_or_empty(result.get("verifier")),
         )
     ):
         shortfalls.append("child_executor_differs_from_launcher")
     if launcher_environment_identity is None or any(
         _environment_runtime_identity(
-            participant.get("handle", {}).get("environment", {})
+            _nested_mapping(participant, "handle", "environment")
         )
         != launcher_environment_identity
         for result in results
         for participant in (
-            result.get("process_a", {}),
-            result.get("process_b", {}),
-            result.get("verifier", {}),
+            _mapping_or_empty(result.get("process_a")),
+            _mapping_or_empty(result.get("process_b")),
+            _mapping_or_empty(result.get("verifier")),
         )
     ):
         shortfalls.append("child_environment_differs_from_launcher")
-    fixture_base = provenance.get("fixture_base", {})
+    fixture_base = _mapping_or_empty(provenance.get("fixture_base"))
     expected_base_digest = {
         name: fixture_base.get(name) for name in ("sha256", "files", "bytes")
     }
     if not expected_base_digest.get("sha256"):
         shortfalls.append("fixture_base_not_authenticated")
     elif any(
-        result.get("copy_authentication", {}).get("base") != expected_base_digest
+        _mapping_or_empty(result.get("copy_authentication")).get("base")
+        != expected_base_digest
         for result in results
     ):
         shortfalls.append("scenario_copy_base_disagrees_with_provenance")
     for result in results:
+        scenario_id = _mapping_or_empty(result.get("scenario")).get("id")
+        try:
+            scenario_shortfalls = _scenario_shortfalls(result)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            scenario_shortfalls = ["malformed_scenario_evidence"]
         shortfalls.extend(
-            f"{result.get('pass')}:{result.get('scenario', {}).get('id')}:{failure}"
-            for failure in _scenario_shortfalls(result)
+            f"{result.get('pass')}:{scenario_id}:{failure}"
+            for failure in scenario_shortfalls
         )
     return sorted(set(shortfalls))
 
@@ -1888,6 +2388,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "barrier_timeout_seconds": args.barrier_timeout_seconds,
             "child_timeout_seconds": args.child_timeout_seconds,
             "no_reopen_workaround": True,
+            "retry_policy": dict(RETRY_POLICY),
+            "effective_rate_relative_tolerance": OFFICIAL_RATE_TOLERANCE,
+            "rate_tolerance_authority": (
+                "accepted CE-3 instrument-v1 protocol; not a threshold from "
+                "GRAFX_PERFORMANCE_NEXT_STEPS.md"
+            ),
             "tool_commit": args.tool_commit,
             "tool_blob": args.tool_blob,
         },
@@ -1931,10 +2437,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "results": [],
         "check_only": bool(args.check_only),
+        "run_failure": None,
+        "finalization": {
+            "status": "pending",
+            "errors": [],
+            "scratch": str(scratch),
+            "scratch_retained": None,
+        },
         "notes": [
             "CE-3 is not implemented by this tool; it only measures the frozen two-process question.",
             "RAW has no hooks/cProfile/timers. Instrumented captures H8 on A only and is never subtracted from RAW.",
-            "B uses one continuously open handle. No refusal is retried or relabelled.",
+            "A and B keep one continuously open handle. Only a typed, retryable, pre-durable Grafx OCC conflict retries the whole logical operation in a fresh transaction.",
+            "Latency includes retry attempts and deterministic full-jitter backoff; terminal, durable, ambiguous and exhausted failures remain fail-closed.",
             "same=Decision and unrelated=Assumption are fixed measurement classifications.",
         ],
     }
@@ -1974,10 +2488,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             identity_start["fingerprint_sha256"] == identity_end["fingerprint_sha256"]
         )
         report["official_shortfalls"] = ["check_only_has_no_measurements"]
+        report["finalization"].update(
+            {
+                "status": "passed",
+                "scratch_retained": False,
+                "completed_at_utc": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                ),
+            }
+        )
         _atomic_json(out, report)
         shutil.rmtree(scratch)
         return report
     base_root = scratch / "m7profile-grafx-base"
+    run_stage = "fixture_base_build"
+    measurement_failure: BaseException | None = None
+    measurement_traceback: Any = None
     try:
         base_workspace = asyncio.run(
             harness._build_base(runner, backends, "grafx", fixtures)
@@ -1997,39 +2523,187 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise MeasurementRefused(f"unknown scenario selector {args.scenario!r}")
         for pass_name in ("raw", "instrumented"):
             for scenario in selected:
-                result = _run_scenario(config, base_workspace, base_digest, pass_name, scenario)
+                run_stage = f"{pass_name}/{scenario.identifier}"
+                result = _run_scenario(
+                    config, base_workspace, base_digest, pass_name, scenario
+                )
                 report["results"].append(result)
                 _atomic_json(out, report)
                 if args.fail_fast and result["status"] != "passed":
                     raise MeasurementRefused(
                         f"{pass_name}/{scenario.identifier} failed: {result['shortfalls']}"
                     )
-    finally:
+        run_stage = "matrix_complete"
+    except BaseException as failure:
+        measurement_failure = failure
+        measurement_traceback = failure.__traceback__
+        report["run_failure"] = {
+            "stage": run_stage,
+            "type": type(failure).__name__,
+            "message": str(failure),
+            "traceback": traceback.format_exception(
+                type(failure), failure, failure.__traceback__
+            )[-80:],
+            "chain": _failure_chain_evidence(failure),
+        }
+
+    finalization = report["finalization"]
+    finalization_errors: list[dict[str, Any]] = finalization["errors"]
+
+    def record_finalization_failure(code: str, failure: BaseException) -> None:
+        finalization_errors.append(
+            {
+                "code": code,
+                "type": type(failure).__name__,
+                "message": str(failure),
+            }
+        )
+
+    try:
         if base_root.exists():
             if base_root.parent != scratch or base_root.name != "m7profile-grafx-base":
-                raise MeasurementRefused(f"refusing to remove unexpected fixture root {base_root}")
+                raise MeasurementRefused(
+                    f"refusing to remove unexpected fixture root {base_root}"
+                )
             shutil.rmtree(base_root)
-    source_after = content_digest(source)
-    report["source_unchanged_after_run"] = source_after == source_before
-    report["provenance"]["source_workspace"]["after"] = source_after
-    report["machine"]["after"] = _machine_state()
-    identity_end = _capture_identity(
-        grafx_repo=grafx_repo,
-        harness_repo=harness_repo,
-        core_repo=core_repo,
-        expected_grafx_head=args.grafx_sha,
-        expected_core_head=args.core_sha,
-        expected_tool_commit=args.tool_commit,
-        expected_tool_blob=args.tool_blob,
+    except BaseException as failure:
+        record_finalization_failure("fixture_base_cleanup_failed", failure)
+    try:
+        source_after = content_digest(source)
+        report["source_unchanged_after_run"] = source_after == source_before
+        report["provenance"]["source_workspace"]["after"] = source_after
+    except BaseException as failure:
+        report["source_unchanged_after_run"] = None
+        record_finalization_failure("source_after_capture_failed", failure)
+    try:
+        report["machine"]["after"] = _machine_state()
+    except BaseException as failure:
+        record_finalization_failure("machine_after_capture_failed", failure)
+    try:
+        identity_end = _capture_identity(
+            grafx_repo=grafx_repo,
+            harness_repo=harness_repo,
+            core_repo=core_repo,
+            expected_grafx_head=args.grafx_sha,
+            expected_core_head=args.core_sha,
+            expected_tool_commit=args.tool_commit,
+            expected_tool_blob=args.tool_blob,
+        )
+        report["provenance"]["identity"]["end"] = identity_end
+        report["provenance"]["identity"]["stable"] = (
+            identity_start["fingerprint_sha256"]
+            == identity_end["fingerprint_sha256"]
+        )
+    except BaseException as failure:
+        report["provenance"]["identity"]["stable"] = False
+        record_finalization_failure("identity_end_capture_failed", failure)
+
+    cleanup_candidate = measurement_failure is None and not finalization_errors
+    finalization["status"] = (
+        "cleanup_pending"
+        if cleanup_candidate
+        else ("failed" if finalization_errors else "passed")
     )
-    report["provenance"]["identity"]["end"] = identity_end
-    report["provenance"]["identity"]["stable"] = (
-        identity_start["fingerprint_sha256"] == identity_end["fingerprint_sha256"]
+    finalization["scratch_retained"] = (
+        "cleanup_pending" if cleanup_candidate else True
     )
-    report["official_shortfalls"] = official_shortfalls(report)
-    report["official"] = bool(args.official) and not report["official_shortfalls"]
-    _atomic_json(out, report)
-    shutil.rmtree(scratch)
+    finalization["completed_at_utc"] = (
+        None
+        if cleanup_candidate
+        else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    )
+    try:
+        report["official_shortfalls"] = official_shortfalls(report)
+    except BaseException as failure:
+        record_finalization_failure("official_shortfalls_evaluation_failed", failure)
+        finalization["status"] = "failed"
+        finalization["scratch_retained"] = True
+        finalization["completed_at_utc"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+        )
+        report["official_shortfalls"] = sorted(
+            {
+                "official_shortfalls_evaluation_failed",
+                "finalization_incomplete",
+                *(["measurement_run_failed"] if measurement_failure is not None else []),
+            }
+        )
+    # This checkpoint is deliberately never official.  If cleanup or the final atomic write
+    # fails, the durable artifact left behind cannot be mistaken for accepted evidence.
+    report["official"] = False
+    try:
+        _atomic_json(out, report)
+    except BaseException as artifact_failure:
+        if measurement_failure is not None:
+            try:
+                measurement_failure.add_note(
+                    "CE-3 final artifact write also failed: "
+                    f"{type(artifact_failure).__name__}: {artifact_failure}"
+                )
+            except BaseException:
+                pass
+            raise measurement_failure.with_traceback(measurement_traceback)
+        raise MeasurementRefused(
+            f"CE-3 final artifact write failed: {type(artifact_failure).__name__}: "
+            f"{artifact_failure}"
+        ) from artifact_failure
+
+    if cleanup_candidate and not finalization_errors:
+        try:
+            if scratch.parent != work_root or not scratch.name.startswith("grafx-ce3-"):
+                raise MeasurementRefused(
+                    f"refusing to remove unexpected scratch root {scratch}"
+                )
+            shutil.rmtree(scratch)
+            finalization["status"] = "passed"
+            finalization["scratch_retained"] = False
+        except BaseException as failure:
+            record_finalization_failure("scratch_cleanup_failed", failure)
+            finalization["status"] = "failed"
+            finalization["scratch_retained"] = True
+        finalization["completed_at_utc"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+        )
+        try:
+            report["official_shortfalls"] = official_shortfalls(report)
+        except BaseException as failure:
+            record_finalization_failure("official_shortfalls_evaluation_failed", failure)
+            finalization["status"] = "failed"
+            report["official_shortfalls"] = [
+                "finalization_incomplete",
+                "official_shortfalls_evaluation_failed",
+            ]
+        report["official"] = (
+            bool(args.official)
+            and not finalization_errors
+            and not report["official_shortfalls"]
+        )
+        try:
+            _atomic_json(out, report)
+        except BaseException as artifact_failure:
+            raise MeasurementRefused(
+                "CE-3 final post-cleanup artifact write failed; the prior checkpoint "
+                "remains non-official: "
+                f"{type(artifact_failure).__name__}: {artifact_failure}"
+            ) from artifact_failure
+
+    if measurement_failure is not None:
+        for finalization_failure in finalization_errors:
+            try:
+                measurement_failure.add_note(
+                    "CE-3 finalization also failed: "
+                    f"{finalization_failure['code']}: "
+                    f"{finalization_failure['type']}: "
+                    f"{finalization_failure['message']}"
+                )
+            except BaseException:
+                pass
+        raise measurement_failure.with_traceback(measurement_traceback)
+    if finalization_errors:
+        raise MeasurementRefused(
+            "CE-3 finalization failed: "
+            + ", ".join(str(failure["code"]) for failure in finalization_errors)
+        )
     return report
 
 

@@ -1,12 +1,174 @@
 from __future__ import annotations
 
+import asyncio
 import copy
+import inspect
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from okto_grafx.errors import GrafxWriteConflict
 from tools import measure_m7_ce3 as ce3
+
+
+class GateFailure(RuntimeError):
+    pass
+
+
+class GraphLockContention(RuntimeError):
+    code = "graph_lock_contention"
+
+    def __init__(
+        self,
+        message: str = "typed contention",
+        *,
+        retryable: bool = True,
+        commit_durable: object | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.details: dict[str, object] = {
+            "backend": "okto_grafx",
+            "operation": "commit",
+            "backend_error_type": "GrafxWriteConflict",
+            "backend_error_code": "write_conflict",
+            "backend_retryable": True,
+        }
+        if commit_durable is not None:
+            self.details["commit_durable"] = commit_durable
+
+
+class GraphIndexUnavailable(RuntimeError):
+    code = "graph_index_unavailable"
+    retryable = True
+
+    def __init__(self, message: str = "durable index refusal") -> None:
+        super().__init__(message)
+        self.details = {"field": "durable_index_state"}
+
+
+class _RandomizerDouble:
+    def __init__(self) -> None:
+        self.calls: list[tuple[float, float]] = []
+
+    def uniform(self, lower: float, upper: float) -> float:
+        self.calls.append((lower, upper))
+        return 0.0
+
+
+class _RunnerDouble:
+    def __init__(self, outcomes: list[BaseException | None]) -> None:
+        self.outcomes = outcomes
+        self.calls: list[tuple[object, object, object]] = []
+        self.scope_tokens: list[object] = []
+
+    async def _execute_operation(
+        self, backend: object, context: object, operation: object
+    ) -> None:
+        # The real harness opens and settles a transaction scope inside every call.
+        self.scope_tokens.append(object())
+        self.calls.append((backend, context, operation))
+        outcome = self.outcomes[len(self.calls) - 1]
+        if outcome is not None:
+            raise outcome
+
+
+def _install_graph_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_import = ce3.importlib.import_module
+
+    def import_module(name: str, package: str | None = None) -> Any:
+        if name == "okto_pulse.core.kg.interfaces.graph_errors":
+            return SimpleNamespace(GraphLockContention=GraphLockContention)
+        return real_import(name, package)
+
+    monkeypatch.setattr(ce3.importlib, "import_module", import_module)
+
+
+def _from_cause(cause: BaseException) -> GateFailure:
+    failure = GateFailure("adapter boundary")
+    failure.__cause__ = cause
+    return failure
+
+
+def _typed_contention(
+    *,
+    core_retryable: bool = True,
+    backend_retryable: bool = True,
+    declared_backend_retryable: bool | None = None,
+    commit_durable: object | None = None,
+    field: str | None = None,
+    include_backend_cause: bool = True,
+    rollback_note: bool = False,
+) -> GateFailure:
+    backend = GrafxWriteConflict(
+        "optimistic conflict", retryable=backend_retryable
+    )
+    contention = GraphLockContention(
+        retryable=core_retryable, commit_durable=commit_durable
+    )
+    contention.details["backend_retryable"] = (
+        backend_retryable
+        if declared_backend_retryable is None
+        else declared_backend_retryable
+    )
+    if field is not None:
+        contention.details["field"] = field
+    if include_backend_cause:
+        contention.__cause__ = backend
+    if rollback_note:
+        contention.add_note("rollback also failed: synthetic release failure")
+    return _from_cause(contention)
+
+
+def _retry_refusal(attempt: int = 1) -> dict[str, object]:
+    core_details = {
+        "backend": "okto_grafx",
+        "operation": "commit",
+        "backend_error_type": "GrafxWriteConflict",
+        "backend_error_code": "write_conflict",
+        "backend_retryable": True,
+        "commit_durable": False,
+    }
+    return {
+        "attempt": attempt,
+        "attempt_scope": "fresh_transaction",
+        "type": "GraphLockContention",
+        "code": "graph_lock_contention",
+        "retryable": True,
+        "details": core_details,
+        "message": "typed contention",
+        "classification": "typed_pre_durable_grafx_write_conflict",
+        "chain": [
+            {
+                "type": "GateFailure",
+                "code": None,
+                "retryable": None,
+                "details": None,
+                "notes": [],
+                "message": "adapter boundary",
+            },
+            {
+                "type": "GraphLockContention",
+                "code": "graph_lock_contention",
+                "retryable": True,
+                "details": core_details,
+                "notes": [],
+                "message": "typed contention",
+            },
+            {
+                "type": "GrafxWriteConflict",
+                "code": "write_conflict",
+                "retryable": True,
+                "details": {},
+                "notes": [],
+                "message": "optimistic conflict",
+            },
+        ],
+        "backoff_seconds": 0.0,
+    }
 
 
 def _environment_evidence(*, executor: str = "executor") -> dict[str, object]:
@@ -50,6 +212,12 @@ def _samples(*, instrumented: bool, per_family: int = 5) -> list[dict[str, objec
                 "postcondition": "node_exists",
                 "postcondition_status": "passed",
                 "foreign_commits_completed_during_operation": 0,
+                "attempts": 1,
+                "conflicts": 0,
+                "retries": 0,
+                "retryable_refusal_count": 0,
+                "retryable_refusals": [],
+                "last_refusal": None,
             }
             if instrumented:
                 sample["hooks"] = {
@@ -78,6 +246,12 @@ def _scenario_result(pass_name: str, scenario: ce3.Scenario) -> dict[str, object
                     "started_at_ns": ended - 1_000_000,
                     "ended_at_ns": ended,
                     "wall_ms": 1.0,
+                    "attempts": 1,
+                    "conflicts": 0,
+                    "retries": 0,
+                    "retryable_refusal_count": 0,
+                    "retryable_refusals": [],
+                    "last_refusal": None,
                 }
             )
     environment = _environment_evidence()
@@ -119,6 +293,14 @@ def _scenario_result(pass_name: str, scenario: ce3.Scenario) -> dict[str, object
         "families": list(ce3.EXPECTED_FAMILIES),
         "samples": _samples(instrumented=pass_name == "instrumented"),
         "postconditions_passed": 60,
+        "retry_policy": dict(ce3.RETRY_POLICY),
+        "retryable_conflicts": 0,
+        "retries": 0,
+        "retryable_refusal_count": 0,
+        "retryable_refusals": [],
+        "durable_refusals": [],
+        "nonretryable_refusals": [],
+        "retry_exhaustions": [],
         "refusals": [],
     }
     b: dict[str, object] = {
@@ -142,6 +324,14 @@ def _scenario_result(pass_name: str, scenario: ce3.Scenario) -> dict[str, object
             "observed_nodes": len(commits),
             "status": "passed",
         },
+        "retry_policy": dict(ce3.RETRY_POLICY),
+        "retryable_conflicts": 0,
+        "retries": 0,
+        "retryable_refusal_count": 0,
+        "retryable_refusals": [],
+        "durable_refusals": [],
+        "nonretryable_refusals": [],
+        "retry_exhaustions": [],
         "refusals": [],
     }
     verifier = {
@@ -246,11 +436,196 @@ def _official_report() -> dict[str, object]:
         },
         "source_unchanged_after_run": True,
         "machine": {"machine_idle_asserted": True, "before": {"cpu_percent": 2.0}},
+        "finalization": {"status": "passed", "errors": []},
         "results": results,
     }
 
 
+def _install_official_run_doubles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    run_scenario: Any,
+    scratch_name: str,
+) -> tuple[SimpleNamespace, Path, Path]:
+    source = tmp_path / "source"
+    source.mkdir()
+    harness_repo = tmp_path / "community"
+    grafx_repo = tmp_path / "grafx"
+    core_repo = tmp_path / "core"
+    for repo in (harness_repo, grafx_repo, core_repo):
+        repo.mkdir()
+    provenance = tmp_path / "source-provenance.json"
+    provenance.write_text("{}", encoding="utf-8")
+    work_root = tmp_path / "work"
+    work_root.mkdir()
+    scratch = work_root / scratch_name
+    scratch.mkdir()
+    base_workspace = scratch / "m7profile-grafx-base"
+    base_workspace.mkdir()
+    out = tmp_path / "ce3-report.json"
+    good_report = _official_report()
+    identity = good_report["provenance"]["identity"]["start"]
+    environment = good_report["provenance"]["environment"]
+
+    async def build_base(*_args: object) -> Path:
+        return base_workspace
+
+    harness = SimpleNamespace(_build_base=build_base)
+    plan_info = {
+        "digest": ce3.EXPECTED_OPERATION_SET_SHA256,
+        "families": list(ce3.EXPECTED_FAMILIES),
+    }
+
+    monkeypatch.setattr(ce3, "_assert_output_outside_inputs", lambda *_args: None)
+    monkeypatch.setattr(ce3, "_capture_identity", lambda **_kwargs: copy.deepcopy(identity))
+    monkeypatch.setattr(ce3, "_git", lambda *_args: ce3.PINNED_HARNESS_BLOB)
+    monkeypatch.setattr(
+        ce3,
+        "content_digest",
+        lambda path: (
+            {"sha256": "source", "files": 2, "bytes": 3}
+            if Path(path).resolve() == source.resolve()
+            else {"sha256": "a", "files": 1, "bytes": 2}
+        ),
+    )
+    monkeypatch.setattr(ce3, "_source_binding", lambda _source: {"backend": "grafx"})
+    monkeypatch.setattr(
+        ce3,
+        "source_provenance_evidence",
+        lambda *_args, **_kwargs: copy.deepcopy(
+            good_report["provenance"]["source_provenance"]
+        ),
+    )
+    monkeypatch.setattr(ce3, "_prepare_import_paths", lambda _config: None)
+    monkeypatch.setattr(ce3, "_environment", lambda: copy.deepcopy(environment))
+    monkeypatch.setattr(
+        ce3,
+        "_runtime",
+        lambda _config: (harness, object(), object(), object(), plan_info),
+    )
+    machine_samples = iter(
+        [
+            {"cpu_percent": 2.0, "sample": "before"},
+            {"cpu_percent": 3.0, "sample": "after"},
+        ]
+    )
+    monkeypatch.setattr(ce3, "_machine_state", lambda: next(machine_samples))
+    monkeypatch.setattr(ce3.tempfile, "mkdtemp", lambda **_kwargs: str(scratch))
+    monkeypatch.setattr(ce3, "_run_scenario", run_scenario)
+
+    args = SimpleNamespace(
+        source_workspace=source,
+        source_workspace_sha256="source",
+        source_provenance=provenance,
+        source_provenance_sha256="receipt",
+        harness_repo=harness_repo,
+        grafx=grafx_repo,
+        grafx_sha="grafx",
+        tool_commit="tool-commit",
+        tool_blob="tool-blob",
+        core=core_repo,
+        core_sha="core",
+        work_root=work_root,
+        out=out,
+        official=True,
+        per_family=5,
+        scenario="all",
+        machine_idle_asserted=True,
+        maximum_initial_cpu_percent=20.0,
+        barrier_timeout_seconds=1.0,
+        child_timeout_seconds=1.0,
+        check_only=False,
+        fail_fast=True,
+    )
+    return args, out, scratch
+
+
+def test_fail_fast_finalizes_report_provenance_without_reclassifying_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    failed_result = _scenario_result("raw", ce3.SCENARIOS[0])
+    failed_result["process_b"]["status"] = "failed"
+    failed_result["process_exitcodes"]["b"] = 1
+    failed_result["shortfalls"] = ["process_b_failed"]
+    failed_result["status"] = "failed"
+    args, out, _scratch = _install_official_run_doubles(
+        monkeypatch,
+        tmp_path,
+        run_scenario=lambda *_args: failed_result,
+        scratch_name="grafx-ce3-failfast",
+    )
+
+    with pytest.raises(ce3.MeasurementRefused, match="raw/idle-0 failed"):
+        ce3.run(args)
+
+    persisted = json.loads(out.read_text(encoding="utf-8"))
+    assert persisted["official"] is False
+    assert persisted["run_failure"]["type"] == "MeasurementRefused"
+    assert persisted["finalization"]["status"] == "passed"
+    assert persisted["finalization"]["errors"] == []
+    assert persisted["results"][0]["status"] == "failed"
+    assert persisted["source_unchanged_after_run"] is True
+    assert persisted["provenance"]["source_workspace"]["after"] == {
+        "sha256": "source",
+        "files": 2,
+        "bytes": 3,
+    }
+    assert persisted["machine"]["after"]["sample"] == "after"
+    assert persisted["provenance"]["identity"]["end"] is not None
+    assert persisted["provenance"]["identity"]["stable"] is True
+    assert persisted["official_shortfalls"]
+    assert "measurement_run_failed" in persisted["official_shortfalls"]
+    assert any("process_b_failed" in item for item in persisted["official_shortfalls"])
+
+
+def test_failed_post_cleanup_write_cannot_leave_an_official_pending_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def passed_scenario(
+        _config: object,
+        _base_workspace: object,
+        _base_digest: object,
+        pass_name: str,
+        scenario: ce3.Scenario,
+    ) -> dict[str, object]:
+        result = _scenario_result(pass_name, scenario)
+        result["shortfalls"] = []
+        result["status"] = "passed"
+        return result
+
+    args, out, _scratch = _install_official_run_doubles(
+        monkeypatch,
+        tmp_path,
+        run_scenario=passed_scenario,
+        scratch_name="grafx-ce3-cleanup-write",
+    )
+    real_atomic_json = ce3._atomic_json
+
+    def fail_post_cleanup_write(path: Path, payload: dict[str, object]) -> None:
+        finalization = payload.get("finalization", {})
+        if finalization.get("scratch_retained") is False:
+            raise OSError("synthetic post-cleanup artifact failure")
+        real_atomic_json(path, payload)
+
+    monkeypatch.setattr(ce3, "_atomic_json", fail_post_cleanup_write)
+
+    with pytest.raises(
+        (OSError, ce3.MeasurementRefused), match="post-cleanup artifact failure"
+    ):
+        ce3.run(args)
+
+    persisted = json.loads(out.read_text(encoding="utf-8"))
+    assert persisted["official"] is False
+    assert not (
+        persisted["official"] is True
+        and persisted["finalization"]["scratch_retained"] == "cleanup_pending"
+    )
+
+
 def test_frozen_matrix_and_pins_are_literal() -> None:
+    assert ce3.SCHEMA == "okto-grafx.ce3-m7-multiprocess.v2"
+    assert ce3.MAX_OPERATION_ATTEMPTS == 60
     assert ce3.EXPECTED_OPERATION_SET_SHA256 == (
         "c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81"
     )
@@ -271,12 +646,455 @@ def test_frozen_matrix_and_pins_are_literal() -> None:
     assert all(scenario.meaning for scenario in ce3.SCENARIOS)
 
 
+def test_typed_pre_durable_contention_retries_whole_operation_on_same_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_graph_errors(monkeypatch)
+    first = _typed_contention()
+    second = _typed_contention(commit_durable=False)
+    runner = _RunnerDouble([first, second, None])
+    randomizer = _RandomizerDouble()
+    backend = object()
+    context = object()
+    operation = {"operation_id": "logical-1", "payload": {"id": "n-1"}}
+
+    outcome = asyncio.run(
+        ce3._execute_with_retry(
+            runner,
+            backend,
+            context,
+            operation,
+            randomizer=randomizer,
+        )
+    )
+
+    assert outcome["status"] == "committed"
+    assert outcome["attempts"] == 3
+    assert outcome["conflicts"] == outcome["retries"] == 2
+    assert outcome["retryable_refusal_count"] == 2
+    assert [item["attempt"] for item in outcome["retryable_refusals"]] == [1, 2]
+    assert {item["type"] for item in outcome["retryable_refusals"]} == {
+        "GraphLockContention"
+    }
+    assert {item["code"] for item in outcome["retryable_refusals"]} == {
+        "graph_lock_contention"
+    }
+    assert {
+        item["classification"] for item in outcome["retryable_refusals"]
+    } == {"typed_pre_durable_grafx_write_conflict"}
+    assert {item["attempt_scope"] for item in outcome["retryable_refusals"]} == {
+        "fresh_transaction"
+    }
+    assert all(
+        [entry["type"] for entry in item["chain"]]
+        == ["GateFailure", "GraphLockContention", "GrafxWriteConflict"]
+        for item in outcome["retryable_refusals"]
+    )
+    assert outcome["last_refusal"] == outcome["retryable_refusals"][-1]
+    assert len(runner.calls) == 3
+    assert all(call[0] is backend and call[1] is context for call in runner.calls)
+    assert all(call[2] is operation for call in runner.calls)
+    assert len({id(scope) for scope in runner.scope_tokens}) == 3
+    assert len(randomizer.calls) == 2
+
+
+@pytest.mark.parametrize("commit_durable", [None, False], ids=("absent", "false"))
+def test_absent_or_false_commit_durable_remains_retryable(
+    monkeypatch: pytest.MonkeyPatch, commit_durable: object | None
+) -> None:
+    _install_graph_errors(monkeypatch)
+    failure = _typed_contention(commit_durable=commit_durable)
+
+    assert isinstance(ce3._retryable_contention(failure), GraphLockContention)
+
+
+@pytest.mark.parametrize(
+    "commit_durable",
+    ["true", 1, object()],
+    ids=("string", "integer", "object"),
+)
+def test_malformed_commit_durable_is_never_retryable(
+    monkeypatch: pytest.MonkeyPatch, commit_durable: object
+) -> None:
+    _install_graph_errors(monkeypatch)
+    failure = _typed_contention(commit_durable=commit_durable)
+
+    assert ce3._retryable_contention(failure) is None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        _typed_contention(core_retryable=False),
+        _typed_contention(commit_durable=True),
+        _typed_contention(field="index_view_unavailable"),
+        _typed_contention(rollback_note=True),
+        _typed_contention(declared_backend_retryable=False),
+        _typed_contention(backend_retryable=False),
+        _typed_contention(include_backend_cause=False),
+        _from_cause(GraphIndexUnavailable()),
+        _from_cause(
+            RuntimeError(
+                "GraphLockContention GrafxWriteConflict retryable=True "
+                "commit_durable=False"
+            )
+        ),
+    ],
+    ids=(
+        "non-retryable-core",
+        "commit-durable",
+        "durable-index-field",
+        "rollback-failed",
+        "declared-flag-diverges",
+        "backend-non-retryable",
+        "missing-typed-backend-cause",
+        "durable-index-type",
+        "text-forgery",
+    ),
+)
+def test_only_typed_retryable_pre_durable_contention_is_retried(
+    monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    _install_graph_errors(monkeypatch)
+    runner = _RunnerDouble([failure])
+    randomizer = _RandomizerDouble()
+
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(
+            ce3._execute_with_retry(
+                runner,
+                object(),
+                object(),
+                {"operation_id": "terminal"},
+                randomizer=randomizer,
+            )
+        )
+
+    assert raised.value is failure
+    assert len(runner.calls) == 1
+    assert randomizer.calls == []
+
+
+def test_retry_budget_exhaustion_remains_a_terminal_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_graph_errors(monkeypatch)
+    runner = _RunnerDouble(
+        [
+            _typed_contention()
+            for index in range(ce3.MAX_OPERATION_ATTEMPTS)
+        ]
+    )
+    randomizer = _RandomizerDouble()
+    backend = object()
+    context = object()
+    operation = {"operation_id": "exhausted"}
+
+    with pytest.raises(ce3.MeasurementRefused, match="exhausted 60"):
+        asyncio.run(
+            ce3._execute_with_retry(
+                runner,
+                backend,
+                context,
+                operation,
+                randomizer=randomizer,
+            )
+        )
+
+    assert len(runner.calls) == ce3.MAX_OPERATION_ATTEMPTS
+    assert len(randomizer.calls) == ce3.MAX_OPERATION_ATTEMPTS - 1
+    assert all(call == (backend, context, operation) for call in runner.calls)
+    assert len({id(scope) for scope in runner.scope_tokens}) == ce3.MAX_OPERATION_ATTEMPTS
+
+
+def test_b_can_close_its_window_after_a_pre_durable_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_graph_errors(monkeypatch)
+    runner = _RunnerDouble([_typed_contention()])
+    stop_event = SimpleNamespace(is_set=lambda: True)
+
+    outcome = asyncio.run(
+        ce3._execute_with_retry(
+            runner,
+            object(),
+            object(),
+            {"operation_id": "window-closes"},
+            randomizer=_RandomizerDouble(),
+            stop_event=stop_event,
+        )
+    )
+
+    assert outcome["status"] == "window_closed"
+    assert outcome["attempts"] == outcome["conflicts"] == outcome["retries"] == 1
+    assert outcome["retryable_refusal_count"] == 1
+    assert len(outcome["retryable_refusals"]) == 1
+
+
+@pytest.mark.parametrize(
+    "worker",
+    [ce3._run_process_a_async, ce3._run_process_b_async],
+    ids=("process-a", "process-b"),
+)
+def test_operation_latency_includes_every_retry(worker: Any) -> None:
+    source = inspect.getsource(worker)
+    execute = source.index("retry = await _execute_with_retry(")
+    started = source.rfind("started = time.perf_counter_ns()", 0, execute)
+    ended = source.index("ended = time.perf_counter_ns()", execute)
+
+    assert 0 <= started < execute < ended
+
+
 def test_rate_is_recomputed_from_the_real_intersection() -> None:
     scenario = ce3.SCENARIOS[1]
     result = _scenario_result("raw", scenario)
 
     assert result["rate"]["intersection_seconds"] == 10.0
     assert result["rate"]["effective_rate_per_second"] == 1.0
+    assert ce3._scenario_shortfalls(result) == []
+
+
+def test_consistent_retry_evidence_for_both_processes_can_pass() -> None:
+    result = _scenario_result("raw", ce3.SCENARIOS[1])
+    refusal_a = _retry_refusal()
+    sample = result["process_a"]["samples"][0]
+    sample.update(
+        attempts=2,
+        conflicts=1,
+        retries=1,
+        retryable_refusal_count=1,
+        retryable_refusals=[refusal_a],
+        last_refusal=refusal_a,
+    )
+    result["process_a"].update(
+        retryable_conflicts=1,
+        retries=1,
+        retryable_refusal_count=1,
+        retryable_refusals=[refusal_a],
+    )
+    refusal_b = _retry_refusal()
+    commit = result["process_b"]["commits"][0]
+    commit.update(
+        attempts=2,
+        conflicts=1,
+        retries=1,
+        retryable_refusal_count=1,
+        retryable_refusals=[refusal_b],
+        last_refusal=refusal_b,
+    )
+    result["process_b"].update(
+        retryable_conflicts=1,
+        retries=1,
+        retryable_refusal_count=1,
+        retryable_refusals=[refusal_b],
+    )
+
+    assert ce3._scenario_shortfalls(result) == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value["process_a"]["samples"][0].update(attempts=2),
+        lambda value: value["process_a"]["samples"][0].update(conflicts=True),
+        lambda value: value["process_a"]["samples"][0].update(
+            retryable_refusal_count=1
+        ),
+        lambda value: value["process_a"].update(retryable_conflicts=1),
+        lambda value: value["process_a"].update(retryable_refusal_count=1),
+        lambda value: value["process_a"].update(retries=1),
+        lambda value: value["process_a"].update(retry_policy={}),
+        lambda value: value["process_b"]["commits"][0].update(attempts=2),
+        lambda value: value["process_b"].update(retryable_refusals=[_retry_refusal()]),
+    ],
+    ids=(
+        "attempt-count",
+        "bool-conflict-count",
+        "record-refusal-count",
+        "a-conflict-total",
+        "participant-refusal-count",
+        "a-retry-total",
+        "policy",
+        "b-attempt-count",
+        "b-refusal-total",
+    ),
+)
+def test_gate_rejects_incoherent_retry_evidence(mutation: Any) -> None:
+    result = _scenario_result("raw", ce3.SCENARIOS[1])
+
+    mutation(result)
+
+    assert "retry_evidence_inconsistent" in ce3._scenario_shortfalls(result)
+
+
+@pytest.mark.parametrize("record_owner", ["process_a", "process_b"])
+@pytest.mark.parametrize(
+    ("counter", "malformed"),
+    [
+        ("attempts", True),
+        ("attempts", 1.0),
+        ("conflicts", False),
+        ("conflicts", 0.0),
+        ("retries", False),
+        ("retries", 0.0),
+        ("retryable_refusal_count", False),
+        ("retryable_refusal_count", 0.0),
+    ],
+)
+def test_record_counters_reject_bool_and_float(
+    record_owner: str, counter: str, malformed: object
+) -> None:
+    result = _scenario_result("raw", ce3.SCENARIOS[1])
+    records = (
+        result[record_owner]["samples"]
+        if record_owner == "process_a"
+        else result[record_owner]["commits"]
+    )
+    records[0][counter] = malformed
+
+    assert "retry_evidence_inconsistent" in ce3._scenario_shortfalls(result)
+
+
+@pytest.mark.parametrize("participant", ["process_a", "process_b"])
+@pytest.mark.parametrize(
+    ("counter", "malformed"),
+    [
+        ("retryable_conflicts", False),
+        ("retryable_conflicts", 0.0),
+        ("retries", False),
+        ("retries", 0.0),
+        ("retryable_refusal_count", False),
+        ("retryable_refusal_count", 0.0),
+    ],
+)
+def test_participant_counters_reject_bool_and_float(
+    participant: str, counter: str, malformed: object
+) -> None:
+    result = _scenario_result("raw", ce3.SCENARIOS[1])
+    result[participant][counter] = malformed
+
+    assert "retry_evidence_inconsistent" in ce3._scenario_shortfalls(result)
+
+
+@pytest.mark.parametrize(
+    "ledger",
+    ["durable_refusals", "nonretryable_refusals", "retry_exhaustions", "refusals"],
+)
+@pytest.mark.parametrize("participant", ["process_a", "process_b"])
+def test_any_terminal_refusal_ledger_keeps_the_scenario_failed(
+    participant: str, ledger: str
+) -> None:
+    result = _scenario_result("raw", ce3.SCENARIOS[1])
+    result[participant][ledger] = [{"type": "terminal"}]
+
+    assert set(ce3._scenario_shortfalls(result)) & {
+        "refusal_was_not_fail_closed",
+        "retry_evidence_inconsistent",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda refusal: refusal.update(type="GraphIndexUnavailable"),
+        lambda refusal: refusal.update(code="graph_index_unavailable"),
+        lambda refusal: refusal.update(retryable=False),
+        lambda refusal: refusal.update(details={"commit_durable": True}),
+        lambda refusal: refusal.update(attempt=60),
+        lambda refusal: refusal.update(classification="message_pattern"),
+        lambda refusal: refusal.update(attempt_scope="same_transaction"),
+        lambda refusal: refusal["chain"].pop(),
+        lambda refusal: refusal["chain"][1]["details"].update(
+            backend_error_code="forged"
+        ),
+        lambda refusal: refusal["chain"][1].update(
+            notes=["rollback also failed"]
+        ),
+        lambda refusal: refusal["chain"][2].update(retryable=False),
+    ],
+    ids=(
+        "wrong-type",
+        "wrong-code",
+        "not-retryable",
+        "post-durable",
+        "budget-exhausted",
+        "wrong-classification",
+        "same-scope",
+        "missing-backend-chain",
+        "mapping-diverges",
+        "rollback-note",
+        "backend-non-retryable",
+    ),
+)
+def test_gate_rejects_a_refusal_that_was_not_eligible_for_retry(mutation: Any) -> None:
+    result = _scenario_result("raw", ce3.SCENARIOS[1])
+    refusal = _retry_refusal()
+    mutation(refusal)
+    sample = result["process_a"]["samples"][0]
+    sample.update(
+        attempts=2,
+        conflicts=1,
+        retries=1,
+        retryable_refusal_count=1,
+        retryable_refusals=[refusal],
+        last_refusal=refusal,
+    )
+    result["process_a"].update(
+        retryable_conflicts=1,
+        retries=1,
+        retryable_refusal_count=1,
+        retryable_refusals=[refusal],
+    )
+
+    assert "retry_evidence_inconsistent" in ce3._scenario_shortfalls(result)
+
+
+@pytest.mark.parametrize("commit_durable", ["true", 1, object()])
+def test_gate_rejects_malformed_commit_durable_evidence(
+    commit_durable: object,
+) -> None:
+    result = _scenario_result("raw", ce3.SCENARIOS[1])
+    refusal = _retry_refusal()
+    refusal["details"]["commit_durable"] = commit_durable
+    sample = result["process_a"]["samples"][0]
+    sample.update(
+        attempts=2,
+        conflicts=1,
+        retries=1,
+        retryable_refusal_count=1,
+        retryable_refusals=[refusal],
+        last_refusal=refusal,
+    )
+    result["process_a"].update(
+        retryable_conflicts=1,
+        retries=1,
+        retryable_refusal_count=1,
+        retryable_refusals=[refusal],
+    )
+
+    assert "retry_evidence_inconsistent" in ce3._scenario_shortfalls(result)
+
+
+def test_gate_accepts_absent_commit_durable_evidence() -> None:
+    result = _scenario_result("raw", ce3.SCENARIOS[1])
+    refusal = _retry_refusal()
+    refusal["details"].pop("commit_durable")
+    sample = result["process_a"]["samples"][0]
+    sample.update(
+        attempts=2,
+        conflicts=1,
+        retries=1,
+        retryable_refusal_count=1,
+        retryable_refusals=[refusal],
+        last_refusal=refusal,
+    )
+    result["process_a"].update(
+        retryable_conflicts=1,
+        retries=1,
+        retryable_refusal_count=1,
+        retryable_refusals=[refusal],
+    )
+
     assert ce3._scenario_shortfalls(result) == []
 
 
@@ -457,6 +1275,39 @@ def test_live_verify_must_finish_before_both_measured_handles_close() -> None:
     result["process_b"]["handle"]["closed_at_ns"] = 20_150_000_000
 
     assert "live_verify_not_inside_open_handle_window" in ce3._scenario_shortfalls(result)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda report: report["finalization"].update(errors=None),
+        lambda report: report["provenance"]["identity"]["start"].update(
+            tool=[]
+        ),
+        lambda report: report["provenance"]["source_provenance"].update(
+            semantic_checks=None
+        ),
+        lambda report: report.update(machine=None),
+        lambda report: report["results"].__setitem__(0, None),
+    ],
+    ids=(
+        "finalization-errors-none",
+        "nested-tool-list",
+        "semantic-checks-none",
+        "machine-none",
+        "result-none",
+    ),
+)
+def test_official_shortfalls_is_total_over_malformed_nested_evidence(
+    mutation: Any,
+) -> None:
+    report = _official_report()
+    mutation(report)
+
+    shortfalls = ce3.official_shortfalls(report)
+
+    assert isinstance(shortfalls, list)
+    assert shortfalls
 
 
 @pytest.mark.parametrize(
