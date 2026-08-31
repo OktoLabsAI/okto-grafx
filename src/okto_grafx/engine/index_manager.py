@@ -2698,6 +2698,12 @@ class ProximityIndex(IndexStore):
 def _tables_written_by(txn: object) -> frozenset[int] | None:
     """Return effective row-intent table ids, or None when they cannot be proved.
 
+    The heap writer caches the ids from the already-reduced intents it actually materialized.
+    Consume that certificate first: reducing the public intent history again here would add an
+    avoidable O(n) pass inside the cross-process commit section, after the WAL barrier. Direct
+    index callers and lightweight doubles have no certificate, so retain the conservative
+    reducer/raw-intent fallback for those compatibility shapes.
+
     Real transactions retain their raw intent history until commit. A pending INSERT followed
     by its DELETE is therefore present in that history even though the shared reducer correctly
     makes both disappear before any heap or index work. Deriving table writes from the raw list
@@ -2706,6 +2712,12 @@ def _tables_written_by(txn: object) -> frozenset[int] | None:
     index test doubles predate ``RowIntent`` and deliberately expose only ``.table``; preserve
     their conservative raw-table evidence instead of inventing reducer fields for them.
     """
+    certified = getattr(txn, "_effective_row_tables", None)
+    if isinstance(certified, frozenset) and all(
+        isinstance(table_id, int) and not isinstance(table_id, bool)
+        for table_id in certified
+    ):
+        return certified
     intents = getattr(txn, "row_intents", None)
     if intents is None:
         return None

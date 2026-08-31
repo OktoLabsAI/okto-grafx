@@ -2686,13 +2686,15 @@ class TransactionManager:
         unreachable space, but never a birth or ending a real snapshot can observe.  Step 3.6
         installs the corrected images only after the barrier returns.
         """
+        txn._effective_row_tables = None
         if not txn.row_intents:
+            txn._effective_row_tables = frozenset()
             return ()
         heap = self._heap
         provisional = PROVISIONAL_CSN
         written: list[_RowWrite] = []
         try:
-            self._write_intents(txn, heap, provisional, written)
+            effective_row_tables = self._write_intents(txn, heap, provisional, written)
         except BaseException as failure:
             # The intents already written are abandoned HERE, by the one frame that knows
             # about them. The caller sees only what this method returns, and a refusal on the
@@ -2704,6 +2706,7 @@ class TransactionManager:
                 self._recovery_required = True
                 _note_cleanup_failure(failure, cleanup_failure)
             raise
+        txn._effective_row_tables = effective_row_tables
         txn.row_refs = [item.born for item in written if item.born is not None]
         return tuple(written)
 
@@ -2713,9 +2716,11 @@ class TransactionManager:
         heap: object,
         provisional: Csn,
         written: list[_RowWrite],
-    ) -> None:
-        """Write each settled intent into the heap, appending to ``written`` as each one lands."""
+    ) -> frozenset[int]:
+        """Write settled intents and return the exact table ids that materialized rows."""
+        effective_row_tables: set[int] = set()
         for intent in self._resolved_intents(txn, heap):
+            effective_row_tables.add(intent.table.table_id)
             if intent.operation is RowOperation.DELETE:
                 ending = self._values_at(intent.reference)
                 heap.delete(intent.table, intent.reference, provisional)
@@ -2756,6 +2761,7 @@ class TransactionManager:
                     born_values=tuple(intent.values),
                 )
             )
+        return frozenset(effective_row_tables)
 
     def _resolved_intents(
         self, txn: TransactionContext, heap: object

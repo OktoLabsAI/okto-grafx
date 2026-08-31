@@ -242,6 +242,7 @@ class TransactionContext:
         "_staging_marks",
         "_next_pending_token",
         "_pending_row_refs",
+        "_effective_row_tables",
         "row_intents",
         "row_refs",
     )
@@ -306,6 +307,11 @@ class TransactionContext:
         # txn_id is process-local and tokens restart in every context, so value equality alone
         # cannot distinguish another handle's first insert from this handle's first insert.
         self._pending_row_refs: dict[int, PendingRowRef] = {}
+        # Filled only by the heap writer, from the reduced intents it actually materialized.
+        # Index maintenance consumes this private certificate so it need not reduce the public
+        # intent history again after the WAL barrier. ``None`` means no writer certificate exists;
+        # an empty frozenset is the proved result of a fully cancelled row batch.
+        self._effective_row_tables: frozenset[int] | None = None
         self.row_intents: list[RowIntent] = []
         self.row_refs: list[object] = []
 
@@ -1011,6 +1017,7 @@ class TransactionContext:
         self._page_image_proofs.clear()
         self.row_intents.clear()
         self.row_refs.clear()
+        self._effective_row_tables = None
         self._staged_payload_bytes = 0
         self._next_pending_token = -1
         self._pending_row_refs.clear()

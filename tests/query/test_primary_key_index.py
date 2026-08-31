@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
+import okto_grafx.engine.index_manager as index_manager_module
 from okto_grafx.domain.errors import GrafxQueryError
 from okto_grafx.domain.query.plan import IndexSeek, NodeScan
 from okto_grafx.engine.index_manager import IndexManager, primary_key_index_name
@@ -183,6 +184,7 @@ def test_a_deleted_row_is_not_returned_by_a_seek(database) -> None:
 
 def test_a_cancelled_pending_insert_does_not_stale_its_primary_key_index(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """CREATE then DELETE in later statements is no table write at commit.
 
@@ -198,6 +200,11 @@ def test_a_cancelled_pending_insert_does_not_stale_its_primary_key_index(
             schema.execute(
                 "CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))"
             )
+
+        def refuse_a_third_reduction(_intents: object) -> tuple[object, ...]:
+            raise AssertionError("index maintenance reduced the row intents again")
+
+        monkeypatch.setattr(index_manager_module, "reduce_row_intents", refuse_a_third_reduction)
         with live.begin("write") as writer:
             writer.execute("CREATE (:Person {id: 7, name: 'temporary'})")
             writer.execute("MATCH (p:Person) WHERE p.id = 7 DELETE p")
