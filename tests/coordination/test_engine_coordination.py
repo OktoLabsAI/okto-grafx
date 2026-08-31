@@ -103,6 +103,7 @@ class SpyCoordinator:
 
     def refresh_reader(self, handle: ReaderHandle) -> None:
         """Record the refresh."""
+        self.readers[handle.reader_id] = handle.snapshot_lsn
         self.calls.append(("refresh", handle.reader_id))
 
     def unregister_reader(self, handle: ReaderHandle) -> None:
@@ -335,6 +336,26 @@ def test_a_closed_registration_refuses_to_be_refreshed() -> None:
     with pytest.raises(GrafxUnsupportedOperation):
         registration.refresh()
     assert repr(registration).startswith("ReaderRegistration(reader_id='spy-r1'")
+
+
+def test_a_registration_advances_its_pin_forward_in_the_refresh_publication() -> None:
+    coordinator = SpyCoordinator()
+    registration = ReaderRegistration.open(coordinator, 7)
+    registration.advance(11)
+    assert registration.snapshot_lsn == 11
+    assert coordinator.reader_horizon() == 11
+    assert coordinator.calls == [("register", 7), ("refresh", "spy-r1")]
+
+
+def test_a_registration_refuses_to_regress_or_advance_after_close() -> None:
+    coordinator = SpyCoordinator()
+    registration = ReaderRegistration.open(coordinator, 7)
+    with pytest.raises(GrafxUnsupportedOperation):
+        registration.advance(6)
+    assert registration.snapshot_lsn == 7
+    registration.close()
+    with pytest.raises(GrafxUnsupportedOperation):
+        registration.advance(8)
 
 
 def test_a_snapshot_that_is_not_an_lsn_is_refused() -> None:

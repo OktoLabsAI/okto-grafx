@@ -1248,6 +1248,12 @@ class LocalProcessCoordinator:
         writers and writers never block readers (FR-2).
         """
         pinned = _require_index("snapshot_lsn", snapshot_lsn)
+        # No fallible host clock read may happen after the durable record is published but
+        # before this coordinator adopts its handle. Otherwise register_reader could raise
+        # without returning the only capability able to withdraw an own record -- and own
+        # registrations are deliberately never TTL-pruned. An earlier sample is conservative:
+        # it can only make the first heartbeat due sooner.
+        observed_at = self._clock.monotonic()
         with self._state_lock:
             self._reader_counter += 1
             reader_id = f"{self._reader_prefix}{self._reader_counter:04d}"
@@ -1263,7 +1269,7 @@ class LocalProcessCoordinator:
         with self._state_lock:
             self._readers[reader_id] = handle
             self._reader_sequences[reader_id] = 1
-            self._reader_samples[reader_id] = (1, self._clock.monotonic())
+            self._reader_samples[reader_id] = (1, observed_at)
         return handle
 
     def refresh_reader(self, handle: ReaderHandle) -> None:

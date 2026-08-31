@@ -243,7 +243,7 @@ class TransactionManager:
         "_lease_guard",
         "_next_txn_id",
         "_open",
-        "_pins",
+        "_participant_pin",
         "_published_high_water",
         "_own_published_lsn",
         "_recovery_required",
@@ -385,7 +385,11 @@ class TransactionManager:
         )
         self._next_txn_id: TxnId = 1
         self._open: dict[TxnId, TransactionContext] = {}
-        self._pins: dict[TxnId, _ReaderPin] = {}
+        # CE-2: ONE reader registration per participant, opened lazily by the first begin and
+        # withdrawn only by close. Its pin is deferred and monotone -- it follows the oldest
+        # open snapshot, never passes it (BR-10), and is republished on the refresh cadence
+        # rather than on every transaction boundary.
+        self._participant_pin: _ReaderPin | None = None
         self._published_high_water: Lsn = NO_LSN
         # The last commit number THIS manager published through step 3.7 (CQ-2/QW-4). Only
         # _publish_commit_state remembers it: a gap completion or a checkpoint publishes
@@ -733,25 +737,36 @@ class TransactionManager:
     ) -> tuple[TransactionContext, int]:
         """Open and register one transaction while the participant section is held.
 
-        This helper emits no host metric.  Retry uses it immediately after forgetting the old
-        context, so no close or competing lifecycle door can enter between withdrawal of the old
-        pin and publication of its successor.  Every failure after registration attempts to
-        withdraw the partial pin and leaves no local tracking entry behind.
+        This helper emits no host metric. Retry uses it immediately after forgetting the old
+        context, so no close or competing lifecycle door can enter between settlement of the old
+        context and publication of its successor. The participant registration, once opened,
+        belongs to the manager and therefore survives a failed begin.
         """
         self._require_not_closed("begin a transaction")
         if mode is TransactionMode.WRITE:
             self._require_writable("begin a write transaction")
         self._require_recovery_complete()
-        registration: ReaderRegistration | None = None
         transaction: TransactionContext | None = None
         counted = False
         try:
-            self._refresh_due_readers()
-            self._require_not_closed("begin a transaction")
             floor = self._published_state_in_section().last_committed_lsn
             self._require_not_closed("begin a transaction")
-            with self._close_wait_hazard():
-                registration = ReaderRegistration.open(self._coordinator, floor)
+            # CE-2: the participant registration answers for every transaction. When one is
+            # already standing, its pin is at or below this floor by monotonicity (it only
+            # ever advances to open-snapshot or published floors), so CF-2's order survives:
+            # a visible pin bounds every horizon before the snapshot below is handed out. A
+            # standing registration refreshed within the interval cannot have been pruned
+            # (the observer TTL is three intervals), and one that is due is advanced or
+            # republished below. The floor has to be read FIRST: when no transaction is open it
+            # is the only safe forward target, and refreshing before reading it would renew an
+            # obsolete pin for another full interval.
+            standing = (
+                self._participant_pin is not None
+                and not self._participant_pin.registration.closed
+            )
+            self._ensure_participant_pin(floor)
+            if standing:
+                self._refresh_due_readers(floor=floor)
             self._require_not_closed("begin a transaction")
             selected = self._published_state_in_section().last_committed_lsn
             self._require_not_closed("begin a transaction")
@@ -784,10 +799,8 @@ class TransactionManager:
                 max_transaction_rows=self._max_transaction_rows,
                 max_transaction_bytes=self._max_transaction_bytes,
             )
-            opened_at = self._monotonic()
             self._require_not_closed("begin a transaction")
             self._open[transaction.txn_id] = transaction
-            self._pins[transaction.txn_id] = _ReaderPin(registration, opened_at)
             self._mode_counts[mode.value] += 1
             counted = True
             self._next_txn_id += 1
@@ -795,16 +808,12 @@ class TransactionManager:
         except BaseException as failure:
             if transaction is not None:
                 self._open.pop(transaction.txn_id, None)
-                self._pins.pop(transaction.txn_id, None)
             if counted and self._mode_counts[mode.value] > 0:
                 self._mode_counts[mode.value] -= 1
-            cleanup_failure = (
-                None
-                if registration is None
-                else self._close_reader_quietly(registration)
-            )
-            if cleanup_failure is not None:
-                _note_cleanup_failure(failure, cleanup_failure)
+            # CE-2: the participant registration is never withdrawn by a failed begin -- it
+            # belongs to the manager, its standing pin is monotone-safe, and close() owns the
+            # withdrawal. There is deliberately no per-transaction cleanup left to do here.
+            del failure
             raise
 
     def _ensure_begin_publishable(self, txn: TransactionContext) -> None:
@@ -940,7 +949,7 @@ class TransactionManager:
         this one transition so two lifecycle doors cannot each believe they won.
         """
         self._require_current_active(txn)
-        self._refresh_due_readers(skip=txn.txn_id)
+        self._refresh_finished_door()
         mode = txn.mode.value
         cleanup_failure: BaseException | None = None
         try:
@@ -968,10 +977,6 @@ class TransactionManager:
         notes; the caller raises it only after every context, pin, lease and metric is handled.
         """
         failure: BaseException | None = None
-        try:
-            self._refresh_due_readers(skip=txn.txn_id)
-        except BaseException as refresh_failure:
-            failure = _accumulate_failure(failure, refresh_failure)
         try:
             with self._close_wait_hazard():
                 self._drop_index_changes(txn)
@@ -1023,32 +1028,109 @@ class TransactionManager:
         self._require_not_closed("refresh readers")
         with self._participant_section():
             self._require_not_closed("refresh readers")
-            return self._refresh_due_readers(now_monotonic, skip=None)
+            pin = self._participant_pin
+            if pin is None or pin.registration.closed:
+                return 0
+            now = (
+                self._monotonic()
+                if now_monotonic is None
+                else float(now_monotonic)
+            )
+            if now < pin.last_refresh + self._refresh_interval:
+                return 0
+            floor = None
+            if not self._open:
+                floor = self._published_state_in_section().last_committed_lsn
+            return self._refresh_due_readers(now, floor=floor)
 
     def _refresh_due_readers(
-        self, now_monotonic: float | None = None, *, skip: TxnId | None = None
+        self, now_monotonic: float | None = None, *, floor: Lsn | None = None
     ) -> int:
-        """Refresh every due registration except the one named, and return how many moved.
+        """Refresh the participant registration when due and return whether it moved.
 
-        ``skip`` names a transaction that is being finished. Proving a reader alive one call
-        before withdrawing it is a control-file write nobody reads, and this component is called
-        on every begin, commit and rollback.
+        ``floor`` is a published LSN the caller already read while holding the participant
+        section. It lets a participant with no open transactions move its deferred pin forward
+        without an extra state read in every lifecycle door.
         """
-        if not self._pins:
+        pin = self._participant_pin
+        if pin is None or pin.registration.closed:
             return 0
         now = self._monotonic() if now_monotonic is None else float(now_monotonic)
-        interval = self._refresh_interval
-        refreshed = 0
-        for txn_id, pin in list(self._pins.items()):
-            if txn_id == skip or pin.registration.closed:
-                continue
-            if now < pin.last_refresh + interval:
-                continue
-            with self._close_wait_hazard():
+        if now < pin.last_refresh + self._refresh_interval:
+            return 0
+        self._advance_participant_pin(now, floor=floor)
+        return 1
+
+    def _refresh_finished_door(self) -> int:
+        """Give a finishing door the due-gated republish CE-2's acceptance names.
+
+        The NEXT_STEPS CE-2 row is explicit that an operation longer than the refresh interval
+        has its OVERDUE pin republished at commit -- moved, never removed. The transaction being
+        finished remains part of the open floor until its outcome is settled. Excluding it here
+        could advance the pin beyond a transaction that remains active if a later commit step
+        fails. A directly composed manager with no known stall threshold retains the old
+        finishing-door behavior only for its sole transaction: that transaction was excluded
+        from the per-transaction refresh set, so commit/rollback did not add a publication. If
+        another transaction survives the door, however, its shared pin must be republished now;
+        explicit ticks and later begins also refresh immediately in that conservative mode.
+        """
+        if self._refresh_interval <= 0.0 and len(self._open) <= 1:
+            return 0
+        return self._refresh_due_readers()
+
+    def _ensure_participant_pin(self, floor: Lsn) -> ReaderRegistration:
+        """Return the participant's standing registration, opening it at ``floor`` when absent.
+
+        Opening happens at most once per manager lifetime (plus once after each close-drain,
+        which clears it). The pin is published BEFORE any snapshot is selected above it, which
+        is the CF-2 ordering; every later begin finds the standing pin already at or below its
+        own floor.
+        """
+        pin = self._participant_pin
+        if pin is not None and not pin.registration.closed:
+            return pin.registration
+        # Read the fallible host clock before publishing the durable registration. If it raises,
+        # no record exists to become an ownerless pin that this coordinator will never prune.
+        # A timestamp taken slightly before publication is conservative: it can only make the
+        # first refresh happen earlier, never after the observer's stall deadline.
+        opened_at = self._monotonic()
+        with self._close_wait_hazard():
+            registration = ReaderRegistration.open(self._coordinator, floor)
+        self._participant_pin = _ReaderPin(registration, opened_at)
+        return registration
+
+    def _open_snapshot_floor(self) -> Lsn | None:
+        """Return the oldest snapshot still open in this participant."""
+        floors = [txn.snapshot.read_lsn for txn in self._open.values()]
+        return min(floors) if floors else None
+
+    def _advance_participant_pin(
+        self,
+        now: float | None = None,
+        *,
+        floor: Lsn | None = None,
+    ) -> None:
+        """Republish the participant pin at the highest position BR-10 allows right now.
+
+        The safe target is the oldest open snapshot. With none open, the pin advances only
+        when the caller HANDS a floor it already holds -- the checkpoint passes the number it
+        is about to publish, and begin passes the floor it just read -- so this door never
+        reads the published state itself and never adds a read to the frozen protocols. The
+        write is one control-file publication, the same one that proves liveness, so a
+        registration a foreign observer pruned is recreated by the very call that moves it.
+        """
+        pin = self._participant_pin
+        if pin is None or pin.registration.closed:
+            return
+        target = self._open_snapshot_floor()
+        if target is None:
+            target = floor
+        with self._close_wait_hazard():
+            if target is not None and target > pin.registration.snapshot_lsn:
+                pin.registration.advance(target)
+            else:
                 pin.registration.refresh()
-            pin.last_refresh = now
-            refreshed += 1
-        return refreshed
+        pin.last_refresh = self._monotonic() if now is None else now
 
     def checkpoint(self) -> RecycleReport:
         """Put the committed state on the platter, publish the checkpoint, and reclaim the log behind it.
@@ -1193,6 +1275,13 @@ class TransactionManager:
                     # Recycling belongs to the same stable-WAL picture as redo and checkpoint
                     # publication.  Releasing COMMIT_SECTION before this call let startup
                     # recovery scan while segments were disappearing underneath it.
+                    # CE-2: the participant's own pin is deferred and its coordinator never
+                    # prunes it, so it is advanced HERE, before the horizon is computed --
+                    # otherwise this manager would hold its own recycling hostage forever.
+                    # The floor handed over is the number this checkpoint just published.
+                    self._advance_participant_pin(
+                        floor=published.last_committed_lsn
+                    )
                     reader_present = self._reader_horizon() is not None
                     with self._close_wait_hazard():
                         state["recycled"] = self._wal.recycle(
@@ -1475,19 +1564,14 @@ class TransactionManager:
                                         txn._pending_row_refs.clear()
                                         txn._staging_marks.clear()
                                 self._open.pop(txn.txn_id, None)
-                                pin = self._pins.pop(txn.txn_id, None)
-                                if pin is not None:
-                                    txn_failure = _accumulate_failure(
-                                        txn_failure,
-                                        self._close_reader_quietly(pin.registration),
-                                    )
                             failure = _accumulate_failure(failure, txn_failure)
-                        for pin in list(self._pins.values()):
+                        pin = self._participant_pin
+                        if pin is not None:
                             failure = _accumulate_failure(
                                 failure,
                                 self._close_reader_quietly(pin.registration),
                             )
-                        self._pins.clear()
+                        self._participant_pin = None
                         self._open.clear()
                         for mode_name in self._mode_counts:
                             self._mode_counts[mode_name] = 0
@@ -1558,7 +1642,7 @@ class TransactionManager:
             self._require_current_active(txn)
             if txn.mode is TransactionMode.WRITE:
                 self._require_writable("commit a write transaction")
-            self._refresh_due_readers(skip=txn.txn_id)
+            self._refresh_finished_door()
             txn.mark_committed(csn)
             # Reader withdrawal is best-effort after the outcome is settled. Its registration
             # has a TTL; surfacing a foreign cleanup exception here would invite a caller to
@@ -1593,7 +1677,7 @@ class TransactionManager:
             self._require_recovery_complete()
             self._validate_staged_inputs(txn)
             txn.validate_budgets()
-            self._refresh_due_readers(skip=txn.txn_id)
+            self._refresh_finished_door()
             lease = self._hold_lease()
             try:
                 # Step 2: the epoch is confirmed before any byte can reach the device (BR-7,
@@ -3434,9 +3518,15 @@ class TransactionManager:
             )
 
     def _release_reader(self, txn: TransactionContext) -> BaseException | None:
-        """Detach a transaction's reader pin and return any foreign withdrawal failure."""
-        pin = self._pins.pop(txn.txn_id, None)
-        return None if pin is None else self._close_reader_quietly(pin.registration)
+        """Finish one transaction against the participant pin, withdrawing nothing.
+
+        CE-2: the registration belongs to the PARTICIPANT and only :meth:`close` withdraws it.
+        The finished transaction merely stops holding the floor down -- the pin advances past
+        it at the next due refresh, the next checkpoint, or the next begin's refresh call
+        (E-CE2-1 rewrote the frozen step 1 that used to unregister here).
+        """
+        del txn  # the pin is per-participant; nothing per-transaction remains to detach
+        return None
 
     def _forget(self, txn: TransactionContext, mode: str) -> int:
         """Drop a finished transaction and return how many of its mode are still open.

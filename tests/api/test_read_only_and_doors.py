@@ -219,9 +219,9 @@ def test_reopening_at_any_other_page_size_is_a_schema_mismatch(
 
 
 def test_an_autocommit_read_leaves_no_transaction_open(tmp_path: Path) -> None:
-    # Database.execute opens a transaction of its own. A door that opens one per call and keeps
-    # it holds the recycling horizon down for the life of the database, and the caller is holding
-    # nothing it could withdraw it with.
+    # Database.execute opens a transaction of its own. CE-2 keeps exactly one PARTICIPANT pin,
+    # not one leaked transaction pin per call; it advances on the configured cadence and close
+    # withdraws it. The public invariant here is still zero open transactions.
     with connect(tmp_path / "db", page_size=512) as db:
         with db.begin("write") as txn:
             txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
@@ -229,18 +229,18 @@ def test_an_autocommit_read_leaves_no_transaction_open(tmp_path: Path) -> None:
         for _ in range(5):
             db.execute("MATCH (p:Person) RETURN p.name")
         assert db.transactions.open_transactions == 0
-        assert db._coordinator.reader_horizon() is None
+        assert db._coordinator.reader_horizon() is not None
 
 
 def test_an_autocommit_read_that_fails_leaves_no_transaction_open(tmp_path: Path) -> None:
-    # The other arm. A failure is exactly when a caller cannot clean up after the door, because
-    # it never received anything to clean up with.
+    # The other arm. A failure is exactly when a caller cannot clean up a transaction it never
+    # received. The transaction is settled; CE-2's one manager-owned registration remains.
     with connect(tmp_path / "db", page_size=512) as db:
         for _ in range(5):
             with pytest.raises(GrafxError):
                 db.execute("THIS IS NOT A STATEMENT")
         assert db.transactions.open_transactions == 0
-        assert db._coordinator.reader_horizon() is None
+        assert db._coordinator.reader_horizon() is not None
 
 
 def test_an_interrupt_during_the_open_still_releases_the_device(tmp_path: Path) -> None:

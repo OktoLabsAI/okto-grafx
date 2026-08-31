@@ -33,6 +33,26 @@ def test_no_reader_means_no_horizon(make_coordinator: CoordinatorFactory) -> Non
     assert coordinator.reader_horizon() is None
 
 
+def test_clock_failure_precedes_reader_publication(
+    make_coordinator: CoordinatorFactory,
+    database_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Register cannot leave an own durable record behind without returning its handle."""
+    clock = ManualClock()
+    coordinator = make_coordinator(owner_id="p1-aaaa", clock=clock)
+    failure = RuntimeError("reader clock failed")
+
+    def fail() -> float:
+        raise failure
+
+    monkeypatch.setattr(clock, "monotonic", fail)
+    with pytest.raises(RuntimeError, match="reader clock failed"):
+        coordinator.register_reader(7)
+
+    assert reader_files(database_root) == []
+
+
 def test_the_horizon_is_the_minimum_over_live_readers(
     make_coordinator: CoordinatorFactory, database_root: Path
 ) -> None:

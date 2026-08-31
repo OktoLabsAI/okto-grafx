@@ -242,6 +242,12 @@ db = connect(sys.argv[1], wal_segment_bytes=65536)
 for identity in range(200, 230):
     with db.begin("write") as txn:
         txn.execute(f"CREATE (:P {{id: {identity}, name: 'b'}})")
+# CE-2 keeps one deferred reader registration per participant. This process has no open
+# transaction now, so a due explicit tick advances its standing pin to the published floor and
+# lets the other participant exercise REDO+recycle immediately rather than waiting the 15 s TTL.
+db._transactions.refresh_due_readers(
+    time.monotonic() + db._transactions.refresh_interval
+)
 print("COMMITTED", flush=True)
 time.sleep(60)   # hold the pages in memory; the test kills this process before it flushes
 '''

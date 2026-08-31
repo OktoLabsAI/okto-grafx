@@ -246,7 +246,8 @@ def test_a_settled_fake_is_not_mistaken_for_an_idempotent_real_rollback(
 
     assert raised.value.details["reason"] == "transaction_capability_mismatch"
     assert manager.open_transactions == 0
-    assert stack.coordinator.reader_horizon() is None
+    # CE-2: the participant pin outlives the genuine transaction; a forged settle changes nothing.
+    assert stack.coordinator.reader_horizon() == genuine.snapshot.read_lsn
 
 
 def test_read_transactions_and_their_reader_pins_are_unchanged(stack: Stack) -> None:
@@ -260,7 +261,9 @@ def test_read_transactions_and_their_reader_pins_are_unchanged(stack: Stack) -> 
 
     assert report.csn == transaction.snapshot.read_lsn
     assert manager.open_transactions == 0
-    assert stack.coordinator.reader_horizon() is None
+    # CE-2 (E-CE2-1): commit settles against the PARTICIPANT registration and withdraws
+    # nothing; the pin persists until it advances or close() runs.
+    assert stack.coordinator.reader_horizon() == transaction.snapshot.read_lsn
 
 
 def test_writable_defaults_to_the_compatible_enabled_capability(stack: Stack) -> None:

@@ -300,6 +300,38 @@ class ReaderRegistration:
             )
         self._coordinator.refresh_reader(self._handle)
 
+    def advance(self, snapshot_lsn: Lsn) -> None:
+        """Move this registration's pin forward and prove it alive in the same publication.
+
+        CE-2's deferred participant pin: the registration outlives any one transaction, so the
+        position it holds against recycling must be able to FOLLOW the oldest open snapshot --
+        forward only. A regression is refused here rather than published, because a pin that
+        moves backward could re-cover segments the horizon already released (E-CE2-2; the C3
+        port's ``refresh_reader`` republishes at the handle's pin, which is what makes this one
+        write both the liveness proof and the new position).
+        """
+        if self._closed:
+            raise GrafxUnsupportedOperation(
+                "This reader registration was closed and cannot advance.",
+                reader_id=self._handle.reader_id,
+            )
+        pinned = _require_lsn("snapshot_lsn", snapshot_lsn)
+        if pinned < self._handle.snapshot_lsn:
+            raise GrafxUnsupportedOperation(
+                "A reader pin only ever advances; moving it backward could re-cover "
+                "segments the horizon already released.",
+                reader_id=self._handle.reader_id,
+                pinned=self._handle.snapshot_lsn,
+                requested=pinned,
+            )
+        advanced = ReaderHandle(reader_id=self._handle.reader_id, snapshot_lsn=pinned)
+        # Publish can fail after the coordinator has replaced the durable record. Retaining the
+        # old local handle in that uncertain outcome would let the next refresh regress a pin
+        # that may already be visible at ``pinned``. Move the local monotone state first; a retry
+        # can only republish the same safe position or advance it again.
+        self._handle = advanced
+        self._coordinator.refresh_reader(advanced)
+
     def close(self) -> None:
         """Withdraw the registration and release the snapshot it pinned. Repeating it is a no-op."""
         if self._closed:
