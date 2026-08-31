@@ -288,7 +288,9 @@
   snapshot global original; o fixture vetorial passou a declarar explicitamente seu teto
   sintético. A reprodução red-first falhou nos dois representantes, e depois toda a bateria
   vetorial/rebuild, 41 testes ST-7/staleness e 162 focados de buffer/index/vector passaram, com
-  Ruff e `diff --check`. O gate global final permanece obrigatório antes da promoção.
+  Ruff e `diff --check`. O gate global final do candidato corrigido coletou 10.831 casos,
+  atravessou novamente toda a cauda vetorial e terminou em 100%/exit `0`, sem falhas; esse é o
+  gate válido para promoção.
 - **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`
