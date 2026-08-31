@@ -291,6 +291,24 @@ for 90.00 s and has SHA-256
 Also measured there: index maintenance costs ~**6.6%** of total suite runtime (572 s → 610 s on an
 idle machine; an earlier draft said 52% and was measuring a concurrent agent, kept as a lesson).
 
+### Pending F1/CE-3 and M-PULSE-7 gates
+
+The M-PULSE-7 input ratchet is certified at Pulse Community
+`6595abdcfa788dfa2cc8da1a53ff96c378790531` (base
+`d44c82155e9884c556813ea96dec829be567c236`, branch
+`origin/milestone/grafx-mpulse7-ratchet-530df34`) and pins Grafx
+`d39e27435171574ab6f03bc1d17672b26bf163b2`. Its manifest physical/canonical SHA-256 values are
+`d1777bb26aee2feae5c8d5f4593840c08bdc37474ad6be4bdfe5334daedd0192` and
+`1e6e92fc3bae3b54d3052ca9055b7682a9d518927573e0ffcbfcbb4568cf9f93`; its corpus
+physical/logical SHA-256 values are
+`0997747ed8bb9172d05781a62e5f81e7694630b173aaa152ac9ea28daec9d13f` and
+`b29334edf6e7c1e6b9419a4f3add84ede4baad94fdeaecb0c679261a78f241cc`. The focused gate passed
+12/12 and independent audit passed 39/39.
+
+This ratchet authenticates inputs only. F1 is still under review and has no accepted commit. The
+binding order is **accepted F1 -> literal two-process CE-3 -> CE-3 disposition -> M-PULSE-7 10k**.
+No result exists yet for the 10,000-operation run.
+
 ---
 
 ## 6. Reproducing
