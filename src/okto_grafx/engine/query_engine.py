@@ -837,6 +837,7 @@ class QueryEngine:
         "_clock",
         "_skipped_indexes",
         "_working",
+        "_owner_memo",
         "_txn_effects",
         "_page_stager",
         "_max_statement_writes",
@@ -873,6 +874,12 @@ class QueryEngine:
         # leaks the copy until the process ends, which is memory, not a wrong answer -- txn ids
         # are never reused, so a stale entry can never be read.
         self._working: dict[int, Catalog] = {}
+        # Each open transaction's landing memo: the owner-visible rows of each node table it
+        # has resolved, keyed by txn id then table id, with the snapshot and fingerprint that
+        # vouch for the entry (see _owner_landing_view). Dropped by settle_schema exactly as
+        # the working catalog is, with the same shrug about a caller that never settles: txn
+        # ids are never reused, so a stale entry can never be read.
+        self._owner_memo: dict[int, dict[int, tuple[object, object, dict]]] = {}
         # Every out-of-transaction effect each open schema transaction has made -- indexes
         # registered, spaces attached, skip-report entries, index files created -- in the order
         # it made them. The rollback undo. Pruning by table id against the live catalog was
@@ -1381,6 +1388,7 @@ class QueryEngine:
         and replacing its reason would hide why the transaction was abandoned at all.
         """
         working = self._working.pop(txn_id, None)
+        self._owner_memo.pop(txn_id, None)  # the landing memo dies with its transaction
         effects = self._txn_effects.pop(txn_id, None)
         if committed or working is None:
             return
@@ -2140,7 +2148,7 @@ def _traverse(
         """Return the version of one node its owner can see, indexing each table once."""
         found = nodes_by_id.get(table.table_id)
         if found is None:
-            found = _owner_nodes(engine, context, table, ended)
+            found = _owner_landing_view(engine, context, table, ended)
             nodes_by_id[table.table_id] = found
         return found.get(identity)  # type: ignore[arg-type]
 
@@ -2263,7 +2271,7 @@ def _traverse_any(
         """Return the version of one node its owner can see, indexing each table once."""
         found = nodes_by_id.get(table.table_id)
         if found is None:
-            found = _owner_nodes(engine, context, table, ended)
+            found = _owner_landing_view(engine, context, table, ended)
             nodes_by_id[table.table_id] = found
         return found.get(identity)  # type: ignore[arg-type]
 
@@ -2350,7 +2358,7 @@ def _relationship_scan(
     def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
         found = nodes_by_id.get(table.table_id)
         if found is None:
-            found = _owner_nodes(engine, context, table, ended)
+            found = _owner_landing_view(engine, context, table, ended)
             nodes_by_id[table.table_id] = found
         return found.get(identity)
 
@@ -2387,7 +2395,10 @@ def _relationship_scan(
                 latest = changed[ref]
                 if latest is None:
                     continue
-                if latest[:ENDPOINT_COLUMN_COUNT] != version.values[:ENDPOINT_COLUMN_COUNT]:
+                if (
+                    latest[:ENDPOINT_COLUMN_COUNT]
+                    != version.values[:ENDPOINT_COLUMN_COUNT]
+                ):
                     raise GrafxTransactionStateError(
                         f"An update of relationship table {relationship.name!r} may change "
                         "properties but not its layout-owned endpoints.",
@@ -3768,6 +3779,72 @@ def _owner_nodes(
                 table_id=table.table_id,
             ),
         )
+    return found
+
+
+def _landing_fingerprint(context: _Context, table: TableDef) -> tuple:
+    """Summarise everything this transaction has said about one table's rows, by content.
+
+    The landing view of a table is a pure function of the snapshot, the schema, the row
+    intents the transaction has staged for that table, and the rows this statement holds but
+    has not yet handed over. Content, not counts: a savepoint rollback can truncate the intent
+    list back to a length it already had, and a second update of one row replaces values
+    without changing any length. Comparing the pieces themselves costs the size of this
+    transaction's writes to the table -- the scan the memo avoids costs the size of the table.
+    """
+    table_id = table.table_id
+    intents = tuple(
+        (intent.operation, intent.reference, intent.record_id, intent.values)
+        for intent in getattr(context.txn, "row_intents", ())
+        if getattr(getattr(intent, "table", None), "table_id", None) == table_id
+    )
+    held = tuple(
+        (row.operation, row.reference, row.identity, row.values, row.token)
+        for row in context.staged_rows
+        if row.table.table_id == table_id
+    )
+    return (table.schema_version, intents, held)
+
+
+def _owner_landing_view(
+    engine: QueryEngine,
+    context: _Context,
+    table: TableDef,
+    ended: frozenset[object] | set[object],
+) -> dict[object, tuple[object, HeapVersion]]:
+    """Return :func:`_owner_nodes` for this table, resolved once per transaction, not per statement.
+
+    The memo lives on the engine keyed by txn id and dies in ``settle_schema`` with the rest
+    of the transaction's bookkeeping. An entry answers again only while three things still
+    hold: the SAME snapshot object (a manager retry opens a successor view under the same
+    context), an equal :func:`_landing_fingerprint` (any write to this table changes it; a
+    write to another table does not), and implicitly the ``ended`` set -- which needs no slot
+    of its own, because the refs of this table inside ``ended`` are derived entirely from the
+    intents and held rows the fingerprint already covers, and refs of other tables can never
+    collide with this table's (a :class:`RecordRef` names a page of the one shared heap).
+
+    Two deliberate exclusions, decided in ST-6 and not to be revisited casually:
+    ``require_endpoints`` is NOT routed through here (the door checks visibility of a row the
+    caller names; the memo filters ``ended`` -- same table, different question) and neither is
+    ``_incident_edges`` (a DETACH DELETE invalidates its own view as it goes, so the memo
+    would rebuild per statement and pay its bookkeeping for nothing).
+
+    The memo's memory is engine working state, like the working catalog above it. It is NOT
+    metered by the admission budgets: ``max_transaction_rows``/``max_transaction_bytes`` and
+    the query row budgets meter what a transaction asks to write and to answer, and a
+    traversal that merely lands on a wide table asks for neither.
+    """
+    txn_id = getattr(context.txn, "txn_id", None)
+    if not isinstance(txn_id, int) or isinstance(txn_id, bool):
+        return _owner_nodes(engine, context, table, ended)
+    snapshot = context.snapshot
+    fingerprint = _landing_fingerprint(context, table)
+    memo = engine._owner_memo.setdefault(txn_id, {})
+    entry = memo.get(table.table_id)
+    if entry is not None and entry[0] is snapshot and entry[1] == fingerprint:
+        return entry[2]
+    found = _owner_nodes(engine, context, table, ended)
+    memo[table.table_id] = (snapshot, fingerprint, found)
     return found
 
 
