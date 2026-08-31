@@ -44,14 +44,20 @@ def _commit_row(database: Database, record_id: int, name: str, csn: int) -> obje
     """Insert a row and commit the index changes it owes."""
     txn = TransactionDouble(txn_id=record_id)
     ref = database.insert(record_id, name, csn)
-    database.manager.stage_row_insert(txn, database.table.table_id, ref, (record_id, name), csn)
+    database.manager.stage_row_insert(
+        txn, database.table.table_id, ref, (record_id, name), csn
+    )
     database.manager.commit(txn, csn)
     return ref
 
 
-def test_an_index_behind_the_published_position_is_marked_stale(database: Database) -> None:
+def test_an_index_behind_the_published_position_is_marked_stale(
+    database: Database,
+) -> None:
     _commit_row(database, 1, "Ada", BORN)
-    database.insert(2, "Grace", BORN + 5)  # committed heap row omitted from both indexes
+    database.insert(
+        2, "Grace", BORN + 5
+    )  # committed heap row omitted from both indexes
 
     stale = database.manager.open(BORN + 5)
 
@@ -60,7 +66,9 @@ def test_an_index_behind_the_published_position_is_marked_stale(database: Databa
     assert "published" in (database.exact.stale_reason or "")
 
 
-def test_an_index_level_with_the_published_position_is_not_stale(database: Database) -> None:
+def test_an_index_level_with_the_published_position_is_not_stale(
+    database: Database,
+) -> None:
     _commit_row(database, 1, "Ada", BORN)
 
     assert database.manager.open(BORN) == ()
@@ -99,7 +107,9 @@ def test_a_commit_to_another_table_does_not_rewrite_or_stale_this_index(
     ref = database.heap.insert(book, 1, (1, "Graph Databases"), ENDED)
     txn = TransactionDouble(txn_id=41)
     txn.row_intents = (SimpleNamespace(table=book),)
-    database.manager.stage_row_insert(txn, book.table_id, ref, (1, "Graph Databases"), ENDED)
+    database.manager.stage_row_insert(
+        txn, book.table_id, ref, (1, "Graph Databases"), ENDED
+    )
     database.manager.commit(txn, ENDED)
 
     assert database.device.raw_page(database.exact.file, 0) == exact_before
@@ -151,7 +161,9 @@ def test_a_local_table_write_that_omits_its_indexes_refuses_immediately(
             SnapshotDouble(ENDED),
         )
     assert refused.value.details["field"] == "stale"
-    assert header_on_device(database.device, database.exact.file).flags & INDEX_FLAG_STALE
+    assert (
+        header_on_device(database.device, database.exact.file).flags & INDEX_FLAG_STALE
+    )
 
 
 def test_a_foreign_live_reader_observes_a_durable_refusal_for_an_omitted_index(
@@ -175,7 +187,9 @@ def test_a_foreign_live_reader_observes_a_durable_refusal_for_an_omitted_index(
             SnapshotDouble(ENDED),
         )
     assert refused.value.details["field"] == "index_view_unavailable"
-    assert header_on_device(database.device, database.exact.file).flags & INDEX_FLAG_STALE
+    assert (
+        header_on_device(database.device, database.exact.file).flags & INDEX_FLAG_STALE
+    )
 
 
 def test_an_untouched_table_does_not_become_stale_at_a_later_replay_floor(
@@ -190,13 +204,19 @@ def test_an_index_ahead_of_the_published_position_is_marked_stale(
     database: Database,
 ) -> None:
     """A future watermark may belong to another database state and cannot be trusted."""
-    database.manager.mark_built_through(ENDED)
+    # ST-7: the manager's completion mark now leaves a header alone when it already covers its
+    # table, so the foreign-file scenario is built the way it actually happens -- the FILES
+    # claim the future position themselves.
+    database.exact.advance_built_through(ENDED)
+    database.proximity.advance_built_through(ENDED)
 
     stale = database.manager.open(BORN)
 
     assert {index.name for index in stale} == {"person_by_name", "person_near_name"}
     assert "ahead" in (database.exact.stale_reason or "")
-    assert header_on_device(database.device, database.exact.file).flags & INDEX_FLAG_STALE
+    assert (
+        header_on_device(database.device, database.exact.file).flags & INDEX_FLAG_STALE
+    )
 
 
 def test_checking_a_replay_floor_does_not_regress_the_published_position(
@@ -220,7 +240,9 @@ def test_a_stale_index_refuses_to_answer_rather_than_omitting_a_row(
     """The whole point: a short answer is a wrong answer that looks like an empty one."""
     ref = _commit_row(database, 1, "Ada", BORN)
     key = database.key(1, "Ada")
-    assert database.manager.lookup("person_by_name", key, SnapshotDouble(BORN)) == (ref,)
+    assert database.manager.lookup("person_by_name", key, SnapshotDouble(BORN)) == (
+        ref,
+    )
 
     database.insert(2, "Grace", BORN + 5)
     database.manager.open(BORN + 5)
@@ -247,7 +269,9 @@ def test_a_stale_index_still_accepts_the_changes_of_new_transactions(
 
     ref = _commit_row(database, 2, "Grace", BORN + 10)
 
-    assert (database.key(2, "Grace"), ref, False, 0, 0) in database.entries()["person_by_name"]
+    assert (database.key(2, "Grace"), ref, False, 0, 0) in database.entries()[
+        "person_by_name"
+    ]
 
 
 def test_a_stale_index_does_not_stop_looking_stale_by_seeing_a_newer_commit(
@@ -290,7 +314,9 @@ def test_a_rebuild_re_derives_every_entry_from_the_heap(database: Database) -> N
     database.manager.clear_stale("person_by_name", BORN)
 
     assert staged == 2, "one reset plus one insert"
-    assert database.manager.lookup("person_by_name", key, SnapshotDouble(BORN)) == (ref,)
+    assert database.manager.lookup("person_by_name", key, SnapshotDouble(BORN)) == (
+        ref,
+    )
     assert database.manager.verify("person_by_name") == ()
 
 
@@ -318,7 +344,9 @@ def test_a_repaired_index_stays_repaired_across_the_next_freshness_check(
     ) == (ref,)
 
 
-def test_a_rebuild_carries_the_stamps_of_every_stored_version(database: Database) -> None:
+def test_a_rebuild_carries_the_stamps_of_every_stored_version(
+    database: Database,
+) -> None:
     """A proximity index rebuilt from the heap must reproduce the tombstones too.
 
     Rebuilding only the live rows would leave an older snapshot with no entry for a row it can
@@ -334,7 +362,9 @@ def test_a_rebuild_carries_the_stamps_of_every_stored_version(database: Database
     database.manager.clear_stale("person_near_name", ENDED)
 
     key = database.key(1, "Ada")
-    assert database.manager.lookup("person_near_name", key, SnapshotDouble(ENDED - 1)) == (ref,)
+    assert database.manager.lookup(
+        "person_near_name", key, SnapshotDouble(ENDED - 1)
+    ) == (ref,)
     assert database.manager.lookup("person_near_name", key, SnapshotDouble(ENDED)) == ()
 
 
@@ -351,7 +381,9 @@ def test_a_rebuild_that_is_staged_and_never_committed_leaves_the_index_stale(
     assert database.exact.stale
     assert database.entries()["person_by_name"] == ()
     with pytest.raises(GrafxIndexError):
-        database.manager.lookup("person_by_name", database.key(1, "Ada"), SnapshotDouble(BORN))
+        database.manager.lookup(
+            "person_by_name", database.key(1, "Ada"), SnapshotDouble(BORN)
+        )
 
 
 def test_a_rebuild_replaces_what_the_index_held_rather_than_adding_to_it(
@@ -395,7 +427,10 @@ def test_declaring_a_replay_complete_keeps_an_untouched_index_out_of_a_rebuild(
     database.manager.mark_built_through(BORN + 40)
 
     assert database.manager.open(BORN + 40) == ()
-    assert database.exact.built_through_lsn == BORN + 40
+    # ST-7 (reopening R3-do-plano): the header already covers its table, which is the
+    # strongest position open() ever requires, so the declaration no longer rewrites it to
+    # the global number -- the index stays out of a rebuild either way.
+    assert database.exact.built_through_lsn == BORN
 
 
 def test_a_file_written_under_another_definition_is_refused_and_not_rebuilt(
@@ -429,13 +464,17 @@ def test_the_position_an_index_claims_never_moves_backwards(database: Database) 
     """
     ref = database.insert(1, "Ada", BORN)
     late = TransactionDouble(txn_id=3)
-    database.manager.stage_row_insert(late, database.table.table_id, ref, (1, "Ada"), BORN)
+    database.manager.stage_row_insert(
+        late, database.table.table_id, ref, (1, "Ada"), BORN
+    )
     database.manager.commit(late, 100)
     assert database.exact.built_through_lsn == 100
 
     early = TransactionDouble(txn_id=4)
     second = database.insert(2, "Grace", BORN)
-    database.manager.stage_row_insert(early, database.table.table_id, second, (2, "Grace"), BORN)
+    database.manager.stage_row_insert(
+        early, database.table.table_id, second, (2, "Grace"), BORN
+    )
     for position, record in enumerate(early.staged):
         database.manager.apply(record.with_lsn(50 + position))
 
@@ -463,7 +502,9 @@ def test_a_header_keeps_the_higher_of_the_two_positions_it_is_offered() -> None:
     assert header.reconciled_to(101).reconciled_through_lsn == 101
 
 
-def test_a_freshness_check_refuses_a_position_that_is_not_one(database: Database) -> None:
+def test_a_freshness_check_refuses_a_position_that_is_not_one(
+    database: Database,
+) -> None:
     with pytest.raises(GrafxIndexError) as refused:
         database.exact.check_freshness(-1)
 
@@ -493,7 +534,9 @@ def test_the_stale_flag_reaches_the_device_and_not_only_the_page_cache(
         )
 
 
-def test_another_participant_reads_the_refusal_off_the_device(database: Database) -> None:
+def test_another_participant_reads_the_refusal_off_the_device(
+    database: Database,
+) -> None:
     """The same property as the consequence a second process meets, through a cold cache."""
     ref = _commit_row(database, 1, "Ada", BORN)
     database.insert(2, "Grace", BORN + 5)
@@ -503,7 +546,9 @@ def test_another_participant_reads_the_refusal_off_the_device(database: Database
 
     assert other.exact.stale
     with pytest.raises(GrafxIndexError) as refused:
-        other.manager.lookup("person_by_name", database.key(1, "Ada"), SnapshotDouble(BORN))
+        other.manager.lookup(
+            "person_by_name", database.key(1, "Ada"), SnapshotDouble(BORN)
+        )
     assert refused.value.details["field"] == "stale"
     assert ref is not None
 
@@ -545,7 +590,9 @@ def test_a_crash_after_the_mark_does_not_let_a_complete_replay_declare_it_fresh(
     survivor.manager.mark_built_through(BORN + 30)
 
     assert recovered in survivor.manager.open(BORN + 30)
-    assert recovered.built_through_lsn == 0, "a stale index may not move the position it claims"
+    assert recovered.built_through_lsn == 0, (
+        "a stale index may not move the position it claims"
+    )
     with pytest.raises(GrafxIndexError) as refused:
         survivor.manager.lookup("person_by_name_late", key, SnapshotDouble(BORN + 30))
     assert refused.value.details["field"] == "stale"
@@ -571,7 +618,9 @@ def test_a_crash_after_marking_stale_by_hand_does_not_answer_a_short_set(
     # The freshness check is given a position the index already claims, so nothing here can
     # re-derive the verdict: the only thing that can refuse is the mark on the device.
     assert survivor.manager.open(BORN) == (survivor.exact,)
-    assert len(survivor.exact.walk()) == 1, "the index really is one entry short of the heap"
+    assert len(survivor.exact.walk()) == 1, (
+        "the index really is one entry short of the heap"
+    )
     with pytest.raises(GrafxIndexError) as refused:
         survivor.manager.lookup("person_by_name", key, SnapshotDouble(BORN + 5))
     assert refused.value.details["field"] == "stale"
@@ -586,7 +635,9 @@ def test_clearing_the_mark_reaches_the_device_too(database: Database) -> None:
     """
     _commit_row(database, 1, "Ada", BORN)
     database.exact.mark_stale("operator-declared test refusal")
-    assert header_on_device(database.device, database.exact.file).flags & INDEX_FLAG_STALE
+    assert (
+        header_on_device(database.device, database.exact.file).flags & INDEX_FLAG_STALE
+    )
 
     database.manager.clear_stale("person_by_name", BORN)
 
@@ -603,7 +654,13 @@ def test_a_completed_replay_is_recorded_on_the_device(database: Database) -> Non
 
     database.manager.mark_built_through(BORN + 30)
 
-    assert header_on_device(database.device, database.exact.file).built_through_lsn == BORN + 30
+    # ST-7: the declaration reaches the device exactly when an index NEEDS it -- pinned by
+    # test_an_index_behind_its_table_still_advances_to_a_durable_header. A header already
+    # covering its table is left as the commit flushed it, and a cold participant still
+    # accepts it, because open() requires the table's high water, never a global number.
+    assert (
+        header_on_device(database.device, database.exact.file).built_through_lsn == BORN
+    )
     other = cold_view(database)
     assert other.manager.open(BORN + 30) == ()
 
@@ -620,7 +677,9 @@ def test_a_reconciliation_horizon_reaches_the_device_so_verify_does_not_cry_wolf
     """
     ref = _commit_row(database, 1, "Ada", BORN)
     ending = TransactionDouble(txn_id=2)
-    database.manager.stage_row_delete(ending, database.table.table_id, ref, (1, "Ada"), ENDED)
+    database.manager.stage_row_delete(
+        ending, database.table.table_id, ref, (1, "Ada"), ENDED
+    )
     database.manager.commit(ending, ENDED)
     database.heap.delete(database.table, ref, ENDED)
     pass_txn = TransactionDouble(txn_id=3)
@@ -635,7 +694,9 @@ def test_a_reconciliation_horizon_reaches_the_device_so_verify_does_not_cry_wolf
     assert other.manager.verify("person_near_name") == ()
 
 
-def test_clearing_the_stale_flag_lets_the_index_answer_again(database: Database) -> None:
+def test_clearing_the_stale_flag_lets_the_index_answer_again(
+    database: Database,
+) -> None:
     ref = _commit_row(database, 1, "Ada", BORN)
     database.exact.mark_stale("operator-declared test refusal")
 
@@ -704,4 +765,7 @@ def test_marking_an_index_stale_needs_a_reason_a_reader_can_act_on(
         assert refused.value.details["field"] == "reason"
 
     assert not database.exact.stale
-    assert not header_on_device(database.device, database.exact.file).flags & INDEX_FLAG_STALE
+    assert (
+        not header_on_device(database.device, database.exact.file).flags
+        & INDEX_FLAG_STALE
+    )

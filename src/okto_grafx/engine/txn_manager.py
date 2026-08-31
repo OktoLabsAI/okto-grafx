@@ -1396,15 +1396,19 @@ class TransactionManager:
             self._index_sync()
 
         manager = self._index_manager
+        watermarks = None
         if manager is not None:
             # Only after lineage is proven and foreign schema is adopted may this conservative
-            # verdict write a stale flag for every now-known persistent index.
-            manager.check_replay_floor(checkpoint)
+            # verdict write a stale flag for every now-known persistent index. Heap pages are
+            # already applied and index replay never moves them, so one photo serves this pass
+            # and the completion mark below (ST-7).
+            watermarks = manager.table_watermark_photo()
+            manager.check_replay_floor(checkpoint, watermarks=watermarks)
         index_result = self._commit_redo.apply(index_replay)
         self._commit_redo.flush(page_result)
         self._commit_redo.flush(index_result)
         if manager is not None and replay.last_committed_lsn > NO_LSN:
-            manager.mark_built_through(replay.last_committed_lsn)
+            manager.mark_built_through(replay.last_committed_lsn, watermarks=watermarks)
         return page_result.effects_replayed + index_result.effects_replayed
 
     def close(self) -> None:
