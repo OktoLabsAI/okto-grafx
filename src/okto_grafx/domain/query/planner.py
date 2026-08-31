@@ -119,6 +119,7 @@ from okto_grafx.domain.query.plan import (
     SkipRows,
     SortRows,
     TraverseAnyRelationship,
+    RelationshipScan,
     TraverseRelationship,
     UnionRows,
     UnwindRows,
@@ -2132,6 +2133,9 @@ class _Planner:
         self, pipeline: PlanNode, pattern: PatternPath, terms: list[Expression]
     ) -> tuple[PlanNode, list[Expression]]:
         """Plan one connected path, taking index seeks from the predicate where it can."""
+        fast = self._single_hop_fast_path(pipeline, pattern, terms)
+        if fast is not None:
+            return fast
         first = pattern.nodes[0]
         inferred: TableDef | None = None
         if pattern.relationships and not first.labels:
@@ -2589,6 +2593,16 @@ class _Planner:
             target_table = self.tables[named]
         elif target_table is not None:
             self.tables[target_variable] = target_table
+        if (
+            relationship.min_hops == 1
+            and relationship.max_hops == 1
+            and target_table is not None
+            and (target_pattern.labels or already_bound)
+        ):
+            # ST-1 (a): both ends of a single typed hop are declared by the relationship.
+            # The source has always been validated above; a labelled or bound TARGET that
+            # cannot be that table's landing used to plan fine and match nothing.
+            self._require_landing(target_table, table, relationship.direction)
         return (
             TraverseRelationship(
                 child=pipeline,
@@ -2604,6 +2618,187 @@ class _Planner:
                 path_variable=path_variable,
             ),
             target_variable,
+        )
+
+    def _require_landing(
+        self, landing: TableDef, table: TableDef, direction: Direction
+    ) -> None:
+        """Refuse a single hop whose far end cannot be an endpoint of that relationship."""
+        if direction is Direction.OUTGOING:
+            allowed: tuple[str, ...] = (str(table.to_table),)
+        elif direction is Direction.INCOMING:
+            allowed = (str(table.from_table),)
+        else:
+            allowed = (str(table.from_table), str(table.to_table))
+        if landing.name not in allowed:
+            raise GrafxPlanError(
+                f"A {table.name!r} relationship written this way lands at "
+                f"{' or '.join(allowed)}, and the target is bound to {landing.name!r}, so "
+                "this pattern can match nothing.",
+                field="to_table",
+                value=landing.name,
+            )
+
+    def _single_hop_fast_path(
+        self, pipeline: PlanNode, pattern: PatternPath, terms: list[Expression]
+    ) -> tuple[PlanNode, list[Expression]] | None:
+        """Plan one directed typed single hop from its cheap side (ST-1), or return None.
+
+        Two shapes, tried in order and only when today's plan would start with a scan: a
+        seekable TARGET mirrors the hop so the seek drives it, and a hop whose residual
+        predicate reads only the relationship becomes one RelationshipScan. Every guard
+        below is an early-out to the unchanged path -- multi-hop, undirected, untyped,
+        projected paths, bound ends, inline relationship maps and label-free sources all
+        keep exactly the plan they had.
+        """
+        if len(pattern.relationships) != 1 or len(pattern.nodes) != 2:
+            return None
+        if pattern.variable is not None:
+            # A named path -- projected or merely decorative -- keeps today's traversal
+            # shape; the frozen path form and its refusals are not this fast path's to touch.
+            return None
+        relationship = pattern.relationships[0]
+        if len(relationship.types) != 1:
+            return None
+        if (
+            relationship.min_hops != 1
+            or relationship.max_hops != 1
+            or relationship.hop_range_written
+            or relationship.direction is Direction.UNDIRECTED
+            or relationship.properties is not None
+        ):
+            return None
+        first, target = pattern.nodes[0], pattern.nodes[1]
+        if not first.labels:
+            return None
+        if first.variable is not None and first.variable in self.tables:
+            return None
+        if target.variable is not None and target.variable in self.tables:
+            return None
+        table = self._relationship_table(relationship)
+        if relationship.direction is Direction.OUTGOING:
+            near_name, far_name = str(table.from_table), str(table.to_table)
+        else:
+            near_name, far_name = str(table.to_table), str(table.from_table)
+        first_table = self._node_table_of(first)
+        target_table = (
+            self._node_table_of(target)
+            if target.labels
+            else self._table_named(far_name, "to_table")
+        )
+        # ST-1 (a): both ends of a typed hop are declared by the relationship. Validate them
+        # before choosing a side, so a wrong end refuses instead of matching nothing.
+        if first_table.name != near_name:
+            raise GrafxPlanError(
+                f"A {table.name!r} relationship written this way starts at {near_name}, and "
+                f"{first.variable or first.describe()!r} is bound to {first_table.name!r}, "
+                "so this pattern can match nothing.",
+                field="from_table",
+                value=first_table.name,
+            )
+        mirrored_direction = (
+            Direction.INCOMING
+            if relationship.direction is Direction.OUTGOING
+            else Direction.OUTGOING
+        )
+        self._require_landing(target_table, table, relationship.direction)
+        if self._dry_seek(first, first_table, terms):
+            return None  # today's shape already drives from the seekable source
+        if target.variable is not None and self._dry_seek(target, target_table, terms):
+            pipeline, terms, source = self._match_node(
+                pipeline, target, terms, standalone=False, inferred_table=target_table
+            )
+            mirrored = replace(relationship, direction=mirrored_direction)
+            pipeline, landing = self._traverse(pipeline, source, mirrored, first)
+            if first.properties is not None:
+                terms = terms + list(self._property_terms(landing, first.properties))
+            return pipeline, terms
+        return self._relationship_scan_shape(
+            pipeline,
+            terms,
+            relationship,
+            first,
+            target,
+            table,
+            first_table,
+            target_table,
+        )
+
+    def _dry_seek(
+        self, node_pattern: NodePattern, table: TableDef, terms: list[Expression]
+    ) -> bool:
+        """Whether an index seek would answer this node's equalities, consuming nothing."""
+        if node_pattern.variable is None:
+            return False
+        candidates = list(terms)
+        if node_pattern.properties is not None:
+            candidates += list(
+                self._property_terms(node_pattern.variable, node_pattern.properties)
+            )
+        constrained: list[str] = []
+        for term in candidates:
+            binding = self._equality_on(term, node_pattern.variable, table)
+            if binding is not None and binding[0] not in constrained:
+                constrained.append(binding[0])
+        if not constrained:
+            return False
+        return self._index_for(table, tuple(constrained)) is not None
+
+    def _relationship_scan_shape(
+        self,
+        pipeline: PlanNode,
+        terms: list[Expression],
+        relationship: RelationshipPattern,
+        first: NodePattern,
+        target: NodePattern,
+        table: TableDef,
+        first_table: TableDef,
+        target_table: TableDef,
+    ) -> tuple[PlanNode, list[Expression]] | None:
+        """Scan the relationship once when the residual predicate reads only it (ST-1 b)."""
+        if first.properties is not None or target.properties is not None:
+            return None
+        first_variable = first.variable or self._anonymous()
+        target_variable = target.variable or self._anonymous()
+        r_variable = relationship.variable
+        r_only: list[Expression] = []
+        rest: list[Expression] = []
+        for term in terms:
+            names = {leaf.name for leaf in walk(term) if isinstance(leaf, Variable)}
+            if names & {first_variable, target_variable}:
+                return (
+                    None  # an endpoint is part of the predicate: keep today's traversal
+                )
+            if r_variable is not None and names == {r_variable}:
+                r_only.append(term)
+            else:
+                rest.append(term)
+        if not r_only:
+            # The scan earns its keep by judging the r-only predicate before any endpoint is
+            # resolved; a hop with no such predicate keeps the traversal it always had.
+            return None
+        self.tables[first_variable] = first_table
+        self.tables[target_variable] = target_table
+        if r_variable is not None:
+            self.tables[r_variable] = table
+        if relationship.direction is Direction.OUTGOING:
+            from_variable, to_variable = first_variable, target_variable
+            from_table_def, to_table_def = first_table, target_table
+        else:
+            from_variable, to_variable = target_variable, first_variable
+            from_table_def, to_table_def = target_table, first_table
+        return (
+            RelationshipScan(
+                child=pipeline,
+                from_variable=from_variable,
+                to_variable=to_variable,
+                relationship=r_variable,
+                table=table,
+                from_table=from_table_def,
+                to_table=to_table_def,
+                predicate=_conjoin(r_only),
+            ),
+            rest,
         )
 
     def _require_path_projection_schema(self, table: TableDef) -> None:

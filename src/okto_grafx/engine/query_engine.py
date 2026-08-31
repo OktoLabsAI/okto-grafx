@@ -147,6 +147,7 @@ from okto_grafx.domain.query.plan import (
     ProduceResults,
     ProjectRows,
     PropertyAssignment,
+    RelationshipScan,
     SetProperties,
     SingleRow,
     SkipRows,
@@ -2071,6 +2072,11 @@ def _planned_table_for_variable(root: PlanNode, variable: str) -> TableDef | Non
             and planned.target_table is not None
         ):
             return planned.target_table
+        if isinstance(planned, RelationshipScan):
+            if planned.from_variable == variable:
+                return planned.from_table
+            if planned.to_variable == variable:
+                return planned.to_table
     return None
 
 
@@ -2318,6 +2324,132 @@ def _traverse_any(
                 yield _Row(
                     bindings=bindings, computed=row.computed, columns=row.columns
                 )
+
+
+def _relationship_scan(
+    engine: QueryEngine, node: RelationshipScan, context: _Context
+) -> Iterator[_Row]:
+    """Scan one relationship table once and bind both endpoints of each surviving edge.
+
+    ST-1 (b). The rules are the traversal's, applied edge-first: the owner overlay folds this
+    transaction's replaced pictures and pending edges in, an edge this transaction ended never
+    matches, the r-only predicate is judged exactly as FilterRows judges one (false and unknown
+    drop the row, a non-boolean refuses), and an edge counts only when BOTH its endpoints are
+    visible under the snapshot -- resolved only for the rows the predicate kept. Every emitted
+    row passes the same single admission point every scan uses.
+    """
+    relationship = node.table
+    dirty_tables = _intent_table_ids(context.txn)
+    changed: Mapping[object, tuple[Value, ...] | None] = {}
+    pending: tuple[tuple[object, HeapVersion], ...] = ()
+    if relationship.table_id in dirty_tables:
+        changed, pending = _owner_edges(context, relationship)
+    ended = _ended_by_this_transaction(context)
+    nodes_by_id: dict[int, dict[object, tuple[object, HeapVersion]]] = {}
+
+    def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
+        found = nodes_by_id.get(table.table_id)
+        if found is None:
+            found = _owner_nodes(engine, context, table, ended)
+            nodes_by_id[table.table_id] = found
+        return found.get(identity)
+
+    def judged(version: HeapVersion, ref: object) -> RowBinding | None:
+        """Return the edge binding when the predicate keeps this edge, refusing non-booleans."""
+        edge = RowBinding(
+            variable=node.relationship or "",
+            table=relationship,
+            ref=ref,
+            version=version,
+        )
+        if node.predicate is None:
+            return edge
+        probe = _Row(bindings={node.relationship or "": edge})
+        value = _evaluate(node.predicate, probe, context)
+        if value is None:
+            return None
+        if not isinstance(value, bool):
+            raise GrafxPlanError(
+                "A WHERE predicate is a condition, not a value; "
+                f"{node.predicate.describe()} produced {type(value).__name__}.",
+                field="predicate",
+                value=type(value).__name__,
+            )
+        return edge if value else None
+
+    single_child = isinstance(node.child, SingleRow)
+    for row in engine._rows(node.child, context):
+        context.count("edge_scans")
+        for ref, version in engine.heap.scan(relationship, context.snapshot):
+            if ref in ended:
+                continue
+            if ref in changed:
+                latest = changed[ref]
+                if latest is None:
+                    continue
+                if latest[:ENDPOINT_COLUMN_COUNT] != version.values[:ENDPOINT_COLUMN_COUNT]:
+                    raise GrafxTransactionStateError(
+                        f"An update of relationship table {relationship.name!r} may change "
+                        "properties but not its layout-owned endpoints.",
+                        field="endpoints",
+                        table=relationship.name,
+                        table_id=relationship.table_id,
+                        operation="relationship_update",
+                    )
+                version = replace(version, values=latest)
+            edge = judged(version, ref)
+            if edge is None:
+                continue
+            landing_from = node_at(node.from_table, version.values[0])
+            if landing_from is None:
+                continue
+            landing_to = node_at(node.to_table, version.values[1])
+            if landing_to is None:
+                continue
+            bindings = {} if single_child else dict(row.bindings)
+            bindings[node.from_variable] = RowBinding(
+                variable=node.from_variable,
+                table=node.from_table,
+                ref=landing_from[0],
+                version=landing_from[1],
+            )
+            bindings[node.to_variable] = RowBinding(
+                variable=node.to_variable,
+                table=node.to_table,
+                ref=landing_to[0],
+                version=landing_to[1],
+            )
+            if node.relationship is not None:
+                bindings[node.relationship] = edge
+            context.count("rows_scanned")
+            yield _Row(bindings=bindings)
+        for reference, version in pending:
+            edge = judged(version, reference)
+            if edge is None:
+                continue
+            landing_from = node_at(node.from_table, version.values[0])
+            if landing_from is None:
+                continue
+            landing_to = node_at(node.to_table, version.values[1])
+            if landing_to is None:
+                continue
+            bindings = {} if single_child else dict(row.bindings)
+            bindings[node.from_variable] = RowBinding(
+                variable=node.from_variable,
+                table=node.from_table,
+                ref=landing_from[0],
+                version=landing_from[1],
+            )
+            bindings[node.to_variable] = RowBinding(
+                variable=node.to_variable,
+                table=node.to_table,
+                ref=landing_to[0],
+                version=landing_to[1],
+            )
+            if node.relationship is not None:
+                bindings[node.relationship] = edge
+            context.count("rows_scanned")
+            yield _Row(bindings=bindings)
 
 
 def _filter_rows(
@@ -4018,6 +4150,7 @@ _HANDLERS: dict[type, _Handler] = {
     IndexSeek: _index_seek,  # type: ignore[dict-item]
     TraverseAnyRelationship: _traverse_any,  # type: ignore[dict-item]
     TraverseRelationship: _traverse,  # type: ignore[dict-item]
+    RelationshipScan: _relationship_scan,  # type: ignore[dict-item]
     FilterRows: _filter_rows,  # type: ignore[dict-item]
     VectorSearch: _vector_search,  # type: ignore[dict-item]
     AggregateRows: _aggregate_rows,  # type: ignore[dict-item]
