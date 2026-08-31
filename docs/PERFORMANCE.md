@@ -305,8 +305,12 @@ physical/logical SHA-256 values are
 `b29334edf6e7c1e6b9419a4f3add84ede4baad94fdeaecb0c679261a78f241cc`. The focused gate passed
 12/12 and independent audit passed 39/39.
 
-This ratchet authenticates inputs only. F1 is still under review and has no accepted commit. The
-binding order is **accepted F1 -> literal two-process CE-3 -> CE-3 disposition -> M-PULSE-7 10k**.
+This ratchet authenticates inputs only. The F1 instrument is now accepted: author object
+`d87a0c6520683b2d22929165136f718d14a1d795`, squashed and published at
+`main@2b8e9006218b9ccf013d914dfe98e32abaa5bdd3`. Its focused suite passed 61/61, static checks were
+clean, and an independent read-only audit confirmed the frozen guards plus the exact 312-cell
+matrix expansion. The official long matrix has **not** run, so F1 publishes no performance result.
+The remaining binding order is **literal two-process CE-3 -> CE-3 disposition -> M-PULSE-7 10k**.
 No result exists yet for the 10,000-operation run.
 
 ---
