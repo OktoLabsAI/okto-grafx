@@ -380,8 +380,9 @@
   **3,00x**. O smoke histórico inalterado de 4 writers + 3 readers passou em `46,6 s`, com 500/500
   rows, 10,7 rows/s, leitura pontual `3,16/12,97 ms` mediana/p99, 173,9 statements/s e zero perda,
   duplicação, phantom, leitura rasgada, escape ou finding. Documento de decisão e reprodução:
-  `docs/architecture/CE2_READER_PARTICIPANT_PIN.md`. ST-2 e CN-1 continuam bloqueados sem
-  autorização do usuário; não são parte da CE-2 nem condição retroativa deste gate.
+  `docs/architecture/CE2_READER_PARTICIPANT_PIN.md`. Naquele checkpoint, ST-2 e CN-1 ainda estavam
+  bloqueados sem autorização; não eram parte da CE-2 nem condição retroativa daquele gate. A
+  autorização posterior e estritamente delimitada de CN-1 está registrada no resultado CE-3 abaixo.
 - **M-7 WAL-only re-medido e aprovado; seu escopo não foi inflado.** Em `origin/main@530df34`, o
   runner D5 congelado (`30` amostras, `5` warm-ups, `2.000` registros, LadybugDB `0.16.0`, CRC
   puro e source pin explícito) mediu abertura/replay Grafx em `232,351 ms` contra `123,633 ms` no
@@ -400,8 +401,9 @@
   verdes; auditoria independente PASS confirmou os seis guards congelados e a expansão pura dos
   eixos em **312 células**. O instrumento exige exatamente N+M métricas reais, oráculos live/cold/
   serial com cobertura, janela long oficial de 60 s, mesma base pós-bootstrap e provenance source+
-  script recapturada/fail-closed. A matriz oficial longa ainda não foi executada e esses testes não
-  constituem resultado de performance. `600d17b`, `1eec9e4` e os demais commits intermediários
+  script recapturada/fail-closed. Naquele checkpoint, a matriz oficial longa ainda não havia sido
+  executada; sua execução posterior está registrada no item seguinte. `600d17b`, `1eec9e4` e os
+  demais commits intermediários
   permanecem apenas históricos; o squash aceito é `2b8e900`. O instrumento CE-3 literal também foi
   concluído no objeto auditado `da7f5e41e851a4cb8bc14c404b2f19df3ec9efc7` e integrado/publicado em
   `main@4f6201a1e2f520bfe747a9636af10b036984732d`. A raiz reproduziu **70/70** testes focados e o
@@ -410,13 +412,43 @@
   `ce3-checkonly-da7f5e4/ce3-check-only.json`, SHA-256
   `c2a643652caf6bd83748624f5a2808396c40c1467ae39bc190e9021242be1324`, com único shortfall esperado
   `check_only_has_no_measurements`. Isso certifica o instrumento, não um resultado. A ordem
-  vinculante restante é **medição oficial CE-3 -> decisão CE-3 -> M-PULSE-7 10k**.
+  vinculante naquele checkpoint era **medição oficial CE-3 -> decisão CE-3 -> M-PULSE-7 10k**; o
+  resultado oficial e a decisão finita estão registrados abaixo.
   Os instrumentos atuais de 4 writers + 3 readers e reader-pin são apenas evidência parcial. NT-1
   permanece condicional/bloqueado até o gate skip-decode e a decisão RC8-B. Nenhuma mudança que
   estreite multi-writer/multi-reader foi iniciada. O inventário residual corrigido foi concluído e
   verificado/PASS no Nexus `hof_ec7f56977c2a4a1593ab9753406ba6b2`; o relatório
   `PERF-RESIDUAL-POS-CE2.md` tem SHA-256
   `ffd7298831fdaaf3066eda99b869de2581e178937a2eed273752017ee7272fb4`.
+- **CE-3 oficial isolou falso compartilhamento físico na heap page 0; CN-1 foi autorizado e é o
+  próximo gate finito.** No candidato Grafx `c2ca648b3388dbc969fccac7b35a85c84111a44f`, o artefato
+  `D:\Projetos\Techridy\grafx-ce3-official-c2ca648\ce3-official.json` tem SHA-256
+  `319ac5a3966c7fd096bdab8800e37e6beb4ea8e0a255db719f981b5a3c1f71af`. `RAW/idle-0` e
+  `RAW/same-1` passaram; `RAW/same-10` falhou fail-fast na operação A 19/60, a quarta
+  `replace_node_payload(Criterion)`, após 60 conflitos OCC tipados antes da durabilidade. Em paralelo,
+  B concluiu 864/864 `create_node(Decision)`, recuperou 13 conflitos e não esgotou retry. A partição
+  final `18446744071110879591` é exatamente `page_partition("heap.dat", 0)`: extents de tabelas
+  logicamente distintas compartilham o contador `next_record_id` da página física 0 e, portanto,
+  conflitam no grão de página. `verify("all")` terminou estruturalmente limpo. O observador lógico
+  recusou a duplicidade deliberada do estado intermediário da fixture porque A parou antes das
+  operações de limpeza 51–55; isso não é corrupção, perda, phantom nem vazamento de retry.
+  A correção instrumental v3 está em `d80b438a4544ebb08be513739edfc3734cdd898e`: sempre preserva
+  `verify("all")`, só aplica o fingerprint do perfil completo quando as 60 operações e suas
+  pós-condições foram certificadas, representa amostras ausentes como progresso desconhecido e
+  mantém cenários incompletos fail-closed. O gate focado passou 165/165, Ruff e `diff --check`
+  passaram, e a revisão Nexus `hof_655c090ee6f547d98e249aeff95c367f` foi concluída/verificada/PASS.
+  Ele não altera taxa, workload, tolerância ou política de retry.
+
+  O usuário autorizou CN-1 com a resposta explícita `aceito. pode seguir`, registrada na sessão
+  Claude `9699f9ef-9534-43db-9888-7031689e86f5`, mensagem Nexus
+  `msg_a4a139748d0942f3a6df40cb23af0ed1` e trace
+  `trc_38e40d10c9ec412fa45eb1b449c7e26e`. A autorização cobre somente identity-range leasing que
+  preserve multi-writer/multi-reader e heap/WAL v1: reserva durable-before-use por
+  `WRITE_PAGE+COMMIT`, imagem COW da page 0, cursor local burn-only, refill concorrente protegido por
+  OCC, descarte de sobra em close/restart/fork e IDs explícitos fail-closed. Não autoriza ST-2,
+  single-writer, group commit, relaxamento de consistência ou a proposta expansiva heap/WAL v2 de
+  `IDENTITY-LEASING-V7.md`. O próximo gate é implementar e provar esse recorte, repetir primeiro
+  `RAW/same-10` e somente então repetir a matriz CE-3 completa e o M-PULSE-7 10k.
 - **O ratchet de entrada do M-PULSE-7 está certificado; ele não é o run de 10.000 operações.** No
   Community `6595abdcfa788dfa2cc8da1a53ff96c378790531` (base
   `d44c82155e9884c556813ea96dec829be567c236`, branch
@@ -1177,6 +1209,18 @@ móvel do gate de compatibilidade.
 Todo insert avança `next_record_id`, fazendo writers disjuntos conflitarem na página 0. A medição oficial registra 10,9 rows/s, 254 conflitos e caudas de segundos em [`PERFORMANCE.md`](docs/PERFORMANCE.md#L62).
 
 O registro W6 recomenda corretamente identity-range leasing em [`W6-WRITE-CEILING.md`](docs/architecture/W6-WRITE-CEILING.md#L19).
+
+**Estado em 2026-08-31:** CN-1 está autorizado e em execução após CE-3 provar a colisão em
+`page_partition("heap.dat", 0)`. O recorte aprovado mantém o formato heap/WAL v1 e a concorrência
+multi-writer/multi-reader. Cada refill reserva e avança duravelmente o piso da extensão por uma
+transação interna COW normal antes de qualquer ID ser entregue; o participante consome localmente o
+intervalo de forma monotônica/burn-only e nunca devolve IDs após conflito, aborto, crash, close ou
+fork. Refill stale perde por OCC e reconstrói a partir da page 0 fresca. Commits que consomem um ID
+já reservado deixam de declarar page 0 sem tê-la modificado; refill e crescimento de tail continuam
+declarando-a. IDs explícitos abaixo do piso durável são recusados enquanto leasing estiver ativo, e
+IDs explícitos acima do piso exigem avanço durável antes do uso. O knob planejado é
+`identity_lease_size`, com fallback operacional `1`; o default definitivo deve ser congelado pelos
+testes de compatibilidade e concorrência, sem ampliar este recorte.
 
 Sequência recomendada:
 
@@ -2371,7 +2415,8 @@ nenhum resultado delegado é integrado sem validação final do Codex e sem o ga
 | M-PULSE-6 — fundação, resolver, pinning e primeiro lote roteado | checkpoint histórico concluído; supersedido pelo fechamento abaixo | Pulse Community `origin/milestone/grafx-mpulse6-integration@c524813`; commits integrados `00247fc..c524813`; resolver `559647b` + hardening P0 `6d0dc2` (origem revisada `b346ddc`); pool/pinning `fb21702` + correção terminal `8f54dc1`; Board facades `789c07c`, directory quarantine/restore `0092e6b` + inventário terminal `87641f3`, recovery offline `3231eba`, `init` neutro `03e96da`, transação roteada `f154cb9`, pin `okto-grafx[accel]==0.0.1` em `fb18d53`, lifecycle `171c6d2` e handshake `c524813`; Core inicial `8d2dbcb`; engine LIMIT originado em `b3fd6e4` e integrado em Grafx `main@1bbb839` | Board store/Cypher/schema/runtime/transação/lifecycle têm facades explícitas com snapshot imutável e revalidação física; o lifecycle não cria binding implicitamente e passou regressão independente 130/130. O manifesto Core/Community reconhece `logical_transfer`, eliminando os bridges do baseline. Quarantine/restore autentica a geração completa. Os gaps então abertos de Global, composição, provenance, conformance e regressão longa foram fechados no marco seguinte. O residual não corruptivo do receipt pós-rename permanece explicitamente rastreado para a auditoria de release; os bytes e o snapshot final permanecem seguros |
 | M-PULSE-6 — bundle integral, recovery e certificação instalável | concluído, certificado e publicado nos milestones; M-PULSE-7 autorizado | Pulse Community `milestone/grafx-mpulse6-assembly@d1e988a` (`b4e27ff`, `f42d2e9`, `d1e988a`); Pulse Core `milestone/grafx-mpulse6-logical-transfer-manifest@ccc1f34` (`a9cf33d`, `ccc1f34`); Grafx `main@1bbb839` (`55e025e`, `1bbb839`) | Bundle único Board+Global compartilha binding store, resolver e pool; startup, CLI, restore, shutdown e rebuild não fazem fallback silencioso. Auditoria de interface 91/91; regressão roteada 232/232; conformance real Ladybug/Grafx 1/1; wheel Grafx `0.0.1` isolado com `[accel]`, `uv pip check`, bindings Board/Global e catálogos 81/11; recovery-only 220/220 aplicáveis; F13/AF21 25/25; gate curto 32/32; checks estáticos verdes e zero import Grafx no Core. A execução oficial completa no estado commitado fechou as 36 falhas diagnósticas anteriores e terminou em `4890 passed, 3 skipped, 13 deselected, 5 warnings` em `8150.11 s`; JUnit SHA-256 `d4d5bfc33cb9aa5d22a03e8f078dbd5df97dc94f6a7821a89b15737a33f14498`. A freeze pré-publicação do `uv.lock` Community ainda não é resolvível pelo índice enquanto `okto-grafx==0.0.1` não existir no PyPI; regenerar o lock a partir do índice imediatamente após a publicação conjunta, sem inserir URL/path local fictício |
 | M-PULSE-7 — estabilização de performance A1/B/C | ratchet de entrada certificado e F1 instrumental concluído/auditado; próximos gates: CE-3 literal e depois run 10k | base Grafx `6d9b7a1`; A1 `5002a77c8d4e59e137890a45bcf61874398d2dcc`; B original `420ca4886e5e226aa10bf3a28a1396f98471faca`; código Grafx integrado `91a59c6806659cdd75d1b33500885f0c7354de6b`; candidato Grafx `origin/main@7b5a2ace36d0a300dc71dbdf97f8b9686d55fcba`; C-community `65d07b5` + hardening `c05d89d`, publicado em `origin/milestone/grafx-mpulse7-rollout@c05d89d`; ratchet Community `6595abdcfa788dfa2cc8da1a53ff96c378790531` sobre base `d44c82155e9884c556813ea96dec829be567c236`, branch `origin/milestone/grafx-mpulse7-ratchet-530df34`, pin Grafx `d39e27435171574ab6f03bc1d17672b26bf163b2`; manifesto físico/canônico `d1777bb26aee2feae5c8d5f4593840c08bdc37474ad6be4bdfe5334daedd0192` / `1e6e92fc3bae3b54d3052ca9055b7682a9d518927573e0ffcbfcbb4568cf9f93`; corpus físico/lógico `0997747ed8bb9172d05781a62e5f81e7694630b173aaa152ac9ea28daec9d13f` / `b29334edf6e7c1e6b9419a4f3add84ede4baad94fdeaecb0c679261a78f241cc`; ratchet 12/12 e auditoria independente 39/39; F1 autoral `d87a0c6520683b2d22929165136f718d14a1d795`, squash/integrado `main@2b8e9006218b9ccf013d914dfe98e32abaa5bdd3`, 61/61, matriz pura 312 células, auditoria independente PASS e handoff Nexus `hof_81cf7d9bc9d94fc7b76ad9639519cd2e` concluído/verificado; handoffs B `hof_7a5be05b5b644b609b92b5e8c09fdeea`, harness `hof_1ad44f9d92d04f58abbcfe4a6e316ba6`, fixture `hof_42a66b0033f0454ca5e12b3f27668141`, runbook `hof_93dbf437246040a3a83cb900f3a488ea` concluídos/PASS; C `hof_d301014276c148c59c4709a2c2a87950` cancelado após entregar o commit/mutantes, follow-up concluído pelo Codex | A1 remove o fan-out de page 0 entre tabelas com freshness fail-closed; B restringe o namespace e preserva contenção contra redirects; C usa uma view pública de catálogo por scope com invalidação DDL fail-closed e preserva operações de erro. Gates C: cinco mutantes mortos, 213 testes relacionados no autor, 98/98 independentes, 9/9 pós-fast-forward e checks estáticos verdes. Evidência curta (`94c692af…`): catálogo 94→12 e RAW `19.266,1–19.564,1`→`17.219,4 ms`, com mesmo digest/forense e 68/43 writes. Evidência oficial C (`655c0ec0a10d4ee272fe6e2e6eea0b584d165b8ae3645148a77cd16bd1c428c8`, 526.344 B): 60/60, 12/12, catálogo 94/`5.606,59`→12/`718,69 ms`, RAW `18.561,15`→`17.196,86 ms`, instrumentado `40.072,74`→`37.073,95 ms`, mesmas 72/43 writes, digest `c994255b…` e forense; referência Ladybug reutilizada porque o delta toca somente o adapter Grafx, razão `19,12x`→`17,72x`. O F1 agora autentica o instrumento, não publica ainda números da matriz longa. D5 `<=10x` e meta final `<=1x` permanecem dívidas do plano, não SLO do manifesto. Patch 2/A2/plan cache não são promovidos antes do gate completo; quarentenas e RUN #4 permanecem inalterados. O ratchet autentica somente as entradas; não existe ainda resultado do run 10k |
-| CE-2 — reader pin por participante | concluída, certificada e publicada em `main` neste milestone | produto integrado `565ac37`; global 10.910/19; H1-H8.1 `bc305be2…`; reader-pin v8 47/47 `d0285b51…`; concorrência histórica PASS | Um único registro conservador por participante elimina publication/unregister por transação sem estreitar multi-writer/multi-reader. Rename/fsync/open `1/6/2 -> 0/4/0`; RAW 12 famílias `3.078,01 -> 2.363,90 ms`; razão contra Ladybug congelada `3,00x`. Long reader de 90 s, avanço após close, processo morto/TTL, recycle do WAL e verify hot+cold têm prova multiprocesso. ST-2/CN-1 seguem fora sem autorização |
+| CE-2 — reader pin por participante | concluída, certificada e publicada em `main` neste milestone | produto integrado `565ac37`; global 10.910/19; H1-H8.1 `bc305be2…`; reader-pin v8 47/47 `d0285b51…`; concorrência histórica PASS | Um único registro conservador por participante elimina publication/unregister por transação sem estreitar multi-writer/multi-reader. Rename/fsync/open `1/6/2 -> 0/4/0`; RAW 12 famílias `3.078,01 -> 2.363,90 ms`; razão contra Ladybug congelada `3,00x`. Long reader de 90 s, avanço após close, processo morto/TTL, recycle do WAL e verify hot+cold têm prova multiprocesso. ST-2 e CN-1 estavam fora naquele checkpoint; somente CN-1 recebeu autorização posterior, após o resultado CE-3 abaixo |
+| CE-3 — matriz multiprocesso e diagnóstico same-10 | execução oficial parcial válida; decisão concluída, correção estrutural CN-1 em execução | candidato `c2ca648`; artefato SHA-256 `319ac5a3966c7fd096bdab8800e37e6beb4ea8e0a255db719f981b5a3c1f71af`; instrumento v3 `d80b438`; revisão Nexus `hof_655c090ee6f547d98e249aeff95c367f` concluída/verificada/PASS | `idle-0` e `same-1` passaram; `same-10` provou starvation OCC na partição exata de `heap.dat/0`: A parou em 19/60 após 60 conflitos tipados, B concluiu 864/864 e recuperou 13. `verify("all")` limpo e duplicidade intermediária deliberada descartam corrupção. CN-1 está autorizado no recorte heap/WAL v1, burn-only e multi-writer/multi-reader; repetir `same-10` antes da matriz completa |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
