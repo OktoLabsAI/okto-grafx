@@ -58,10 +58,10 @@ def crash_before_the_commit_state_publication(seed: int) -> tuple[Any, Any, Any]
     """Return a composition whose log holds a durable COMMIT above ``commit.state``.
 
     The crash is placed by survey: one identical composition runs the commit undisturbed and
-    the bench reports its write points; the ``atomic_replace`` that publishes ``commit.state``
-    is the point, and a fresh composition crashes right before it (process death: everything
-    already written stays, nothing after it happens). The schema is checkpointed first, so the
-    published position is the checkpoint's and the crashed commit is the only thing above it.
+    the bench reports its write points; the inactive-slot ``write_page`` that publishes
+    ``commit.state`` is the point, and a fresh composition crashes right before it (process death:
+    everything already written stays, nothing after it happens). The schema is checkpointed first,
+    so the published position is the checkpoint's and the crashed commit is the only thing above it.
     """
     registry, bench, inner = bench_registry(seed)
     database = connect(":memory:", registry=registry)
@@ -75,7 +75,7 @@ def crash_before_the_commit_state_publication(seed: int) -> tuple[Any, Any, Any]
     publication = [
         point.call_index
         for point in points
-        if point.method == "atomic_replace" and "commit.state" in point.args_summary
+        if point.method == "write_page" and point.file == "control/commit.state"
     ]
     assert len(publication) == 1, points
     database.close()
