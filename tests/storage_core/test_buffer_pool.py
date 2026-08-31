@@ -371,6 +371,22 @@ def test_a_fresh_page_observation_bypasses_a_resident_frame_without_replacing_it
         )
 
 
+def test_the_dirty_probe_is_file_scoped_and_clears_after_publication() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 2)
+
+    assert pool.has_dirty_pages() is False
+    with pool.pinned(FILE, 0) as dirty:
+        dirty.update_slot(0, b"local-unpublished")
+
+    assert pool.has_dirty_pages() is True
+    assert pool.has_dirty_pages(FILE) is True
+    assert pool.has_dirty_pages("another.dat") is False
+    pool.flush(FILE)
+    assert pool.has_dirty_pages(FILE) is False
+
+
 def test_discard_clean_file_forgets_clean_frames_without_writing_them_back() -> None:
     device = MemoryDevice()
     pool = make_pool(device, RecordingMetrics())

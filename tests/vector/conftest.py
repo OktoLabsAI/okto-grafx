@@ -371,7 +371,10 @@ class VectorFixture:
         # The fixture has no independent WAL writer: every exposed row mutation updates the heap
         # and its vector index in one helper. Its far-future snapshots therefore name this
         # synthetic closed-world ceiling, not an unrepresented backlog of commits.
-        self.registry.mark_built_through(FIXTURE_READ_LSN)
+        self.registry.mark_built_through(
+            FIXTURE_READ_LSN,
+            watermarks={table.table_id: FIXTURE_READ_LSN},
+        )
         return index
 
     def create_table(self, name: str, space_name: str) -> TableDef:

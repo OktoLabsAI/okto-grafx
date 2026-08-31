@@ -269,9 +269,9 @@
   watermarks por tabela após aplicar páginas e adotar o catálogo; a foto só é reutilizada dentro
   da mesma seção e qualquer tabela ausente é relida, enquanto a montagem final continua fazendo
   uma foto própria. O marcador de replay deixa intacto um header somente com certificado page-0
-  fresco e saudável, ausência de `stale`/claim/rebuild local, igualdade do
-  `built_through_lsn` residente (único campo avançado pelo replay) e cobertura do high-water da
-  tabela; qualquer desconhecido usa integralmente o caminho anterior. Uma gravação `STALE` por
+  fresco e saudável, ausência de páginas dirty e de `stale`/claim/rebuild local, igualdade do
+  `built_through_lsn` residente e cobertura do high-water da tabela; qualquer desconhecido usa
+  integralmente o caminho anterior. Uma gravação `STALE` por
   processo spawnado continua observada no open seguinte e a consulta usa o scan correto.
   Origem publicada: `perf/w7-st7-open-freshness@61ca9f5`; integração: `ef2d16e`; handoff Nexus
   `hof_dcd0953d2fe345fcb76e2a0e0098723a` verificado/PASS. Medição discriminante:
@@ -281,6 +281,14 @@
   637 index+txn, 1.612 recovery+WAL+storage, 2.390 API/foundation e 1.693 query; a reprodução
   independente passou os 40 testes críticos, inclusive o subprocesso real, Ruff e `diff --check`.
   Nenhuma lease, WAL, publicação, seção de commit ou premissa multi-writer/multi-reader mudou.
+  O primeiro gate global integrado revelou duas premissas que os focados iniciais não cobriam:
+  uma aplicação direta pode deixar page 0 dirty sem mover o watermark, e uma foto usada para o
+  skip também precisa ser o floor de leitura por tabela. O follow-up adiciona a sonda read-only
+  `BufferPool.has_dirty_pages`, vincula a foto ao manager/índices e mantém o fence de rebuild no
+  snapshot global original; o fixture vetorial passou a declarar explicitamente seu teto
+  sintético. A reprodução red-first falhou nos dois representantes, e depois toda a bateria
+  vetorial/rebuild, 41 testes ST-7/staleness e 162 focados de buffer/index/vector passaram, com
+  Ruff e `diff --check`. O gate global final permanece obrigatório antes da promoção.
 - **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`

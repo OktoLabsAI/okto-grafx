@@ -20,7 +20,13 @@ import okto_grafx
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import INDEX_FLAG_STALE, IndexStore
 
-from .conftest import TransactionDouble, build_database, cold_view, header_on_device
+from .conftest import (
+    SnapshotDouble,
+    TransactionDouble,
+    build_database,
+    cold_view,
+    header_on_device,
+)
 
 BORN: int = 10
 
@@ -185,6 +191,22 @@ def test_a_header_already_covering_its_table_is_left_alone_by_the_mark() -> None
     ), "a complete header was rewritten to a global position it does not need"
     other = cold_view(database)
     assert other.manager.open(BORN + 40) == ()
+
+
+def test_a_completion_photo_becomes_the_table_local_read_floor() -> None:
+    """A skipped global advance and a later global snapshot must agree on the same floor."""
+    database = build_database()
+    expected = _commit_row(database, 1, "Ada", BORN)
+    settled = header_on_device(database.device, database.exact.file).built_through_lsn
+
+    database.manager.mark_built_through(BORN + 40)
+
+    assert header_on_device(database.device, database.exact.file).built_through_lsn == settled
+    assert database.manager.lookup(
+        database.exact.name,
+        database.key(1, "Ada"),
+        SnapshotDouble(BORN + 40),
+    ) == (expected,)
 
 
 def _poison_index_header(root: str, page_size: int, queue) -> None:

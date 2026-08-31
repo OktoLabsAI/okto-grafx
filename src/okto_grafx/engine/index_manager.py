@@ -658,9 +658,19 @@ class IndexStore:
         return certificate
 
     def _require_safe_certificate(
-        self, certificate: _IndexReadCertificate, required_lsn: Lsn
+        self,
+        certificate: _IndexReadCertificate,
+        required_lsn: Lsn,
+        *,
+        rebuild_required_lsn: Lsn | None = None,
     ) -> None:
-        """Refuse a durable state that cannot answer the requested snapshot completely."""
+        """Refuse a durable state that cannot answer the requested snapshot completely.
+
+        Ordinary header coverage is table-local, but a rebuild completed by this live handle
+        keeps a stronger process-local fence against the original database snapshot.  A later
+        index-only commit can advance the transaction clock without moving the heap high-water;
+        capping that fence to the table would then certify a generation the rebuild never read.
+        """
         header = certificate.header
         if header.flags & INDEX_FLAG_STALE:
             raise GrafxIndexError(
@@ -672,7 +682,12 @@ class IndexStore:
                 retryable=True,
             )
         fenced_through = self._completed_rebuild_through
-        if fenced_through is not None and required_lsn > fenced_through:
+        rebuild_required = (
+            required_lsn
+            if rebuild_required_lsn is None
+            else rebuild_required_lsn
+        )
+        if fenced_through is not None and rebuild_required > fenced_through:
             # A rebuild this handle completed derived its entries at ``fenced_through``. The
             # header may legitimately record a later position -- the checkpoint that finished
             # the rebuild proved the device that far -- but those later effects were not in the
@@ -681,12 +696,12 @@ class IndexStore:
             # and reads the header the checkpoint proved.
             raise GrafxIndexError(
                 f"Index {self.name!r} was rebuilt through position {fenced_through}, before "
-                f"the snapshot at {required_lsn}; a lookup could omit a row.",
+                f"the snapshot at {rebuild_required}; a lookup could omit a row.",
                 field="index_view_unavailable",
                 index=self.name,
                 file=self.file,
                 built_through_lsn=fenced_through,
-                required_lsn=required_lsn,
+                required_lsn=rebuild_required,
                 seq=certificate.seq,
                 retryable=True,
             )
@@ -704,7 +719,11 @@ class IndexStore:
             )
 
     def _foreign_healthy_replaces_stale(
-        self, certificate: _IndexReadCertificate, required_lsn: Lsn
+        self,
+        certificate: _IndexReadCertificate,
+        required_lsn: Lsn,
+        *,
+        rebuild_required_lsn: Lsn,
     ) -> bool:
         """Say whether a different healthy generation may release this handle's refusal.
 
@@ -725,11 +744,19 @@ class IndexStore:
             if certificate.seq == stale_seq:
                 self._require_readable()
             self._stale_device_seq = certificate.seq
-            self._require_safe_certificate(certificate, required_lsn)
+            self._require_safe_certificate(
+                certificate,
+                required_lsn,
+                rebuild_required_lsn=rebuild_required_lsn,
+            )
         if certificate.seq == stale_seq:
             self._require_readable()
         try:
-            self._require_safe_certificate(certificate, required_lsn)
+            self._require_safe_certificate(
+                certificate,
+                required_lsn,
+                rebuild_required_lsn=rebuild_required_lsn,
+            )
         except GrafxIndexError:
             # The stale flag was cleared but coverage is not sufficient yet. Bind to that
             # intermediate generation so a later page-0 advance can release the refusal.
@@ -757,28 +784,49 @@ class IndexStore:
         of :meth:`finish_exact_read`. A foreign page-0 transition between two lookups is seen
         there, costs one of the bounded retries, and the retry re-proves from the device.
         """
+        rebuild_required_lsn = required_lsn
         required_lsn = self._required_table_position(required_lsn)
         carried = self._carried_certificate
         if carried is not None:
             self._carried_certificate = None
             if self._stale_reason is None and carried == self._cache_certificate:
                 try:
-                    self._require_safe_certificate(carried, required_lsn)
+                    self._require_safe_certificate(
+                        carried,
+                        required_lsn,
+                        rebuild_required_lsn=rebuild_required_lsn,
+                    )
                 except GrafxIndexError:
                     # Fallback, never a verdict: the device decides below.
                     pass
                 else:
                     return carried
         certificate = self._fresh_certificate()
-        recovering = self._foreign_healthy_replaces_stale(certificate, required_lsn)
-        self._require_safe_certificate(certificate, required_lsn)
+        recovering = self._foreign_healthy_replaces_stale(
+            certificate,
+            required_lsn,
+            rebuild_required_lsn=rebuild_required_lsn,
+        )
+        self._require_safe_certificate(
+            certificate,
+            required_lsn,
+            rebuild_required_lsn=rebuild_required_lsn,
+        )
         if certificate != self._cache_certificate or recovering:
             # The mismatch includes first use. Pre/post equality alone cannot detect a rebuild
             # that finished before this lookup while old bucket frames remained resident.
             self._pool.discard_clean_file(self.file)
             certificate = self._fresh_certificate()
-            recovering = self._foreign_healthy_replaces_stale(certificate, required_lsn)
-            self._require_safe_certificate(certificate, required_lsn)
+            recovering = self._foreign_healthy_replaces_stale(
+                certificate,
+                required_lsn,
+                rebuild_required_lsn=rebuild_required_lsn,
+            )
+            self._require_safe_certificate(
+                certificate,
+                required_lsn,
+                rebuild_required_lsn=rebuild_required_lsn,
+            )
             if recovering:
                 self._stale_reason = None
                 self._stale_device_seq = None
@@ -791,10 +839,15 @@ class IndexStore:
         self, before: _IndexReadCertificate, required_lsn: Lsn
     ) -> bool:
         """Say whether traversal+heap validation stayed inside one durable index view."""
+        rebuild_required_lsn = required_lsn
         required_lsn = self._required_table_position(required_lsn)
         after = self._fresh_certificate()
         if after == before:
-            self._require_safe_certificate(after, required_lsn)
+            self._require_safe_certificate(
+                after,
+                required_lsn,
+                rebuild_required_lsn=rebuild_required_lsn,
+            )
             # The device-observed certificate that proved this view is the next lookup's
             # pre-certificate; it stays bound to the resident frames it just certified.
             self._carried_certificate = after
@@ -1479,14 +1532,15 @@ class IndexStore:
         Eligibility to skip is proved by THIS call's own fresh device certificate and the
         caller's current watermark photo, never by a remembered flag: a foreign participant may
         persist STALE outside any commit section at any moment, and page 0 is the only place
-        that verdict lives (ST-7). Three proofs make a skip: the fresh certificate is healthy,
-        its built-through position agrees with the resident header (the only header field replay
-        advances, so no replayed work is waiting for a flush), and it covers the table's committed
-        high water -- which is the strongest position
+        that verdict lives (ST-7). Four proofs make a skip: the fresh certificate is healthy,
+        no page of this index holds unpublished local work, its built-through position agrees
+        with the resident header, and it covers the table's committed high water -- which is the
+        strongest position
         :meth:`IndexManager.open` will ever require of it. The skip never writes; the worst a
         wrong photo can cost is a rebuild nobody needed, never a wrong answer. Every other
-        state -- no photo for this table, a stale mark in either home, a rebuild in flight, a
-        disagreement between device and resident -- takes :meth:`advance_built_through` whole.
+        state -- no photo for this table, dirty work, a stale mark in either home, a rebuild in
+        flight, or a disagreement between device and resident -- takes
+        :meth:`advance_built_through` whole.
         """
         position = _require_position("lsn", lsn)
         if (
@@ -1494,6 +1548,7 @@ class IndexStore:
             or self._stale_reason is not None
             or self._rebuild_authority is not None
             or self._completed_rebuild_through is not None
+            or self._pool.has_dirty_pages(self.file)
         ):
             self.advance_built_through(position)
             return
@@ -3137,6 +3192,11 @@ class IndexManager:
             if watermarks is not None
             else self._table_high_waters(indexes)
         )
+        # The same photograph that justifies leaving a per-table-complete header alone is the
+        # read floor future snapshots must use.  Without this binding the header remains at the
+        # table high-water while reads still demand the global clock, falsely refusing a complete
+        # index after an index-only commit (ST-7 integration regression).
+        self._replace_table_watermarks(photo)
         for index in indexes:
             index.complete_built_through(position, photo.get(index.definition.table_id))
             self._bind_local_heap_view(index)

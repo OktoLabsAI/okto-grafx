@@ -680,6 +680,20 @@ class BufferPool:
         )
 
     @_guarded
+    def has_dirty_pages(self, file: str | None = None) -> bool:
+        """Say whether resident or doomed frames still hold unpublished local changes."""
+        if any(
+            frame.page.dirty and (file is None or name == file)
+            for (name, _page_index), frame in self._frames.items()
+        ):
+            return True
+        return any(
+            frame.page.dirty and (file is None or name == file)
+            for (name, _page_index), frames in self._doomed.items()
+            for frame in frames
+        )
+
+    @_guarded
     def pages_written_back(self, file: str | None = None) -> frozenset[tuple[str, PageIndex]]:
         """Return the pages this pool has WRITTEN OUT since the last :meth:`forget_modified`.
 
