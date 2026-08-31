@@ -290,7 +290,8 @@ class ProcessCoordinator(Protocol):
         """Increment epoch and become the owner. Must be atomic against concurrent takeovers."""
 
     def register_reader(self, snapshot_lsn: Lsn) -> ReaderHandle: ...
-    def refresh_reader(self, handle: ReaderHandle) -> None: ...
+    def refresh_reader(self, handle: ReaderHandle) -> None:
+        """Republish liveness at handle.snapshot_lsn; that pin may only move forward."""
     def unregister_reader(self, handle: ReaderHandle) -> None: ...
     def reader_horizon(self) -> Lsn | None:
         """Minimum snapshot_lsn over LIVE readers; None when there is no live reader.
@@ -728,6 +729,20 @@ Thin engine-side helper over the port: lease renewal scheduling driven by the ca
 threads in the engine — the API layer may drive renewal), epoch validation helpers, reader
 registration lifecycle.
 
+E-CE2-2: C5 owns one lazy registration per participant. Its pin is deferred but monotone and must
+always satisfy `P <= min(snapshot.read_lsn for every open transaction)`. A due `begin()` first
+reads the published floor, then advances/recreates the standing pin, then selects the snapshot;
+commit and rollback may republish liveness but never exclude the still-active transaction from the
+safe floor. With no open transaction, an explicit tick advances to a published floor it read while
+holding the participant section. Checkpoint advances its own pin before asking C3 for the horizon,
+and `close()` is the only normal withdrawal. A live long reader must be driven at the configured
+refresh interval; a crashed participant remains conservatively pinned until the full foreign
+observer stall threshold elapses. When the interval is the conservative zero default, a finishing
+door may skip publication only if its transaction is the sole open one; any surviving transaction
+forces a refresh. Every fallible clock reading needed to adopt a first registration precedes its
+durable publication, so a failed `begin()` cannot leave an own record without a handle that
+`close()` can withdraw.
+
 ### 8.5 `engine/txn_manager.py` (C5)
 ```python
 @dataclass(frozen=True, slots=True)
@@ -759,7 +774,11 @@ after the mark and an added key that sorts before an older key, without relying 
 growth or ordering.
 
 **Commit protocol (FROZEN — implement exactly):**
-1. read-only txn → unregister reader, return `CommitReport(csn=snapshot.read_lsn, durable=True, wrote=False)`.
+1. read-only txn → settle against the PARTICIPANT reader registration and return
+   `CommitReport(csn=snapshot.read_lsn, durable=True, wrote=False)`. (E-CE2-1: the reader
+   registration is per participant, deferred and monotone — commit/rollback never unregister
+   it; the pin advances past finished snapshots on the refresh cadence and before every
+   checkpoint horizon, and only `close()` withdraws it.)
 2. `coordinator.validate_epoch(lease.epoch)` — **before any device call** (BR-7/AC-6).
 3. `with coordinator.exclusive("commit", timeout=commit_lock_timeout):`
    1. re-`validate_epoch`.
@@ -1177,6 +1196,11 @@ M1: `oktografx_lease_wait_seconds`{outcome=granted|timeout|takeover} ·
 `oktografx_buffer_budget_exceeded_total`{db} · `oktografx_database_opens_total` ·
 `oktografx_recoveries_total`{outcome} ·
 `oktografx_baseline_ceiling_multiple`{ceiling=durable_commit|point_read|open_replay|vector_recall}
+
+E-CE2-3: `reader_present=true` means that the checkpoint observed at least one standing,
+non-pruned participant registration. It does not imply an open transaction: a warm manager keeps
+its registration between transactions until `close()`, and checkpoint first advances its own idle
+pin so the label never changes the recyclable horizon.
 
 VEC: `oktografx_vector_recall_ratio` · `oktografx_vector_query_latency_seconds`{regime,phase} ·
 `oktografx_vector_exact_fallback_total` · `oktografx_vector_achieved_k` ·

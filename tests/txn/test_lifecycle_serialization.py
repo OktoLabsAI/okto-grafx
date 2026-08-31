@@ -104,7 +104,8 @@ def test_rollback_winning_after_commit_selection_prevents_all_commit_effects(
     assert len(failures) == 1 and isinstance(failures[0], GrafxTransactionStateError)
     assert transaction.state is TransactionState.ABORTED
     assert manager.open_transactions == 0
-    assert stack.coordinator.reader_horizon() is None
+    # CE-2: the participant pin persists; only close() withdraws it.
+    assert stack.coordinator.reader_horizon() is not None
     assert stack.wal.barriers == 0
     assert not [record for record in stack.wal.records() if record.record_type == WalRecordType.COMMIT]
     assert _wal_mutations(storage) == ()
@@ -151,7 +152,8 @@ def test_two_selected_commits_produce_exactly_one_outcome(
     assert isinstance(first_failures[0], GrafxTransactionStateError)
     assert transaction.state is TransactionState.COMMITTED
     assert manager.open_transactions == 0
-    assert stack.coordinator.reader_horizon() is None
+    # CE-2: the participant pin persists; only close() withdraws it.
+    assert stack.coordinator.reader_horizon() is not None
     commits = [
         record for record in stack.wal.records() if record.record_type == WalRecordType.COMMIT
     ]
@@ -224,4 +226,5 @@ def test_retry_settlement_serializes_against_a_commit_of_the_same_context(
     assert _wal_mutations(storage) == ()
     manager.rollback(successor)
     assert manager.open_transactions == 0
-    assert stack.coordinator.reader_horizon() is None
+    # CE-2: the participant pin persists past the successor's rollback.
+    assert stack.coordinator.reader_horizon() is not None

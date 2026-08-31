@@ -154,6 +154,7 @@ def test_retry_open_failure_leaves_the_old_context_aborted_and_no_partial_pin(
         original(pool, read_lsn, **kwargs)
 
     monkeypatch.setattr(BufferPool, "begin_read_view", fail_successor_open)
+    standing = stack.coordinator.reader_horizon()
 
     with pytest.raises(SystemExit) as raised:
         stack.manager.retry(old)
@@ -161,7 +162,9 @@ def test_retry_open_failure_leaves_the_old_context_aborted_and_no_partial_pin(
     assert raised.value is opening_bomb
     assert old.state is TransactionState.ABORTED
     assert stack.manager.open_transactions == 0
-    assert stack.coordinator.reader_horizon() is None
+    # CE-2: the PARTICIPANT registration stands whatever a failed retry did -- the no-leak
+    # claim is that the horizon did not move, not that it vanished.
+    assert stack.coordinator.reader_horizon() == standing
     assert metrics.gauge_values(ACTIVE_TRANSACTIONS, "mode", "write")[-1] == 0.0
 
 
@@ -455,7 +458,8 @@ def test_public_rollback_preenter_failure_keeps_wrapper_and_pin_retryable(
     assert not transaction.active
     assert context.state is TransactionState.ABORTED
     assert stack.manager.open_transactions == 0
-    assert stack.coordinator.reader_horizon() is None
+    # CE-2: rollback never unregisters; the participant pin persists at the floor it holds.
+    assert stack.coordinator.reader_horizon() == context.snapshot.read_lsn
     database.close()
 
 
@@ -882,32 +886,24 @@ def test_close_is_fail_complete_across_two_txns_three_baseexceptions_and_a_lease
     second = stack.manager.begin("write")
     with stack.manager._participant_section():
         guard = stack.manager._hold_lease()
-    refresh_bomb = RuntimeError("reader refresh bomb")
-    index_bomb = KeyboardInterrupt("index cleanup bomb")
+    # CE-2 deliberately re-legged this battery: close no longer refreshes readers (it
+    # WITHDRAWS the participant registration), so the RuntimeError leg moved from the
+    # refresh door to the index cleanup of the FIRST transaction, the KeyboardInterrupt to
+    # the second's, and the SystemExit stayed on the lease release. Fail-complete means all
+    # three are evidence and every owned object is still retired.
+    index_bomb_first = RuntimeError("index cleanup bomb one")
+    index_bomb_second = KeyboardInterrupt("index cleanup bomb")
     lease_bomb = SystemExit("lease release bomb")
-    original_refresh = TransactionManager._refresh_due_readers
     original_drop = TransactionManager._drop_index_changes
     original_release = LeaseGuard.release
-    refresh_calls = 0
 
-    def fail_first_refresh(
-        self: TransactionManager,
-        now_monotonic: float | None = None,
-        *,
-        skip: int | None = None,
-    ) -> int:
-        nonlocal refresh_calls
-        if self is stack.manager and refresh_calls == 0:
-            refresh_calls += 1
-            raise refresh_bomb
-        refresh_calls += 1
-        return original_refresh(self, now_monotonic, skip=skip)
-
-    def fail_second_index(
+    def fail_index_cleanup(
         self: TransactionManager, candidate: TransactionContext
     ) -> None:
+        if self is stack.manager and candidate is first:
+            raise index_bomb_first
         if self is stack.manager and candidate is second:
-            raise index_bomb
+            raise index_bomb_second
         original_drop(self, candidate)
 
     def release_then_fail(self: LeaseGuard) -> None:
@@ -915,23 +911,25 @@ def test_close_is_fail_complete_across_two_txns_three_baseexceptions_and_a_lease
         if self is guard:
             raise lease_bomb
 
-    monkeypatch.setattr(TransactionManager, "_refresh_due_readers", fail_first_refresh)
-    monkeypatch.setattr(TransactionManager, "_drop_index_changes", fail_second_index)
+    monkeypatch.setattr(TransactionManager, "_drop_index_changes", fail_index_cleanup)
     monkeypatch.setattr(LeaseGuard, "release", release_then_fail)
 
     with pytest.raises(RuntimeError) as raised:
         stack.manager.close()
 
-    assert raised.value is refresh_bomb
+    assert raised.value is index_bomb_first
     assert any(
-        "KeyboardInterrupt" in note for note in getattr(refresh_bomb, "__notes__", ())
+        "KeyboardInterrupt" in note
+        for note in getattr(index_bomb_first, "__notes__", ())
     )
-    assert any("SystemExit" in note for note in getattr(refresh_bomb, "__notes__", ()))
+    assert any(
+        "SystemExit" in note for note in getattr(index_bomb_first, "__notes__", ())
+    )
     assert first.state is TransactionState.ABORTED
     assert second.state is TransactionState.ABORTED
     assert stack.manager.closed
     assert stack.manager.open_transactions == 0
-    assert stack.manager._pins == {}
+    assert stack.manager._participant_pin is None
     assert set(stack.manager._mode_counts.values()) == {0}
     assert stack.manager._lease_guard is None
     assert guard.released

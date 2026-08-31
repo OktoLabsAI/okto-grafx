@@ -151,6 +151,8 @@ def test_threads_opening_and_abandoning_transactions_never_report_damage(
     assert len(opened) == WORKERS * ROUNDS
     assert len(set(opened)) == len(opened), "two transactions were given the same number"
     assert stack.manager.open_transactions == 0
+    assert stack.coordinator.reader_horizon() is not None
+    stack.manager.close()
     assert stack.coordinator.reader_horizon() is None
 
 

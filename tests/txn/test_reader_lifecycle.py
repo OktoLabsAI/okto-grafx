@@ -97,7 +97,11 @@ def test_every_open_transaction_holds_the_horizon_down(make_stack) -> None:
     early = reader_side.manager.begin("read")
     for page in (4, 5, 6):
         _commit_one(writer_side, page_index=page, payload=bytes([page]))
-    assert writer_side.coordinator.reader_horizon() == early.snapshot.read_lsn
+    # CE-2: the writer participant keeps its own standing pin at the floor of its first
+    # begin, so the horizon is BOUNDED BY the early reader's snapshot rather than equal to
+    # it -- which is all BR-10 requires: no segment the early reader needs is recyclable.
+    horizon = writer_side.coordinator.reader_horizon()
+    assert horizon is not None and horizon <= early.snapshot.read_lsn
     assert writer_side.manager.published_lsn() > early.snapshot.read_lsn
 
 
@@ -107,18 +111,34 @@ def test_a_writer_also_pins_the_snapshot_it_reads_under(make_stack) -> None:
     second = make_stack()
     _commit_one(first, page_index=3)
     txn = second.manager.begin("write")
-    assert first.coordinator.reader_horizon() == txn.snapshot.read_lsn
+    # CE-2: BOTH participants hold standing pins now -- the writer that ran _commit_one keeps
+    # its own at the floor it began under -- so the horizon is bounded by the write txn's
+    # snapshot rather than equal to it. The per-participant CF-2 pin-before-snapshot property
+    # is pinned in test_reader_participant_pin.py.
+    horizon = first.coordinator.reader_horizon()
+    assert horizon is not None and horizon <= txn.snapshot.read_lsn
     second.manager.rollback(txn)
-    assert first.coordinator.reader_horizon() is None
+    # CE-2: the pin belongs to the participant, not the transaction; rollback keeps it.
+    after = first.coordinator.reader_horizon()
+    assert after is not None and after <= txn.snapshot.read_lsn
 
 
-def test_finishing_a_transaction_releases_its_pin(make_stack) -> None:
+def test_finishing_a_transaction_keeps_the_participant_pin(make_stack) -> None:
+    # CE-2 deliberately rewrote this pin: finishing a transaction used to unregister its
+    # per-transaction reader; the registration now belongs to the PARTICIPANT and only
+    # close() withdraws it (E-CE2-1). What finishing releases is the FLOOR -- the pin may
+    # advance past the finished snapshot at the next due refresh or checkpoint.
     reader_side = make_stack()
     writer_side = make_stack()
     _commit_one(writer_side, page_index=3)
     txn = reader_side.manager.begin("read")
     assert writer_side.coordinator.reader_horizon() is not None
     reader_side.manager.commit(txn)
+    assert writer_side.coordinator.reader_horizon() is not None
+    reader_side.manager.close()
+    # The writer participant ran _commit_one, so its OWN standing pin remains until it too
+    # closes -- only then is the directory free of registrations.
+    writer_side.manager.close()
     assert writer_side.coordinator.reader_horizon() is None
 
 
@@ -136,7 +156,8 @@ def test_a_long_read_survives_the_stall_threshold_when_the_manager_is_driven(
     txn = reader_side.manager.begin("read")
     pinned = txn.snapshot.read_lsn
     assert observer.coordinator.reader_horizon() == pinned
-    for _step in range(6):
+    # Ten six-second ticks model the CE-2 acceptance reader held for a full minute.
+    for _step in range(10):
         reader_side.clock.advance(6.0)
         observer.clock.advance(6.0)
         reader_side.manager.refresh_due_readers()

@@ -62,6 +62,15 @@ including the on-disk format.
 
 ### Changed
 
+- **Reader horizon publication is now per database participant, not per transaction (E-CE2-1).**
+  The first transaction opens one standing registration; later begins inside the configured
+  refresh interval publish nothing, and commit/rollback no longer unregister it. A deferred,
+  forward-only pin follows the oldest open snapshot, advances on due ticks and before checkpoint
+  recycling, recreates a file pruned by another participant, and is withdrawn only by database
+  close. Interval-zero compatibility still republishes when another transaction remains open,
+  and fallible clock reads precede first durable publication so a failed begin cannot orphan an
+  own pin. This removes one control-record publication from warm short operations while
+  preserving multi-process readers, writers, CF-2 snapshot ordering and BR-10 WAL retention.
 - **Nullable vector columns now use a sparse durable index.** A `NULL` embedding creates no
   vector-index entry or WAL effect; transitions to and from `NULL` insert or tombstone only the
   populated side.  Empty sparse commits still certify index coverage, while rebuild, exact

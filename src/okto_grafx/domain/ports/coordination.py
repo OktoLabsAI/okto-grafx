@@ -91,7 +91,13 @@ class ProcessCoordinator(Protocol):
         ...
 
     def refresh_reader(self, handle: ReaderHandle) -> None:
-        """Prove that a registered reader is still alive."""
+        """Prove that a registered reader is still alive, republishing at the handle's pin.
+
+        E-CE2-2: the handle names the pin the registration holds FROM NOW ON, so a caller may
+        advance a deferred pin -- forward only, the engine refuses regressions -- with the same
+        single publication that proves liveness. A registration a foreign observer pruned is
+        recreated by this call rather than lost (BR-10 forbids evicting a live reader).
+        """
         ...
 
     def unregister_reader(self, handle: ReaderHandle) -> None:

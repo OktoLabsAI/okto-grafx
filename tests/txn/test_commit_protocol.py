@@ -793,10 +793,12 @@ def test_reader_close_escape_cannot_leave_a_committed_transaction_active(
     txn = stack.manager.begin("read")
     coordinator_type = type(stack.coordinator)
     original = coordinator_type.unregister_reader
+    observed_states: list[TransactionState] = []
 
     def close_then_fail(coordinator: object, handle: object) -> None:
         original(coordinator, handle)  # type: ignore[arg-type]
         if coordinator is stack.coordinator:
+            observed_states.append(txn.state)
             raise failure
 
     monkeypatch.setattr(coordinator_type, "unregister_reader", close_then_fail)
@@ -806,6 +808,16 @@ def test_reader_close_escape_cannot_leave_a_committed_transaction_active(
     assert report.durable is True and report.wrote is False
     assert txn.state is TransactionState.COMMITTED
     assert stack.manager.open_transactions == 0
+    assert observed_states == [], "CE-2 keeps the participant pin until manager close"
+
+    with pytest.raises(type(failure)) as raised:
+        stack.manager.close()
+    assert raised.value is failure
+    assert observed_states == [TransactionState.COMMITTED]
+    assert stack.manager.closed is True
+    assert stack.manager.close_quiesced is True
+    assert stack.manager.close_complete is True
+    stack.manager.close()
 
 
 def test_a_failure_after_the_barrier_is_reported_as_already_committed(
