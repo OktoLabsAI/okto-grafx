@@ -122,7 +122,7 @@ regime, seconds = sys.argv[5], float(sys.argv[6])
 rows_per_txn, txns = int(sys.argv[7]), int(sys.argv[8])
 rate_text, warmup = sys.argv[9], float(sys.argv[10])
 reopen_on_stale, out = sys.argv[11] == "1", sys.argv[12]
-metrics_out = sys.argv[13]
+metrics_out, ready_path, barrier_path = sys.argv[13], sys.argv[14], sys.argv[15]
 # "" = unpaced (flat out). "0" = COMMANDED IDLE, the zero of the 6.5 curve. ">0" = paced.
 rate = None if rate_text == "" else float(rate_text)
 
@@ -144,19 +144,47 @@ latency = {family: [] for family in
            ("create_node", "create_edge", "update_node", "mark_superseded")}
 conflicts = 0
 retries = 0
+outside_window = 0
 escapes = []
 durable_refusals = []
 reopens = 0
 acknowledged = []
 commits = 0
+# THE COMMON WINDOW. Every participant waits on a barrier outside the database and then runs
+# the SAME absolute window. Spawning sequentially and letting each process time itself gives
+# each one a different denominator, and the curve would carry that stagger as though it were
+# an effect of the foreign rate.
+pathlib.Path(ready_path).write_text(json.dumps({"role": "writer", "slot": slot}),
+                                    encoding="utf-8")
+waited = 0.0
+while not pathlib.Path(barrier_path).is_file() and waited < 900.0:
+    time.sleep(0.02)
+    waited += 0.02
+if not pathlib.Path(barrier_path).is_file():
+    raise SystemExit("BARRIER-TIMEOUT: writer %d never saw the start barrier" % slot)
+barrier = json.loads(pathlib.Path(barrier_path).read_text(encoding="utf-8"))
+start_at, end_at = float(barrier["start_at"]), float(barrier["end_at"])
+timing_starts_at = start_at + warmup
+opening = start_at - time.time()
+if opening > 0:
+    time.sleep(opening)
+
 started = time.monotonic()
-deadline = started + seconds
-# Warmup is discarded from BOTH the samples and the commit count, so the reported commits/s
-# divides by the very window the percentiles were drawn from.
-timing_starts = started + warmup
+deadline = end_at
 timed_from = None
-next_slot = started
+next_slot = time.time()
 idle = rate == 0.0
+
+
+def window_is_open():
+    """True while the shared measured window is still running."""
+    return time.time() < end_at
+
+
+def in_timed_window():
+    """True once the discarded warmup is over, and only while the window is still open."""
+    now = time.time()
+    return timing_starts_at <= now < end_at
 
 
 def committed(family, build):
@@ -165,25 +193,38 @@ def committed(family, build):
     A give-up carries the LAST refusal that caused it. "Gave up after 60 retries" on its own
     names the symptom and throws away the only evidence of the cause.
     """
-    global conflicts, retries, commits, timed_from, next_slot, db, reopens
+    global conflicts, retries, commits, timed_from, next_slot, db, reopens, outside_window
     last_refusal = None
     if rate:
-        # Pace to the target rate: this writer IS the foreign traffic whose effect on reader
-        # latency is the key curve of section 6.5.
-        pause = next_slot - time.monotonic()
-        if pause > 0:
-            time.sleep(pause)
-        next_slot = max(next_slot + 1.0 / rate, time.monotonic())
+        # Pace to this writer's share of the aggregate rate. The deadline is rechecked AROUND
+        # the sleep: at N=8 and an aggregate of 1/s a writer waits 8s between commits, so a
+        # round entered just before the end would otherwise commit long after the readers
+        # stopped and be counted into a window it never belonged to.
+        if not window_is_open():
+            return False, None
+        gap = next_slot - time.time()
+        if gap > 0:
+            time.sleep(min(gap, max(0.0, end_at - time.time())))
+        if not window_is_open():
+            return False, None
+        next_slot = max(next_slot + 1.0 / rate, time.time())
+    elif not window_is_open():
+        return False, None
     began = time.perf_counter()
     for attempt in range(60):
         try:
             with db.begin("write") as txn:
                 made = build(txn)
-            if time.monotonic() >= timing_starts:
+            # Only commits that landed INSIDE the shared timed window are counted. One
+            # that lands after the readers stopped is real, but it is not part of this
+            # measurement, and counting it would inflate the rate the reader felt.
+            if in_timed_window():
                 if timed_from is None:
                     timed_from = time.monotonic()
                 latency[family].append((time.perf_counter() - began) * 1000.0)
                 commits += 1
+            else:
+                outside_window += 1
             return True, made
         except GrafxError as refused:
             if refused.details.get("field") == DURABLE_FIELD:
@@ -234,17 +275,21 @@ index = 0
 expected_owner = {}       # id -> owner value written by the last update that committed
 expected_superseded = []  # ids whose live flag a committed mark_superseded set to false
 expected_edges = []       # [source id, target id] pairs a committed create_edge made
+# The ordered list of committed operations, in this writer's commit order. It is what the
+# serial oracle replays: section 6 asks for a serial run of the SAME operation list, and a
+# ledger of final values alone cannot answer that.
+operations = []
 
 if idle:
     # The zero of the curve: hold the database open, commit nothing, occupy a process slot.
-    while time.monotonic() < deadline:
+    while window_is_open():
         time.sleep(0.05)
 else:
-    # A PACED writer runs to the deadline; the txns cap applies only to the unpaced case.
-    # Otherwise a fast rate exhausts the rounds early, the writer stops, and the reader spends
-    # the rest of its window with no foreign traffic at all -- so the curve point would be
-    # labelled 10/s while the reader actually experienced about half of that.
-    while (rate or index < txns) and time.monotonic() < deadline:
+    # A PACED writer runs to the end of the shared window; the txns cap applies only to the
+    # unpaced case. Otherwise a fast rate exhausts the rounds early, the writer stops, and the
+    # reader spends the rest of its window with no foreign traffic at all, so the point would
+    # be labelled 10/s while the reader experienced about half of that.
+    while (rate or index < txns) and window_is_open():
         def build_nodes(txn, index=index):
             keys = []
             for offset in range(rows_per_txn):
@@ -261,8 +306,9 @@ else:
             made_nodes.extend(keys)
             for key in keys:
                 expected_owner[key] = slot
+            operations.append(["create_node", node_table, list(keys), slot])
 
-        if len(made_nodes) >= 2:
+        if window_is_open() and len(made_nodes) >= 2:
             pair = (made_nodes[-2], made_nodes[-1])
 
             def build_edge(txn, pair=pair):
@@ -275,8 +321,10 @@ else:
             ok, _made = committed("create_edge", build_edge)
             if ok:
                 expected_edges.append([pair[0], pair[1]])
+                operations.append(["create_edge", node_table, edge_table,
+                                   pair[0], pair[1]])
 
-        if made_nodes:
+        if window_is_open() and made_nodes:
             update_key, update_owner = made_nodes[-1], slot * 1000 + index
 
             def build_update(txn, key=update_key, owner=update_owner):
@@ -289,6 +337,7 @@ else:
             if ok:
                 # Last committed write wins -- exactly what the oracle will read back.
                 expected_owner[update_key] = update_owner
+                operations.append(["update_node", node_table, update_key, update_owner])
 
             supersede_key = made_nodes[0]
 
@@ -298,9 +347,14 @@ else:
                     {"k": key},
                 )
                 return key
-            ok, _made = committed("mark_superseded", build_supersede)
-            if ok and supersede_key not in expected_superseded:
-                expected_superseded.append(supersede_key)
+            if window_is_open():
+                ok, _made = committed("mark_superseded", build_supersede)
+            else:
+                ok = False
+            if ok:
+                operations.append(["mark_superseded", node_table, supersede_key])
+                if supersede_key not in expected_superseded:
+                    expected_superseded.append(supersede_key)
         index += 1
 
 ended = time.monotonic()
@@ -310,7 +364,7 @@ elapsed = (ended - timed_from) if timed_from is not None else 0.0
 # How long this writer was actually present after the warmup, whether or not it committed.
 # This is the span the reader's window has to be compared against: a writer that went quiet
 # halfway through did not deliver the foreign rate its label claims.
-active_span = max(0.0, ended - max(started, timing_starts))
+active_span = max(0.0, time.time() - max(start_at, timing_starts_at))
 metrics = None
 metrics_error = None
 try:
@@ -333,12 +387,15 @@ pathlib.Path(out).write_text(json.dumps({
     "latency_ms": latency, "conflicts": conflicts, "retries": retries,
     "commits": commits, "elapsed_seconds": elapsed,
     "active_span_seconds": active_span, "rounds_completed": index,
+    "commits_outside_window": outside_window,
+    "window": {"start_at": start_at, "end_at": end_at, "warmup": warmup},
     "durable_refusals": durable_refusals, "reopens": reopens,
     "reopen_on_stale_index": reopen_on_stale,
     "acknowledged": acknowledged, "escapes": escapes,
     "expected_owner": {str(key): value for key, value in expected_owner.items()},
     "expected_superseded": expected_superseded,
     "expected_edges": expected_edges,
+    "operations": operations,
     "metrics": metrics, "metrics_error": metrics_error,
     "metrics_document": metrics_out,
 }, sort_keys=True), encoding="utf-8")
@@ -355,7 +412,7 @@ from okto_grafx.domain.errors import GrafxError
 root, slot, seed = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 shape, seconds, tables_json = sys.argv[5], float(sys.argv[6]), sys.argv[7]
 edges_json, warmup, out = sys.argv[8], float(sys.argv[9]), sys.argv[10]
-metrics_out = sys.argv[11]
+metrics_out, ready_path, barrier_path = sys.argv[11], sys.argv[12], sys.argv[13]
 tables = json.loads(tables_json)
 edges = json.loads(edges_json)
 rnd = random.Random(seed * 104729 + slot)
@@ -366,31 +423,73 @@ torn = []
 escapes = []      # ILLEGAL: anything that is not a Grafx refusal. Any entry fails the case.
 refusals = []     # LEGAL: a Grafx refusal a reader is contractually allowed to receive.
 statements = 0
+lifecycle_ms = []   # begin -> rollback/commit, the whole read transaction
+statement_ms = []   # the execute alone, so the two are never conflated
+
+pathlib.Path(ready_path).write_text(json.dumps({"role": "reader", "slot": slot}),
+                                    encoding="utf-8")
+waited = 0.0
+while not pathlib.Path(barrier_path).is_file() and waited < 900.0:
+    time.sleep(0.02)
+    waited += 0.02
+if not pathlib.Path(barrier_path).is_file():
+    raise SystemExit("BARRIER-TIMEOUT: reader %d never saw the start barrier" % slot)
+barrier = json.loads(pathlib.Path(barrier_path).read_text(encoding="utf-8"))
+start_at = float(barrier["start_at"])
+end_at = start_at + seconds
+timing_starts_at = start_at + warmup
+opening = start_at - time.time()
+if opening > 0:
+    time.sleep(opening)
+
 started = time.monotonic()
-deadline = started + seconds
-timing_starts = started + warmup
+deadline = end_at
 timed_from = None
 long_first = None
 long_scans = 0
 
 
-def record(began):
-    """Keep one latency sample, unless it fell inside the discarded warmup."""
+def window_is_open():
+    """True while the shared measured window is still running."""
+    return time.time() < end_at
+
+
+def in_timed_window():
+    """True once the discarded warmup is over, and only while the window is still open."""
+    now = time.time()
+    return timing_starts_at <= now < end_at
+
+
+def record(began, lifecycle_began=None):
+    """Keep one latency sample, unless it fell inside the discarded warmup.
+
+    Section 6.5 asks for the whole begin->commit lifecycle per operation, not only the time
+    inside execute(). Both are kept, separately, because a reader that spends its cost opening
+    and releasing a snapshot would look free if only the statement were timed.
+    """
     global statements, timed_from
-    if time.monotonic() >= timing_starts:
+    if in_timed_window():
         if timed_from is None:
             timed_from = time.monotonic()
-        latency_ms.append((time.perf_counter() - began) * 1000.0)
+        elapsed_statement = (time.perf_counter() - began) * 1000.0
+        latency_ms.append(elapsed_statement)
+        statement_ms.append(elapsed_statement)
+        if lifecycle_began is not None:
+            lifecycle_ms.append((time.perf_counter() - lifecycle_began) * 1000.0)
         statements += 1
 
 
-def one_read(execute, table):
-    """One statement, timed; returns its rows."""
+def one_read(execute, table, autocommit=False):
+    """One statement, timed; returns its rows.
+
+    For an autocommit read the call IS the whole lifecycle (begin, execute, commit), so the
+    two timings coincide. Inside an explicit transaction the caller passes its own begin.
+    """
     began = time.perf_counter()
     rows = execute(
         "MATCH (n:%s) RETURN n.id, n.owner ORDER BY n.id LIMIT 100" % table
     ).rows
-    record(began)
+    record(began, lifecycle_began=began if autocommit else None)
     return rows
 
 
@@ -400,7 +499,7 @@ if shape == "long":
     reader = db.begin("read")
     table = tables[0]
     long_first = sorted(one_read(reader.execute, table))
-    while time.monotonic() < deadline:
+    while window_is_open():
         time.sleep(0.25)
         try:
             again = sorted(one_read(reader.execute, table))
@@ -414,19 +513,19 @@ if shape == "long":
             break
     reader.rollback()
 else:
-    while time.monotonic() < deadline:
+    while window_is_open():
         table = rnd.choice(tables)
         try:
             if shape == "autocommit":
                 # Database.execute = begin+execute+commit, the shape measure_concurrency
                 # leaves outside its timers (roadmap 6.5).
-                one_read(db.execute, table)
+                one_read(db.execute, table, autocommit=True)
                 began = time.perf_counter()
                 first = db.execute("MATCH (n:%s) RETURN count(*)" % table).rows[0][0]
-                record(began)
+                record(began, lifecycle_began=began)
                 began = time.perf_counter()
                 second = db.execute("MATCH (n:%s) RETURN count(*)" % table).rows[0][0]
-                record(began)
+                record(began, lifecycle_began=began)
                 # Rows are only ever added, never deleted, so a count that SHRANK between two
                 # autocommit reads is a committed row that went missing.
                 if second < first:
@@ -437,14 +536,18 @@ else:
                 # so the disjoint regime traverses ITS writer's edges rather than a name that
                 # does not exist in this database.
                 edge = edges[tables.index(table)] if len(edges) == len(tables) else edges[0]
+                lifecycle_began = time.perf_counter()
                 reader = db.begin("read")
                 try:
                     began = time.perf_counter()
+                    # The read-only shape of delete_edges: select exactly the edges a delete
+                    # would remove, by endpoint, and remove nothing. A bare one-hop MATCH
+                    # would exercise a cheaper plan than the family it stands for.
                     rows = reader.execute(
-                        "MATCH (a:%s)-[r:%s]->(b) RETURN a.id, b.id LIMIT 100"
-                        % (table, edge)
+                        "MATCH (a:%s)-[r:%s]->(b:%s) WHERE a.live = true "
+                        "RETURN a.id, b.id, r.w LIMIT 100" % (table, edge, table)
                     ).rows
-                    record(began)
+                    record(began, lifecycle_began=lifecycle_began)
                     if len(rows) != len(set(rows)):
                         torn.append({"kind": "duplicate_rows", "rows": len(rows)})
                 finally:
@@ -478,6 +581,8 @@ db.close()
 pathlib.Path(out).write_text(json.dumps({
     "role": "reader", "slot": slot, "shape": shape, "tables_read": tables,
     "latency_ms": latency_ms, "statements": statements, "torn": torn,
+    "lifecycle_ms": lifecycle_ms, "statement_ms": statement_ms,
+    "window": {"start_at": start_at, "end_at": end_at, "warmup": warmup},
     "elapsed_seconds": elapsed, "escapes": escapes, "refusals": refusals,
     "long_scans": long_scans, "warmup_seconds": warmup,
     "metrics": metrics, "metrics_error": metrics_error,
@@ -574,6 +679,102 @@ print(json.dumps({
 }), flush=True)
 '''
 
+SERIAL_ORACLE_CHILD = r'''
+import json, sys
+SRC = sys.argv[1]
+sys.path.insert(0, SRC)
+__PIN_GUARD__
+from okto_grafx import connect
+
+root, tables_json, edges_json = sys.argv[2], sys.argv[3], sys.argv[4]
+quiet, quiet_rows, log_path = sys.argv[5], int(sys.argv[6]), sys.argv[7]
+tables = json.loads(tables_json)
+edge_tables = json.loads(edges_json)
+operations = json.loads(open(log_path, encoding="utf-8").read())
+
+# A FRESH database, and the acknowledged operations replayed one at a time in one process.
+# Whatever this produces is what a serial execution of the same list would have produced, so
+# comparing it against the concurrent database answers "zero wrong answers" directly.
+db = connect(root)
+with db.begin("write") as txn:
+    for name in list(tables) + [quiet]:
+        txn.execute(
+            "CREATE NODE TABLE %s(id INT64, owner INT64, body STRING, live BOOL, "
+            "PRIMARY KEY(id))" % name
+        )
+with db.begin("write") as txn:
+    for position, name in enumerate(edge_tables):
+        source = tables[position] if position < len(tables) else tables[0]
+        txn.execute("CREATE REL TABLE %s(FROM %s TO %s, w INT64)" % (name, source, source))
+with db.begin("write") as txn:
+    for offset in range(quiet_rows):
+        txn.execute(
+            "CREATE (:%s {id: $i, owner: 0, body: 'q', live: true})" % quiet,
+            {"i": 900_000_000 + offset},
+        )
+
+replayed = 0
+for entry in operations:
+    kind = entry[0]
+    with db.begin("write") as txn:
+        if kind == "create_node":
+            _kind, table, keys, owner = entry
+            for key in keys:
+                txn.execute(
+                    "CREATE (:%s {id: $i, owner: $o, body: $b, live: true})" % table,
+                    {"i": key, "o": owner, "b": "n" * 96},
+                )
+        elif kind == "create_edge":
+            _kind, table, edge, source, target = entry
+            txn.execute(
+                "MATCH (a:%s), (b:%s) WHERE a.id = $a AND b.id = $b "
+                "CREATE (a)-[:%s {w: 1}]->(b)" % (table, table, edge),
+                {"a": source, "b": target},
+            )
+        elif kind == "update_node":
+            _kind, table, key, owner = entry
+            txn.execute("MATCH (n:%s) WHERE n.id = $k SET n.owner = $o" % table,
+                        {"k": key, "o": owner})
+        elif kind == "mark_superseded":
+            _kind, table, key = entry
+            txn.execute("MATCH (n:%s) WHERE n.id = $k SET n.live = false" % table,
+                        {"k": key})
+        else:
+            raise SystemExit("unknown operation in the acknowledged list: " + repr(kind))
+    replayed += 1
+
+stored = []
+owner = {}
+superseded = []
+edges = []
+for table in list(tables) + [quiet]:
+    for row in db.execute("MATCH (n:%s) RETURN n.id, n.owner, n.live" % table).rows:
+        key = int(row[0])
+        stored.append(key)
+        owner[str(key)] = row[1]
+        if row[2] is False:
+            superseded.append(key)
+for position, edge_table in enumerate(edge_tables):
+    source = tables[position] if position < len(tables) else tables[0]
+    for row in db.execute(
+        "MATCH (a:%s)-[r:%s]->(b) RETURN a.id, b.id" % (source, edge_table)
+    ).rows:
+        edges.append([int(row[0]), int(row[1])])
+report = db.verify("all")
+db.close()
+
+print(json.dumps({
+    "mode": "serial",
+    "replayed": replayed,
+    "stored": stored,
+    "owner": owner,
+    "superseded": superseded,
+    "edges": edges,
+    "findings": len(report.findings),
+    "clean": report.clean,
+}), flush=True)
+'''
+
 AUDITOR_CHILD = r'''
 import json, os, pathlib, sys, time
 SRC = sys.argv[1]
@@ -643,7 +844,7 @@ print(json.dumps({"ok": True}), flush=True)
 
 
 for _name in ("WRITER_CHILD", "READER_CHILD", "BOOTSTRAP_CHILD", "ORACLE_CHILD",
-              "AUDITOR_CHILD"):
+              "AUDITOR_CHILD", "SERIAL_ORACLE_CHILD"):
     globals()[_name] = globals()[_name].replace("__PIN_GUARD__", PIN_GUARD)
 del _name
 
@@ -768,6 +969,35 @@ def gather_metrics(reports: list[dict]) -> dict:
     }
 
 
+def official_shortfalls(opts: argparse.Namespace) -> list[str]:
+    """Return every reason this run is not the official one; empty means it is.
+
+    official = bool(board_template) was too permissive. A run on a copied board is still not
+    the official run if nobody vouched the machine was idle, if the digest was never checked
+    against an expected value, or if the measured checkout was dirty -- each of those makes
+    the number unattributable, which is the same as not having it.
+    """
+    unmet = []
+    if not opts.board_template:
+        unmet.append(
+            "synthetic board: section 6 requires the official run to start from a relocated "
+            "copy of a real board (--board-template)"
+        )
+    elif not opts.board_digest:
+        unmet.append(
+            "--board-digest was not given, so the template was never authenticated against "
+            "an expected content digest"
+        )
+    if not opts.machine_idle_asserted:
+        unmet.append("--machine-idle-asserted was not given (H5)")
+    source = describe_repository(pathlib.Path(opts.src).resolve())
+    if not source.get("src_tests_clean"):
+        unmet.append("the measured checkout has uncommitted changes under src/ or tests/")
+    if not source.get("commit"):
+        unmet.append("the measured source root is not inside a git checkout, so it has no pin")
+    return unmet
+
+
 def plan_tables(writers: int, regime: str, reader_target: str) -> tuple[list, list, list]:
     """Return (writer node tables, writer edge tables, tables the readers read)."""
     if regime == "hot":
@@ -788,7 +1018,9 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
              expected_owner: dict | None = None,
              expected_superseded: list | None = None,
              expected_edges: list | None = None,
-             writer_span: float = 0.0, reader_window: float = 0.0) -> list[dict]:
+             writer_span: float = 0.0, reader_window: float = 0.0,
+             commits_outside_window: int = 0, serial: dict | None = None,
+             serial_operations: int = 0) -> list[dict]:
     """Judge one cell from its collected observations, and return the criteria list.
 
     This is deliberately a PURE function of the observations. The scenarios that matter most
@@ -845,6 +1077,15 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
             "bound": ">= 0.9 of the reader window had a writer present; below that, the "
                      "labelled rate is not the rate the reader felt",
         })
+    # A commit that landed after the readers stopped is a real commit, but it is not part
+    # of this measurement. Counting it would inflate the rate the reader is said to have felt,
+    # and the fix is to refuse the point rather than to invent a tolerance for it.
+    criteria.append({
+        "name": "no_commit_landed_outside_the_window",
+        "pass": commits_outside_window == 0,
+        "observed": commits_outside_window,
+        "bound": "0 commits outside the shared measured window",
+    })
     criteria.append({"name": "no_acknowledged_row_lost", "pass": oracle_ok and not lost,
                      "observed": lost[:8], "bound": "acknowledged is a subset of stored"})
     criteria.append({"name": "no_phantom_row", "pass": oracle_ok and not phantom,
@@ -932,6 +1173,59 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
             "bound": "the stored edges are exactly the pairs a committed create_edge made",
         })
 
+    # THE SERIAL ORACLE: the same acknowledged operations, run one at a time in one process.
+    # If the concurrent database disagrees with that, the protocol produced an answer no
+    # serial execution could have produced, which is the definition of a wrong answer.
+    if serial is not None:
+        ran = not serial.get("child_failed")
+        differences = {}
+        if ran and oracle_ok:
+            for field in ("stored", "superseded"):
+                concurrent = sorted(live.get(field, []))
+                replayed = sorted(serial.get(field, []))
+                if concurrent != replayed:
+                    differences[field] = {
+                        "only_concurrent": sorted(set(concurrent) - set(replayed))[:6],
+                        "only_serial": sorted(set(replayed) - set(concurrent))[:6],
+                    }
+            if live.get("owner") != serial.get("owner"):
+                wrong_owner = {key: {"concurrent": value,
+                                     "serial": serial.get("owner", {}).get(key)}
+                               for key, value in (live.get("owner") or {}).items()
+                               if serial.get("owner", {}).get(key) != value}
+                differences["owner"] = dict(list(wrong_owner.items())[:6])
+            concurrent_edges = sorted(map(list, live.get("edges", [])))
+            replayed_edges = sorted(map(list, serial.get("edges", [])))
+            if concurrent_edges != replayed_edges:
+                differences["edges"] = {"concurrent": len(concurrent_edges),
+                                        "serial": len(replayed_edges)}
+        criteria.append({
+            "name": "serial_oracle_agrees_on_every_answer",
+            "pass": ran and oracle_ok and not differences,
+            "observed": {"replayed_operations": serial.get("replayed"),
+                         "operations_supplied": serial_operations,
+                         "child_failed": bool(serial.get("child_failed")),
+                         "differences": differences},
+            "bound": "0 wrong answers: replaying the acknowledged operation list serially "
+                     "reproduces the concurrent database exactly",
+        })
+        # At rate 0 the writer is COMMANDED idle, so an empty list is the right answer and
+        # not an empty measurement. Everywhere else an empty list would mean the oracle
+        # certified nothing while appearing to agree with everything.
+        expected_some = rate != 0.0
+        criteria.append({
+            "name": "serial_oracle_replayed_every_acknowledged_operation",
+            "pass": (ran and serial.get("replayed") == serial_operations
+                     and (serial_operations > 0 if expected_some else serial_operations == 0)),
+            "observed": {"replayed": serial.get("replayed"),
+                         "supplied": serial_operations,
+                         "operations_expected": "some" if expected_some
+                         else "none, the writer was commanded idle"},
+            "bound": ("every acknowledged operation was replayed, and there was at least one"
+                      if expected_some else
+                      "no operations, because rate 0 commands an idle writer"),
+        })
+
     # The two passes look at the same database from two different vantage points. If they
     # disagree, one of them is wrong and the run cannot certify anything.
     if oracle_ok and not cold.get("child_failed"):
@@ -990,23 +1284,28 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
         template = pathlib.Path(opts.board_template).resolve()
         refuse_a_certified_board(template)
         refuse_a_certified_board(container)
+        source_digest = hash_board(template)
         shutil.copytree(template, root)
+        copy_digest = hash_board(root)
         board_manifest = {
             "template": str(template),
-            "files": len(hash_board(root)),
-            "sha256_by_file": hash_board(root),
-            "identical_to_template": hash_board(root) == hash_board(template),
+            "template_digest": source_digest,
+            "copy_digest": copy_digest,
+            "copy_is_identical": copy_digest["digest"] == source_digest["digest"],
+            "expected_digest": opts.board_digest,
+            "matches_expected_digest": (None if not opts.board_digest
+                                        else source_digest["digest"] == opts.board_digest),
         }
     else:
         root.mkdir(parents=True, exist_ok=True)
     processes: list[tuple[str, subprocess.Popen]] = []
     criteria: list[dict] = []
     done_path = reports_dir / "auditor-done.flag"
+    barrier_path = reports_dir / "start-barrier.json"
+    unmet = official_shortfalls(opts)
     identity = {
-        "official": bool(opts.board_template),
-        "not_official_because": None if opts.board_template else
-        "synthetic board: section 6 requires an official run to start from a relocated copy "
-        "of a real board (--board-template). This cell proves the instrument, not a result.",
+        "official": not unmet,
+        "not_official_because": unmet or None,
         "writers": writers, "readers": readers, "regime": regime, "reader_shape": shape,
         "reader_target": reader_target,
         "foreign_commit_rate": rate,
@@ -1069,6 +1368,7 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
                 "1" if opts.reopen_on_stale_index else "0",
                 str(reports_dir / f"writer-{slot}.json"),
                 str(reports_dir / f"metrics-writer-{slot}.json"),
+                str(reports_dir / f"ready-writer-{slot}.json"), str(barrier_path),
             ])))
         for slot in range(1, readers + 1):
             duration = opts.long_reader_seconds if shape == "long" else opts.seconds
@@ -1077,7 +1377,32 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
                 json.dumps(read_tables), json.dumps(read_edges), str(opts.warmup_seconds),
                 str(reports_dir / f"reader-{slot}.json"),
                 str(reports_dir / f"metrics-reader-{slot}.json"),
+                str(reports_dir / f"ready-reader-{slot}.json"), str(barrier_path),
             ])))
+
+        # Every participant is up and waiting. Opening the window now, from one place, is
+        # what makes the per-process numbers comparable: spawning is sequential, and a
+        # process that started measuring at spawn would carry that stagger into the curve.
+        expected_ready = ([f"ready-writer-{slot}.json" for slot in range(1, writers + 1)]
+                          + [f"ready-reader-{slot}.json" for slot in range(1, readers + 1)])
+        barrier_deadline = time.monotonic() + CHILD_TIMEOUT
+        missing_ready = list(expected_ready)
+        while missing_ready and time.monotonic() < barrier_deadline:
+            missing_ready = [name for name in expected_ready
+                             if not (reports_dir / name).is_file()]
+            if not missing_ready:
+                break
+            if any(process.poll() is not None for label, process in processes
+                   if label != "auditor"):
+                break
+            time.sleep(0.02)
+        window_starts_at = time.time() + 0.25
+        window_ends_at = window_starts_at + writer_seconds
+        barrier_path.write_text(json.dumps({
+            "start_at": window_starts_at, "end_at": window_ends_at,
+            "warmup": opts.warmup_seconds, "participants": len(expected_ready),
+            "ready_before_start": not missing_ready,
+        }), encoding="utf-8")
 
         # Reap the writers and readers first; the auditor is still holding its handle open.
         participants = [entry for entry in processes if entry[0] != "auditor"]
@@ -1124,6 +1449,26 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
         cold = run_child(ORACLE_CHILD, [opts.src, str(root), json.dumps(every_table),
                                         "cold", json.dumps(every_edge)])
 
+        # THE SERIAL ORACLE. Section 6 asks for a serial run of the same operation list, not
+        # a comparison of final ids. The acknowledged operations are replayed one at a time
+        # into a fresh database and the whole resulting state is compared.
+        #
+        # Concatenating the per-writer logs in slot order IS a valid serialisation: every
+        # writer owns a disjoint key range (base = slot * 1_000_000) and only ever touches its
+        # own keys, even in the hot-table regime where the tables are shared. Operations of
+        # different writers therefore commute, while each writer's own order is preserved by
+        # the concatenation. test_the_serial_replay_order_is_a_valid_serialisation pins that
+        # premise so it cannot quietly stop being true.
+        serial_log = []
+        for report in sorted(writer_reports, key=lambda item: item["slot"]):
+            serial_log.extend(report.get("operations", []))
+        log_path = reports_dir / "serial-operations.json"
+        log_path.write_text(json.dumps(serial_log), encoding="utf-8")
+        serial = run_child(SERIAL_ORACLE_CHILD, [
+            opts.src, str(container / "serial-db"), json.dumps(tables),
+            json.dumps(edges), QUIET_TABLE, str(QUIET_SEED_ROWS), str(log_path),
+        ])
+
         acknowledged = set(seeded)
         expected_owner: dict[str, object] = {str(key): 0 for key in seeded}
         expected_superseded: list = []
@@ -1145,10 +1490,12 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
         commits = sum(report.get("commits", 0) for report in writer_reports)
         statements = sum(report.get("statements", 0) for report in reader_reports)
 
-        writer_window = max([report.get("elapsed_seconds", 0.0)
-                             for report in writer_reports] or [0.0])
-        reader_window = max([report.get("elapsed_seconds", 0.0)
-                             for report in reader_reports] or [0.0])
+        # ONE denominator for everybody. Per-process elapsed times differ by scheduling
+        # noise, and dividing each process by its own would let a slow starter report a
+        # higher rate than it delivered.
+        global_window = max(0.0, window_ends_at - (window_starts_at + opts.warmup_seconds))
+        writer_window = global_window
+        reader_window = global_window
         writer_span = max([report.get("active_span_seconds", 0.0)
                            for report in writer_reports] or [0.0])
         criteria = evaluate(
@@ -1159,8 +1506,11 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
             escapes=escapes, durable=durable, reopens=reopens,
             commits=commits, statements=statements,
             expected_owner=expected_owner, expected_superseded=expected_superseded,
-            expected_edges=expected_edges,
+            expected_edges=expected_edges, serial=serial,
+            serial_operations=len(serial_log),
             writer_span=writer_span, reader_window=reader_window,
+            commits_outside_window=sum(report.get("commits_outside_window", 0)
+                                       for report in writer_reports),
         )
 
         return {
@@ -1170,8 +1520,11 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
                 if writer_window else None,
                 "reader_statements_per_second": round(statements / reader_window, 3)
                 if reader_window else None,
+                "shared_timed_window_seconds": round(global_window, 3),
                 "writer_timed_window_seconds": round(writer_window, 3),
                 "reader_timed_window_seconds": round(reader_window, 3),
+                "commits_landing_outside_the_window": sum(
+                    report.get("commits_outside_window", 0) for report in writer_reports),
                 "writer_active_span_seconds": round(writer_span, 3),
                 # The rate the READER actually experienced, over the reader's own window --
                 # not the writer's self-reported rate over whatever window it happened to use.
@@ -1192,8 +1545,25 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
                 report["slot"]: profile(report.get("latency_ms", []))
                 for report in reader_reports
             },
+            # Section 6.5 asks for the whole begin->commit lifecycle per operation. A reader
+            # whose cost sits in opening and releasing the snapshot would look free if only
+            # the statement were timed, so the two are reported side by side.
+            "reader_lifecycle_ms_per_process": {
+                report["slot"]: profile(report.get("lifecycle_ms", []))
+                for report in reader_reports
+            },
+            "reader_statement_ms_per_process": {
+                report["slot"]: profile(report.get("statement_ms", []))
+                for report in reader_reports
+            },
             "tables": {"written": tables, "read": read_tables, "quiet": QUIET_TABLE},
             "board": board_manifest or {"synthetic": True},
+            "window": {
+                "start_at": window_starts_at, "end_at": window_ends_at,
+                "warmup_seconds": opts.warmup_seconds,
+                "every_participant_was_ready_before_the_start": not missing_ready,
+                "participants_never_ready": missing_ready,
+            },
             "layout": {
                 "database_root": str(root),
                 "reports_root": str(reports_dir),
@@ -1271,13 +1641,66 @@ def refuse_a_certified_board(where: pathlib.Path) -> None:
 
 
 def hash_board(where: pathlib.Path) -> dict:
-    """Return a per-file sha256 manifest of a board, so a copy can be proven identical."""
-    manifest = {}
+    """Return one digest over a whole board, plus its file count and byte total.
+
+    The digest is sha256 over ``relpath\0size\0sha256(bytes)\n`` per file in sorted order,
+    which is the algorithm the existing recorded digests were produced with, so a value here
+    can be compared against one recorded earlier instead of merely against itself.
+    """
+    running = hashlib.sha256()
+    files = 0
+    total = 0
     for item in sorted(pathlib.Path(where).rglob("*")):
-        if item.is_file():
-            digest = hashlib.sha256(item.read_bytes()).hexdigest()
-            manifest[str(item.relative_to(where)).replace("\\", "/")] = digest
-    return manifest
+        if not item.is_file():
+            continue
+        payload = item.read_bytes()
+        relative = str(item.relative_to(where)).replace("\\", "/")
+        running.update(
+            f"{relative}\0{len(payload)}\0{hashlib.sha256(payload).hexdigest()}\n".encode()
+        )
+        files += 1
+        total += len(payload)
+    return {"digest": running.hexdigest(), "files": files, "bytes": total}
+
+
+def cpu_percent(sample_seconds: float = 2.0) -> object:
+    """Return CPU utilisation as a percentage, or an explicit reason it could not be read.
+
+    A load average is not what H5 asks for and is not even the same quantity on Windows, so
+    this samples utilisation directly: psutil when it is installed, typeperf otherwise. An
+    invented figure would be worse than an absent one, so failure is reported, never guessed.
+    """
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        try:
+            return {"percent": psutil.cpu_percent(interval=sample_seconds),
+                    "source": "psutil.cpu_percent"}
+        except BaseException as failure:
+            return {"unavailable": f"psutil failed: {type(failure).__name__}"}
+    if sys.platform == "win32":
+        try:
+            sampled = subprocess.run(
+                ["typeperf", r"\Processor(_Total)\% Processor Time", "-sc", "2"],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            readings = []
+            for line in sampled.stdout.splitlines():
+                fields = [field.strip('"') for field in line.strip().split('","')]
+                if len(fields) >= 2:
+                    try:
+                        readings.append(float(fields[-1].strip('"')))
+                    except ValueError:
+                        continue
+            if readings:
+                return {"percent": round(readings[-1], 2), "source": "typeperf"}
+            return {"unavailable": "typeperf produced no numeric reading"}
+        except BaseException as failure:
+            return {"unavailable": f"typeperf failed: {type(failure).__name__}"}
+    return {"unavailable": "no CPU utilisation source on this platform "
+                           "(psutil is not installed and typeperf is Windows-only)"}
 
 
 def machine_evidence() -> dict:
@@ -1287,12 +1710,7 @@ def machine_evidence() -> dict:
     invented for the report would be worse than an absent one.
     """
     evidence: dict[str, object] = {"cpu_count": os.cpu_count()}
-    try:
-        evidence["load_average_1m"] = os.getloadavg()[0]
-    except (AttributeError, OSError) as absent:
-        evidence["load_average_1m"] = {
-            "unavailable": f"os.getloadavg is not available on this platform ({absent})"
-        }
+    evidence["cpu_percent"] = cpu_percent()
     try:
         if sys.platform == "win32":
             listed = subprocess.run(
@@ -1312,6 +1730,19 @@ def machine_evidence() -> dict:
             "unavailable": f"could not enumerate processes: {type(failure).__name__}"
         }
     return evidence
+
+
+def package_versions() -> dict:
+    """Record the versions that change the numbers: the accelerators and numpy."""
+    from importlib import metadata
+
+    found = {}
+    for name in ("numpy", "google-crc32c", "okto-grafx-accel", "psutil"):
+        try:
+            found[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            found[name] = None
+    return found
 
 
 def provenance(opts: argparse.Namespace) -> dict:
@@ -1339,6 +1770,7 @@ def provenance(opts: argparse.Namespace) -> dict:
         "script_and_source_are_the_same_checkout": same,
         "python_executable": sys.executable,
         "python_version": platform.python_version(),
+        "packages": package_versions(),
         "repository": script_repo["path"],
         "script_sha256": hashlib.sha256(script_path.read_bytes()).hexdigest(),
         "source_root": opts.src,
@@ -1378,10 +1810,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--src", required=True,
                         help="src/ root every child must import okto_grafx from (A94 pin)")
-    parser.add_argument("--case", default="ce3-2proc", choices=("matrix", "ce3-2proc"),
-                        help="ce3-2proc (default): the finite 2-process subcase that decides "
-                             "CE-3 -- 2 reader targets x 3 frozen rates. "
-                             "matrix: the full frozen N x M sweep (LONG; not for a smoke run)")
+    parser.add_argument("--case", default="f1-curve-2proc",
+                        choices=("matrix", "f1-curve-2proc", "ce3-2proc"),
+                        help="f1-curve-2proc (default): the finite 2-process subcase -- the "
+                             "frozen rate curve crossed with the same-table / "
+                             "unrelated-table discriminant. It INFORMS the CE-3 decision; it "
+                             "is NOT the literal section 5b CE-3 gate, which needs the twelve "
+                             "warm families on an M7 copy and is not implemented here. "
+                             "'ce3-2proc' is accepted as an alias for the same thing and is "
+                             "deprecated, because the name overclaimed. "
+                             "matrix: the full frozen N x M sweep (LONG; not a smoke run)")
     parser.add_argument("--writers", type=int, default=None,
                         help="override N for a short run; the matrix uses the frozen set")
     parser.add_argument("--readers", type=int, default=None, help="override M for a short run")
@@ -1426,6 +1864,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "labelled official=false. Any path under an m7-cert-* or "
                              "m7-gate-* board is REFUSED: those are forensic evidence and "
                              "opening one replays its WAL over the state it certifies")
+    parser.add_argument("--board-digest", default=None,
+                        help="the digest --board-template is expected to have, as sha256 over "
+                             "relpath\\0size\\0sha256(bytes) per file in sorted order. An "
+                             "official run must authenticate its template against a value "
+                             "recorded beforehand, not merely against itself")
     parser.add_argument("--machine-idle-asserted", action="store_true",
                         help="operator asserts the machine was idle; recorded in provenance")
     parser.add_argument("--reopen-on-stale-index", action="store_true",
@@ -1445,7 +1888,7 @@ def select_cells(opts: argparse.Namespace) -> list[tuple]:
     """Return (writers, readers, regime, shape, reader_target, rate) for every cell to run."""
     rates = ([opts.foreign_commit_rate] if opts.foreign_commit_rate is not None
              else list(FROZEN_FOREIGN_COMMIT_RATES))
-    if opts.case == "ce3-2proc":
+    if opts.case in ("f1-curve-2proc", "ce3-2proc"):
         # Two processes exactly: one writer, one reader. The pair that decides CE-3 is
         # unrelated-table against same-table, swept across the frozen rate curve.
         targets = [opts.reader_target] if opts.reader_target else list(FROZEN_READER_TARGETS)
@@ -1544,11 +1987,23 @@ def main(argv: list[str] | None = None) -> int:
             "seed": opts.seed,
         },
         "not_implemented_here": {
-            "F2": "phase timers", "F3": "takeover and fairness",
+            "F2": "phase timers",
+            "F3": "takeover and fairness",
+            "F4": "PARTIAL. The multi-process scenarios this tool runs are writers and "
+                  "readers over one database with a serial oracle. The full F4 scenario list "
+                  "is not covered and no claim is made that it is.",
             "F5": "Ladybug capacity comparison",
+            "CE-3 literal (section 5b)": "NOT IMPLEMENTED. The literal form is participant A "
+                  "running the twelve warm M7 families against a copy of the M7 board while "
+                  "participant B commits a small write to the same or an unrelated table, "
+                  "reported as RAW per operation with the _read_page / _still_names hooks. "
+                  "The two-process case here is the F1 rate curve plus ONE CE-3 "
+                  "discriminant (same-table vs unrelated-table); it is not the CE-3 gate and "
+                  "must not be read as one.",
         },
         "case": opts.case,
-        "official": bool(opts.board_template),
+        "official": not official_shortfalls(opts),
+        "not_official_because": official_shortfalls(opts) or None,
         "cells": [run_case(opts, *cell) for cell in cells],
     }
     report["machine_after"] = machine_evidence()

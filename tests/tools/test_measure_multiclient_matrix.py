@@ -506,8 +506,159 @@ def test_a_synthetic_run_is_labelled_not_official(tmp_path: Path) -> None:
     cell = run_case(opts, 1, 1, "disjoint", "autocommit", "same-table", 1.0)
 
     assert cell["official"] is False
-    assert "relocated copy" in cell["not_official_because"]
+    # Every reason is named, not just the first one, so nobody has to re-derive the rest.
+    reasons = cell["not_official_because"]
+    assert any("relocated copy" in reason for reason in reasons)
+    assert any("machine-idle-asserted" in reason for reason in reasons)
     assert cell["pass"] is False
+
+
+def test_the_serial_oracle_catches_an_answer_no_serial_run_could_have_produced() -> None:
+    """Section 6 asks for a serial run of the SAME operation list, with zero wrong answers."""
+    serial = {**LEDGER, "replayed": 3, "clean": True}
+
+    agreeing = evaluate(**observations(serial=serial, serial_operations=3))
+    assert failed(agreeing) == []
+
+    # The concurrent database kept an owner value the serial replay never produces.
+    disagreeing = evaluate(**observations(
+        serial={**serial, "owner": {"1": 5, "2": 5, "3": 0}}, serial_operations=3))
+    assert "serial_oracle_agrees_on_every_answer" in failed(disagreeing)
+
+    lost_serially = evaluate(**observations(
+        serial={**serial, "stored": [1, 2]}, serial_operations=3))
+    assert "serial_oracle_agrees_on_every_answer" in failed(lost_serially)
+
+    edges_differ = evaluate(**observations(
+        serial={**serial, "edges": []}, serial_operations=3))
+    assert "serial_oracle_agrees_on_every_answer" in failed(edges_differ)
+
+
+def test_a_serial_oracle_that_did_not_run_the_whole_list_cannot_certify_it() -> None:
+    """A replay that stopped early agrees with everything it never got to."""
+    partial = evaluate(**observations(
+        serial={**LEDGER, "replayed": 1, "clean": True}, serial_operations=40))
+    assert "serial_oracle_replayed_every_acknowledged_operation" in failed(partial)
+
+    empty = evaluate(**observations(
+        serial={**LEDGER, "replayed": 0, "clean": True}, serial_operations=0))
+    assert "serial_oracle_replayed_every_acknowledged_operation" in failed(empty)
+
+    # Unless the writer was COMMANDED idle, where an empty list is the right answer rather
+    # than an oracle that certified nothing while appearing to agree with everything.
+    idle = evaluate(**observations(
+        rate=0.0, commits=0,
+        serial={**LEDGER, "replayed": 0, "clean": True}, serial_operations=0))
+    assert "serial_oracle_replayed_every_acknowledged_operation" not in failed(idle)
+
+    died = evaluate(**observations(serial={"child_failed": True}, serial_operations=3))
+    names = failed(died)
+    assert "serial_oracle_agrees_on_every_answer" in names
+    assert "serial_oracle_replayed_every_acknowledged_operation" in names
+
+
+def test_the_serial_replay_order_is_a_valid_serialisation() -> None:
+    """Concatenating per-writer logs is only sound because writers never share a key.
+
+    Each writer derives its keys from base = slot * 1_000_000 and touches nothing else, so
+    operations of different writers commute and each writer's own order survives the
+    concatenation. If that premise ever changes, the serial oracle silently starts comparing
+    against a state no execution could reach -- so the premise is pinned here.
+    """
+    from tools.measure_multiclient_matrix import WRITER_CHILD
+
+    assert "base = slot * 1_000_000" in WRITER_CHILD
+    # Every key a writer writes is derived from its own base.
+    assert "key = base + index * rows_per_txn + offset + 1" in WRITER_CHILD
+    # And the rows it later updates or supersedes come from that same list.
+    assert "update_key, update_owner = made_nodes[-1]" in WRITER_CHILD
+    assert "supersede_key = made_nodes[0]" in WRITER_CHILD
+
+    slots, rows = range(1, 9), 5000
+    ranges = [range(slot * 1_000_000 + 1, slot * 1_000_000 + rows) for slot in slots]
+    seen: set[int] = set()
+    for span in ranges:
+        assert not seen & set(span), "two writers would share a key"
+        seen |= set(span)
+
+
+def test_a_commit_landing_after_the_window_is_refused_rather_than_counted() -> None:
+    """At N=8 and 1/s aggregate a writer waits 8s between commits; one entered near the end
+    would otherwise land long after the readers stopped and inflate the rate they felt."""
+    late = evaluate(**observations(commits_outside_window=3))
+
+    assert "no_commit_landed_outside_the_window" in failed(late)
+    observed = next(item["observed"] for item in late
+                    if item["name"] == "no_commit_landed_outside_the_window")
+    assert observed == 3
+
+
+def test_official_is_a_conjunction_and_names_every_reason_it_failed(tmp_path: Path) -> None:
+    """bool(board_template) was too permissive: a copied board still gives an unattributable
+    number if nobody vouched the machine was idle or the digest was never authenticated."""
+    from tools.measure_multiclient_matrix import official_shortfalls
+
+    board = tmp_path / "board"
+    board.mkdir()
+
+    synthetic = build_parser().parse_args(["--src", str(SOURCE_ROOT)])
+    reasons = official_shortfalls(synthetic)
+    assert any("synthetic board" in reason for reason in reasons)
+    assert any("machine-idle-asserted" in reason for reason in reasons)
+
+    undigested = build_parser().parse_args(
+        ["--src", str(SOURCE_ROOT), "--board-template", str(board),
+         "--machine-idle-asserted"])
+    reasons = official_shortfalls(undigested)
+    assert any("board-digest" in reason for reason in reasons)
+    assert not any("synthetic board" in reason for reason in reasons)
+
+    # A source root outside any checkout has no pin, so its number cannot be attributed.
+    unpinned = build_parser().parse_args(
+        ["--src", str(tmp_path), "--board-template", str(board), "--board-digest", "abc",
+         "--machine-idle-asserted"])
+    assert any("no pin" in reason for reason in official_shortfalls(unpinned))
+
+
+def test_the_board_digest_uses_the_recorded_historical_algorithm(tmp_path: Path) -> None:
+    """sha256 over relpath\\0size\\0sha256(bytes) per file, sorted.
+
+    Pinned against an independently computed value so the digest can be compared with ones
+    recorded before this tool existed, rather than only with itself.
+    """
+    import hashlib
+
+    from tools.measure_multiclient_matrix import hash_board
+
+    board = tmp_path / "board"
+    (board / "inner").mkdir(parents=True)
+    (board / "a.dat").write_bytes(b"alpha")
+    (board / "inner" / "b.dat").write_bytes(b"beta!!")
+
+    expected = hashlib.sha256()
+    for relative, payload in (("a.dat", b"alpha"), ("inner/b.dat", b"beta!!")):
+        expected.update(
+            f"{relative}\0{len(payload)}\0{hashlib.sha256(payload).hexdigest()}\n".encode()
+        )
+
+    observed = hash_board(board)
+    assert observed["digest"] == expected.hexdigest()
+    assert observed["files"] == 2
+    assert observed["bytes"] == len(b"alpha") + len(b"beta!!")
+
+
+def test_the_report_declares_what_it_does_not_cover() -> None:
+    """The two-process case informs CE-3; it is not the section 5b gate, and F4 is partial."""
+    text = build_parser().format_help()
+
+    assert "f1-curve-2proc" in text
+    assert "NOT the literal section 5b CE-3 gate" in text
+    assert "deprecated" in text
+
+    # The deprecated alias still resolves to the same finite subcase.
+    alias = build_parser().parse_args(["--src", str(SOURCE_ROOT), "--case", "ce3-2proc"])
+    assert len(select_cells(alias)) == len(FROZEN_READER_TARGETS) * len(
+        FROZEN_FOREIGN_COMMIT_RATES)
 
 
 def test_the_machine_evidence_reports_what_it_cannot_observe(tmp_path: Path) -> None:
@@ -517,10 +668,15 @@ def test_the_machine_evidence_reports_what_it_cannot_observe(tmp_path: Path) -> 
     evidence = machine_evidence()
 
     assert isinstance(evidence["cpu_count"], int)
-    for key in ("load_average_1m", "python_processes"):
-        value = evidence[key]
-        # Either a real number, or a dict saying plainly that it could not be observed.
-        assert isinstance(value, (int, float)) or "unavailable" in value
+    # H5 asks for CPU utilisation, which is not a load average and is not even the same
+    # quantity on Windows. Either a real percentage with its source, or a named reason.
+    cpu = evidence["cpu_percent"]
+    assert "percent" in cpu or "unavailable" in cpu
+    if "percent" in cpu:
+        assert 0.0 <= cpu["percent"] <= 100.0 * (evidence["cpu_count"] or 1)
+        assert cpu["source"] in ("psutil.cpu_percent", "typeperf")
+    value = evidence["python_processes"]
+    assert isinstance(value, int) or "unavailable" in value
 
 
 def test_a_source_root_that_is_not_a_directory_is_refused(tmp_path: Path) -> None:
