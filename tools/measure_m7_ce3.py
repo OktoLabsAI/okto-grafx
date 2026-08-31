@@ -42,7 +42,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable, Mapping, Sequence
 
-SCHEMA = "okto-grafx.ce3-m7-multiprocess.v2"
+SCHEMA = "okto-grafx.ce3-m7-multiprocess.v3"
 PINNED_HARNESS_HEAD = "0dfb5269dd8531fd4db2679fc80b649c64bd9b09"
 PINNED_HARNESS_BLOB = "a02b86dce098ceec3fdbd10a820a4dd6f9e2a7b1"
 EXPECTED_OPERATION_SET_SHA256 = (
@@ -1140,7 +1140,11 @@ def _process_b_worker(
     _atomic_json(result, payload)
 
 
-async def _verify_async(config: Mapping[str, Any], workspace: Path) -> dict[str, Any]:
+async def _verify_async(
+    config: Mapping[str, Any],
+    workspace: Path,
+    profile_completion: Mapping[str, Any],
+) -> dict[str, Any]:
     harness, runner, backends, _fixtures, plan_info = _runtime(config)
     backend: Any = None
     try:
@@ -1149,18 +1153,44 @@ async def _verify_async(config: Mapping[str, Any], workspace: Path) -> dict[str,
         )
         verification = dict(await backend._verify_all())
         verification["clean"] = True
-        fingerprints = backend.observe_fingerprints()
+        complete = profile_completion.get("complete") is True
+        if complete:
+            try:
+                fingerprints = backend.observe_fingerprints()
+            except Exception as failure:
+                observation = {
+                    "status": "failed",
+                    "failure": _failure_payload(
+                        "whole_profile_observation", failure
+                    )["failure"],
+                }
+                status = "failed"
+            else:
+                observation = {
+                    "status": "passed",
+                    "fingerprints": fingerprints,
+                }
+                status = "passed"
+        else:
+            observation = {
+                "status": "not_applicable",
+                "reason": "process_a_profile_incomplete",
+                "expected_operations": profile_completion.get("expected_operations"),
+                "completed_operations": profile_completion.get("completed_operations"),
+            }
+            status = "passed"
         await backend.close()
         backend = None
         handle["closed_at_ns"] = time.perf_counter_ns()
         return {
             "role": "verifier",
-            "status": "passed",
+            "status": status,
             "pid": os.getpid(),
             "cold_open": True,
             "verify_scope": "all",
             "verification": verification,
-            "fingerprints": fingerprints,
+            "whole_profile_observation": observation,
+            "profile_completion": dict(profile_completion),
             "handle": handle,
             "operation_set_sha256": plan_info["digest"],
         }
@@ -1169,14 +1199,25 @@ async def _verify_async(config: Mapping[str, Any], workspace: Path) -> dict[str,
             await backend.close()
 
 
-def _verify_worker(config: dict[str, Any], workspace_text: str, result_text: str) -> None:
+def _verify_worker(
+    config: dict[str, Any],
+    workspace_text: str,
+    result_text: str,
+    profile_completion: dict[str, Any],
+) -> None:
     result = Path(result_text)
     try:
-        payload = asyncio.run(_verify_async(config, Path(workspace_text)))
+        payload = asyncio.run(
+            _verify_async(config, Path(workspace_text), profile_completion)
+        )
     except BaseException as failure:
         _atomic_json(result, _failure_payload("verifier", failure))
         raise
     _atomic_json(result, payload)
+    if payload.get("status") != "passed":
+        raise MeasurementRefused(
+            "whole-profile observation failed after structural verify(all) passed"
+        )
 
 
 def _read_child_result(path: Path, role: str) -> dict[str, Any]:
@@ -1573,6 +1614,71 @@ def _retry_evidence_is_consistent(participant: object, records: object) -> bool:
     )
 
 
+def _profile_completion(
+    process_a: Mapping[str, Any], per_family: object
+) -> dict[str, Any]:
+    """Prove whether whole-profile logical invariants are applicable.
+
+    ``observe_fingerprints`` describes the final PF5 state. It must not be applied to a retained
+    intermediate state after process A fails, but skipping it must never turn that failed
+    scenario into a pass. This certificate is derived from the exact operation-count,
+    family-order and postcondition evidence that already governs CE-3.
+    """
+
+    valid_per_family = (
+        isinstance(per_family, int)
+        and not isinstance(per_family, bool)
+        and per_family > 0
+    )
+    expected = (
+        int(per_family) * len(EXPECTED_FAMILIES)
+        if valid_per_family
+        else OFFICIAL_PER_FAMILY * len(EXPECTED_FAMILIES)
+    )
+    samples_value = process_a.get("samples")
+    samples_known = isinstance(samples_value, list)
+    samples = samples_value if samples_known else []
+    reasons: list[str] = []
+    if process_a.get("status") != "passed":
+        reasons.append("process_a_not_passed")
+    if not valid_per_family:
+        reasons.append("per_family_invalid")
+    if not samples_known or len(samples) != expected or not all(
+        isinstance(sample, Mapping) for sample in samples
+    ):
+        reasons.append("operation_set_incomplete")
+    if tuple(process_a.get("families", ())) != EXPECTED_FAMILIES:
+        reasons.append("family_set_or_order_changed")
+    if process_a.get("postconditions_passed") != expected or any(
+        sample.get("postcondition_status") != "passed"
+        for sample in samples
+        if isinstance(sample, Mapping)
+    ):
+        reasons.append("postconditions_incomplete")
+    expected_per_family = int(per_family) if valid_per_family else OFFICIAL_PER_FAMILY
+    if any(
+        sum(
+            isinstance(sample, Mapping) and sample.get("family") == family
+            for sample in samples
+        )
+        != expected_per_family
+        for family in EXPECTED_FAMILIES
+    ):
+        reasons.append("family_sample_counts_changed")
+    operation_set = process_a.get("operation_set_sha256")
+    if not isinstance(operation_set, str) or not operation_set:
+        reasons.append("operation_set_digest_missing")
+    elif per_family == OFFICIAL_PER_FAMILY and operation_set != EXPECTED_OPERATION_SET_SHA256:
+        reasons.append("operation_set_digest_mismatch")
+    return {
+        "status": "complete" if not reasons else "incomplete",
+        "complete": not reasons,
+        "expected_operations": expected,
+        "completed_operations": len(samples) if samples_known else None,
+        "reasons": reasons,
+    }
+
+
 def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
     """Fail-closed criteria; tests mutate each evidence surface independently."""
 
@@ -1606,6 +1712,37 @@ def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
         if isinstance(per_family, int) and not isinstance(per_family, bool) and per_family > 0
         else OFFICIAL_PER_FAMILY * len(EXPECTED_FAMILIES)
     )
+    profile_completion = _profile_completion(a, per_family)
+    if (
+        result.get("profile_completion") != profile_completion
+        or verifier.get("profile_completion") != profile_completion
+    ):
+        shortfalls.append("profile_completion_evidence_inconsistent")
+    if any(
+        reason in {"operation_set_digest_missing", "operation_set_digest_mismatch"}
+        for reason in profile_completion["reasons"]
+    ):
+        shortfalls.append("profile_completion_digest_invalid")
+    observation = verifier.get("whole_profile_observation", {})
+    if profile_completion["complete"]:
+        if (
+            not isinstance(observation, Mapping)
+            or observation.get("status") != "passed"
+            or not isinstance(observation.get("fingerprints"), Mapping)
+            or not observation["fingerprints"]
+        ):
+            shortfalls.append("whole_profile_observation_failed")
+    else:
+        expected_not_applicable = {
+            "status": "not_applicable",
+            "reason": "process_a_profile_incomplete",
+            "expected_operations": profile_completion["expected_operations"],
+            "completed_operations": profile_completion["completed_operations"],
+        }
+        if observation != expected_not_applicable:
+            shortfalls.append(
+                "incomplete_profile_observation_not_marked_not_applicable"
+            )
     if len(a.get("samples", [])) != expected_samples:
         shortfalls.append("a_did_not_run_exact_pf5")
     if tuple(a.get("families", ())) != EXPECTED_FAMILIES:
@@ -2081,10 +2218,16 @@ def _run_scenario(
         a = _failure_payload("A", MeasurementRefused(f"unexpected exit code {process_a.exitcode}"))
     if process_b.exitcode != 0 and b.get("status") == "passed":
         b = _failure_payload("B", MeasurementRefused(f"unexpected exit code {process_b.exitcode}"))
+    profile_completion = _profile_completion(a, int(config["per_family"]))
     verifier_process = context.Process(
         target=_verify_worker,
         name=f"ce3-verify-{copy_id}",
-        args=(child_config, str(workspace), str(verifier_result)),
+        args=(
+            child_config,
+            str(workspace),
+            str(verifier_result),
+            profile_completion,
+        ),
     )
     verifier_process.start()
     _join_until((verifier_process,), float(config["child_timeout_seconds"]))
@@ -2123,6 +2266,7 @@ def _run_scenario(
         "process_a": a,
         "process_b": b,
         "verifier": verifier,
+        "profile_completion": profile_completion,
         "rate": _rate_evidence(a, b),
         "process_exitcodes": {
             "a": process_a.exitcode,

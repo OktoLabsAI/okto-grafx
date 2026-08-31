@@ -334,6 +334,7 @@ def _scenario_result(pass_name: str, scenario: ce3.Scenario) -> dict[str, object
         "retry_exhaustions": [],
         "refusals": [],
     }
+    profile_completion = ce3._profile_completion(a, 5)
     verifier = {
         "status": "passed",
         "operation_set_sha256": ce3.EXPECTED_OPERATION_SET_SHA256,
@@ -344,6 +345,11 @@ def _scenario_result(pass_name: str, scenario: ce3.Scenario) -> dict[str, object
             "environment": copy.deepcopy(environment),
         },
         "verification": dict(verification),
+        "profile_completion": copy.deepcopy(profile_completion),
+        "whole_profile_observation": {
+            "status": "passed",
+            "fingerprints": {"logical": "fingerprint"},
+        },
     }
     result: dict[str, object] = {
         "copy_id": f"{pass_name}-{scenario.identifier}",
@@ -359,6 +365,7 @@ def _scenario_result(pass_name: str, scenario: ce3.Scenario) -> dict[str, object
         "process_a": a,
         "process_b": b,
         "verifier": verifier,
+        "profile_completion": profile_completion,
         "process_exitcodes": {"a": 0, "b": 0, "verifier": 0},
     }
     result["rate"] = ce3._rate_evidence(a, b)
@@ -624,7 +631,7 @@ def test_failed_post_cleanup_write_cannot_leave_an_official_pending_artifact(
 
 
 def test_frozen_matrix_and_pins_are_literal() -> None:
-    assert ce3.SCHEMA == "okto-grafx.ce3-m7-multiprocess.v2"
+    assert ce3.SCHEMA == "okto-grafx.ce3-m7-multiprocess.v3"
     assert ce3.MAX_OPERATION_ATTEMPTS == 60
     assert ce3.EXPECTED_OPERATION_SET_SHA256 == (
         "c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81"
@@ -1268,6 +1275,203 @@ def test_both_live_and_cold_verify_all_clean_coverage_govern_pass(
         else "cold_verify_all_clean_coverage_not_proved"
     )
     assert expected in ce3._scenario_shortfalls(result)
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_cold_verifier_applies_whole_profile_observer_only_after_complete_pf5(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, complete: bool
+) -> None:
+    class Backend:
+        def __init__(self) -> None:
+            self.verify_calls = 0
+            self.observe_calls = 0
+            self.closed = False
+
+        async def _verify_all(self) -> dict[str, object]:
+            self.verify_calls += 1
+            return {
+                "engine": "okto-grafx",
+                "pages_checked": 1,
+                "records_checked": 1,
+                "index_entries_checked": 1,
+            }
+
+        def observe_fingerprints(self) -> dict[str, str]:
+            self.observe_calls += 1
+            return {"nodes": "n", "edges": "e"}
+
+        async def close(self) -> None:
+            self.closed = True
+
+    backend = Backend()
+
+    async def open_warm(*_args: object) -> tuple[Backend, object, dict[str, int]]:
+        return backend, object(), {"opened_at_ns": 1}
+
+    monkeypatch.setattr(
+        ce3,
+        "_runtime",
+        lambda _config: (
+            object(),
+            object(),
+            object(),
+            object(),
+            {"digest": ce3.EXPECTED_OPERATION_SET_SHA256},
+        ),
+    )
+    monkeypatch.setattr(ce3, "_open_warm", open_warm)
+    completion = {
+        "status": "complete" if complete else "incomplete",
+        "complete": complete,
+        "expected_operations": 60,
+        "completed_operations": 60 if complete else 18,
+        "reasons": [] if complete else ["process_a_not_passed"],
+    }
+
+    payload = asyncio.run(ce3._verify_async({}, tmp_path, completion))
+
+    assert backend.verify_calls == 1
+    assert backend.observe_calls == int(complete)
+    assert backend.closed is True
+    assert payload["verification"]["clean"] is True
+    assert payload["profile_completion"] == completion
+    observation = payload["whole_profile_observation"]
+    if complete:
+        assert payload["status"] == "passed"
+        assert observation == {
+            "status": "passed",
+            "fingerprints": {"nodes": "n", "edges": "e"},
+        }
+    else:
+        assert payload["status"] == "passed"
+        assert observation == {
+            "status": "not_applicable",
+            "reason": "process_a_profile_incomplete",
+            "expected_operations": 60,
+            "completed_operations": 18,
+        }
+
+
+def test_cold_verifier_preserves_structural_success_when_applicable_observer_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class Backend:
+        async def _verify_all(self) -> dict[str, object]:
+            return {
+                "engine": "okto-grafx",
+                "pages_checked": 1,
+                "records_checked": 1,
+                "index_entries_checked": 1,
+            }
+
+        def observe_fingerprints(self) -> dict[str, str]:
+            raise GateFailure("logical observer refused")
+
+        async def close(self) -> None:
+            return None
+
+    async def open_warm(*_args: object) -> tuple[Backend, object, dict[str, int]]:
+        return Backend(), object(), {"opened_at_ns": 1}
+
+    monkeypatch.setattr(
+        ce3,
+        "_runtime",
+        lambda _config: (
+            object(),
+            object(),
+            object(),
+            object(),
+            {"digest": ce3.EXPECTED_OPERATION_SET_SHA256},
+        ),
+    )
+    monkeypatch.setattr(ce3, "_open_warm", open_warm)
+    completion = {
+        "status": "complete",
+        "complete": True,
+        "expected_operations": 60,
+        "completed_operations": 60,
+        "reasons": [],
+    }
+
+    payload = asyncio.run(ce3._verify_async({}, tmp_path, completion))
+
+    assert payload["status"] == "failed"
+    assert payload["verification"]["clean"] is True
+    assert payload["whole_profile_observation"]["status"] == "failed"
+    assert payload["whole_profile_observation"]["failure"]["type"] == "GateFailure"
+
+
+def test_incomplete_profile_observation_is_not_applicable_but_never_passes_gate() -> None:
+    result = _scenario_result("raw", ce3.SCENARIOS[2])
+    result["process_a"].update(status="failed", postconditions_passed=0)
+    del result["process_a"]["samples"]
+    completion = ce3._profile_completion(result["process_a"], result["per_family"])
+    result["profile_completion"] = completion
+    result["verifier"]["profile_completion"] = copy.deepcopy(completion)
+    result["verifier"]["whole_profile_observation"] = {
+        "status": "not_applicable",
+        "reason": "process_a_profile_incomplete",
+        "expected_operations": completion["expected_operations"],
+        "completed_operations": completion["completed_operations"],
+    }
+
+    shortfalls = ce3._scenario_shortfalls(result)
+
+    assert "process_a_failed" in shortfalls
+    assert "a_did_not_run_exact_pf5" in shortfalls
+    assert "post_run_verifier_failed" not in shortfalls
+    assert "whole_profile_observation_failed" not in shortfalls
+    assert "incomplete_profile_observation_not_marked_not_applicable" not in shortfalls
+    assert completion["completed_operations"] is None
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        (
+            lambda value: value["profile_completion"].update(complete=False),
+            "profile_completion_evidence_inconsistent",
+        ),
+        (
+            lambda value: value["verifier"]["profile_completion"].update(
+                completed_operations=59
+            ),
+            "profile_completion_evidence_inconsistent",
+        ),
+        (
+            lambda value: value["verifier"]["whole_profile_observation"].pop(
+                "fingerprints"
+            ),
+            "whole_profile_observation_failed",
+        ),
+    ],
+)
+def test_whole_profile_applicability_evidence_is_fail_closed(
+    mutation: Any, expected: str
+) -> None:
+    result = _scenario_result("raw", ce3.SCENARIOS[0])
+
+    mutation(result)
+
+    assert expected in ce3._scenario_shortfalls(result)
+
+
+def test_missing_operation_digest_has_an_independent_completion_shortfall() -> None:
+    result = _scenario_result("raw", ce3.SCENARIOS[0])
+    result["process_a"]["operation_set_sha256"] = None
+    result["process_b"]["operation_set_sha256"] = None
+    result["verifier"]["operation_set_sha256"] = None
+    completion = ce3._profile_completion(result["process_a"], result["per_family"])
+    result["profile_completion"] = completion
+    result["verifier"]["profile_completion"] = copy.deepcopy(completion)
+    result["verifier"]["whole_profile_observation"] = {
+        "status": "not_applicable",
+        "reason": "process_a_profile_incomplete",
+        "expected_operations": completion["expected_operations"],
+        "completed_operations": completion["completed_operations"],
+    }
+
+    assert "profile_completion_digest_invalid" in ce3._scenario_shortfalls(result)
 
 
 def test_live_verify_must_finish_before_both_measured_handles_close() -> None:
