@@ -642,7 +642,7 @@ class TransactionManager:
         self._require_recovery_complete()
 
     @contextmanager
-    def page_access_section(self) -> Iterator[None]:
+    def page_access_section(self, *, fresh_read_view: bool = False) -> Iterator[None]:
         """Keep the recovery latch stable for one page-touching public operation.
 
         A check performed immediately before a flush, query or verification still leaves a
@@ -651,6 +651,14 @@ class TransactionManager:
         participant section closes that window because every path that can set the latch after a
         durable commit holds the same section. An operation that enters first finishes before the
         latch can be set; one that enters afterwards refuses before touching the pool.
+
+        ``fresh_read_view`` additionally rebases clean cached pages on the latest published LSN.
+        Verification needs that boundary because its physical pass reads the device directly
+        while its heap and index passes use the resident stores. Without a rebase after a foreign
+        commit, one report can compare a current index image with an older cached heap page and
+        report damage that disappears on reopen. Ordinary transaction reads establish the same
+        view in :meth:`begin`; this option gives non-transactional verification that guarantee
+        without opening a synthetic transaction or changing reader/writer concurrency.
         """
         page_access = getattr(self._metrics, "page_access", None)
         boundary = page_access() if callable(page_access) else nullcontext()
@@ -662,6 +670,20 @@ class TransactionManager:
             with self._participant_section():
                 self._require_not_closed("access database pages")
                 self._require_recovery_complete()
+                if fresh_read_view:
+                    published = self._published_state_in_section().last_committed_lsn
+                    own_view = published == self._own_published_lsn
+                    with self._close_wait_hazard():
+                        self._pool.begin_read_view(
+                            published,
+                            own=own_view,
+                            unfenced_file=self._file_ids.catalog_file,
+                        )
+                    if not own_view:
+                        # A foreign view consumes any previous own-publication provenance just
+                        # like begin() and commit(): a later numeric coincidence is not proof
+                        # that the resident frames came from this participant.
+                        self._own_published_lsn = None
                 yield
 
     def _require_recovery_complete(self) -> None:

@@ -1938,7 +1938,7 @@ class Database:
             # Built per call, not held: a verifier is given the index set it must walk, and a
             # database registers indexes for as long as it is open. A verifier captured at open
             # would quietly report a clean "indexes" scope for every index registered after it.
-            with self._transactions.page_access_section():
+            with self._transactions.page_access_section(fresh_read_view=True):
                 verifier = factory()  # type: ignore[operator]
                 report = verifier.verify(wanted_scope)  # type: ignore[attr-defined]
                 return _verification_report_view(report, requested_scope=wanted_scope)
