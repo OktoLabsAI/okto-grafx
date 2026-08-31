@@ -196,21 +196,27 @@ crash-safe inactive-slot page write plus barrier. The H1-H8.1 run used the same 
 same `continuous/per_family=5` shape and the certified operation digest
 `c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81` as the preceding ST-7 run.
 
-| discriminator | pre-CE-1 | CE-1 | result |
-|---|---:|---:|---:|
-| `_windows_posix_replace` per instrumented operation | 4 | **1** | expected reader registration remains until CE-2 |
-| `os.fsync` per instrumented operation | 9 | **6** | gate `<= 6` met |
-| `LocalStorageDevice.list_files` per operation | 9 | **2** | gate `<= 7` met |
-| `_open_descriptor` after warm-up | — | **2** | gate `<= 3` met |
-| seven simple-family RAW medians, sum | 1,586.60 ms | **1,482.21 ms** | **-6.58%** |
-| seven simple-family commit phase, sum | 674.81 ms | **455.90 ms** | **-32.44%** |
-| all 12 RAW medians, sum | 3,401.74 ms | 3,539.92 ms | +4.06%; no gain credited |
+| discriminator | pre-CE-1 | first CE-1 run | final `75eac97` | final vs pre |
+|---|---:|---:|---:|---:|
+| `_windows_posix_replace` per instrumented operation | 4 | **1** | **1** | reader registration remains until CE-2 |
+| `os.fsync` per instrumented operation | 9 | **6** | **6** | gate `<= 6` met |
+| `LocalStorageDevice.list_files` per operation | 9 | **2** | **2** | gate `<= 7` met |
+| `_open_descriptor` after warm-up | — | **2** | **2** | gate `<= 3` met |
+| seven simple-family RAW medians, sum | 1,586.60 ms | 1,482.21 ms | **1,289.48 ms** | **-18.73%** |
+| seven simple-family commit phase, sum | 674.81 ms | 455.90 ms | **406.52 ms** | **-39.76%** |
+| all 12 RAW medians, sum | 3,401.74 ms | 3,539.92 ms | **3,078.01 ms** | **-9.52%** |
+| all 12 instrumented medians, sum | 8,341.64 ms | 8,701.84 ms | **7,379.22 ms** | **-11.54%** |
+| all 12 phase medians, sum | 3,456.28 ms | 3,577.08 ms | **3,087.96 ms** | **-10.66%** |
+| setup, 110 commits | 397.7 s | 458.6 s | **443.6 s** | +11.54%; no gain credited |
 
-Six of the seven simple-family RAW medians improved; the source-deleted tombstone family moved
-`+17.98%`. The all-family instrumented and phase sums moved `+4.32%` and `+3.50%`, respectively,
-so CE-1 is credited only for the causal publication/commit reduction, not for an aggregate hot-path
-claim. Setup took 458.6 s (397.7 s in the preceding window). The report contains 180/180 samples;
-artifact `ce1-93a3ee3-64a9da6-pf5-h1h8_1.json`, SHA-256
+The first CE-1 timing window had six of seven simple-family RAW medians improve but the aggregate
+move `+4.06%`; it was retained rather than explained away. The final clean-window run improved all
+12 families relative to that first run and put the aggregate below the pre-CE-1 window. Absolute
+wall movement is still not treated as wholly causal: acceptance remains anchored to the publication
+counts and the simple-family commit reduction. Both reports contain 180/180 samples and the same
+logical digest. Final artifact `ce1-final-75eac97-64a9da6-pf5-h1h8_1.json`, SHA-256
+`4f943009c93ff8c85061519e578b08f0da85e677aa158e4b649f8701029c8d31`; first-run artifact
+`ce1-93a3ee3-64a9da6-pf5-h1h8_1.json`, SHA-256
 `e031cb4c7ede4859e6513d8614cb625db9fef38ffa0c30960a8852d1b0f2d2ae`.
 
 Also measured there: index maintenance costs ~**6.6%** of total suite runtime (572 s → 610 s on an

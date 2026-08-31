@@ -1,6 +1,6 @@
 # CE-1 — Registros de controle em dois slots (contrato / ADR executável)
 
-Status: **IMPLEMENTED CANDIDATE — G6 PASS; promoção BLOQUEADA por G7 e pela correção cross-repo ST-7/Pulse.** A implementação candidata preserva multi-writer/multi-reader e passou unidade, matriz de falhas, regressão por subsistema, rollback, benchmark same-code, concorrência pareada e suíte global; nenhum merge ocorre antes da revisão independente final.
+Status: **ACCEPTED — G0–G7 PASS; correção cross-repo ST-7/Pulse integrada e validada.** O candidato final `75eac97` preserva multi-writer/multi-reader e passou unidade, matriz de falhas, regressão por subsistema, rollback, benchmark same-code, concorrência pareada, revisão crítica independente, gate Pulse e suíte global.
 
 Origem: `GRAFX_PERFORMANCE_NEXT_STEPS.md` §5b (CE-1 = ST-5 / RC1-C), `GRAFX-CONSENSUS-RESPONSE.md` (ACCEPT-B com portões), handoff `hof_35575263f735440abffb3e14a9fd79fa`. Base de leitura: Grafx `main@4c474b56`. Autor: claude-coder, 2026-08-30. Revisor esperado: codex (criador do handoff), depois o blind critic do processo C13.
 
@@ -264,14 +264,14 @@ Sem estas 7 emendas aprovadas tecnicamente pelos dois agentes (Codex + Claude) e
 
 | Gate | O que prova | Aceite |
 |---|---|---|
-| **G0 medição fria** (codex, em curso) | custo do primitivo com descritor frio e sob LRU realista | JSON no `ce1-spike` com fase `open`; decide §7 |
-| **G1 unidade** | §2 I3/I4/I7/I10, §3 layout, §4.1/4.2 | todos os testes **(a criar)** de `tests/storage_core/test_two_slot_control_record.py` verdes; property-based (Hypothesis) sobre sequências de publicação/falha com ≥ 10^4 exemplos |
-| **G2 matriz de falhas** | §8 C1–C14 | 14 testes verdes; C4 parametrizado em todas as fronteiras de 512 B do `page_size` padrão e em `MIN_PAGE_SIZE` |
+| **G0 medição fria — PASS** | custo do primitivo com descritor frio e sob LRU realista | três ordens, 20 warmups + 200 amostras/caso: slot quente `108,85–158,01x`, frio `2,58–14,95x`, LRU com evicção `4,24–4,98x`; artefatos na Revisão 3 |
+| **G1 unidade — PASS** | §2 I3/I4/I7/I10, §3 layout, §4.1/4.2 | 11 testes dedicados verdes e sequência determinística de 10.000 publicações coberta |
+| **G2 matriz de falhas — PASS** | §8 C1–C14 | 30 casos verdes, inclusive partial writes em todas as fronteiras de 512 B do `page_size` padrão e `MIN_PAGE_SIZE` |
 | **G3 multiprocesso — PASS** | I1, I2, I5, C12, C13 | matriz determinística de 10.000 publicações mais processos reais; smoke pareado 4w+3r com 500/500 linhas, zero decode/loss/duplicate/phantom/torn read/escape e `verify('all')` limpo vivo/reopen. Leitura pontual mediana/p99 `4,15/15,31 → 4,34/16,05 ms`; throughput de escrita `7,3 → 10,7 rows/s`. A separação executável dos regimes está na Revisão 3. |
-| **G4 regressão** | suites existentes | `tests/coordination`, `tests/txn`, `tests/recovery`, `tests/storage_adapters` verdes; `test_no_instant_of_a_commit_offers_a_snapshot_of_half_of_it` inalterado e verde; E-CE1-7 reescrito e verde; ruff limpo |
-| **G5 rollback** | §6 | round-trip v1 → v2 → v1 byte-idêntico; build v1 recusa v2 com `GrafxSchemaVersionMismatch`; build v2 abre v1 só-leitura sem migrar |
-| **G6 desempenho same-code — PASS** | ganho real, não inferido | harness h1-h8 (`okto-pulse-perf-harness`), `--mode continuous --per-family 5`, digest `c994255b…` igual: `_windows_posix_replace` `4 → 1`, `os.fsync` `9 → 6`, `list_files` `9 → 2`, `_open_descriptor=2`; sete famílias simples RAW `-6,58%` e commit phase `-32,44%`. O agregado das 12 famílias variou `+4,06%` e não é creditado como ganho. Artefato/SHA em Revisão 4. |
-| **G7 crítico cego** | processo C13 | revisão independente de §4.4 (visível-antes-de-durável) e §7 (pin) antes do merge |
+| **G4 regressão — PASS** | suites existentes | subsistemas verdes e global final `10.911 passed, 17 skipped`; `test_no_instant_of_a_commit_offers_a_snapshot_of_half_of_it` inalterado; E-CE1-7 reescrito; Ruff check limpo |
+| **G5 rollback — PASS** | §6 | round-trip v1 → v2 → v1 preserva payload lógico byte a byte; build v1 recusa v2 com `GrafxSchemaVersionMismatch`; build v2 abre v1 só-leitura sem migrar |
+| **G6 desempenho same-code — PASS** | ganho real, não inferido | harness h1-h8, `continuous/per-family=5`, 180/180 e digest `c994255b…`: rename/fsync/listagens/descriptors `1/6/2/2`; no final, simples RAW `-18,73%`, commit simples `-39,76%` e agregado RAW `-9,52%` vs pré-CE-1. Artefato/SHA na Revisão 5 |
+| **G7 crítico cego — PASS** | processo C13 | revisão independente de §4.4, slots/crash, migração/downgrade, §7 e premissas multiprocesso; 222 testes verdes no candidato imutável, zero blocker, handoff `hof_e4105ee7665e40a7b1a2b4a4d1537d84` verificado pelo Codex |
 
 ---
 
@@ -355,3 +355,23 @@ Status permanece **PROPOSED / produção bloqueada**; todos os demais invariante
    em `1.531,26 s`; Ruff `src tests` e `git diff --check` verdes.
 5. **Bloqueios restantes:** G7 e a correção mínima da regressão ST-7 × contrato vetorial do Pulse,
    descoberta pelo gate QW-8/QW-10. Nenhum deles altera multi-writer/multi-reader.
+
+### Revisão 5 (2026-08-31, aceite final e compatibilidade Pulse)
+
+1. **ST-7 × proximity corrigido:** `75eac97` mantém o skip por tabela somente para índices exact/hash
+   e restaura o avanço global durável para proximity/vector. O gate local passou 43/43, a regressão
+   index+recovery+vector passou 958 casos e o Pulse pinado passou **8/8 vector + 8/8 discovery +
+   12/12 routed = 28/28**. Nenhuma premissa de concorrência mudou.
+2. **G7 concluído:** a revisão cega do candidato `93a3ee3` verificou visible-before-durable,
+   seleção de slots e rasgos, v1→v2, downgrade offline, pinning e multiwriter/multireader. Resultado:
+   **222 passed, zero blocker**; três observações não-bloqueantes ficaram registradas em
+   `claude-scratch/CE1-G7-REVIEW.md`.
+3. **Global final:** no candidato integrado `75eac97`, **10.911 passed, 17 skipped, 0 failed** em
+   `1.628,96 s`; `ruff check`, `git diff --check` e árvore limpa passaram.
+4. **H1-H8.1 final:** 180/180 amostras, 12/12 famílias, digest `c994255b…`; rename/fsync/listagens/
+   descritores permaneceram `1/6/2/2`. RAW agregado `3.078,01 ms` (`-9,52%` vs pré-CE-1), sete
+   famílias simples `1.289,48 ms` (`-18,73%`) e commit simples `406,52 ms` (`-39,76%`). Setup:
+   `443,6 s`. Artefato `ce1-final-75eac97-64a9da6-pf5-h1h8_1.json`, SHA-256
+   `4f943009c93ff8c85061519e578b08f0da85e677aa158e4b649f8701029c8d31`.
+5. **Decisão:** todos os gates do CE-1 estão satisfeitos; o candidato está apto à promoção. CE-2 é
+   um marco separado e não condiciona este aceite.

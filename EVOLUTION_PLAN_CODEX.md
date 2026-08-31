@@ -271,8 +271,7 @@
   global completo terminou em 100%/exit `0`, além dos testes focados de imports, documentação,
   ST-1, ST-6, corpus, Ruff e `diff --check`. Nenhuma regra de leitura, escrita ou concorrência foi
   afrouxada para obter o resultado.
-- **ST-7 implementado e integrado; correção cross-repo vetorial em curso antes da próxima
-  promoção.** A abertura/recovery fotografa uma vez os
+- **ST-7 implementado, integrado e corrigido no gate cross-repo vetorial.** A abertura/recovery fotografa uma vez os
   watermarks por tabela após aplicar páginas e adotar o catálogo; a foto só é reutilizada dentro
   da mesma seção e qualquer tabela ausente é relida, enquanto a montagem final continua fazendo
   uma foto própria. O marcador de replay deixa intacto um header somente com certificado page-0
@@ -302,9 +301,11 @@
   também alcançou índices vetoriais/proximity, mas o contrato Pulse exige que seu
   `built_through_lsn` acompanhe a posição global. Com o mesmo Community/Core, a matriz vetorial
   teve 6 erros, discovery 5 falhas e composição routed 2 falhas em `ef0de63`, contra
-  **8/8, 8/8 e 12/12** no pré-ST-7 `72671c0`. A correção mínima acordada preserva o skip e o ganho
-  para exact/hash, exclui vector/proximity e está delegada no handoff
-  `hof_c23df4f3e7124d98a2409b23a6354e3f`; main/CE-1 não serão promovidos antes desse gate.
+  **8/8, 8/8 e 12/12** no pré-ST-7 `72671c0`. A correção mínima entregue em `75eac97` preserva o
+  skip e o ganho para exact/hash e restaura o avanço global durável para vector/proximity. O
+  handoff `hof_c23df4f3e7124d98a2409b23a6354e3f` foi verificado/PASS: 43/43 locais, 958 de
+  index+recovery+vector e **28/28** no Pulse pinado. Nenhuma lease, WAL, seção ou premissa
+  multi-writer/multi-reader mudou.
 - **Gate final ST-6/ST-7 concluído e aprovado com a limitação temporal registrada.** O perfil
   H1-H8.1 em `Grafx@ef0de63`, `Community@64a9da6` e `Core@ccc1f345` concluiu 180/180 operações,
   12/12 famílias e manteve exatamente o digest lógico certificado `c994255b...`. O setup de 110
@@ -320,8 +321,7 @@
   `w7-ef0de63-64a9da6-pf5-h1h8_1.json`, SHA-256
   `2ce10d4200a9a420c75c081da9ae804001223cfb5f833aacdb91b854b68415c9`; check-only anterior,
   mesmo conjunto lógico e checkouts limpos: `w7-ef0de63-64a9da6-check.json`.
-- **CE-1 possui candidato de produção integrado; G6 passou e promoção aguarda G7 mais a correção
-  ST-7 × Pulse.** O spike
+- **CE-1 aceito: G0–G7 e correção ST-7 × Pulse concluídos; candidato apto à promoção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`
   (`108,85x-158,01x`), o caso frio `1,00-7,16 ms` (`2,58x-14,95x`) e a LRU real com evicção
@@ -351,9 +351,15 @@
   `e031cb4c7ede4859e6513d8614cb625db9fef38ffa0c30960a8852d1b0f2d2ae`.
   O smoke pareado pré-CE-1/CE-1 preservou a leitura pontual (`4,15/15,31 → 4,34/16,05 ms`,
   mediana/p99) e passou 4 writers + 3 readers com 500/500 linhas e `verify()` limpo. Após adaptar
-  três expectativas históricas ao novo formato, a suíte global terminou em **10.909 passed,
-  17 skipped, 0 failed** em `98e52dd`; Ruff e `diff --check` verdes. Resta G7, além do blocker
-  cross-repo ST-7 já explicitado acima.
+  três expectativas históricas ao novo formato, a primeira suíte global terminou em **10.909
+  passed, 17 skipped, 0 failed** em `98e52dd`. A revisão cega G7 passou com 222 testes e zero
+  blocker; o gate final após `75eac97` terminou em **10.911 passed, 17 skipped, 0 failed** em
+  `1.628,96 s`, com Ruff check e `diff --check` verdes. O H1-H8 final concluiu 180/180 amostras,
+  12/12 famílias e o mesmo digest: rename/fsync/listagens/descriptors `1/6/2/2`, RAW agregado
+  `3.078,01 ms` (`-9,52%` vs pré-CE-1), simples `1.289,48 ms` (`-18,73%`) e commit simples
+  `406,52 ms` (`-39,76%`). Artefato `ce1-final-75eac97-64a9da6-pf5-h1h8_1.json`, SHA-256
+  `4f943009c93ff8c85061519e578b08f0da85e677aa158e4b649f8701029c8d31`. CE-2 é o próximo marco
+  seguro independente; ST-2 e CN-1 continuam bloqueados sem autorização do usuário.
 - **Compatibilidade Okto Pulse: M-PULSE-1 a M-PULSE-6 concluídos e certificados conforme o quadro
   9.7; M-PULSE-7 está em execução e permanece o gate serial.** O primeiro trace representativo
   expôs um blocker de performance, não de semântica: no mesmo workload, Ladybug concluiu em
