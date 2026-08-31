@@ -594,6 +594,50 @@ def test_a_real_lease_written_by_the_adapter_fits_the_cap(tmp_path: Path) -> Non
     assert lease_file.stat().st_size <= _MAX_CONTROL_RECORD_BYTES // 4
 
 
+def test_a_format_two_lease_is_retired_as_one_exact_three_page_generation(
+    stack: Stack,
+) -> None:
+    """CE-1 expands the door for exactly one bound lease envelope, never an arbitrary size."""
+    from okto_grafx.domain.control_record import (
+        CONTROL_FILE_PAGES,
+        ControlRecordKind,
+        TwoSlotControlRecordStore,
+    )
+
+    slot_store = TwoSlotControlRecordStore(
+        stack.storage,  # type: ignore[arg-type]
+        file=LEASE,
+        record_kind=ControlRecordKind.LEASE,
+        database_uuid=bytes.fromhex("00112233445566778899aabbccddeeff"),
+        file_nonce=20260831,
+        temporary="control/writer.lease.retirement.tmp",
+    )
+    slot_store.publish(b"damaged logical lease")
+    exact_generation = _bytes_of(stack, LEASE)
+    assert len(exact_generation) == CONTROL_FILE_PAGES * stack.storage.page_size  # type: ignore[attr-defined]
+
+    report = _manager(stack).retire_control_record(LEASE)
+
+    retired = report.findings_of(FindingKind.CONTROL_RECORD_RETIRED)
+    assert report.records_discarded == 1
+    assert retired
+    assert stack.quarantine.read(retired[0].quarantine) == exact_generation
+    assert not stack.storage.exists(LEASE)  # type: ignore[attr-defined]
+
+
+def test_a_noncanonical_near_slot_size_refuses_before_the_first_read(
+    stack: Stack,
+) -> None:
+    """The v2 exception is exact: 4097 bytes is not accepted merely for being below 3 pages."""
+    _seed(stack, LEASE, bytes(4097))
+    probe = _DamageProbe()
+    with pytest.raises(GrafxRecoveryRefused, match="claims"):
+        _manager(stack, control_probe=probe).retire_control_record(LEASE)
+    assert probe.calls == 0
+    assert len(stack.ledger.entries()) == 0
+    assert len(_bytes_of(stack, LEASE)) == 4097
+
+
 class _SizeSequenceStorage:
     """A device whose target size mutates at an exact observation, never to be read again."""
 

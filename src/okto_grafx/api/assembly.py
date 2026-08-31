@@ -43,7 +43,11 @@ import warnings
 from collections.abc import Callable
 from typing import TypeVar, cast
 
-from okto_grafx.adapters.coordination_local import CONTROL_DIRECTORY, LOCK_FILE_SUFFIX
+from okto_grafx.adapters.coordination_local import (
+    CONTROL_DIRECTORY,
+    LEASE_SECTION,
+    LOCK_FILE_SUFFIX,
+)
 from okto_grafx.adapters.graph_guard import ConditionGuard
 from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
 from okto_grafx.adapters.metrics_noop import NoOpMetricsSink
@@ -84,7 +88,7 @@ from okto_grafx.engine.metrics_catalog import register_catalog
 from okto_grafx.engine.quarantine import QuarantineStore
 from okto_grafx.engine.query_engine import QueryEngine
 from okto_grafx.engine.recovery_manager import RecoveryManager
-from okto_grafx.engine.txn_manager import TransactionManager
+from okto_grafx.engine.txn_manager import COMMIT_SECTION, TransactionManager
 from okto_grafx.engine.vector_engine import VectorEngine
 from okto_grafx.engine.verifier import Verifier
 from okto_grafx.engine.wal_manager import WalManager
@@ -334,6 +338,11 @@ def assemble_database(
             ),
         )
         identity = _open_identity(config, pool, clock, storage, coordinator)
+        if not config.read_only:
+            identity = _upgrade_control_record_identity(
+                config, storage, pool, coordinator, identity
+            )
+        _bind_coordinator_control_format(coordinator, identity)
 
         wal = WalManager(
             storage,
@@ -431,6 +440,9 @@ def assemble_database(
             policy=config.recovery_policy,
             coordinator=coordinator,
             commit_lock_timeout=config.commit_lock_timeout_seconds,
+            database_uuid=identity.database_uuid,
+            control_format_version=identity.format_version,
+            control_file_nonce=_new_control_file_nonce(),
         )
         # FR-1: a writable reopen replays BEFORE catalog payloads are interpreted. A read-only
         # reopen proves from both commit.state and the WAL that replay is unnecessary, then may
@@ -477,6 +489,9 @@ def assemble_database(
             max_transaction_rows=config.max_transaction_rows,
             max_transaction_bytes=config.max_transaction_bytes,
             max_wal_batch_bytes=config.max_wal_batch_bytes,
+            database_uuid=identity.database_uuid,
+            control_format_version=identity.format_version,
+            control_file_nonce=_new_control_file_nonce(),
         )
         queries = QueryEngine(
             catalog=catalog,
@@ -883,6 +898,122 @@ def _open_identity(
         return intent
 
 
+def _new_control_file_nonce() -> int:
+    """Return one host-generated nonce for a control file that may need bootstrapping."""
+    return int.from_bytes(uuid.uuid4().bytes[:8], "little")
+
+
+def _identity_with_format(
+    identity: DatabaseIdentity, format_version: int
+) -> DatabaseIdentity:
+    """Return the same database identity carrying a different physical format version."""
+    return DatabaseIdentity(
+        database_uuid=identity.database_uuid,
+        page_size=identity.page_size,
+        partitions_per_table=identity.partitions_per_table,
+        created_at_wall=identity.created_at_wall,
+        granularity_descriptor=identity.granularity_descriptor,
+        format_version=format_version,
+    )
+
+
+def _same_identity_except_format(
+    left: DatabaseIdentity, right: DatabaseIdentity
+) -> bool:
+    """Return whether two identities differ, if at all, only in their format version."""
+    return _identity_with_format(left, right.format_version) == right
+
+
+def _replace_first_open_complete(
+    storage: StorageDevice, identity: DatabaseIdentity
+) -> None:
+    """Atomically replace the completion authority during a control-format upgrade."""
+    payload = _encode_first_open_intent(identity, magic=_FIRST_OPEN_COMPLETE_MAGIC)
+    if storage.exists(_FIRST_OPEN_COMPLETE_STAGING):
+        storage.remove(_FIRST_OPEN_COMPLETE_STAGING)
+    storage.create(_FIRST_OPEN_COMPLETE_STAGING, exclusive=True)
+    terminal = storage.append_log(_FIRST_OPEN_COMPLETE_STAGING, payload)
+    if terminal != len(payload):
+        raise GrafxCorruptionDetected(
+            "The upgraded completion marker was not staged in full.",
+            file=_FIRST_OPEN_COMPLETE_STAGING,
+            field="terminal_offset",
+            value=terminal,
+            expected=len(payload),
+        )
+    storage.durable_barrier(_FIRST_OPEN_COMPLETE_STAGING)
+    storage.atomic_replace(_FIRST_OPEN_COMPLETE_STAGING, _FIRST_OPEN_COMPLETE)
+    storage.durable_barrier(_FIRST_OPEN_COMPLETE)
+
+
+def _upgrade_control_record_identity(
+    config: DatabaseConfig,
+    storage: StorageDevice,
+    pool: BufferPool,
+    coordinator: ProcessCoordinator,
+    identity: DatabaseIdentity,
+) -> DatabaseIdentity:
+    """Upgrade format 1 to 2 before any two-slot control file can be published.
+
+    ``grafx.meta`` is replaced and barriered first.  That is the compatibility fence: an old
+    build refuses format 2 before it can mistake a slot file for a legacy record.  The permanent
+    completion marker follows; a crash between the two leaves the explicit, resumable
+    ``meta=v2/complete=v1`` state handled by :func:`_open_completed_identity`.
+    """
+    if identity.format_version >= 2:
+        return identity
+    with coordinator.exclusive(
+        _FIRST_OPEN_SECTION, timeout=config.commit_lock_timeout_seconds
+    ):
+        with coordinator.exclusive(
+            COMMIT_SECTION, timeout=config.commit_lock_timeout_seconds
+        ):
+            with coordinator.exclusive(
+                LEASE_SECTION, timeout=config.commit_lock_timeout_seconds
+            ):
+                current = MetaStore(pool).read()
+                if current.format_version >= 2:
+                    return current
+                if current != identity:
+                    raise GrafxCorruptionDetected(
+                        "The database identity changed while its control format was upgraded.",
+                        file=META_FILE,
+                        field="identity",
+                        state="upgrade_race",
+                    )
+                upgraded = _identity_with_format(current, 2)
+                _stage_meta(storage, pool, upgraded)
+                storage.atomic_replace(_FIRST_OPEN_META_STAGING, META_FILE)
+                storage.durable_barrier(META_FILE)
+                pool.invalidate(META_FILE)
+                pool.invalidate(_FIRST_OPEN_META_STAGING)
+                if storage.exists(_FIRST_OPEN_COMPLETE):
+                    complete = _read_first_open_complete(storage)
+                    if complete is None or not _same_identity_except_format(
+                        upgraded, complete
+                    ):
+                        raise GrafxCorruptionDetected(
+                            "The completion marker cannot be upgraded with this database identity.",
+                            file=_FIRST_OPEN_COMPLETE,
+                            field="identity",
+                            state="upgrade_mismatch",
+                        )
+                    _replace_first_open_complete(storage, upgraded)
+                return upgraded
+
+
+def _bind_coordinator_control_format(
+    coordinator: ProcessCoordinator, identity: DatabaseIdentity
+) -> None:
+    """Select the shipped coordinator's envelope without imposing it on custom ports."""
+    bind = getattr(coordinator, "bind_control_record_format", None)
+    if callable(bind):
+        bind(
+            database_uuid=identity.database_uuid,
+            format_version=identity.format_version,
+        )
+
+
 def _preflight_default_read_only_storage(
     config: DatabaseConfig,
     storage: StorageDevice,
@@ -1058,12 +1189,28 @@ def _open_completed_identity(
         )
     stored = _read_existing_identity(config, storage, meta)
     if stored != complete:
-        raise GrafxCorruptionDetected(
-            "The permanent first-open completion identity does not match grafx.meta.",
-            file=_FIRST_OPEN_COMPLETE,
-            field="identity",
-            state="complete_meta_mismatch",
+        resumable_upgrade = (
+            stored.format_version == 2
+            and complete.format_version == 1
+            and _same_identity_except_format(stored, complete)
         )
+        if not resumable_upgrade:
+            raise GrafxCorruptionDetected(
+                "The permanent first-open completion identity does not match grafx.meta.",
+                file=_FIRST_OPEN_COMPLETE,
+                field="identity",
+                state="complete_meta_mismatch",
+            )
+        if config.read_only:
+            raise GrafxUnsupportedOperation(
+                "A writable open must finish the interrupted control-format upgrade.",
+                file=_FIRST_OPEN_COMPLETE,
+                field="format_version",
+                state="upgrade_pending",
+                repairable=True,
+            )
+        _replace_first_open_complete(storage, stored)
+        complete = stored
     _require_complete_final_files(storage)
     if config.read_only:
         # Read-only validates every byte above but never cleans pending state or manufactures a

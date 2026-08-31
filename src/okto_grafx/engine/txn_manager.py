@@ -281,6 +281,9 @@ class TransactionManager:
         max_transaction_rows: int | None = None,
         max_transaction_bytes: int | None = None,
         max_wal_batch_bytes: int | None = None,
+        database_uuid: bytes | None = None,
+        control_format_version: int = 1,
+        control_file_nonce: int = 0,
     ) -> None:
         """Build a manager over one database.
 
@@ -316,7 +319,11 @@ class TransactionManager:
         self._catalog: Any = catalog
         self._coordinator: ProcessCoordinator = coordinator
         self._commit_state_store = CommitStateStore(
-            pool.storage, owner_id=coordinator.owner_id()
+            pool.storage,
+            owner_id=coordinator.owner_id(),
+            database_uuid=database_uuid,
+            control_format_version=control_format_version,
+            file_nonce=control_file_nonce,
         )
         self._commit_redo = CommitRedo(pool, index_manager)
         self._clock: Clock = clock

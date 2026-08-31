@@ -1,6 +1,6 @@
 # CE-1 — Registros de controle em dois slots (contrato / ADR executável)
 
-Status: **PROPOSED — produção BLOQUEADA.** Nenhuma linha de `src/` muda com este documento. Ele existe para que a implementação, quando autorizada, seja verificável cláusula a cláusula por testes nomeados, e para que nenhum ganho seja creditado antes de medido no lugar certo.
+Status: **IMPLEMENTED CANDIDATE — promoção BLOQUEADA por G6/G7.** A implementação candidata preserva multi-writer/multi-reader e passou unidade, matriz de falhas, regressão por subsistema e rollback; nenhum ganho é creditado até a medição same-code e a revisão independente finais.
 
 Origem: `GRAFX_PERFORMANCE_NEXT_STEPS.md` §5b (CE-1 = ST-5 / RC1-C), `GRAFX-CONSENSUS-RESPONSE.md` (ACCEPT-B com portões), handoff `hof_35575263f735440abffb3e14a9fd79fa`. Base de leitura: Grafx `main@4c474b56`. Autor: claude-coder, 2026-08-30. Revisor esperado: codex (criador do handoff), depois o blind critic do processo C13.
 
@@ -226,7 +226,7 @@ A docstring de `commit_state_store.py:3-6` e CONTRACT §8.5 passo 3.7 ("via `ato
 | C1 | crash **antes** de `write_page` do slot alvo | nada mudou; slot mais novo anterior continua servido; geração não avança | `test_crash_before_write_page_leaves_the_previous_generation` |
 | C2 | crash **depois** de `write_page`, **antes** de `durable_barrier` | (a) escrita chegou ao dispositivo → nova geração servida; (b) escrita perdida (perda de energia simulada = descarte de escritas não barradas) → geração anterior servida; em ambos os casos `commit.state` ≤ último `COMMIT` durável do WAL e a recuperação republica | `test_crash_between_write_and_barrier_serves_either_generation_never_a_torn_one` |
 | C3 | crash **depois** de `durable_barrier` | nova geração servida sempre | `test_crash_after_barrier_serves_the_new_generation` |
-| C4 | escrita **parcial** da página em cada fronteira de 512 B (k × 512, k = 1..page_size/512 − 1) | checksum de página falha → slot inválido → outro slot servido; próxima publicação sobrescreve o slot rasgado | `test_torn_page_at_every_sector_boundary_is_ignored_and_repaired_by_the_next_publication` (parametrizado) |
+| C4 | escrita **parcial** da página em cada fronteira de 512 B (k × 512, k = 1..page_size/512 − 1) | geração anterior **ou nova inteira**, nunca híbrida: como o registro lógico cabe no primeiro setor, um prefixo de 512 B pode já ser byte-idêntico à página nova completa; corte dentro dos bytes alterados invalida o checksum/slot e cai no anterior; a publicação seguinte converge | `test_partial_page_write_serves_only_a_whole_generation_and_the_next_publish_repairs` (parametrizado) |
 | C5 | escrita parcial que preserva o cabeçalho de página mas rasga o registro de slot (offsets 32..) | `slot_crc32c` falha → inválido | `test_torn_slot_record_with_intact_page_header_is_invalid` |
 | C6 | slot mais velho já rasgado (C4) **e** crash a meio da publicação seguinte (que reescreve exatamente esse slot) | o slot mais novo nunca foi tocado → servido; 1 slot válido sempre (I3) | `test_the_newest_slot_is_never_the_one_being_rewritten` |
 | C7 | **ambos** os slots inválidos (corrupção em repouso injetada após C4) | lease/commit_state → `GrafxCorruptionDetected`; porta de retirement da recuperação quarentena o arquivo de 3 páginas como uma geração (I9); reconstrução: `commit.state` a partir do WAL (último `COMMIT` durável), lease a partir da maior época vista no WAL + 1 (mesma regra de hoje para lease ausente), reader → ABSENT | `test_double_corruption_is_fail_closed_and_retired_as_one_generation` |
@@ -307,3 +307,31 @@ Registro: documento redigido sem abrir bancos, sem executar benchmarks ou gates,
 3. **Vínculo autenticado** (§3.3, §3.4): cada slot carrega `database_uuid` + `file_nonce` (cunhado na página 0 no bootstrap) cobertos pelo `slot_crc32c`; a alegação de que o slot CRC protegia contra restore trocado foi retirada — uma página movida intacta preservaria ambos os CRCs; o que a recusa é o vínculo.
 4. **Aprovação** (§9, §12): "[DECISÃO do usuário]" substituído por aprovação técnica Codex + Claude + G0–G7; o usuário autorizou operacionalizar e pediu consulta só se a premissa mudar — CE-1 não a muda.
 Status permanece **PROPOSED / produção bloqueada**; todos os demais invariantes inalterados.
+
+### Revisão 3 (2026-08-31, implementação candidata e correção experimental de C4)
+
+1. **C4 corrigido por teste red-first:** a expectativa de que todo corte em fronteira de setor
+   invalidaria a página era falsa para os payloads reais, que cabem no primeiro setor. O gate agora
+   exige o contrato correto — geração anterior ou nova inteira, nunca híbrida — e mantém cortes
+   dentro do registro para provar fallback e reparo. Trinta cenários da matriz passaram.
+2. **G0 concluído:** quente `0,095–0,133 ms`, frio `1,00–7,16 ms`, LRU real
+   `3,00–4,37 ms`; por isso `writer.lease` e `commit.state` recebem reservas best-effort dentro de
+   `max_open_files`, sempre deixando uma entrada comum e sempre executando `_still_names`.
+3. **G1/G2 concluídos no candidato:** 11 testes unitários de envelope (incluindo overflow u64,
+   wrap de `seq` e página mínima), 30 cenários de crash/partial-write e uma sequência determinística
+   de 10.000 publicações; o teste determinístico evita introduzir Hypothesis apenas para este gate.
+4. **G4 concluído por subsistema:** `tests/storage_adapters`, `tests/coordination`, `tests/txn`,
+   `tests/recovery`, os testes API CE-1 e toda `tests/cli` passaram; Ruff e `git diff --check`
+   passaram. O gate global ainda será repetido no commit candidato.
+5. **G5 concluído:** `oktografx control downgrade PATH` toma COMMIT→LEASE, recusa lease ativa ou
+   qualquer registro de leitor, converte os payloads lógicos byte a byte e publica meta v1 por
+   último. O round-trip v2→v1 e a repetição idempotente passaram.
+6. **G3 parcialmente coberto, medição final pendente:** as suítes multiprocessos existentes de
+   dois writers + leitor e visibilidade longeva passaram. A parte 4 writers + 3 readers será
+   executada pelo instrumento `measure_concurrency.py`; a formulação original “fault twin +
+   kill −9 em 10^5 publicações” misturava um double in-memory com processos reais e não é um único
+   ensaio executável. O aceite foi separado em matriz determinística de 10.000 operações e carga
+   real multiprocesso, sem reduzir as propriedades verificadas.
+7. **G6/G7 permanecem bloqueios de promoção:** benchmark H1-H8/concorrência e revisão crítica
+   independente ainda não concluídos. Portanto este documento ainda não declara CE-1 aceita nem
+   publica número de ganho em commits reais.

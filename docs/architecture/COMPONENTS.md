@@ -97,6 +97,13 @@ items travel with it to W6 and do not block the wave.
 
 ### CF-5 — BLOCKING: `atomic_replace` cannot publish a control file any participant has read (Windows)
 
+> **CE-1 resolution (2026-08-31).** This section is retained as historical diagnosis. Identity
+> format 2 no longer uses `atomic_replace` for warm `writer.lease` or `commit.state`
+> publications: each alternates one bound/checksummed slot page and performs one file barrier.
+> Whole-file replace remains for bootstrap, reader records pending CE-2, and the offline
+> downgrade. Descriptor-cache pins for the two hot files stay within `max_open_files` and still
+> execute `_still_names` on every hit, so the cross-process identity fix below is not relaxed.
+
 Raised by C5 while driving real multi-process commits; **independently reproduced by the coordinator**,
 same-process and cross-process, against the delivered `LocalStorageDevice`:
 

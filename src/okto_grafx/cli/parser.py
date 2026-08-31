@@ -447,6 +447,16 @@ COMMANDS: tuple[CommandSpec, ...] = (
         "metrics",
         "Report the metrics endpoint of this database and the current value of every metric.",
     ),
+    _database_command(
+        "control",
+        "Offline downgrade of format-2 control records to format 1.",
+        subcommand="downgrade",
+        details=(
+            "Run only while no other process has this database open. The command refuses an",
+            "active writer lease or any reader registration and commits grafx.meta version 1",
+            "only after the lease and commit-state payloads are durably converted.",
+        ),
+    ),
 )
 """Every command this tool offers. The help text is rendered from this table, so the parser and
 the documentation are one description rather than two that drift."""

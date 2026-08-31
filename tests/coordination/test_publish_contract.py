@@ -20,9 +20,19 @@ from pathlib import Path
 import pytest
 
 from conftest import CoordinatorFactory
-from coordination_support import DirectoryStorageDevice, HookStorageDevice, ManualClock, owned_by
+from coordination_support import (
+    DirectoryStorageDevice,
+    HookStorageDevice,
+    ManualClock,
+    owned_by,
+)
 from okto_grafx.adapters.coordination_local import decode_lease_record
+from okto_grafx.domain.control_record import (
+    ControlRecordKind,
+    TwoSlotControlRecordStore,
+)
 from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
     GrafxDeviceFull,
     GrafxDurabilityBarrierFailed,
     GrafxStorageError,
@@ -82,9 +92,13 @@ def test_a_publication_flushes_the_target_after_the_replacement(
     temporary, target = trail[0][1], trail[-1][1]
     assert temporary.endswith(".tmp")
     assert target == "control/writer.lease"
-    assert trail[2][1] == temporary, "the temporary is flushed before it is put in place"
+    assert trail[2][1] == temporary, (
+        "the temporary is flushed before it is put in place"
+    )
     assert trail[3][1] == f"{temporary}->{target}"
-    assert trail[4][1] == target, "the rename has to reach the device, on POSIX via its directory"
+    assert trail[4][1] == target, (
+        "the rename has to reach the device, on POSIX via its directory"
+    )
 
 
 def test_every_publication_flushes_twice(
@@ -102,10 +116,57 @@ def test_every_publication_flushes_twice(
     for publish in publications:
         device.reset()
         publish()
-        barriers = [name for operation, name in device.touched if operation == "durable_barrier"]
+        barriers = [
+            name for operation, name in device.touched if operation == "durable_barrier"
+        ]
         assert len(barriers) == 2, device.touched
         assert barriers[0].endswith(".tmp")
         assert not barriers[1].endswith(".tmp")
+
+
+def test_format_two_lease_renewal_is_one_page_write_and_one_barrier(
+    make_coordinator: CoordinatorFactory, database_root: Path
+) -> None:
+    device = HookStorageDevice(DirectoryStorageDevice(database_root))
+    coordinator = make_coordinator(owner_id="p1-aaaa", storage=device)
+    coordinator.bind_control_record_format(database_uuid=b"d" * 16, format_version=2)
+    lease = coordinator.acquire_writer_lease(timeout=1.0)
+    device.reset()
+
+    renewed = coordinator.renew_lease(lease)
+
+    relevant = [
+        (operation, name)
+        for operation, name in device.touched
+        if operation in {"write_page", "durable_barrier", "atomic_replace"}
+    ]
+    assert relevant == [
+        ("write_page", "control/writer.lease"),
+        ("durable_barrier", "control/writer.lease"),
+    ]
+    store = TwoSlotControlRecordStore(
+        device,
+        file="control/writer.lease",
+        record_kind=ControlRecordKind.LEASE,
+        database_uuid=b"d" * 16,
+        file_nonce=0,
+        temporary="control/unused.tmp",
+    )
+    observed = store.read()
+    assert observed is not None
+    assert decode_lease_record(observed.payload).heartbeat_seq == renewed.heartbeat_seq
+
+
+def test_binding_format_two_after_a_lease_is_active_is_refused(
+    make_coordinator: CoordinatorFactory,
+) -> None:
+    coordinator = make_coordinator(owner_id="p1-aaaa")
+    coordinator.acquire_writer_lease(timeout=1.0)
+
+    with pytest.raises(GrafxConfigurationError, match="before leases"):
+        coordinator.bind_control_record_format(
+            database_uuid=b"d" * 16, format_version=2
+        )
 
 
 # --- A47: the classification travels in the details, not in the class -------------------------
@@ -123,7 +184,9 @@ def test_a_transient_barrier_failure_is_ridden_out(
     assert lease.epoch == 1
     assert device.fail_next["durable_barrier"] == 0
     assert clock.slept, "the retry did not back off"
-    published = decode_lease_record((database_root / "control" / "writer.lease").read_bytes())
+    published = decode_lease_record(
+        (database_root / "control" / "writer.lease").read_bytes()
+    )
     assert owned_by(published.owner_id, "p1-aaaa")
 
 
@@ -165,7 +228,9 @@ def test_a_permanent_barrier_failure_keeps_its_class(
         coordinator.acquire_writer_lease(timeout=1.0)
     assert not isinstance(failure.value, GrafxStorageError)
     assert failure.value.details["reason"] == "fsync failure"
-    assert device.fail_next["durable_barrier"] == 9_999, "a permanent failure was retried"
+    assert device.fail_next["durable_barrier"] == 9_999, (
+        "a permanent failure was retried"
+    )
 
 
 def test_an_endless_transient_barrier_failure_keeps_its_class_too(

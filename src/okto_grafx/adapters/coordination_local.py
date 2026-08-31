@@ -5,9 +5,10 @@ the writer epoch, which readers are alive and what snapshot each of them pins, a
 a short critical section right now. It answers them with two mechanisms and nothing else:
 
 * **durable control files, written through the StorageDevice port.** The lease lives in
-  ``control/writer.lease`` and every reader in ``control/readers/<reader_id>.reader``. Both are
-  fixed-layout, checksummed records published with ``atomic_replace``, so a reader of the file
-  sees either the whole previous record or the whole next one, never a half-updated one.
+  ``control/writer.lease`` and every reader in ``control/readers/<reader_id>.reader``. Legacy
+  databases publish whole records with ``atomic_replace``. Format-2 databases alternate two
+  checksummed lease pages; reader records remain whole-file publications until CE-2 gives them a
+  participant lifetime. In both forms a reader sees one complete generation, never torn bytes.
 * **an operating-system advisory lock per named section.** ``exclusive()`` takes a real file
   lock (``msvcrt.locking`` on Windows, ``fcntl.flock`` on POSIX) so the read-modify-write of the
   lease is atomic between processes and, decisively, so a participant killed without cleanup
@@ -44,6 +45,10 @@ from dataclasses import dataclass, replace
 from math import isfinite
 from typing import TypeVar
 
+from okto_grafx.domain.control_record import (
+    ControlRecordKind,
+    TwoSlotControlRecordStore,
+)
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
@@ -840,10 +845,76 @@ class LocalProcessCoordinator:
         self._reader_samples: dict[str, tuple[int, float]] = {}
         self._stray_samples: dict[str, float] = {}
         self._reader_counter: int = 0
+        self._lease_slots: TwoSlotControlRecordStore | None = None
+        self._control_database_uuid: bytes | None = None
+        self._control_format_version: int = 1
 
     def __repr__(self) -> str:
         """Return a representation naming the owner and the control files this coordinator uses."""
         return f"LocalProcessCoordinator(owner_id={self._owner!r}, lease_file={self._lease_file!r})"
+
+    def bind_control_record_format(
+        self, *, database_uuid: bytes, format_version: int
+    ) -> None:
+        """Bind the on-disk control envelope after the database identity has been opened.
+
+        The coordinator is constructed before ``grafx.meta`` can be trusted because it supplies
+        the first-open section.  No lease operation happens in that interval.  Assembly calls
+        this door exactly once after opening (and, for writable legacy databases, upgrading) the
+        identity.  Directly composed coordinators that never call it retain the format-1
+        whole-file protocol, preserving their existing contract.
+        """
+        if type(format_version) is not int or format_version not in {1, 2}:
+            raise GrafxConfigurationError(
+                "The coordinator control format must be version 1 or 2.",
+                field="format_version",
+                value=repr(format_version),
+            )
+        with self._state_lock:
+            if self._control_database_uuid is not None and (
+                self._control_database_uuid != database_uuid
+                or self._control_format_version != format_version
+            ):
+                raise GrafxConfigurationError(
+                    "A coordinator cannot be rebound to a different database or control format.",
+                    field="control_format",
+                    state="different_binding",
+                )
+            if self._control_database_uuid == database_uuid:
+                return
+            if self._held is not None or self._readers:
+                raise GrafxConfigurationError(
+                    "The control format must be bound before leases or readers are acquired.",
+                    field="control_format",
+                    state="active",
+                )
+            if format_version == 1:
+                if self._lease_slots is not None:
+                    raise GrafxConfigurationError(
+                        "A coordinator already bound to format 2 cannot be rebound to format 1.",
+                        field="control_format",
+                        state="already_bound",
+                    )
+                self._control_database_uuid = database_uuid
+                self._control_format_version = 1
+                return
+            nonce = int.from_bytes(uuid.uuid4().bytes[:8], "little")
+            candidate = TwoSlotControlRecordStore(
+                self._storage,
+                file=self._lease_file,
+                record_kind=ControlRecordKind.LEASE,
+                database_uuid=database_uuid,
+                file_nonce=nonce,
+                temporary=f"{self._lease_file}.{self._owner}.tmp",
+            )
+            if self._lease_slots is not None:
+                return
+            self._lease_slots = candidate
+            self._control_database_uuid = database_uuid
+            self._control_format_version = 2
+            pin = getattr(self._storage, "pin_descriptor", None)
+            if callable(pin):
+                pin(self._lease_file)
 
     # --- identity and epoch --------------------------------------------------------------------
 
@@ -1468,6 +1539,13 @@ class LocalProcessCoordinator:
 
     def _read_lease_record(self) -> LeaseRecord | None:
         """Read and decode the lease file, returning None when nothing is published yet."""
+        if self._lease_slots is not None:
+            record = self._lease_slots.read()
+            return (
+                None
+                if record is None
+                else decode_lease_record(record.payload, file=self._lease_file)
+            )
         return self._read_record(
             self._lease_file, decode_lease_record, empty_is_absent=False
         )
@@ -1589,7 +1667,11 @@ class LocalProcessCoordinator:
 
     def _publish_lease(self, record: LeaseRecord) -> None:
         """Write the lease record atomically and adopt it as this participant own observation."""
-        self._publish(self._lease_file, encode_lease_record(record))
+        payload = encode_lease_record(record)
+        if self._lease_slots is None:
+            self._publish(self._lease_file, payload)
+        else:
+            self._lease_slots.publish(payload)
         self._observe_lease(record, self._clock.monotonic())
 
     def _publish_reader(self, record: ReaderRecord) -> None:

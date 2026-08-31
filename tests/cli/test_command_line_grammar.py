@@ -41,6 +41,7 @@ def test_the_command_table_covers_the_operator_surface() -> None:
         "quarantine inspect",
         "quarantine read",
         "metrics",
+        "control downgrade",
     }
 
 

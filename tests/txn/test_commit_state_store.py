@@ -114,7 +114,9 @@ def test_checkpoint_hint_is_explicitly_lenient_without_weakening_strict_read() -
         store.read()
 
 
-def test_publish_uses_an_owner_exclusive_temporary_and_the_frozen_durability_order() -> None:
+def test_publish_uses_an_owner_exclusive_temporary_and_the_frozen_durability_order() -> (
+    None
+):
     device = FaultInjectingStorageDevice(MemoryStorageDevice())
     stale = b"stale temporary bytes"
     _write(device, TEMPORARY, stale)
@@ -139,3 +141,33 @@ def test_publish_uses_an_owner_exclusive_temporary_and_the_frozen_durability_ord
     ]
     assert not device.exists(TEMPORARY)
     assert CommitStateStore(device, owner_id="reader").read() == state
+
+
+def test_format_two_migrates_the_legacy_state_then_uses_one_page_write() -> None:
+    device = FaultInjectingStorageDevice(MemoryStorageDevice())
+    original = CommitState(last_committed_lsn=7, last_csn=7, checkpoint_lsn=4)
+    _write(device, COMMIT_STATE_FILE, original.encode())
+    store = CommitStateStore(
+        device,
+        owner_id=OWNER,
+        database_uuid=b"d" * 16,
+        file_nonce=17,
+        control_format_version=2,
+    )
+
+    assert store.read() == original
+    store.publish(CommitState(last_committed_lsn=9, last_csn=9, checkpoint_lsn=4))
+    device.clear_trail()
+    final = CommitState(last_committed_lsn=12, last_csn=12, checkpoint_lsn=4)
+    store.publish(final)
+
+    relevant = [
+        (call.method, call.file)
+        for call in device.trail()
+        if call.method in {"write_page", "durable_barrier", "atomic_replace"}
+    ]
+    assert relevant == [
+        ("write_page", COMMIT_STATE_FILE),
+        ("durable_barrier", COMMIT_STATE_FILE),
+    ]
+    assert store.read() == final

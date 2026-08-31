@@ -1,14 +1,19 @@
 """Shared persistence for the published commit state.
 
 ``control/commit.state`` is a small control-plane record, but its ordering is part of the
-durability contract: readers may observe the new state only after its complete payload has been
-made durable and atomically installed.  This store keeps that protocol in one place so commit
-and recovery cannot drift apart when they publish or interpret the record.
+durability contract.  Format 1 atomically replaces the whole record.  Format 2 alternates two
+checksummed pages after the WAL commit is already durable, then barriers the updated page before
+acknowledgement.  This store keeps both protocols in one place so commit and recovery cannot
+drift apart when they publish or interpret the record.
 """
 
 from __future__ import annotations
 
-from okto_grafx.domain.errors import GrafxError
+from okto_grafx.domain.control_record import (
+    ControlRecordKind,
+    TwoSlotControlRecordStore,
+)
+from okto_grafx.domain.errors import GrafxConfigurationError, GrafxError
 from okto_grafx.domain.ids import NO_LSN, Lsn
 from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE, CommitState
@@ -22,9 +27,17 @@ COMMIT_STATE_READ_ATTEMPTS: int = 4
 class CommitStateStore:
     """Read and atomically publish the durable commit-state record for one participant."""
 
-    __slots__ = ("_owner_id", "_storage")
+    __slots__ = ("_owner_id", "_slots", "_storage")
 
-    def __init__(self, storage: StorageDevice, *, owner_id: str) -> None:
+    def __init__(
+        self,
+        storage: StorageDevice,
+        *,
+        owner_id: str,
+        database_uuid: bytes | None = None,
+        file_nonce: int = 0,
+        control_format_version: int = 1,
+    ) -> None:
         """Bind a storage namespace and the owner identity used for the staging file.
 
         Owner identities are issued by the process coordinator, which already constrains them to
@@ -33,6 +46,34 @@ class CommitStateStore:
         """
         self._storage: StorageDevice = storage
         self._owner_id: str = owner_id
+        if type(control_format_version) is not int or control_format_version not in {
+            1,
+            2,
+        }:
+            raise GrafxConfigurationError(
+                "The commit-state control format must be version 1 or 2.",
+                field="control_format_version",
+                value=repr(control_format_version),
+            )
+        if control_format_version == 2:
+            if database_uuid is None:
+                raise GrafxConfigurationError(
+                    "Commit-state slot format 2 needs the database UUID.",
+                    field="database_uuid",
+                )
+            self._slots: TwoSlotControlRecordStore | None = TwoSlotControlRecordStore(
+                storage,
+                file=COMMIT_STATE_FILE,
+                record_kind=ControlRecordKind.COMMIT_STATE,
+                database_uuid=database_uuid,
+                file_nonce=file_nonce,
+                temporary=self._temporary_file,
+            )
+            pin = getattr(storage, "pin_descriptor", None)
+            if callable(pin):
+                pin(COMMIT_STATE_FILE)
+        else:
+            self._slots = None
 
     def read(self) -> CommitState:
         """Return the published state, or an empty state only when the file is absent.
@@ -46,6 +87,13 @@ class CommitStateStore:
         while True:
             attempts += 1
             try:
+                if self._slots is not None:
+                    record = self._slots.read()
+                    return (
+                        CommitState()
+                        if record is None
+                        else CommitState.decode(record.payload)
+                    )
                 if not self._storage.exists(COMMIT_STATE_FILE):
                     return CommitState()
                 size = self._storage.log_size(COMMIT_STATE_FILE)
@@ -71,7 +119,10 @@ class CommitStateStore:
             return NO_LSN
 
     def publish(self, state: CommitState) -> None:
-        """Durably stage ``state`` and atomically replace the published record with it."""
+        """Publish ``state`` with the database's declared control-record protocol."""
+        if self._slots is not None:
+            self._slots.publish(state.encode())
+            return
         temporary = self._temporary_file
         if self._storage.exists(temporary):
             self._storage.remove(temporary)

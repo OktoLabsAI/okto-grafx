@@ -306,7 +306,7 @@
   `w7-ef0de63-64a9da6-pf5-h1h8_1.json`, SHA-256
   `2ce10d4200a9a420c75c081da9ae804001223cfb5f833aacdb91b854b68415c9`; check-only anterior,
   mesmo conjunto lógico e checkouts limpos: `w7-ef0de63-64a9da6-check.json`.
-- **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
+- **CE-1 possui candidato de produção integrado; promoção aguarda somente G6/G7.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`
   (`108,85x-158,01x`), o caso frio `1,00-7,16 ms` (`2,58x-14,95x`) e a LRU real com evicção
@@ -314,13 +314,21 @@
   descriptor evicto, sem extrapolá-lo ainda para commits reais. Artefatos v2: `run-10` SHA-256
   `a41b645cf8d40abce0f46ff9cb3c8eb9d25c22c89f519bf6df4e1e33dd89af3c`, `run-11`
   `63fc77475a39697924d3b8ff8613c458a579ae5fe2ed9a02e7cc2986bc350262` e `run-12`
-  `2e8e4e062734eb668b15ab74b350f7a5d20eb4b39ef18647354909b341118ff8`. Isso libera somente a
-  matriz de crash/fault; produção continua bloqueada. A proposta de
+  `2e8e4e062734eb668b15ab74b350f7a5d20eb4b39ef18647354909b341118ff8`. O candidato implementa
+  o envelope de três páginas (header imutável + dois slots), migração crash-safe v1→v2,
+  `writer.lease` e `commit.state` in-place, reservas best-effort dos dois descritores dentro do
+  orçamento, retirement v2 e rollback offline `oktografx control downgrade`. Unidade (11), matriz
+  de crash/partial-write (30, inclusive todas as fronteiras de 512 B e 10.000 publicações),
+  storage adapters, coordination, txn, recovery, API CE-1 e CLI passaram, assim como Ruff e
+  `diff --check`. O gate experimental corrigiu uma premissa do plano: um prefixo setorial pode
+  conter o registro inteiro, portanto o aceite é geração antiga ou nova **inteira**, nunca híbrida,
+  e não “sempre fallback”. O round-trip v2→v1 preservou os payloads lógicos byte a byte. A proposta de
   formato/migração/crash matrix está em
   `perf/w1-ce1-contract@7b83dcd8c89c991bac35273d099a7a79e982d227`, documento
   `docs/architecture/CE1_TWO_SLOT_CONTROL_RECORD.md` SHA-256
-  `5d07dcebaeda8c33a5220846985b80b8a4353e2294659eb352e076ffbf973dd9`; status continua
-  `PROPOSED`, preservando multi-writer/multi-reader e bloqueando produção até todos os gates.
+  `5d07dcebaeda8c33a5220846985b80b8a4353e2294659eb352e076ffbf973dd9`; o ADR agora está
+  `IMPLEMENTED CANDIDATE`, preservando multi-writer/multi-reader e bloqueando promoção somente
+  até o benchmark same-code (G6) e a revisão crítica independente (G7).
 - **Compatibilidade Okto Pulse: M-PULSE-1 a M-PULSE-6 concluídos e certificados conforme o quadro
   9.7; M-PULSE-7 está em execução e permanece o gate serial.** O primeiro trace representativo
   expôs um blocker de performance, não de semântica: no mesmo workload, Ladybug concluiu em

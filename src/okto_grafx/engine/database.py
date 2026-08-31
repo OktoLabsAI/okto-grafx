@@ -180,7 +180,7 @@ a second DEFINITION of a shared rule; a file name that two components must agree
 IDENTITY_MAGIC: bytes = b"OKTOGRFX"
 """The eight bytes that open the identity record (CONTRACT.md section 6.2)."""
 
-IDENTITY_FORMAT_VERSION: int = 1
+IDENTITY_FORMAT_VERSION: int = 2
 """The identity format this build writes. Every earlier version stays readable."""
 
 IDENTITY_SLOT: int = 1
@@ -1170,9 +1170,7 @@ class Database:
             )
         self._wal_max_bytes: int | None = None
         if wal_max_bytes is not None:
-            self._wal_max_bytes = _builtin_int(
-                wal_max_bytes, field="wal_max_bytes"
-            )
+            self._wal_max_bytes = _builtin_int(wal_max_bytes, field="wal_max_bytes")
             if self._wal_max_bytes <= 0:
                 raise GrafxConfigurationError(
                     "The WAL byte threshold must be a positive number of bytes.",
@@ -2010,23 +2008,23 @@ class Database:
             # deliberately exposes neither; the context behind it is the staging transaction.
             context = transaction._context
             through = _builtin_int(transaction.snapshot.read_lsn)
-        # A transaction that stages durable work and claims no partition could never be
-        # refused by optimistic validation, so a concurrent commit could replace what it
-        # wrote. The page this pass rewrites is the index header that carries the stale
-        # mark and the built-through position, and naming it is what makes two rebuilds of
-        # one index conflict instead of silently overwriting each other. Concurrency
-        # against the HEAP is not this declaration's job: the durable rebuild generation
-        # already refuses a superseded reset, and later commits stage their own entries.
+            # A transaction that stages durable work and claims no partition could never be
+            # refused by optimistic validation, so a concurrent commit could replace what it
+            # wrote. The page this pass rewrites is the index header that carries the stale
+            # mark and the built-through position, and naming it is what makes two rebuilds of
+            # one index conflict instead of silently overwriting each other. Concurrency
+            # against the HEAP is not this declaration's job: the durable rebuild generation
+            # already refuses a superseded reset, and later commits stage their own entries.
             context.note_write(page_partition(target.file, HEADER_PAGE_INDEX))
-        # The header alone only fences rebuild against rebuild. The claim makes the index
-        # durably stale BEFORE anything is staged, and a row written to the target table in
-        # the window that follows advances the very generation this pass is rebuilding: the
-        # RESET then reaches the log durably and refuses to apply, which leaves a committed
-        # redo nobody can complete -- recovery_required, checkpoint refused, and a database
-        # that will not reopen. Reading every partition of the target table turns that into
-        # an ordinary optimistic refusal BEFORE the barrier, because a row write already
-        # publishes its key partition. Only this table is fenced, so unrelated commits are
-        # untouched.
+            # The header alone only fences rebuild against rebuild. The claim makes the index
+            # durably stale BEFORE anything is staged, and a row written to the target table in
+            # the window that follows advances the very generation this pass is rebuilding: the
+            # RESET then reaches the log durably and refuses to apply, which leaves a committed
+            # redo nobody can complete -- recovery_required, checkpoint refused, and a database
+            # that will not reopen. Reading every partition of the target table turns that into
+            # an ordinary optimistic refusal BEFORE the barrier, because a row write already
+            # publishes its key partition. Only this table is fenced, so unrelated commits are
+            # untouched.
             table_id = _builtin_int(
                 manager.index(name).definition.table_id  # type: ignore[attr-defined]
             )

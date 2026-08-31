@@ -42,6 +42,8 @@ from okto_grafx.domain.txn.records import encode_page_write
 from okto_grafx.domain.wal.record import WalRecord, WalRecordType
 import okto_grafx.engine.commit_redo as commit_redo_module
 from okto_grafx.engine.buffer_pool import BufferPool
+from okto_grafx.engine.commit_state_store import CommitStateStore
+from okto_grafx.engine.database import MetaStore
 from okto_grafx.engine.index_manager import IndexStore, primary_key_index_name
 from okto_grafx.engine.ledger_store import LEDGER_FILE
 from okto_grafx.runtime.bootstrap import coordinator_settings, install_checksum
@@ -62,7 +64,7 @@ class _PersistentPageWriteFailure(FaultInjectingStorageDevice):
         self.block_page_writes = False
 
     def write_page(self, file: str, page_index: int, data: bytes) -> None:
-        if self.block_page_writes:
+        if self.block_page_writes and not file.startswith("control/"):
             raise GrafxDeviceFull(
                 "The test device is persistently refusing page writes.",
                 file=file,
@@ -79,12 +81,23 @@ class _PersistentCommitStatePublishFailure(FaultInjectingStorageDevice):
         self.block_state_publication = False
 
     def atomic_replace(self, source: str, target: str) -> None:
+        """Keep covering a legacy/bootstrap publication of commit state."""
         if self.block_state_publication and target == COMMIT_STATE_FILE:
             raise GrafxDeviceFull(
                 "The test device is persistently refusing commit-state publication.",
                 file=target,
             )
         super().atomic_replace(source, target)
+
+    def write_page(self, file: str, page_index: int, data: bytes) -> None:
+        """Refuse the format-2 in-place publication without blocking ordinary page apply."""
+        if self.block_state_publication and file == COMMIT_STATE_FILE:
+            raise GrafxDeviceFull(
+                "The test device is persistently refusing commit-state publication.",
+                file=file,
+                page=page_index,
+            )
+        super().write_page(file, page_index, data)
 
 
 def _registry(
@@ -130,8 +143,21 @@ def _connect(
 
 
 def _published(storage: MemoryStorageDevice) -> CommitState:
-    size = storage.log_size(COMMIT_STATE_FILE)
-    return CommitState.decode(storage.read_log(COMMIT_STATE_FILE, 0, size))
+    pool = BufferPool(
+        storage,
+        PageCodecV1(PAGE_SIZE),
+        NoOpMetricsSink(),
+        budget_bytes=2 * PAGE_SIZE,
+        db_label="crash-test",
+        guard=threading.RLock(),
+    )
+    identity = MetaStore(pool).read()
+    return CommitStateStore(
+        storage,
+        owner_id="crash-test-reader",
+        database_uuid=identity.database_uuid,
+        control_format_version=identity.format_version,
+    ).read()
 
 
 def _operators(database: Database, statement: str) -> set[str]:
@@ -168,9 +194,7 @@ def _recovery_artifacts(storage: MemoryStorageDevice) -> dict[str, bytes]:
         for name in storage.list_files("")
         if name in exact or name.startswith(prefixes)
     )
-    return {
-        name: storage.read_log(name, 0, storage.file_size(name)) for name in names
-    }
+    return {name: storage.read_log(name, 0, storage.file_size(name)) for name in names}
 
 
 def _durable_row_crash() -> tuple[
@@ -196,7 +220,7 @@ def _durable_row_crash() -> tuple[
     # The first data-page write belongs to step 3.6.  The WAL append and its barrier have
     # already returned, while neither a heap page nor an index change has reached its file.
     fault.clear_trail()
-    fault.crash_on("write_page", occurrence=1, moment="before")
+    fault.crash_on("write_page", occurrence=2, moment="before")
     with pytest.raises(SimulatedCrash) as stopped:
         txn.commit()
     fault.disarm()
@@ -284,9 +308,7 @@ def test_missing_mandatory_index_redo_refuses_publication_and_page_flush() -> No
     assert _heap_images(memory) == heap_before
 
 
-def test_a_late_invalid_effect_preflights_before_stale_or_control_bytes_move() -> (
-    None
-):
+def test_a_late_invalid_effect_preflights_before_stale_or_control_bytes_move() -> None:
     """A stale-floor verdict cannot persist before the complete redo plan validates."""
     memory = MemoryStorageDevice(page_size=PAGE_SIZE)
     fault = FaultInjectingStorageDevice(memory, seed=20260830)
@@ -330,9 +352,7 @@ def test_a_late_invalid_effect_preflights_before_stale_or_control_bytes_move() -
             (
                 WalRecord(
                     record_type=int(WalRecordType.WRITE_PAGE),
-                    payload=encode_page_write(
-                        "heap.dat", page_index, valid_image
-                    ),
+                    payload=encode_page_write("heap.dat", page_index, valid_image),
                     epoch=epoch,
                     txn_id=txn_id,
                 ),
@@ -389,16 +409,14 @@ def test_a_failed_operator_recovery_cannot_later_certify_a_short_index(
     txn = crashed.begin("write")
     txn.execute("CREATE (:P {id: 7, name: 'durable'})")
     fault.clear_trail()
-    fault.crash_on("write_page", occurrence=1, moment="before")
+    fault.crash_on("write_page", occurrence=2, moment="before")
     with pytest.raises(SimulatedCrash):
         txn.commit()
     fault.disarm()
     unpublished_commit = crashed.wal.last_lsn
     assert state_before.last_committed_lsn < unpublished_commit
 
-    def fail_logical_redo(
-        index: IndexStore, change: object, lsn: int
-    ) -> bool:
+    def fail_logical_redo(index: IndexStore, change: object, lsn: int) -> bool:
         del change, lsn
         raise GrafxDeviceFull(
             "The transient device fault reached logical index redo.", file=index.file
@@ -446,16 +464,14 @@ def test_a_failed_checkpoint_page_redo_cannot_be_skipped_by_a_later_commit(
     txn = crashed.begin("write")
     txn.execute("CREATE (:P {id: 7, name: 'durable'})")
     fault.clear_trail()
-    fault.crash_on("write_page", occurrence=1, moment="before")
+    fault.crash_on("write_page", occurrence=2, moment="before")
     with pytest.raises(SimulatedCrash):
         txn.commit()
     fault.disarm()
     unpublished_commit = crashed.wal.last_lsn
     assert state_before.last_committed_lsn < unpublished_commit
 
-    def fail_page_redo(
-        pool: object, file: str, page_index: int, image: bytes
-    ) -> bool:
+    def fail_page_redo(pool: object, file: str, page_index: int, image: bytes) -> bool:
         del pool, page_index, image
         raise GrafxDeviceFull(
             "The transient device fault reached page redo.", file=file
@@ -495,7 +511,9 @@ def test_the_same_handle_requires_recovery_after_its_post_barrier_redo_fails() -
     database = _connect(fault, namespace=memory)
     try:
         with database.begin("write") as schema:
-            schema.execute("CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))")
+            schema.execute(
+                "CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))"
+            )
         database.checkpoint()
 
         waiting = database.begin("write")
@@ -560,7 +578,9 @@ def test_flush_cannot_race_a_post_barrier_recovery_latch(
     database = _connect(fault, namespace=memory)
     try:
         with database.begin("write") as schema:
-            schema.execute("CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))")
+            schema.execute(
+                "CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))"
+            )
         database.checkpoint()
 
         transaction = database.begin("write")
@@ -578,7 +598,10 @@ def test_flush_cannot_race_a_post_barrier_recovery_latch(
 
         def paused_flush(pool: BufferPool, file: str | None = None) -> int:
             flush_calls.append((threading.current_thread().name, file))
-            if pool is database._pool and threading.current_thread().name == "public-flush":
+            if (
+                pool is database._pool
+                and threading.current_thread().name == "public-flush"
+            ):
                 flush_entered.set()
                 if not release_flush.wait(timeout=5.0):
                     raise AssertionError("the test did not release the public flush")
@@ -637,13 +660,17 @@ def test_flush_cannot_race_a_post_barrier_recovery_latch(
         database.close()
 
 
-def test_an_already_open_participant_completes_a_foreign_gap_before_same_page_write() -> None:
+def test_an_already_open_participant_completes_a_foreign_gap_before_same_page_write() -> (
+    None
+):
     """A later full-page image cannot permanently replace an unapplied durable commit."""
     memory = MemoryStorageDevice(page_size=PAGE_SIZE)
     fault = _PersistentPageWriteFailure(memory)
     with _connect(fault, namespace=memory) as setup:
         with setup.begin("write") as schema:
-            schema.execute("CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))")
+            schema.execute(
+                "CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))"
+            )
         setup.checkpoint()
 
     later_writer = _connect(fault, namespace=memory)
@@ -702,7 +729,9 @@ def test_public_recovery_refuses_effects_whose_commit_outcome_was_lost(
     fault = _PersistentCommitStatePublishFailure(memory)
     with _connect(fault, namespace=memory) as setup:
         with setup.begin("write") as schema:
-            schema.execute("CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))")
+            schema.execute(
+                "CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))"
+            )
         setup.checkpoint()
 
     failed = _connect(fault, namespace=memory)
@@ -757,7 +786,9 @@ def test_public_recovery_refuses_effects_whose_commit_outcome_was_lost(
     failed.close()
 
     before_recovery = _recovery_artifacts(memory)
-    assert not any(name.startswith(("ledger/", "quarantine/")) for name in before_recovery)
+    assert not any(
+        name.startswith(("ledger/", "quarantine/")) for name in before_recovery
+    )
 
     # Two ordinary opens model the attempted later writer B: neither may obtain a Database from
     # which it could advance the watermark, and a refusal is a strictly byte-identical decision.
@@ -780,9 +811,7 @@ def test_read_only_open_refuses_an_applied_ddl_effect_with_no_outcome() -> None:
 
     failed = _connect(fault, namespace=memory)
     state_before = _published(memory)
-    catalog_before = memory.read_log(
-        "catalog.dat", 0, memory.file_size("catalog.dat")
-    )
+    catalog_before = memory.read_log("catalog.dat", 0, memory.file_size("catalog.dat"))
     transaction = failed.begin("write")
     transaction.execute(
         "CREATE NODE TABLE Ambiguous(id INT64, name STRING, PRIMARY KEY(id))"
@@ -849,7 +878,9 @@ REL_TABLE = "R"
 
 def _surviving(database: Database) -> tuple[int, ...]:
     """Return the node identities a reader can still see, ordered."""
-    return tuple(sorted(row[0] for row in database.execute("MATCH (p:P) RETURN p.id").rows))
+    return tuple(
+        sorted(row[0] for row in database.execute("MATCH (p:P) RETURN p.id").rows)
+    )
 
 
 def _live_edges(database: Database) -> tuple[tuple[object, object], ...]:
@@ -910,8 +941,12 @@ def _detach_crash(
     )
     with _connect(fault, namespace=memory) as setup:
         with setup.begin("write") as txn:
-            txn.execute(f"CREATE NODE TABLE {TABLE}(id INT64, name STRING, PRIMARY KEY(id))")
-            txn.execute(f"CREATE REL TABLE {REL_TABLE}(FROM {TABLE} TO {TABLE}, w INT64)")
+            txn.execute(
+                f"CREATE NODE TABLE {TABLE}(id INT64, name STRING, PRIMARY KEY(id))"
+            )
+            txn.execute(
+                f"CREATE REL TABLE {REL_TABLE}(FROM {TABLE} TO {TABLE}, w INT64)"
+            )
         with setup.begin("write") as txn:
             for identity in (1, 2, 3):
                 txn.execute(f"CREATE (:{TABLE} {{id: $i, name: 'n'}})", {"i": identity})
@@ -931,7 +966,7 @@ def _detach_crash(
     if aim == "log":
         fault.armed = True
     else:
-        fault.crash_on(aim, occurrence=1, moment="before")
+        fault.crash_on(aim, occurrence=2, moment="before")
     with pytest.raises(SimulatedCrash) as stopped:
         txn.commit()
     if aim == "log":
@@ -952,7 +987,9 @@ def test_a_crashed_detach_delete_publishes_the_node_with_its_edges_or_neither() 
     # Cut AFTER the COMMIT record is durable: the next open completes all three ends.
     memory, fault, before, stopped = _detach_crash("write_page")
     assert stopped.file == "heap.dat"
-    assert _published(memory).last_committed_lsn == before  # not published yet, but durable
+    assert (
+        _published(memory).last_committed_lsn == before
+    )  # not published yet, but durable
     with _connect(fault, namespace=memory) as recovered:
         assert recovered.recovery_report.records_replayed > 0
         assert _published(memory).last_committed_lsn > before
@@ -977,8 +1014,7 @@ def _created_graph(
     """Return the two public halves of the graph created by the pending-endpoint test."""
     nodes = _surviving(database)
     edges = database.execute(
-        f"MATCH (a:{TABLE})-[r:{REL_TABLE}]->(b:{TABLE}) "
-        "RETURN a.id, b.id, r.w"
+        f"MATCH (a:{TABLE})-[r:{REL_TABLE}]->(b:{TABLE}) RETURN a.id, b.id, r.w"
     ).rows
     return nodes, edges
 
@@ -1023,7 +1059,7 @@ def _pending_graph_crash(
         assert isinstance(fault, _CrashBeforeTheLogAccepts)
         fault.armed = True
     else:
-        fault.crash_on("write_page", occurrence=1, moment="before")
+        fault.crash_on("write_page", occurrence=2, moment="before")
     with pytest.raises(SimulatedCrash) as stopped:
         transaction.commit()
     if isinstance(fault, _CrashBeforeTheLogAccepts):

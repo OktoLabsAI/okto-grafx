@@ -503,10 +503,17 @@ index/<index_name>.idx     paged secondary index
 wal/<000000000001>.wal     append-only WAL segments
 ledger/ledger.log          append-only unapplied-work ledger
 quarantine/<stamp>-<name>/{manifest.json, <copied bytes>}
-control/writer.lease       lease + epoch
+control/writer.lease       lease + epoch (format 2: immutable header + two alternating slots)
 control/readers/<id>.reader
-control/commit.state       published {last_committed_lsn, last_csn, checkpoint_lsn} (atomic_replace)
+control/commit.state       published {last_committed_lsn, last_csn, checkpoint_lsn} (format 2 slots)
 ```
+
+Identity format 1 stores each control record as one raw logical payload published by temporary
+file plus `atomic_replace`. Identity format 2 keeps reader registrations on that protocol until
+CE-2, but stores `writer.lease` and `commit.state` in fixed three-page envelopes: page 0 is an
+immutable database/file binding and pages 1/2 are alternating checksummed generations. A warm
+publication writes only the older/invalid slot and barriers the target file. Bootstrap and the
+offline `oktografx control downgrade PATH` remain atomic whole-file publications.
 
 ### 6.2 Meta page (`grafx.meta`, page 0)
 
@@ -514,12 +521,17 @@ control/commit.state       published {last_committed_lsn, last_csn, checkpoint_l
  created_at_wall f64 | partitions_per_table u16 | granularity_descriptor_len u16 |
  granularity_descriptor UTF-8 | reserved | crc32c u32`
 
+`format_version = 2` declares the two-slot control envelope above. A v2 build reads v1 and v2;
+a v1 build must refuse v2 at `grafx.meta` before interpreting any control file. Writable open
+migrates v1 to v2 by durably publishing meta v2 first and the completion marker second; the
+intermediate `meta=v2/complete=v1` state is resumable by a writer and read-only refuses it.
+
 ### 6.3 Page header (32 bytes, every paged file)
 
 | off | type | field |
 |---|---|---|
 | 0 | u32 | `checksum` — CRC-32C over bytes[4:page_size] |
-| 4 | u16 | `page_type` 0 free · 1 meta · 2 heap · 3 catalog · 4 index_hash · 5 index_hnsw · 6 overflow |
+| 4 | u16 | `page_type` 0 free · 1 meta · 2 heap · 3 catalog · 4 index_hash · 5 index_hnsw · 6 overflow · 7 control_slot · 8 control_header |
 | 6 | u16 | `flags` |
 | 8 | u64 | `page_lsn` — LSN of the last WAL record applied to this page (redo idempotence) |
 | 16 | u32 | `seq` — even = stable, odd = being written (torn-read detection helper) |
@@ -532,7 +544,8 @@ control/commit.state       published {last_committed_lsn, last_csn, checkpoint_l
 Slotted layout: payloads grow up from `free_start`; the slot directory grows **down** from
 `page_size`, each slot `(u16 offset, u16 length)`.
 
-**Page 0 of every paged file is a reserved file-header page** (`page_type = 1`). No heap/catalog/index
+**Page 0 of every ordinary paged file is a reserved file-header page** (`page_type = 1`). A format-2
+control envelope instead reserves page 0 as `control_header` (`page_type = 8`). No heap/catalog/index
 record ever lives on page 0. Consequence: a real `RecordRef` can never encode to `0`, so the heap
 `prev_version` field can safely use literal `0` as "no previous version". Write literal `0` for the
 end of a version chain — never `NULL_REF.encode()`.
@@ -540,6 +553,14 @@ end of a version chain — never `NULL_REF.encode()`.
 **Torn-read protocol (readers never block writers):** `read_page` → if `seq` is odd or the checksum
 fails, re-read (bounded retries, default 8, with no sleep in domain). After the budget is exhausted
 raise `GrafxCorruptionDetected` with the page location.
+
+For a control envelope, one invalid/torn slot is not whole-file corruption: the reader validates
+both pages and serves the valid non-empty slot with the greatest u64 generation. Zero valid
+non-empty slots fail closed for lease/commit state. Equal non-zero generations, persistent
+generation regression, a foreign database UUID/kind/file nonce, and generation overflow also fail
+closed. The immutable header and each slot carry CRC-32C; the slot binding prevents an intact page
+from another file or database being accepted. Exact bytes and algorithms are frozen by
+`docs/architecture/CE1_TWO_SLOT_CONTROL_RECORD.md`.
 
 ### 6.4 Heap record (inside a slot) — 40-byte header
 
@@ -752,7 +773,10 @@ growth or ordering.
    5. `wal.barrier()` — **BR-4: no acknowledgement before this returns**.
    6. apply page images: for each, `if page.page_lsn < lsn: write with page_lsn = lsn`.
       (Data files are NOT fsynced here; the WAL is the authority, redo is idempotent.)
-   7. publish `control/commit.state` via `atomic_replace`.
+   7. publish `control/commit.state` into the older/invalid format-2 slot via one `write_page`
+      followed by `durable_barrier(file)`. The new complete slot may become visible before the
+      barrier because the corresponding `COMMIT` is already durable at step 5; acknowledgement
+      still waits for the control-file barrier. Format 1 retains `atomic_replace`.
 4. return `CommitReport(csn=lsn, durable=True, wrote=True)`.
 
 Disjoint partition sets never conflict → both commit (BR-6/AC-1).

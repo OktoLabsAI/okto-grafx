@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from okto_grafx import connect
+from okto_grafx.api import assembly
 from okto_grafx.api.assembly import _release, assemble_database, database_label
 from okto_grafx.adapters.codec_v1 import PageCodecV1
 from okto_grafx.adapters.storage_local import LocalStorageDevice, barrier_failure
@@ -43,6 +44,7 @@ from okto_grafx.engine.database import (
     MetaStore,
 )
 from okto_grafx.engine.recovery_manager import META_FILE as RECOVERY_META_FILE
+from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE
 from okto_grafx.runtime.bootstrap import build_default_registry, release_ports
 from okto_grafx.runtime.config import DatabaseConfig
 
@@ -65,13 +67,112 @@ def test_a_new_database_gets_an_identity_of_its_own(tmp_path: Path) -> None:
     assert identity.created_at_wall > 0.0
 
 
-def test_reopening_finds_the_identity_the_database_was_created_with(tmp_path: Path) -> None:
+def test_reopening_finds_the_identity_the_database_was_created_with(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "db"
     with connect(root) as db:
         first = db.identity
     with connect(root) as db:
         second = db.identity
     assert second == first
+
+
+def test_a_writable_open_upgrades_a_format_one_database_before_slot_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "legacy"
+    real_upgrade = assembly._upgrade_control_record_identity
+
+    def legacy_identity(config: DatabaseConfig, clock: object) -> DatabaseIdentity:
+        """Build exactly the identity emitted by the preceding on-disk format."""
+        return DatabaseIdentity(
+            database_uuid=assembly.new_database_uuid(),
+            page_size=config.page_size,
+            partitions_per_table=config.partitions_per_table,
+            created_at_wall=clock.wall(),  # type: ignore[attr-defined]
+            granularity_descriptor=config.granularity_descriptor,
+            format_version=1,
+        )
+
+    monkeypatch.setattr(assembly, "_configured_identity", legacy_identity)
+    monkeypatch.setattr(
+        assembly,
+        "_upgrade_control_record_identity",
+        lambda _config, _storage, _pool, _coordinator, identity: identity,
+    )
+    with connect(root) as legacy:
+        assert legacy.identity.format_version == 1
+        with legacy.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE Legacy(id INT64, PRIMARY KEY(id))")
+    assert (root / COMMIT_STATE_FILE).stat().st_size < 8192
+    assert (root / "control" / "writer.lease").stat().st_size < 8192
+
+    monkeypatch.setattr(assembly, "_upgrade_control_record_identity", real_upgrade)
+    with connect(root) as upgraded:
+        assert upgraded.identity.format_version == 2
+        with upgraded.begin("write") as txn:
+            txn.execute("CREATE (n:Legacy {id: 1})")
+        upgraded.checkpoint()
+    assert (root / COMMIT_STATE_FILE).stat().st_size == 3 * 8192
+    assert (root / "control" / "writer.lease").stat().st_size == 3 * 8192
+    with connect(root, read_only=True) as reader:
+        assert reader.identity.format_version == 2
+        assert reader.execute("MATCH (n:Legacy) RETURN n.id AS id").rows == ((1,),)
+
+
+def test_an_interrupted_format_upgrade_is_read_only_safe_and_writably_resumable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The durable v2 meta fence may lead the v1 completion marker, never vice versa."""
+    root = tmp_path / "interrupted-upgrade"
+    real_upgrade = assembly._upgrade_control_record_identity
+    real_replace_complete = assembly._replace_first_open_complete
+
+    def legacy_identity(config: DatabaseConfig, clock: object) -> DatabaseIdentity:
+        return DatabaseIdentity(
+            database_uuid=assembly.new_database_uuid(),
+            page_size=config.page_size,
+            partitions_per_table=config.partitions_per_table,
+            created_at_wall=clock.wall(),  # type: ignore[attr-defined]
+            granularity_descriptor=config.granularity_descriptor,
+            format_version=1,
+        )
+
+    monkeypatch.setattr(assembly, "_configured_identity", legacy_identity)
+    monkeypatch.setattr(
+        assembly,
+        "_upgrade_control_record_identity",
+        lambda _config, _storage, _pool, _coordinator, identity: identity,
+    )
+    with connect(root) as legacy:
+        assert legacy.identity.format_version == 1
+
+    monkeypatch.setattr(assembly, "_upgrade_control_record_identity", real_upgrade)
+
+    def stop_after_meta(_storage: object, _identity: DatabaseIdentity) -> None:
+        raise GrafxStorageError(
+            "Injected process death after the v2 meta fence.",
+            operation="control_format_upgrade",
+        )
+
+    monkeypatch.setattr(assembly, "_replace_first_open_complete", stop_after_meta)
+    with pytest.raises(GrafxStorageError, match="v2 meta fence"):
+        connect(root)
+
+    # A reader never mutates or guesses through the explicitly pending state.
+    monkeypatch.setattr(
+        assembly, "_replace_first_open_complete", real_replace_complete
+    )
+    with pytest.raises(GrafxUnsupportedOperation, match="writable open") as refused:
+        connect(root, read_only=True)
+    assert refused.value.details["state"] == "upgrade_pending"
+
+    # The next writer finishes the marker and proceeds with the same database identity.
+    with connect(root) as resumed:
+        assert resumed.identity.format_version == 2
+    with connect(root, read_only=True) as reader:
+        assert reader.identity.format_version == 2
 
 
 def test_two_databases_never_share_an_identity(tmp_path: Path) -> None:
@@ -240,7 +341,9 @@ def test_a_device_failure_reaches_the_caller_with_its_class_and_its_retryable_in
     [
         GrafxDeviceFull("The device is full.", free_bytes=0),
         GrafxCorruptionDetected("A page failed its checksum.", page=7),
-        GrafxStorageError("A sharing violation was exhausted.", winerror=32, attempts=3),
+        GrafxStorageError(
+            "A sharing violation was exhausted.", winerror=32, attempts=3
+        ),
     ],
     ids=["device_full", "corruption", "storage"],
 )
@@ -265,7 +368,10 @@ def test_a_failure_raised_under_the_assembly_arrives_unchanged(
         type(device).page_count = original  # type: ignore[method-assign]
         release_ports(registry)
     assert raised.value is planted
-    assert raised.value.details.get("retryable", raised.value.retryable) == planted.retryable
+    assert (
+        raised.value.details.get("retryable", raised.value.retryable)
+        == planted.retryable
+    )
 
 
 @pytest.mark.parametrize("cleanup_type", [RuntimeError, KeyboardInterrupt])
@@ -297,7 +403,9 @@ def test_assembly_unwind_exhausts_closers_without_replacing_the_primary_failure(
     assert ran == ["inner", "outer"]
 
 
-def test_a_retryable_device_failure_stays_retryable_through_connect(tmp_path: Path) -> None:
+def test_a_retryable_device_failure_stays_retryable_through_connect(
+    tmp_path: Path,
+) -> None:
     """A47: the retryable classification is what a caller acts on, so it must survive the open.
 
     This test used to provoke the condition with a path that is a file, which the device then
@@ -393,7 +501,9 @@ def _heap_page(db: object) -> object:
     )
 
 
-def test_nothing_that_is_not_a_grafx_error_escapes_the_public_door(tmp_path: Path) -> None:
+def test_nothing_that_is_not_a_grafx_error_escapes_the_public_door(
+    tmp_path: Path,
+) -> None:
     # DoD item 5: only Grafx types leave a public door.
     for call in (
         lambda: connect(object()),  # type: ignore[arg-type]
@@ -416,7 +526,9 @@ def test_a_registry_missing_a_slot_refuses_the_open() -> None:
 def test_a_device_whose_page_size_disagrees_with_the_configuration_is_refused(
     tmp_path: Path,
 ) -> None:
-    registry = build_default_registry(DatabaseConfig(path=str(tmp_path / "db"), page_size=1024))
+    registry = build_default_registry(
+        DatabaseConfig(path=str(tmp_path / "db"), page_size=1024)
+    )
     try:
         with pytest.raises(GrafxConfigurationError) as raised:
             assemble_database(
@@ -432,7 +544,9 @@ def test_the_database_label_is_stable_for_one_path() -> None:
     assert database_label("/some/place") != database_label("/other/place")
 
 
-def test_a_component_that_is_absent_is_named_rather_than_guessed(tmp_path: Path) -> None:
+def test_a_component_that_is_absent_is_named_rather_than_guessed(
+    tmp_path: Path,
+) -> None:
     with connect(tmp_path / "db") as db:
         object.__setattr__(db, "_queries", None)
         with pytest.raises(GrafxUnsupportedOperation) as raised:
@@ -544,7 +658,9 @@ def test_the_identity_store_refuses_a_page_size_the_database_was_not_created_wit
     # even divide the file into pages. This is the guard behind that one, asked directly: it is
     # the one that compares what the identity record SAYS against what the caller asked for, and
     # it is what protects a caller that reaches MetaStore without going through connect.
-    registry = build_default_registry(DatabaseConfig(path=str(tmp_path / "db"), page_size=512))
+    registry = build_default_registry(
+        DatabaseConfig(path=str(tmp_path / "db"), page_size=512)
+    )
     try:
         db = connect(tmp_path / "db", page_size=512, registry=registry)
         pool = db._pool
@@ -614,7 +730,9 @@ def test_a_device_failure_under_a_read_reaches_the_caller_as_the_class_it_starte
     is the object the caller catches -- because an equal-looking error rebuilt on the way up
     passes every ``isinstance`` and has already lost whatever detail it did not copy.
     """
-    registry = build_default_registry(DatabaseConfig(path=str(tmp_path / "db"), page_size=512))
+    registry = build_default_registry(
+        DatabaseConfig(path=str(tmp_path / "db"), page_size=512)
+    )
     device = registry.get("storage")
     device_type = type(device)
     original = device_type.read_page
@@ -627,7 +745,9 @@ def test_a_device_failure_under_a_read_reaches_the_caller_as_the_class_it_starte
     database = connect(tmp_path / "db", page_size=512, registry=registry)
     try:
         with database.begin("write") as txn:
-            txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
+            txn.execute(
+                "CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))"
+            )
         database._pool.invalidate()
 
         def refuse(self: object, file: str, page_index: int) -> bytes:
@@ -657,17 +777,24 @@ def test_a_retryable_device_failure_under_a_read_keeps_its_retryable_flag(
     # The same path with the other classification. A47's whole point is that the RETRYABLE detail
     # is what a caller acts on: reporting a transient device condition as permanent forbids the
     # one action that would have worked.
-    registry = build_default_registry(DatabaseConfig(path=str(tmp_path / "db"), page_size=512))
+    registry = build_default_registry(
+        DatabaseConfig(path=str(tmp_path / "db"), page_size=512)
+    )
     device = registry.get("storage")
     device_type = type(device)
     original = device_type.read_page
     planted = GrafxStorageError(
-        "A sharing violation was exhausted.", winerror=32, attempts=3, reason="access_failed"
+        "A sharing violation was exhausted.",
+        winerror=32,
+        attempts=3,
+        reason="access_failed",
     )
     database = connect(tmp_path / "db", page_size=512, registry=registry)
     try:
         with database.begin("write") as txn:
-            txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
+            txn.execute(
+                "CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))"
+            )
         database._pool.invalidate()
 
         def refuse(self: object, file: str, page_index: int) -> bytes:

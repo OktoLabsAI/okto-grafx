@@ -6,12 +6,20 @@ import pytest
 
 from okto_grafx.adapters.storage_fault import FaultInjectingStorageDevice
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
+from okto_grafx.adapters.coordination_local import (
+    LeaseRecord,
+    ReaderRecord,
+    encode_lease_record,
+    encode_reader_record,
+)
 from okto_grafx.domain.control_record import (
     CONTROL_FILE_PAGES,
     ControlRecordKind,
     TwoSlotControlRecordStore,
 )
 from okto_grafx.domain.errors import GrafxCorruptionDetected
+from okto_grafx.domain.page.layout import MAX_U64, MIN_PAGE_SIZE, PageHeader
+from okto_grafx.domain.txn.commit_state import CommitState
 
 FILE = "control/unit.state"
 TEMP = "control/unit.state.test.tmp"
@@ -160,3 +168,94 @@ def test_a_slot_file_is_bound_to_the_database_uuid() -> None:
 
     with pytest.raises(GrafxCorruptionDetected, match="not bound"):
         _store(device, database_uuid=b"x" * 16).read()
+
+
+def test_generation_at_u64_max_refuses_to_publish() -> None:
+    from okto_grafx.domain.control_record import _encode_slot  # noqa: PLC2701
+
+    device = MemoryStorageDevice()
+    store = _store(device)
+    store.publish(b"one")
+    header = store._read_header()  # noqa: SLF001 - exact overflow fixture
+    device.write_page(
+        FILE,
+        1,
+        _encode_slot(
+            header=header,
+            generation=MAX_U64,
+            payload=b"last",
+            page_size=device.page_size,
+        ),
+    )
+
+    with pytest.raises(GrafxCorruptionDetected, match="without wrapping"):
+        _store(device).publish(b"never")
+
+
+def test_page_seq_wraparound_does_not_affect_slot_selection() -> None:
+    from okto_grafx.domain.control_record import _encode_slot  # noqa: PLC2701
+
+    device = MemoryStorageDevice()
+    store = _store(device)
+    store.publish(b"one")
+    header = store._read_header()  # noqa: SLF001 - exact wrap fixture
+    before_wrap = (1 << 31) - 1
+    after_wrap = 1 << 31
+    device.write_page(
+        FILE,
+        1,
+        _encode_slot(
+            header=header,
+            generation=before_wrap,
+            payload=b"before",
+            page_size=device.page_size,
+        ),
+    )
+    wrapped = _encode_slot(
+        header=header,
+        generation=after_wrap,
+        payload=b"after",
+        page_size=device.page_size,
+    )
+    device.write_page(FILE, 2, wrapped)
+
+    assert PageHeader.decode(wrapped).seq == 0
+    observed = _store(device).read()
+    assert observed is not None
+    assert (observed.payload, observed.generation) == (b"after", after_wrap)
+
+
+def test_every_logical_v1_record_fits_in_the_smallest_control_page() -> None:
+    device = MemoryStorageDevice(page_size=MIN_PAGE_SIZE)
+    payloads = (
+        encode_lease_record(
+            LeaseRecord(
+                owner_id="o" * 88,
+                epoch=1,
+                heartbeat_seq=1,
+                ttl_seconds=30.0,
+                wall_stamp=1.0,
+                held=True,
+                superseded_epoch=0,
+            )
+        ),
+        encode_reader_record(
+            ReaderRecord(
+                reader_id="r" * 96,
+                snapshot_lsn=1,
+                heartbeat_seq=1,
+                wall_stamp=1.0,
+                active=True,
+            )
+        ),
+        CommitState(last_committed_lsn=1, last_csn=1, checkpoint_lsn=1).encode(),
+    )
+    for index, payload in enumerate(payloads, start=1):
+        store = _store(
+            device,
+            file=f"control/minimum-{index}.state",
+            temporary=f"control/minimum-{index}.tmp",
+            nonce=index,
+        )
+        assert store.publish(payload) == 1
+        assert store.read() is not None

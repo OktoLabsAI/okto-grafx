@@ -65,6 +65,7 @@ from okto_grafx.runtime.bootstrap import (
     open_quarantine_inventory,
 )
 from okto_grafx.runtime.config import MEMORY_PATH, DatabaseConfig
+from okto_grafx.runtime.control_migration import downgrade_control_format
 
 __all__ = [
     "MAX_PREVIEW_BYTES",
@@ -1711,6 +1712,38 @@ def _metrics(invocation: Invocation) -> Report:
     return _on_database(invocation, lambda database: _metrics_body(invocation, database))
 
 
+def _control_downgrade(invocation: Invocation) -> Report:
+    """Run the explicitly offline v2-to-v1 control-envelope migration."""
+    _require_database(invocation)
+    if invocation.flag("read_only"):
+        raise GrafxUnsupportedOperation(
+            "The control downgrade cannot run with --read-only.", field="read_only"
+        )
+    result = downgrade_control_format(
+        DatabaseConfig(path=invocation.path, **_connect_options(invocation))
+    )
+    payload = {
+        **_head(invocation),
+        "previous_format": result.previous_format,
+        "current_format": result.current_format,
+        "converted_files": list(result.converted_files),
+        "already_current": result.already_current,
+    }
+    lines = (
+        f"control downgrade of {invocation.path}",
+        *tuple(
+            _field_lines(
+                [
+                    ("format", f"{result.previous_format} -> {result.current_format}"),
+                    ("converted files", len(result.converted_files)),
+                    ("already format 1", result.already_current),
+                ]
+            )
+        ),
+    )
+    return Report(exit_code=OK, payload=payload, lines=lines)
+
+
 def _metrics_body(invocation: Invocation, database: Database) -> Report:
     """Build the metrics report of one open database."""
     snapshot = database.snapshot_metrics()
@@ -1871,5 +1904,6 @@ _HANDLERS: Mapping[str, Callable[[Invocation], Report]] = {
     "quarantine inspect": _quarantine_inspect,
     "quarantine read": _quarantine_read,
     "metrics": _metrics,
+    "control downgrade": _control_downgrade,
 }
 """Every command label the parser can produce, mapped to the function that answers it."""

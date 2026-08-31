@@ -659,6 +659,10 @@ class LocalStorageDevice:
         self._root = _validate_root(root)
         self._lock = threading.RLock()
         self._handles: dict[str, int] = {}
+        # A very small set of hot control files may reserve cache entries.  Pins remain inside
+        # ``max_open_files`` and leave at least one ordinary entry available, so a deliberately
+        # tiny test/user budget degrades to normal LRU behavior instead of exceeding its limit.
+        self._pinned_handles: set[str] = set()
         # The proved physical path each cached descriptor was opened through, so that a warm
         # hit checks the entry's identity without proving the whole chain again (A63 warm test).
         self._paths: dict[str, str] = {}
@@ -806,6 +810,30 @@ class LocalStorageDevice:
         name = normalize_logical_name(file)
         with self._lock:
             return self._size(name)
+
+    def pin_descriptor(self, file: str) -> bool:
+        """Best-effort reserve one descriptor-cache entry for a hot logical file.
+
+        This adapter-specific performance hint never opens or creates the file and never skips
+        the normal ``_still_names`` identity proof.  At least one cache entry is reserved for
+        non-pinned traffic; a smaller configured cache simply declines extra pins.
+        """
+        name = normalize_logical_name(file)
+        with self._lock:
+            self._require_open()
+            if name in self._pinned_handles:
+                return True
+            capacity = max(0, self._max_open_files - 1)
+            if len(self._pinned_handles) >= capacity:
+                return False
+            self._pinned_handles.add(name)
+            return True
+
+    def unpin_descriptor(self, file: str) -> None:
+        """Return a performance reservation without changing the file or its open handle."""
+        name = normalize_logical_name(file)
+        with self._lock:
+            self._pinned_handles.discard(name)
 
     def atomic_replace(self, source: str, target: str) -> None:
         """Move source onto target so a reader observes either the old or the new content.
@@ -1141,6 +1169,7 @@ class LocalStorageDevice:
                     os.close(descriptor)
             self._handles.clear()
             self._paths.clear()
+            self._pinned_handles.clear()
             self._closed = True
 
     def close_read_only(self) -> None:
@@ -1151,6 +1180,7 @@ class LocalStorageDevice:
                     os.close(descriptor)
             self._handles.clear()
             self._paths.clear()
+            self._pinned_handles.clear()
             self._closed = True
 
     def __enter__(self) -> LocalStorageDevice:
@@ -1771,7 +1801,11 @@ class LocalStorageDevice:
         else:
             self._paths[name] = path
         while len(self._handles) > self._max_open_files:
-            oldest = next(iter(self._handles))
+            oldest = next(
+                cached_name
+                for cached_name in self._handles
+                if cached_name not in self._pinned_handles
+            )
             self._release(oldest)
 
     def _still_names(self, name: str, descriptor: int) -> bool:

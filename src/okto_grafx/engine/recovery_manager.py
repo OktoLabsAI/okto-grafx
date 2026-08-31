@@ -185,13 +185,13 @@ _LEASE_RECORD: str = "control/writer.lease"
 """The writer lease, exactly where the coordination adapter keeps it."""
 
 _MAX_CONTROL_RECORD_BYTES: int = 4096
-"""One page: far above any lease the coordination adapter writes (header 64 bytes + an owner
-id capped at 96 + CRC 4), far below anything worth reading blind. A control record whose SIZE
-already exceeds this is either damage the door does not need to READ to prove, or not a
-control record at all -- and reading it first would let a sparse or damaged file demand an
-arbitrary allocation before the probe ever types the corruption. Pinned two ways by the
-battery: a declared-gigantic size refuses with zero reads, and a REAL lease written by the
-production adapter fits with room to spare."""
+"""Maximum legacy record size; format 2 admits only its exact three-page lease envelope.
+
+The strict shape check in :func:`_control_record_size_allowed` prevents an arbitrary oversized
+or sparse file from demanding an unbounded allocation before the probe types the corruption.
+It is pinned both ways by the retirement battery: gigantic and merely-off-shape files refuse
+with zero reads, while real legacy and format-2 leases are accepted in full.
+"""
 
 _LEASE_SECTION: str = "writer.lease"
 """The section every cooperating publisher of the lease serialises on.
@@ -291,6 +291,20 @@ same deliberate act as reading a mangled attribute. A door that demands one ther
 was reached from :meth:`RecoveryManager.run` or its siblings, INSIDE the commit section, rather
 than by a caller that skipped the fence.
 """
+
+
+def _control_record_size_allowed(
+    storage: StorageDevice, name: str, size: int
+) -> bool:
+    """Accept legacy records, plus exactly one three-page format-2 writer lease.
+
+    A size merely below the slot-file ceiling is not enough: that would let arbitrary oversized
+    legacy bytes consume memory through the recovery door.  Format 2 has one exact physical
+    length, while reader registrations remain legacy until CE-2.
+    """
+    return size <= _MAX_CONTROL_RECORD_BYTES or (
+        name == _LEASE_RECORD and size == 3 * storage.page_size
+    )
 
 
 class _RecoveryPermit:
@@ -395,6 +409,9 @@ class RecoveryManager:
         commit_lock_timeout: float = 30.0,
         meta_file: str = META_FILE,
         policy: str | None = None,
+        database_uuid: bytes | None = None,
+        control_format_version: int = 1,
+        control_file_nonce: int = 0,
     ) -> None:
         """Build the manager over the stores and ports one recovery pass needs.
 
@@ -476,7 +493,13 @@ class RecoveryManager:
         self._state_store = (
             commit_state_store
             if commit_state_store is not None
-            else CommitStateStore(storage, owner_id=owner)
+            else CommitStateStore(
+                storage,
+                owner_id=owner,
+                database_uuid=database_uuid,
+                control_format_version=control_format_version,
+                file_nonce=control_file_nonce,
+            )
         )
         self._redo_engine = CommitRedo(pool, index_manager)  # type: ignore[arg-type]
         if self._metrics.enabled:
@@ -869,7 +892,7 @@ class RecoveryManager:
         cap, which tells the same truth non-retryably.
         """
         size = self._storage.log_size(name)
-        if size > _MAX_CONTROL_RECORD_BYTES:
+        if not _control_record_size_allowed(self._storage, name, size):
             raise GrafxRecoveryRefused(
                 f"The control record {name!r} now claims {size} bytes, past the "
                 f"{_MAX_CONTROL_RECORD_BYTES} cap: the generation under inspection is gone, "
@@ -895,7 +918,7 @@ class RecoveryManager:
         # decision below is about THESE bytes, and the door refuses rather than act on any
         # other generation it happens to find later.
         size = self._storage.log_size(name)
-        if size > _MAX_CONTROL_RECORD_BYTES:
+        if not _control_record_size_allowed(self._storage, name, size):
             raise GrafxRecoveryRefused(
                 f"The control record {name!r} claims {size} bytes, past the "
                 f"{_MAX_CONTROL_RECORD_BYTES} any record the coordination adapter writes can "
