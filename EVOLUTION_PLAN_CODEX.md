@@ -382,6 +382,25 @@
   duplicação, phantom, leitura rasgada, escape ou finding. Documento de decisão e reprodução:
   `docs/architecture/CE2_READER_PARTICIPANT_PIN.md`. ST-2 e CN-1 continuam bloqueados sem
   autorização do usuário; não são parte da CE-2 nem condição retroativa deste gate.
+- **M-7 WAL-only re-medido e aprovado; seu escopo não foi inflado.** Em `origin/main@530df34`, o
+  runner D5 congelado (`30` amostras, `5` warm-ups, `2.000` registros, LadybugDB `0.16.0`, CRC
+  puro e source pin explícito) mediu abertura/replay Grafx em `232,351 ms` contra `123,633 ms` no
+  Ladybug: **`1,88x`**, dentro do teto `<=3x` e abaixo do histórico `3,51x/3,55x`. O exit global
+  foi `1` exclusivamente porque o mesmo runner também mede durable commit, ainda fora de seu teto;
+  M-7 passou. O instrumento constrói `WalManager` diretamente e faz `open()+scan_all()`: não chama
+  `Database._open`, não exercita QW-9/ST-7 e não substitui a Etapa 5. Artefato principal
+  `m7-open-replay-530df34-pure/calibration.json`, SHA-256
+  `317091b280922e66a68e87dc39c9352b421ceb1e83ad26b641ab8f8431c0d37f`. Como o schema v1 não
+  embute commit/source/comando/estado dirty, o sidecar retrospectivo da mesma sessão registra esses
+  dados e ancora os hashes sem alegar autoautenticação (`provenance.json`, SHA-256
+  `ec1ec8ecb09673f01b19a085f0efef67d7b3c2cbeb12b7b6e0a4254f373614e5`). O próximo discriminante
+  congelado é F1 de dois processos para decidir CE-3; a matriz F1 completa ainda não existe, e os
+  instrumentos atuais de 4 writers + 3 readers e reader-pin são apenas evidência parcial. NT-1
+  permanece condicional/bloqueado até o gate skip-decode e a decisão RC8-B. Nenhuma mudança que
+  estreite multi-writer/multi-reader foi iniciada. O inventário residual corrigido foi concluído e
+  verificado/PASS no Nexus `hof_ec7f56977c2a4a1593ab9753406ba6b2`; o relatório
+  `PERF-RESIDUAL-POS-CE2.md` tem SHA-256
+  `ffd7298831fdaaf3066eda99b869de2581e178937a2eed273752017ee7272fb4`.
 - **Compatibilidade Okto Pulse: M-PULSE-1 a M-PULSE-6 concluídos e certificados conforme o quadro
   9.7; M-PULSE-7 está em execução e permanece o gate serial.** O primeiro trace representativo
   expôs um blocker de performance, não de semântica: no mesmo workload, Ladybug concluiu em

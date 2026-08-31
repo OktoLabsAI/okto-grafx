@@ -204,6 +204,31 @@ It is the largest single item in W6 and the denominator behind §2's write laten
 record — why the ceiling stands unamended — is in `docs/architecture/COMPONENTS.md` under the D5
 entry.
 
+### M-7 WAL-only open/replay remeasurement (2026-08-31)
+
+The frozen 30-sample D5 runner was repeated with the integration worktree at
+`origin/main@530df34`, an explicit source pin, LadybugDB 0.16.0, pure CRC, 5 discarded warm-ups
+and 2,000 records. The open/replay result moved
+from the historical `3.51x`/`3.55x` miss to **1.88x**, inside the `<= 3x` ceiling:
+
+| engine | median | p95 | minimum | kept samples |
+|---|---:|---:|---:|---:|
+| Okto Grafx WAL open + `scan_all()` | 232.351 ms | 261.143 ms | 197.763 ms | 30 |
+| Ladybug crashed-database open | 123.633 ms | 147.456 ms | 94.369 ms | 30 |
+
+The parent D5 command exits `1` because the same run also measures durable commit, which remained
+outside its independent ceiling (`150.82x`); that exit does not change the M-7 verdict. This is the
+historically frozen **WAL-only lower bound**: it constructs `WalManager` directly and never calls
+`Database._open`, so it does not certify full product recovery and does not exercise QW-9 or ST-7.
+The v1 calibration schema is not self-authenticating: commit, source root, command, dirty state and
+the machine-idle assertion are bound by the explicitly retrospective same-session
+`provenance.json` sidecar (SHA-256
+`ec1ec8ecb09673f01b19a085f0efef67d7b3c2cbeb12b7b6e0a4254f373614e5`). The hash-pinned scratch
+outputs are `m7-open-replay-530df34-pure/calibration.json` (SHA-256
+`317091b280922e66a68e87dc39c9352b421ceb1e83ad26b641ab8f8431c0d37f`), `metrics.json`
+(`067f66683a6c6b5bb0ef1ee547d8e736ddd505cd603099949371bb32d2064351`) and `run.log`
+(`68c80b48fe0135c34d2f1dc7f49338f47fef9da0601b1b5a0a54284ba223bc20`).
+
 ### CE-1 same-code control-publication gate (2026-08-31)
 
 `93a3ee3` replaces the per-commit rename publication of `writer.lease` and `commit.state` with a
