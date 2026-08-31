@@ -181,6 +181,36 @@
   harness e checkouts Pulse. Multi-writer/multi-reader permanece intacto: qualquer publicação
   estrangeira ou duvidosa conserva a invalidação fail-closed e nenhuma lease, época, horizonte de
   leitores, recovery ou protocolo de commit foi removido.
+- **QW-5 medido, aprovado e integrado.** O pacote remove apenas overhead de materialização e
+  interpretação: o heap reutiliza o `RecordHeader` já validado, lê slots por `memoryview` enquanto
+  pinados e copia somente payloads aceitos; o índice valida os 27 bytes de toda entrada, mas só
+  copia/constrói/atribui localização quando chave e referência correspondem; `decode_value` usa uma
+  tabela fechada dos 12 tags, `decode_tuple` compara o tag persistido no caminho válido,
+  `TableDef` pré-computa posições em um slot derivado imutável fora dos fields públicos e os três
+  produtores aplicáveis não copiam os bindings vazios de `SingleRow`. A forma literal de campo
+  `init=False` do relatório foi corrigida durante o gate: embora o plan walker pudesse ignorá-lo,
+  o `mappingproxy` ainda vazava pelo `CatalogStoreView`; o slot herdado não-dataclass mantém
+  igualdade/hash, codec, plan view e grafo público byte/shape-idênticos. Integração:
+  `7df6e17` (a/c/f), `132e3f0` (d/e/g) e `5de6c95` (pins finais). As suítes completas de query,
+  storage core, índice/API e fronteiras públicas hostis passaram, além de Ruff e `diff --check`.
+  A auditoria read-only do Claude comparou o diff independente com o integrado e foi
+  verificada/PASS no handoff `hof_2282f896e995432686bd92e332e09c0d`; os três únicos reforços
+  apontados — layout relacional normalizado, reconstrução no round-trip do catálogo e
+  `value/offset` da recusa de tag — estão pinados em `5de6c95`.
+  O gate H1-H8.1/pf5 concluiu 110 commits preparatórios em `614,8 s`, 180 operações, 12/12
+  famílias e exit `0`. Contra CQ-2, a soma RAW caiu `5.324,61 -> 5.269,96 ms` (`-54,65 ms`,
+  `-1,03%`); o passe instrumentado caiu `14.406,72 -> 12.130,81 ms` (`-15,80%`), o wall das
+  fases `4.721,70 -> 4.664,64 ms` (`-1,21%`) e execute `3.284,61 -> 3.183,66 ms` (`-3,07%`).
+  Na amostra 0 de delete_edges com exatamente as mesmas chamadas lógicas, as 529.208 construções
+  `Enum.__call__/__new__` desapareceram do top-25, `decode_value` cumulativo caiu
+  `1,916 -> 1,481 s`, `decode_tuple` `2,738 -> 2,137 s` e `RecordHeader.decode` caiu exatamente
+  uma vez por linha visível (`80.576 -> 68.636` chamadas). As 12 famílias mantiveram idênticos
+  bytes persistidos/WAL, page writes totais/de índice e contagens de `_read_page` (`124`),
+  `read_fresh_page` (`76`), `_still_names` (`1.528`) e `os.lstat` (`11.356`): nenhuma economia
+  protocolar foi creditada ao pacote. Artefato `qw5-132e3f0-pf5-h1h8_1.json`, SHA-256
+  `59232c0f485aa696fc0e4593b666bb20de0e9efca8ebf5e8f9f4fda21fe8a9fb`, mesmo digest lógico e
+  checkouts Pulse. Multi-writer/multi-reader permanece intacto: formato, WAL, lease, cerca,
+  visibilidade, publicação, recovery e coordenação não mudaram.
 - **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`
