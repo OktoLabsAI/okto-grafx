@@ -28,11 +28,13 @@ latency -- then WAL-directed read-view invalidation has a real target. If it cos
 CE-3 loses its justification on this axis. `same-table` is the control: the reader reads exactly
 what the writer writes.
 
-THE ZERO OF THE CURVE. `--foreign-commit-rate 0` means the writer opens the database and stays
-idle: zero commits COMMANDED. Its report carries `idle: true` and the case asserts that the
-commit count really is zero, so a commanded zero can never be confused with a zero caused by a
-child that died. Omitting the option entirely means unpaced (flat out), which is a different
-thing again and is recorded as `null`.
+THE RATE IS AN AGGREGATE, AND THE ZERO IS COMMANDED. `--foreign-commit-rate` names the rate
+the READER sees; it is divided among the writers and they are staggered across one period, so
+N=1 and N=8 are comparable at the same point instead of arriving N at a time. A rate of 0 means
+every writer opens the database and stays idle: zero commits COMMANDED, marked `idle: true`,
+with the case asserting the count really is zero, so a commanded zero is never confused with a
+zero caused by a child that died. OMITTING the option sweeps the frozen curve; it does not mean
+unpaced.
 
 HONESTY RULES (a broken run must never read as a good one):
   * a child that dies, times out, or emits garbage fails the whole case; it never becomes 0
@@ -123,6 +125,7 @@ rows_per_txn, txns = int(sys.argv[7]), int(sys.argv[8])
 rate_text, warmup = sys.argv[9], float(sys.argv[10])
 reopen_on_stale, out = sys.argv[11] == "1", sys.argv[12]
 metrics_out, ready_path, barrier_path = sys.argv[13], sys.argv[14], sys.argv[15]
+phase_offset = float(sys.argv[16])
 # "" = unpaced (flat out). "0" = COMMANDED IDLE, the zero of the 6.5 curve. ">0" = paced.
 rate = None if rate_text == "" else float(rate_text)
 
@@ -171,8 +174,13 @@ if opening > 0:
 
 started = time.monotonic()
 timed_from = None
-next_slot = time.time()
+# STAGGERED. Every writer starting its pacing at the same instant makes N commits arrive
+# together and then nothing for a whole period: N-at-a-time bursts, not the smooth aggregate
+# rate the frozen curve names. Each writer is offset by its share of one aggregate period.
+next_slot = start_at + phase_offset
 idle = rate == 0.0
+first_commit_at = None
+last_commit_at = None
 
 
 def window_is_open():
@@ -193,6 +201,7 @@ def committed(family, build):
     names the symptom and throws away the only evidence of the cause.
     """
     global conflicts, retries, commits, timed_from, next_slot, db, reopens, outside_window
+    global first_commit_at, last_commit_at
     last_refusal = None
     if rate:
         # Pace to this writer's share of the aggregate rate. The deadline is rechecked AROUND
@@ -220,6 +229,10 @@ def committed(family, build):
             if in_timed_window():
                 if timed_from is None:
                     timed_from = time.monotonic()
+                landed = time.time()
+                if first_commit_at is None:
+                    first_commit_at = landed
+                last_commit_at = landed
                 latency[family].append((time.perf_counter() - began) * 1000.0)
                 commits += 1
             else:
@@ -392,6 +405,8 @@ pathlib.Path(out).write_text(json.dumps({
     "commits": commits, "elapsed_seconds": elapsed,
     "active_span_seconds": active_span, "rounds_completed": index,
     "commits_outside_window": outside_window,
+    "first_commit_at": first_commit_at, "last_commit_at": last_commit_at,
+    "phase_offset_seconds": phase_offset,
     "window": {"start_at": start_at, "end_at": end_at, "warmup": warmup},
     "durable_refusals": durable_refusals, "reopens": reopens,
     "reopen_on_stale_index": reopen_on_stale,
@@ -515,6 +530,7 @@ def one_read(execute, table, autocommit=False):
 if shape == "long":
     # ONE long read transaction: its snapshot must not move under it, however much the
     # writers commit. A moved snapshot is a torn read, and it fails the case.
+    long_began = time.perf_counter()
     reader = db.begin("read")
     table = tables[0]
     long_first = sorted(one_read(reader.execute, table))
@@ -535,6 +551,9 @@ if shape == "long":
             finished_because = "refused"
             break
     reader.rollback()
+    # The long transaction has exactly one lifecycle, and this is it: begin to rollback,
+    # spanning the whole window. Its statements stay in their own series.
+    lifecycle_ms.append((time.perf_counter() - long_began) * 1000.0)
 else:
     while window_is_open():
         table = rnd.choice(tables)
@@ -570,11 +589,16 @@ else:
                         "MATCH (a:%s)-[r:%s]->(b:%s) WHERE a.live = true "
                         "RETURN a.id, b.id, r.w LIMIT 100" % (table, edge, table)
                     ).rows
-                    record(began, lifecycle_began=lifecycle_began)
+                    record(began)
                     if len(rows) != len(set(rows)):
                         torn.append({"kind": "duplicate_rows", "rows": len(rows)})
                 finally:
                     reader.rollback()
+                # AFTER the rollback. Timing up to the last row read leaves the cost of
+                # releasing the snapshot outside the number, which is the half a reader
+                # under a busy writer is most likely to pay.
+                if in_timed_window():
+                    lifecycle_ms.append((time.perf_counter() - lifecycle_began) * 1000.0)
         except GrafxError as refused:
             # A RETRYABLE refusal is legal for a reader whose index view moved: counted, not
             # charged against the case. Anything else is the product failing.
@@ -718,31 +742,16 @@ __PIN_GUARD__
 from okto_grafx import connect
 
 root, tables_json, edges_json = sys.argv[2], sys.argv[3], sys.argv[4]
-quiet, quiet_rows, log_path = sys.argv[5], int(sys.argv[6]), sys.argv[7]
+log_path = sys.argv[5]
 tables = json.loads(tables_json)
 edge_tables = json.loads(edges_json)
 operations = json.loads(open(log_path, encoding="utf-8").read())
 
-# A FRESH database, and the acknowledged operations replayed one at a time in one process.
-# Whatever this produces is what a serial execution of the same list would have produced, so
-# comparing it against the concurrent database answers "zero wrong answers" directly.
+# THE SAME INITIAL STATE. This opens a copy of the database as it stood after bootstrap and
+# before any participant touched it, then replays the acknowledged operations one at a time
+# in one process. Rebuilding an empty database here would compare two runs that started from
+# different places, which is not the serial oracle section 6 asks for.
 db = connect(root)
-with db.begin("write") as txn:
-    for name in list(tables) + [quiet]:
-        txn.execute(
-            "CREATE NODE TABLE %s(id INT64, owner INT64, body STRING, live BOOL, "
-            "PRIMARY KEY(id))" % name
-        )
-with db.begin("write") as txn:
-    for position, name in enumerate(edge_tables):
-        source = tables[position] if position < len(tables) else tables[0]
-        txn.execute("CREATE REL TABLE %s(FROM %s TO %s, w INT64)" % (name, source, source))
-with db.begin("write") as txn:
-    for offset in range(quiet_rows):
-        txn.execute(
-            "CREATE (:%s {id: $i, owner: 0, body: 'q', live: true})" % quiet,
-            {"i": 900_000_000 + offset},
-        )
 
 replayed = 0
 for entry in operations:
@@ -778,7 +787,7 @@ stored = []
 owner = {}
 superseded = []
 edges = []
-for table in list(tables) + [quiet]:
+for table in tables:
     for row in db.execute(
         "MATCH (n:%s) RETURN n.id, n.owner, n.live, n.body" % table
     ).rows:
@@ -801,6 +810,9 @@ db.close()
 print(json.dumps({
     "mode": "serial",
     "replayed": replayed,
+    "pages_checked": report.pages_checked,
+    "records_checked": report.records_checked,
+    "index_entries_checked": report.index_entries_checked,
     "stored": stored,
     "owner": owner,
     "superseded": superseded,
@@ -1039,6 +1051,20 @@ def official_shortfalls(opts: argparse.Namespace, board: dict | None = None) -> 
             unmet.append("the relocated copy is not byte-identical to its template")
     if not opts.machine_idle_asserted:
         unmet.append("--machine-idle-asserted was not given (H5)")
+    if opts.case != "matrix":
+        unmet.append(f"--case {opts.case} is a subcase; the official run is the full frozen "
+                     "matrix")
+    overridden = [name for name, value in (
+        ("--writers", opts.writers), ("--readers", opts.readers),
+        ("--regime", opts.regime), ("--reader-shape", opts.reader_shape),
+        ("--reader-target", opts.reader_target),
+        ("--foreign-commit-rate", opts.foreign_commit_rate),
+    ) if value is not None]
+    if overridden:
+        unmet.append("frozen dimensions were overridden: " + ", ".join(overridden))
+    if opts.reopen_on_stale_index:
+        unmet.append("--reopen-on-stale-index works around a product refusal, so the run "
+                     "does not measure the product as it stands")
     source = describe_repository(pathlib.Path(opts.src).resolve())
     if not source.get("src_tests_clean"):
         unmet.append("the measured checkout has uncommitted changes under src/ or tests/")
@@ -1070,7 +1096,10 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
              writer_span: float = 0.0, reader_window: float = 0.0,
              commits_outside_window: int = 0, serial: dict | None = None,
              serial_operations: int = 0, board: dict | None = None,
-             readers_stopped_early: list | None = None) -> list[dict]:
+             readers_stopped_early: list | None = None, writers: int = 0,
+             participants_never_ready: list | None = None, metrics: dict | None = None,
+             family_gaps: list | None = None,
+             commit_span: tuple | None = None) -> list[dict]:
     """Judge one cell from its collected observations, and return the criteria list.
 
     This is deliberately a PURE function of the observations. The scenarios that matter most
@@ -1086,6 +1115,11 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
     duplicates = (len(stored_list) - len(stored)) if oracle_ok else None
 
     criteria: list[dict] = [
+        {"name": "every_participant_reached_the_barrier",
+         "pass": not (participants_never_ready or []),
+         "observed": participants_never_ready or [],
+         "bound": "every writer and reader signalled ready before the window opened; one "
+                  "that did not was measured over a window it never fully saw"},
         {"name": "every_child_completed",
          "pass": not child_failures and not missing,
          "observed": {"failures": child_failures, "missing": missing},
@@ -1112,20 +1146,56 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
     # The curve only means something if the foreign traffic was present for the whole window
     # the reader was measured over. A writer that exhausted its rounds at the halfway mark
     # leaves the reader alone for the rest, and the point carries a rate nobody experienced.
+    if rate and reader_window > 0:
+        expected_commits = rate * reader_window
+        # One slot of quantisation per writer, and not a percentage anybody invented: a
+        # writer can be at most one pacing period short or long inside the window.
+        allowed = max(1, writers)
+        delivered = abs(commits - expected_commits) <= allowed
+        criteria.append({
+            "name": "the_labelled_rate_was_delivered",
+            "pass": delivered,
+            "observed": {"labelled_rate": rate, "commits": commits,
+                         "expected_commits": round(expected_commits, 3),
+                         "allowed_slack_commits": allowed,
+                         "effective_rate": round(commits / reader_window, 3)},
+            "bound": "commits within one pacing slot per writer of rate * window; a point "
+                     "that delivered a different rate carries a label nobody experienced",
+        })
     if rate and readers and reader_window > 0:
-        coverage = writer_span / reader_window
+        # Coverage from the REAL first and last commit, not from a nominal span: staggered
+        # writers start at different instants and the nominal figure hides a gap.
+        if commit_span and commit_span[0] is not None and commit_span[1] is not None:
+            observed_span = commit_span[1] - commit_span[0]
+            measured_from = "first and last aggregate commit"
+        else:
+            observed_span = writer_span
+            measured_from = "nominal writer span"
+        # A paced writer cannot commit at the very first and very last instant of the window:
+        # at 1/s over 5s the commits land at 0,1,2,3,4 and the span is 4s however healthy the
+        # run. One aggregate period is the quantisation the pacing itself creates, so the
+        # window it is measured against is shortened by exactly that -- not by a percentage.
+        period = 1.0 / rate
+        reachable = max(period, reader_window - period)
+        coverage = min(1.0, observed_span / reachable)
         criteria.append({
             "name": "foreign_traffic_covered_the_reader_window",
             "pass": coverage >= 0.9,
             "observed": {
                 "coverage": round(coverage, 3),
+                "measured_from": measured_from,
+                "reachable_span_seconds": round(reachable, 3),
+                "one_pacing_period_seconds": round(period, 3),
+                "first_commit_at": commit_span[0] if commit_span else None,
+                "last_commit_at": commit_span[1] if commit_span else None,
                 "writer_span_seconds": round(writer_span, 3),
                 "reader_window_seconds": round(reader_window, 3),
                 "labelled_rate": rate,
                 "effective_rate_over_reader_window": round(commits / reader_window, 3),
             },
-            "bound": ">= 0.9 of the reader window had a writer present; below that, the "
-                     "labelled rate is not the rate the reader felt",
+            "bound": ">= 0.9 of the REACHABLE window had a writer present, where the "
+                     "reachable window is the reader window less one pacing period; below "
+                     "that there is a real gap, not an edge effect",
         })
     # A commit that landed after the readers stopped is a real commit, but it is not part
     # of this measurement. Counting it would inflate the rate the reader is said to have felt,
@@ -1150,6 +1220,14 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
             "bound": "the template matches the digest recorded beforehand AND the relocated "
                      "copy is byte-identical to it",
         })
+    if rate and family_gaps is not None:
+        criteria.append({
+            "name": "every_writer_sampled_every_family",
+            "pass": not family_gaps,
+            "observed": family_gaps[:6],
+            "bound": "each writer produced at least one timed sample per family; an empty "
+                     "profile cannot certify the dimension it is named after",
+        })
     criteria.append({"name": "no_acknowledged_row_lost", "pass": oracle_ok and not lost,
                      "observed": lost[:8], "bound": "acknowledged is a subset of stored"})
     criteria.append({"name": "no_phantom_row", "pass": oracle_ok and not phantom,
@@ -1166,6 +1244,25 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
         "bound": "every reader finished because its window closed, not because it was "
                  "refused, torn or thrown out",
     })
+    if metrics is not None:
+        captured = metrics.get("captured", {})
+        by_process = captured.get("by_process", [])
+        documents = [entry for entry in by_process if entry.get("document")]
+        expected_processes = writers + readers
+        criteria.append({
+            "name": "every_process_published_real_metrics",
+            "pass": (not metrics.get("capture_errors")
+                     and len(by_process) >= expected_processes
+                     and len(documents) >= expected_processes
+                     and all(entry["document"].get("final", {}).get("metrics")
+                             for entry in documents)),
+            "observed": {"expected_processes": expected_processes,
+                         "snapshots": len(by_process),
+                         "documents": len(documents),
+                         "capture_errors": metrics.get("capture_errors")},
+            "bound": "every writer and reader published a real, non-empty metrics document; "
+                     "counters the product does not emit stay explicitly unavailable",
+        })
     criteria.append({"name": "no_torn_read", "pass": not torn, "observed": torn[:4],
                      "bound": "0 torn observations"})
     criteria.append({"name": "no_non_grafx_escape", "pass": not escapes,
@@ -1300,6 +1397,28 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
                       "no operations, because rate 0 commands an idle writer"),
         })
 
+    if serial is not None:
+        criteria.append({
+            "name": "verify_clean_serial",
+            "pass": serial.get("clean") is True,
+            "observed": {key: serial.get(key) for key in
+                         ("clean", "findings", "pages_checked", "records_checked",
+                          "index_entries_checked")},
+            "bound": "the serially replayed database verifies clean with real coverage "
+                     "(A75.2), so it is fit to be compared against",
+        })
+        baseline = serial.get("initial_state") or {}
+        if baseline:
+            criteria.append({
+                "name": "serial_started_from_the_same_state",
+                "pass": baseline.get("identical") is True,
+                "observed": {"identical": baseline.get("identical"),
+                             "source_digest": (baseline.get("source") or {}).get("digest"),
+                             "copy_digest": (baseline.get("copy") or {}).get("digest")},
+                "bound": "the serial replay began from a byte-identical copy of the state "
+                         "the concurrent run began from",
+            })
+
     # The two passes look at the same database from two different vantage points. If they
     # disagree, one of them is wrong and the run cannot certify anything.
     if oracle_ok and not cold.get("child_failed"):
@@ -1403,6 +1522,18 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
                              "bound": "schema created and quiet table seeded"})
             return {**identity, "criteria": criteria, "pass": False}
         seeded = made.get("seeded", [])
+        # Copied while every bootstrap handle is closed and before any participant opens the
+        # database, so it IS the state the concurrent run began from. Hashed both ways so the
+        # claim is checkable rather than asserted.
+        baseline_root = container / "serial-db"
+        shutil.copytree(root, baseline_root)
+        baseline_manifest = {
+            "source": hash_board(root),
+            "copy": hash_board(baseline_root),
+        }
+        baseline_manifest["identical"] = (
+            baseline_manifest["source"]["digest"] == baseline_manifest["copy"]["digest"]
+        )
 
         # The LIVE auditor opens before any writer starts and holds that one handle across the
         # whole run. Without it, "live" and "cold" would both be fresh opens after everybody
@@ -1430,8 +1561,11 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
         # The writers have to be present for the WHOLE window the readers are measured over.
         # With shape=long the reader runs for long_reader_seconds, so writers bounded by
         # --seconds would leave the tail of the official cell with no foreign traffic.
-        writer_seconds = (max(opts.seconds, opts.long_reader_seconds)
-                          if (readers and shape == "long") else opts.seconds)
+        # EXACTLY the reader's window, not max(): with --seconds greater than
+        # --long-reader-seconds the writers would outlive the readers and the denominators
+        # would part company again.
+        writer_seconds = (opts.long_reader_seconds if (readers and shape == "long")
+                          else opts.seconds)
         writers_started_at = time.time()
         for slot in range(1, writers + 1):
             processes.append((f"writer-{slot}", spawn(WRITER_CHILD, [
@@ -1443,6 +1577,9 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
                 str(reports_dir / f"writer-{slot}.json"),
                 str(reports_dir / f"metrics-writer-{slot}.json"),
                 str(reports_dir / f"ready-writer-{slot}.json"), str(barrier_path),
+                # One aggregate period spread across the writers, so the commits arrive
+                # evenly instead of N at a time followed by silence.
+                str(0.0 if not rate else (slot - 1) / rate),
             ])))
         for slot in range(1, readers + 1):
             duration = opts.long_reader_seconds if shape == "long" else opts.seconds
@@ -1538,10 +1675,17 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
             serial_log.extend(report.get("operations", []))
         log_path = reports_dir / "serial-operations.json"
         log_path.write_text(json.dumps(serial_log), encoding="utf-8")
+        # The serial replay has to START WHERE THE CONCURRENT RUN STARTED. Rebuilding an
+        # empty database and recreating the schema compares two runs that began from
+        # different states, which is not the serial oracle section 6 asks for. The
+        # post-bootstrap state was copied aside before any participant opened it, and the
+        # serial child merely opens that copy and replays the log.
+        serial_root = container / "serial-db"
         serial = run_child(SERIAL_ORACLE_CHILD, [
-            opts.src, str(container / "serial-db"), json.dumps(tables),
-            json.dumps(edges), QUIET_TABLE, str(QUIET_SEED_ROWS), str(log_path),
+            opts.src, str(serial_root), json.dumps(every_table),
+            json.dumps(every_edge), str(log_path),
         ])
+        serial["initial_state"] = baseline_manifest
 
         acknowledged = {f"{QUIET_TABLE}:{key}" for key in seeded}
         expected_owner: dict[str, object] = {f"{QUIET_TABLE}:{key}": [0, "q"]
@@ -1576,6 +1720,21 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
         reader_window = global_window
         writer_span = max([report.get("active_span_seconds", 0.0)
                            for report in writer_reports] or [0.0])
+        folded_metrics = gather_metrics(writer_reports + reader_reports)
+        # A writer that produced no sample for a family cannot certify that family, so the
+        # gap is named per writer rather than shown as an empty profile.
+        family_gaps = [
+            {"writer": report["slot"], "family": family}
+            for report in writer_reports
+            for family in FROZEN_FAMILIES
+            if not report["latency_ms"].get(family)
+        ] if rate else []
+        first_commits = [report["first_commit_at"] for report in writer_reports
+                         if report.get("first_commit_at") is not None]
+        last_commits = [report["last_commit_at"] for report in writer_reports
+                        if report.get("last_commit_at") is not None]
+        commit_span = (min(first_commits) if first_commits else None,
+                       max(last_commits) if last_commits else None)
         criteria = evaluate(
             readers=readers, rate=rate,
             reopen_workaround=bool(opts.reopen_on_stale_index),
@@ -1589,7 +1748,9 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
             writer_span=writer_span, reader_window=reader_window,
             commits_outside_window=sum(report.get("commits_outside_window", 0)
                                        for report in writer_reports),
-            readers_stopped_early=stopped_early,
+            readers_stopped_early=stopped_early, writers=writers,
+            participants_never_ready=missing_ready, metrics=folded_metrics,
+            family_gaps=family_gaps, commit_span=commit_span,
         )
 
         return {
@@ -1662,7 +1823,7 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
                 report["slot"]: report.get("refusals_per_thousand_statements")
                 for report in reader_reports},
             "readers_stopped_early": stopped_early,
-            "metrics": gather_metrics(writer_reports + reader_reports),
+            "metrics": folded_metrics,
             "criteria": criteria,
             "pass": all(item["pass"] for item in criteria),
         }
@@ -2085,12 +2246,32 @@ def main(argv: list[str] | None = None) -> int:
                   "must not be read as one.",
         },
         "case": opts.case,
-        "official": not official_shortfalls(opts),
-        "not_official_because": official_shortfalls(opts) or None,
         "cells": [run_case(opts, *cell) for cell in cells],
     }
     report["machine_after"] = machine_evidence()
-    report["pass"] = bool(report["cells"]) and all(cell["pass"] for cell in report["cells"])
+
+    # The full matrix runs for hours. If the checkout moved, went dirty, or the source tree
+    # changed under it, the numbers can no longer be attributed to the commit named at the
+    # start -- so the run is re-described at the end and any drift is fatal to official.
+    after = describe_repository(pathlib.Path(opts.src).resolve())
+    before = report["provenance"]["source_repository"]
+    drift = [field for field in ("commit", "tree", "src_tests_clean")
+             if before.get(field) != after.get(field)]
+    report["provenance_after"] = after
+    report["source_tree_drifted_during_the_run"] = drift or None
+
+    # official is the CELLS' verdict, not a re-derivation from the options: a cell that found
+    # an inauthentic board is false, and the report must not be true above it.
+    cell_reasons = sorted({reason for cell in report["cells"]
+                           for reason in (cell.get("not_official_because") or [])})
+    if drift:
+        cell_reasons.append("the source tree changed during the run: " + ", ".join(drift))
+    report["official"] = bool(report["cells"]) and all(
+        cell.get("official") for cell in report["cells"]) and not drift
+    report["not_official_because"] = cell_reasons or None
+    report["pass"] = (bool(report["cells"])
+                      and all(cell["pass"] for cell in report["cells"])
+                      and not drift)
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if opts.json_out:
         pathlib.Path(opts.json_out).write_text(rendered, encoding="utf-8")

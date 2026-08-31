@@ -42,6 +42,18 @@ LEDGER = {"stored": ["Item1:1", "Item1:2", "Item1:3"],
           "superseded": ["Item1:1"], "edges": [["Links1", 1, 2, 1]]}
 LIVE_MARKS = {"held_open_through_run": True, "opened_before_writers": True,
               "saw_done_flag": True, "pid": 4242, "waited_seconds": 1.0}
+HEALTHY_METRICS = {
+    "captured": {
+        "per_process_snapshots": 2,
+        "by_process": [
+            {"role": "writer", "slot": 1,
+             "document": {"publications": 2, "final": {"metrics": {"oktografx_x": 1}}}},
+            {"role": "reader", "slot": 1,
+             "document": {"publications": 2, "final": {"metrics": {"oktografx_x": 1}}}},
+        ],
+    },
+    "capture_errors": None,
+}
 
 
 def observations(**overrides: object) -> dict:
@@ -54,11 +66,19 @@ def observations(**overrides: object) -> dict:
         "acknowledged": ["Item1:1", "Item1:2", "Item1:3"],
         "stored_list": ["Item1:1", "Item1:2", "Item1:3"],
         "torn": [], "escapes": [], "durable": [], "reopens": 0,
-        "commits": 7, "statements": 40,
+        "statements": 40,
         "expected_owner": {"Item1:1": [5, "n"], "Item1:2": [5, "n"], "Item1:3": [9, "n"]},
         "expected_superseded": ["Item1:1"],
         "expected_edges": [["Links1", 1, 2, 1]],
         "readers_stopped_early": [],
+        "writers": 1,
+        "participants_never_ready": [],
+        "metrics": HEALTHY_METRICS,
+        "family_gaps": [],
+        "commit_span": (1000.0, 1039.0),
+        "reader_window": 40.0,
+        "writer_span": 39.0,
+        "commits": 40,
     }
     baseline.update(overrides)
     return baseline
@@ -113,22 +133,30 @@ def test_a_curve_point_whose_writer_went_quiet_early_is_refused() -> None:
     """
     name = "foreign_traffic_covered_the_reader_window"
 
-    truncated = evaluate(**observations(rate=10.0, commits=100,
-                                        writer_span=10.0, reader_window=20.0))
-    assert name in failed(truncated)
+    # The writer committed at its labelled rate for ten seconds and then stopped, while the
+    # reader kept measuring for twenty.
+    truncated = evaluate(**observations(rate=10.0, commits=100, writer_span=10.0,
+                                        reader_window=20.0,
+                                        commit_span=(1000.0, 1010.0)))
+    names = failed(truncated)
+    assert name in names
     observed = next(item["observed"] for item in truncated if item["name"] == name)
-    assert observed["coverage"] == 0.5
+    # 10s of commits against a reachable window of 20 - 0.1, so a hair over half.
+    assert 0.5 <= observed["coverage"] < 0.51
     assert observed["labelled_rate"] == 10.0
     # The number a reader of the report should trust is the one over the reader's window.
     assert observed["effective_rate_over_reader_window"] == 5.0
+    # And the label itself is refused, independently of the coverage figure.
+    assert "the_labelled_rate_was_delivered" in names
 
-    covered = evaluate(**observations(rate=10.0, commits=200,
-                                      writer_span=19.8, reader_window=20.0))
+    covered = evaluate(**observations(rate=10.0, commits=200, writer_span=19.8,
+                                      reader_window=20.0,
+                                      commit_span=(1000.0, 1019.8)))
     assert failed(covered) == []
 
     # With no foreign traffic commanded there is no coverage question to ask.
-    idle = evaluate(**observations(rate=0.0, commits=0,
-                                   writer_span=0.0, reader_window=20.0))
+    idle = evaluate(**observations(rate=0.0, commits=0, writer_span=0.0,
+                                   reader_window=20.0, commit_span=(None, None)))
     assert name not in {item["name"] for item in idle}
 
 
@@ -211,6 +239,111 @@ def test_the_ledger_notices_a_row_that_changed_table_or_lost_a_property() -> Non
     reweighted = {**LEDGER, "edges": [["Links1", 1, 2, 99]]}
     assert "create_edge_effect_stored" in failed(evaluate(**observations(
         live=dict(CLEAN_WALK, **reweighted, **LIVE_MARKS))))
+
+
+def test_a_label_the_run_did_not_deliver_is_refused() -> None:
+    """200 commits over 20s is 10/s only if 20s is the window; over 10s it is 20/s.
+
+    The slack is one pacing slot per writer, which is the quantisation a paced writer can
+    actually incur -- not a percentage chosen to make the number fit.
+    """
+    name = "the_labelled_rate_was_delivered"
+
+    exact = evaluate(**observations(rate=1.0, commits=40, reader_window=40.0))
+    assert name not in failed(exact)
+
+    doubled = evaluate(**observations(rate=1.0, commits=80, reader_window=40.0))
+    assert name in failed(doubled)
+    observed = next(item["observed"] for item in doubled if item["name"] == name)
+    assert observed["expected_commits"] == 40.0
+    assert observed["effective_rate"] == 2.0
+
+    # One slot per writer is tolerated; two writers may each be one slot out.
+    assert name not in failed(evaluate(**observations(
+        rate=1.0, commits=42, reader_window=40.0, writers=2)))
+    assert name in failed(evaluate(**observations(
+        rate=1.0, commits=44, reader_window=40.0, writers=2)))
+
+
+def test_coverage_is_measured_from_the_real_first_and_last_commit() -> None:
+    """Staggered writers start at different instants; a nominal span hides the gap."""
+    name = "foreign_traffic_covered_the_reader_window"
+
+    late = evaluate(**observations(rate=1.0, commits=40, reader_window=40.0,
+                                   commit_span=(1000.0, 1015.0)))
+    assert name in failed(late)
+    observed = next(item["observed"] for item in late if item["name"] == name)
+    assert observed["measured_from"] == "first and last aggregate commit"
+    # 15s of commits against a reachable window of 40 - 1.
+    assert observed["reachable_span_seconds"] == 39.0
+    assert 0.38 <= observed["coverage"] < 0.39
+
+    # A healthy paced run cannot span the whole window -- at 1/s over 40s the commits land at
+    # 0..39 -- and must not be failed for the edge the pacing itself creates.
+    edge_effect = evaluate(**observations(rate=1.0, commits=40, reader_window=40.0,
+                                          commit_span=(1000.0, 1039.0)))
+    assert name not in failed(edge_effect)
+
+
+def test_a_participant_that_never_reached_the_barrier_fails_the_cell() -> None:
+    """It was recorded in the JSON and judged nowhere, so such a cell still passed."""
+    name = "every_participant_reached_the_barrier"
+
+    assert name not in failed(evaluate(**observations()))
+    assert name in failed(evaluate(**observations(
+        participants_never_ready=["ready-reader-1.json"])))
+
+
+def test_metrics_that_came_back_empty_fail_the_cell() -> None:
+    """gather_metrics was folded into the report after the judgement, so an empty capture
+    could not fail anything -- which is how a run with no counters at all read as complete."""
+    name = "every_process_published_real_metrics"
+
+    assert name not in failed(evaluate(**observations()))
+
+    nothing = {"captured": {"per_process_snapshots": 0, "by_process": []},
+               "capture_errors": None}
+    assert name in failed(evaluate(**observations(metrics=nothing)))
+
+    errored = {**HEALTHY_METRICS, "capture_errors": [{"role": "writer", "error": "boom"}]}
+    assert name in failed(evaluate(**observations(metrics=errored)))
+
+    hollow = {"captured": {"per_process_snapshots": 2, "by_process": [
+        {"role": "writer", "slot": 1, "document": {"publications": 1, "final": {}}},
+        {"role": "reader", "slot": 1, "document": {"publications": 1, "final": {}}},
+    ]}, "capture_errors": None}
+    assert name in failed(evaluate(**observations(metrics=hollow)))
+
+
+def test_a_family_with_no_samples_cannot_certify_itself() -> None:
+    """An empty profile is not a measurement of the family it is named after."""
+    name = "every_writer_sampled_every_family"
+
+    assert name not in failed(evaluate(**observations()))
+    assert name in failed(evaluate(**observations(
+        family_gaps=[{"writer": 1, "family": "create_edge"}])))
+    # With no foreign traffic commanded there is no family coverage question to ask.
+    assert name not in {item["name"] for item in evaluate(**observations(
+        rate=0.0, commits=0, family_gaps=[{"writer": 1, "family": "create_edge"}]))}
+
+
+def test_the_serial_replay_must_verify_clean_and_start_from_the_same_state() -> None:
+    """A replay from an empty database is not the same run, and one that never verified
+    itself is not fit to be compared against."""
+    baseline = {"identical": True, "source": {"digest": "aa"}, "copy": {"digest": "aa"}}
+    healthy = {**LEDGER, "replayed": 3, "clean": True, "initial_state": baseline}
+
+    assert failed(evaluate(**observations(serial=healthy, serial_operations=3))) == []
+
+    unclean = {**healthy, "clean": False}
+    assert "verify_clean_serial" in failed(evaluate(**observations(
+        serial=unclean, serial_operations=3)))
+
+    different_start = {**healthy, "initial_state": {"identical": False,
+                                                    "source": {"digest": "aa"},
+                                                    "copy": {"digest": "bb"}}}
+    assert "serial_started_from_the_same_state" in failed(evaluate(**observations(
+        serial=different_start, serial_operations=3)))
 
 
 def test_a_reader_that_stopped_before_its_window_closed_fails() -> None:
