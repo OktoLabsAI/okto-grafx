@@ -437,7 +437,12 @@
   pós-condições foram certificadas, representa amostras ausentes como progresso desconhecido e
   mantém cenários incompletos fail-closed. O gate focado passou 165/165, Ruff e `diff --check`
   passaram, e a revisão Nexus `hof_655c090ee6f547d98e249aeff95c367f` foi concluída/verificada/PASS.
-  Ele não altera taxa, workload, tolerância ou política de retry.
+  O check-only autenticado contra as mesmas fontes e os três checkouts fixos confirmou schema v3,
+  identidade estável, tool blob `9637251d469248a015d93af6163c1120e2a85154` e somente o shortfall
+  esperado `check_only_has_no_measurements`; artefato
+  `D:\Projetos\Techridy\grafx-ce3-v3-checkonly-e311be8\ce3-check-only.json`, SHA-256
+  `cec6f2d0b6671515502c85fda9d60988fa504a851c86252a01528ab2b020ee8c`. Ele não altera taxa,
+  workload, tolerância ou política de retry.
 
   O usuário autorizou CN-1 com a resposta explícita `aceito. pode seguir`, registrada na sessão
   Claude `9699f9ef-9534-43db-9888-7031689e86f5`, mensagem Nexus
