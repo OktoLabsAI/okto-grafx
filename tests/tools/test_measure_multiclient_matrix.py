@@ -37,8 +37,9 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 
 CLEAN_WALK = {"clean": True, "findings": 0, "pages_checked": 40, "records_checked": 12,
               "index_entries_checked": 12}
-LEDGER = {"stored": [1, 2, 3], "owner": {"1": 5, "2": 5, "3": 9},
-          "superseded": [1], "edges": [[1, 2]]}
+LEDGER = {"stored": ["Item1:1", "Item1:2", "Item1:3"],
+          "owner": {"Item1:1": [5, "n"], "Item1:2": [5, "n"], "Item1:3": [9, "n"]},
+          "superseded": ["Item1:1"], "edges": [["Links1", 1, 2, 1]]}
 LIVE_MARKS = {"held_open_through_run": True, "opened_before_writers": True,
               "saw_done_flag": True, "pid": 4242, "waited_seconds": 1.0}
 
@@ -50,12 +51,14 @@ def observations(**overrides: object) -> dict:
         "child_failures": [], "missing": [],
         "live": {**CLEAN_WALK, **LEDGER, **LIVE_MARKS},
         "cold": {**CLEAN_WALK, **LEDGER},
-        "acknowledged": [1, 2, 3], "stored_list": [1, 2, 3],
+        "acknowledged": ["Item1:1", "Item1:2", "Item1:3"],
+        "stored_list": ["Item1:1", "Item1:2", "Item1:3"],
         "torn": [], "escapes": [], "durable": [], "reopens": 0,
         "commits": 7, "statements": 40,
-        "expected_owner": {"1": 5, "2": 5, "3": 9},
-        "expected_superseded": [1],
-        "expected_edges": [[1, 2]],
+        "expected_owner": {"Item1:1": [5, "n"], "Item1:2": [5, "n"], "Item1:3": [9, "n"]},
+        "expected_superseded": ["Item1:1"],
+        "expected_edges": [["Links1", 1, 2, 1]],
+        "readers_stopped_early": [],
     }
     baseline.update(overrides)
     return baseline
@@ -178,6 +181,57 @@ def test_lost_phantom_duplicate_and_torn_rows_each_fail_by_name() -> None:
 
     escaped = evaluate(**observations(escapes=["ZeroDivisionError: boom"]))
     assert "no_non_grafx_escape" in failed(escaped)
+
+
+def test_the_ledger_notices_a_row_that_changed_table_or_lost_a_property() -> None:
+    """Flattening ids across tables let a row move from Item1 to Item2 and read as unchanged.
+
+    The same hole hid a lost body and an edge whose weight changed, because neither the
+    property nor the edge table was part of what was compared.
+    """
+    moved = {**LEDGER, "stored": ["Item2:1", "Item1:2", "Item1:3"],
+             "owner": {"Item2:1": [5, "n"], "Item1:2": [5, "n"], "Item1:3": [9, "n"]}}
+    criteria = evaluate(**observations(live=dict(CLEAN_WALK, **moved, **LIVE_MARKS),
+                                       cold=dict(CLEAN_WALK, **moved),
+                                       stored_list=moved["stored"]))
+    names = failed(criteria)
+    assert "no_acknowledged_row_lost" in names
+    assert "no_phantom_row" in names
+    # And the owner ledger notices it too, independently of the id sets.
+    assert "update_node_effect_stored" in names
+
+    lost_body = {**LEDGER, "owner": {**LEDGER["owner"], "Item1:2": [5, None]}}
+    assert "update_node_effect_stored" in failed(evaluate(**observations(
+        live=dict(CLEAN_WALK, **lost_body, **LIVE_MARKS))))
+
+    other_edge_table = {**LEDGER, "edges": [["LinksOther", 1, 2, 1]]}
+    assert "create_edge_effect_stored" in failed(evaluate(**observations(
+        live=dict(CLEAN_WALK, **other_edge_table, **LIVE_MARKS))))
+
+    reweighted = {**LEDGER, "edges": [["Links1", 1, 2, 99]]}
+    assert "create_edge_effect_stored" in failed(evaluate(**observations(
+        live=dict(CLEAN_WALK, **reweighted, **LIVE_MARKS))))
+
+
+def test_a_reader_that_stopped_before_its_window_closed_fails() -> None:
+    """A long reader refused on its second scan used to end early and pass anyway."""
+    name = "every_reader_ran_its_whole_window"
+
+    assert name not in failed(evaluate(**observations()))
+    for why in ("refused", "torn", "escaped"):
+        stopped = evaluate(**observations(readers_stopped_early=[{"slot": 1, "why": why}]))
+        assert name in failed(stopped), why
+
+
+def test_a_non_retryable_refusal_is_an_escape_not_a_legal_refusal() -> None:
+    """Treating every GrafxError as legal was a false pass: only a retryable one is legal."""
+    from tools.measure_multiclient_matrix import READER_CHILD
+
+    # The classifier is the code that decides, so its rule is asserted where it lives.
+    assert "if not refused.retryable:" in READER_CHILD
+    assert '"kind": "non_retryable_refusal"' in READER_CHILD
+    # And a non-retryable refusal lands in escapes, which already fails the case.
+    assert "escapes.append({\"kind\": \"non_retryable_refusal\"" in READER_CHILD
 
 
 def test_a_durable_index_refusal_fails_unless_the_workaround_was_asked_for() -> None:

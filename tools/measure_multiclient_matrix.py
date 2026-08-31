@@ -170,7 +170,6 @@ if opening > 0:
     time.sleep(opening)
 
 started = time.monotonic()
-deadline = end_at
 timed_from = None
 next_slot = time.time()
 idle = rate == 0.0
@@ -238,7 +237,10 @@ def committed(family, build):
                 # the index state instead of spinning on this process's stale view.
                 try:
                     db.close()
-                    db = connect(root)
+                    # The reopen keeps the SAME observable sink. Reconnecting with the
+                    # default would silently drop this process back to the noop sink and
+                    # every counter after the first refusal would go missing.
+                    db = connect(root, metrics="json", metrics_destination=metrics_out)
                     reopens += 1
                 except BaseException as failed:
                     escapes.append("reopen failed: %s: %s"
@@ -249,7 +251,7 @@ def committed(family, build):
                 conflicts += 1
                 retries += 1
                 last_refusal = refused.to_dict()
-                if time.monotonic() >= deadline:
+                if not window_is_open():
                     # The phase is over. Stop retrying rather than overrunning the window
                     # the percentiles and the throughput denominator are drawn from.
                     escapes.append("%s: deadline reached after %d retries; last refusal: %s"
@@ -302,10 +304,10 @@ else:
             return keys
         ok, keys = committed("create_node", build_nodes)
         if ok:
-            acknowledged.extend(keys)
+            acknowledged.extend("%s:%s" % (node_table, key) for key in keys)
             made_nodes.extend(keys)
             for key in keys:
-                expected_owner[key] = slot
+                expected_owner["%s:%s" % (node_table, key)] = [slot, "n" * 96]
             operations.append(["create_node", node_table, list(keys), slot])
 
         if window_is_open() and len(made_nodes) >= 2:
@@ -320,7 +322,7 @@ else:
                 return pair
             ok, _made = committed("create_edge", build_edge)
             if ok:
-                expected_edges.append([pair[0], pair[1]])
+                expected_edges.append([edge_table, pair[0], pair[1], 1])
                 operations.append(["create_edge", node_table, edge_table,
                                    pair[0], pair[1]])
 
@@ -336,7 +338,8 @@ else:
             ok, _made = committed("update_node", build_update)
             if ok:
                 # Last committed write wins -- exactly what the oracle will read back.
-                expected_owner[update_key] = update_owner
+                expected_owner["%s:%s" % (node_table, update_key)] = [update_owner,
+                                                                        "n" * 96]
                 operations.append(["update_node", node_table, update_key, update_owner])
 
             supersede_key = made_nodes[0]
@@ -353,8 +356,9 @@ else:
                 ok = False
             if ok:
                 operations.append(["mark_superseded", node_table, supersede_key])
-                if supersede_key not in expected_superseded:
-                    expected_superseded.append(supersede_key)
+                marked = "%s:%s" % (node_table, supersede_key)
+                if marked not in expected_superseded:
+                    expected_superseded.append(marked)
         index += 1
 
 ended = time.monotonic()
@@ -420,8 +424,24 @@ rnd = random.Random(seed * 104729 + slot)
 db = connect(root, metrics="json", metrics_destination=metrics_out)
 latency_ms = []
 torn = []
-escapes = []      # ILLEGAL: anything that is not a Grafx refusal. Any entry fails the case.
-refusals = []     # LEGAL: a Grafx refusal a reader is contractually allowed to receive.
+escapes = []      # ILLEGAL: fails the case. Non-Grafx errors AND non-retryable refusals.
+refusals = []     # LEGAL: a RETRYABLE refusal, which a reader may contractually receive.
+finished_because = "window_closed"
+
+
+def classify(refused):
+    """Record a Grafx refusal, and say whether the reader was entitled to it.
+
+    Treating every GrafxError as legal was a false pass: a corruption report or any
+    non-retryable refusal is the product failing, not a read view moving under a reader.
+    """
+    detail = refused.to_dict()
+    detail["at"] = time.time()
+    if not refused.retryable:
+        escapes.append({"kind": "non_retryable_refusal", "error": detail})
+        return False
+    refusals.append(detail)
+    return True
 statements = 0
 lifecycle_ms = []   # begin -> rollback/commit, the whole read transaction
 statement_ms = []   # the execute alone, so the two are never conflated
@@ -443,7 +463,6 @@ if opening > 0:
     time.sleep(opening)
 
 started = time.monotonic()
-deadline = end_at
 timed_from = None
 long_first = None
 long_scans = 0
@@ -507,9 +526,13 @@ if shape == "long":
             if again != long_first:
                 torn.append({"kind": "long_snapshot_moved",
                              "first_rows": len(long_first), "now_rows": len(again)})
+                finished_because = "torn"
                 break
         except GrafxError as refused:
-            refusals.append("%s: %s" % (type(refused).__name__, repr(refused)[:160]))
+            classify(refused)
+            # A long reader that stops before its window closes has not run the scenario,
+            # whatever the reason. Ending early used to look identical to finishing.
+            finished_because = "refused"
             break
     reader.rollback()
 else:
@@ -553,12 +576,13 @@ else:
                 finally:
                     reader.rollback()
         except GrafxError as refused:
-            # A refusal is LEGAL for a reader whose index view moved: it is counted, not
-            # charged against the case. Only a non-Grafx escape means the product broke.
-            refusals.append("%s(retryable=%s): %s"
-                            % (type(refused).__name__, refused.retryable, repr(refused)[:120]))
+            # A RETRYABLE refusal is legal for a reader whose index view moved: counted, not
+            # charged against the case. Anything else is the product failing.
+            classify(refused)
         except BaseException as escaped:
-            escapes.append("%s: %s" % (type(escaped).__name__, repr(escaped)[:160]))
+            escapes.append({"kind": "non_grafx_escape",
+                            "error": "%s: %s" % (type(escaped).__name__, repr(escaped)[:180])})
+            finished_because = "escaped"
             break
 
 ended = time.monotonic()
@@ -585,6 +609,9 @@ pathlib.Path(out).write_text(json.dumps({
     "window": {"start_at": start_at, "end_at": end_at, "warmup": warmup},
     "elapsed_seconds": elapsed, "escapes": escapes, "refusals": refusals,
     "long_scans": long_scans, "warmup_seconds": warmup,
+    "finished_because": finished_because,
+    "refusals_per_thousand_statements": (
+        round(len(refusals) * 1000.0 / statements, 3) if statements else None),
     "metrics": metrics, "metrics_error": metrics_error,
     "metrics_document": metrics_out,
 }, sort_keys=True), encoding="utf-8")
@@ -648,18 +675,22 @@ edges = []
 for table in tables:
     # Every column the four families touch, so the ledger can certify each family's EFFECT
     # and not merely that a node with that id exists.
-    for row in db.execute("MATCH (n:%s) RETURN n.id, n.owner, n.live" % table).rows:
-        key = int(row[0])
+    for row in db.execute(
+        "MATCH (n:%s) RETURN n.id, n.owner, n.live, n.body" % table
+    ).rows:
+        # Keyed BY TABLE, and carrying the properties. Flattening ids across tables meant a
+        # row appearing under a different table with the same id read as unchanged.
+        key = "%s:%s" % (table, int(row[0]))
         stored.append(key)
-        owner[str(key)] = row[1]
+        owner[key] = [row[1], row[3]]
         if row[2] is False:
             superseded.append(key)
 for position, edge_table in enumerate(edge_tables):
     source = tables[position] if position < len(tables) else tables[0]
     for row in db.execute(
-        "MATCH (a:%s)-[r:%s]->(b) RETURN a.id, b.id" % (source, edge_table)
+        "MATCH (a:%s)-[r:%s]->(b) RETURN a.id, b.id, r.w" % (source, edge_table)
     ).rows:
-        edges.append([int(row[0]), int(row[1])])
+        edges.append([edge_table, int(row[0]), int(row[1]), row[2]])
 report = db.verify("all")
 db.close()
 # `clean` is the predicate, NOT `findings == 0`: a walk that checked NOTHING also has an empty
@@ -748,18 +779,22 @@ owner = {}
 superseded = []
 edges = []
 for table in list(tables) + [quiet]:
-    for row in db.execute("MATCH (n:%s) RETURN n.id, n.owner, n.live" % table).rows:
-        key = int(row[0])
+    for row in db.execute(
+        "MATCH (n:%s) RETURN n.id, n.owner, n.live, n.body" % table
+    ).rows:
+        # Keyed BY TABLE, and carrying the properties. Flattening ids across tables meant a
+        # row appearing under a different table with the same id read as unchanged.
+        key = "%s:%s" % (table, int(row[0]))
         stored.append(key)
-        owner[str(key)] = row[1]
+        owner[key] = [row[1], row[3]]
         if row[2] is False:
             superseded.append(key)
 for position, edge_table in enumerate(edge_tables):
     source = tables[position] if position < len(tables) else tables[0]
     for row in db.execute(
-        "MATCH (a:%s)-[r:%s]->(b) RETURN a.id, b.id" % (source, edge_table)
+        "MATCH (a:%s)-[r:%s]->(b) RETURN a.id, b.id, r.w" % (source, edge_table)
     ).rows:
-        edges.append([int(row[0]), int(row[1])])
+        edges.append([edge_table, int(row[0]), int(row[1]), row[2]])
 report = db.verify("all")
 db.close()
 
@@ -807,18 +842,22 @@ owner = {}
 superseded = []
 edges = []
 for table in tables:
-    for row in db.execute("MATCH (n:%s) RETURN n.id, n.owner, n.live" % table).rows:
-        key = int(row[0])
+    for row in db.execute(
+        "MATCH (n:%s) RETURN n.id, n.owner, n.live, n.body" % table
+    ).rows:
+        # Keyed BY TABLE, and carrying the properties. Flattening ids across tables meant a
+        # row appearing under a different table with the same id read as unchanged.
+        key = "%s:%s" % (table, int(row[0]))
         stored.append(key)
-        owner[str(key)] = row[1]
+        owner[key] = [row[1], row[3]]
         if row[2] is False:
             superseded.append(key)
 for position, edge_table in enumerate(edge_tables):
     source = tables[position] if position < len(tables) else tables[0]
     for row in db.execute(
-        "MATCH (a:%s)-[r:%s]->(b) RETURN a.id, b.id" % (source, edge_table)
+        "MATCH (a:%s)-[r:%s]->(b) RETURN a.id, b.id, r.w" % (source, edge_table)
     ).rows:
-        edges.append([int(row[0]), int(row[1])])
+        edges.append([edge_table, int(row[0]), int(row[1]), row[2]])
 report = db.verify("all")
 db.close()
 
@@ -969,7 +1008,7 @@ def gather_metrics(reports: list[dict]) -> dict:
     }
 
 
-def official_shortfalls(opts: argparse.Namespace) -> list[str]:
+def official_shortfalls(opts: argparse.Namespace, board: dict | None = None) -> list[str]:
     """Return every reason this run is not the official one; empty means it is.
 
     official = bool(board_template) was too permissive. A run on a copied board is still not
@@ -988,6 +1027,16 @@ def official_shortfalls(opts: argparse.Namespace) -> list[str]:
             "--board-digest was not given, so the template was never authenticated against "
             "an expected content digest"
         )
+    elif board is not None:
+        # Requiring the option to EXIST authenticated nothing. A wrong digest, or a copy that
+        # came out different from its template, has to be fail-closed.
+        if board.get("matches_expected_digest") is not True:
+            unmet.append(
+                f"the template digest {board.get('template_digest', {}).get('digest')} does "
+                f"not match the expected {opts.board_digest}"
+            )
+        if board.get("copy_is_identical") is not True:
+            unmet.append("the relocated copy is not byte-identical to its template")
     if not opts.machine_idle_asserted:
         unmet.append("--machine-idle-asserted was not given (H5)")
     source = describe_repository(pathlib.Path(opts.src).resolve())
@@ -1020,7 +1069,8 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
              expected_edges: list | None = None,
              writer_span: float = 0.0, reader_window: float = 0.0,
              commits_outside_window: int = 0, serial: dict | None = None,
-             serial_operations: int = 0) -> list[dict]:
+             serial_operations: int = 0, board: dict | None = None,
+             readers_stopped_early: list | None = None) -> list[dict]:
     """Judge one cell from its collected observations, and return the criteria list.
 
     This is deliberately a PURE function of the observations. The scenarios that matter most
@@ -1086,12 +1136,36 @@ def evaluate(*, readers: int, rate: float | None, reopen_workaround: bool,
         "observed": commits_outside_window,
         "bound": "0 commits outside the shared measured window",
     })
+    if board is not None and not board.get("synthetic"):
+        criteria.append({
+            "name": "board_copy_is_authentic",
+            "pass": (board.get("matches_expected_digest") is True
+                     and board.get("copy_is_identical") is True),
+            "observed": {
+                "expected_digest": board.get("expected_digest"),
+                "template_digest": (board.get("template_digest") or {}).get("digest"),
+                "matches_expected_digest": board.get("matches_expected_digest"),
+                "copy_is_identical": board.get("copy_is_identical"),
+            },
+            "bound": "the template matches the digest recorded beforehand AND the relocated "
+                     "copy is byte-identical to it",
+        })
     criteria.append({"name": "no_acknowledged_row_lost", "pass": oracle_ok and not lost,
                      "observed": lost[:8], "bound": "acknowledged is a subset of stored"})
     criteria.append({"name": "no_phantom_row", "pass": oracle_ok and not phantom,
                      "observed": phantom[:8], "bound": "stored is a subset of acknowledged"})
     criteria.append({"name": "no_duplicate_row", "pass": duplicates == 0,
                      "observed": duplicates, "bound": "0 duplicate ids"})
+    # A reader that ended before its window closed did not run the scenario. Ending early
+    # used to be indistinguishable from finishing, so a refusal on the second scan of a long
+    # read could end the reader and still pass.
+    criteria.append({
+        "name": "every_reader_ran_its_whole_window",
+        "pass": not (readers_stopped_early or []),
+        "observed": (readers_stopped_early or [])[:4],
+        "bound": "every reader finished because its window closed, not because it was "
+                 "refused, torn or thrown out",
+    })
     criteria.append({"name": "no_torn_read", "pass": not torn, "observed": torn[:4],
                      "bound": "0 torn observations"})
     criteria.append({"name": "no_non_grafx_escape", "pass": not escapes,
@@ -1302,7 +1376,7 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
     criteria: list[dict] = []
     done_path = reports_dir / "auditor-done.flag"
     barrier_path = reports_dir / "start-barrier.json"
-    unmet = official_shortfalls(opts)
+    unmet = official_shortfalls(opts, board_manifest)
     identity = {
         "official": not unmet,
         "not_official_because": unmet or None,
@@ -1469,8 +1543,9 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
             json.dumps(edges), QUIET_TABLE, str(QUIET_SEED_ROWS), str(log_path),
         ])
 
-        acknowledged = set(seeded)
-        expected_owner: dict[str, object] = {str(key): 0 for key in seeded}
+        acknowledged = {f"{QUIET_TABLE}:{key}" for key in seeded}
+        expected_owner: dict[str, object] = {f"{QUIET_TABLE}:{key}": [0, "q"]
+                                             for key in seeded}
         expected_superseded: list = []
         expected_edges: list = []
         for report in writer_reports:
@@ -1483,6 +1558,9 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
         escapes = [entry for report in writer_reports + reader_reports
                    for entry in report.get("escapes", [])]
         refusals = [entry for report in reader_reports for entry in report.get("refusals", [])]
+        stopped_early = [{"slot": report["slot"], "why": report.get("finished_because")}
+                         for report in reader_reports
+                         if report.get("finished_because") != "window_closed"]
         durable = [entry for report in writer_reports
                    for entry in report.get("durable_refusals", [])]
         reopens = sum(report.get("reopens", 0) for report in writer_reports)
@@ -1507,10 +1585,11 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
             commits=commits, statements=statements,
             expected_owner=expected_owner, expected_superseded=expected_superseded,
             expected_edges=expected_edges, serial=serial,
-            serial_operations=len(serial_log),
+            serial_operations=len(serial_log), board=board_manifest,
             writer_span=writer_span, reader_window=reader_window,
             commits_outside_window=sum(report.get("commits_outside_window", 0)
                                        for report in writer_reports),
+            readers_stopped_early=stopped_early,
         )
 
         return {
@@ -1579,6 +1658,10 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
             "writer_reopens": reopens,
             "legal_reader_refusals": len(refusals),
             "legal_reader_refusal_sample": refusals[:4],
+            "reader_refusals_per_thousand_statements": {
+                report["slot"]: report.get("refusals_per_thousand_statements")
+                for report in reader_reports},
+            "readers_stopped_early": stopped_early,
             "metrics": gather_metrics(writer_reports + reader_reports),
             "criteria": criteria,
             "pass": all(item["pass"] for item in criteria),
