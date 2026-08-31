@@ -201,12 +201,60 @@ def test_a_completion_photo_becomes_the_table_local_read_floor() -> None:
 
     database.manager.mark_built_through(BORN + 40)
 
-    assert header_on_device(database.device, database.exact.file).built_through_lsn == settled
+    assert (
+        header_on_device(database.device, database.exact.file).built_through_lsn
+        == settled
+    )
     assert database.manager.lookup(
         database.exact.name,
         database.key(1, "Ada"),
         SnapshotDouble(BORN + 40),
     ) == (expected,)
+
+
+def test_the_mark_still_advances_a_proximity_index_to_the_global_position() -> None:
+    # The Pulse regression (msg_179ada60): the ANN freshness contract reads built_through
+    # against the GLOBAL replay declaration, not against the table's high water, so a
+    # proximity/vector header the mark leaves at its table position reopens as "vector
+    # contract not satisfied" for a consumer this repo's suites never see. Proximity-class
+    # indexes therefore keep the pre-ST-7 semantics whole: every completion mark advances
+    # them to the declared global position, durably.
+    database = build_database()
+    _commit_row(database, 1, "Ada", BORN)
+    database.manager.mark_built_through(
+        BORN
+    )  # settle both headers at their table floor
+
+    database.manager.mark_built_through(BORN + 40)
+
+    assert (
+        header_on_device(database.device, database.proximity.file).built_through_lsn
+        == BORN + 40
+    ), (
+        "a proximity header stayed at its table position; the ANN contract reads the global one"
+    )
+
+
+def test_an_exact_index_keeps_the_table_local_skip_beside_a_vector_neighbour() -> None:
+    # The other half of the fix's contract: restoring the global advance for proximity must
+    # not quietly hand it back to exact indexes too -- the 161-header cost ST-7 removed is
+    # almost entirely exact-class, and open() never asks an exact index for more than its
+    # table's high water.
+    database = build_database()
+    _commit_row(database, 1, "Ada", BORN)
+    database.manager.mark_built_through(BORN)
+    settled = header_on_device(database.device, database.exact.file).built_through_lsn
+
+    database.manager.mark_built_through(BORN + 40)
+
+    assert (
+        header_on_device(database.device, database.exact.file).built_through_lsn
+        == settled
+    ), "an exact header was rewritten to the global position the skip exists to avoid"
+    assert (
+        header_on_device(database.device, database.proximity.file).built_through_lsn
+        == BORN + 40
+    )
 
 
 def _poison_index_header(root: str, page_size: int, queue) -> None:
