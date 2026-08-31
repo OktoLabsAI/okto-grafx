@@ -263,6 +263,12 @@ def test_frozen_matrix_and_pins_are_literal() -> None:
         ("unrelated", "Assumption", 1.0),
         ("unrelated", "Assumption", 10.0),
     ]
+    assert all(
+        tuple(scenario.as_dict())
+        == ("id", "relation", "table", "target_rate_per_second")
+        for scenario in ce3.SCENARIOS
+    )
+    assert all(scenario.meaning for scenario in ce3.SCENARIOS)
 
 
 def test_rate_is_recomputed_from_the_real_intersection() -> None:
@@ -405,16 +411,19 @@ def test_scenario_target_rate_type_is_part_of_exact_canonical_equality() -> None
 
 
 @pytest.mark.parametrize("location", ["result", "process_b"])
-@pytest.mark.parametrize("mutation", ["meaning", "extra"])
-def test_canonical_scenario_rejects_changed_or_extra_fields(
-    location: str, mutation: str
-) -> None:
+def test_canonical_scenario_rejects_meaning_as_an_extra_field(location: str) -> None:
     result = _scenario_result("raw", ce3.SCENARIOS[1])
     target = result["scenario"] if location == "result" else result["process_b"]["scenario"]
-    if mutation == "meaning":
-        target["meaning"] = "forged"
-    else:
-        target["extra"] = "forged"
+    target["meaning"] = ce3.SCENARIOS[1].meaning
+
+    assert f"{location}_scenario_not_canonical" in ce3._scenario_shortfalls(result)
+
+
+@pytest.mark.parametrize("location", ["result", "process_b"])
+def test_canonical_scenario_rejects_any_other_extra_field(location: str) -> None:
+    result = _scenario_result("raw", ce3.SCENARIOS[1])
+    target = result["scenario"] if location == "result" else result["process_b"]["scenario"]
+    target["extra"] = "forged"
 
     assert f"{location}_scenario_not_canonical" in ce3._scenario_shortfalls(result)
 

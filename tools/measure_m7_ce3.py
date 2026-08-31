@@ -94,16 +94,15 @@ class Scenario:
             "relation": self.relation,
             "table": self.table,
             "target_rate_per_second": self.target_rate_per_second,
-            "meaning": (
-                "idle handle; zero commits"
-                if self.relation == "idle"
-                else (
-                    "same=Decision: a small foreign create_node commit in A's hot table"
-                    if self.relation == "same"
-                    else "unrelated=Assumption: a small foreign create_node commit outside A's hot table"
-                )
-            ),
         }
+
+    @property
+    def meaning(self) -> str:
+        if self.relation == "idle":
+            return "idle handle; zero commits"
+        if self.relation == "same":
+            return "same=Decision: a small foreign create_node commit in A's hot table"
+        return "unrelated=Assumption: a small foreign create_node commit outside A's hot table"
 
 
 SCENARIOS = (
@@ -1923,6 +1922,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "matrix": {
             "passes": ["raw", "instrumented"],
             "scenarios": [scenario.as_dict() for scenario in SCENARIOS],
+            "scenario_meanings": {
+                scenario.identifier: scenario.meaning for scenario in SCENARIOS
+            },
             "same_table": "Decision",
             "unrelated_table": "Assumption",
             "raw_and_instrumented_use_distinct_copies": True,
