@@ -310,8 +310,15 @@ This ratchet authenticates inputs only. The F1 instrument is now accepted: autho
 `main@2b8e9006218b9ccf013d914dfe98e32abaa5bdd3`. Its focused suite passed 61/61, static checks were
 clean, and an independent read-only audit confirmed the frozen guards plus the exact 312-cell
 matrix expansion. The official long matrix has **not** run, so F1 publishes no performance result.
-The remaining binding order is **literal two-process CE-3 -> CE-3 disposition -> M-PULSE-7 10k**.
-No result exists yet for the 10,000-operation run.
+The literal CE-3 instrument is also accepted: author object
+`da7f5e41e851a4cb8bc14c404b2f19df3ec9efc7`, squashed and published at
+`main@4f6201a1e2f520bfe747a9636af10b036984732d`. Its focused suite passed 70/70 and the combined
+integration tools gate passed 136/136. The clean check-only artifact
+`ce3-checkonly-da7f5e4/ce3-check-only.json` has SHA-256
+`c2a643652caf6bd83748624f5a2808396c40c1467ae39bc190e9021242be1324` and only the expected
+`check_only_has_no_measurements` shortfall. It authenticates the instrument but contains no
+measurement. The remaining binding order is **official CE-3 measurement -> CE-3 disposition ->
+M-PULSE-7 10k**. No result exists yet for the 10,000-operation run.
 
 ---
 

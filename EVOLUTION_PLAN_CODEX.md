@@ -402,8 +402,15 @@
   serial com cobertura, janela long oficial de 60 s, mesma base pós-bootstrap e provenance source+
   script recapturada/fail-closed. A matriz oficial longa ainda não foi executada e esses testes não
   constituem resultado de performance. `600d17b`, `1eec9e4` e os demais commits intermediários
-  permanecem apenas históricos; o squash aceito é `2b8e900`. A ordem vinculante desta frente agora é
-  **CE-3 literal em dois processos -> decisão CE-3 -> M-PULSE-7 10k**.
+  permanecem apenas históricos; o squash aceito é `2b8e900`. O instrumento CE-3 literal também foi
+  concluído no objeto auditado `da7f5e41e851a4cb8bc14c404b2f19df3ec9efc7` e integrado/publicado em
+  `main@4f6201a1e2f520bfe747a9636af10b036984732d`. A raiz reproduziu **70/70** testes focados e o
+  branch integrado fechou **136/136** em `tests/tools`, com Ruff/AST/diff-check verdes. O check-only
+  real autenticou environment, checkouts, fonte e tool sem executar a matriz; artefato
+  `ce3-checkonly-da7f5e4/ce3-check-only.json`, SHA-256
+  `c2a643652caf6bd83748624f5a2808396c40c1467ae39bc190e9021242be1324`, com único shortfall esperado
+  `check_only_has_no_measurements`. Isso certifica o instrumento, não um resultado. A ordem
+  vinculante restante é **medição oficial CE-3 -> decisão CE-3 -> M-PULSE-7 10k**.
   Os instrumentos atuais de 4 writers + 3 readers e reader-pin são apenas evidência parcial. NT-1
   permanece condicional/bloqueado até o gate skip-decode e a decisão RC8-B. Nenhuma mudança que
   estreite multi-writer/multi-reader foi iniciada. O inventário residual corrigido foi concluído e
