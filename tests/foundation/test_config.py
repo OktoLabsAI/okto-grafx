@@ -32,7 +32,7 @@ def test_defaults_match_the_contract() -> None:
     assert config.page_size == 8192
     assert config.partitions_per_table == 64
     assert config.buffer_budget_bytes == 64 * 1024 * 1024
-    assert config.max_open_files == 256
+    assert config.max_open_files == 128
     assert config.recovery_policy == "replay"
     assert config.lease_ttl_seconds == 5.0
     assert config.lease_timeout_seconds == 10.0

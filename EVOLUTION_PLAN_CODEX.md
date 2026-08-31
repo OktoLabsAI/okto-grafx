@@ -7,7 +7,7 @@
 **Ambiente principal:** Windows, Python 3.13.1
 **Escopo:** integridade, recuperação, concorrência, estabilidade, performance, API, configuração e novas capacidades.
 
-## Estado de execução — 2026-08-30
+## Estado de execução — 2026-08-31
 
 - **M0 estabilização: concluído e publicado** em
   `milestone/m0-stabilization@e2d6a22da8ec2571127fc9d1533995d40330c632`. Os cinco P0
@@ -211,6 +211,39 @@
   `59232c0f485aa696fc0e4593b666bb20de0e9efca8ebf5e8f9f4fda21fe8a9fb`, mesmo digest lógico e
   checkouts Pulse. Multi-writer/multi-reader permanece intacto: formato, WAL, lease, cerca,
   visibilidade, publicação, recovery e coordenação não mudaram.
+- **Onda QW-8/QW-9/QW-10 + ST-1 implementada e perfilada; promoção aguarda o gate agregado.**
+  No Pulse Community, `perf/w5-qw8-qw10@64a9da6` troca as revalidações completas intermediárias
+  do roteamento por um probe fail-closed de identidade do JSON de binding e do diretório físico;
+  `begin`/`commit`, qualquer diferença e qualquer `OSError` continuam fazendo a prova completa.
+  A mesma abertura passa um único catálogo já provado ao bootstrap/validação de schema. No Grafx,
+  `perf/w5-qw9-open@75d956e` torna o limite de descriptors configurável e reutiliza uma listagem
+  provada do diretório de índices durante o attach, sem remover prova de tamanho, cabeçalho,
+  digest, frescor ou corrupção; a composição é `5896c12`. O default final foi corrigido de
+  `256` para `128` após confirmar `_getmaxstdio()=512` no UCRT do Python suportado: duas instâncias
+  Grafx podem assim coexistir deixando metade da tabela CRT para WAL, coordenação, Pulse e host,
+  enquanto um processo que controla seu orçamento continua podendo elevar o parâmetro. ST-1 foi entregue em
+  `perf/w5-st1-planner@20dd9b1` e integrado como `f01b659`: hops de uma aresta partem do lado
+  seekable quando existe e consultas cujo predicado lê somente a relação usam `RelationshipScan`,
+  mantendo overlay da transação, `ended`, limites de admissão e validação dos dois rótulos. As
+  baterias focadas, query completa (1.684 casos após o reforço), API (92), fronteiras públicas,
+  Ruff e `diff --check` passaram. O perfil H1-H8.1 dessa composição concluiu 110 commits de setup
+  em `490,6 s` e 180/180 operações, 12/12 famílias, mesmo digest e page writes por família. Contra
+  QW-5, a soma RAW caiu `5.269,96 -> 3.337,76 ms` (`-36,66%`), o instrumentado
+  `12.130,81 -> 7.724,27 ms` (`-36,33%`) e as fases `4.664,64 -> 3.385,62 ms` (`-27,42%`);
+  `delete_edges_by_session` caiu `1.916,61 -> 483,06 ms` (`-74,79%`). O aparente aumento de
+  `delete_nodes_by_session` (`184,81 -> 265,58 ms`) não veio acompanhado de mudança em consultas,
+  escritas ou chamadas de storage e atingiu begin/execute/commit juntos; fica como variância
+  temporal a repetir no gate final, não como regressão aceita nem como alvo móvel. Artefato Grafx:
+  `w5-f01b659-64a9da6-pf5-h1h8_1.json`, SHA-256
+  `e5108fee403b6055a2902bc7b9524dc30313882538c4369cc77a4d3dd20f1ad8`.
+- **Referência Ladybug reancorada após QW-8.** Como QW-8 altera código comum do adaptador, a
+  referência anterior de `970,62 ms` foi invalidada e não é reutilizada. O novo perfil sequencial
+  em `Community@64a9da6`, com o mesmo digest e 180/180 operações, mediu `787,00 ms`; portanto a
+  razão atual correta é `3.337,76 / 787,00 = 4,24x`, e não `3,44x` contra a referência antiga.
+  `delete_edges_by_session` está em `1,84x`; o maior desvio isolado passa a ser
+  `delete_nodes_by_session`, em `14,21x`. Artefato
+  `ladybug-64a9da6-pf5-h1h8_1.json`, SHA-256
+  `23314a1b2609e57518166ed81bdc6d8bc0a8a7f9a8b0b4f541d9ec27a3f0b653`.
 - **CE-1 passou o gate de viabilidade do primitivo, mas permanece sem código de produção.** O spike
   `perf/w1-ce1-spike@fe9977d` foi executado em três ordens, 20 warmups + 200 amostras por caso.
   `atomic_replace` mediu `13,37-18,51 ms` de mediana; o slot quente `0,095-0,133 ms`

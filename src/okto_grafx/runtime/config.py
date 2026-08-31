@@ -59,12 +59,14 @@ MAX_PARTITIONS_PER_TABLE: int = 65535
 MAX_VECTOR_EF_SEARCH: int = MAX_EF_SEARCH
 """Largest HNSW base beam accepted from public database configuration."""
 
-DEFAULT_MAX_OPEN_FILES: int = 256
+DEFAULT_MAX_OPEN_FILES: int = 128
 """Default descriptor-cache budget for a composed local database.
 
 The Windows UCRT available to the supported interpreter starts with 512 stdio descriptors.
-Keeping at most half for Grafx's storage cache leaves equal headroom for WAL, coordination,
-Pulse and the host process while avoiding the 64-entry churn on index-heavy databases.
+Keeping at most one quarter for each Grafx storage cache lets two databases coexist while still
+leaving half for WAL, coordination, Pulse and the host process.  It also doubles the former
+64-entry cache, avoiding its worst churn on index-heavy databases.  Callers that own the process
+may raise the per-database budget explicitly.
 """
 
 MINIMUM_STORE_FRAMES: int = max(CATALOG_FRAMES, HEAP_FRAMES)
