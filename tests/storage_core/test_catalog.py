@@ -247,6 +247,12 @@ def test_a_catalog_round_trips_through_its_bytes() -> None:
     assert restored.spaces() == catalog.spaces()
     assert restored.next_table_id() == catalog.next_table_id()
     assert restored.next_space_id() == catalog.next_space_id()
+    assert restored.table("Person").column_positions == {"id": 0, "name": 1}
+    assert restored.table("BelongsTo").column_positions == {
+        "_from": 0,
+        "_to": 1,
+        "weight": 2,
+    }
 
 
 def test_an_empty_catalog_round_trips() -> None:

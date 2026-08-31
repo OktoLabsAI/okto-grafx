@@ -152,6 +152,7 @@ def test_a_relationship_table_needs_both_endpoints() -> None:
         to_table="Person",
     )
     assert table.from_table == "Person"
+    assert table.column_positions == {"_from": 0, "_to": 1, "since": 2}
     with pytest.raises(GrafxConfigurationError):
         TableDef(table_id=2, name="Knows", kind="rel", columns=columns, from_table="Person")
     with pytest.raises(GrafxConfigurationError):

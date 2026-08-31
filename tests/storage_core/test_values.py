@@ -194,6 +194,8 @@ def test_an_unknown_tag_is_refused() -> None:
     with pytest.raises(GrafxCorruptionDetected) as raised:
         decode_value(bytes([200]))
     assert raised.value.details["field"] == "tag"
+    assert raised.value.details["value"] == 200
+    assert raised.value.details["offset"] == 0
 
 
 def test_a_boolean_body_outside_zero_and_one_is_refused() -> None:
