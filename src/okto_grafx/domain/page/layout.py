@@ -102,6 +102,8 @@ class PageType(IntEnum):
     INDEX_HASH = 4
     INDEX_HNSW = 5
     OVERFLOW = 6
+    CONTROL_SLOT = 7
+    CONTROL_HEADER = 8
 
 
 def is_unwritten_image(raw: bytes, page_size: int) -> bool:
