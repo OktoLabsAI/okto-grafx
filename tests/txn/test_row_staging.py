@@ -436,21 +436,20 @@ def test_a_read_view_is_not_dropped_when_nothing_has_committed(
     assert stack.pool.begin_read_view(stack.manager.published_lsn() + 1) is True
 
 
-def test_two_participants_inserting_rows_cannot_both_replace_the_directory_page(
+def test_two_participants_inserting_from_one_old_extent_view_still_conflict(
     make_stack,
 ) -> None:
-    """The row half of defect E1, and carried finding CF-A stated as a test.
+    """The row half of defect E1 remains protected after page-zero false sharing is removed.
 
     Two participants inserting into the same table declare disjoint ROW partitions, so the row
     predicate lets both through -- but both also rewrite the reserved header page, which carries
     the table's extent and its identity counter, and a page image replaces the whole page. The
     second image would erase the first participant's extent and hand its identity out again.
 
-    A row write therefore declares the pages it lands on as well as the key it touched. The
-    second writer meets the first in the log and is refused, retryably, which is the outcome
-    BR-6 asks for when two commits really do intersect.
+    A row write therefore declares the pages it actually lands on as well as the key it touched.
+    The second writer meets the first on that physical page and is refused retryably.  Requiring
+    the directory page here would reintroduce the false sharing CN-1 removes.
     """
-    from okto_grafx.domain.page import HEADER_PAGE_INDEX
     from okto_grafx.domain.txn import page_partition
 
     first = make_stack()
@@ -473,7 +472,9 @@ def test_two_participants_inserting_rows_cannot_both_replace_the_directory_page(
     with pytest.raises(GrafxWriteConflict) as raised:
         second.manager.commit(loser)
     assert raised.value.retryable is True
-    assert page_partition("heap.dat", HEADER_PAGE_INDEX) in raised.value.details["partitions"]
+    assert page_partition("heap.dat", winner.row_refs[0].page) in raised.value.details[
+        "partitions"
+    ]
 
     successor = second.manager.retry(loser)
     successor.stage_row_insert(table, (2, "second"))

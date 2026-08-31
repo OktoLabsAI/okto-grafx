@@ -247,6 +247,7 @@ class DatabaseConfig:
     path: str
     page_size: int = 8192
     partitions_per_table: int = 64
+    identity_lease_size: int = 64
     buffer_budget_bytes: int = 64 * 1024 * 1024
     max_open_files: int = DEFAULT_MAX_OPEN_FILES
     recovery_policy: str = "replay"
@@ -304,6 +305,7 @@ class DatabaseConfig:
             )
 
         for field in (
+            "identity_lease_size",
             "buffer_budget_bytes",
             "max_open_files",
             "wal_segment_bytes",

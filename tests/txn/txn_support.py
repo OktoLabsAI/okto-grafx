@@ -18,7 +18,7 @@ properties of those pieces working together and cannot be observed against a moc
 from __future__ import annotations
 
 import struct
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -454,6 +454,8 @@ def build_stack(
     db_label: str = "txn",
     wal_factory: object = None,
     retain_lease: bool = False,
+    identity_lease_size: int = 64,
+    process_identity_provider: Callable[[], object] | None = None,
 ) -> Stack:
     """Assemble a working database around a transaction manager."""
     device = storage if storage is not None else _device(root, page_size)
@@ -465,6 +467,11 @@ def build_stack(
     catalog.bootstrap()
     heap = HeapStore(pool, catalog)
     heap.bootstrap()
+    # Production assembly checkpoints bootstrap state before exposing a handle.  A second direct
+    # test participant must likewise not carry a dirty, pre-open page zero that a later read-view
+    # refresh would flush over another participant's committed directory.
+    pool.flush(catalog.file)
+    pool.flush(heap.file)
     coordinator = LocalProcessCoordinator(
         device,
         the_clock,
@@ -487,11 +494,13 @@ def build_stack(
         the_metrics,
         None,
         partitions_per_table=partitions_per_table,
+        identity_lease_size=identity_lease_size,
         commit_lock_timeout=commit_lock_timeout,
         lease_timeout=lease_timeout,
         reader_stall_threshold=reader_stall_threshold,
         descriptor=f"hash-v1;partitions_per_table={partitions_per_table}",
         retain_lease=retain_lease,
+        process_identity_provider=process_identity_provider,
     )
     return Stack(
         root=root,

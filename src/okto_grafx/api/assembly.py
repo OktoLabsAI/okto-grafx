@@ -480,6 +480,7 @@ def assemble_database(
             metrics,
             indexes,
             partitions_per_table=config.partitions_per_table,
+            identity_lease_size=config.identity_lease_size,
             commit_lock_timeout=config.commit_lock_timeout_seconds,
             lease_timeout=config.lease_timeout_seconds,
             reader_stall_threshold=config.reader_stall_threshold_seconds,
@@ -492,6 +493,7 @@ def assemble_database(
             database_uuid=identity.database_uuid,
             control_format_version=identity.format_version,
             control_file_nonce=_new_control_file_nonce(),
+            process_identity_provider=os.getpid,
         )
         queries = QueryEngine(
             catalog=catalog,

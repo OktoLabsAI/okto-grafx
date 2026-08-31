@@ -19,7 +19,7 @@ Two rules decide everything else:
 from __future__ import annotations
 
 import struct
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol
 
@@ -99,6 +99,8 @@ __all__ = [
     "MINIMUM_FRAMES",
     "SnapshotLike",
     "TableExtent",
+    "RecordIdFloorAdvance",
+    "RecordIdFloorPlan",
     "HeapVersion",
     "HeapStore",
 ]
@@ -241,6 +243,24 @@ def _require_record_id(value: RecordId) -> RecordId:
     return value
 
 
+def _require_record_id_floor(value: RecordId) -> RecordId:
+    """Return a requested exclusive identity floor after validating the v1 field width."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise GrafxConfigurationError(
+            f"A record identity floor must be an integer; got a {type(value).__name__}.",
+            field="next_record_id",
+            value=repr(value),
+        )
+    if not FIRST_RECORD_ID <= value <= MAX_U64:
+        raise GrafxConfigurationError(
+            f"A record identity floor must be between {FIRST_RECORD_ID} and {MAX_U64}; "
+            f"got {value}.",
+            field="next_record_id",
+            value=value,
+        )
+    return value
+
+
 class SnapshotLike(Protocol):
     """The only thing the heap needs from a snapshot: whether a version may be seen.
 
@@ -345,6 +365,29 @@ class TableExtent:
             page_count=page_count,
             next_record_id=next_record_id,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RecordIdFloorAdvance:
+    """One table's durable identity floor before and after a staged reservation."""
+
+    table_id: int
+    old_floor: RecordId
+    new_floor: RecordId
+
+
+@dataclass(frozen=True, slots=True)
+class RecordIdFloorPlan:
+    """The detached page-zero image and the identity ranges it reserves.
+
+    ``advances`` is ordered by ``table_id``.  Each item reserves the half-open range
+    ``[old_floor, new_floor)`` once ``image`` has been committed through the ordinary page-image
+    WAL path.  Constructing this value changes no resident page.
+    """
+
+    page_index: PageIndex
+    image: bytes
+    advances: tuple[RecordIdFloorAdvance, ...]
 
 
 class HeapStore:
@@ -558,6 +601,129 @@ class HeapStore:
 
     # --- record identity ----------------------------------------------------------------------
 
+    def plan_record_id_floors(
+        self, floors: Mapping[TableDef, RecordId]
+    ) -> RecordIdFloorPlan:
+        """Plan atomic durable reservations on a detached image of heap page 0.
+
+        ``floors`` maps each existing table to the exclusive upper bound of the range being
+        reserved.  One call may advance several extents because every extent lives on the same
+        physical page: returning one image lets the caller commit all of those advances through
+        one ordinary ``WRITE_PAGE`` plus ``COMMIT`` pair.  The half-open range granted to a table
+        is reported as ``[old_floor, new_floor)``.
+
+        This is deliberately a copy-on-write door.  It reads one checksum-verified, detached
+        header page directly from the device, validates the complete request, and changes only
+        that private copy.  Bypassing the resident frame matters when another process has just
+        published a newer floor.  A caller that loses OCC or abandons the plan discards the
+        value; neither the live frame nor the durable counter moved.  Missing extents are refused
+        rather than created, because first use still belongs to the legacy insert/allocation path
+        and may need a new data page as well as a directory slot.
+        """
+        if not isinstance(floors, Mapping):
+            raise GrafxConfigurationError(
+                f"Identity floors must be supplied as a mapping; got {type(floors).__name__}.",
+                field="identity_floors",
+                value=type(floors).__name__,
+            )
+        requested = tuple(floors.items())
+        if not requested:
+            raise GrafxConfigurationError(
+                "At least one table is required to plan an identity-floor advance.",
+                field="identity_floors",
+                value=0,
+            )
+        table_ids: set[int] = set()
+        validated: list[tuple[TableDef, RecordId]] = []
+        for table, floor in requested:
+            if not isinstance(table, TableDef):
+                raise GrafxConfigurationError(
+                    f"An identity-floor key must be a TableDef; got {type(table).__name__}.",
+                    field="identity_floors",
+                    value=type(table).__name__,
+                )
+            if table.table_id in table_ids:
+                raise GrafxConfigurationError(
+                    f"Identity floors name table id {table.table_id} more than once.",
+                    field="table_id",
+                    value=table.table_id,
+                )
+            table_ids.add(table.table_id)
+            validated.append((table, _require_record_id_floor(floor)))
+        validated.sort(key=lambda item: item[0].table_id)
+
+        self._require_bootstrapped()
+        # A resident clean frame can precede another participant's just-published image, so the
+        # reservation must be based on the device image and must not replace or mutate that
+        # resident object.  The caller stages this detached image under the global commit
+        # ordering; if the device changes after this read, page-zero interest makes the caller
+        # rebuild the reservation from the new durable image.
+        image = self._pool.read_fresh_page(self._file, HEADER_PAGE_INDEX)
+        self._require_header_page(image)
+        located: dict[int, tuple[SlotId, TableExtent]] = {}
+        for slot, payload in image.iter_slots():
+            if slot < EXTENT_FIRST_SLOT:
+                continue
+            extent = TableExtent.decode(payload)
+            if extent.table_id not in table_ids:
+                continue
+            if extent.table_id in located:
+                raise GrafxCorruptionDetected(
+                    f"Table {extent.table_id} has more than one directory entry on the "
+                    f"header page of {self._file!r}.",
+                    file=self._file,
+                    page=HEADER_PAGE_INDEX,
+                    table_id=extent.table_id,
+                    field="directory_entry",
+                )
+            located[extent.table_id] = (slot, self._require_first_page(extent))
+
+        advances: list[RecordIdFloorAdvance] = []
+        for table, new_floor in validated:
+            found = located.get(table.table_id)
+            if found is None:
+                raise GrafxTransactionStateError(
+                    f"Table {table.name!r} has no heap extent, so an identity range cannot "
+                    "be reserved for it yet.",
+                    file=self._file,
+                    table=table.name,
+                    table_id=table.table_id,
+                    field="table_extent",
+                )
+            old_floor = found[1].next_record_id
+            if new_floor <= old_floor:
+                raise GrafxTransactionStateError(
+                    f"Table {table.name!r} already has durable identity floor {old_floor}; "
+                    f"a reservation must advance it, not request {new_floor}.",
+                    file=self._file,
+                    table=table.name,
+                    table_id=table.table_id,
+                    field="next_record_id",
+                    old_floor=old_floor,
+                    value=new_floor,
+                )
+            advances.append(
+                RecordIdFloorAdvance(
+                    table_id=table.table_id,
+                    old_floor=old_floor,
+                    new_floor=new_floor,
+                )
+            )
+
+        # Only after every extent and floor passed validation does the detached page change.  No
+        # partial image can escape if a later table is absent or its requested floor is stale.
+        for advance in advances:
+            slot, extent = located[advance.table_id]
+            image.update_slot(
+                slot,
+                replace(extent, next_record_id=advance.new_floor).encode(),
+            )
+        return RecordIdFloorPlan(
+            page_index=HEADER_PAGE_INDEX,
+            image=self._pool.codec.encode_page(image),
+            advances=tuple(advances),
+        )
+
     def allocate_record_id(self, table: TableDef) -> RecordId:
         """Take the next row identity of this table and record that it is spent.
 
@@ -653,6 +819,64 @@ class HeapStore:
         _require_record_id(record_id)
         payload = encode_tuple(table, values)
         self.observe_record_id(table, record_id)
+        header = RecordHeader(
+            record_id=record_id,
+            xmin=xmin,
+            xmax=0,
+            prev_version=NO_PREVIOUS_VERSION,
+            payload_len=len(payload),
+            schema_version=table.schema_version,
+        )
+        return self._store_version(table, header, payload)
+
+    def insert_reserved(
+        self,
+        table: TableDef,
+        record_id: RecordId,
+        values: tuple[Value, ...],
+        xmin: Csn,
+    ) -> RecordRef:
+        """Store a row whose identity is already below this table's durable floor.
+
+        The ordinary :meth:`insert` must raise page 0 before it writes a supplied identity,
+        because that identity may have come from replay or from an explicit caller.  A leased
+        identity has already been burned by a committed floor image, so raising the counter again
+        would manufacture the page-zero false sharing the lease exists to remove.  This narrower
+        door therefore requires an existing extent and proves ``record_id < next_record_id``
+        before storing the version, then leaves the floor untouched.  Tail repair or growth may
+        still update the other fields of the extent; only the identity floor is bypassed.
+        """
+        _require_commit_number("xmin", xmin)
+        _require_record_id(record_id)
+        if record_id < FIRST_RECORD_ID:
+            raise GrafxConfigurationError(
+                f"A reserved record id starts at {FIRST_RECORD_ID}; got {record_id}.",
+                field="record_id",
+                value=record_id,
+            )
+        extent = self._find_extent(table.table_id)
+        if extent is None:
+            raise GrafxTransactionStateError(
+                f"Table {table.name!r} has no heap extent, so record id {record_id} cannot "
+                "belong to a durable reservation.",
+                file=self._file,
+                table=table.name,
+                table_id=table.table_id,
+                field="table_extent",
+                record_id=record_id,
+            )
+        if record_id >= extent.next_record_id:
+            raise GrafxTransactionStateError(
+                f"Record id {record_id} of table {table.name!r} is not below its durable "
+                f"identity floor {extent.next_record_id}.",
+                file=self._file,
+                table=table.name,
+                table_id=table.table_id,
+                field="record_id",
+                record_id=record_id,
+                durable_floor=extent.next_record_id,
+            )
+        payload = encode_tuple(table, values)
         header = RecordHeader(
             record_id=record_id,
             xmin=xmin,

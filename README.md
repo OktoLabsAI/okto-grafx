@@ -546,6 +546,7 @@ refused with the field name the caller actually wrote.
 |---|---|---|
 | `page_size` | `8192` | Fixed for the life of the database |
 | `partitions_per_table` | `64` | Conflict granularity — more partitions, fewer false conflicts |
+| `identity_lease_size` | `64` | Burn-only row-id range reserved durably per refill; larger values reduce heap page-0 metadata commits at the cost of wider harmless gaps after close/crash |
 | `buffer_budget_bytes` | `64 MiB` | Per database, never shared; must hold at least two configured pages |
 | `max_open_files` | `256` | Local descriptor-cache budget; tune down for descriptor-constrained hosts |
 | `recovery_policy` | `"replay"` | What the pass at open is allowed to do |

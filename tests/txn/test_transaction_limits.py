@@ -84,6 +84,16 @@ def _context(
     )
 
 
+@pytest.mark.parametrize("value", [0, -1, True, False, 1.5, "64", None])
+def test_direct_manager_refuses_an_invalid_identity_lease_size(
+    stack: Stack, value: object
+) -> None:
+    with pytest.raises(GrafxConfigurationError) as raised:
+        _manager(stack, identity_lease_size=value)  # type: ignore[arg-type]
+
+    assert raised.value.details["field"] == "identity_lease_size"
+
+
 def _assert_budget(
     failure: GrafxTransactionBudgetExceeded,
     *,

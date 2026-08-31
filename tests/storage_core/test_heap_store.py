@@ -57,6 +57,8 @@ from okto_grafx.engine.heap_store import (
     EXTENT_FIRST_SLOT,
     MAX_DIRECTORY_FIELD,
     HeapStore,
+    RecordIdFloorAdvance,
+    RecordIdFloorPlan,
     TableExtent,
 )
 
@@ -2884,6 +2886,198 @@ def test_the_three_page_states_are_told_apart_by_their_field(
 def reopened_heap(pool: BufferPool, store: HeapStore) -> HeapStore:
     """Return a heap over the same pool that has read nothing yet, which is what a reopen is."""
     return HeapStore(pool, store.catalog)
+
+
+def image_extents(pool: BufferPool, image: bytes) -> dict[int, TableExtent]:
+    """Decode the table extents carried by a detached heap page-zero image."""
+    page = pool.codec.decode_page(image, verify=True)
+    return {
+        extent.table_id: extent
+        for slot, payload in page.iter_slots()
+        if slot >= EXTENT_FIRST_SLOT
+        for extent in (TableExtent.decode(payload),)
+    }
+
+
+def test_one_cow_floor_plan_advances_multiple_extents_without_touching_page_zero(
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+    person_table: TableDef,
+) -> None:
+    other = second_table(catalog_store)
+    heap_store.insert(person_table, 1, (1, "Ada"), xmin=5)
+    heap_store.insert(other, 4, (4, "Acme"), xmin=5)
+    old_person = heap_store.extent_of(person_table)
+    old_other = heap_store.extent_of(other)
+    assert old_person is not None and old_other is not None
+    pool.flush(heap_store.file)
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        before = pool.codec.encode_page(page)
+        assert page.dirty is False
+
+    plan = heap_store.plan_record_id_floors({other: 11, person_table: 7})
+
+    assert isinstance(plan, RecordIdFloorPlan)
+    assert plan.page_index == HEADER_PAGE_INDEX
+    assert plan.advances == (
+        RecordIdFloorAdvance(person_table.table_id, old_person.next_record_id, 7),
+        RecordIdFloorAdvance(other.table_id, old_other.next_record_id, 11),
+    )
+    planned = image_extents(pool, plan.image)
+    assert planned[person_table.table_id] == replace(old_person, next_record_id=7)
+    assert planned[other.table_id] == replace(old_other, next_record_id=11)
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        assert pool.codec.encode_page(page) == before
+        assert page.dirty is False
+    assert heap_store.extent_of(person_table) == old_person
+    assert heap_store.extent_of(other) == old_other
+
+
+def test_a_floor_plan_uses_the_durable_image_without_replacing_a_stale_resident_frame(
+    device: MemoryDevice,
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+    person_table: TableDef,
+) -> None:
+    heap_store.insert(person_table, 1, (1, "Ada"), xmin=5)
+    pool.flush(heap_store.file)
+    assert heap_store.next_record_id(person_table) == 2
+
+    writer_pool = make_pool(device, RecordingMetrics(), db_label="other-process")
+    writer = HeapStore(writer_pool, catalog_store)
+    writer.observe_record_id(person_table, 9)
+    writer_pool.flush(writer.file)
+    assert writer.next_record_id(person_table) == 10
+    # This handle still owns its older clean frame.  Planning must neither trust nor replace it.
+    assert heap_store.next_record_id(person_table) == 2
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        stale_resident = pool.codec.encode_page(page)
+
+    plan = heap_store.plan_record_id_floors({person_table: 20})
+
+    assert plan.advances == (
+        RecordIdFloorAdvance(person_table.table_id, old_floor=10, new_floor=20),
+    )
+    assert image_extents(pool, plan.image)[person_table.table_id].next_record_id == 20
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        assert pool.codec.encode_page(page) == stale_resident
+        assert page.dirty is False
+    assert heap_store.next_record_id(person_table) == 2
+
+
+def test_a_multi_table_floor_plan_validates_every_extent_before_producing_an_image(
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+    person_table: TableDef,
+) -> None:
+    missing = second_table(catalog_store)
+    heap_store.insert(person_table, 1, (1, "Ada"), xmin=5)
+    pool.flush(heap_store.file)
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        before = pool.codec.encode_page(page)
+
+    with pytest.raises(GrafxTransactionStateError) as raised:
+        heap_store.plan_record_id_floors({person_table: 20, missing: 20})
+
+    assert raised.value.details["field"] == "table_extent"
+    assert raised.value.details["table_id"] == missing.table_id
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        assert pool.codec.encode_page(page) == before
+        assert page.dirty is False
+    assert heap_store.next_record_id(person_table) == 2
+    assert heap_store.extent_of(missing) is None
+
+
+@pytest.mark.parametrize("new_floor", [2, 1])
+def test_a_floor_plan_must_strictly_advance_the_existing_floor(
+    pool: BufferPool, heap_store: HeapStore, person_table: TableDef, new_floor: int
+) -> None:
+    heap_store.insert(person_table, 1, (1, "Ada"), xmin=5)
+    pool.flush(heap_store.file)
+
+    with pytest.raises(GrafxTransactionStateError) as raised:
+        heap_store.plan_record_id_floors({person_table: new_floor})
+
+    assert raised.value.details["field"] == "next_record_id"
+    assert raised.value.details["old_floor"] == 2
+    assert heap_store.next_record_id(person_table) == 2
+
+
+@pytest.mark.parametrize("floors", [{}, {"Person": 10}])
+def test_a_floor_plan_requires_a_nonempty_table_mapping(
+    heap_store: HeapStore, floors: object
+) -> None:
+    with pytest.raises(GrafxConfigurationError) as raised:
+        heap_store.plan_record_id_floors(floors)  # type: ignore[arg-type]
+    assert raised.value.details["field"] == "identity_floors"
+
+
+def test_a_reserved_insert_uses_an_existing_durable_floor_without_advancing_it(
+    monkeypatch: pytest.MonkeyPatch,
+    pool: BufferPool,
+    heap_store: HeapStore,
+    person_table: TableDef,
+) -> None:
+    heap_store.insert(person_table, 1, (1, "seed"), xmin=5)
+    heap_store.observe_record_id(person_table, 9)
+    assert heap_store.next_record_id(person_table) == 10
+    pool.flush(heap_store.file)
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        before = pool.codec.encode_page(page)
+
+    def observe_was_not_allowed(
+        _store: HeapStore, _table: TableDef, _record_id: int
+    ) -> bool:
+        raise AssertionError("a reserved insert tried to advance page zero")
+
+    monkeypatch.setattr(HeapStore, "observe_record_id", observe_was_not_allowed)
+    reference = heap_store.insert_reserved(person_table, 3, (3, "leased"), xmin=6)
+
+    assert heap_store.read(reference).record_id == 3
+    assert heap_store.next_record_id(person_table) == 10
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        assert pool.codec.encode_page(page) == before
+        assert page.dirty is False
+
+
+@pytest.mark.parametrize("record_id", [0, 10, 11])
+def test_a_reserved_insert_refuses_an_id_outside_the_burned_range_without_writing(
+    pool: BufferPool,
+    heap_store: HeapStore,
+    person_table: TableDef,
+    record_id: int,
+) -> None:
+    heap_store.insert(person_table, 1, (1, "seed"), xmin=5)
+    heap_store.observe_record_id(person_table, 9)
+    pool.flush(heap_store.file)
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        before = pool.codec.encode_page(page)
+    rows_before = tuple(heap_store.scan_all(person_table))
+
+    with pytest.raises((GrafxConfigurationError, GrafxTransactionStateError)) as raised:
+        heap_store.insert_reserved(person_table, record_id, (record_id, "no"), xmin=6)
+
+    assert raised.value.details["field"] == "record_id"
+    assert tuple(heap_store.scan_all(person_table)) == rows_before
+    assert heap_store.next_record_id(person_table) == 10
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        assert pool.codec.encode_page(page) == before
+
+
+def test_a_reserved_insert_never_creates_the_first_extent(
+    pool: BufferPool, heap_store: HeapStore, person_table: TableDef
+) -> None:
+    pages_before = pool.storage.page_count(heap_store.file)
+
+    with pytest.raises(GrafxTransactionStateError) as raised:
+        heap_store.insert_reserved(person_table, 1, (1, "no extent"), xmin=5)
+
+    assert raised.value.details["field"] == "table_extent"
+    assert heap_store.extent_of(person_table) is None
+    assert pool.storage.page_count(heap_store.file) == pages_before
 
 
 def test_the_first_row_of_a_table_takes_the_first_identity(

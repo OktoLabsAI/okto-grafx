@@ -620,15 +620,15 @@ def test_a_tampered_identity_is_refused_before_the_commit_window(
     stack.manager.rollback(transaction)
 
 
-def test_an_identity_a_row_already_carries_is_refused_but_a_gap_is_not(
+def test_an_identity_below_the_durable_floor_is_refused_even_when_it_is_a_gap(
     stack: Stack,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Gaps are free; reuse is never. The counter alone cannot tell those two apart.
+    """A missing row does not prove that an id below the floor is unowned.
 
-    ``observe_record_id`` only ever raises the counter, so it accepts a number BELOW it without
-    a word -- and the heap would then hold two rows under one identity. An identity the counter
-    has passed WITHOUT giving to anyone is a different case, and it stays available.
+    Durable leasing advances the shared floor before a process uses its range.  Another process
+    can therefore own a below-floor id that no row carries yet, so both a known reuse and an
+    apparently empty gap fail closed.
     """
     (person,) = _registered(stack, _person())
     established = stack.manager.begin("write")
@@ -651,14 +651,18 @@ def test_an_identity_a_row_already_carries_is_refused_but_a_gap_is_not(
     stack.manager.rollback(reusing)
     monkeypatch.undo()
 
-    # Identity 3 was never handed to anyone, only stepped over. It is still available.
+    # Identity 3 has no row, but it is below the durable floor and may be reserved elsewhere.
     gap = stack.manager.begin("write")
     gap.stage_row_insert(person, (3,), record_id=3)
     _declare(stack, gap, person)
-    stack.manager.commit(gap)
+    with pytest.raises(GrafxTransactionStateError) as gap_refusal:
+        stack.manager.commit(gap)
+    assert gap_refusal.value.details["field"] == "record_id"
+    assert gap_refusal.value.details["durable_floor"] == 6
+    stack.manager.rollback(gap)
 
-    identities = sorted(version.record_id for _ref, version in stack.heap.scan_all(person))
-    assert identities == [3, 5]
+    identities = [version.record_id for _ref, version in stack.heap.scan_all(person)]
+    assert identities == [5]
 
 
 def test_the_budget_admits_the_exact_size_and_refuses_one_byte_less() -> None:

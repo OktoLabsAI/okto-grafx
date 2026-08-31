@@ -31,6 +31,7 @@ def test_defaults_match_the_contract() -> None:
     assert config.path == "./mydb"
     assert config.page_size == 8192
     assert config.partitions_per_table == 64
+    assert config.identity_lease_size == 64
     assert config.buffer_budget_bytes == 64 * 1024 * 1024
     assert config.max_open_files == 128
     assert config.recovery_policy == "replay"
@@ -155,6 +156,7 @@ def test_an_invalid_partition_count_is_rejected(partitions: object) -> None:
 @pytest.mark.parametrize(
     "field",
     [
+        "identity_lease_size",
         "buffer_budget_bytes",
         "max_open_files",
         "wal_segment_bytes",
@@ -683,6 +685,7 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         path=":memory:",
         page_size=_HostileInt(8192),
         partitions_per_table=_HostileInt(256),
+        identity_lease_size=_HostileInt(32),
         buffer_budget_bytes=_HostileInt(8192 * 8),
         wal_segment_bytes=_HostileInt(4096),
         wal_max_bytes=_HostileInt(8192),
@@ -700,6 +703,7 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
     for field in (
         "page_size",
         "partitions_per_table",
+        "identity_lease_size",
         "buffer_budget_bytes",
         "wal_segment_bytes",
         "wal_max_bytes",

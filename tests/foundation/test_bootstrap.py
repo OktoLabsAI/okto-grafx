@@ -65,6 +65,16 @@ def test_the_local_storage_descriptor_budget_comes_from_database_config(
         bootstrap.release_ports(registry)
 
 
+def test_the_identity_lease_size_reaches_the_transaction_manager() -> None:
+    database = bootstrap.open_database(
+        DatabaseConfig(path=":memory:", identity_lease_size=17)
+    )
+    try:
+        assert database._transactions._identity_lease_size == 17
+    finally:
+        database.close()
+
+
 def test_building_the_default_registry_fails_closed_on_every_unfilled_slot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

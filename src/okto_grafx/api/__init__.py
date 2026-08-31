@@ -56,9 +56,10 @@ def connect(
     ``":memory:"`` for an in-memory database with exactly the same transactional semantics.
     Every keyword after it is a field of
     :class:`okto_grafx.runtime.config.DatabaseConfig` -- ``page_size``, ``partitions_per_table``,
-    ``buffer_budget_bytes``, ``recovery_policy``, ``metrics``, ``vector_math``, ``read_only`` and
-    the rest -- and an unknown one is refused by name rather than ignored, because a mistyped
-    option that is silently dropped is a configuration a caller believes it applied.
+    ``identity_lease_size``, ``buffer_budget_bytes``, ``recovery_policy``, ``metrics``,
+    ``vector_math``, ``read_only`` and the rest -- and an unknown one is refused by name rather
+    than ignored, because a mistyped option that is silently dropped is a configuration a caller
+    believes it applied.
 
     ``registry`` composes the database over adapters the caller built. The default is None, which
     builds the adapters the configuration selects; either way every required port slot is

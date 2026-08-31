@@ -95,7 +95,7 @@ from okto_grafx.domain.page.layout import MAX_U64
 from okto_grafx.domain.recovery.decision import CommittedReplay, committed_replay
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
 from okto_grafx.domain.model.schema import ENDPOINT_COLUMN_COUNT, encode_tuple
-from okto_grafx.domain.page import HEADER_PAGE_INDEX, Page
+from okto_grafx.domain.page import Page
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.txn.commit_record import CommitPayload, FileIdMap, PageTouch
 from okto_grafx.domain.txn.commit_state import CommitState
@@ -205,6 +205,24 @@ class _RowWrite:
     ended_values: tuple[object, ...] = ()
 
 
+@dataclass(slots=True)
+class _IdentityLease:
+    """One process-local, burn-only slice below a table's durable identity floor."""
+
+    next_id: int
+    stop: int
+
+
+@dataclass(frozen=True, slots=True)
+class _IdentityPlan:
+    """The exact reduced row batch and the durable identities it may materialise."""
+
+    intents: tuple[RowIntent, ...]
+    record_ids: dict[int, int]
+    leased_positions: frozenset[int]
+    reservation_lsn: Lsn | None = None
+
+
 class _ReaderPin:
     """One live reader registration together with the reading at which it was last refreshed."""
 
@@ -231,6 +249,11 @@ class TransactionManager:
         "_index_manager",
         "_index_sync",
         "_partitions_per_table",
+        "_identity_lease_size",
+        "_identity_leases",
+        "_identity_process",
+        "_identity_process_invalid",
+        "_process_identity_provider",
         "_commit_lock_timeout",
         "_dirty_mark",
         "_lease_timeout",
@@ -272,6 +295,7 @@ class TransactionManager:
         *,
         partitions_per_table: int,
         commit_lock_timeout: float,
+        identity_lease_size: int = 64,
         lease_timeout: float | None = None,
         reader_stall_threshold: float | None = None,
         descriptor: str = "",
@@ -284,6 +308,7 @@ class TransactionManager:
         database_uuid: bytes | None = None,
         control_format_version: int = 1,
         control_file_nonce: int = 0,
+        process_identity_provider: Callable[[], object] | None = None,
     ) -> None:
         """Build a manager over one database.
 
@@ -333,6 +358,30 @@ class TransactionManager:
         self._partitions_per_table: int = validate_partitions_per_table(
             partitions_per_table
         )
+        self._identity_lease_size: int = _require_positive_int(
+            "identity_lease_size", identity_lease_size
+        )
+        if process_identity_provider is None:
+            # Direct/internal composition historically supplies only a coordinator. Capture its
+            # construction identity once so fail-fast doors never turn an ownership check into
+            # operational coordination. Production assembly injects ``os.getpid`` and therefore
+            # gets the stronger post-fork guard.
+            construction_identity = coordinator.owner_id()
+
+            def provider() -> object:
+                return construction_identity
+        else:
+            provider = process_identity_provider
+        if not callable(provider):
+            raise GrafxConfigurationError(
+                "process_identity_provider must be callable.",
+                field="process_identity_provider",
+                value=type(provider).__name__,
+            )
+        self._process_identity_provider: Callable[[], object] = provider
+        self._identity_process: object = provider()
+        self._identity_process_invalid: bool = False
+        self._identity_leases: dict[int, _IdentityLease] = {}
         self._commit_lock_timeout: float = _require_timeout(
             "commit_lock_timeout", commit_lock_timeout
         )
@@ -508,6 +557,7 @@ class TransactionManager:
 
     def request_close(self) -> None:
         """Publish the terminal latch without trying to interrupt an in-flight transition."""
+        self._require_process_owner("request close")
         self._closed = True
 
     @contextmanager
@@ -533,6 +583,7 @@ class TransactionManager:
         self._require_not_closed("require recovery")
         with self._participant_section():
             self._require_not_closed("require recovery")
+            self._identity_leases.clear()
             self._recovery_required = True
 
     def recovery_completed(self) -> None:
@@ -549,6 +600,7 @@ class TransactionManager:
                     published_lsn=durable.last_committed_lsn,
                     required_lsn=self._published_high_water,
                 )
+            self._identity_leases.clear()
             self._recovery_required = False
 
     # --- snapshots --------------------------------------------------------------------------
@@ -690,6 +742,9 @@ class TransactionManager:
         """Refuse work that could publish over a durable commit missing from the pages."""
         if not self._recovery_required:
             return
+        # The durable floor may have moved in a commit whose apply/publication is being repaired.
+        # Dropping local ranges turns every uncertain remainder into a harmless gap.
+        self._identity_leases.clear()
         raise GrafxRecoveryRefused(
             "A previous durable commit or redo could not be completed on this handle. Roll "
             "back any open transaction and run database.recover() before beginning or "
@@ -710,6 +765,7 @@ class TransactionManager:
 
     def _require_not_closed(self, operation: str) -> None:
         """Refuse work after terminal close before a collaborator can be reached."""
+        self._require_process_owner(operation)
         if not self._closed:
             return
         raise GrafxTransactionStateError(
@@ -1629,6 +1685,7 @@ class TransactionManager:
                                 self._close_reader_quietly(pin.registration),
                             )
                         self._participant_pin = None
+                        self._identity_leases.clear()
                         self._open.clear()
                         for mode_name in self._mode_counts:
                             self._mode_counts[mode_name] = 0
@@ -1727,6 +1784,7 @@ class TransactionManager:
         open_now = 0
         post_barrier_failure: BaseException | None = None
         cleanup_failure: BaseException | None = None
+        identities: _IdentityPlan | None = None
         with self._participant_section():
             self._require_not_closed("commit a transaction")
             self._require_current_active(txn)
@@ -1734,6 +1792,10 @@ class TransactionManager:
             self._require_recovery_complete()
             self._validate_staged_inputs(txn)
             txn.validate_budgets()
+            # Preserve the long-standing fail-before-lock boundary for malformed or obviously
+            # below-floor explicit ids. A fresh cross-process proof is repeated later under the
+            # global commit lock before any such id is accepted.
+            self._validate_explicit_identity_floors(txn)
             self._refresh_finished_door()
             lease = self._hold_lease()
             try:
@@ -1776,6 +1838,46 @@ class TransactionManager:
                     # declared BEFORE touching the heap keeps a real conflict reported as one.
                     with self._close_wait_hazard():
                         conflict = self._find_conflict(txn)  # step 3.3
+                    if conflict is None:
+                        identities, pending_identity_ranges = (
+                            self._prepare_identity_plan(txn)
+                        )
+                        if pending_identity_ranges:
+                            durable, identities = self._reserve_identity_plan(
+                                txn,
+                                identities,
+                                pending_identity_ranges,
+                                previous=durable,
+                                lease=lease,
+                            )
+                            current = durable.last_committed_lsn
+                            if self._closed:
+                                self._identity_leases.clear()
+                                refusal = GrafxTransactionStateError(
+                                    "The identity-floor reservation became durable, but close "
+                                    "was requested before the user transaction could run. The "
+                                    "range remains burned and the user transaction did not "
+                                    "commit.",
+                                    operation="continue user commit after identity reservation",
+                                    metadata_committed=True,
+                                    user_transaction_committed=False,
+                                    reservation_csn=identities.reservation_lsn,
+                                    closed=True,
+                                    txn_id=txn.txn_id,
+                                )
+                                refusal.details["retryable"] = False
+                                raise refusal
+                        if (
+                            tuple(reduce_row_intents(txn.row_intents))
+                            != identities.intents
+                        ):
+                            raise GrafxTransactionStateError(
+                                "The staged row intents changed while their durable identities "
+                                "were being reserved; the burned identities remain gaps and "
+                                "this transaction must be restaged.",
+                                field="row_intents",
+                                txn_id=txn.txn_id,
+                            )
                     rows: tuple[_RowWrite, ...] = ()
                     staging_mark = len(txn.pending_records)
                     # The mark this attempt's page set is measured against. The window opens
@@ -1787,16 +1889,24 @@ class TransactionManager:
                     self._dirty_mark = self._pool.modified_pages()
                     try:
                         if conflict is None:
+                            if identities is None:
+                                raise GrafxTransactionStateError(
+                                    "A row-writing commit reached the heap without an identity "
+                                    "plan.",
+                                    field="identity_plan",
+                                    txn_id=txn.txn_id,
+                                )
                             # Inside the guard, not before it: a refusal on the SECOND intent
                             # of a batch used to leave the first one written and never
                             # abandoned -- a phantom row the next commit of anyone flushed and
                             # published (C5 round-2 B1).
                             with self._close_wait_hazard():
-                                rows = self._write_rows(txn)
+                                rows = self._write_rows(txn, identities)
                             self._declare_page_interest(txn, rows)
                             with self._close_wait_hazard():
                                 conflict = self._find_conflict(
-                                    txn
+                                    txn,
+                                    ignored_commit_lsn=identities.reservation_lsn,
                                 )  # step 3.3, page half
                         if conflict is None:
                             # AFTER ordinary validation cleared and immediately before
@@ -1831,6 +1941,7 @@ class TransactionManager:
                                         epoch=lease.epoch,
                                     )
                                 self._validate_wal_batch_budget(txn, records)
+                            self._validate_lease(lease)
                             with self._close_wait_hazard():
                                 committed = self._wal.append_many(
                                     records,
@@ -2189,7 +2300,12 @@ class TransactionManager:
         with self._close_wait_hazard():
             validator(txn, records)
 
-    def _find_conflict(self, txn: TransactionContext) -> tuple[int, ...] | None:
+    def _find_conflict(
+        self,
+        txn: TransactionContext,
+        *,
+        ignored_commit_lsn: Lsn | None = None,
+    ) -> tuple[int, ...] | None:
         """Return the partitions that make this commit conflict, or None when none do.
 
         The predicate is the one CONTRACT.md section 8.5 step 3.3 states and nothing more: a
@@ -2215,6 +2331,12 @@ class TransactionManager:
                 # The authority on the range is this comparison, not the argument passed to
                 # read_from: a log that answers a start LSN generously must not be able to turn
                 # a commit that this transaction has already seen into a conflict.
+                continue
+            if ignored_commit_lsn is not None and record.lsn == ignored_commit_lsn:
+                # A durable identity refill is a metadata commit made on behalf of THIS attempt.
+                # The user write materialises from the page image that refill published, so it
+                # may ignore that one exact COMMIT.  A txn id, page or range would also hide a
+                # foreign writer and is deliberately not accepted here.
                 continue
             payload = CommitPayload.decode(record.payload)
             overlap = interested.intersection(payload.write_partitions)
@@ -2664,7 +2786,9 @@ class TransactionManager:
                             txn_id=txn.txn_id,
                         )
 
-    def _write_rows(self, txn: TransactionContext) -> tuple[_RowWrite, ...]:
+    def _write_rows(
+        self, txn: TransactionContext, identities: _IdentityPlan
+    ) -> tuple[_RowWrite, ...]:
         """Write the rows this transaction staged and return where each one landed.
 
         The staged intents are settled first (see :func:`reduce_row_intents`), because a stored row
@@ -2694,7 +2818,9 @@ class TransactionManager:
         provisional = PROVISIONAL_CSN
         written: list[_RowWrite] = []
         try:
-            effective_row_tables = self._write_intents(txn, heap, provisional, written)
+            effective_row_tables = self._write_intents(
+                txn, heap, provisional, written, identities
+            )
         except BaseException as failure:
             # The intents already written are abandoned HERE, by the one frame that knows
             # about them. The caller sees only what this method returns, and a refusal on the
@@ -2716,10 +2842,11 @@ class TransactionManager:
         heap: object,
         provisional: Csn,
         written: list[_RowWrite],
+        identities: _IdentityPlan,
     ) -> frozenset[int]:
         """Write settled intents and return the exact table ids that materialized rows."""
         effective_row_tables: set[int] = set()
-        for intent in self._resolved_intents(txn, heap):
+        for position, intent in enumerate(self._resolved_intents(txn, identities)):
             effective_row_tables.add(intent.table.table_id)
             if intent.operation is RowOperation.DELETE:
                 ending = self._values_at(intent.reference)
@@ -2751,8 +2878,15 @@ class TransactionManager:
             # Planned above, never None here: the identity had to exist before the row was
             # written, because an edge staged in this same transaction may already carry it.
             record_id = intent.record_id
-            heap.observe_record_id(intent.table, record_id)
-            reference = heap.insert(intent.table, record_id, intent.values, provisional)
+            if position in identities.leased_positions:
+                reference = heap.insert_reserved(
+                    intent.table, record_id, intent.values, provisional
+                )
+            else:
+                # The first row of a table has no extent to reserve yet.  Its ordinary insert
+                # creates the extent and advances the floor atomically with the user commit;
+                # leasing starts on the next transaction.
+                reference = heap.insert(intent.table, record_id, intent.values, provisional)
             written.append(
                 _RowWrite(
                     born=reference,
@@ -2764,7 +2898,7 @@ class TransactionManager:
         return frozenset(effective_row_tables)
 
     def _resolved_intents(
-        self, txn: TransactionContext, heap: object
+        self, txn: TransactionContext, identities: _IdentityPlan
     ) -> tuple[RowIntent, ...]:
         """Return the settled intents with every pending identity turned into a stored value.
 
@@ -2781,11 +2915,11 @@ class TransactionManager:
         the counter is advanced by ``observe_record_id`` as each row actually lands, so an attempt
         abandoned here leaves the counter exactly where it was.
         """
-        settled = reduce_row_intents(txn.row_intents)
+        settled = identities.intents
         plans = plan_relationship_endpoints(
             settled, txn_id=txn.txn_id, owns=txn.owns_pending_row_ref
         )
-        planned = self._plan_record_ids(txn, settled, heap)
+        planned = identities.record_ids
         endpoints: dict[int, dict[int, int]] = {}
         for plan in plans:
             endpoints.setdefault(plan.relationship_position, {})[plan.slot] = planned[
@@ -2811,38 +2945,462 @@ class TransactionManager:
         self._refuse_unresolved_intents(txn, settled_rows)
         return settled_rows
 
-    def _plan_record_ids(
-        self, txn: TransactionContext, intents: Sequence[RowIntent], heap: object
-    ) -> dict[int, int]:
-        """Return the durable identity each staged insert will take, by position, spending none.
+    def _prepare_identity_plan(
+        self, txn: TransactionContext
+    ) -> tuple[_IdentityPlan, dict[int, tuple[object, tuple[int, ...]]]]:
+        """Spend cached identities and describe the ranges that still need a durable refill.
 
-        Deterministic per table, and in two passes rather than one. The identities a batch chose
-        for ITSELF are collected first, and each table's cursor starts above all of them, so an
-        implicit identity cannot land on an explicit one that appears LATER in the same batch --
-        which a single pass cannot know about, and which is how two rows of one table end up
-        under one identity while every step looks locally correct.
+        The caller owns the participant section for the whole commit.  Keeping preparation in
+        that same section is a lifecycle invariant: once commit wins selection, ``close`` and
+        ``rollback`` cannot enter between identity preparation and the commit attempt.  Only
+        process-local cache entries are consumed here.  Any shared floor advance is deferred to
+        :meth:`_reserve_identity_plan`, under the writer lease and COMMIT_SECTION.
+
+        A slice is burn-only.  It is advanced before an identity reaches the row writer and is
+        never rewound, so conflict, rollback, close and crash can create gaps but cannot reuse an
+        id.  Tables without an extent stay on the legacy path because creating the first extent
+        before the surrounding catalog/user transaction commits would break atomicity.
         """
-        reserved = self._reserved_record_ids(txn, intents)
-        self._refuse_reused_identities(txn, reserved)
-        planned: dict[int, int] = {}
-        cursors: dict[int, int] = {}
+        intents = tuple(reduce_row_intents(txn.row_intents))
+        self._sync_identity_process()
+
+        groups: dict[int, tuple[object, list[int]]] = {}
         for position, intent in enumerate(intents):
             if intent.operation is not RowOperation.INSERT:
                 continue
-            table = intent.table
-            table_id = getattr(table, "table_id", None)
-            if table_id not in cursors:
-                taken = reserved.get(table_id, (None, frozenset()))[1]
-                cursors[table_id] = max(
-                    (heap.next_record_id(table), *(identity + 1 for identity in taken))
+            table_id = getattr(intent.table, "table_id", None)
+            group = groups.setdefault(table_id, (intent.table, []))
+            group[1].append(position)
+
+        planned: dict[int, int] = {}
+        leased_positions: set[int] = set()
+        pending: dict[int, tuple[object, tuple[int, ...]]] = {}
+        for table_id in sorted(groups):
+            table, positions_list = groups[table_id]
+            positions = tuple(positions_list)
+            explicit = tuple(
+                position
+                for position in positions
+                if intents[position].record_id is not None
+            )
+            for position in explicit:
+                planned[position] = intents[position].record_id  # type: ignore[assignment]
+            implicit = tuple(position for position in positions if position not in explicit)
+            if explicit:
+                # A named id invalidates every local inference about the shared floor.  Burn the
+                # cached remainder first, then fail early when our current durable view already
+                # proves the id is below the floor.  The locked refill repeats this proof against
+                # a fresh cross-process view before accepting anything.
+                self._identity_leases.pop(table_id, None)
+                extent = self._heap.extent_of(table)
+                if extent is not None:
+                    explicit_ids = tuple(
+                        int(intents[position].record_id) for position in explicit
+                    )
+                    below = tuple(
+                        identity
+                        for identity in explicit_ids
+                        if identity < int(extent.next_record_id)
+                    )
+                    if below:
+                        self._raise_explicit_below_identity_floor(
+                            txn,
+                            table,
+                            table_id,
+                            below,
+                            int(extent.next_record_id),
+                        )
+                pending[table_id] = (table, positions)
+                continue
+            lease = self._identity_leases.get(table_id)
+            if lease is not None and lease.stop - lease.next_id >= len(implicit):
+                start = lease.next_id
+                lease.next_id += len(implicit)  # burn before hand-off
+                if lease.next_id >= lease.stop:
+                    self._identity_leases.pop(table_id, None)
+                for offset, position in enumerate(implicit):
+                    planned[position] = start + offset
+                    leased_positions.add(position)
+                continue
+            # A short remainder is deliberately not split across two intervals.  Dropping it
+            # burns it, and one fresh reservation covers the whole batch deterministically.
+            self._identity_leases.pop(table_id, None)
+            pending[table_id] = (table, positions)
+
+        return (
+            _IdentityPlan(
+                intents=intents,
+                record_ids=planned,
+                leased_positions=frozenset(leased_positions),
+            ),
+            pending,
+        )
+
+    def _validate_explicit_identity_floors(self, txn: TransactionContext) -> None:
+        """Reject explicit ids this participant already proves are below a durable floor.
+
+        This early check deliberately performs no cache mutation and no durable work.  It keeps
+        caller-controlled identity refusals ahead of lease acquisition while the locked planner
+        below remains authoritative when another process has advanced a floor since this pool's
+        current view.
+        """
+        intents = tuple(reduce_row_intents(txn.row_intents))
+        for table_id, (table, identities) in self._reserved_record_ids(txn, intents).items():
+            extent = self._heap.extent_of(table)
+            if extent is None:
+                continue
+            floor = int(extent.next_record_id)
+            below = tuple(sorted(identity for identity in identities if identity < floor))
+            if below:
+                self._raise_explicit_below_identity_floor(
+                    txn, table, table_id, below, floor
                 )
-            identity = intent.record_id
-            if identity is None:
-                identity = cursors[table_id]
-                cursors[table_id] = identity + 1
-            self._require_unexhausted_identity(txn, table, table_id, identity)
-            planned[position] = identity
-        return planned
+
+    def _reserve_identity_plan(
+        self,
+        txn: TransactionContext,
+        base: _IdentityPlan,
+        pending: dict[int, tuple[object, tuple[int, ...]]],
+        *,
+        previous: CommitState,
+        lease: LeaseGuard,
+    ) -> tuple[CommitState, _IdentityPlan]:
+        """Durably reserve every pending table while this commit owns global writer ordering.
+
+        The refill is a distinct WAL transaction, but not a recursive public commit.  The outer
+        commit already owns the participant section, writer lease, COMMIT_SECTION and WAL-tail
+        guard; a private context is materialised directly through the same append/barrier/apply/
+        publish protocol.  Therefore no lifecycle or metric callback can enter between selecting
+        the user commit and completing its metadata prerequisite, and every process observes
+        disjoint ranges in the same order in which ordinary commits are already serialised.
+        """
+        try:
+            floor_plan = None
+            for refresh_attempt in range(2):
+                planned = dict(base.record_ids)
+                leased_positions = set(base.leased_positions)
+                floors: dict[object, int] = {}
+                expected_floors: dict[int, int] = {}
+                cache_ranges: dict[int, tuple[int, int]] = {}
+                existing_positions: dict[int, tuple[int, ...]] = {}
+
+                # The outer commit established a current read view under COMMIT_SECTION.  Repeat
+                # the explicit reuse scan against it; a row may have committed since the user's
+                # older snapshot.
+                self._refuse_reused_identities(
+                    txn, self._reserved_record_ids(txn, base.intents)
+                )
+                for table_id in sorted(pending):
+                    table, positions = pending[table_id]
+                    extent = self._heap.extent_of(table)
+                    explicit = tuple(
+                        position
+                        for position in positions
+                        if base.intents[position].record_id is not None
+                    )
+                    implicit = tuple(
+                        position
+                        for position in positions
+                        if base.intents[position].record_id is None
+                    )
+                    explicit_ids = tuple(
+                        int(base.intents[position].record_id) for position in explicit
+                    )
+                    if extent is None:
+                        cursor = max(
+                            (FIRST_RECORD_ID, *(identity + 1 for identity in explicit_ids))
+                        )
+                        for position in explicit:
+                            identity = int(base.intents[position].record_id)
+                            self._require_unexhausted_identity(
+                                txn, table, table_id, identity
+                            )
+                            planned[position] = identity
+                        for position in implicit:
+                            self._require_unexhausted_identity(
+                                txn, table, table_id, cursor
+                            )
+                            planned[position] = cursor
+                            cursor += 1
+                        # Not leased: the user transaction must create the extent and floor
+                        # atomically through HeapStore.insert.
+                        continue
+
+                    floor = int(extent.next_record_id)
+                    below = tuple(identity for identity in explicit_ids if identity < floor)
+                    if below:
+                        self._raise_explicit_below_identity_floor(
+                            txn, table, table_id, below, floor
+                        )
+                    for position in explicit:
+                        identity = int(base.intents[position].record_id)
+                        self._require_unexhausted_identity(txn, table, table_id, identity)
+                        planned[position] = identity
+
+                    if explicit_ids:
+                        cursor = max(floor, max(explicit_ids) + 1)
+                    else:
+                        cursor = floor
+                    for position in implicit:
+                        self._require_unexhausted_identity(txn, table, table_id, cursor)
+                        planned[position] = cursor
+                        cursor += 1
+
+                    # An implicit-only refill has ``identity_lease_size`` total slots, including
+                    # this batch.  An explicit high-water jump gets that many cache slots beyond
+                    # the batch, preserving the established explicit+implicit behaviour.
+                    if not explicit_ids:
+                        stop = floor + max(self._identity_lease_size, len(implicit))
+                    else:
+                        stop = cursor + self._identity_lease_size
+                    stop = min(stop, MAX_U64)
+                    if stop <= floor:
+                        self._require_unexhausted_identity(txn, table, table_id, floor)
+                    floors[table] = stop
+                    expected_floors[table_id] = floor
+                    cache_ranges[table_id] = (cursor, stop)
+                    existing_positions[table_id] = positions
+
+                if not floors:
+                    return (
+                        previous,
+                        _IdentityPlan(
+                            intents=base.intents,
+                            record_ids=planned,
+                            leased_positions=frozenset(leased_positions),
+                        ),
+                    )
+
+                try:
+                    floor_plan = self._heap.plan_record_id_floors(floors)
+                except GrafxTransactionStateError as stale_floor:
+                    if (
+                        stale_floor.details.get("field") != "next_record_id"
+                        or "old_floor" not in stale_floor.details
+                        or refresh_attempt > 0
+                    ):
+                        raise
+                    # A stale resident frame proposed a floor the detached device page already
+                    # passed.  No range was staged or spent; force a full local re-read while the
+                    # global commit lock prevents the device from moving again, then rebuild.
+                    self._pool.begin_read_view(object())
+                    continue
+                observed_floors = {
+                    advance.table_id: advance.old_floor
+                    for advance in floor_plan.advances
+                }
+                if observed_floors != expected_floors:
+                    if refresh_attempt > 0:
+                        raise GrafxTransactionStateError(
+                            "The resident and durable identity floors still disagree after a "
+                            "locked fresh read; no identity was handed to the user transaction.",
+                            field="next_record_id",
+                            expected_floors=expected_floors,
+                            observed_floors=observed_floors,
+                            txn_id=txn.txn_id,
+                        )
+                    self._pool.begin_read_view(object())
+                    continue
+                break
+            if floor_plan is None:
+                raise GrafxTransactionStateError(
+                    "A locked identity-floor reservation could not establish one stable page "
+                    "zero image.",
+                    field="next_record_id",
+                    txn_id=txn.txn_id,
+                )
+
+            reserved_state, reservation_lsn = self._commit_identity_floor_plan(
+                floor_plan.page_index,
+                floor_plan.image,
+                previous=previous,
+                lease=lease,
+                user_txn_id=txn.txn_id,
+            )
+            self._sync_identity_process()
+            for table_id, positions in existing_positions.items():
+                leased_positions.update(positions)
+                next_id, stop = cache_ranges[table_id]
+                if next_id < stop:
+                    self._identity_leases[table_id] = _IdentityLease(next_id, stop)
+                else:
+                    self._identity_leases.pop(table_id, None)
+            return (
+                reserved_state,
+                _IdentityPlan(
+                    intents=base.intents,
+                    record_ids=planned,
+                    leased_positions=frozenset(leased_positions),
+                    reservation_lsn=reservation_lsn,
+                ),
+            )
+        except BaseException:
+            # Any uncertainty burns every local remainder.  Durable floors are monotone, so this
+            # loses only capacity and never makes an identity reusable.
+            self._identity_leases.clear()
+            raise
+
+    def _commit_identity_floor_plan(
+        self,
+        page_index: PageIndex,
+        image: bytes,
+        *,
+        previous: CommitState,
+        lease: LeaseGuard,
+        user_txn_id: TxnId,
+    ) -> tuple[CommitState, Lsn]:
+        """Commit one detached floor image through WAL before its identities can be used."""
+        reservation = TransactionContext(
+            txn_id=self._next_txn_id,
+            mode=TransactionMode.WRITE,
+            snapshot=Snapshot(previous.last_committed_lsn),
+            epoch=_NO_EPOCH,
+            owner=self,
+            page_staging_capability=self._page_staging_capability,
+        )
+        self._next_txn_id += 1
+        # The context is intentionally not present in ``_open``; use the same unforgeable
+        # capability directly instead of the public-context ownership gate.
+        reservation._stage_page_image(
+            self._heap_file,
+            page_index,
+            image,
+            capability=self._page_staging_capability,
+        )
+        reservation.note_write(page_partition(self._heap_file, page_index))
+
+        # A metadata page is not caller row payload.  The database-wide WAL batch limit still
+        # applies, and the private transaction contains exactly one page plus one COMMIT.
+        self._pool.forget_modified()
+        self._dirty_mark = self._pool.modified_pages()
+        committed: Csn = NO_CSN
+        epoch = lease.epoch
+        try:
+            with self._close_wait_hazard():
+                records, images, materialized_csn = self._build_records(
+                    reservation, epoch
+                )
+            self._validate_wal_batch_budget(reservation, records)
+            with self._close_wait_hazard():
+                planned_csn = self._wal.planned_terminal_lsn(records)
+            if planned_csn != materialized_csn:
+                with self._close_wait_hazard():
+                    records, images = self._retarget_commit_batch(
+                        reservation,
+                        records,
+                        images,
+                        (),
+                        old_csn=materialized_csn,
+                        new_csn=planned_csn,
+                        epoch=epoch,
+                    )
+                self._validate_wal_batch_budget(reservation, records)
+            self._validate_lease(lease)
+            with self._close_wait_hazard():
+                committed = self._wal.append_many(
+                    records,
+                    expected_terminal_lsn=planned_csn,
+                )
+            _require_forward_commit(committed, previous.last_committed_lsn)
+            with self._close_wait_hazard():
+                self._wal.barrier()
+            reservation.bind_epoch(epoch)
+            reservation.mark_committed(committed)
+        except BaseException:
+            if committed > NO_CSN or _wal_is_damaged(self._wal):
+                self._recovery_required = True
+            raise
+
+        self._published_high_water = _larger(self._published_high_water, committed)
+        try:
+            with self._close_wait_hazard():
+                self._apply_images(images)
+            with self._close_wait_hazard():
+                self._publish_commit_state(previous, committed)
+        except BaseException as failure:
+            if isinstance(failure, GrafxError):
+                try:
+                    self._redo_onto_device(previous.last_committed_lsn, committed)
+                    self._publish_commit_state(previous, committed)
+                    recovered = True
+                except BaseException as recovery_failure:
+                    _note_cleanup_failure(failure, recovery_failure)
+                    recovered = False
+            else:
+                recovered = False
+            if not recovered:
+                self._recovery_required = True
+            if not isinstance(failure, Exception):
+                failure.add_note(
+                    f"Identity-floor metadata commit {committed} is durable, but user "
+                    f"transaction {user_txn_id} did not run."
+                )
+                raise
+            refusal = GrafxTransactionStateError(
+                "The identity-floor reservation became durable, but the user transaction did "
+                "not commit. Its reserved range was burned; roll back and restage the user "
+                "transaction after any required recovery.",
+                operation="reserve row identities",
+                metadata_committed=True,
+                user_transaction_committed=False,
+                reservation_csn=committed,
+                recovery_required=self._recovery_required,
+                txn_id=user_txn_id,
+            )
+            refusal.details["retryable"] = False
+            raise refusal from failure
+
+        return (
+            CommitState(
+                last_committed_lsn=committed,
+                last_csn=committed,
+                checkpoint_lsn=previous.checkpoint_lsn,
+            ),
+            committed,
+        )
+
+    def _raise_explicit_below_identity_floor(
+        self,
+        txn: TransactionContext,
+        table: object,
+        table_id: int,
+        identities: tuple[int, ...],
+        floor: int,
+    ) -> None:
+        """Refuse a named id that may belong to any participant's open durable range."""
+        raise GrafxTransactionStateError(
+            "An explicit row identity below the durable identity floor may belong to another "
+            "process's reserved but not-yet-used range.",
+            field="record_id",
+            value=min(identities),
+            explicit_ids=identities,
+            durable_floor=floor,
+            table=getattr(table, "name", None),
+            table_id=table_id,
+            txn_id=txn.txn_id,
+        )
+
+    def _sync_identity_process(self) -> None:
+        """Prove this manager still belongs to the process that created its coordination state."""
+        self._require_process_owner("use cached row identities")
+
+    def _require_process_owner(self, operation: str) -> None:
+        """Fail closed after fork before inherited locks, pins, leases or caches are touched."""
+        current = self._process_identity_provider()
+        if not self._identity_process_invalid and current == self._identity_process:
+            return
+        self._identity_leases.clear()
+        self._identity_process_invalid = True
+        raise GrafxTransactionStateError(
+            "This transaction manager was inherited across a process boundary. Its reader "
+            "registration, writer coordination and identity ranges belong to the creating "
+            "process; open a new database connection in this process.",
+            operation=operation,
+            field="process_identity",
+            creating_process=repr(self._identity_process),
+            current_process=repr(current),
+            inherited_process=True,
+        )
 
     def _reserved_record_ids(
         self, txn: TransactionContext, intents: Sequence[RowIntent]
@@ -3072,8 +3630,6 @@ class TransactionManager:
         touched = {
             (self._heap_file, page_index) for page_index in self._pages_touched_by(rows)
         }
-        if rows:
-            touched.add((self._heap_file, HEADER_PAGE_INDEX))
         # The measured set, and the reason the enumeration above stopped being enough on its own.
         # The attempt may have relinked a page no row of it ever landed on, and it may have
         # dirtied pages before it raised and produced no rows at all -- in which case the
@@ -3220,15 +3776,14 @@ class TransactionManager:
     def _pages_touched_by(self, rows: Sequence[_RowWrite]) -> tuple[PageIndex, ...]:
         """Return every heap page a row write can have changed, in a fixed order.
 
-        The reserved header page is always included: it carries the table directory, and every
-        insert can move the extent hint and the identity counter on it. Including a page that did
-        not change costs one image in the log and changes nothing else; missing one that did
-        would leave a change with no record to redo it, which is the failure the log exists to
-        prevent.
+        Only pages that actually carry a born or ended version are derived here.  Structural
+        writes -- a first extent, tail growth, hint repair, and any real page-zero mutation -- are
+        measured by :meth:`_attempt_pages`, so omitting an unchanged header removes false sharing
+        without hiding a byte that must reach WAL or abandonment.
         """
         if not rows:
             return ()
-        touched = {HEADER_PAGE_INDEX}
+        touched: set[PageIndex] = set()
         for item in rows:
             if item.born is not None:
                 touched.add(item.born.page)
@@ -3498,6 +4053,7 @@ class TransactionManager:
         hold another participant up is proved by the two-process tests, which still run
         concurrently with it in place.
         """
+        self._require_process_owner("enter the transaction participant section")
         defer = getattr(self._metrics, "defer", None)
         deferred = defer() if callable(defer) else nullcontext()
         # Deferral surrounds lock acquisition too: coordinator wait metrics are host callbacks,
@@ -3527,6 +4083,7 @@ class TransactionManager:
         their private manager capability distinguishes a genuine idempotent rollback from a
         caller-built lookalike.
         """
+        self._require_process_owner("use a transaction context")
         if not isinstance(txn, TransactionContext):
             raise GrafxConfigurationError(
                 f"A transaction must be a TransactionContext; got {type(txn).__name__}.",
@@ -3629,6 +4186,17 @@ class TransactionManager:
             f"TransactionManager(partitions_per_table={self._partitions_per_table}, "
             f"open_transactions={len(self._open)})"
         )
+
+
+def _require_positive_int(field: str, value: object) -> int:
+    """Return an exact positive integer for direct manager composition."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise GrafxConfigurationError(
+            f"{field} must be a positive integer; got {value!r}.",
+            field=field,
+            value=repr(value),
+        )
+    return int(value)
 
 
 def _require_optional_positive_limit(field: str, value: int | None) -> int | None:

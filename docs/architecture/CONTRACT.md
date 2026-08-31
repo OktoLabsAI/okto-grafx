@@ -396,6 +396,7 @@ class DatabaseConfig:
     path: str                              # ":memory:" selects MemoryStorageDevice
     page_size: int = 8192
     partitions_per_table: int = 64         # calibrated by FR-15, frozen in calibration.json
+    identity_lease_size: int = 64          # local burn-only slice; not a format field
     buffer_budget_bytes: int = 64 * 1024 * 1024
     max_open_files: int = 256              # local descriptor-cache budget; not a format field
     recovery_policy: str = "replay"        # "replay" (DEFAULT) | "refuse"
@@ -754,6 +755,7 @@ class Snapshot:
 class TransactionManager:
     def __init__(self, wal, pool, heap, catalog, coordinator, clock, metrics, index_manager,
                  *, partitions_per_table: int, commit_lock_timeout: float,
+                 identity_lease_size: int = 64,
                  max_transaction_rows: int | None = None,
                  max_transaction_bytes: int | None = None,
                  max_wal_batch_bytes: int | None = None)
@@ -772,6 +774,15 @@ mark capability: a reconstructed or stale equal tuple is refused, and successful
 handover explicitly settles it. `discard_since(mark)` therefore restores a page that was replaced
 after the mark and an added key that sorts before an older key, without relying on dictionary
 growth or ordering.
+
+Existing heap extents allocate row identities from durable burn-only ranges. A refill is a
+separate private `WRITE_PAGE(heap.dat, 0) + COMMIT` performed under the outer commit's existing
+participant/lease/`COMMIT_SECTION`/WAL-tail ordering; its barrier, page apply and state publication
+complete before a row may use the range. The first OCC precedes cache consumption. The second OCC
+may ignore only that refill's exact COMMIT LSN. Explicit ids below the durable floor are refused;
+ids at or above it require a durable floor advance. A missing extent keeps first-row creation on
+the ordinary atomic insert path. The complete protocol and failure boundaries are frozen in
+`CN1_IDENTITY_RANGE_LEASING.md`.
 
 **Commit protocol (FROZEN — implement exactly):**
 1. read-only txn → settle against the PARTICIPANT reader registration and return
