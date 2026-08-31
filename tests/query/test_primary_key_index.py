@@ -181,6 +181,44 @@ def test_a_deleted_row_is_not_returned_by_a_seek(database) -> None:
     )
 
 
+def test_a_cancelled_pending_insert_does_not_stale_its_primary_key_index(
+    tmp_path: Path,
+) -> None:
+    """CREATE then DELETE in later statements is no table write at commit.
+
+    The transaction keeps both raw intents until its shared reducer cancels them. Index
+    completeness must follow that reduced outcome: treating the raw CREATE as a write while
+    observing no reduced row poisons an otherwise unchanged PK index as stale.
+    """
+    root = tmp_path / "cancelled-pending-insert"
+    keyed_read = "MATCH (p:Person) WHERE p.id = $key RETURN p.name"
+
+    with okto_grafx.connect(root, page_size=512) as live:
+        with live.begin("write") as schema:
+            schema.execute(
+                "CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))"
+            )
+        with live.begin("write") as writer:
+            writer.execute("CREATE (:Person {id: 7, name: 'temporary'})")
+            writer.execute("MATCH (p:Person) WHERE p.id = 7 DELETE p")
+
+        assert not live.indexes.index("pk_Person").stale
+        assert IndexSeek.__name__ in _plan_operators(live, keyed_read, {"key": 7})
+        assert live.execute(keyed_read, {"key": 7}).rows == ()
+        live_verification = live.verify("all")
+        assert live_verification.clean is True
+        assert live_verification.findings == ()
+
+    with okto_grafx.connect(root, page_size=512) as cold:
+        assert cold.stale_indexes == ()
+        assert not cold.indexes.index("pk_Person").stale
+        assert IndexSeek.__name__ in _plan_operators(cold, keyed_read, {"key": 7})
+        assert cold.execute(keyed_read, {"key": 7}).rows == ()
+        cold_verification = cold.verify("all")
+        assert cold_verification.clean is True
+        assert cold_verification.findings == ()
+
+
 def test_an_updated_row_is_found_under_its_new_key_and_not_its_old_one(database) -> None:
     with database.begin("write") as txn:
         txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")

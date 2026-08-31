@@ -113,6 +113,8 @@ from okto_grafx.domain.page import (
     PageType,
 )
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
+from okto_grafx.domain.txn.context import RowIntent
+from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.wal.record import WalRecord
 from okto_grafx.engine.buffer_pool import (
     BufferPool,
@@ -2694,12 +2696,27 @@ class ProximityIndex(IndexStore):
 
 
 def _tables_written_by(txn: object) -> frozenset[int] | None:
-    """Return row-intent table ids, or None when the transaction cannot prove them."""
+    """Return effective row-intent table ids, or None when they cannot be proved.
+
+    Real transactions retain their raw intent history until commit. A pending INSERT followed
+    by its DELETE is therefore present in that history even though the shared reducer correctly
+    makes both disappear before any heap or index work. Deriving table writes from the raw list
+    would call the missing-observation guard below for a mutation that does not exist and poison
+    the unchanged index as stale. Use the same reduced outcome as the heap writer. Lightweight
+    index test doubles predate ``RowIntent`` and deliberately expose only ``.table``; preserve
+    their conservative raw-table evidence instead of inventing reducer fields for them.
+    """
     intents = getattr(txn, "row_intents", None)
     if intents is None:
         return None
+    captured = tuple(intents)
+    effective = (
+        reduce_row_intents(captured)
+        if all(isinstance(intent, RowIntent) for intent in captured)
+        else captured
+    )
     tables: set[int] = set()
-    for intent in intents:
+    for intent in effective:
         table_id = getattr(getattr(intent, "table", None), "table_id", None)
         if not isinstance(table_id, int) or isinstance(table_id, bool):
             return None
