@@ -523,12 +523,10 @@ def assemble_database(
                 )
             )
         )
-        stale = tuple(
-            index.name
-            for index in indexes.open(
-                transactions.published_lsn(), persist_stale=not config.read_only
-            )
+        _registered, stale_indexes = transactions.refresh_index_inventory(
+            persist_stale=not config.read_only
         )
+        stale = tuple(index.name for index in stale_indexes)
     except GrafxError:
         # A47: the class a component chose and the retryable detail it carries are what a caller
         # switches on, so a Grafx failure leaves this guard exactly as it arrived.

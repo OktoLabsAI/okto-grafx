@@ -211,8 +211,9 @@ def test_checkpoint_index_inventory_is_serialized_with_a_post_barrier_commit(
         commit_thread = threading.Thread(target=run_commit, name="latching-commit")
         commit_thread.start()
         try:
-            # IndexManager.open is after TransactionManager.checkpoint returned. Holding the same
-            # participant section here must nevertheless keep commit from reaching its barrier.
+            # IndexManager.open now remains inside TransactionManager's checkpoint fence. The
+            # outer participant section independently keeps this same-handle commit from reaching
+            # its barrier while the public inventory is still being settled.
             assert not commit_done.wait(timeout=0.2)
             # WAL and transaction publication observations now join this same section. Asking
             # for either here would correctly wait behind the paused checkpoint instead of
@@ -232,6 +233,208 @@ def test_checkpoint_index_inventory_is_serialized_with_a_post_barrier_commit(
     finally:
         release_inventory.set()
         database.close()
+
+
+@pytest.mark.parametrize("operation", ("checkpoint", "recover"))
+def test_maintenance_index_inventory_fences_a_foreign_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """Published position and index certificates are one cross-process photograph.
+
+    The old checkpoint/recovery postlude evaluated ``published_lsn()`` before entering
+    ``IndexManager.open``. A foreign commit in that exact gap advanced page 0 beyond the captured
+    number, so the postlude persisted ``INDEX_FLAG_STALE`` on a healthy index. A participant-local
+    section cannot close that gap because the writer below owns a different participant.
+    """
+    root = tmp_path / operation
+    maintainer = connect(str(root))
+    writer = None
+    inventory_entered = threading.Event()
+    release_inventory = threading.Event()
+    maintenance_done = threading.Event()
+    commit_done = threading.Event()
+    maintenance_failures: list[BaseException] = []
+    commit_failures: list[BaseException] = []
+    try:
+        _schema(maintainer)
+        maintainer.checkpoint()
+        writer = connect(str(root))
+        transaction = writer.begin("write")
+        transaction.execute("CREATE (:P {id: 7, name: 'foreign'})")
+
+        original_open = IndexManager.open
+        maintained_indexes = maintainer._indexes
+
+        def pause_stable_inventory(
+            manager: IndexManager,
+            published_lsn: int,
+            *,
+            persist_stale: bool = True,
+            allow_ahead: bool = False,
+        ) -> tuple[object, ...]:
+            if (
+                manager is maintained_indexes
+                and threading.current_thread().name == "stable-maintenance-inventory"
+            ):
+                inventory_entered.set()
+                if not release_inventory.wait(timeout=5.0):
+                    raise AssertionError("the test did not release maintenance inventory")
+            return original_open(
+                manager,
+                published_lsn,
+                persist_stale=persist_stale,
+                allow_ahead=allow_ahead,
+            )
+
+        def run_maintenance() -> None:
+            try:
+                getattr(maintainer, operation)()
+            except BaseException as failure:
+                maintenance_failures.append(failure)
+            finally:
+                maintenance_done.set()
+
+        def run_commit() -> None:
+            try:
+                transaction.commit()
+            except BaseException as failure:
+                commit_failures.append(failure)
+            finally:
+                commit_done.set()
+
+        monkeypatch.setattr(IndexManager, "open", pause_stable_inventory)
+        maintenance_thread = threading.Thread(
+            target=run_maintenance, name="stable-maintenance-inventory"
+        )
+        commit_thread = threading.Thread(target=run_commit, name="foreign-inventory-commit")
+        maintenance_thread.start()
+        assert inventory_entered.wait(timeout=5.0)
+        commit_thread.start()
+        try:
+            assert not commit_done.wait(timeout=0.2), (
+                "a foreign commit crossed the stable index-inventory photograph"
+            )
+        finally:
+            release_inventory.set()
+
+        maintenance_thread.join(timeout=5.0)
+        commit_thread.join(timeout=5.0)
+        assert maintenance_done.is_set() and commit_done.is_set()
+        assert maintenance_failures == []
+        assert commit_failures == []
+        assert maintainer.stale_indexes == ()
+        assert maintainer.indexes.index("pk_P").stale is False
+        assert _people(maintainer) == 1
+        assert maintainer.verify("all").findings == ()
+    finally:
+        release_inventory.set()
+        if writer is not None:
+            writer.close()
+        maintainer.close()
+
+    reopened = connect(str(root))
+    try:
+        assert reopened.stale_indexes == ()
+        assert _people(reopened) == 1
+        assert reopened.verify("all").findings == ()
+    finally:
+        reopened.close()
+
+
+def test_startup_index_inventory_fences_a_foreign_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Connect cannot compare a captured LSN with an index header a writer moves later."""
+    root = tmp_path / "startup"
+    seeded = connect(str(root))
+    try:
+        _schema(seeded)
+        seeded.checkpoint()
+    finally:
+        seeded.close()
+
+    writer = connect(str(root))
+    transaction = writer.begin("write")
+    transaction.execute("CREATE (:P {id: 8, name: 'foreign'})")
+    inventory_entered = threading.Event()
+    release_inventory = threading.Event()
+    connect_done = threading.Event()
+    commit_done = threading.Event()
+    connected: list[object] = []
+    connect_failures: list[BaseException] = []
+    commit_failures: list[BaseException] = []
+    original_open = IndexManager.open
+
+    def pause_startup_inventory(
+        manager: IndexManager,
+        published_lsn: int,
+        *,
+        persist_stale: bool = True,
+        allow_ahead: bool = False,
+    ) -> tuple[object, ...]:
+        if threading.current_thread().name == "stable-startup-inventory":
+            inventory_entered.set()
+            if not release_inventory.wait(timeout=5.0):
+                raise AssertionError("the test did not release startup inventory")
+        return original_open(
+            manager,
+            published_lsn,
+            persist_stale=persist_stale,
+            allow_ahead=allow_ahead,
+        )
+
+    def run_connect() -> None:
+        try:
+            connected.append(connect(str(root)))
+        except BaseException as failure:
+            connect_failures.append(failure)
+        finally:
+            connect_done.set()
+
+    def run_commit() -> None:
+        try:
+            transaction.commit()
+        except BaseException as failure:
+            commit_failures.append(failure)
+        finally:
+            commit_done.set()
+
+    monkeypatch.setattr(IndexManager, "open", pause_startup_inventory)
+    connect_thread = threading.Thread(target=run_connect, name="stable-startup-inventory")
+    commit_thread = threading.Thread(target=run_commit, name="foreign-startup-commit")
+    try:
+        connect_thread.start()
+        assert inventory_entered.wait(timeout=5.0)
+        commit_thread.start()
+        assert not commit_done.wait(timeout=0.2), (
+            "a foreign commit crossed the startup index-inventory photograph"
+        )
+    finally:
+        release_inventory.set()
+        connect_thread.join(timeout=5.0)
+        commit_thread.join(timeout=5.0)
+
+    try:
+        assert connect_done.is_set() and commit_done.is_set()
+        assert connect_failures == []
+        assert commit_failures == []
+        assert len(connected) == 1
+        database = connected[0]
+        assert database.stale_indexes == ()  # type: ignore[attr-defined]
+        assert _people(database) == 1
+        assert database.verify("all").findings == ()  # type: ignore[attr-defined]
+    finally:
+        for database in connected:
+            database.close()  # type: ignore[attr-defined]
+        writer.close()
+
+    reopened = connect(str(root))
+    try:
+        assert reopened.stale_indexes == ()
+        assert _people(reopened) == 1
+        assert reopened.verify("all").findings == ()
+    finally:
+        reopened.close()
 
 
 _OTHER_PROCESS = r'''

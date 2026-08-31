@@ -2276,20 +2276,19 @@ class Database:
         self._recovery_report = public_report
         indexes = self._indexes
         if indexes is not None:
-            # Reacquire after recovery_section released. A concurrent post-barrier failure may
-            # latch this participant in that gap; index open can mark/flush headers, so it must
-            # either finish before that latch or refuse after it, never straddle it.
+            # Reacquire after recovery_section released. The manager's inventory door adds the
+            # cross-process commit section: page_access_section alone protects this participant
+            # but cannot stop a foreign commit from moving an index header between the published
+            # reading and the freshness certificate.
             with self._transactions.page_access_section():
-                registered = indexes.indexes()  # type: ignore[attr-defined]
+                registered, stale = self._transactions.refresh_index_inventory()
                 self._attached_indexes = tuple(
                     _builtin_text(index.name, field="attached_index", empty=False)
                     for index in registered
                 )
                 self._stale_indexes = tuple(
                     _builtin_text(index.name, field="stale_index", empty=False)
-                    for index in indexes.open(  # type: ignore[attr-defined]
-                        self._transactions.published_lsn()
-                    )
+                    for index in stale
                 )
         return public_report
 
@@ -2332,8 +2331,9 @@ class Database:
                 indexes = self._indexes
                 if indexes is not None:
                     # Checkpoint redo may have adopted schema and indexes committed by another
-                    # participant after this handle opened. Keep the public inventory aligned
-                    # with the registry that now serves queries, just as operator recovery does.
+                    # participant after this handle opened. TransactionManager refreshed their
+                    # freshness inside the same cross-process commit section as the checkpoint;
+                    # only copy that stable local result into the public inventory here.
                     registered = indexes.indexes()  # type: ignore[attr-defined]
                     self._attached_indexes = tuple(
                         _builtin_text(index.name, field="attached_index", empty=False)
@@ -2341,9 +2341,8 @@ class Database:
                     )
                     self._stale_indexes = tuple(
                         _builtin_text(index.name, field="stale_index", empty=False)
-                        for index in indexes.open(  # type: ignore[attr-defined]
-                            self._transactions.published_lsn()
-                        )
+                        for index in registered
+                        if index.stale
                     )
             return _recycle_report_view(report)
 

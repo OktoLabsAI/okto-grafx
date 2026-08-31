@@ -1182,7 +1182,42 @@ class TransactionManager:
         checkpoint allow together. A reader still pinned below the checkpoint holds the horizon
         back on its own account; nothing here evicts it.
         """
-        return self._checkpoint(None)[0]
+        manager = self._index_manager
+        transition = None if manager is None else manager.open
+        return self._checkpoint(transition)[0]
+
+    def refresh_index_inventory(
+        self, *, persist_stale: bool = True
+    ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        """Open every index against one cross-process-stable published picture.
+
+        Recovery and startup both finish their own fenced work before the facade can publish
+        its index inventory.  A foreign commit in that gap is harmless only when the published
+        position and every table/header certificate are photographed under the same commit
+        section.  The participant section alone cannot provide that property: it coordinates
+        threads of this handle, not another process.
+
+        This is deliberately a narrow index door rather than a general callback under
+        ``COMMIT_SECTION``.  It changes no normal reader/writer premise and does not repair an
+        index; a real stale verdict remains fail-closed exactly as :meth:`IndexManager.open`
+        defines it.
+        """
+        self._require_not_closed("refresh index inventory")
+        manager = self._index_manager
+        if manager is None:
+            return (), ()
+        with self._participant_section():
+            self._require_not_closed("refresh index inventory")
+            self._require_recovery_complete()
+            with self._coordinator_section(
+                COMMIT_SECTION, timeout=self._commit_lock_timeout
+            ):
+                published = self._published_state_in_section().last_committed_lsn
+                registered = tuple(manager.indexes())
+                stale = tuple(
+                    manager.open(published, persist_stale=persist_stale)
+                )
+        return registered, stale
 
     def checkpoint_and_claim_index_rebuild(self, index: Any, reason: str) -> int:
         """Retire the redo and claim a rebuild generation without leaving the section.
