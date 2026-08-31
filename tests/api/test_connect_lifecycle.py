@@ -137,6 +137,34 @@ def test_close_releases_the_device_the_composition_opened(tmp_path: Path) -> Non
     assert _closed(device) is True
 
 
+def test_reopen_adopts_listed_indexes_without_rechecking_each_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "db"
+    with connect(root) as database:
+        with database.begin("write") as transaction:
+            for number in range(8):
+                transaction.execute(
+                    f"CREATE NODE TABLE T{number}(id INT64, PRIMARY KEY(id))"
+                )
+
+    original_exists = LocalStorageDevice.exists
+    index_exists_calls: list[str] = []
+
+    def counted_exists(device: LocalStorageDevice, file: str) -> bool:
+        if file.startswith("index/"):
+            index_exists_calls.append(file)
+        return original_exists(device, file)
+
+    monkeypatch.setattr(LocalStorageDevice, "exists", counted_exists)
+
+    with connect(root) as reopened:
+        assert len(reopened.indexes.indexes()) >= 8
+
+    assert len(index_exists_calls) == 8
+    assert len(set(index_exists_calls)) == 8
+
+
 def test_close_leaves_a_caller_supplied_registry_alone(tmp_path: Path) -> None:
     # A caller that composed its own adapters may be using them for something else, so the
     # database closes only what the composition root opened.

@@ -32,6 +32,7 @@ def test_defaults_match_the_contract() -> None:
     assert config.page_size == 8192
     assert config.partitions_per_table == 64
     assert config.buffer_budget_bytes == 64 * 1024 * 1024
+    assert config.max_open_files == 256
     assert config.recovery_policy == "replay"
     assert config.lease_ttl_seconds == 5.0
     assert config.lease_timeout_seconds == 10.0
@@ -153,13 +154,25 @@ def test_an_invalid_partition_count_is_rejected(partitions: object) -> None:
 
 @pytest.mark.parametrize(
     "field",
-    ["buffer_budget_bytes", "wal_segment_bytes", "checkpoint_interval_records"],
+    [
+        "buffer_budget_bytes",
+        "max_open_files",
+        "wal_segment_bytes",
+        "checkpoint_interval_records",
+    ],
 )
 @pytest.mark.parametrize("value", [0, -1, "1024", 1024.5, None, True])
 def test_a_non_positive_integer_budget_is_rejected(field: str, value: object) -> None:
     with pytest.raises(GrafxConfigurationError) as raised:
         DatabaseConfig(path=":memory:", **{field: value})
     assert raised.value.details["field"] == field
+
+
+def test_a_positive_open_file_budget_is_canonicalized() -> None:
+    config = DatabaseConfig(path=":memory:", max_open_files=_HostileInt(73))
+
+    assert type(config.max_open_files) is int
+    assert config.max_open_files == 73
 
 
 @pytest.mark.parametrize("value", [0, -1, "1024", 1024.5, True])

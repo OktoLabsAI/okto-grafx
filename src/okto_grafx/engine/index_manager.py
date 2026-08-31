@@ -404,15 +404,21 @@ class IndexStore:
         """Return True when the file of this index has been created."""
         return self._pool.storage.exists(self.file)
 
-    def is_created(self) -> bool:
+    def is_created(self, *, proved_present: bool = False) -> bool:
         """Return True when page 0 of the file really is the header page of THIS index.
 
         A file that a redo grew before anything reserved page 0 exists, has pages, and is not
         created (amendment A22); saying so here is what lets :meth:`create` repair it instead of
         refusing it for good.
+
+        ``proved_present`` carries an exact entry from the composition root's immediately
+        preceding ``list_files('index/')``. It skips only the duplicate name lookup; page count,
+        header identity, definition digest and every corruption refusal remain mandatory.
         """
         storage = self._pool.storage
-        if not storage.exists(self.file) or storage.page_count(self.file) == 0:
+        if (not proved_present and not storage.exists(self.file)) or storage.page_count(
+            self.file
+        ) == 0:
             return False
         with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
             if page.is_pristine():
@@ -425,18 +431,21 @@ class IndexStore:
             self._require_file_header(page)
         return True
 
-    def create(self) -> IndexHeader:
+    def create(self, *, proved_present: bool = False) -> IndexHeader:
         """Create the file of this index, or open the one that is already there.
 
         Creating is safe to run on every open: an index whose file already carries this
         definition is opened rather than replaced, because G6 forbids a sanctioned operation
         destroying what is under ``index/``.
+
+        A true ``proved_present`` is the same short-lived directory proof accepted by
+        :meth:`is_created`; it never turns a missing/torn structure into a created one.
         """
         storage = self._pool.storage
-        if not storage.exists(self.file):
+        if not proved_present and not storage.exists(self.file):
             storage.create(self.file)
-        if self.is_created():
-            return self.open()
+        if self.is_created(proved_present=proved_present):
+            return self.open(proved_present=proved_present)
         self._reserve_header_page()
         self._grow_buckets()
         header = self.open()
@@ -507,14 +516,14 @@ class IndexStore:
                     page.page_type = self.page_type
                     page.dirty = True
 
-    def open(self) -> IndexHeader:
+    def open(self, *, proved_present: bool = False) -> IndexHeader:
         """Return the header of this index file, refusing a file that is not its own.
 
         A digest that disagrees is NOT staleness and must not be repaired by rebuilding: a file
         written under a different definition answers a different question, and the honest reply
         is to refuse to open it.
         """
-        header = self._read_header()
+        header = self._read_header(proved_present=proved_present)
         definition = self._definition
         if header.digest != definition.digest():
             raise GrafxIndexError(
@@ -580,10 +589,12 @@ class IndexStore:
             )
         return header
 
-    def _read_header(self) -> IndexHeader:
+    def _read_header(self, *, proved_present: bool = False) -> IndexHeader:
         """Return the index header stored in slot 1 of the reserved header page."""
         storage = self._pool.storage
-        if not storage.exists(self.file) or storage.page_count(self.file) == 0:
+        if (not proved_present and not storage.exists(self.file)) or storage.page_count(
+            self.file
+        ) == 0:
             raise GrafxIndexError(
                 f"Index {self.name!r} has no file yet; create it before using it.",
                 field="file",
@@ -2747,6 +2758,7 @@ class IndexManager:
         complete_through: Lsn | None = None,
         existing_only: bool = False,
         persist_stale: bool = True,
+        proved_present: bool = False,
     ) -> IndexStore:
         """Register an index, optionally requiring a complete existing file, and check freshness.
 
@@ -2758,6 +2770,10 @@ class IndexManager:
         advance after the check is a no-op and the index stays stale for ever. That is what
         happened: every table declared in a session after the first got an index that was marked
         stale on the spot and that no amount of loading could lift.
+
+        ``proved_present`` is an internal startup optimization: the composition root already
+        proved this exact logical file in one index-directory listing. It suppresses repeated
+        existence walks only; opening and validating the persisted structure is unchanged.
         """
         if not isinstance(index, IndexStore):
             raise GrafxIndexError(
@@ -2789,7 +2805,9 @@ class IndexManager:
             # repair a zero-length/torn one as a side effect of opening the database. ``create``
             # deliberately repairs that shape, so the strict route proves the structure first
             # and then calls the read-only ``open`` door directly.
-            if not index.exists() or not index.is_created():
+            if (not proved_present and not index.exists()) or not index.is_created(
+                proved_present=proved_present
+            ):
                 raise GrafxIndexError(
                     f"Index {index.name!r} has no complete existing file to register without "
                     "creating or repairing one.",
@@ -2797,9 +2815,9 @@ class IndexManager:
                     file=index.file,
                     index=index.name,
                 )
-            index.open()
+            index.open(proved_present=proved_present)
         else:
-            index.create()
+            index.create(proved_present=proved_present)
         self._indexes[key] = index
         if complete_through is not None:
             index.advance_built_through(complete_through)

@@ -25,7 +25,7 @@ honestly, ceilings included.
 | OS / filesystem | Windows 11 Home (10.0.26200) / NTFS |
 | Python | 3.13.1 |
 | Build | `[accel]` installed — native CRC-32C (`google-crc32c`), numpy 2.5.1 present |
-| Configuration | `connect()` defaults: `page_size=8192`, `buffer_budget_bytes=64 MiB`, `partitions_per_table=64`, `metrics="noop"`, `checksum="auto"` (→ native) |
+| Configuration | `connect()` defaults: `page_size=8192`, `buffer_budget_bytes=64 MiB`, `max_open_files=256`, `partitions_per_table=64`, `metrics="noop"`, `checksum="auto"` (→ native) |
 
 Cross-platform rows in §5 additionally used Ubuntu (WSL2, ext4) on the same hardware.
 

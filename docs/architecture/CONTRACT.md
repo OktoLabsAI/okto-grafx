@@ -396,6 +396,7 @@ class DatabaseConfig:
     page_size: int = 8192
     partitions_per_table: int = 64         # calibrated by FR-15, frozen in calibration.json
     buffer_budget_bytes: int = 64 * 1024 * 1024
+    max_open_files: int = 256              # local descriptor-cache budget; not a format field
     recovery_policy: str = "replay"        # "replay" (DEFAULT) | "refuse"
     lease_ttl_seconds: float = 5.0
     lease_timeout_seconds: float = 10.0

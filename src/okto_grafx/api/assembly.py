@@ -379,19 +379,22 @@ def assemble_database(
         catalog_loaded = False
 
         def sync_indexes(*, existing_only: bool) -> tuple[str, ...]:
-            """Adopt every index the current catalog declares, idempotently."""
+            """Adopt every declared index from one proved directory inventory."""
+            existing_files = frozenset(storage.list_files("index/"))
             newly_attached = _attach_primary_key_indexes(
                 catalog,
                 indexes,
                 pool,
                 metrics,
                 existing_only=existing_only,
+                existing_files=existing_files,
             )
             newly_attached += _attach_declared_vector_indexes(
                 catalog,
                 vectors,
                 storage=storage,
                 existing_only=existing_only,
+                existing_files=existing_files,
             )
             for name in newly_attached:
                 if name not in attached_names:
@@ -609,6 +612,7 @@ def _attach_primary_key_indexes(
     metrics: MetricsSink,
     *,
     existing_only: bool = False,
+    existing_files: frozenset[str] | None = None,
 ) -> tuple[str, ...]:
     """Register the primary-key index of every table the catalog holds, and name them.
 
@@ -632,13 +636,21 @@ def _attach_primary_key_indexes(
             for endpoint in relationship_endpoint_indexes(table, pool, metrics):
                 if endpoint.name.lower() in known:
                     continue
-                if existing_only and not pool.storage.exists(endpoint.file):
+                proved_present = (
+                    existing_files is not None and endpoint.file in existing_files
+                )
+                if existing_only and (
+                    not proved_present
+                    if existing_files is not None
+                    else not pool.storage.exists(endpoint.file)
+                ):
                     continue
                 attached.append(
                     indexes.register(
                         endpoint,
                         existing_only=existing_only,
                         persist_stale=not existing_only,
+                        proved_present=proved_present,
                     ).name
                 )
                 known.add(endpoint.name.lower())
@@ -647,13 +659,19 @@ def _attach_primary_key_indexes(
                 continue
             if index.name.lower() in known:
                 continue
-            if existing_only and not pool.storage.exists(index.file):
+            proved_present = existing_files is not None and index.file in existing_files
+            if existing_only and (
+                not proved_present
+                if existing_files is not None
+                else not pool.storage.exists(index.file)
+            ):
                 continue
             attached.append(
                 indexes.register(
                     index,
                     existing_only=existing_only,
                     persist_stale=not existing_only,
+                    proved_present=proved_present,
                 ).name
             )
             known.add(index.name.lower())
@@ -674,6 +692,7 @@ def _attach_declared_vector_indexes(
     *,
     storage: StorageDevice | None = None,
     existing_only: bool = False,
+    existing_files: frozenset[str] | None = None,
 ) -> tuple[str, ...]:
     """Attach the index of every vector column the catalog declares, and name what was attached.
 
@@ -699,8 +718,12 @@ def _attach_declared_vector_indexes(
             name = f"vector_{table.name}_{space}"
             if name.lower() in known:
                 continue
+            file = index_file(name)
+            proved_present = existing_files is not None and file in existing_files
             if existing_only and (
-                storage is None or not storage.exists(index_file(name))
+                not proved_present
+                if existing_files is not None
+                else storage is None or not storage.exists(file)
             ):
                 continue
             try:
@@ -710,6 +733,7 @@ def _attach_declared_vector_indexes(
                         space,
                         existing_only=existing_only,
                         persist_stale=not existing_only,
+                        proved_present=proved_present,
                     ).name
                 )
                 known.add(name.lower())
