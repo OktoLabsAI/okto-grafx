@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import platform
 import shutil
@@ -121,6 +122,7 @@ regime, seconds = sys.argv[5], float(sys.argv[6])
 rows_per_txn, txns = int(sys.argv[7]), int(sys.argv[8])
 rate_text, warmup = sys.argv[9], float(sys.argv[10])
 reopen_on_stale, out = sys.argv[11] == "1", sys.argv[12]
+metrics_out = sys.argv[13]
 # "" = unpaced (flat out). "0" = COMMANDED IDLE, the zero of the 6.5 curve. ">0" = paced.
 rate = None if rate_text == "" else float(rate_text)
 
@@ -131,7 +133,7 @@ rate = None if rate_text == "" else float(rate_text)
 DURABLE_FIELD = "index_view_unavailable"
 
 rnd = random.Random(seed * 7919 + slot)
-db = connect(root)
+db = connect(root, metrics="json", metrics_destination=metrics_out)
 base = slot * 1_000_000
 # Disjoint: this writer owns its own tables. Hot: every writer hammers the shared pair. Keys
 # stay disjoint per writer either way, so a conflict measures the protocol, not a duplicate key.
@@ -318,6 +320,10 @@ try:
         snapshot, default=lambda item: getattr(item, "__dict__", str(item))))
 except BaseException as failure:
     metrics_error = "%s: %s" % (type(failure).__name__, repr(failure)[:200])
+try:
+    db.publish_metrics()
+except BaseException as failure:
+    metrics_error = (metrics_error or "") + " publish: %s" % repr(failure)[:120]
 db.close()
 
 pathlib.Path(out).write_text(json.dumps({
@@ -334,6 +340,7 @@ pathlib.Path(out).write_text(json.dumps({
     "expected_superseded": expected_superseded,
     "expected_edges": expected_edges,
     "metrics": metrics, "metrics_error": metrics_error,
+    "metrics_document": metrics_out,
 }, sort_keys=True), encoding="utf-8")
 '''
 
@@ -348,11 +355,12 @@ from okto_grafx.domain.errors import GrafxError
 root, slot, seed = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 shape, seconds, tables_json = sys.argv[5], float(sys.argv[6]), sys.argv[7]
 edges_json, warmup, out = sys.argv[8], float(sys.argv[9]), sys.argv[10]
+metrics_out = sys.argv[11]
 tables = json.loads(tables_json)
 edges = json.loads(edges_json)
 rnd = random.Random(seed * 104729 + slot)
 
-db = connect(root)
+db = connect(root, metrics="json", metrics_destination=metrics_out)
 latency_ms = []
 torn = []
 escapes = []      # ILLEGAL: anything that is not a Grafx refusal. Any entry fails the case.
@@ -461,6 +469,10 @@ try:
         snapshot, default=lambda item: getattr(item, "__dict__", str(item))))
 except BaseException as failure:
     metrics_error = "%s: %s" % (type(failure).__name__, repr(failure)[:200])
+try:
+    db.publish_metrics()
+except BaseException as failure:
+    metrics_error = (metrics_error or "") + " publish: %s" % repr(failure)[:120]
 db.close()
 
 pathlib.Path(out).write_text(json.dumps({
@@ -469,6 +481,7 @@ pathlib.Path(out).write_text(json.dumps({
     "elapsed_seconds": elapsed, "escapes": escapes, "refusals": refusals,
     "long_scans": long_scans, "warmup_seconds": warmup,
     "metrics": metrics, "metrics_error": metrics_error,
+    "metrics_document": metrics_out,
 }, sort_keys=True), encoding="utf-8")
 '''
 
@@ -703,6 +716,33 @@ def collect(processes: list[tuple[str, subprocess.Popen]]) -> list[dict]:
     return failures
 
 
+def read_metrics_document(where: str | None) -> dict | None:
+    """Return the product's own metrics document for one process, if it wrote one.
+
+    The JSON sink APPENDS one document per publication, so the file is JSON Lines rather than
+    a single object. Parsing the whole file as one document fails and would silently look
+    exactly like a process that emitted nothing -- which is how a real capture becomes an
+    absent one in the report.
+    """
+    if not where:
+        return None
+    target = pathlib.Path(where)
+    if not target.is_file():
+        return None
+    documents = []
+    try:
+        for line in target.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                documents.append(json.loads(line))
+    except (OSError, json.JSONDecodeError) as failure:
+        return {"unreadable": f"{type(failure).__name__}: {failure}",
+                "path": str(target), "bytes": target.stat().st_size}
+    if not documents:
+        return None
+    # The last publication is the end-of-run state; the count says how many there were.
+    return {"publications": len(documents), "final": documents[-1]}
+
+
 def gather_metrics(reports: list[dict]) -> dict:
     """Fold what the product actually emitted; name what it does not, with the reason.
 
@@ -714,7 +754,8 @@ def gather_metrics(reports: list[dict]) -> dict:
                "error": report["metrics_error"]}
               for report in reports if report.get("metrics_error")]
     per_process = [{"role": report.get("role"), "slot": report.get("slot"),
-                    "metrics": report["metrics"]}
+                    "metrics": report["metrics"],
+                    "document": read_metrics_document(report.get("metrics_document"))}
                    for report in reports if report.get("metrics")]
     return {
         "captured": {
@@ -941,11 +982,31 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
     # measurement -- and directory listing is one of the things being measured.
     root = container / "db"
     reports_dir = container / "reports"
-    root.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
+    board_manifest = None
+    if opts.board_template:
+        # Section 6, imported by 6.5: the official run works on a RELOCATED COPY of a real
+        # board, never on the original. The copy is hashed so it can be proven identical.
+        template = pathlib.Path(opts.board_template).resolve()
+        refuse_a_certified_board(template)
+        refuse_a_certified_board(container)
+        shutil.copytree(template, root)
+        board_manifest = {
+            "template": str(template),
+            "files": len(hash_board(root)),
+            "sha256_by_file": hash_board(root),
+            "identical_to_template": hash_board(root) == hash_board(template),
+        }
+    else:
+        root.mkdir(parents=True, exist_ok=True)
     processes: list[tuple[str, subprocess.Popen]] = []
     criteria: list[dict] = []
+    done_path = reports_dir / "auditor-done.flag"
     identity = {
+        "official": bool(opts.board_template),
+        "not_official_because": None if opts.board_template else
+        "synthetic board: section 6 requires an official run to start from a relocated copy "
+        "of a real board (--board-template). This cell proves the instrument, not a result.",
         "writers": writers, "readers": readers, "regime": regime, "reader_shape": shape,
         "reader_target": reader_target,
         "foreign_commit_rate": rate,
@@ -974,7 +1035,6 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
         # whole run. Without it, "live" and "cold" would both be fresh opens after everybody
         # closed -- two names for the same measurement.
         ready_path = reports_dir / "auditor-ready.json"
-        done_path = reports_dir / "auditor-done.flag"
         auditor_report = reports_dir / "auditor.json"
         auditor = spawn(AUDITOR_CHILD, [
             opts.src, str(root), json.dumps(tables + [QUIET_TABLE]),
@@ -994,15 +1054,21 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
         # Stamped immediately before the FIRST writer is spawned. Comparing the auditor's open
         # against the end of the run would only prove it opened before the end, which every
         # post-hoc reopen also satisfies.
+        # The writers have to be present for the WHOLE window the readers are measured over.
+        # With shape=long the reader runs for long_reader_seconds, so writers bounded by
+        # --seconds would leave the tail of the official cell with no foreign traffic.
+        writer_seconds = (max(opts.seconds, opts.long_reader_seconds)
+                          if (readers and shape == "long") else opts.seconds)
         writers_started_at = time.time()
         for slot in range(1, writers + 1):
             processes.append((f"writer-{slot}", spawn(WRITER_CHILD, [
                 opts.src, str(root), str(slot), str(opts.seed), regime,
-                str(opts.seconds), str(opts.rows_per_txn), str(opts.txns_per_writer),
+                str(writer_seconds), str(opts.rows_per_txn), str(opts.txns_per_writer),
                 "" if rate is None else str(per_writer_rate(rate, writers)),
                 str(opts.warmup_seconds),
                 "1" if opts.reopen_on_stale_index else "0",
                 str(reports_dir / f"writer-{slot}.json"),
+                str(reports_dir / f"metrics-writer-{slot}.json"),
             ])))
         for slot in range(1, readers + 1):
             duration = opts.long_reader_seconds if shape == "long" else opts.seconds
@@ -1010,6 +1076,7 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
                 opts.src, str(root), str(slot), str(opts.seed), shape, str(duration),
                 json.dumps(read_tables), json.dumps(read_edges), str(opts.warmup_seconds),
                 str(reports_dir / f"reader-{slot}.json"),
+                str(reports_dir / f"metrics-reader-{slot}.json"),
             ])))
 
         # Reap the writers and readers first; the auditor is still holding its handle open.
@@ -1126,6 +1193,7 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
                 for report in reader_reports
             },
             "tables": {"written": tables, "read": read_tables, "quiet": QUIET_TABLE},
+            "board": board_manifest or {"synthetic": True},
             "layout": {
                 "database_root": str(root),
                 "reports_root": str(reports_dir),
@@ -1146,6 +1214,16 @@ def run_case(opts: argparse.Namespace, writers: int, readers: int, regime: str, 
             "pass": all(item["pass"] for item in criteria),
         }
     finally:
+        # Release the auditor BEFORE reaping. On the exception path it is still blocked on a
+        # done flag nobody wrote, and collect() would sit on it for the full child timeout.
+        try:
+            if not done_path.exists():
+                done_path.write_text("aborted", encoding="utf-8")
+        except BaseException:
+            pass
+        for _label, process in processes:
+            if process.poll() is None:
+                process.terminate()
         collect(processes)
         shutil.rmtree(container, ignore_errors=True)
 
@@ -1172,6 +1250,68 @@ def describe_repository(where: pathlib.Path) -> dict:
         "git_status_porcelain": status.stdout.splitlines() if status.returncode == 0 else None,
         "src_tests_clean": product.returncode == 0 and not product.stdout.strip(),
     }
+
+
+# Section 6 preconditions, imported by 6.5. A certified board is EVIDENCE: opening one can
+# replay its WAL and destroy the very state it certifies, so the instrument refuses by name
+# rather than trusting the operator to remember.
+FORBIDDEN_BOARD_MARKERS = ("m7-cert-", "m7-gate-")
+
+
+def refuse_a_certified_board(where: pathlib.Path) -> None:
+    """Refuse any path that names a certification or gate board, at any depth."""
+    parts = [part.lower() for part in pathlib.Path(where).resolve().parts]
+    for marker in FORBIDDEN_BOARD_MARKERS:
+        if any(part.startswith(marker) for part in parts):
+            raise SystemExit(
+                f"REFUSED: {where} lies under a '{marker}*' board. Those are forensic "
+                "evidence: opening one replays its WAL and destroys what it certifies. "
+                "Copy it elsewhere first and point --board-template at the copy."
+            )
+
+
+def hash_board(where: pathlib.Path) -> dict:
+    """Return a per-file sha256 manifest of a board, so a copy can be proven identical."""
+    manifest = {}
+    for item in sorted(pathlib.Path(where).rglob("*")):
+        if item.is_file():
+            digest = hashlib.sha256(item.read_bytes()).hexdigest()
+            manifest[str(item.relative_to(where)).replace("\\", "/")] = digest
+    return manifest
+
+
+def machine_evidence() -> dict:
+    """H5: what the machine was doing, not merely the operator's word that it was idle.
+
+    Anything this cannot observe is recorded as unavailable with its reason. A load figure
+    invented for the report would be worse than an absent one.
+    """
+    evidence: dict[str, object] = {"cpu_count": os.cpu_count()}
+    try:
+        evidence["load_average_1m"] = os.getloadavg()[0]
+    except (AttributeError, OSError) as absent:
+        evidence["load_average_1m"] = {
+            "unavailable": f"os.getloadavg is not available on this platform ({absent})"
+        }
+    try:
+        if sys.platform == "win32":
+            listed = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq python.exe", "/NH", "/FO", "CSV"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            running = [line for line in listed.stdout.splitlines()
+                       if line.strip().startswith('"python.exe"')]
+        else:
+            listed = subprocess.run(["pgrep", "-c", "python"], capture_output=True,
+                                    text=True, timeout=30, check=False)
+            running = [listed.stdout.strip()]
+        evidence["python_processes"] = (len(running) if sys.platform == "win32"
+                                        else int(running[0] or 0))
+    except BaseException as failure:
+        evidence["python_processes"] = {
+            "unavailable": f"could not enumerate processes: {type(failure).__name__}"
+        }
+    return evidence
 
 
 def provenance(opts: argparse.Namespace) -> dict:
@@ -1204,6 +1344,8 @@ def provenance(opts: argparse.Namespace) -> dict:
         "source_root": opts.src,
         "system": platform.platform(),
         "machine_idle_asserted": bool(opts.machine_idle_asserted),
+        # The boolean is the operator's word. These are the observations that can contradict it.
+        "machine_before": machine_evidence(),
     }
 
 
@@ -1275,6 +1417,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="also write the report to this path")
     parser.add_argument("--workspace", default=None,
                         help="directory to build the databases in (default: a temp dir)")
+    parser.add_argument("--board-template", default=None,
+                        help="directory holding a real board to copy into the workspace. "
+                             "Section 6 (imported by 6.5) requires an OFFICIAL run to work "
+                             "on a relocated COPY, never the original, and the copy is "
+                             "hashed file by file so it can be proven identical. Without "
+                             "this the run builds a synthetic board and every cell is "
+                             "labelled official=false. Any path under an m7-cert-* or "
+                             "m7-gate-* board is REFUSED: those are forensic evidence and "
+                             "opening one replays its WAL over the state it certifies")
     parser.add_argument("--machine-idle-asserted", action="store_true",
                         help="operator asserts the machine was idle; recorded in provenance")
     parser.add_argument("--reopen-on-stale-index", action="store_true",
@@ -1359,6 +1510,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--foreign-commit-rate must not be negative")
     if not pathlib.Path(opts.src).is_dir():
         parser.error(f"--src is not a directory: {opts.src}")
+    if opts.board_template:
+        template = pathlib.Path(opts.board_template)
+        if not template.is_dir():
+            parser.error(f"--board-template is not a directory: {opts.board_template}")
+        refuse_a_certified_board(template)
+    if opts.workspace:
+        refuse_a_certified_board(pathlib.Path(opts.workspace))
 
     cells = select_cells(opts)
     report = {
@@ -1376,6 +1534,9 @@ def main(argv: list[str] | None = None) -> int:
         },
         "parameterised_gaps": {
             "seconds": opts.seconds,
+            "note_writers_follow_the_long_reader": "with reader shape 'long' the writers run "
+            "max(seconds, long_reader_seconds) so the foreign load covers the whole measured "
+            "window rather than stopping partway through it",
             "long_reader_seconds": opts.long_reader_seconds,
             "rows_per_txn": opts.rows_per_txn,
             "txns_per_writer": opts.txns_per_writer,
@@ -1387,8 +1548,10 @@ def main(argv: list[str] | None = None) -> int:
             "F5": "Ladybug capacity comparison",
         },
         "case": opts.case,
+        "official": bool(opts.board_template),
         "cells": [run_case(opts, *cell) for cell in cells],
     }
+    report["machine_after"] = machine_evidence()
     report["pass"] = bool(report["cells"]) and all(cell["pass"] for cell in report["cells"])
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if opts.json_out:

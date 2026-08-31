@@ -459,6 +459,70 @@ def test_the_cleanliness_check_sees_a_real_change_from_inside_the_source_directo
     assert from_src["commit"] == from_top["commit"]
 
 
+def test_a_certification_board_is_refused_by_name_at_any_depth(tmp_path: Path) -> None:
+    """Those boards are forensic evidence: opening one replays its WAL over what it certifies.
+
+    The refusal is fail-closed and by name, because the alternative is trusting whoever runs
+    the tool to remember which directory they pointed at.
+    """
+    from tools.measure_multiclient_matrix import refuse_a_certified_board
+
+    for forbidden in ("m7-cert-2026", "m7-gate-run3"):
+        board = tmp_path / forbidden / "db"
+        board.mkdir(parents=True)
+        with pytest.raises(SystemExit) as refused:
+            refuse_a_certified_board(board)
+        assert "forensic evidence" in str(refused.value)
+
+    innocent = tmp_path / "m7-something-else" / "db"
+    innocent.mkdir(parents=True)
+    refuse_a_certified_board(innocent)
+
+
+@pytest.mark.parametrize("option", ["--board-template", "--workspace"])
+def test_the_cli_refuses_a_certification_board_before_spawning_anything(
+    option: str, tmp_path: Path
+) -> None:
+    board = tmp_path / "m7-cert-abc"
+    board.mkdir()
+
+    with pytest.raises(SystemExit) as refused:
+        main(["--src", str(SOURCE_ROOT), option, str(board)])
+
+    # SystemExit(2) is argparse's usage error; this must be the named refusal instead.
+    assert "forensic evidence" in str(refused.value)
+
+
+def test_a_synthetic_run_is_labelled_not_official(tmp_path: Path) -> None:
+    """A smoke on a synthetic board must never be mistaken for the section 6 official run."""
+    from tools.measure_multiclient_matrix import run_case
+
+    opts = build_parser().parse_args(["--src", str(SOURCE_ROOT)])
+    assert opts.board_template is None
+
+    # The labelling is decided before any process runs, so a bootstrap failure still carries it.
+    opts.workspace = str(tmp_path)
+    opts.src = str(tmp_path / "no-such-source")
+    cell = run_case(opts, 1, 1, "disjoint", "autocommit", "same-table", 1.0)
+
+    assert cell["official"] is False
+    assert "relocated copy" in cell["not_official_because"]
+    assert cell["pass"] is False
+
+
+def test_the_machine_evidence_reports_what_it_cannot_observe(tmp_path: Path) -> None:
+    """H5 wants the machine's state, and an invented load figure is worse than an absent one."""
+    from tools.measure_multiclient_matrix import machine_evidence
+
+    evidence = machine_evidence()
+
+    assert isinstance(evidence["cpu_count"], int)
+    for key in ("load_average_1m", "python_processes"):
+        value = evidence[key]
+        # Either a real number, or a dict saying plainly that it could not be observed.
+        assert isinstance(value, (int, float)) or "unavailable" in value
+
+
 def test_a_source_root_that_is_not_a_directory_is_refused(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as refused:
         main(["--src", str(tmp_path / "absent")])
@@ -532,10 +596,34 @@ def test_one_real_two_process_cell_runs_and_certifies_the_database(tmp_path: Pat
                  if item["name"] == "create_edge_effect_stored")
     assert edges["observed"]["expected"] > 0, "the smoke never exercised create_edge"
 
-    # Per-process metrics, not one process standing in for the rest.
+    # Per-process metrics, not one process standing in for the rest -- and NOT EMPTY. With
+    # the default noop sink every snapshot came back with entries=(), so the report counted
+    # snapshots that held nothing at all.
     captured = cell["metrics"]["captured"]
     assert captured["per_process_snapshots"] >= 2
     assert {entry["role"] for entry in captured["by_process"]} == {"writer", "reader"}
+    assert cell["metrics"]["capture_errors"] is None
+    rendered = json.dumps(captured["by_process"])
+    assert "oktografx_" in rendered, "no product metric was actually captured"
+    for entry in captured["by_process"]:
+        # The product's OWN machine-readable document, per process. A repr string would not
+        # be a counter anyone could compare across processes, and None would mean the sink
+        # was still the noop one.
+        document = entry["document"]
+        assert document is not None, f"{entry['role']}-{entry['slot']} published nothing"
+        assert "unreadable" not in document, document
+        assert document["publications"] >= 1
+        assert document["final"]["metrics"], "the published document carried no metrics"
+
+    # This run was a smoke on a synthetic board, and says so.
+    assert cell["official"] is False
+    assert cell["board"] == {"synthetic": True}
+    assert report["official"] is False
+
+    # H5: the machine was observed at both ends, not merely asserted about.
+    assert "machine_before" in report["provenance"]
+    assert "machine_after" in report
+    assert report["provenance"]["machine_idle_asserted"] is False
 
     # Provenance a later reader can check, and the declared gaps beside the frozen defaults.
     provenance = report["provenance"]
