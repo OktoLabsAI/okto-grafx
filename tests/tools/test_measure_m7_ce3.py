@@ -1557,6 +1557,13 @@ def test_hook_gate_does_not_require_an_event_impossible_for_every_operation() ->
     assert ce3._scenario_shortfalls(result) == []
 
 
+def test_hook_gate_is_stable_across_sorted_json_object_keys() -> None:
+    result = _scenario_result("instrumented", ce3.SCENARIOS[0])
+    round_tripped = json.loads(json.dumps(result, sort_keys=True))
+
+    assert ce3._scenario_shortfalls(round_tripped) == []
+
+
 @pytest.mark.parametrize("field", ["id", "relation", "table", "target_rate_per_second"])
 @pytest.mark.parametrize("location", ["result", "process_b"])
 def test_every_scenario_coordinate_is_bound_to_the_canonical_id(

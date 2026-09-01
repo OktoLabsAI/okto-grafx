@@ -2604,8 +2604,12 @@ def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
             ):
                 per_operation_complete = False
                 continue
-            call_keys = list(calls)
-            if observed != call_keys or set(inclusive) != set(calls) or not calls:
+            canonical_observed = [hook for hook in REQUIRED_HOOKS if hook in calls]
+            if (
+                observed != canonical_observed
+                or set(inclusive) != set(calls)
+                or not calls
+            ):
                 per_operation_complete = False
             if any(
                 hook not in REQUIRED_HOOKS
