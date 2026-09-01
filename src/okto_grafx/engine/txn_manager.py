@@ -96,7 +96,7 @@ from okto_grafx.domain.page.layout import MAX_U64
 from okto_grafx.domain.recovery.decision import CommittedReplay, committed_replay
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
 from okto_grafx.domain.model.schema import ENDPOINT_COLUMN_COUNT, encode_tuple
-from okto_grafx.domain.page import Page
+from okto_grafx.domain.page import HEADER_PAGE_INDEX, Page
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.txn.commit_record import CommitPayload, FileIdMap, PageTouch
 from okto_grafx.domain.txn.commit_state import CommitState
@@ -704,6 +704,11 @@ class TransactionManager:
         previous publication is still retained, ends at the current COMMIT, contains only record
         kinds this build can classify, and fits all three internal work budgets.  No commit,
         checkpoint, recovery or WAL-format rule is weakened by this fast path.
+
+        Every supported mutation of an existing index header that has no logical index record is
+        currently co-published with a heap ``WRITE_PAGE`` (sparse and missing observations are the
+        concrete cases).  A future path that can move such a header without a heap write must add
+        its physical target here or make this proof decline to the full refresh.
         """
 
         if (
@@ -749,6 +754,7 @@ class TransactionManager:
 
             pages: set[tuple[str, PageIndex]] = set()
             files: set[str] = set()
+            heap_changed = False
             for record in replay.effects:
                 if record.record_type == int(WalRecordType.WRITE_PAGE):
                     write = decode_page_write(record.payload)
@@ -759,6 +765,7 @@ class TransactionManager:
                     ):
                         return None
                     pages.add((write.file, write.page_index))
+                    heap_changed = heap_changed or write.file == self._heap_file
                     continue
                 if record.record_type not in (
                     int(WalRecordType.INDEX_WRITE),
@@ -777,6 +784,37 @@ class TransactionManager:
                 ):
                     return None
                 files.add(index_file)
+
+            if heap_changed:
+                # A sparse index observation intentionally emits no INDEX_WRITE: there is no
+                # entry to replay.  Its live apply still advances the index coverage certificate,
+                # which changes page 0.  The WAL delta therefore has to name that implicit
+                # physical effect or a later participant can retain an older clean header until
+                # its own post-barrier flush discovers the page-0 CAS conflict.  Do not infer the
+                # affected tables from caller-declared logical partitions -- that set is an OCC
+                # interest, not a complete row-intent certificate.  One header per registered
+                # index is the bounded conservative proof; explicit index records above still
+                # dominate it by targeting their whole file.
+                manager = self._index_manager
+                if manager is not None:
+                    indexes_of = getattr(manager, "indexes", None)
+                    if not callable(indexes_of):
+                        return None
+                    indexes = indexes_of()
+                    if (
+                        not isinstance(indexes, tuple)
+                        or len(indexes) > _READ_VIEW_MAX_TARGETS
+                    ):
+                        return None
+                    for index in indexes:
+                        index_file = getattr(index, "file", None)
+                        if (
+                            not isinstance(index_file, str)
+                            or not index_file
+                            or "\x00" in index_file
+                        ):
+                            return None
+                        pages.add((index_file, HEADER_PAGE_INDEX))
 
             # The catalog has no page-zero freshness certificate and is therefore always a
             # whole-file target when a foreign publication moves.  Count it in the proof budget

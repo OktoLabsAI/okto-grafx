@@ -38,13 +38,17 @@ class _BoundedWal:
 
 
 class _IndexRegistry:
-    def __init__(self, file: str) -> None:
+    def __init__(self, file: str, *other_files: str) -> None:
         self.file = file
+        self.files = (file, *other_files)
         self.names: list[str] = []
 
     def index(self, name: str) -> object:
         self.names.append(name)
         return SimpleNamespace(file=self.file)
+
+    def indexes(self) -> tuple[object, ...]:
+        return tuple(SimpleNamespace(file=file) for file in self.files)
 
 
 def test_committed_page_and_index_effects_become_exact_physical_targets() -> None:
@@ -94,6 +98,46 @@ def test_committed_page_and_index_effects_become_exact_physical_targets() -> Non
     assert changes.files == frozenset({"indexes/by_name.idx"})
     assert registry.names == ["by_name"]
     assert wal.calls == [(1, 3, 512, 2 * 1024 * 1024)]
+
+
+def test_heap_effect_targets_sparse_index_headers_without_an_index_record() -> None:
+    stack = build_stack()
+    wal = _BoundedWal(
+        (
+            WalRecord(
+                record_type=int(WalRecordType.WRITE_PAGE),
+                payload=encode_page_write("heap.dat", 17, b"image"),
+                lsn=1,
+                epoch=7,
+                txn_id=9,
+            ),
+            WalRecord(
+                record_type=int(WalRecordType.COMMIT),
+                lsn=2,
+                epoch=7,
+                txn_id=9,
+            ),
+        )
+    )
+    stack.manager._wal = wal
+    stack.manager._index_manager = _IndexRegistry(
+        "indexes/by_name.idx", "index/vector_person_embedding.idx"
+    )
+
+    changes = stack.manager._read_view_changes(
+        _ReadViewToken(last_committed_lsn=0, checkpoint_lsn=0),
+        _ReadViewToken(last_committed_lsn=2, checkpoint_lsn=0),
+    )
+
+    assert changes is not None
+    assert changes.pages == frozenset(
+        {
+            ("heap.dat", 17),
+            ("indexes/by_name.idx", 0),
+            ("index/vector_person_embedding.idx", 0),
+        }
+    )
+    assert changes.files == frozenset()
 
 
 def test_unknown_record_checkpoint_movement_and_unregistered_index_decline_ce3() -> (

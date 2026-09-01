@@ -56,10 +56,18 @@ def _search(database: Any, k: int) -> tuple[int, str]:
         reader.rollback()
 
 
-def _other_process_inserts(root: Path, record_id: int) -> dict[str, Any]:
+def _other_process_inserts(
+    root: Path, record_id: int, *, with_vector: bool = True
+) -> dict[str, Any]:
     """Run one insert in a fresh interpreter and return what it reported."""
     completed = subprocess.run(
-        [sys.executable, str(CHILD), str(root), str(record_id)],
+        [
+            sys.executable,
+            str(CHILD),
+            str(root),
+            str(record_id),
+            "vector" if with_vector else "sparse",
+        ],
         capture_output=True,
         text=True,
         timeout=CHILD_BUDGET,
@@ -104,3 +112,44 @@ def test_a_commit_does_not_certify_a_warm_graph_that_another_process_left_behind
         assert _search(database, k=5) == (5, "approximate")
     finally:
         database.close()
+
+
+@pytest.mark.multiprocess
+@pytest.mark.timeout(240, method="thread")
+def test_an_open_writer_materializes_vector_pages_from_the_current_durable_view(
+    tmp_path: Path,
+) -> None:
+    """A foreign index commit after begin is incorporated before the late writer applies.
+
+    The transaction snapshot remains the authority for caller-declared interests.  Index pages,
+    however, are not staged by the caller: the durable logical index records are materialized
+    only after the WAL barrier.  Their physical write-back must therefore start from the current
+    durable index generation selected under COMMIT_SECTION, not from a clean page cached when the
+    transaction began.
+    """
+    root = tmp_path / "db"
+    database = connect(root, vector_exact_scan_threshold=0)
+    try:
+        with database.begin("write") as txn:
+            txn.execute("CREATE VECTOR SPACE s {dimension: 4, metric: 'cosine'}")
+            txn.execute("CREATE NODE TABLE V(id INT64, e VECTOR(s), PRIMARY KEY(id))")
+        with database.begin("write") as txn:
+            for record_id in (1, 2, 3):
+                _insert(txn, record_id)
+        assert _search(database, k=5) == (3, "approximate")
+
+        later = database.begin("write")
+        _insert(later, 5)
+        _other_process_inserts(root, 4, with_vector=False)
+
+        report = later.commit()
+        assert report.durable is True
+        assert database.transactions.recovery_required is False
+        assert _search(database, k=5) == (4, "approximate")
+        assert database.verify("all").findings == ()
+    finally:
+        database.close()
+
+    with connect(root, vector_exact_scan_threshold=0) as reopened:
+        assert _search(reopened, k=5) == (4, "approximate")
+        assert reopened.verify("all").findings == ()

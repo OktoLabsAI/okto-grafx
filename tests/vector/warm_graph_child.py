@@ -21,7 +21,7 @@ for _entry in (str(HERE), str(PROJECT_ROOT / "src")):
 from okto_grafx import connect  # noqa: E402
 
 
-def main(root: str, record_id: int) -> int:
+def main(root: str, record_id: int, *, with_vector: bool = True) -> int:
     report: dict[str, object] = {
         "record_id": record_id,
         "committed": False,
@@ -30,12 +30,15 @@ def main(root: str, record_id: int) -> int:
     try:
         database = connect(root, vector_exact_scan_threshold=0)
         try:
-            a, b = 1.0 - record_id * 0.05, record_id * 0.05
             with database.begin("write") as txn:
-                txn.execute(
-                    "CREATE (:V {id: $i, e: [$a, $b, 0.25, 0.0]})",
-                    {"i": record_id, "a": a, "b": b},
-                )
+                if with_vector:
+                    a, b = 1.0 - record_id * 0.05, record_id * 0.05
+                    txn.execute(
+                        "CREATE (:V {id: $i, e: [$a, $b, 0.25, 0.0]})",
+                        {"i": record_id, "a": a, "b": b},
+                    )
+                else:
+                    txn.execute("CREATE (:V {id: $i, e: NULL})", {"i": record_id})
             report["committed"] = True
         finally:
             database.close()
@@ -46,4 +49,10 @@ def main(root: str, record_id: int) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1], int(sys.argv[2])))
+    sys.exit(
+        main(
+            sys.argv[1],
+            int(sys.argv[2]),
+            with_vector=len(sys.argv) < 4 or sys.argv[3] != "sparse",
+        )
+    )
