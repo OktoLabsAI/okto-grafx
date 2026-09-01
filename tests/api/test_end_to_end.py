@@ -97,10 +97,10 @@ def test_a_commit_through_the_public_surface_is_durable_across_a_reopen(
         assert reopened.transactions.published_lsn() == committed
 
 
-def test_commit_and_checkpoint_each_derive_one_wal_tail_picture(
+def test_commit_and_each_checkpoint_commit_section_derive_one_wal_tail_picture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CQ-1 wiring: every concrete commit section pays for one tail refresh, not one per door."""
+    """CQ-1 wiring: each concrete commit section pays for exactly one tail refresh."""
     root = tmp_path / "db"
     with connect(root, page_size=512, partitions_per_table=8) as db:
         _grow_to(db, 3)
@@ -122,7 +122,10 @@ def test_commit_and_checkpoint_each_derive_one_wal_tail_picture(
 
         refreshes = 0
         db._transactions.checkpoint()
-        assert refreshes == 1
+        # The split checkpoint has two concrete commit sections.  Phase C must derive a
+        # fresh picture after the unlocked durability barrier so it can observe commits
+        # that completed while phase B was running.
+        assert refreshes == 2
 
 
 def test_a_rolled_back_transaction_leaves_nothing_on_the_device(tmp_path: Path) -> None:
