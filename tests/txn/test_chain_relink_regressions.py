@@ -29,13 +29,25 @@ from pathlib import Path
 
 import pytest
 
-from okto_grafx.domain.errors import GrafxError, GrafxWriteConflict
+from okto_grafx.domain.errors import (
+    GrafxError,
+    GrafxTransactionStateError,
+    GrafxWriteConflict,
+)
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.page import HEADER_PAGE_INDEX, PageType
-from okto_grafx.domain.txn import Snapshot, WalRecordType
+from okto_grafx.domain.txn import (
+    PAGE_PARTITION_TABLE_ID,
+    CommitPayload,
+    Snapshot,
+    WalRecordType,
+    page_partition,
+    split_partition_key,
+)
 from okto_grafx.domain.txn.records import decode_page_write
 from okto_grafx.domain.verify.findings import FindingKind
+from okto_grafx.engine.txn_manager import TransactionManager
 from okto_grafx.engine.verifier import Verifier
 from okto_grafx.engine.wal_manager import WalManager
 from shared_device import SharedDirectoryDevice
@@ -481,11 +493,176 @@ def test_growing_a_file_to_an_index_never_spends_a_page_it_meant_to_add(
     assert after > target - 1
 
 
+def test_a_historical_tail_write_already_in_the_fresh_view_is_not_a_conflict(
+    tmp_path: Path,
+) -> None:
+    """A page discovered from ``current`` must not conflict with the commit it already contains.
+
+    P2 takes its transaction snapshot and caches the existing tail before P1 appends. Their logical
+    partitions are deliberately disjoint, so the first OCC pass accepts P2. Once P2 owns
+    COMMIT_SECTION it must discard that stale frame, refresh to P1's durable image and append to
+    the exact data page P1 changed. Both COMMIT payloads consequently name the same physical page,
+    but P2's page image includes P1's row and must not be refused for history it incorporated.
+
+    Before the materialisation-baseline amendment the second OCC pass walked back to P2's old
+    transaction snapshot, found P1's write to that page and refused forever under a continuous
+    appender. The shared page assertion keeps this from becoming a merely disjoint-writer test.
+    """
+    root = tmp_path / "db"
+    clock = ManualClock()
+    p1 = _participant(root, "p1", clock)
+    table = _registered(p1, _table())
+    _insert(p1, table, 0, "seed")
+    p2 = _participant(root, "p2", clock)
+
+    later = p2.manager.begin("write")
+    later.stage_row_insert(table, (2, "p2"))
+    p2_partition = p2.manager.partition_of(table.table_id, b"p2-only")
+    later.note_write(p2_partition)
+    cached = [found.values for _ref, found in p2.heap.scan(table, later.snapshot)]
+    assert cached == [(0, "seed")], "P2 did not cache the pre-winner tail image"
+
+    earlier = p1.manager.begin("write")
+    earlier.stage_row_insert(table, (1, "p1"))
+    p1_partition = p1.manager.partition_of(table.table_id, b"p1-only")
+    earlier.note_write(p1_partition)
+    assert p1_partition != p2_partition
+
+    first = p1.manager.commit(earlier)
+    second = p2.manager.commit(later)
+    assert second.csn > first.csn
+
+    commits = {
+        record.lsn: CommitPayload.decode(record.payload)
+        for record in p2.wal.read_from(1)
+        if record.record_type == WalRecordType.COMMIT
+    }
+    shared = set(commits[first.csn].write_partitions).intersection(
+        commits[second.csn].write_partitions
+    )
+    assert shared, "the two commits did not exercise a shared physical page"
+    assert page_partition(HEAP, later.row_refs[0].page) in shared
+    assert all(split_partition_key(partition)[0] == PAGE_PARTITION_TABLE_ID for partition in shared)
+
+    witness = _participant(root, "witness", clock)
+    assert (0, "seed") in _rows(witness, table)
+    assert (1, "p1") in _rows(witness, table)
+    assert (2, "p2") in _rows(witness, table)
+    assert _verify(witness).findings == ()
+
+
+def test_fresh_materialization_preserves_the_previous_tail_when_append_grows(
+    tmp_path: Path,
+) -> None:
+    """The structural relink page is fresh even though no new row lands on it.
+
+    A large P2 batch grows the chain after P1 changed the old tail. The new pages carry P2's rows,
+    while the page that makes them reachable is the previous tail's ``next_page`` image measured
+    by ``_attempt_pages``. It must be rebuilt from P1's durable bytes, included in both COMMIT
+    payloads and survive a cold walk. This guards the structural member of the eligible set, not
+    merely the page where an inserted row landed.
+    """
+    root = tmp_path / "db"
+    clock = ManualClock()
+    p1 = _participant(root, "p1", clock)
+    table = _registered(p1, _table())
+    next_id = _fill_until_a_second_page(p1, table)
+    p2 = _participant(root, "p2", clock)
+
+    doomed = p2.manager.begin("write")
+    before_values = [found.values for _ref, found in p2.heap.scan(table, doomed.snapshot)]
+    assert before_values, "P2 did not cache the pre-winner chain"
+    for offset in range(60):
+        doomed.stage_row_insert(table, (next_id + offset, FILLER))
+    doomed.note_write(p2.manager.partition_of(table.table_id, b"p2-growth"))
+
+    winner = p1.manager.begin("write")
+    winner.stage_row_insert(table, (9001, "winner"))
+    winner.note_write(p1.manager.partition_of(table.table_id, b"p1-tail"))
+    assert p1.manager.partition_of(
+        table.table_id, b"p1-tail"
+    ) != p2.manager.partition_of(table.table_id, b"p2-growth")
+    first = p1.manager.commit(winner)
+    pages_before = p2.storage.page_count(HEAP)
+    second = p2.manager.commit(doomed)
+    assert second.csn > first.csn
+    assert p2.storage.page_count(HEAP) > pages_before
+
+    commits = {
+        record.lsn: CommitPayload.decode(record.payload)
+        for record in p2.wal.read_from(1)
+        if record.record_type == WalRecordType.COMMIT
+    }
+    shared = set(commits[first.csn].write_partitions).intersection(
+        commits[second.csn].write_partitions
+    )
+    assert page_partition(HEAP, winner.row_refs[0].page) in shared
+
+    witness = _participant(root, "witness", clock)
+    stored = _rows(witness, table)
+    assert (9001, "winner") in stored
+    assert set(range(next_id, next_id + 60)).issubset(values[0] for values in stored)
+    assert _verify(witness).findings == ()
+
+
+def test_a_late_logical_interest_is_not_reclassified_as_a_fresh_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only locations measured from the heap may cross the materialisation baseline.
+
+    The hostile hook adds a logical partition after the first OCC pass, and that partition has a
+    winner after this transaction's snapshot. A naive ``current_interest - old_interest`` would
+    classify it beside newly discovered pages and validate it from ``current``, silently hiding
+    the conflict. The certified page-location set cannot name it, so the attempt fails closed and
+    abandons the row it had materialised.
+    """
+    root = tmp_path / "db"
+    clock = ManualClock()
+    p1 = _participant(root, "p1", clock)
+    table = _registered(p1, _table())
+    _insert(p1, table, 1, "seed")
+    p2 = _participant(root, "p2", clock)
+
+    doomed = p2.manager.begin("write")
+    doomed.stage_row_insert(table, (2, "doomed"))
+    safe = p2.manager.partition_of(table.table_id, b"safe")
+    late = p2.manager.partition_of(table.table_id, b"late-logical")
+    assert safe != late
+    doomed.note_write(safe)
+
+    winner = p1.manager.begin("write")
+    winner.stage_row_insert(table, (3, "winner"))
+    winner.note_write(late)
+    p1.manager.commit(winner)
+
+    original_write_rows = TransactionManager._write_rows
+
+    def add_late_interest(self, txn, identities):  # noqa: ANN001, ANN202
+        rows = original_write_rows(self, txn, identities)
+        if self is p2.manager:
+            txn.note_write(late)
+        return rows
+
+    monkeypatch.setattr(TransactionManager, "_write_rows", add_late_interest)
+    with pytest.raises(GrafxTransactionStateError) as raised:
+        p2.manager.commit(doomed)
+    assert raised.value.details["field"] == "transaction_interest"
+    assert late in raised.value.details["added"]
+    p2.manager.rollback(doomed)
+    p2.pool.settle_abandoned()
+
+    witness = _participant(root, "witness", clock)
+    stored = _rows(witness, table)
+    assert (3, "winner") in stored
+    assert (2, "doomed") not in stored
+    assert _verify(witness).findings == ()
+
+
 @pytest.mark.parametrize("frames", [4, 12, 24, 40, 59, 62, 64, 1024])
 def test_a_refusal_on_the_PAGE_half_undoes_the_link_the_append_had_already_made(
-    tmp_path: Path, frames: int
+    tmp_path: Path, frames: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The undo half of the fix, reached by the only refusal that can reach it.
+    """The undo half remains sound if a conflict appears after page materialisation.
 
     Every other test in this file lands its refusal on the ROW half -- the first
     ``_find_conflict``, which runs BEFORE ``_write_rows``. Nothing has been appended at that point,
@@ -493,11 +670,13 @@ def test_a_refusal_on_the_PAGE_half_undoes_the_link_the_append_had_already_made(
     reached twice in this whole file, both times with ``rows=0``. Deleting the undo entirely left
     the full 7879-test suite green.
 
-    Reaching it needs the SECOND ``_find_conflict``, the page half. That means the two
-    participants must declare DIFFERENT key partitions -- so the row half cannot refuse -- and
-    must still collide on a page, which any two row-writing commits do, because every one of them
-    writes the table directory on heap page 0. P2 then gets all the way through ``_write_rows``:
-    it allocates a page, points the old tail at it, and is refused afterwards.
+    Historical writes to a page materialised from ``current`` no longer constitute that refusal:
+    their bytes are already present in the fresh image. COMMIT_SECTION also prevents an ordinary
+    foreign commit from arriving between that image and the second pass. The hostile hook below
+    therefore injects the outcome a future coordinator regression or WAL publisher outside the
+    section would create, but only when the materialised-page pass is reached. P2 gets all the way
+    through ``_write_rows``: it allocates a page, points the old tail at it, and is refused after
+    those changes so the cleanup invariant remains directly exercised.
 
     What must not survive that refusal is the link. Left in P2's pool it is written to the device
     by P2's own retry, and a walk then follows it into a page nobody ever wrote.
@@ -519,8 +698,30 @@ def test_a_refusal_on_the_PAGE_half_undoes_the_link_the_append_had_already_made(
     winner.note_write(p1.manager.partition_of(table.table_id, b"p1-only"))
     p1.manager.commit(winner)
 
+    original_find_conflict = TransactionManager._find_conflict
+    injected = [False]
+
+    def refuse_materialized_page(self, txn, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        conflict = original_find_conflict(self, txn, **kwargs)
+        if (
+            self is not p2.manager
+            or injected[0]
+            or conflict is not None
+            or kwargs.get("baseline_lsn") is None
+            or not txn.row_refs
+        ):
+            return conflict
+        interested = kwargs.get("interested_partitions")
+        assert interested, "the hostile pass was reached without a materialised page"
+        injected[0] = True
+        return (min(interested),)
+
+    monkeypatch.setattr(TransactionManager, "_find_conflict", refuse_materialized_page)
+
     with pytest.raises(GrafxWriteConflict):
         p2.manager.commit(doomed)                 # refused on the PAGE half, after the append
+    assert doomed.row_refs, "the refusal happened before row materialisation"
+    assert injected[0], "the hostile page-half refusal was not injected"
     p2.manager.rollback(doomed)
 
     # 1. The participant that was refused can still read its own table.

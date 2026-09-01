@@ -454,6 +454,50 @@
   single-writer, group commit, relaxamento de consistência ou a proposta expansiva heap/WAL v2 de
   `IDENTITY-LEASING-V7.md`. O próximo gate é implementar e provar esse recorte, repetir primeiro
   `RAW/same-10` e somente então repetir a matriz CE-3 completa e o M-PULSE-7 10k.
+
+  Esse gate foi executado no candidato autenticado
+  `origin/perf/w8-ce1-production@6fd26f9e62b88eb852a4aa59aef2d5c35913752b` (código CN-1
+  `40b2b43`). O artefato
+  `D:\Projetos\Techridy\grafx-ce3-same10-cn1-6fd26f9\ce3-same10.json`, SHA-256
+  `bbdc9dd52d1ebfb703246c5aa8e52beed8688d42bfce0d7b8f6b2e74cc4d27d3`, falhou fail-fast
+  em `RAW/same-10`; por isso a variante instrumentada e a matriz oficial não foram executadas. O
+  processo A avançou de 19 para **46 operações concluídas** antes de esgotar 60 tentativas na 47ª,
+  `reconcile_projection_active_set`; a partição terminal mudou de `heap.dat/0` para exatamente
+  `heap.dat/394`. B concluiu 807/807 operações em 819 tentativas, com 12 conflitos recuperados; 11
+  dos 12 foram exclusivamente nas páginas de dados 350--353 e somente um incluiu a page 0. O cold
+  `verify("all")` passou com 10.865 páginas, 9.467 registros e 12.178 entradas de índice. Portanto,
+  CN-1 está fechado como eficaz e sem corrupção: removeu o gargalo de identidade; o blocker
+  residual é starvation por colisão física na cauda de append da mesma tabela.
+
+  A auditoria conjunta local/Nexus (`hof_c783f3f0cbb3411788d8c3145fd58db3`, concluído,
+  verificado/PASS) registrou o diagnóstico em
+  `D:\Projetos\Techridy\claude-scratch\CE3-SAME10-POSTCN1-RESIDUAL.md`. O candidato mínimo é
+  preservar a primeira OCC integral desde o snapshot original e usar, somente para partições
+  físicas descobertas durante a materialização posterior a `begin_read_view(current)`, esse
+  `current` como baseline da segunda OCC. Páginas pré-staged, interesses lógicos, WAL, durabilidade
+  e multi-writer/multi-reader permanecem inalterados. O usuário autorizou explicitamente essa
+  emenda em 2026-08-31 com: `Autorizo ajustar o baseline da segunda OCC apenas para páginas físicas
+  materializadas a partir da visão durável atual, mantendo a primeira OCC integral, páginas
+  pré-staged no snapshot original e todas as garantias de WAL/durabilidade.` A implementação fica
+  limitada a esse texto: o conjunto antigo é congelado e revalidado inclusive sobre eventual
+  subcommit CN-1; somente localizações físicas medidas, novas e não pré-staged recebem o baseline
+  atual. Não aumentar retries, reduzir a carga, alterar o harness ou introduzir page/tail leasing:
+  isso esconderia ou ampliaria o blocker sem necessidade.
+
+  **Implementação OCC-MB1 concluída localmente em 2026-08-31.** O commit path congela a união de
+  interesses e as localizações pré-staged antes da primeira OCC, revalida o conjunto antigo sem
+  bypass se um refill CN-1 avançar o WAL e deriva o conjunto elegível exclusivamente das
+  localizações `(file, page)` medidas após a visão durável. Drift tardio, overlap pré-staged e
+  baseline anterior ao snapshot falham fechado; o payload COMMIT continua carregando o conjunto
+  completo. Gates locais verdes: 100/100 focados nos cinco arquivos diretamente afetados,
+  454/454 transacionais não-multiprocesso (14 deselected), 17/17 multiprocesso, 8/8 de falha e
+  concorrência CN-1, 9/9 de cleanup/relink, Ruff, compileall e `git diff --check`. A auditoria
+  independente local encerrou sem blocker e matou o mutante `_attempt_pages -> ()`. O parecer
+  adversarial Nexus `hof_cb653c8a25fd479098fc31a5ac8415f9` foi concluído/PASS; sua ressalva
+  inicial de manter bypass no refill foi posteriormente retirada pelo próprio auditor após
+  conferir que o código revalida o conjunto antigo sem perdão e coloca o refill no baseline das
+  páginas frescas. Restam a auditoria Nexus do SHA imutável e, depois dela, o mesmo gate
+  autenticado `RAW/same-10`; a matriz CE-3 oficial continua bloqueada até esse gate passar.
 - **O ratchet de entrada do M-PULSE-7 está certificado; ele não é o run de 10.000 operações.** No
   Community `6595abdcfa788dfa2cc8da1a53ff96c378790531` (base
   `d44c82155e9884c556813ea96dec829be567c236`, branch
@@ -1215,17 +1259,23 @@ Todo insert avança `next_record_id`, fazendo writers disjuntos conflitarem na p
 
 O registro W6 recomenda corretamente identity-range leasing em [`W6-WRITE-CEILING.md`](docs/architecture/W6-WRITE-CEILING.md#L19).
 
-**Estado em 2026-08-31:** CN-1 está autorizado e em execução após CE-3 provar a colisão em
-`page_partition("heap.dat", 0)`. O recorte aprovado mantém o formato heap/WAL v1 e a concorrência
+**Estado em 2026-08-31:** CN-1 foi implementado, auditado e publicado em `40b2b43`, com
+`identity_lease_size=64` parametrizável e fallback operacional `1`, preservando heap/WAL v1 e
 multi-writer/multi-reader. Cada refill reserva e avança duravelmente o piso da extensão por uma
 transação interna COW normal antes de qualquer ID ser entregue; o participante consome localmente o
 intervalo de forma monotônica/burn-only e nunca devolve IDs após conflito, aborto, crash, close ou
 fork. Refill stale perde por OCC e reconstrói a partir da page 0 fresca. Commits que consomem um ID
 já reservado deixam de declarar page 0 sem tê-la modificado; refill e crescimento de tail continuam
 declarando-a. IDs explícitos abaixo do piso durável são recusados enquanto leasing estiver ativo, e
-IDs explícitos acima do piso exigem avanço durável antes do uso. O knob planejado é
-`identity_lease_size`, com fallback operacional `1`; o default definitivo deve ser congelado pelos
-testes de compatibilidade e concorrência, sem ampliar este recorte.
+IDs explícitos acima do piso exigem avanço durável antes do uso.
+
+A repetição autenticada de `RAW/same-10` no candidato `6fd26f9` mediu o efeito: page 0 caiu de
+partição fatal para uma ocorrência em 807 commits de B, e A avançou de 19 para 46 operações. O cold
+verifier permaneceu limpo. O gate ainda não passou porque a cauda de dados da mesma tabela se tornou
+o blocker seguinte (`heap.dat/394` terminal; páginas 350--353 nos retries de B). Isso já era a
+limitação prevista para writers na mesma tabela depois de remover a identidade compartilhada; não é
+um novo requisito nem evidência de corrupção. O próximo passo está limitado à correção dessa colisão
+física, sem elevar retries, mudar workload ou executar a matriz oficial antes de `same-10` passar.
 
 Sequência recomendada:
 
@@ -2421,8 +2471,9 @@ nenhum resultado delegado é integrado sem validação final do Codex e sem o ga
 | M-PULSE-6 — bundle integral, recovery e certificação instalável | concluído, certificado e publicado nos milestones; M-PULSE-7 autorizado | Pulse Community `milestone/grafx-mpulse6-assembly@d1e988a` (`b4e27ff`, `f42d2e9`, `d1e988a`); Pulse Core `milestone/grafx-mpulse6-logical-transfer-manifest@ccc1f34` (`a9cf33d`, `ccc1f34`); Grafx `main@1bbb839` (`55e025e`, `1bbb839`) | Bundle único Board+Global compartilha binding store, resolver e pool; startup, CLI, restore, shutdown e rebuild não fazem fallback silencioso. Auditoria de interface 91/91; regressão roteada 232/232; conformance real Ladybug/Grafx 1/1; wheel Grafx `0.0.1` isolado com `[accel]`, `uv pip check`, bindings Board/Global e catálogos 81/11; recovery-only 220/220 aplicáveis; F13/AF21 25/25; gate curto 32/32; checks estáticos verdes e zero import Grafx no Core. A execução oficial completa no estado commitado fechou as 36 falhas diagnósticas anteriores e terminou em `4890 passed, 3 skipped, 13 deselected, 5 warnings` em `8150.11 s`; JUnit SHA-256 `d4d5bfc33cb9aa5d22a03e8f078dbd5df97dc94f6a7821a89b15737a33f14498`. A freeze pré-publicação do `uv.lock` Community ainda não é resolvível pelo índice enquanto `okto-grafx==0.0.1` não existir no PyPI; regenerar o lock a partir do índice imediatamente após a publicação conjunta, sem inserir URL/path local fictício |
 | M-PULSE-7 — estabilização de performance A1/B/C | ratchet de entrada certificado e F1 instrumental concluído/auditado; próximos gates: CE-3 literal e depois run 10k | base Grafx `6d9b7a1`; A1 `5002a77c8d4e59e137890a45bcf61874398d2dcc`; B original `420ca4886e5e226aa10bf3a28a1396f98471faca`; código Grafx integrado `91a59c6806659cdd75d1b33500885f0c7354de6b`; candidato Grafx `origin/main@7b5a2ace36d0a300dc71dbdf97f8b9686d55fcba`; C-community `65d07b5` + hardening `c05d89d`, publicado em `origin/milestone/grafx-mpulse7-rollout@c05d89d`; ratchet Community `6595abdcfa788dfa2cc8da1a53ff96c378790531` sobre base `d44c82155e9884c556813ea96dec829be567c236`, branch `origin/milestone/grafx-mpulse7-ratchet-530df34`, pin Grafx `d39e27435171574ab6f03bc1d17672b26bf163b2`; manifesto físico/canônico `d1777bb26aee2feae5c8d5f4593840c08bdc37474ad6be4bdfe5334daedd0192` / `1e6e92fc3bae3b54d3052ca9055b7682a9d518927573e0ffcbfcbb4568cf9f93`; corpus físico/lógico `0997747ed8bb9172d05781a62e5f81e7694630b173aaa152ac9ea28daec9d13f` / `b29334edf6e7c1e6b9419a4f3add84ede4baad94fdeaecb0c679261a78f241cc`; ratchet 12/12 e auditoria independente 39/39; F1 autoral `d87a0c6520683b2d22929165136f718d14a1d795`, squash/integrado `main@2b8e9006218b9ccf013d914dfe98e32abaa5bdd3`, 61/61, matriz pura 312 células, auditoria independente PASS e handoff Nexus `hof_81cf7d9bc9d94fc7b76ad9639519cd2e` concluído/verificado; handoffs B `hof_7a5be05b5b644b609b92b5e8c09fdeea`, harness `hof_1ad44f9d92d04f58abbcfe4a6e316ba6`, fixture `hof_42a66b0033f0454ca5e12b3f27668141`, runbook `hof_93dbf437246040a3a83cb900f3a488ea` concluídos/PASS; C `hof_d301014276c148c59c4709a2c2a87950` cancelado após entregar o commit/mutantes, follow-up concluído pelo Codex | A1 remove o fan-out de page 0 entre tabelas com freshness fail-closed; B restringe o namespace e preserva contenção contra redirects; C usa uma view pública de catálogo por scope com invalidação DDL fail-closed e preserva operações de erro. Gates C: cinco mutantes mortos, 213 testes relacionados no autor, 98/98 independentes, 9/9 pós-fast-forward e checks estáticos verdes. Evidência curta (`94c692af…`): catálogo 94→12 e RAW `19.266,1–19.564,1`→`17.219,4 ms`, com mesmo digest/forense e 68/43 writes. Evidência oficial C (`655c0ec0a10d4ee272fe6e2e6eea0b584d165b8ae3645148a77cd16bd1c428c8`, 526.344 B): 60/60, 12/12, catálogo 94/`5.606,59`→12/`718,69 ms`, RAW `18.561,15`→`17.196,86 ms`, instrumentado `40.072,74`→`37.073,95 ms`, mesmas 72/43 writes, digest `c994255b…` e forense; referência Ladybug reutilizada porque o delta toca somente o adapter Grafx, razão `19,12x`→`17,72x`. O F1 agora autentica o instrumento, não publica ainda números da matriz longa. D5 `<=10x` e meta final `<=1x` permanecem dívidas do plano, não SLO do manifesto. Patch 2/A2/plan cache não são promovidos antes do gate completo; quarentenas e RUN #4 permanecem inalterados. O ratchet autentica somente as entradas; não existe ainda resultado do run 10k |
 | CE-2 — reader pin por participante | concluída, certificada e publicada em `main` neste milestone | produto integrado `565ac37`; global 10.910/19; H1-H8.1 `bc305be2…`; reader-pin v8 47/47 `d0285b51…`; concorrência histórica PASS | Um único registro conservador por participante elimina publication/unregister por transação sem estreitar multi-writer/multi-reader. Rename/fsync/open `1/6/2 -> 0/4/0`; RAW 12 famílias `3.078,01 -> 2.363,90 ms`; razão contra Ladybug congelada `3,00x`. Long reader de 90 s, avanço após close, processo morto/TTL, recycle do WAL e verify hot+cold têm prova multiprocesso. ST-2 e CN-1 estavam fora naquele checkpoint; somente CN-1 recebeu autorização posterior, após o resultado CE-3 abaixo |
-| CE-3 — matriz multiprocesso e diagnóstico same-10 | execução oficial parcial válida; decisão concluída; correção estrutural CN-1 publicada no candidato | candidato original `c2ca648`; artefato SHA-256 `319ac5a3966c7fd096bdab8800e37e6beb4ea8e0a255db719f981b5a3c1f71af`; instrumento v3 `d80b438`; CN-1 `40b2b43`; revisão Nexus `hof_655c090ee6f547d98e249aeff95c367f` concluída/verificada/PASS | `idle-0` e `same-1` passaram; `same-10` provou starvation OCC na partição exata de `heap.dat/0`: A parou em 19/60 após 60 conflitos tipados, B concluiu 864/864 e recuperou 13. `verify("all")` limpo e duplicidade intermediária deliberada descartam corrupção. CN-1 foi implementado no recorte heap/WAL v1, burn-only e multi-writer/multi-reader; o próximo gate continua sendo repetir `same-10` no candidato promovido antes da matriz completa |
-| CN-1 — leasing durável de identidades | implementação, documentação, auditorias e gates focados concluídos e publicados; regressão global e re-medição CE-3 pendentes | commit `40b2b43` em `origin/perf/w8-ce1-production`; desenho final `docs/architecture/CN1_IDENTITY_RANGE_LEASING.md`; auditoria conjunta Nexus inicial `hof_8867688a5b9649d4a718fbf6eec91a63`, auditoria do código `hof_9e0acf09542a47bd9873a04fea7b0d51` e auditoria final dos testes `hof_c03087626717449ea68b8fc595345fdf` concluídas/verificadas/PASS, sem blocker | `identity_lease_size=64` parametrizável; piso multi-tabela COW em `heap.dat/0`; subcommit privado `WRITE_PAGE+COMMIT` sob participant/lease/`COMMIT_SECTION`/WAL-tail; barrier/apply/publish antes do uso; primeiro OCC antes de consumo; segundo OCC ignora somente o LSN exato da reserva; cache local burn-only; explicit `< floor` recusa e `>= floor` exige avanço durável; primeira extensão permanece atômica no commit do usuário; manager herdado após fork falha fechado. Gates: 8/8 identidade, 4/4 falhas, 4/4 multiprocesso (inclui kill após reserva e recovery/reopen), 449/449 transacionais não-multiprocesso e composição focada 523/523; Ruff/compileall/diff-check verdes. A página 0 continua corretamente presente em primeira extensão e crescimento/reparo de tail; nenhum ganho foi ainda rotulado como medido |
+| CE-3 — matriz multiprocesso e diagnóstico same-10 | execução oficial parcial válida; CN-1 medido e eficaz; gate ainda vermelho por cauda física da mesma tabela | candidato original `c2ca648`; artefato original SHA-256 `319ac5a3966c7fd096bdab8800e37e6beb4ea8e0a255db719f981b5a3c1f71af`; instrumento v3 `d80b438`; CN-1 `40b2b43`; candidato repetido `6fd26f9`; artefato pós-CN-1 SHA-256 `bbdc9dd52d1ebfb703246c5aa8e52beed8688d42bfce0d7b8f6b2e74cc4d27d3`; diagnóstico Nexus `hof_c783f3f0cbb3411788d8c3145fd58db3` concluído/verificado/PASS | No baseline, `same-10` parou A em 19/60 na page 0. Pós-CN-1, A concluiu 46 operações e esgotou a 47ª na `heap.dat/394`; B concluiu 807/807, recuperou 12 conflitos e teve page 0 em somente um deles. Cold `verify("all")` limpo (10.865 páginas, 9.467 registros, 12.178 índices) prova liveness/performance, não corrupção. A variante instrumentada e a matriz oficial não rodaram por fail-fast. O próximo gate permanece exatamente o mesmo: corrigir a colisão física e fazer `same-10` passar antes da matriz completa |
+| CN-1 — leasing durável de identidades | concluído, publicado, auditado e medido; não é o blocker residual | commits `40b2b43` + evidência documental `6fd26f9` em `origin/perf/w8-ce1-production`; desenho final `docs/architecture/CN1_IDENTITY_RANGE_LEASING.md`; auditorias Nexus `hof_8867688a5b9649d4a718fbf6eec91a63`, `hof_9e0acf09542a47bd9873a04fea7b0d51` e `hof_c03087626717449ea68b8fc595345fdf` concluídas/verificadas/PASS | `identity_lease_size=64` parametrizável; piso multi-tabela COW em `heap.dat/0`; subcommit privado `WRITE_PAGE+COMMIT` sob participant/lease/`COMMIT_SECTION`/WAL-tail; barrier/apply/publish antes do uso; primeiro OCC antes de consumo; a emenda OCC posterior remove o bypass do LSN e revalida interesses antigos incrementalmente; cache local burn-only; explicit `< floor` recusa e `>= floor` exige avanço durável; primeira extensão permanece atômica no commit do usuário; manager herdado após fork falha fechado. Gates: 8/8 identidade, 4/4 falhas, 4/4 multiprocesso, 449/449 transacionais não-multiprocesso e 523/523 de composição; Ruff/compileall/diff-check verdes. Medição autenticada: A 19→46 operações e page 0 fatal→1/807 commits de B; residual deslocou-se para a tail data page, como previsto |
+| OCC-MB1 — baseline de materialização da segunda OCC | implementado e aprovado nos gates locais; promoção aguarda auditoria Nexus do SHA imutável | autorização explícita do usuário em 2026-08-31; auditoria adversarial Nexus `hof_cb653c8a25fd479098fc31a5ac8415f9` concluída/PASS; auditoria final local PASS; 100/100 focados, 454/454 txn não-multiprocesso, 17/17 multiprocesso, 8/8 CN-1 failure/concurrency e 9/9 cleanup/relink | Primeira OCC usa conjunto congelado desde o snapshot; avanço CN-1 revalida esse conjunto sem bypass; somente novas localizações físicas medidas e não pré-staged usam o LSN durável atual. Interesses lógicos tardios e overlap/drift de página falham fechado. WAL/payload, durabilidade, readers e multiwriter não mudam. Próximo gate fixo: commit/push, auditoria independente no SHA e `RAW/same-10` autenticado; somente se passar executar a matriz CE-3 oficial |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria

@@ -125,13 +125,18 @@ def test_a_refusal_inside_the_row_batch_leaves_no_phantom_row(tmp_path: Path) ->
 
 
 def test_an_abandoned_attempt_never_overwrites_what_another_participant_committed(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Page-half write conflict in P2, then P1 commits, then P2 retries: nothing of P1 is lost.
+    """A late page-half refusal in P2 cannot make a durable P1 row disappear.
 
     The refused attempt's pages stayed DIRTY in P2's pool holding the page as it looked during the
     attempt. The next read view, or P2's next flush, wrote them back -- over the page P1 had since
     committed and put on the device. P1's acknowledged row was gone and ``verify()`` agreed.
+
+    A historical write to a page materialised from the current durable view is deliberately no
+    longer a conflict: that fresh image already contains the write.  Inject exactly one refusal
+    on the second OCC pass instead, after row materialisation, so this remains a direct regression
+    for abandonment rather than depending on the obsolete false-conflict behaviour.
     """
     root = tmp_path / "db"
     clock = ManualClock()
@@ -144,8 +149,29 @@ def test_an_abandoned_attempt_never_overwrites_what_another_participant_committe
     refused.stage_row_insert(table, (3, "p2-x"))
     refused.note_write(p2.manager.partition_of(table.table_id, b"3"))
     _insert(p1, table, 2, "p1")  # lands on the same page after P2's snapshot
+
+    original_find_conflict = TransactionManager._find_conflict
+    injected = [False]
+
+    def refuse_materialized_page(self, txn, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        conflict = original_find_conflict(self, txn, **kwargs)
+        if (
+            self is not p2.manager
+            or injected[0]
+            or conflict is not None
+            or kwargs.get("baseline_lsn") is None
+            or not txn.row_refs
+        ):
+            return conflict
+        interested = kwargs.get("interested_partitions")
+        assert interested, "the hostile pass was reached without a materialised page"
+        injected[0] = True
+        return (min(interested),)
+
+    monkeypatch.setattr(TransactionManager, "_find_conflict", refuse_materialized_page)
     with pytest.raises(GrafxWriteConflict):
         p2.manager.commit(refused)
+    assert injected[0], "the refusal did not exercise the post-materialisation OCC pass"
 
     _insert(p1, table, 4, "p1")  # acknowledged durable
 

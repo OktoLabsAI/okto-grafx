@@ -779,10 +779,13 @@ Existing heap extents allocate row identities from durable burn-only ranges. A r
 separate private `WRITE_PAGE(heap.dat, 0) + COMMIT` performed under the outer commit's existing
 participant/lease/`COMMIT_SECTION`/WAL-tail ordering; its barrier, page apply and state publication
 complete before a row may use the range. The first OCC precedes cache consumption. The second OCC
-may ignore only that refill's exact COMMIT LSN. Explicit ids below the durable floor are refused;
-ids at or above it require a durable floor advance. A missing extent keeps first-row creation on
-the ordinary atomic insert path. The complete protocol and failure boundaries are frozen in
-`CN1_IDENTITY_RANGE_LEASING.md`.
+does not ignore the refill: interests frozen before the first OCC are revalidated over any
+incremental interval the refill created, so an older pre-staged image of heap page 0 conflicts
+instead of overwriting the new floor. Only page locations first discovered while rows are
+materialised from the refreshed durable image use that image's LSN as their OCC baseline. Explicit
+ids below the durable floor are refused; ids at or above it require a durable floor advance. A
+missing extent keeps first-row creation on the ordinary atomic insert path. The complete protocol
+and failure boundaries are frozen in `CN1_IDENTITY_RANGE_LEASING.md`.
 
 **Commit protocol (FROZEN — implement exactly):**
 1. read-only txn → settle against the PARTICIPANT reader registration and return
@@ -794,10 +797,24 @@ the ordinary atomic insert path. The complete protocol and failure boundaries ar
 3. `with coordinator.exclusive("commit", timeout=commit_lock_timeout):`
    1. re-`validate_epoch`.
    2. `current = published_lsn()`.
-   3. **OCC validation**: for every `COMMIT` record with `lsn > txn.snapshot.read_lsn`, conflict iff
-      `record.write_partitions ∩ (txn.read_partitions | txn.write_partitions) != ∅`
-      → raise `GrafxWriteConflict` (retryable), metrics `oktografx_write_conflicts_total`.
-      Nothing has been written to the device at this point.
+   3. **Tiered OCC validation**:
+      - Freeze `snapshot_interest = txn.read_partitions | txn.write_partitions`, including every
+        authenticated pre-staged page image. For every `COMMIT` with
+        `lsn > txn.snapshot.read_lsn`, conflict iff
+        `record.write_partitions ∩ snapshot_interest != ∅` → raise `GrafxWriteConflict`
+        (retryable), metrics `oktografx_write_conflicts_total`. Nothing from the user transaction
+        has been written to the device at this point.
+      - Complete any required CN-1 floor reservation. If it advanced `current`, revalidate
+        `snapshot_interest` only over that incremental interval; the reservation receives no
+        bypass. Then materialise row intents from this durable `current` image and measure the
+        exact physical `(file, page)` locations modified. A pre-staged location is never fresh,
+        overlap with one is refused, and late logical/staged-interest drift fails closed.
+      - Derive only the new page partitions from those certified fresh locations and compare them
+        against every `COMMIT` with `lsn > current`. Commits at or below `current` are already
+        incorporated in the materialised full-page image; commits above it remain conflicts.
+        `COMMIT_SECTION` prevents a foreign commit from crossing that interval, but the predicate
+        stays explicit and fail-closed. The complete interest set still travels in the final
+        `COMMIT` payload for future transactions.
    4. Form `[..., WRITE_PAGE..., COMMIT]`; enforce `max_wal_batch_bytes` over those records' exact
       encoded lengths, excluding any `SEGMENT_HEADER`; then call `wal.append_many(...)`.
    5. `wal.barrier()` — **BR-4: no acknowledgement before this returns**.

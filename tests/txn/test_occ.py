@@ -122,6 +122,41 @@ def test_a_commit_at_or_below_the_snapshot_is_not_a_conflict(make_stack) -> None
     assert first.manager.commit(later).wrote is True
 
 
+def test_an_explicit_materialization_baseline_still_detects_every_later_commit(
+    make_stack,
+) -> None:
+    """The page-half floor excludes incorporated history, never future writes.
+
+    The target transaction predates both commits. Supplying the first commit as the durable
+    materialisation baseline must hide exactly that commit and still return the second. Moving the
+    baseline to the second then returns no conflict. This pins both inequalities independently of
+    COMMIT_SECTION, which normally prevents the later interleaving from occurring in production.
+    """
+    observer = make_stack()
+    first = make_stack()
+    target = observer.manager.partition_of(1, b"materialized-page")
+    candidate = observer.manager.begin("write")
+
+    first_report = first.manager.commit(_write(first, writes=(target,), page=3))
+    second = make_stack()
+    second_report = second.manager.commit(_write(second, writes=(target,), page=4))
+
+    interested = frozenset((target,))
+    assert observer.manager._find_conflict(
+        candidate,
+        interested_partitions=interested,
+        baseline_lsn=first_report.csn,
+    ) == (target,)
+    assert (
+        observer.manager._find_conflict(
+            candidate,
+            interested_partitions=interested,
+            baseline_lsn=second_report.csn,
+        )
+        is None
+    )
+
+
 def test_a_record_that_is_not_a_commit_never_conflicts(stack: Stack) -> None:
     """The record type is part of the predicate: an index write is not a commit."""
     shared = stack.manager.partition_of(1, b"shared")

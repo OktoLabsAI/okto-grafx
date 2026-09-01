@@ -436,22 +436,21 @@ def test_a_read_view_is_not_dropped_when_nothing_has_committed(
     assert stack.pool.begin_read_view(stack.manager.published_lsn() + 1) is True
 
 
-def test_two_participants_inserting_from_one_old_extent_view_still_conflict(
+def test_two_participants_inserting_from_one_old_extent_view_both_commit(
     make_stack,
 ) -> None:
-    """The row half of defect E1 remains protected after page-zero false sharing is removed.
+    """A page image rebuilt from ``current`` incorporates the earlier disjoint writer.
 
     Two participants inserting into the same table declare disjoint ROW partitions, so the row
-    predicate lets both through -- but both also rewrite the reserved header page, which carries
-    the table's extent and its identity counter, and a page image replaces the whole page. The
-    second image would erase the first participant's extent and hand its identity out again.
+    predicate lets both through. The second commit then refreshes its pool under COMMIT_SECTION
+    and materialises onto the page the first writer just published. Its full-page image therefore
+    contains BOTH rows. Revalidating that newly discovered page from the transaction's older
+    snapshot would refuse incorporated history and starve under a continuous appender; validating
+    it from the durable materialisation baseline lets both commits finish without losing either.
 
-    A row write therefore declares the pages it actually lands on as well as the key it touched.
-    The second writer meets the first on that physical page and is refused retryably.  Requiring
-    the directory page here would reintroduce the false sharing CN-1 removes.
+    The exact same-page assertion is essential: without it this would only repeat the ordinary
+    disjoint-writer test and could not kill a regression back to the old page-half floor.
     """
-    from okto_grafx.domain.txn import page_partition
-
     first = make_stack()
     second = make_stack()
     table = _registered(first, _table())
@@ -463,24 +462,15 @@ def test_two_participants_inserting_from_one_old_extent_view_still_conflict(
     winner = first.manager.begin("write")
     winner.stage_row_insert(table, (1, "first"))
     winner.note_write(first.manager.partition_of(table.table_id, b"1"))
-    report = first.manager.commit(winner)
+    first_report = first.manager.commit(winner)
 
-    # The row partitions really are disjoint: the refusal below is the PAGE, not the key.
+    # The logical row partitions really are disjoint; the shared physical page is proven below.
     assert first.manager.partition_of(table.table_id, b"1") != second.manager.partition_of(
         table.table_id, b"2"
     )
-    with pytest.raises(GrafxWriteConflict) as raised:
-        second.manager.commit(loser)
-    assert raised.value.retryable is True
-    assert page_partition("heap.dat", winner.row_refs[0].page) in raised.value.details[
-        "partitions"
-    ]
-
-    successor = second.manager.retry(loser)
-    successor.stage_row_insert(table, (2, "second"))
-    successor.note_write(second.manager.partition_of(table.table_id, b"2"))
-    retried = second.manager.commit(successor)
-    assert retried.csn > report.csn
+    second_report = second.manager.commit(loser)
+    assert second_report.csn > first_report.csn
+    assert loser.row_refs[0].page == winner.row_refs[0].page
 
     reader = build_stack(second.root, owner_id="third")
     fresh = reader.manager.begin("read")

@@ -9,6 +9,7 @@ import pytest
 from okto_grafx.domain.errors import GrafxTransactionStateError, GrafxWriteConflict
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import ValueType
+from okto_grafx.domain.txn import page_partition
 from okto_grafx.domain.txn.records import WalRecordType, decode_page_write
 from okto_grafx.engine.heap_store import FIRST_RECORD_ID
 from txn_support import Stack, build_stack
@@ -155,6 +156,41 @@ def test_a_conflict_visible_before_row_planning_reserves_no_identity(tmp_path: P
 
     stored = _identities(loser, table)
     assert stored.count(2) == 1
+
+
+def test_a_pre_staged_page_zero_cannot_overwrite_its_own_later_refill() -> None:
+    """Pre-staged bytes stay on the transaction snapshot side of the OCC boundary.
+
+    The second insert needs a CN-1 refill, which durably advances heap page 0 after the first OCC
+    pass. This transaction also carries an authenticated image of the older page 0. Treating every
+    page touched after the refill as fresh would let that old staged image overwrite the durable
+    floor and make row identities reusable. The incremental old-interest pass must instead see the
+    refill as a conflict; only the private metadata COMMIT survives and the user row does not.
+    """
+    stack = build_stack(identity_lease_size=4)
+    table = _table()
+    _register(stack, table)
+    _insert(stack, table, "seed")
+
+    with stack.pool.pinned(stack.heap.file, 0) as page:
+        stale_page_zero = stack.codec.encode_page(page)
+
+    txn = stack.manager.begin("write")
+    txn.owner._stage_page_image(txn, stack.heap.file, 0, stale_page_zero)
+    txn.stage_row_insert(table, ("must-not-land",))
+    txn.note_write(stack.manager.partition_of(table.table_id, b"pre-staged-page-zero"))
+    before = len(stack.wal.records())
+
+    with pytest.raises(GrafxWriteConflict) as raised:
+        stack.manager.commit(txn)
+
+    assert raised.value.details["partitions"] == [page_partition(stack.heap.file, 0)]
+    reservation = stack.wal.records()[before:]
+    assert sum(record.record_type == WalRecordType.COMMIT for record in reservation) == 1
+    assert _page_writes(reservation) == [(stack.heap.file, 0)]
+    assert stack.heap.next_record_id(table) == 6
+    assert _identities(stack, table) == [FIRST_RECORD_ID]
+    stack.manager.rollback(txn)
 
 
 def test_an_inherited_manager_refuses_and_its_unused_range_stays_burned(

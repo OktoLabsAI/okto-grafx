@@ -1825,19 +1825,28 @@ class TransactionManager:
                         )
                     if not own_view:
                         self._own_published_lsn = None
-                    # The rows go in BEFORE validation, because the pages they land on are
-                    # part of what this commit will overwrite and therefore part of what it must
-                    # declare. Nothing of them is durable yet, and a refusal below puts them
-                    # beyond the reach of every snapshot (defect E1, carried finding CF-A).
-                    # Validation runs TWICE, and the first pass is not redundant. The pages a
-                    # row lands on are only known after the row is written, so the page half of
-                    # the interest set cannot exist before then -- but writing the row first
-                    # means the heap gets to refuse a version another participant has already
-                    # ended, and it refuses with transaction_state, which tells a caller to stop
-                    # where write_conflict would tell it to retry. Comparing what the caller
-                    # declared BEFORE touching the heap keeps a real conflict reported as one.
+                    validated_through = current
+                    # Validation has two tiers, and the first is not redundant. Caller-declared
+                    # logical interests and pre-staged pages are known now, so validate them
+                    # BEFORE touching the heap; otherwise the heap can refuse a version another
+                    # participant already ended with transaction_state, which tells a caller to
+                    # stop where write_conflict would tell it to retry. The physical pages a row
+                    # lands on are knowable only after it is materialised, so those newly
+                    # discovered interests receive their bounded second pass below. Nothing of
+                    # the provisional rows is durable yet, and a refusal abandons them beyond
+                    # the reach of every snapshot (defect E1, carried finding CF-A).
+                    # Freeze exactly what the first OCC pass proved.  Logical interests and
+                    # physical images staged before commit belong to the transaction's original
+                    # snapshot for their whole lifetime.  Only page partitions discovered by
+                    # materialising rows from the fresh view below may use a newer baseline.
+                    snapshot_interest = frozenset(
+                        txn.read_partitions | txn.write_partitions
+                    )
+                    pre_staged_pages = frozenset(txn.staged_pages())
                     with self._close_wait_hazard():
-                        conflict = self._find_conflict(txn)  # step 3.3
+                        conflict = self._find_conflict(
+                            txn, interested_partitions=snapshot_interest
+                        )  # step 3.3
                     if conflict is None:
                         identities, pending_identity_ranges = (
                             self._prepare_identity_plan(txn)
@@ -1878,7 +1887,25 @@ class TransactionManager:
                                 field="row_intents",
                                 txn_id=txn.txn_id,
                             )
+                        if current > validated_through:
+                            # A CN-1 refill is a real durable commit between the first OCC pass
+                            # and row materialisation.  Fresh heap pages may use its image as
+                            # their baseline, but caller-declared logical interests and
+                            # pre-staged pages may not.  Revalidate only that already-proved set
+                            # over the incremental interval and do not forgive the refill: a
+                            # pre-staged heap page 0 is stale relative to the new durable floor.
+                            with self._close_wait_hazard():
+                                conflict = self._find_conflict(
+                                    txn,
+                                    interested_partitions=snapshot_interest,
+                                    baseline_lsn=validated_through,
+                                )
                     rows: tuple[_RowWrite, ...] = ()
+                    # ``current`` includes an identity-floor subcommit when this attempt needed
+                    # one.  It is the durable image the heap will materialise from, not a promise
+                    # about a future image.  COMMIT_SECTION prevents a foreign publisher from
+                    # moving it while rows are being built.
+                    materialization_lsn = current
                     staging_mark = len(txn.pending_records)
                     # The mark this attempt's page set is measured against. The window opens
                     # and the reading is taken HERE, after the read view has settled and before
@@ -1902,11 +1929,18 @@ class TransactionManager:
                             # published (C5 round-2 B1).
                             with self._close_wait_hazard():
                                 rows = self._write_rows(txn, identities)
-                            self._declare_page_interest(txn, rows)
+                            materialized_pages = self._declare_page_interest(txn, rows)
+                            materialized_interest = self._materialized_page_delta(
+                                txn,
+                                snapshot_interest=snapshot_interest,
+                                pre_staged_pages=pre_staged_pages,
+                                materialized_pages=materialized_pages,
+                            )
                             with self._close_wait_hazard():
                                 conflict = self._find_conflict(
                                     txn,
-                                    ignored_commit_lsn=identities.reservation_lsn,
+                                    interested_partitions=materialized_interest,
+                                    baseline_lsn=materialization_lsn,
                                 )  # step 3.3, page half
                         if conflict is None:
                             # AFTER ordinary validation cleared and immediately before
@@ -2089,7 +2123,7 @@ class TransactionManager:
 
     def _declare_page_interest(
         self, txn: TransactionContext, rows: Sequence[_RowWrite]
-    ) -> None:
+    ) -> frozenset[tuple[str, PageIndex]]:
         """Declare interest in every page this commit is about to overwrite, then refuse silence.
 
         Two things happen here, and the second is the one defect E1 was about.
@@ -2109,16 +2143,21 @@ class TransactionManager:
         transaction with nothing to write still commits through the read-only path, and one with
         something to write must say what.
         """
+        materialized: set[tuple[str, PageIndex]] = set()
         for file, page_index in txn.staged_pages():
             txn.write_partitions.add(page_partition(file, page_index))
         for page_index in self._pages_touched_by(rows):
-            txn.write_partitions.add(page_partition(self._heap_file, page_index))
+            partition = page_partition(self._heap_file, page_index)
+            txn.write_partitions.add(partition)
+            materialized.add((self._heap_file, page_index))
         # Every page this attempt actually modified, which is a superset of the two above and
         # is the one that includes a relinked chain page. Without it two participants appending
         # to one table both rewrote the same tail page and neither conflicted, because the page
         # that carried the difference was in nobody's interest set.
         for file, page_index in self._attempt_pages():
-            txn.write_partitions.add(page_partition(file, page_index))
+            partition = page_partition(file, page_index)
+            txn.write_partitions.add(partition)
+            materialized.add((file, page_index))
         if txn.wrote and not (txn.read_partitions or txn.write_partitions):
             raise GrafxTransactionStateError(
                 "This transaction staged durable work and declared interest in no partition, so "
@@ -2130,6 +2169,54 @@ class TransactionManager:
                 page_images=len(txn.page_images),
                 row_intents=len(txn.row_intents),
             )
+        return frozenset(materialized)
+
+    def _materialized_page_delta(
+        self,
+        txn: TransactionContext,
+        *,
+        snapshot_interest: frozenset[int],
+        pre_staged_pages: frozenset[tuple[str, PageIndex]],
+        materialized_pages: frozenset[tuple[str, PageIndex]],
+    ) -> frozenset[int]:
+        """Return only physical interests legitimately discovered from the fresh commit view.
+
+        The first OCC pass freezes every interest the caller brought into commit, including
+        internal pre-staged page images.  Heap materialisation may add page partitions because
+        the target pages are unknowable before the current heap image is read.  Nothing else may
+        change either set in that window: accepting a late logical partition here would silently
+        move it from the transaction snapshot to the newer materialisation baseline, while losing
+        an earlier partition would erase a conflict the first pass was required to preserve.
+
+        Digest collisions are conservative.  A materialised page whose partition was already in
+        ``snapshot_interest`` stays on the old baseline; it is not returned as new merely because
+        this attempt reached the same numeric partition through another page.
+        """
+        current_staged_pages = frozenset(txn.staged_pages())
+        staged_drift = current_staged_pages.symmetric_difference(pre_staged_pages)
+        staged_overlap = pre_staged_pages.intersection(materialized_pages)
+        fresh_partitions = frozenset(
+            page_partition(file, page_index)
+            for file, page_index in materialized_pages - pre_staged_pages
+        )
+        current_interest = frozenset(txn.read_partitions | txn.write_partitions)
+        missing = snapshot_interest - current_interest
+        added = current_interest - snapshot_interest
+        eligible = fresh_partitions - snapshot_interest
+        if missing or added != eligible or staged_drift or staged_overlap:
+            raise GrafxTransactionStateError(
+                "The transaction interest set changed while rows were being materialised. Only "
+                "physical pages discovered from the current durable view, and never a page with "
+                "a pre-staged image, may be added after the first optimistic validation.",
+                field="transaction_interest",
+                txn_id=txn.txn_id,
+                missing=sorted(missing),
+                added=sorted(added),
+                materialized=sorted(eligible),
+                staged_drift=sorted(staged_drift),
+                staged_overlap=sorted(staged_overlap),
+            )
+        return frozenset(eligible)
 
     def _validate_staged_inputs(self, txn: TransactionContext) -> None:
         """Refuse caller-reachable durable inputs before the commit mutates a page or WAL."""
@@ -2304,25 +2391,42 @@ class TransactionManager:
         self,
         txn: TransactionContext,
         *,
-        ignored_commit_lsn: Lsn | None = None,
+        interested_partitions: frozenset[int] | None = None,
+        baseline_lsn: Lsn | None = None,
     ) -> tuple[int, ...] | None:
         """Return the partitions that make this commit conflict, or None when none do.
 
-        The predicate is the one CONTRACT.md section 8.5 step 3.3 states and nothing more: a
-        conflict exists when a COMMIT record appended after this transaction's snapshot WROTE a
-        partition this transaction read or wrote.
+        By default the predicate is the one CONTRACT.md section 8.5 step 3.3 states: a conflict
+        exists when a COMMIT record appended after this transaction's snapshot WROTE a partition
+        this transaction read or wrote.  The page-half pass supplies the strictly bounded
+        exception: only physical partitions first discovered while materialising from a newer
+        durable view are compared from that view's LSN.  Caller-declared logical interests and
+        pre-staged page images never enter through that door.
 
         Both halves matter. Dropping the read set would let a transaction that decided something
         from a row commit after that row changed underneath it. Adding the other side's READ set
         would refuse two transactions that merely looked at the same partition, which BR-6 calls
         out by name: conflict is intersection, never the existence of another writer.
         """
-        interested = txn.read_partitions | txn.write_partitions
+        interested = (
+            txn.read_partitions | txn.write_partitions
+            if interested_partitions is None
+            else interested_partitions
+        )
         if not interested:
             # Nothing to intersect with. Skipping the scan cannot change the answer, because the
             # intersection of an empty set with anything is empty.
             return None
-        floor = txn.snapshot.read_lsn
+        floor = txn.snapshot.read_lsn if baseline_lsn is None else baseline_lsn
+        if floor < txn.snapshot.read_lsn:
+            raise GrafxTransactionStateError(
+                "Optimistic validation cannot use a baseline older than the transaction's "
+                "snapshot.",
+                field="baseline_lsn",
+                txn_id=txn.txn_id,
+                baseline_lsn=floor,
+                snapshot_lsn=txn.snapshot.read_lsn,
+            )
         self._require_log_retains_from(floor + 1)
         for record in self._wal.read_from(floor + 1):
             if record.record_type != WalRecordType.COMMIT:
@@ -2331,12 +2435,6 @@ class TransactionManager:
                 # The authority on the range is this comparison, not the argument passed to
                 # read_from: a log that answers a start LSN generously must not be able to turn
                 # a commit that this transaction has already seen into a conflict.
-                continue
-            if ignored_commit_lsn is not None and record.lsn == ignored_commit_lsn:
-                # A durable identity refill is a metadata commit made on behalf of THIS attempt.
-                # The user write materialises from the page image that refill published, so it
-                # may ignore that one exact COMMIT.  A txn id, page or range would also hide a
-                # foreign writer and is deliberately not accepted here.
                 continue
             payload = CommitPayload.decode(record.payload)
             overlap = interested.intersection(payload.write_partitions)

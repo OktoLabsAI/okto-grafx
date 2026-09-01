@@ -35,9 +35,10 @@ cache somente como consumidor local de uma faixa já queimada.
    implícitos do mesmo lote.
 7. DDL e a primeira linha de uma tabela permanecem no caminho legado. Sem `TableExtent`, não há
    leasing: `HeapStore.insert` cria a extensão e avança o piso atomicamente com a primeira linha.
-8. O segundo OCC pode ignorar somente o LSN exato do subcommit de reserva desta tentativa. Não é
-   permitido ignorar txn id, página, tabela, partição ou faixa, pois isso poderia ocultar um
-   writer estrangeiro.
+8. O subcommit de reserva não recebe bypass. Interesses anteriores são revalidados no intervalo
+   que ele criou; somente páginas físicas certificadas como materializadas da visão durável já
+   posterior à reserva usam esse novo LSN como baseline. Não é permitido promover um interesse
+   lógico, uma imagem pré-staged ou uma localização não medida para esse baseline.
 
 ## Protocolo de commit
 
@@ -65,8 +66,13 @@ Esse subcommit executa, nesta ordem:
 
 Só depois dessa sequência o commit do usuário grava as linhas reservadas por
 `HeapStore.insert_reserved`, que exige extensão existente e `record_id < next_record_id` sem
-avançar novamente o piso. O segundo OCC passa a `_find_conflict` apenas o `reservation_lsn` exato;
-todos os demais commits posteriores ao snapshot continuam participando da detecção de conflito.
+avançar novamente o piso. A emenda de baseline da segunda OCC remove o bypass por
+`reservation_lsn`: interesses lógicos e páginas pré-staged congelados antes do primeiro OCC são
+revalidados incrementalmente quando a reserva avança o estado durável, inclusive contra a própria
+reserva. Assim, uma imagem pré-staged da antiga página 0 conflita em vez de poder rebaixar o piso.
+Somente páginas físicas novas, medidas durante a materialização posterior e ausentes do conjunto
+pré-staged, são validadas a partir do novo LSN durável; todos os demais interesses permanecem no
+snapshot original.
 
 Falha antes da barreira não instala faixa nem linha. Falha depois da barreira trata o subcommit
 como durável, tenta completar aplicação/publicação, queima qualquer cache local e recusa o commit
