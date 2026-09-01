@@ -607,23 +607,32 @@
   Como o gate de taxa falhou, a matriz CE-3 completa não foi iniciada; o próximo passo é somente o
   gargalo residual medido no H8, sem alterar workload, retry, tolerância ou garantias de produto.
 
-  **Probe finito F2/CN-2 implementado e publicado em 2026-09-01, sem mudança de produto.** A
-  reconciliação local e com Claude concluiu que o artefato anterior não separava o wall normal do
-  commit das duas janelas globais compatíveis com checkpoint; portanto ainda não justificava CN-2
-  nem ST-2. O consenso imutável está em
+  **Probe finito F2/CN-2 implementado, corrigido e publicado em 2026-09-01, sem mudança de
+  produto.** A reconciliação local e com Claude concluiu que o artefato anterior não separava o
+  wall normal do commit das duas janelas globais compatíveis com checkpoint; portanto ainda não
+  justificava CN-2 nem ST-2. O consenso imutável está em
   `D:\Projetos\Techridy\claude-scratch\CE3-NEXT-GATE-RECOMMENDATION.md`. O instrumento v4 foi
-  publicado em
-  `origin/perf/ce3-bounded-invalidation@321b2f02051849806d734759395d80140845da35` (tool blob
-  `d00884277bbbbf30e34023ce2bfa2f4f10ec2d78`, test blob
-  `e510c819fe440efc2b334ff63a0b42e5d912da8c`) e toca somente `tools/` e `tests/tools/`; o diff em
-  `src/` é vazio. RAW não instala hook algum e essa condição é presa por prova AST; somente H8
-  instrumenta A e B. Os 25 hooks medem, por intervalo e relógio absoluto, a seção de commit já
-  adquirida, OCC, WAL append/barrier, aplicação/publicação e checkpoint redo/flush/publicação/
-  recycle. Totais, união dos intervalos e resíduo são recomputados na validação; captura forjada,
-  contexto ausente ou resíduo incoerente falha fechado. O motor real capturou commit+checkpoint,
-  a restauração dos 25 métodos preservou as identidades originais, 171/171 testes passaram e Ruff,
-  compile, format-check e diff-check ficaram verdes; auditoria independente retornou PASS nos blobs
-  acima. Não houve alteração em OCC, WAL, durabilidade, multiwriter ou multireader.
+  publicado em `321b2f02051849806d734759395d80140845da35`, mas o primeiro run real revelou que os
+  eventos delimitadores `_coordinator_section` eram indevidamente incluídos na união de cobertura:
+  508 reconciliações pareciam conclusivas, enquanto apenas 84 permaneciam conclusivas sem esses
+  contêineres. O artefato
+  `D:\Projetos\Techridy\grafx-ce3-same10-phaseprobe-r1-60a0323\ce3-same10-phase-r1.json`
+  (SHA-256 `a37a3c3d42f2096d30b340a70fa21a8290c42c0788ee65555828b04ead7a501f`) continua válido para
+  funcionalidade e throughput, mas está invalidado para atribuição de fases e não conta como uma
+  das duas repetições do gate.
+
+  A correção fail-closed schema v5 está em
+  `origin/perf/ce3-bounded-invalidation@74e4cf77fe07ede5ee9f7dfc0939fdb33b392731` (tool blob
+  `28a03217f7de9d4c62447164f0b24210b2f957ed`, test blob
+  `b38d16acccdd854067d160c5d2d18a876e1f52d8`). Os delimitadores continuam medindo a posse da
+  seção, mas não contam como trabalho coberto; snapshot e validador aplicam a mesma regra. O único
+  hook adicional, `IndexManager.open`, cobre a transição causal de `452,309/545,582 ms` observada
+  após `WalManager.recycle`; `BufferPool.begin_read_view` foi rejeitado por medir apenas
+  `0,314/0,647 ms`. RAW não instala hooks; H8 usa 26 hooks em A e B e restaura as identidades
+  originais. O v5 rejeita as 252 capturas v4, captura commit+checkpoint no motor real, passou
+  171/171 testes, Ruff, compile, format-check e diff-check, e recebeu PASS independente nos blobs
+  finais. Os dois commits tocam somente `tools/` e `tests/tools/`; o diff em `src/` é vazio. Não
+  houve alteração em OCC, WAL, durabilidade, multiwriter ou multireader.
 
   O próximo gate permanece único e congelado: repetir **duas vezes** somente
   `same-10/per_family=5`, cada vez com pares RAW+H8 autenticados e os mesmos corpus, harness, Core,
