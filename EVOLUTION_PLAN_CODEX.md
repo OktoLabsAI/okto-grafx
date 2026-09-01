@@ -9,8 +9,21 @@
 
 ## Estado de execução — 2026-09-01
 
-- **ST-2 autorizado, implementado e certificado; o gate estrutural PF5 passou e `same-10` é o
-  próximo passo finito.**
+- **Decisão normativa de 2026-09-01 — gates de performance aposentados.** Throughput, latências,
+  RSS, CPU, contadores de syscall, o antigo piso `same-10 >= 7,5/s`, D5 e paridade temporal com
+  Ladybug continuam registrados como observações, mas não bloqueiam M-PULSE-7, compatibilidade
+  Pulse, auditoria integrada ou `0.0.1`. Toda passagem histórica deste documento que ainda diga
+  “bloqueado” por uma dessas métricas está supersedida por esta decisão. Permanecem vinculantes
+  somente os gates de qualidade: zero divergência sem explicação, corrupção, falha de WAL/
+  durabilidade, recovery/reopen, segurança de concorrência, timeout da operação semântica,
+  `verify("all")`, identidade/proveniência de fonte ou regressão funcional. O `same-10` autenticado
+  pós-ST-2 foi aceito como prova de qualidade: A `60/60`, B `194/194`, zero conflito, retry, recusa
+  ou reopen, verify live+cold limpo e geração/fonte/identidade estáveis; `4,421593/s` e CPU são
+  apenas informativos. Artefato
+  `D:\GrafxBenchEvidence\st2-same10-20260901-final-a01\ce3-same10.json`, SHA-256
+  `419d60d64747f1676210b2772b8d0efbb732d72283039aeebb4c89a59f75834c`.
+- **ST-2 autorizado, implementado e certificado; PF5 e `same-10` fecharam em qualidade, e o próximo
+  passo finito é o M-PULSE-7 sob gates exclusivamente funcionais.**
   A autorização posterior do usuário congelou dois modos públicos de
   `descriptor_revalidation`: `"strict"` permanece o padrão e revalida cada hit; `"generation"`
   é opt-in para o diretório exclusivamente gerido por Grafx/Pulse e amortiza a prova somente para
@@ -26,9 +39,9 @@
   pinados percorreu **11.357 nodeids** até 100%/exit 0; Ruff, compileall e diff-check passaram, e
   uma revisão independente concluiu `GO` sem defeito alto/médio diferencial. O contrato, prós,
   contras e critérios explícitos de quando usar/não usar cada modo estão em
-  `docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md` e CONTRACT A96. A evidência de performance
-  seguinte será rotulada por modo: o `same-10`/M-PULSE usa `generation`, configuração opt-in
-  efetivamente destinada ao Pulse; nenhum número será atribuído ao default `strict`. Para que essa
+  `docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md` e CONTRACT A96. Qualquer medição futura será
+  rotulada por modo: o Pulse usa `generation`, configuração opt-in efetivamente destinada a esse
+  deployment; nenhum número será atribuído ao default `strict`. Para que essa
   proveniência não seja apenas declaratória, o handle expõe o modo efetivo process-local pela
   propriedade read-only `Database.descriptor_revalidation`, fora da identidade persistida; o
   provider Pulse deve comparar solicitado e observado antes de admitir o handle e o runner deve
@@ -51,6 +64,24 @@
   gates e os cinco contadores invariantes, e foi verificada/PASS pelo Codex. Como
   `machine_idle_asserted=false`, esta evidência aprova somente contagens estruturais e não publica
   throughput temporal.
+- **M-PULSE-7 — primeira passagem de qualidade preservada e falso timeout do harness corrigido.**
+  O run `D:\GrafxBenchEvidence\mpulse7-quality-20260901-a01` completou os dois traces de 10.000
+  mutações e os 11 cenários de crash/recovery; auditoria independente confirmou os 11 PASS, os
+  fingerprints contra o oracle, autoridade dos 22 workers, ausência física nos dois casos de
+  privacidade e nenhum processo/lock ativo residual. O run falhou fail-closed antes do primeiro
+  caso Board e, corretamente, não gravou receipt. A causa não era consulta nem backend: no primeiro
+  worker Ladybug, importação e duas validações de autoridade ocorriam dentro do mesmo `join(30)`;
+  o preâmbulo medido levou `54,074 s`, enquanto `find_by_topic` levou `84,6 ms` no Ladybug e
+  `59,4 ms` no Grafx, com resultado e fingerprints bilaterais idênticos. Os tempos são diagnóstico,
+  não SLO. Community `perf/st2-pulse-generation@1d2a25d` introduz um handshake fail-closed: spawn,
+  autoridade integral, open, identidade e fingerprint precedem a prontidão; somente a operação
+  semântica usa os `30 s`; identidade/fingerprint finais, close e receipt permanecem obrigatórios
+  sob contenção operacional separada. Timestamps monotônicos publicados pelo filho fecham a corrida
+  de fronteira, e terminate/kill precisa comprovar a morte. Setup/finalização acima do timeout da
+  operação passam; operações lentas em Board/Pulse são encerradas. A regressão pinada do harness
+  terminou **73/73**, com py_compile, Ruff (somente E402 histórico ignorado) e diff-check limpos;
+  revisão independente não encontrou blocker. O próximo passo é somente repetir M-PULSE-7 e auditar
+  o receipt, sem matriz ou piso de performance intermediário.
 - **Passo futuro — cache/bundle autenticado da autoridade do harness M-PULSE-7 (não bloqueante para
   `0.0.1`).** A correção corrente permanece deliberadamente limitada ao protocolo de fases do
   subprocesso: pré-validação integral de autoridade, abertura, identidade e fingerprint; operação
@@ -2700,9 +2731,9 @@ uma mudança de formato ou semântica fica concentrado no Grafx, no adapter Comm
   M-PULSE-5.
 - M-PULSE-7 começa somente depois da certificação M-PULSE-6 e é exclusivamente rollout/cutover;
   não pode descobrir semântica básica faltante.
-- Dentro do pivot de performance corrente, o instrumento F1 aceito precede a medição CE-3; a
-  disposição de CE-3 precede o run M-PULSE-7 de 10.000 operações. Essa ordem não altera o gate
-  congelado.
+- A antiga precedência temporal F1 → matriz CE-3 → M-PULSE-7 foi aposentada em 2026-09-01. F1 e
+  CE-3 permanecem reproduzíveis como instrumentos, mas nenhuma taxa condiciona o run de 10.000
+  operações; M-PULSE-7 avança diretamente sob os gates de qualidade congelados.
 - A sequência vinculante é M-PULSE-5 → M-PULSE-6 → M-PULSE-7 → run integrado e auditoria →
   build/install limpo → checkpoint interativo, publicação e reinstalação de
   `okto-grafx[accel]==0.0.1` no PyPI → somente então linha `0.0.2`.
@@ -2716,6 +2747,12 @@ Nexus. A divisão corrente mantém implementação, revisão e medição em resp
 nenhum resultado delegado é integrado sem validação final do Codex e sem o gate do milestone.
 
 ### 9.7 Registro de execução e evidências
+
+**Leitura normativa do quadro:** estados temporais antigos nas linhas M-PULSE-7, CE-3, CN-2 e ST-2
+foram preservados como histórico, mas seus pisos/razões de performance não são mais blockers. O
+estado vigente é o do topo deste documento: `same-10` aceito em qualidade, harness de timeout
+corrigido em Community `1d2a25d`, regressão pinada `73/73` e M-PULSE-7 como próximo gate funcional
+único. A matriz CE-3 temporal tornou-se evidência opcional.
 
 | Marco | Estado | Evidência integrada | Validação registrada |
 |---|---|---|---|

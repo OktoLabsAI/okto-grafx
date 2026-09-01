@@ -2,6 +2,19 @@
 
 Measured numbers, with the conditions that produced them and the instruments that reproduce them.
 
+## Normative gate status — 2026-09-01
+
+Performance measurements are now **informational only**. Throughput, latency percentiles, RSS,
+CPU load, syscall counts, the former `7.5/s` floor, D5 ratios, and temporal parity with Ladybug do
+not block M-PULSE-7, Pulse compatibility, the integrated audit, or the `0.0.1` release. Historical
+thresholds and results remain below for provenance and regression analysis; any statement that they
+block a later gate is superseded by this section.
+
+The remaining release gates are quality gates: no unexplained semantic divergence, corruption,
+WAL/durability or recovery/reopen failure, concurrency safety violation, query operation timeout,
+`verify("all")` failure, source-authority/provenance mismatch, or functional regression. Performance
+can still motivate a later optimization, but cannot turn a quality-clean run red.
+
 **How to read this document.** Okto Grafx's test suite asserts *behavior*, never timings — a test
 that asserts a duration fails on a loaded machine and proves nothing on a fast one. Performance is
 measured by **instruments kept in the tree** (`tools/`), so every number here can be re-run by
@@ -319,8 +332,9 @@ at the maximum. CN-2 therefore moved the intended local durability work out of t
 fence, without changing WAL ordering or reader/writer guarantees. It did not make the whole
 checkpoint faster: median root duration increased by about 38%, the two same-SHA RAW rates differed
 by 4.02x, and normal-commit phase attribution remained inconclusive (2/62 conclusive sections).
-No throughput delta is reproducible, and every pass remained below the frozen `7.5/s` floor. The
-full CE-3 matrix and M-PULSE-7 10k run therefore remain blocked.
+No throughput delta was reproducible, and every pass remained below the former `7.5/s` floor. That
+floor was retired as a gate on 2026-09-01; these measurements are historical and no longer block
+the CE-3 instrument or the M-PULSE-7 quality run.
 
 ### ST-2 dual descriptor revalidation — accepted structural gate
 
@@ -377,11 +391,17 @@ it is not a temporal throughput result. Nexus handoff
 `hof_566e4a5333b54b55946b5dc7ad416b36` independently recomputed the hash, checkout pins, three
 gates and five invariant counters and was verified PASS.
 
-No ST-2 throughput number exists yet. Grafx's default remains `strict`; the next authenticated
-`same-10` and any later M-PULSE matrix must select and record
-`descriptor_revalidation="generation"`, because they certify the controlled Pulse deployment that
+Grafx's default remains `strict`; Pulse certification selects and records
+`descriptor_revalidation="generation"`, because it certifies the controlled Pulse deployment that
 opts into this policy. A strict control, if repeated, is a separate labelled artifact. Generation
-numbers must never be presented as default-strict numbers.
+numbers must never be presented as default-strict numbers. No temporal result is a release gate.
+
+The authenticated post-ST-2 `same-10` quality run is preserved at
+`D:\GrafxBenchEvidence\st2-same10-20260901-final-a01\ce3-same10.json` (SHA-256
+`419d60d64747f1676210b2772b8d0efbb732d72283039aeebb4c89a59f75834c`). It completed A `60/60`
+and B `194/194`, with zero conflicts, retries, refusals or reopens; live and cold verification,
+generation, source authority and storage identity were stable. Its `4.421593/s` rate and CPU values
+are recorded only as observations.
 
 ### F1, CE-3 and M-PULSE-7 gate chain
 
@@ -409,11 +429,11 @@ integration tools gate passed 136/136. The clean check-only artifact
 `ce3-checkonly-da7f5e4/ce3-check-only.json` has SHA-256
 `c2a643652caf6bd83748624f5a2808396c40c1467ae39bc190e9021242be1324` and only the expected
 `check_only_has_no_measurements` shortfall. It authenticates the instrument but contains no
-measurement. The authenticated `same-10` disposition is now recorded above. ST-2, its A96/CF-12
-contract and F4 multiprocess proof are complete, and the structural PF5 gate above passed. The
-remaining fixed order is **repeat `same-10` with authenticated `generation` -> official CE-3
-matrix -> M-PULSE-7 10k**; the latter two remain blocked until the unchanged `7.5/s` entry floor
-passes. No result exists yet for the full matrix or the 10,000-operation run.
+measurement. The authenticated `same-10` quality disposition is recorded above. ST-2, its A96/CF-12
+contract, F4 multiprocess proof and structural PF5 gate are complete. The former ordering through
+an official CE-3 performance matrix and a `7.5/s` entry floor was retired on 2026-09-01. M-PULSE-7
+now proceeds directly under the quality gates stated at the top of this document; a future CE-3
+matrix is optional performance evidence and cannot block it.
 
 ---
 
