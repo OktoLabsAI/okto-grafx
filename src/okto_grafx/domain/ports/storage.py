@@ -8,11 +8,22 @@ structurally impossible to reproduce.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, TypeAlias, runtime_checkable
 
 from okto_grafx.domain.ids import PageIndex
 
-__all__ = ["StorageDevice"]
+__all__ = [
+    "DESCRIPTOR_REVALIDATION_MODES",
+    "DescriptorRevalidationMode",
+    "StorageDevice",
+]
+
+
+DescriptorRevalidationMode: TypeAlias = Literal["strict", "generation"]
+"""How a local descriptor cache proves that a logical name still owns its handle."""
+
+DESCRIPTOR_REVALIDATION_MODES: frozenset[str] = frozenset({"strict", "generation"})
+"""The closed descriptor-revalidation vocabulary shared by config and the local adapter."""
 
 
 @runtime_checkable

@@ -65,6 +65,24 @@ def test_the_local_storage_descriptor_budget_comes_from_database_config(
         bootstrap.release_ports(registry)
 
 
+@pytest.mark.parametrize("mode", ("strict", "generation"))
+def test_descriptor_revalidation_mode_reaches_the_local_storage(
+    tmp_path: Path, mode: str
+) -> None:
+    registry = bootstrap.build_default_registry(
+        DatabaseConfig(
+            path=str(tmp_path / mode),
+            descriptor_revalidation=mode,
+        )
+    )
+    try:
+        storage = registry.get("storage")
+        assert type(storage) is LocalStorageDevice
+        assert storage.descriptor_revalidation == mode
+    finally:
+        bootstrap.release_ports(registry)
+
+
 def test_the_identity_lease_size_reaches_the_transaction_manager() -> None:
     database = bootstrap.open_database(
         DatabaseConfig(path=":memory:", identity_lease_size=17)

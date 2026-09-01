@@ -1029,15 +1029,47 @@ the repository, all of which used a fresh process for the read, passed (L23/L24:
 Measured before the fix, one parent process and one child: parent `published=5`, child publishes 17,
 parent still `[(1,)]` / `published=5`, parent commit `GrafxWriteConflict`, fresh process `[1..5]`.
 
-**Fix (C2):** `_descriptor` re-checks, on every cached hit, that the name still names the file the
-descriptor holds -- identity `(st_dev, st_ino)` from `os.stat(path)` vs `os.fstat(fd)`, which on
-Windows is the volume serial and the 64-bit file index -- and closes and reopens when it does not.
-CF-5's rename was only ever half of publication; this is the reader's half.
+**Fix (C2):** the default `descriptor_revalidation="strict"` policy makes `_descriptor` re-check, on
+every cached hit, that the name still names the file the descriptor holds -- identity
+`(st_dev, st_ino)` from `os.stat(path)` vs `os.fstat(fd)`, which on Windows is the volume serial and
+the 64-bit file index -- and closes and reopens when it does not. CF-5's rename was only ever half of
+publication; this is the reader's half.
 
 Four adapter tests had pinned the defect as the property ("the reader that opened the file before it
 happened keeps reading what it opened"): rewritten to assert the published content. One test asserted
 an unlinked file still readable through the held descriptor: now refuses missing, which is the same
 honesty. New: `tests/api/test_cross_process_visibility.py` (fails with the check reverted).
+
+### ST-2 — strict/default and generation/opt-in descriptor proofs (C0/C1/C2)
+
+CF-12 remains the baseline and the default. `DatabaseConfig.descriptor_revalidation` accepts only
+`"strict"` and `"generation"`; strict performs CF-12's identity proof at every cache hit. Generation
+keeps control, `grafx.meta` and unknown names strict and reuses a proof only for the closed canonical
+set: `heap.dat`, `catalog.dat`, valid `index/<identifier>.idx` and valid twelve-digit
+`wal/<segment>.wal`. It is a performance opt-in only for a directory exclusively managed by Grafx
+and Pulse.
+
+The adapter-global generation is process-local and not persisted. Full `invalidate(None)`, a full
+foreign refresh and a baseline-mismatch `every_file` refresh advance it. `invalidate(file)` removes
+only that file's stamp. Same-token, proved-own and valid CE-3 partial read views do not advance it.
+Bounded changed/unfenced targets still invalidate only their named stamps; `read_fresh_page` and the
+fenced page-0 CAS also reprove their one logical name before the device read.
+This is deliberately not an LSN, transaction generation or cross-process signal. Strict and
+generation participants can coexist on one format, but a strict participant does not strengthen a
+generation peer's local proofs. `":memory:"` accepts the option inertly, and a caller-supplied
+registry is validated without reconfiguring its storage adapter.
+
+The falsifiable premise is that normal Grafx operation does not republish live `heap.dat` or
+`catalog.dat` names. Directed `read_fresh_page` observations, certificates, pre-WAL validation and
+page-0 CAS checks remain the safety proofs; generation only amortizes bulk identity calls. Any
+future path that can republish a canonical paged name while peers may hold it open must add a
+directed identity proof at its fence/certificate or make that name/path fail closed to strict, with
+a counterfactual regression. Neither mode protects arbitrary external in-place mutation.
+
+No WAL ordering, OCC pass, checkpoint barrier, multiwriter/multireader rule or BR-10 horizon changes
+under ST-2. The exact whitelist, transition matrix, external-replacement risk and operator guidance
+are normative in
+[`ST2_DESCRIPTOR_REVALIDATION.md`](ST2_DESCRIPTOR_REVALIDATION.md) and CONTRACT A96.
 
 ### C9 round 3 — B5 and B6 CLOSED (coordinator)
 

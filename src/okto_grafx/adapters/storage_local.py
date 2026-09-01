@@ -79,6 +79,9 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import PageIndex
+from okto_grafx.domain.index.definition import INDEX_DIRECTORY, INDEX_FILE_SUFFIX
+from okto_grafx.domain.model.schema import is_identifier
+
 # A24: the page size vocabulary has exactly one owner. The bounds are imported rather than
 # restated, and MIN_PAGE_SIZE and MAX_PAGE_SIZE are carried here only so a reader of this module
 # resolves them to the very objects C1 defines, never to a second opinion.
@@ -88,6 +91,11 @@ from okto_grafx.domain.page import (
     MIN_PAGE_SIZE as MIN_PAGE_SIZE,
     validate_page_size,
 )
+from okto_grafx.domain.ports.storage import (
+    DESCRIPTOR_REVALIDATION_MODES,
+    DescriptorRevalidationMode,
+)
+from okto_grafx.domain.wal.segment import parse_segment_number
 
 __all__ = [
     "MAX_LOGICAL_NAME_LENGTH",
@@ -650,12 +658,19 @@ class LocalStorageDevice:
         retry_attempts: int = RETRY_ATTEMPTS,
         retry_backoff_seconds: float = RETRY_BACKOFF_SECONDS,
         create_root: bool = True,
+        descriptor_revalidation: DescriptorRevalidationMode = "strict",
     ) -> None:
         """Open a device over the directory, optionally refusing an absent root."""
         self._page_size = validate_page_size(page_size)
         self._max_open_files = _validate_positive("max_open_files", max_open_files)
         self._retry_attempts = _validate_positive("retry_attempts", retry_attempts)
         self._retry_backoff = _validate_backoff(retry_backoff_seconds)
+        self._descriptor_revalidation = _validate_descriptor_revalidation(
+            descriptor_revalidation
+        )
+        self._descriptor_generation = 0
+        self._descriptor_identity_generation: dict[str, int] = {}
+        self._generation_revalidated_handles: set[str] = set()
         self._root = _validate_root(root)
         self._lock = threading.RLock()
         self._handles: dict[str, int] = {}
@@ -810,6 +825,28 @@ class LocalStorageDevice:
         name = normalize_logical_name(file)
         with self._lock:
             return self._size(name)
+
+    @property
+    def descriptor_revalidation(self) -> DescriptorRevalidationMode:
+        """Return the immutable descriptor-identity policy selected for this device."""
+        return self._descriptor_revalidation
+
+    def invalidate_descriptor_identity(self, file: str | None = None) -> None:
+        """Forget one cached identity proof, or advance the global proof generation.
+
+        This adapter-only cache callback performs no I/O and changes no durable bytes.  A buffer
+        pool invokes it after its refusal preflight and before it writes back a refreshed view.
+        The frozen :class:`StorageDevice` port deliberately does not require this optimization.
+        """
+        if self._descriptor_revalidation == "strict":
+            return
+        name = None if file is None else normalize_logical_name(file)
+        with self._lock:
+            self._require_open()
+            if name is None:
+                self._descriptor_generation += 1
+            else:
+                self._descriptor_identity_generation.pop(name, None)
 
     def pin_descriptor(self, file: str) -> bool:
         """Best-effort reserve one descriptor-cache entry for a hot logical file.
@@ -1170,6 +1207,8 @@ class LocalStorageDevice:
             self._handles.clear()
             self._paths.clear()
             self._pinned_handles.clear()
+            self._descriptor_identity_generation.clear()
+            self._generation_revalidated_handles.clear()
             self._closed = True
 
     def close_read_only(self) -> None:
@@ -1181,6 +1220,8 @@ class LocalStorageDevice:
             self._handles.clear()
             self._paths.clear()
             self._pinned_handles.clear()
+            self._descriptor_identity_generation.clear()
+            self._generation_revalidated_handles.clear()
             self._closed = True
 
     def __enter__(self) -> LocalStorageDevice:
@@ -1673,7 +1714,13 @@ class LocalStorageDevice:
             )
         self._require_open()
         cached = self._handles.pop(name, None)
-        if cached is not None and not self._still_names(name, cached):
+        uses_generation = cached is not None and name in self._generation_revalidated_handles
+        generation_proved = (
+            uses_generation
+            and self._descriptor_identity_generation.get(name)
+            == self._descriptor_generation
+        )
+        if cached is not None and not generation_proved and not self._still_names(name, cached):
             # The directory entry moved from under the handle: another participant published
             # over this name with atomic_replace, and the cached descriptor now reads the OLD
             # file -- forever. A long-lived process that had once read control/commit.state kept
@@ -1684,8 +1731,12 @@ class LocalStorageDevice:
             with contextlib.suppress(OSError):
                 os.close(cached)
             self._paths.pop(name, None)
+            self._descriptor_identity_generation.pop(name, None)
+            self._generation_revalidated_handles.discard(name)
             cached = None
         if cached is not None:
+            if uses_generation:
+                self._descriptor_identity_generation[name] = self._descriptor_generation
             self._handles[name] = cached
             if intent == "write":
                 self._acknowledge(name)
@@ -1798,8 +1849,13 @@ class LocalStorageDevice:
         self._handles[name] = descriptor
         if path is None:
             self._paths.pop(name, None)
+            self._descriptor_identity_generation.pop(name, None)
+            self._generation_revalidated_handles.discard(name)
         else:
             self._paths[name] = path
+            if self._uses_generation_revalidation(name):
+                self._generation_revalidated_handles.add(name)
+                self._descriptor_identity_generation[name] = self._descriptor_generation
         while len(self._handles) > self._max_open_files:
             oldest = next(
                 cached_name
@@ -1848,9 +1904,30 @@ class LocalStorageDevice:
         """
         descriptor = self._handles.pop(name, None)
         self._paths.pop(name, None)
+        self._descriptor_identity_generation.pop(name, None)
+        self._generation_revalidated_handles.discard(name)
         if descriptor is not None:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
+
+    def _uses_generation_revalidation(self, name: str) -> bool:
+        """Return whether ``name`` belongs to the closed, fail-safe amortized set.
+
+        Normal live Grafx writes mutate heap/catalog pages in place; index page-zero certificates
+        and their pre-WAL checks explicitly invalidate the exact identity first; WAL segment
+        names are monotonic and BR-10 protects a live reader's horizon.  Any future path that
+        republishes one of these names while participants are open must add the same directed
+        identity fence or keep that name strict.  This premise is intentionally falsifiable.
+        """
+        if self._descriptor_revalidation != "generation":
+            return False
+        if name == "heap.dat" or name == "catalog.dat":
+            return True
+        index_prefix = f"{INDEX_DIRECTORY}/"
+        if name.startswith(index_prefix) and name.endswith(INDEX_FILE_SUFFIX):
+            index_name = name[len(index_prefix) : -len(INDEX_FILE_SUFFIX)]
+            return is_identifier(index_name)
+        return parse_segment_number("wal", name) is not None
 
     def _size(self, name: str) -> int:
         """Return the current size of a file in bytes."""
@@ -2204,6 +2281,29 @@ def _validate_backoff(value: object) -> float:
             value=value,
         )
     return min(float(value), MAX_RETRY_SLEEP_SECONDS)
+
+
+def _validate_descriptor_revalidation(value: object) -> DescriptorRevalidationMode:
+    """Return one exact descriptor policy without invoking caller-defined string hooks."""
+    if not issubclass(type(value), str):
+        raise GrafxConfigurationError(
+            "Invalid configuration for 'descriptor_revalidation': one of "
+            f"{', '.join(sorted(DESCRIPTOR_REVALIDATION_MODES))} is required. "
+            f"Got {type(value).__name__}.",
+            field="descriptor_revalidation",
+            value=type(value).__name__,
+        )
+    plain = str.__str__(value)
+    if plain == "strict":
+        return "strict"
+    if plain == "generation":
+        return "generation"
+    raise GrafxConfigurationError(
+        "Invalid configuration for 'descriptor_revalidation': one of "
+        f"{', '.join(sorted(DESCRIPTOR_REVALIDATION_MODES))} is required. Got {plain!r}.",
+        field="descriptor_revalidation",
+        value=plain,
+    )
 
 
 def as_payload(file: str, payload: object) -> bytes:

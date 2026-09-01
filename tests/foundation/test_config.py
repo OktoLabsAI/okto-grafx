@@ -14,6 +14,7 @@ from okto_grafx.runtime.config import (
     CORE_MAX_PAGE_SIZE,
     CORE_MIN_PAGE_SIZE,
     DEFAULT_OPENMETRICS_DESTINATION,
+    DESCRIPTOR_REVALIDATION_MODES,
     MAX_PAGE_SIZE,
     MAX_PARTITIONS_PER_TABLE,
     MAX_VECTOR_EF_SEARCH,
@@ -58,6 +59,29 @@ def test_defaults_match_the_contract() -> None:
         field.name for field in dataclasses.fields(DatabaseConfig)
     }
     assert config.read_only is False
+    assert config.descriptor_revalidation == "strict"
+
+
+def test_descriptor_revalidation_extends_the_positional_surface_only_at_its_tail() -> (
+    None
+):
+    """An old positional call must still bind its last argument to ``read_only``."""
+    configured = DatabaseConfig(path=":memory:", read_only=True)
+    fields = dataclasses.fields(DatabaseConfig)
+    assert tuple(field.name for field in fields[-2:]) == (
+        "read_only",
+        "descriptor_revalidation",
+    )
+
+    legacy_arguments = dataclasses.astuple(configured)[:-1]
+    legacy = DatabaseConfig(*legacy_arguments)
+    assert legacy == configured
+    assert legacy.read_only is True
+    assert legacy.descriptor_revalidation == "strict"
+
+    opted_in = DatabaseConfig(*(legacy_arguments + ("generation",)))
+    assert opted_in.read_only is True
+    assert opted_in.descriptor_revalidation == "generation"
 
 
 def test_the_config_is_a_frozen_value() -> None:
@@ -297,6 +321,16 @@ def test_every_recovery_policy_is_accepted(policy: str) -> None:
     )
 
 
+@pytest.mark.parametrize("mode", sorted(DESCRIPTOR_REVALIDATION_MODES))
+def test_every_descriptor_revalidation_mode_is_accepted(mode: str) -> None:
+    assert (
+        DatabaseConfig(
+            path=":memory:", descriptor_revalidation=mode
+        ).descriptor_revalidation
+        == mode
+    )
+
+
 @pytest.mark.parametrize("sink", sorted(METRICS_SINKS))
 def test_every_metrics_sink_is_accepted(sink: str) -> None:
     # The JSON sink writes to a file, so it is the one sink that needs a destination (A8).
@@ -325,6 +359,10 @@ def test_every_vector_math_selector_is_accepted(selector: str) -> None:
         ("metrics", 1),
         ("vector_math", "torch"),
         ("vector_math", None),
+        ("descriptor_revalidation", "always"),
+        ("descriptor_revalidation", "GENERATION"),
+        ("descriptor_revalidation", None),
+        ("descriptor_revalidation", 1),
     ],
 )
 def test_a_value_outside_an_enumerated_choice_is_rejected(
@@ -747,6 +785,7 @@ def test_configuration_canonicalizes_every_text_leaf_before_using_it() -> None:
         metrics_destination=_HostileStr("./metrics.json"),
         vector_math=_HostileStr("pure"),
         checksum=_HostileStr("pure"),
+        descriptor_revalidation=_HostileStr("generation"),
     )
 
     for field in (
@@ -756,6 +795,7 @@ def test_configuration_canonicalizes_every_text_leaf_before_using_it() -> None:
         "metrics_destination",
         "vector_math",
         "checksum",
+        "descriptor_revalidation",
     ):
         assert type(getattr(config, field)) is str
 

@@ -100,6 +100,29 @@ def reserve_header(pool: BufferPool, file: str = FILE) -> None:
         pool.unpin(file, page.page_index, dirty=True)
 
 
+class DescriptorIdentityRecordingDevice(MemoryDevice):
+    """Storage double exposing ST-2's optional, non-port cache callback."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.identity_invalidations: list[str | None] = []
+
+    def invalidate_descriptor_identity(self, file: str | None = None) -> None:
+        """Record the cache boundary without changing device bytes."""
+        self.trace.append(f"identity:{file}")
+        self.identity_invalidations.append(file)
+
+    def read_page(self, file: str, page_index: PageIndex) -> bytes:
+        """Expose device-read ordering beside the descriptor callback."""
+        self.trace.append(f"read:{file}:{page_index}")
+        return super().read_page(file, page_index)
+
+    def write_page(self, file: str, page_index: PageIndex, data: bytes) -> None:
+        """Expose write-back ordering beside the descriptor callback."""
+        self.trace.append(f"write:{file}:{page_index}")
+        super().write_page(file, page_index, data)
+
+
 def seed_pages(pool: BufferPool, count: int, *, file: str = FILE) -> list[PageIndex]:
     """Allocate and write count pages, returning their indices."""
     indices: list[PageIndex] = []
@@ -2196,3 +2219,230 @@ def test_a_read_view_dooms_a_pinned_frame_instead_of_refusing_the_begin() -> Non
     with pytest.raises(GrafxUnsupportedOperation):
         pool.invalidate()
     pool.unpin(FILE, 1)
+
+
+# --- ST-2 descriptor identity generation boundaries ------------------------------------------
+
+
+def test_descriptor_identity_callback_remains_optional_for_buffer_pool() -> None:
+    """The optimization is an adapter capability, not a new StorageDevice requirement."""
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+
+    detached = pool.read_fresh_page(FILE, 0)
+    assert detached.read_slot(0) == b"page-0"
+    pool.invalidate(FILE)
+    assert not pool.is_resident(FILE, 0)
+    pool.invalidate()
+
+
+def test_explicit_invalidate_forwards_named_and_global_descriptor_boundaries() -> None:
+    device = DescriptorIdentityRecordingDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    device.identity_invalidations.clear()
+    device.trace.clear()
+
+    pool.invalidate(FILE)
+    page = pool.pin(FILE, 0)
+    pool.unpin(FILE, 0, page=page)
+    pool.invalidate()
+
+    assert device.identity_invalidations == [FILE, None]
+
+
+@pytest.mark.parametrize("target", [FILE, None])
+def test_invalidate_advances_descriptor_boundary_before_dirty_write_back(
+    target: str | None,
+) -> None:
+    device = DescriptorIdentityRecordingDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    page = pool.pin(FILE, 0)
+    page.update_slot(0, b"locally-dirty")
+    pool.unpin(FILE, 0, dirty=True, page=page)
+    device.identity_invalidations.clear()
+    device.trace.clear()
+
+    pool.invalidate(target)
+
+    assert device.identity_invalidations == [target]
+    assert device.trace == [f"identity:{target}", f"write:{FILE}:0"]
+
+
+def test_pinned_invalidate_refuses_before_advancing_descriptor_boundary() -> None:
+    device = DescriptorIdentityRecordingDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    held = pool.pin(FILE, 0)
+    device.identity_invalidations.clear()
+    device.trace.clear()
+
+    try:
+        with pytest.raises(GrafxUnsupportedOperation):
+            pool.invalidate()
+
+        assert device.identity_invalidations == []
+        assert pool.is_resident(FILE, 0)
+    finally:
+        pool.unpin(FILE, 0, page=held)
+
+
+def test_read_view_routes_only_full_refreshes_to_the_global_descriptor_boundary() -> (
+    None
+):
+    device = DescriptorIdentityRecordingDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    device.identity_invalidations.clear()
+
+    assert pool.begin_read_view("old") is True
+    assert device.identity_invalidations == [None]
+
+    page = pool.pin(FILE, 0)
+    pool.unpin(FILE, 0, page=page)
+    device.identity_invalidations.clear()
+    assert pool.begin_read_view("old") is False  # same view: no boundary
+    assert device.identity_invalidations == []
+
+    assert pool.begin_read_view(
+        "new", changed_pages={(FILE, 0)}, expected_previous="old"
+    )
+    # CE-3 revalidates only its proved logical names; it does not advance the global generation.
+    assert device.identity_invalidations == [FILE]
+    device.identity_invalidations.clear()
+
+    page = pool.pin(FILE, 0)
+    pool.unpin(FILE, 0, page=page)
+    assert pool.begin_read_view("own", own=True) is False
+    assert device.identity_invalidations == []  # the participant's own view is retained
+
+    assert pool.begin_read_view(
+        "late", changed_pages={(FILE, 0)}, expected_previous="stale"
+    )
+    # A stale baseline has no bounded proof and therefore fails closed globally.
+    assert device.identity_invalidations == [None]
+
+
+def test_baseline_mismatch_refuses_dirty_state_before_advancing_generation() -> None:
+    device = DescriptorIdentityRecordingDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    pool.begin_read_view("old")
+    dirty = pool.pin(FILE, 0)
+    dirty.update_slot(0, b"unpublished")
+    pool.unpin(FILE, 0, dirty=True, page=dirty)
+    device.identity_invalidations.clear()
+    device.trace.clear()
+
+    with pytest.raises(GrafxUnsupportedOperation) as refused:
+        pool.begin_read_view(
+            "new", changed_pages={(FILE, 0)}, expected_previous="stale"
+        )
+
+    assert refused.value.details["field"] == "dirty"
+    assert device.identity_invalidations == []
+    assert pool.read_view_token() == "old"
+    assert pool.is_resident(FILE, 0)
+
+
+@pytest.mark.parametrize("origin", ("same", "own"))
+def test_nonadvancing_views_invalidate_only_the_unfenced_descriptor(
+    origin: str,
+) -> None:
+    device = DescriptorIdentityRecordingDevice()
+    pool = make_pool(device, RecordingMetrics())
+    reserve_header(pool, "catalog.dat")
+    pool.begin_read_view("old")
+    observed = pool.pin("catalog.dat", 0)
+    pool.unpin("catalog.dat", 0, page=observed)
+    device.identity_invalidations.clear()
+
+    if origin == "same":
+        assert pool.begin_read_view("old", unfenced_file="catalog.dat") is True
+    else:
+        assert (
+            pool.begin_read_view("own", own=True, unfenced_file="catalog.dat") is True
+        )
+
+    assert device.identity_invalidations == ["catalog.dat"]
+
+
+def test_partial_refresh_refuses_dirty_target_before_directed_invalidation() -> None:
+    device = DescriptorIdentityRecordingDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    pool.begin_read_view("old")
+    dirty = pool.pin(FILE, 0)
+    dirty.update_slot(0, b"unpublished")
+    pool.unpin(FILE, 0, dirty=True, page=dirty)
+    device.identity_invalidations.clear()
+
+    with pytest.raises(GrafxUnsupportedOperation) as refused:
+        pool.begin_read_view("new", changed_pages={(FILE, 0)}, expected_previous="old")
+
+    assert refused.value.details["field"] == "dirty"
+    assert device.identity_invalidations == []
+    assert pool.read_view_token() == "old"
+
+
+def test_foreign_full_refresh_advances_generation_before_legacy_dirty_publication() -> (
+    None
+):
+    device = DescriptorIdentityRecordingDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    dirty = pool.pin(FILE, 0)
+    dirty.update_slot(0, b"legitimate-local-work")
+    pool.unpin(FILE, 0, dirty=True, page=dirty)
+    device.identity_invalidations.clear()
+    device.trace.clear()
+
+    assert pool.begin_read_view("foreign") is True
+
+    assert device.identity_invalidations == [None]
+    assert device.trace == ["identity:None", f"write:{FILE}:0"]
+
+
+def test_read_fresh_page_revalidates_its_name_before_the_device_read() -> None:
+    device = DescriptorIdentityRecordingDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    device.identity_invalidations.clear()
+    device.trace.clear()
+
+    resident = pool.pin(FILE, 0)
+    pool.unpin(FILE, 0, page=resident)
+    assert device.trace == []  # ordinary resident hits retain the amortized proof
+
+    detached = pool.read_fresh_page(FILE, 0)
+
+    assert detached is not resident
+    assert detached.read_slot(0) == b"page-0"
+    assert device.identity_invalidations == [FILE]
+    assert device.trace == [f"identity:{FILE}", f"read:{FILE}:0"]
+
+
+def test_fenced_page_zero_write_revalidates_its_name_before_the_cas_read() -> None:
+    device = DescriptorIdentityRecordingDevice()
+    pool = make_pool(
+        device,
+        RecordingMetrics(),
+        page_sequence_fence=lambda _file, page_index: page_index == 0,
+    )
+    seed_pages(pool, 1)
+    page = pool.pin(FILE, 0)
+    page.update_slot(0, b"next-header")
+    pool.unpin(FILE, 0, dirty=True, page=page)
+    device.identity_invalidations.clear()
+    device.trace.clear()
+
+    assert pool.flush(FILE) == 1
+
+    assert device.identity_invalidations == [FILE]
+    assert device.trace == [
+        f"identity:{FILE}",
+        f"read:{FILE}:0",
+        f"write:{FILE}:0",
+    ]

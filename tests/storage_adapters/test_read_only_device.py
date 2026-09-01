@@ -102,6 +102,13 @@ class _RecordingDevice:
         raise AssertionError(f"read-only wrapper reached {operation}")
 
 
+class _RecordingIdentityDevice(_RecordingDevice):
+    """A storage port that advertises the optional cache-only invalidation capability."""
+
+    def invalidate_descriptor_identity(self, file: str | None = None) -> None:
+        self.calls.append(("invalidate_descriptor_identity", file))
+
+
 READ_CASES: tuple[
     tuple[str, Callable[[ReadOnlyStorageDevice], object], object, tuple[object, ...]], ...
 ] = (
@@ -170,6 +177,29 @@ def test_the_wrapper_satisfies_the_port_without_a_public_raw_escape() -> None:
     assert not hasattr(device, "inner")
     assert not hasattr(device, "device")
     assert not hasattr(device, "__dict__")
+
+
+@pytest.mark.parametrize(
+    "file", (None, "heap.dat"), ids=("whole-generation", "one-file")
+)
+def test_descriptor_identity_invalidation_is_forwarded_without_becoming_a_mutation(
+    file: str | None,
+) -> None:
+    inner = _RecordingIdentityDevice()
+    device = ReadOnlyStorageDevice(inner)
+
+    device.invalidate_descriptor_identity(file)
+
+    assert inner.calls == [("invalidate_descriptor_identity", file)]
+
+
+def test_missing_descriptor_identity_capability_is_a_no_op() -> None:
+    inner = _RecordingDevice()
+    device = ReadOnlyStorageDevice(inner)
+
+    device.invalidate_descriptor_identity()
+
+    assert inner.calls == []
 
 
 @pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt, SystemExit))

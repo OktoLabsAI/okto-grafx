@@ -57,7 +57,12 @@ import sys
 sys.path.insert(0, sys.argv[2])
 from okto_grafx import connect
 
-with connect(sys.argv[1], page_size=512, checkpoint_interval_records=1_000_000) as db:
+with connect(
+    sys.argv[1],
+    page_size=512,
+    checkpoint_interval_records=1_000_000,
+    descriptor_revalidation=sys.argv[3],
+) as db:
     with db.begin("write") as txn:
         txn.execute(
             "CREATE NODE TABLE Decision("
@@ -503,14 +508,19 @@ def test_same_identity_with_a_different_primary_key_never_exposes_the_loser(
         assert cold.verify("all").findings == ()
 
 
+@pytest.mark.parametrize("descriptor_revalidation", ["strict", "generation"])
 def test_foreign_durable_definition_replaces_local_speculation_before_writer_wal(
-    tmp_path: Path,
+    tmp_path: Path, descriptor_revalidation: str
 ) -> None:
     """A local DML commit must sync P before replay-floor checks can inspect Q."""
 
     root = tmp_path / "foreign-definition-writer-sync"
     source = _source_root()
-    database = connect(root, **_OPTIONS)
+    database = connect(
+        root,
+        descriptor_revalidation=descriptor_revalidation,
+        **_OPTIONS,
+    )
     loser = database.begin("write")
     writer = None
     successor = None
@@ -526,12 +536,14 @@ def test_foreign_durable_definition_replaces_local_speculation_before_writer_wal
                 _DIFFERENT_PRIMARY_KEY_CHILD,
                 str(root),
                 source,
+                descriptor_revalidation,
             ],
             capture_output=True,
             text=True,
             timeout=180,
         )
         assert child.returncode == 0, child.stderr[-2_000:]
+        assert len(database.storage.list_files("index_orphan/")) == 1
 
         # Refreshing the durable catalog may withhold P until the existing-only sync, but it
         # must never expose Q merely because P reused Q's provisional numeric id and name.
@@ -602,7 +614,11 @@ def test_foreign_durable_definition_replaces_local_speculation_before_writer_wal
         except Exception:
             pass
 
-    with connect(root, **_OPTIONS) as cold:
+    with connect(
+        root,
+        descriptor_revalidation=descriptor_revalidation,
+        **_OPTIONS,
+    ) as cold:
         assert cold.indexes.index("pk_Decision").definition.positions == (1,)
         assert set(
             cold.execute(

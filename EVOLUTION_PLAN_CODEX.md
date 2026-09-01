@@ -9,6 +9,25 @@
 
 ## Estado de execução — 2026-09-01
 
+- **ST-2 autorizado, implementado e certificado; medição `same-10` é o próximo passo finito.**
+  A autorização posterior do usuário congelou dois modos públicos de
+  `descriptor_revalidation`: `"strict"` permanece o padrão e revalida cada hit; `"generation"`
+  é opt-in para o diretório exclusivamente gerido por Grafx/Pulse e amortiza a prova somente para
+  `heap.dat`, `catalog.dat`, índices canônicos e segmentos WAL canônicos. Controle, metadata,
+  temporários, órfãos, nomes malformados e desconhecidos continuam estritos. A geração é local ao
+  adapter e não substitui OCC, WAL, lease, page-0 CAS ou BR-10; refreshes CE-3 parciais invalidam
+  apenas os nomes comprovadamente alterados, e `read_fresh_page`/CAS page 0 revalidam o alvo antes
+  da leitura física. O primeiro F4 `generation` encontrou um descritor de índice movido para
+  `index_orphan` ainda certificado; a invalidação dirigida fechou-o antes do WAL. O F4 final passou
+  `strict` e `generation`: DDL estrangeiro com recusa pre-WAL e WAL/LSN imutáveis, mais
+  checkpoint/recycle com reader pin, horizonte preservado, kill do writer sem flush e
+  `verify("all")` limpo após cold reopen. A suíte integral autenticada com os baselines Pulse
+  pinados percorreu **11.357 nodeids** até 100%/exit 0; Ruff, compileall e diff-check passaram, e
+  uma revisão independente concluiu `GO` sem defeito alto/médio diferencial. O contrato, prós,
+  contras e critérios explícitos de quando usar/não usar cada modo estão em
+  `docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md` e CONTRACT A96. A evidência de performance
+  seguinte será rotulada por modo: o `same-10`/M-PULSE usa `generation`, configuração opt-in
+  efetivamente destinada ao Pulse; nenhum número será atribuído ao default `strict`.
 - **M0 estabilização: concluído e publicado** em
   `milestone/m0-stabilization@e2d6a22da8ec2571127fc9d1533995d40330c632`. Os cinco P0
   reproduzidos, as fronteiras públicas, o primeiro open durável, read-only observacional, fencing
@@ -734,6 +753,8 @@
   `7,5/s`. A matriz CE-3 completa e o M-PULSE-7 10k permanecem bloqueados.
   O próximo survivor preexistente é ST-2, porém ele continua fora desta autorização: exige decisão
   explícita para a emenda A66.1/CF-12, prova F4 multiprocesso e nova repetição do mesmo `same-10`.
+  Essa restrição era o estado daquele gate CN-2 e foi superada apenas pela autorização explícita
+  posterior registrada no item ST-2 do topo desta seção; não há autorização retroativa implícita.
 - **O ratchet de entrada do M-PULSE-7 está certificado; ele não é o run de 10.000 operações.** No
   Community `6595abdcfa788dfa2cc8da1a53ff96c378790531` (base
   `d44c82155e9884c556813ea96dec829be567c236`, branch

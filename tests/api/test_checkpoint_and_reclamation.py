@@ -820,8 +820,12 @@ _OTHER_PROCESS = r'''
 import sys, time
 sys.path.insert(0, sys.argv[2])
 from okto_grafx import connect
-db = connect(sys.argv[1], wal_segment_bytes=65536)
-for identity in range(200, 230):
+db = connect(
+    sys.argv[1],
+    wal_segment_bytes=65536,
+    descriptor_revalidation=sys.argv[3],
+)
+for identity in range(215, 230):
     with db.begin("write") as txn:
         txn.execute(f"CREATE (:P {{id: {identity}, name: 'b'}})")
 # CE-2 keeps one deferred reader registration per participant. This process has no open
@@ -946,8 +950,9 @@ def test_checkpoint_crash_windows_preserve_the_proved_prefix(
         cold.close()
 
 
+@pytest.mark.parametrize("descriptor_revalidation", ["strict", "generation"])
 def test_a_checkpoint_never_reclaims_a_page_another_process_has_not_flushed(
-    tmp_path: Path,
+    tmp_path: Path, descriptor_revalidation: str
 ) -> None:
     """The reason the checkpoint redoes the log onto the device before it publishes.
 
@@ -958,18 +963,44 @@ def test_a_checkpoint_never_reclaims_a_page_another_process_has_not_flushed(
     copy of those pages; if that participant then crashed, its acknowledged commits would be
     gone -- loss an ordinary caller reaches, with every commit having said ``durable=True``.
 
-    So: process B commits thirty rows and holds them unflushed; process A checkpoints and
-    recycles; B is killed without ever flushing or closing; a cold reopen must still find all
-    thirty. This test reads the outcome from a third process's view of the device.
+    So: process A commits fifteen rows, a reader pins that snapshot, and process B commits fifteen
+    newer rows and holds them unflushed. Process C checkpoints and recycles only below the reader
+    horizon; B is killed without ever flushing or closing; a cold reopen must still find all
+    thirty. This test reads the outcome from a fourth participant's view of the device.
     """
     root = tmp_path / "db"
     source = str(Path(connect.__code__.co_filename).resolve().parents[1])
-    database = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
-    _schema(database)
-    database.close()
+    database = connect(
+        str(root),
+        wal_segment_bytes=SEGMENT_BYTES,
+        descriptor_revalidation=descriptor_revalidation,
+    )
+    try:
+        _schema(database)
+        for identity in range(200, 215):
+            with database.begin("write") as txn:
+                txn.execute(f"CREATE (:P {{id: {identity}, name: 'a'}})")
+    finally:
+        database.close()
+
+    reader_database = connect(
+        str(root),
+        wal_segment_bytes=SEGMENT_BYTES,
+        descriptor_revalidation=descriptor_revalidation,
+    )
+    reader = reader_database.begin("read")
+    snapshot = reader.snapshot.read_lsn
+    assert len(reader.execute("MATCH (p:P) RETURN p.id").rows) == 15
 
     other = subprocess.Popen(
-        [sys.executable, "-c", _OTHER_PROCESS, str(root), source],
+        [
+            sys.executable,
+            "-c",
+            _OTHER_PROCESS,
+            str(root),
+            source,
+            descriptor_revalidation,
+        ],
         stdout=subprocess.PIPE,
         text=True,
     )
@@ -981,18 +1012,39 @@ def test_a_checkpoint_never_reclaims_a_page_another_process_has_not_flushed(
             line = other.stdout.readline().strip()
         assert line == "COMMITTED", f"the other process did not commit: {line!r}"
 
-        checkpointer = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+        checkpointer = connect(
+            str(root),
+            wal_segment_bytes=SEGMENT_BYTES,
+            descriptor_revalidation=descriptor_revalidation,
+        )
         try:
             assert _people(checkpointer, at_least=200) == 30
+            protected = {
+                segment.name
+                for segment in checkpointer.wal.segments()
+                if segment.last_lsn > snapshot
+            }
+            assert protected, "the scenario needs WAL newer than the reader snapshot"
             report = checkpointer.checkpoint()
             assert report.recycled, "the scenario needs the checkpoint to actually reclaim"
+            assert report.reader_present is True
+            assert report.horizon_lsn == snapshot
+            assert protected <= set(report.retained)
+            assert len(reader.execute("MATCH (p:P) RETURN p.id").rows) == 15
         finally:
             checkpointer.close()
     finally:
         other.kill()
         other.wait(timeout=30)
+        if reader.active:
+            reader.rollback()
+        reader_database.close()
 
-    reopened = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    reopened = connect(
+        str(root),
+        wal_segment_bytes=SEGMENT_BYTES,
+        descriptor_revalidation=descriptor_revalidation,
+    )
     try:
         assert _people(reopened, at_least=200) == 30
         assert reopened.verify("all").findings == ()

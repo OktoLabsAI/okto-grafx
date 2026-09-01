@@ -25,7 +25,7 @@ honestly, ceilings included.
 | OS / filesystem | Windows 11 Home (10.0.26200) / NTFS |
 | Python | 3.13.1 |
 | Build | `[accel]` installed — native CRC-32C (`google-crc32c`), numpy 2.5.1 present |
-| Configuration | `connect()` defaults: `page_size=8192`, `buffer_budget_bytes=64 MiB`, `max_open_files=256`, `partitions_per_table=64`, `identity_lease_size=64`, `metrics="noop"`, `checksum="auto"` (→ native) |
+| Configuration | `connect()` defaults: `page_size=8192`, `buffer_budget_bytes=64 MiB`, `max_open_files=128`, `partitions_per_table=64`, `identity_lease_size=64`, `descriptor_revalidation="strict"`, `metrics="noop"`, `checksum="auto"` (→ native) |
 
 Cross-platform rows in §5 additionally used Ubuntu (WSL2, ext4) on the same hardware.
 
@@ -321,6 +321,34 @@ checkpoint faster: median root duration increased by about 38%, the two same-SHA
 by 4.02x, and normal-commit phase attribution remained inconclusive (2/62 conclusive sections).
 No throughput delta is reproducible, and every pass remained below the frozen `7.5/s` floor. The
 full CE-3 matrix and M-PULSE-7 10k run therefore remain blocked.
+
+### ST-2 dual descriptor revalidation — implementation gate
+
+ST-2 was explicitly authorised after the CN-2 disposition. It adds two public modes without
+changing durable bytes or concurrency semantics: `strict` remains the Grafx default and proves the
+physical identity of every cached descriptor hit; `generation` is an explicit Pulse-oriented
+performance opt-in that amortizes proofs only for a closed canonical heap/catalog/index/WAL set.
+Every control, metadata, temporary, orphan, malformed and unknown name remains strict. Full
+refreshes advance an adapter-local generation; CE-3 partial refreshes invalidate only names proved
+changed, while detached certificate reads and fenced page-0 CAS writes revalidate their exact name.
+The complete risk and deployment contract is
+[`architecture/ST2_DESCRIPTOR_REVALIDATION.md`](architecture/ST2_DESCRIPTOR_REVALIDATION.md).
+
+The first generation-mode DDL F4 exposed a real stale descriptor after another participant moved a
+speculative index to `index_orphan`; the targeted CE-3 invalidation made the subsequent proof read
+the current canonical name before any WAL append. The final DDL cells passed in both modes with the
+loser refused pre-WAL, LSN/byte counts unchanged and live/cold verification clean. The second F4
+passed in both modes with a real pinned reader, checkpoint/recycle below its horizon, all newer WAL
+segments retained, a writer killed without flushing and all 30 durable rows recovered cold.
+The full repository suite, with the pinned Pulse baselines explicitly supplied, traversed 11,357
+nodeids to 100% with exit 0. Ruff, compileall and diff-check also passed; an independent differential
+review concluded GO with no high/medium generation-only defect.
+
+No ST-2 throughput number exists yet. Provenance is frozen before measurement: Grafx's default
+remains `strict`; the next authenticated `same-10` and any later M-PULSE matrix will select and
+record `descriptor_revalidation="generation"`, because they certify the controlled Pulse
+deployment that opts into this policy. A strict control, if repeated, is a separate labelled
+artifact. Generation numbers must never be presented as default-strict numbers.
 
 ### F1, CE-3 and M-PULSE-7 gate chain
 

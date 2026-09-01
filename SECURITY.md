@@ -15,8 +15,9 @@ Do not open a public GitHub issue for a suspected vulnerability. Send a private 
 
 - the affected version and installation mode (core, `accel`, from source);
 - the operating system and filesystem;
-- the relevant configuration — buffer budget, page size, lease and timeout settings, the metrics
-  selector and destination, `allow_remote_metrics`, and whether the database is opened read-only;
+- the relevant configuration — buffer budget, page size, lease and timeout settings,
+  `descriptor_revalidation`, the metrics selector and destination, `allow_remote_metrics`, and
+  whether the database is opened read-only;
 - reproduction steps or a minimal proof of concept;
 - the security impact and the data or permissions affected;
 - any suggested mitigation, if known.
@@ -72,8 +73,27 @@ owns its own security boundary. Operators are responsible for:
 - keeping the database off shared network filesystems whose locking semantics differ from a local
   disk — the multi-process guarantees rest on the platform's locking and atomic-replace behaviour;
 - backup and restore;
+- keeping live database-file replacement, removal, restore and synchronization outside the
+  database directory, especially when `descriptor_revalidation="generation"` is selected;
 - binding, or not exposing, the optional metrics endpoint;
 - timely upgrades.
+
+`descriptor_revalidation="strict"` is the default and checks the directory identity of every cached
+descriptor hit. `"generation"` is a performance opt-in only for a database directory exclusively
+managed by Okto Grafx and the Okto Pulse processes embedding it. It amortizes identity proofs for a
+closed canonical heap/catalog/index/WAL whitelist; an out-of-protocol replacement or removal of one
+of those names can remain undetected until a directed stamp invalidation, an adapter-wide generation
+advance, or reopen. During that interval the process may read an old inode or write an inode no
+longer named by the directory. Do not use generation mode with live restore, file-level sync,
+snapshot rollback over an open directory, external rotation/replacement, uncertain directory
+provenance or a shared filesystem whose semantics are unsupported. Strict and generation processes
+can coexist, but a strict process does not strengthen another process's local generation proofs.
+
+Neither selector detects an external process modifying bytes in place without changing the
+physical file identity; that is unsupported in both modes. ST-2 changes no WAL, OCC, durability,
+multiwriter/multireader or BR-10 guarantee. See
+[`docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md`](docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md)
+for the exact whitelist, risks and use criteria.
 
 For `metrics="openmetrics"`, `allow_remote_metrics` is an exact boolean and defaults to `False`.
 Without the override, `metrics_destination` must contain a literal IP for which

@@ -74,6 +74,31 @@ def test_the_bench_satisfies_the_port_and_forwards_its_identity() -> None:
     assert bench.inner.read_log(SEGMENT, 0, len(RECORD)) == RECORD
 
 
+def test_missing_inner_descriptor_identity_capability_is_a_no_op() -> None:
+    bench = _twin()
+
+    bench.invalidate_descriptor_identity()
+
+    assert bench.trail() == ()
+
+
+def test_descriptor_identity_invalidation_reaches_a_local_inner_without_entering_the_fault_trail(
+    tmp_path: Path,
+) -> None:
+    with LocalStorageDevice(
+        tmp_path / "descriptor-generation",
+        page_size=PAGE_SIZE,
+        descriptor_revalidation="generation",
+    ) as inner:
+        bench = FaultInjectingStorageDevice(inner, seed=7)
+        before = inner._descriptor_generation
+
+        bench.invalidate_descriptor_identity()
+
+        assert inner._descriptor_generation == before + 1
+        assert bench.trail() == ()
+
+
 def test_a_simulated_crash_is_not_an_ordinary_exception() -> None:
     # The bench must survive an "except Exception" anywhere in the engine, otherwise a crash
     # test would prove nothing at all about recovery.

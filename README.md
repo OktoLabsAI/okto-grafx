@@ -548,7 +548,8 @@ refused with the field name the caller actually wrote.
 | `partitions_per_table` | `64` | Conflict granularity — more partitions, fewer false conflicts |
 | `identity_lease_size` | `64` | Burn-only row-id range reserved durably per refill; larger values reduce heap page-0 metadata commits at the cost of wider harmless gaps after close/crash |
 | `buffer_budget_bytes` | `64 MiB` | Per database, never shared; must hold at least two configured pages |
-| `max_open_files` | `256` | Local descriptor-cache budget; tune down for descriptor-constrained hosts |
+| `max_open_files` | `128` | Local descriptor-cache budget; tune down for descriptor-constrained hosts |
+| `descriptor_revalidation` | `"strict"` | `"strict"` proves every cached descriptor hit; `"generation"` amortizes proofs for a closed canonical-file whitelist and requires an exclusively Grafx/Pulse-managed directory |
 | `recovery_policy` | `"replay"` | What the pass at open is allowed to do |
 | `lease_ttl_seconds` | `5.0` | How long a writer's lease stays valid without renewal |
 | `lease_timeout_seconds` | `10.0` | How long to wait for another writer's lease |
@@ -571,6 +572,18 @@ refused with the field name the caller actually wrote.
 | `vector_exact_scan_threshold` | `4096` | Below this many candidates, search is exhaustive |
 | `vector_ef_search` | `320` | Base HNSW beam in the approximate regime; integer from 1 through 1,048,576 |
 | `read_only` | `False` | Opens without writing anything, including recovery |
+
+`descriptor_revalidation="strict"` is the safe default: on every cached hit, the local adapter
+proves that the logical name still names the physical file held by its descriptor. The opt-in
+`"generation"` mode keeps control records, `grafx.meta` and unknown names strict, but amortizes that
+proof for canonical heap, catalog, index and WAL files. It must be used only when Okto Grafx and
+Okto Pulse are the exclusive writers of the database directory. An external replacement of a
+whitelisted file can otherwise remain undetected until a directed proof of that name, a full
+generation invalidation or reopen, and a stale descriptor can read or write an inode no longer
+named by the directory. The option is inert for `":memory:"`; a caller-supplied registry is validated
+but its storage adapter is not reconfigured by it. See
+[`ST2_DESCRIPTOR_REVALIDATION.md`](docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md) for the exact
+whitelist, transition table, coexistence rules, advantages and risks.
 
 Without an override, an OpenMetrics destination must name a literal IP address that
 `ipaddress.ip_address(host).is_loopback` classifies as loopback, for example IPv4 `127/8` or IPv6 `::1`.
@@ -671,7 +684,10 @@ optional OpenMetrics endpoint. That endpoint is loopback-only by default; a call
 remote address or hostname only with `allow_remote_metrics=True`, which adds no authentication, TLS
 or firewall. Operators are responsible for filesystem permissions, access control, backup, metrics
 endpoint exposure, and for keeping the database directory off shared network filesystems whose
-locking semantics differ from a local disk.
+locking semantics differ from a local disk. A deployment that selects
+`descriptor_revalidation="generation"` must additionally keep every live rename, replacement,
+removal, restore and synchronization of database files under the Grafx/Pulse protocol; otherwise use
+the default `"strict"` mode.
 
 ---
 
@@ -685,6 +701,7 @@ locking semantics differ from a local disk.
 | `docs/specs/` | The two validated specifications this is built against |
 | `docs/architecture/CONTRACT.md` | The frozen coordination substrate: error taxonomy, on-disk formats, the commit protocol, the metric catalogue, and the Definition of Done every component is reviewed against |
 | `docs/architecture/COMPONENTS.md` | The component register, the sign-off record, and every carried finding with the measurement behind it |
+| [`docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md`](docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md) | The strict/default and generation/opt-in descriptor identity policies, exact whitelist, risks and deployment guidance |
 | `docs/architecture/LESSONS.md` | What went wrong while building this and what it taught |
 | `docs/architecture/PUNCHLIST.md` | Known gaps, written down rather than hidden |
 | [`CHANGELOG.md`](CHANGELOG.md) | What changed, per release |

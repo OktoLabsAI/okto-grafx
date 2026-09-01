@@ -62,6 +62,19 @@ including the on-disk format.
 
 ### Changed
 
+- **Descriptor identity revalidation now has a strict default and one bounded performance opt-in
+  (ST-2).** `descriptor_revalidation="strict"` retains CF-12's identity proof on every cached hit;
+  `"generation"` amortizes it only for canonical heap, catalog, valid index and valid twelve-digit
+  WAL names while control, malformed and unknown names remain strict. Full invalidations advance a
+  process-local adapter generation, file invalidation drops one stamp, and same-token, proved-own
+  and valid CE-3 partial views do not advance it. Bounded changed names, fresh certificate reads and
+  fenced page-0 CAS checks still reprove only their directed file. Generation mode requires a
+  directory exclusively managed by Grafx/Pulse because external replacement of a whitelisted name
+  may otherwise remain undetected until invalidation or reopen. Normal Grafx operation does not
+  republish live heap or catalog names; any future live paged-name republication must add a directed
+  identity proof at its fence/certificate or fail closed to strict. Memory mode is inert, custom
+  registries are not reconfigured, and WAL, OCC, durability, multiwriter/multireader and BR-10
+  semantics are unchanged.
 - **Cross-writer DDL now proves the exact physical artifact before WAL.** Index headers carry a
   non-zero artifact nonce in format v2 while v1 remains readable and is upgraded only on writable
   startup under the commit fence. Durable foreign artifacts are synchronized only after the first

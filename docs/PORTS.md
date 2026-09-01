@@ -86,10 +86,24 @@ published, and it is the one operation whose implementation genuinely differs be
 | `MemoryStorageDevice` | `adapters/storage_memory.py` | Selected by `connect(":memory:")`. **The same transactional semantics** as the local device — it is not a stub. Nothing survives the process. |
 | `FaultInjectingStorageDevice` | `adapters/storage_fault.py` | Wraps another device and refuses the *n*-th operation, reports a full device, or fails a barrier. This is how the suite proves a hostile device produces a typed refusal and never a half-written page. |
 
-**Cross-process note.** A long-lived participant caches file descriptors. `LocalStorageDevice`
-verifies that the directory entry for a name is still the file the descriptor holds — identity is
-`(st_dev, st_ino)` on both families — because a cached descriptor reading a file another process has
-since replaced answers from a file nobody can see any more.
+**Cross-process note.** A long-lived participant caches file descriptors. By default,
+`descriptor_revalidation="strict"`, `LocalStorageDevice` verifies on every cached hit that the
+directory entry for a name is still the physical file the descriptor holds. This prevents a
+descriptor from silently continuing on a file another process has replaced or removed.
+
+`descriptor_revalidation="generation"` is an explicit performance opt-in. It keeps control,
+`grafx.meta`, malformed and unknown names strict and amortizes proofs only for a closed whitelist:
+`heap.dat`, `catalog.dat`, canonical `index/<identifier>.idx` names and canonical twelve-digit
+`wal/<segment>.wal` names. Its adapter-global generation advances on `invalidate(None)`, a full
+foreign refresh and a CE-3 baseline-mismatch `every_file` refresh. `invalidate(file)` removes only
+that file's proof; same-token, proved-own and valid bounded CE-3 partial views do not advance it.
+The bounded paths may still remove only the exact changed/unfenced names' stamps, and
+`read_fresh_page` plus a fenced page-0 CAS reprove their one name before the device read; those are
+directed checks, not global advancement.
+Because an external replacement of a whitelisted file can therefore remain undetected, use the
+mode only in a directory exclusively managed by Grafx/Pulse. The complete contract, exact grammar,
+risks, coexistence and selection guidance are in
+[`architecture/ST2_DESCRIPTOR_REVALIDATION.md`](architecture/ST2_DESCRIPTOR_REVALIDATION.md).
 
 ---
 
@@ -315,6 +329,12 @@ class CountingMetrics:
    API.
 6. **Be deterministic where the engine depends on order.** `list_files` must return a stable order;
    an index walk must answer identically across two runs over one file.
+7. **Own descriptor identity semantics.** `descriptor_revalidation` configures only the shipped
+   `LocalStorageDevice`; it is not a new member of the frozen `StorageDevice` protocol. A custom
+   adapter remains responsible for ensuring that a cached logical name observes the current file.
+   It may optionally implement
+   `invalidate_descriptor_identity(file: str | None = None)` to consume buffer-pool cache signals;
+   a wrapper preserving this optimization must forward that optional call.
 
 ---
 
@@ -354,6 +374,11 @@ except GrafxPortNotConfigured as refused:
 
 Every missing slot is named in **one** error, so the composition is fixed once rather than one
 `connect()` at a time.
+
+Passing `descriptor_revalidation=` together with a caller-owned registry still validates the
+configuration value, but it does not reach into or reconfigure `registry.get("storage")`. Construct
+the custom adapter with its intended policy yourself. `connect(":memory:")` also accepts the option,
+but it is operationally inert because `MemoryStorageDevice` has no OS descriptor identity.
 
 ### Inspecting a composition safely
 

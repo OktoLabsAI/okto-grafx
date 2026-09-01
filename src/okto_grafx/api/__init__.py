@@ -57,9 +57,11 @@ def connect(
     Every keyword after it is a field of
     :class:`okto_grafx.runtime.config.DatabaseConfig` -- ``page_size``, ``partitions_per_table``,
     ``identity_lease_size``, ``buffer_budget_bytes``, ``recovery_policy``, ``metrics``,
-    ``vector_math``, ``read_only`` and the rest -- and an unknown one is refused by name rather
-    than ignored, because a mistyped option that is silently dropped is a configuration a caller
-    believes it applied.
+    ``vector_math``, ``read_only``, ``descriptor_revalidation`` and the rest -- and an unknown
+    one is refused by name rather than ignored, because a mistyped option that is silently
+    dropped is a configuration a caller believes it applied. Descriptor revalidation defaults
+    to ``"strict"``; the ``"generation"`` opt-in is for a local directory exclusively managed
+    by Grafx/Pulse and is documented in ``ST2_DESCRIPTOR_REVALIDATION.md``.
 
     ``registry`` composes the database over adapters the caller built. The default is None, which
     builds the adapters the configuration selects; either way every required port slot is

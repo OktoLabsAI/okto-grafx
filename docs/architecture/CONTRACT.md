@@ -398,7 +398,7 @@ class DatabaseConfig:
     partitions_per_table: int = 64         # calibrated by FR-15, frozen in calibration.json
     identity_lease_size: int = 64          # local burn-only slice; not a format field
     buffer_budget_bytes: int = 64 * 1024 * 1024
-    max_open_files: int = 256              # local descriptor-cache budget; not a format field
+    max_open_files: int = 128              # local descriptor-cache budget; not a format field
     recovery_policy: str = "replay"        # "replay" (DEFAULT) | "refuse"
     lease_ttl_seconds: float = 5.0
     lease_timeout_seconds: float = 10.0
@@ -420,6 +420,7 @@ class DatabaseConfig:
     vector_exact_scan_threshold: int = 4096   # calibrated (SPEC-VEC FR-5/FR-8)
     vector_ef_search: int = 320                # calibrated HNSW beam, 1..1_048_576
     read_only: bool = False
+    descriptor_revalidation: str = "strict"  # "strict" | "generation"; local adapter policy
 
 class PortRegistry:
     """Fail-closed (G5). Every required slot must be bound before open_database returns."""
@@ -436,6 +437,13 @@ in-place. A registry passed by the caller stays caller-owned after `Database.clo
 released by that caller. Marked Python examples in `README.md` and `docs/PORTS.md` are executed by
 `tests/foundation/test_public_adapter_docs.py`, while the 53 frozen port signatures remain pinned by
 `tests/foundation/test_port_signatures.py`.
+
+**ST-2 — descriptor revalidation selector.** `descriptor_revalidation` is one exact built-in string:
+`"strict"` (default) or `"generation"`. It is not persisted and is not a format field. With the
+default registry it configures `LocalStorageDevice`; with `":memory:"` it is validated but inert.
+A caller-supplied registry is never reconfigured by this option: its storage adapter owns its own
+cache semantics. The frozen `StorageDevice` signature set remains unchanged. Amendment A96 and
+`ST2_DESCRIPTOR_REVALIDATION.md` define the complete transition, whitelist and deployment contract.
 
 **P1.15 / Fase 1.4 — OpenMetrics bind contract (CLOSED).** `allow_remote_metrics` is an exact
 built-in `bool`, defaults to `False`, and may be `True` only when `metrics == "openmetrics"`.
@@ -2342,6 +2350,61 @@ runtime result shape.
   a battery whose root is a private fork cannot disturb the shared tree and must not block a reading
   of it. Where a root cannot be determined, fail closed and treat the tree as busy (A53), because an
   unattributable mutator is exactly the case the check exists for.
+
+* **A96 (ST-2 DECISION — descriptor identity has a strict default and one bounded amortized
+  mode).** `DatabaseConfig.descriptor_revalidation` has the closed vocabulary `"strict"` and
+  `"generation"`; `"strict"` is the default. Strict mode compares the cached descriptor's physical
+  identity with the logical name's current directory entry on every hit. Generation mode may reuse
+  one identity proof only for this fail-closed set: `heap.dat`, `catalog.dat`,
+  `index/<identifier>.idx` for a valid 1..128-character ASCII Grafx identifier, and
+  `wal/<twelve ASCII digits>.wal` for segment 1..999999999999. Every control record, `grafx.meta`,
+  temporary, orphan, malformed, nested or unknown name stays strict. Configuration cannot widen the
+  set.
+
+  The generation is adapter-global but process-local and non-persistent; it is not an LSN, CSN,
+  lease epoch, transaction generation or read-view token. It advances once, after refusal
+  preflight and before possible dirty write-back/frame removal, for `invalidate(None)`, the full
+  foreign-refresh path, and a CE-3 expected-baseline mismatch that takes the clean-only
+  `every_file=True` path. `invalidate(file)` does not advance it and invalidates only that file's
+  proof stamp. Same-token, proved-own and valid bounded CE-3 partial views NEVER advance the global
+  generation. A same-token or own view with no unfenced target changes no stamp; an unfenced target
+  invalidates only its own stamp. A valid bounded CE-3 partial view invalidates only the exact names
+  in its changed-page, changed-file and unfenced-file targets, after dirty refusal preflight.
+  `read_fresh_page(file, page)` and the fenced page-0 write CAS likewise invalidate only `file`
+  before their device read. Closing the adapter discards all proofs.
+
+  **Falsifiable premise.** Normal Grafx operation does not republish `heap.dat` or `catalog.dat`
+  under their live logical names. Directed `read_fresh_page` reads, page/header certificates,
+  pre-WAL validation and page-0 CAS checks remain the operation-specific safety proofs, including
+  directed descriptor revalidation at the fence where a path requires it; generation amortizes
+  only the bulk cache-hit proof. Any future path capable of republishing or rebinding ANY canonical
+  paged name while participants may hold it open MUST, before shipping, either add a directed
+  descriptor-identity proof to the corresponding fence/certificate before read or write-back, or
+  make that name/path decline to strict revalidation. A counterfactual regression must prove the
+  selected branch. A live republication path that does neither violates A96.
+
+  Generation mode is permitted only for a directory exclusively managed by Grafx and Pulse while
+  any participant is open. An external rename, replacement or removal of a whitelisted name after
+  it was proved can remain undetected until its stamp is invalidated, the adapter-wide generation
+  advances, or the adapter reopens; if none occurs, the delay is unbounded. During that interval a
+  cached descriptor can read an old inode or write an inode no longer named by the directory. Live
+  restore, file synchronization, manual replacement and snapshot rollback over an open database
+  therefore require strict mode or, preferably, all participants closed. Neither mode detects an
+  external in-place write to the same inode; such mutation is outside the storage contract.
+
+  Mode selection is local and not persisted, so strict and generation participants can coexist on
+  one format. A strict participant does not advance or strengthen another process's generation
+  proofs; the exclusive-directory precondition applies whenever any participant selects
+  generation. For `":memory:"` the selector is accepted but inert. When a caller supplies a
+  registry, the selector is validated but MUST NOT reconfigure its storage adapter. The frozen
+  storage port gains no required method;
+  `invalidate_descriptor_identity(file: str | None = None)` is an optional cache-only adapter
+  capability.
+
+  ST-2 changes no durable byte and does not weaken or replace either OCC pass, WAL append/barrier
+  order, checkpoint durability, writer fencing, multiwriter/multireader coordination or BR-10 WAL
+  retention/recycling. The complete operator-facing pros, cons and when-to-use/when-not-to-use
+  guidance is `docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md`.
 
 ---
 

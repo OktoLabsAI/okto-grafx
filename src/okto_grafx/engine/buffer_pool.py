@@ -522,6 +522,10 @@ class BufferPool:
         writes, evicts, or changes a cache epoch.
         """
         _require_page_index("page_index", page_index)
+        # A fresh cross-process certificate must also be fresh with respect to the directory
+        # entry.  In generation mode this targeted invalidation keeps page-0 OCC and speculative
+        # index artifact validation from certifying an inode another participant moved aside.
+        self._invalidate_descriptor_identity(file)
         return self._read_page(file, page_index)
 
     @_guarded
@@ -1100,6 +1104,20 @@ class BufferPool:
                     page=page_index,
                 )
 
+        changed_names = files | {file for file, _page_index in pages}
+        if every_file:
+            # A baseline mismatch is a full refresh even though its clean-only path does not
+            # call _invalidate(None).  Advance the optional local descriptor proof only after
+            # every dirty refusal has passed and before any frame can leave the old view.
+            self._invalidate_descriptor_identity(None)
+        else:
+            # A bounded WAL delta does not advance the global generation.  It does, however,
+            # prove exactly which logical names changed.  Reprove only those names before their
+            # frames move so a canonical index displaced by another speculative participant
+            # cannot keep serving its now-orphaned descriptor into pre-WAL validation.
+            for changed_name in sorted(changed_names):
+                self._invalidate_descriptor_identity(changed_name)
+
         dropped = 0
         for key in target_keys:
             resident = self._frames.get(key)
@@ -1123,7 +1141,6 @@ class BufferPool:
         if every_file:
             self._bump_every_file_drop_epoch()
         else:
-            changed_names = files | {file for file, _page_index in pages}
             for file in sorted(changed_names):
                 self._bump_drop_epoch(file)
         if dropped:
@@ -1303,6 +1320,10 @@ class BufferPool:
                         page=page_index,
                         pins=frame.pins,
                     )
+        # A generation-mode local adapter must prove a replaced inode before any dirty frame is
+        # written back through its cached descriptor.  The preflight above remains atomic: a
+        # pinned refusal does not move either frames or descriptor identity state.
+        self._invalidate_descriptor_identity(file)
         for (name, page_index), frame in targets:
             if frame.pins:
                 frame.doomed = True
@@ -1333,6 +1354,12 @@ class BufferPool:
         else:
             self._bump_drop_epoch(file)
         self._report_usage()
+
+    def _invalidate_descriptor_identity(self, file: str | None) -> None:
+        """Invoke the adapter-only descriptor cache capability when one is present."""
+        invalidate = getattr(self._storage, "invalidate_descriptor_identity", None)
+        if callable(invalidate):
+            invalidate(file)
 
     # --- internals ---------------------------------------------------------------------------
 
@@ -1490,6 +1517,10 @@ class BufferPool:
                         page=page_index,
                         retryable=False,
                     )
+                # The page-zero CAS is a correctness fence, not a bulk traversal.  Reprove the
+                # exact logical name before comparing its device clock so a detached old inode
+                # cannot validate a write whose namespace now points somewhere else.
+                self._invalidate_descriptor_identity(file)
                 fresh = self._read_page(file, page_index)
                 if fresh.seq != frame.device_base_seq:
                     raise GrafxUnsupportedOperation(

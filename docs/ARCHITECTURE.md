@@ -307,6 +307,16 @@ Takeover is explicit: a coordinator that finds a lease whose owner is not live r
 refused. Liveness is measured on a **monotonic** clock, so a wall-clock adjustment cannot make a live
 writer look dead.
 
+The local storage adapter separately proves that a cached descriptor still belongs to its logical
+name. `descriptor_revalidation="strict"` is the default and performs that proof on every hit.
+`"generation"` is an opt-in for an exclusively Grafx/Pulse-managed directory: it amortizes the
+proof only for a fail-closed canonical heap/catalog/index/WAL whitelist, while all control records
+stay strict. Its adapter-local generation advances only at full invalidation boundaries; same-token,
+own-publication and valid bounded CE-3 partial views do not advance it. This cache policy does not
+change WAL, either OCC pass, durability, multi-process coordination or BR-10. See
+[`architecture/ST2_DESCRIPTOR_REVALIDATION.md`](architecture/ST2_DESCRIPTOR_REVALIDATION.md) for
+the exact transition and risk contract.
+
 ### Between threads of one process
 
 - **The participant section** is re-entrant and process-wide: the threads of one participant take
@@ -419,5 +429,7 @@ that made a heap unreadable needed all three to be false at once.
 - `docs/architecture/CONTRACT.md` — the normative, frozen substrate.
 - `docs/architecture/COMPONENTS.md` — the register, the sign-offs, every carried finding with its
   measurement.
+- [`architecture/ST2_DESCRIPTOR_REVALIDATION.md`](architecture/ST2_DESCRIPTOR_REVALIDATION.md) —
+  descriptor identity policy, exact generation whitelist and deployment trade-offs.
 - `docs/architecture/LESSONS.md` — what went wrong here and what it taught.
 - `docs/architecture/PUNCHLIST.md` — the known gaps.

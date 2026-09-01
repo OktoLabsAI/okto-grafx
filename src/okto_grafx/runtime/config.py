@@ -15,6 +15,10 @@ from okto_grafx.domain.errors import GrafxConfigurationError
 from okto_grafx.domain.page import MAX_PAGE_SIZE as CORE_MAX_PAGE_SIZE
 from okto_grafx.domain.page import MIN_PAGE_SIZE as CORE_MIN_PAGE_SIZE
 from okto_grafx.domain.page import validate_page_size
+from okto_grafx.domain.ports.storage import (
+    DESCRIPTOR_REVALIDATION_MODES,
+    DescriptorRevalidationMode,
+)
 from okto_grafx.domain.vector.hnsw import DEFAULT_EF_SEARCH, MAX_EF_SEARCH
 from okto_grafx.engine.catalog_store import MINIMUM_FRAMES as CATALOG_FRAMES
 from okto_grafx.engine.heap_store import MINIMUM_FRAMES as HEAP_FRAMES
@@ -29,6 +33,7 @@ __all__ = [
     "MAX_VECTOR_EF_SEARCH",
     "DEFAULT_MAX_OPEN_FILES",
     "MINIMUM_STORE_FRAMES",
+    "DESCRIPTOR_REVALIDATION_MODES",
     "RECOVERY_POLICIES",
     "METRICS_SINKS",
     "VECTOR_MATH_SELECTORS",
@@ -272,6 +277,7 @@ class DatabaseConfig:
     vector_exact_scan_threshold: int = 4096
     vector_ef_search: int = DEFAULT_EF_SEARCH
     read_only: bool = False
+    descriptor_revalidation: DescriptorRevalidationMode = "strict"
 
     def __post_init__(self) -> None:
         """Reject any unusable field with a GrafxConfigurationError that names it."""
@@ -378,6 +384,7 @@ class DatabaseConfig:
             ("metrics", METRICS_SINKS),
             ("vector_math", VECTOR_MATH_SELECTORS),
             ("checksum", CHECKSUM_SELECTORS),
+            ("descriptor_revalidation", DESCRIPTOR_REVALIDATION_MODES),
         ):
             object.__setattr__(
                 self, field, _require_choice(field, getattr(self, field), choices)

@@ -43,6 +43,12 @@ class ReadOnlyStorageDevice:
         """Return the wrapped device's page size unchanged."""
         return self.__device.page_size
 
+    def invalidate_descriptor_identity(self, file: str | None = None) -> None:
+        """Forward the optional cache-only descriptor identity invalidation capability."""
+        invalidate = getattr(self.__device, "invalidate_descriptor_identity", None)
+        if callable(invalidate):
+            invalidate(file)
+
     def exists(self, file: str) -> bool:
         """Return whether ``file`` exists, preserving the wrapped observation."""
         return self.__device.exists(file)

@@ -298,6 +298,7 @@ def open_quarantine_inventory(config: DatabaseConfig) -> QuarantineInventoryRead
         config.path,
         page_size=config.page_size,
         create_root=False,
+        descriptor_revalidation=config.descriptor_revalidation,
     )
     try:
         # This is the authoritative identity classification expressed without constructing a
@@ -386,6 +387,7 @@ def build_storage(context: PortContext) -> object:
         page_size=config.page_size,
         max_open_files=config.max_open_files,
         create_root=not config.read_only,
+        descriptor_revalidation=config.descriptor_revalidation,
     )
 
 

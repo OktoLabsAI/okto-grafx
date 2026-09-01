@@ -665,6 +665,12 @@ class FaultInjectingStorageDevice:
 
     # --- lifecycle ----------------------------------------------------------------------
 
+    def invalidate_descriptor_identity(self, file: str | None = None) -> None:
+        """Forward the optional cache-only identity invalidation outside the fault trail."""
+        invalidate = getattr(self._inner, "invalidate_descriptor_identity", None)
+        if callable(invalidate):
+            invalidate(file)
+
     def close(self) -> None:
         """Close the wrapped device when it has something to close."""
         closer = getattr(self._inner, "close", None)
