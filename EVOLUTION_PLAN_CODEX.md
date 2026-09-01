@@ -51,6 +51,23 @@
   gates e os cinco contadores invariantes, e foi verificada/PASS pelo Codex. Como
   `machine_idle_asserted=false`, esta evidência aprova somente contagens estruturais e não publica
   throughput temporal.
+- **Passo futuro — cache/bundle autenticado da autoridade do harness M-PULSE-7 (não bloqueante para
+  `0.0.1`).** A correção corrente permanece deliberadamente limitada ao protocolo de fases do
+  subprocesso: pré-validação integral de autoridade, abertura, identidade e fingerprint; operação
+  semântica sob os `30 s` reais; e pós-validação, fingerprint e fechamento, com todas as fases
+  fail-closed. Não será introduzido agora um cache/bundle do catálogo de autoridade, pois ele não é
+  necessário para desbloquear o gate e ampliaria a superfície de segurança. Em evolução futura,
+  pode-se evitar que cada `spawn` releia e recompile o catálogo produtivo completo por meio de um
+  bundle canônico, imutável e content-addressed produzido pelo supervisor. Qualquer implementação
+  deverá autenticar bytes e forma canônica, vincular o digest ao `process_authority` esperado,
+  recomputar hashes/contagens do catálogo, validar raízes, revisions e worktrees, ativar o audit hook
+  para imports anteriores e posteriores, falhar sem fallback diante de chave/cache divergente e
+  executar rebuild integral no supervisor ao final. Os testes mínimos incluem adulteração de byte,
+  catálogo, resumo, raiz e HEAD; entradas ausentes, duplicadas ou com escape de caminho; import
+  divergente antes/depois da ativação; modificação TOCTOU persistente; e preservação dos PIDs
+  isolados e do digest de autoridade em Board/Pulse. Essa otimização é de custo operacional do
+  harness, não gate de performance, não muda o watchdog semântico e não condiciona a compatibilidade
+  Pulse, a auditoria integrada ou a publicação conjunta de `0.0.1`.
 - **M0 estabilização: concluído e publicado** em
   `milestone/m0-stabilization@e2d6a22da8ec2571127fc9d1533995d40330c632`. Os cinco P0
   reproduzidos, as fronteiras públicas, o primeiro open durável, read-only observacional, fencing
