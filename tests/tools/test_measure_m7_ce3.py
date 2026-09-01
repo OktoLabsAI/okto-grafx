@@ -205,7 +205,7 @@ def _phase_capture(started: int, ended: int, section_id: int) -> dict[str, objec
     root_ms = (ended - started) / 1e6
     context_ms = (context_ended - context_started) / 1e6
     child_ms = (child_ended - child_started) / 1e6
-    covered_ms = context_ms
+    covered_ms = child_ms
     residual_ms = root_ms - covered_ms
     residual_ratio = residual_ms / root_ms
     body_residual_ms = context_ms - child_ms
@@ -736,7 +736,7 @@ def test_failed_post_cleanup_write_cannot_leave_an_official_pending_artifact(
 
 
 def test_frozen_matrix_and_pins_are_literal() -> None:
-    assert ce3.SCHEMA == "okto-grafx.ce3-m7-multiprocess.v4"
+    assert ce3.SCHEMA == "okto-grafx.ce3-m7-multiprocess.v5"
     assert ce3.MAX_OPERATION_ATTEMPTS == 60
     assert ce3.EXPECTED_OPERATION_SET_SHA256 == (
         "c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81"
@@ -1383,8 +1383,17 @@ def test_phase_probe_records_only_nested_commit_work_and_reconciles_it(
     context_event = next(
         event for event in captured["events"] if event["phase"] == "Fake.section"
     )
+    phase_event = next(
+        event for event in captured["events"] if event["phase"] == "Fake.phase"
+    )
     assert context_event["started_at_ns"] >= boundary["entered_at_ns"]
     assert context_event["ended_at_ns"] <= boundary["exited_at_ns"]
+    assert captured["sections"][0]["covered_ms"] == pytest.approx(
+        phase_event["inclusive_ms"]
+    )
+    assert captured["sections"][0]["commit_section"]["covered_ms"] == pytest.approx(
+        phase_event["inclusive_ms"]
+    )
 
 
 def test_phase_probe_installs_on_the_real_engine_and_captures_auto_checkpoint() -> None:

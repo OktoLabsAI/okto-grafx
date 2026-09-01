@@ -46,7 +46,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable, Mapping, Sequence
 
-SCHEMA = "okto-grafx.ce3-m7-multiprocess.v4"
+SCHEMA = "okto-grafx.ce3-m7-multiprocess.v5"
 PINNED_HARNESS_HEAD = "0dfb5269dd8531fd4db2679fc80b649c64bd9b09"
 PINNED_HARNESS_BLOB = "a02b86dce098ceec3fdbd10a820a4dd6f9e2a7b1"
 EXPECTED_OPERATION_SET_SHA256 = (
@@ -110,6 +110,7 @@ PHASE_PROBE_TARGETS = (
     ("okto_grafx.engine.index_manager", "IndexManager", "table_watermark_photo"),
     ("okto_grafx.engine.index_manager", "IndexManager", "check_replay_floor"),
     ("okto_grafx.engine.index_manager", "IndexManager", "mark_built_through"),
+    ("okto_grafx.engine.index_manager", "IndexManager", "open"),
     ("okto_grafx.engine.txn_manager", "TransactionManager", "_release_reader"),
     ("okto_grafx.engine.txn_manager", "TransactionManager", "_drop_lease"),
 )
@@ -209,7 +210,8 @@ class _SectionPhaseProbe:
     The probe lives entirely in this measurement process.  It neither registers product metrics
     nor changes the RAW pass.  Absolute ``perf_counter_ns`` stamps use the same clock already used
     to correlate process A and B, while ``section_id`` groups nested events without pretending
-    inclusive durations are additive.
+    inclusive durations are additive.  Coordinator-context events delimit held intervals; they
+    are never counted as covered work because doing so would hide every unmeasured child phase.
     """
 
     def __init__(self) -> None:
@@ -411,6 +413,9 @@ class _SectionPhaseProbe:
                 event["inclusive_ms"]
             )
         sections: list[dict[str, Any]] = []
+        context_phase = _phase_name(
+            PHASE_PROBE_CONTEXT_TARGET[1], PHASE_PROBE_CONTEXT_TARGET[2]
+        )
         for root in (event for event in events if event["root"]):
             children = [
                 event
@@ -419,8 +424,11 @@ class _SectionPhaseProbe:
                 and event["scope"] == root["scope"]
                 and event["section_id"] == root["section_id"]
             ]
+            coverage_children = [
+                event for event in children if event["phase"] != context_phase
+            ]
             covered = self._union_ns(
-                children,
+                coverage_children,
                 lower=int(root["started_at_ns"]),
                 upper=int(root["ended_at_ns"]),
             )
@@ -441,11 +449,7 @@ class _SectionPhaseProbe:
             commit_contexts = [
                 event
                 for event in children
-                if event["phase"]
-                == _phase_name(
-                    PHASE_PROBE_CONTEXT_TARGET[1], PHASE_PROBE_CONTEXT_TARGET[2]
-                )
-                and event.get("detail") == "commit"
+                if event["phase"] == context_phase and event.get("detail") == "commit"
             ]
             if commit_contexts:
                 context = max(
@@ -454,9 +458,8 @@ class _SectionPhaseProbe:
                         int(event["ended_at_ns"]) - int(event["started_at_ns"])
                     ),
                 )
-                body_children = [event for event in children if event is not context]
                 body_covered = self._union_ns(
-                    body_children,
+                    coverage_children,
                     lower=int(context["started_at_ns"]),
                     upper=int(context["ended_at_ns"]),
                 )
@@ -2287,6 +2290,9 @@ def _phase_probe_capture_valid(
             return False
     if len(sections) != len(roots):
         return False
+    context_phase = _phase_name(
+        PHASE_PROBE_CONTEXT_TARGET[1], PHASE_PROBE_CONTEXT_TARGET[2]
+    )
     section_keys: set[tuple[str, int]] = set()
     for section in sections:
         if not isinstance(section, Mapping):
@@ -2321,11 +2327,14 @@ def _phase_probe_capture_valid(
             and event["scope"] == root["scope"]
             and event["section_id"] == root["section_id"]
         ]
+        coverage_children = [
+            event for event in children if event["phase"] != context_phase
+        ]
         root_started = int(root["started_at_ns"])
         root_ended = int(root["ended_at_ns"])
         root_duration = root_ended - root_started
         covered = _SectionPhaseProbe._union_ns(
-            children, lower=root_started, upper=root_ended
+            coverage_children, lower=root_started, upper=root_ended
         )
         residual = max(0, root_duration - covered)
         expected_ratio = residual / root_duration if root_duration else 0.0
@@ -2342,9 +2351,7 @@ def _phase_probe_capture_valid(
         commit_contexts = [
             event
             for event in children
-            if event["phase"]
-            == _phase_name(PHASE_PROBE_CONTEXT_TARGET[1], PHASE_PROBE_CONTEXT_TARGET[2])
-            and event.get("detail") == "commit"
+            if event["phase"] == context_phase and event.get("detail") == "commit"
         ]
         if len(commit_contexts) > 1:
             return False
@@ -2362,7 +2369,7 @@ def _phase_probe_capture_valid(
         body_ended = int(context["ended_at_ns"])
         body_duration = body_ended - body_started
         body_covered = _SectionPhaseProbe._union_ns(
-            [event for event in children if event is not context],
+            coverage_children,
             lower=body_started,
             upper=body_ended,
         )
