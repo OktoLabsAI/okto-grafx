@@ -160,6 +160,12 @@ otherwise compensate for a generation participant's process-local proofs. If any
 uses `generation`, the directory must satisfy the exclusive Grafx/Pulse ownership requirements for
 that participant.
 
+The open `Database` handle exposes the effective process-local choice through the read-only
+`database.descriptor_revalidation` property. Hosts should compare this observed value with their
+requested policy before pooling or publishing the handle. It is intentionally absent from
+`Database.identity`: the identity record is durable and shared, while this policy may legitimately
+differ between processes opening the same on-disk database.
+
 For `connect(":memory:")`, the option is accepted and validated but operationally inert:
 `MemoryStorageDevice` has no operating-system descriptor identity to revalidate.
 

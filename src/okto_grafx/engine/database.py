@@ -1066,6 +1066,7 @@ class Database:
         "_path",
         "_metrics_endpoint",
         "_read_only",
+        "_descriptor_revalidation",
         "_checkpoint_interval_records",
         "_wal_max_bytes",
         "_wal_bytes_latched",
@@ -1111,6 +1112,7 @@ class Database:
         checkpoint_interval_records: int = 512,
         wal_max_bytes: int | None = None,
         read_only: bool = False,
+        descriptor_revalidation: str = "strict",
         metrics_endpoint: str | None = None,
         indexes: object = None,
         ledger: object = None,
@@ -1159,6 +1161,15 @@ class Database:
         self._path: str = _require_text("path", path)
         self._label: str = _require_text("label", label)
         self._read_only: bool = _builtin_bool(read_only)
+        self._descriptor_revalidation: str = _require_text(
+            "descriptor_revalidation", descriptor_revalidation
+        )
+        if self._descriptor_revalidation not in {"strict", "generation"}:
+            raise GrafxConfigurationError(
+                "The descriptor revalidation mode must be 'strict' or 'generation'.",
+                field="descriptor_revalidation",
+                value=self._descriptor_revalidation,
+            )
         self._checkpoint_interval_records: int = _builtin_int(
             checkpoint_interval_records, field="checkpoint_interval_records"
         )
@@ -1237,6 +1248,15 @@ class Database:
     def read_only(self) -> bool:
         """Return True when this database refuses to open a write transaction."""
         return self._read_only
+
+    @property
+    def descriptor_revalidation(self) -> str:
+        """Return this handle's process-local descriptor revalidation policy.
+
+        The value reports effective runtime configuration. It is deliberately separate from
+        :attr:`identity`, whose fields describe durable on-disk identity shared by participants.
+        """
+        return self._descriptor_revalidation
 
     @property
     def closed(self) -> bool:

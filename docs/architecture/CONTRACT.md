@@ -2399,7 +2399,9 @@ runtime result shape.
   registry, the selector is validated but MUST NOT reconfigure its storage adapter. The frozen
   storage port gains no required method;
   `invalidate_descriptor_identity(file: str | None = None)` is an optional cache-only adapter
-  capability.
+  capability. `Database.descriptor_revalidation` exposes the effective process-local selection as
+  a read-only value so a host can admit a handle against its requested policy. It MUST NOT be added
+  to `DatabaseIdentity`, whose fields are durable and participant-shared.
 
   ST-2 changes no durable byte and does not weaken or replace either OCC pass, WAL append/barrier
   order, checkpoint durability, writer fencing, multiwriter/multireader coordination or BR-10 WAL

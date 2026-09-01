@@ -586,6 +586,7 @@ def assemble_database(
         checkpoint_interval_records=config.checkpoint_interval_records,
         wal_max_bytes=config.wal_max_bytes,
         read_only=config.read_only,
+        descriptor_revalidation=config.descriptor_revalidation,
         metrics_endpoint=endpoint,
         indexes=indexes,
         ledger=ledger,

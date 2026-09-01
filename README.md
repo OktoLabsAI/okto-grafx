@@ -584,6 +584,8 @@ named by the directory. The option is inert for `":memory:"`; a caller-supplied 
 but its storage adapter is not reconfigured by it. See
 [`ST2_DESCRIPTOR_REVALIDATION.md`](docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md) for the exact
 whitelist, transition table, coexistence rules, advantages and risks.
+The read-only `database.descriptor_revalidation` property reports the effective process-local mode;
+it is deliberately not part of the persisted `database.identity` record.
 
 Without an override, an OpenMetrics destination must name a literal IP address that
 `ipaddress.ip_address(host).is_loopback` classifies as loopback, for example IPv4 `127/8` or IPv6 `::1`.

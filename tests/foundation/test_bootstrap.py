@@ -83,6 +83,23 @@ def test_descriptor_revalidation_mode_reaches_the_local_storage(
         bootstrap.release_ports(registry)
 
 
+@pytest.mark.parametrize("mode", ("strict", "generation"))
+def test_database_reports_its_effective_descriptor_revalidation_mode(
+    tmp_path: Path, mode: str
+) -> None:
+    database = bootstrap.open_database(
+        DatabaseConfig(
+            path=str(tmp_path / f"database-{mode}"),
+            descriptor_revalidation=mode,
+        )
+    )
+    try:
+        assert database.descriptor_revalidation == mode
+        assert not hasattr(database.identity, "descriptor_revalidation")
+    finally:
+        database.close()
+
+
 def test_the_identity_lease_size_reaches_the_transaction_manager() -> None:
     database = bootstrap.open_database(
         DatabaseConfig(path=":memory:", identity_lease_size=17)

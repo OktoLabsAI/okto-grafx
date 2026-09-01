@@ -73,8 +73,10 @@ including the on-disk format.
   may otherwise remain undetected until invalidation or reopen. Normal Grafx operation does not
   republish live heap or catalog names; any future live paged-name republication must add a directed
   identity proof at its fence/certificate or fail closed to strict. Memory mode is inert, custom
-  registries are not reconfigured, and WAL, OCC, durability, multiwriter/multireader and BR-10
-  semantics are unchanged.
+  registries are not reconfigured, and the effective process-local selection is observable through
+  the read-only `Database.descriptor_revalidation` property without entering the persisted
+  `DatabaseIdentity`. WAL, OCC, durability, multiwriter/multireader and BR-10 semantics are
+  unchanged.
 - **Cross-writer DDL now proves the exact physical artifact before WAL.** Index headers carry a
   non-zero artifact nonce in format v2 while v1 remains readable and is upgraded only on writable
   startup under the commit fence. Durable foreign artifacts are synchronized only after the first

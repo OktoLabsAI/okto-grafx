@@ -27,7 +27,11 @@
   contras e critérios explícitos de quando usar/não usar cada modo estão em
   `docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md` e CONTRACT A96. A evidência de performance
   seguinte será rotulada por modo: o `same-10`/M-PULSE usa `generation`, configuração opt-in
-  efetivamente destinada ao Pulse; nenhum número será atribuído ao default `strict`.
+  efetivamente destinada ao Pulse; nenhum número será atribuído ao default `strict`. Para que essa
+  proveniência não seja apenas declaratória, o handle expõe o modo efetivo process-local pela
+  propriedade read-only `Database.descriptor_revalidation`, fora da identidade persistida; o
+  provider Pulse deve comparar solicitado e observado antes de admitir o handle e o runner deve
+  recusar artefatos sem essa prova.
 - **M0 estabilização: concluído e publicado** em
   `milestone/m0-stabilization@e2d6a22da8ec2571127fc9d1533995d40330c632`. Os cinco P0
   reproduzidos, as fronteiras públicas, o primeiro open durável, read-only observacional, fencing
