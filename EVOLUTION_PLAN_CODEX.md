@@ -634,15 +634,50 @@
   finais. Os dois commits tocam somente `tools/` e `tests/tools/`; o diff em `src/` é vazio. Não
   houve alteração em OCC, WAL, durabilidade, multiwriter ou multireader.
 
-  O próximo gate permanece único e congelado: repetir **duas vezes** somente
-  `same-10/per_family=5`, cada vez com pares RAW+H8 autenticados e os mesmos corpus, harness, Core,
-  retries e piso `7,5/s`. RAW nunca será corrigido ou inferido a partir do custo H8. Em cada
-  intervalo, resíduo acima de 15% torna a atribuição inconclusiva e proíbe escolher uma otimização
-  semântica; uma fase só domina se reproduzir em ambas as repetições, incluindo a cauda. O p50 B
-  RAW histórico de `147,6 ms` impõe teto aproximado de `6,77/s`, logo eliminar apenas outliers não
-  basta: o caminho normal precisa demonstrar redução de pelo menos `14,6 ms` para alcançar o piso.
-  CN-2 só entra em produção se esse probe atribuir causalmente checkpoint; ST-2 continua fora do
-  escopo porque estreitaria a detecção fail-closed de substituição externa de inode. A matriz CE-3
+  **Gate schema v5 encerrado em duas repetições autenticadas, sem desconto H8→RAW.** No R1,
+  preflight SHA-256 `0505461c14a0ac105f6f8fdb25143978b3e54b7bd1467f277c1b59be5a8c5373` e
+  artefato
+  `D:\Projetos\Techridy\grafx-ce3-same10-phaseprobe-v5-r1-7b28a45\ce3-same10-phase-v5-r1.json`
+  SHA-256 `231c4eaf8eb57190dbdf76032726296133be6ec24a430bbdc6ef9d3df0953561`: RAW
+  concluiu A `60`, B `194`, um retry OCC pré-durável em A e taxa `5,367894/s`; H8 concluiu A `60`,
+  B `193`, zero retry e taxa `4,801222/s`. No R2, preflight SHA-256
+  `0e2c730ee3d0e8533becc6e7aeeba67b058374afb786b1a0bf80572e4ab4d411` e artefato
+  `D:\Projetos\Techridy\grafx-ce3-same10-phaseprobe-v5-r2-7b28a45\ce3-same10-phase-v5-r2.json`
+  SHA-256 `977c44aee1d26906f29476a7a336af732e941e4779dea3c93defd09bfe1a6911`: RAW
+  concluiu A `60`, B `189`, zero retry e taxa `4,481830/s`; H8 concluiu A `60`, B `147`, zero retry
+  e taxa intrusiva `2,116703/s`. Todos os processos saíram com código zero, não houve recusa,
+  reopen ou perda de efeito, e postconditions, verificação viva e cold-open `verify(all)` passaram
+  limpas; identidade, fontes e checkouts permaneceram estáveis.
+
+  A recomputação independente validou `253/253` capturas e 3 checkpoints no R1 e `207/207`
+  capturas e 1 checkpoint no R2. Todos os checkpoints ficaram conclusivos pelo limite congelado:
+  resíduo máximo `1,968%` na raiz e `3,252%` na seção. Nos checkpoints B, a fase dominante
+  reproduzida foi `_redo_onto_device` (`2.424–2.473 ms`), seguida pelos walks de índice e
+  `BufferPool.checkpoint`; as fases são inclusivas e não aditivas. O bloqueio cross-writer também
+  reproduziu em `_hold_lease`: B65 aguardou `1.870,6 ms` o checkpoint A29 e A57 aguardou
+  `3.278,5 ms` o checkpoint B182 no R1; A29 aguardou `3.800,9 ms` o checkpoint B64 no R2. Já o
+  commit normal permaneceu inconclusivo e sem dominância reproduzida: roots/seções abaixo de 15%
+  foram `68/253` e `20/253` no R1, `92/207` e `57/207` no R2. O R2 H8 ainda teve 24 outliers B
+  acima de 500 ms, dos quais somente um sobrepôs checkpoint; portanto checkpoint não explica a
+  cauda global. Os p50 B RAW de `145,7938/165,8788 ms` também provam que eliminar apenas
+  checkpoints não alcança sozinho o piso `7,5/s` (`133,3333 ms`).
+
+  O falso shortfall `instrumented_per_operation_hook_evidence_incomplete` era somente a ordem das
+  chaves após serialização `sort_keys`; os conjuntos, contagens e durações estavam íntegros. A
+  correção canônica fail-closed foi publicada em
+  `origin/perf/ce3-bounded-invalidation@b77876296bc65a7de3aaa574ff77433b80ed1632` (tool blob
+  `23234d75d91696f44675871d2e3589bd09b7498a`, test blob
+  `1ca8c2bb0ebc96bf73959063bd0588f854daff25`), passou 172/172 testes e auditoria adversarial; ao
+  revalidar R1/R2, resta somente o shortfall real de taxa. O diff continua restrito a `tools/` e
+  `tests/tools/`, sem alteração de produto.
+
+  **Decisão finita:** o gate autoriza CN-2 apenas como otimização da cauda causal de checkpoint,
+  sujeita antes de promoção à matriz crash+multiwriter já prevista. A fase B precisa liberar tanto
+  `COMMIT_SECTION` quanto o writer lease, e a fase C deve readquirir/revalidar autoridade e estado
+  atual; caminhos de claim/clear de rebuild permanecem monolíticos ou usam fallback fail-closed.
+  OCC1/OCC2, páginas pré-staged, ordem WAL `append→barrier→apply→publish`, horizonte de leitores,
+  durabilidade, multiwriter e multireader permanecem invariantes. O gate não autoriza ST-2, mover
+  redo para fora da fase A, nem escolher uma otimização semântica do commit normal. A matriz CE-3
   completa e o M-PULSE-7 10k continuam bloqueados até `same-10 >= 7,5/s`.
 - **O ratchet de entrada do M-PULSE-7 está certificado; ele não é o run de 10.000 operações.** No
   Community `6595abdcfa788dfa2cc8da1a53ff96c378790531` (base
