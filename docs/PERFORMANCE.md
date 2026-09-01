@@ -291,7 +291,38 @@ for 90.00 s and has SHA-256
 Also measured there: index maintenance costs ~**6.6%** of total suite runtime (572 s → 610 s on an
 idle machine; an earlier draft said 52% and was measuring a concurrent agent, kept as a lesson).
 
-### Pending F1/CE-3 and M-PULSE-7 gates
+### CN-2 authenticated `same-10` disposition
+
+CN-2 was measured on the exact integrated source
+`7acb9d869a7a6b9a533033309a3126f4de704f5b`, with the frozen Pulse corpus and provenance hashes
+`6dd6cf05316b38b01bade965b5fc5e4b118b1853f28c7aef705a8d283e0f0f0c` and
+`655c0ec0a10d4ee272fe6e2e6eea0b584d165b8ae3645148a77cd16bd1c428c8`. The runner only permits
+the `official` label for `scenario=all`, so the two valid `same-10` repetitions are authenticated
+non-official evidence, not the full CE-3 matrix.
+
+R1b (SHA-256 `b4d1fa1cff1de76f5ea9a5b21452e5f07ea4dea0897b73ed0274aa583d227e95`) measured RAW/H8
+effective rates of `5.3178/s` and `4.1577/s`; R2 (SHA-256
+`fdf28373c49e11fa4b19420fee8e170c2ebc5a1a2e8bdfe22a49ffd08b4612b6`) measured `1.3218/s` and
+`4.5368/s`. Both runs passed their machine-idle assertions, every A workload completed 60/60, no
+terminal refusal occurred, live and cold verification passed, finalization removed scratch and the
+source remained unchanged. R2 RAW contained one typed pre-durable retry and a genuine B tail
+(`p99 7392.2 ms`, maximum `11489.2 ms`); it is retained rather than selected away. An earlier
+functionally valid attempt (SHA-256
+`a270b74b5efdee630059b2d2211a387ce3a3752202debaa16fe31e8183d84dba`) is diagnostic only because
+its initial CPU load was 43.2%.
+
+Across the six valid H8 checkpoints, fenced A/C sections took `1086.6–2059.2 ms`, while all 978
+data-barrier calls ran without the writer lease or commit section (`497.8–622.5 ms` summed per
+checkpoint). Three ordinary foreign commits completed in those unfenced windows. Against four
+historical monolithic fences, the longest continuous exclusion fell 49.26% at the median and 45.80%
+at the maximum. CN-2 therefore moved the intended local durability work out of the cross-writer
+fence, without changing WAL ordering or reader/writer guarantees. It did not make the whole
+checkpoint faster: median root duration increased by about 38%, the two same-SHA RAW rates differed
+by 4.02x, and normal-commit phase attribution remained inconclusive (2/62 conclusive sections).
+No throughput delta is reproducible, and every pass remained below the frozen `7.5/s` floor. The
+full CE-3 matrix and M-PULSE-7 10k run therefore remain blocked.
+
+### F1, CE-3 and M-PULSE-7 gate chain
 
 The M-PULSE-7 input ratchet is certified at Pulse Community
 `6595abdcfa788dfa2cc8da1a53ff96c378790531` (base
@@ -317,8 +348,10 @@ integration tools gate passed 136/136. The clean check-only artifact
 `ce3-checkonly-da7f5e4/ce3-check-only.json` has SHA-256
 `c2a643652caf6bd83748624f5a2808396c40c1467ae39bc190e9021242be1324` and only the expected
 `check_only_has_no_measurements` shortfall. It authenticates the instrument but contains no
-measurement. The remaining binding order is **official CE-3 measurement -> CE-3 disposition ->
-M-PULSE-7 10k**. No result exists yet for the 10,000-operation run.
+measurement. The authenticated `same-10` disposition is now recorded above. The next surviving
+roadmap item is ST-2, but it requires a separate A66.1/CF-12 contract decision and its F4
+multiprocess proof. If authorised, the binding order is **ST-2 + F4 -> repeat `same-10` -> official
+CE-3 matrix -> M-PULSE-7 10k**. No result exists yet for the full matrix or the 10,000-operation run.
 
 ---
 

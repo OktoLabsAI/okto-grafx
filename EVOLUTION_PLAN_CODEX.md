@@ -680,9 +680,8 @@
   redo para fora da fase A, nem escolher uma otimização semântica do commit normal. A matriz CE-3
   completa e o M-PULSE-7 10k continuam bloqueados até `same-10 >= 7,5/s`.
 
-  **CN-2 implementado e funcionalmente certificado no candidato integrado
-  `afb95b3ff0fa1efb02a09a7ef16a9764061138be` em 2026-09-01; medição `same-10` ainda é o
-  próximo gate fixo.** O P0 de proveniência física/DDL veio de
+  **CN-2 implementado, certificado e medido no candidato integrado
+  `7acb9d869a7a6b9a533033309a3126f4de704f5b` em 2026-09-01.** O P0 de proveniência física/DDL veio de
   `8ec5322751632c37f81fe74044efd090abeff344` e foi reaplicado sem diferença de árvore em
   `53fa576`; o split CN-2 está em `e202324`, o instrumento de medição em `c739733`, a expectativa
   estrita de uma derivação da cauda do WAL por seção A/C em `f872fbe` e duas docstrings exigidas
@@ -704,8 +703,37 @@
   `pip` para o teste hermético de wheel — e o mesmo teste passou após completar a venv ignorada.
   `ruff check src tests tools`, `compileall src tools` e `git diff --check` passaram; a árvore ficou
   limpa. O `ruff format --check` global continua apontando a dívida preexistente de 254 arquivos e
-  não foi convertido em alvo desta etapa. Nenhum benchmark, push ou promoção é alegado por este
-  parágrafo: a próxima operação é a repetição autenticada `same-10` no SHA final documentado.
+  não foi convertido em alvo desta etapa.
+
+  O preflight autenticado passou sobre o corpus físico
+  `6dd6cf05316b38b01bade965b5fc5e4b118b1853f28c7aef705a8d283e0f0f0c` e a proveniência
+  `655c0ec0a10d4ee272fe6e2e6eea0b584d165b8ae3645148a77cd16bd1c428c8`. Uma recomputação local
+  independente e o handoff Nexus `hof_8d1bcdb495ab497c91869f300d4688e2` com Claude convergiram
+  nesses números depois de corrigir uma subcontagem inicial dos checkpoints do processo B. O
+  runner não aceita o rótulo `official` para `scenario=same-10`; por isso as duas repetições válidas são evidência
+  autenticada não oficial, sem confundi-las com a matriz completa. R1b, SHA-256
+  `b4d1fa1cff1de76f5ea9a5b21452e5f07ea4dea0897b73ed0274aa583d227e95`, começou/terminou com CPU
+  `14,8%/9,9%` e mediu RAW `5,3178/s` e H8 `4,1577/s`. R2, SHA-256
+  `fdf28373c49e11fa4b19420fee8e170c2ebc5a1a2e8bdfe22a49ffd08b4612b6`, começou/terminou com CPU
+  `16,9%/21,0%` e mediu RAW `1,3218/s` e H8 `4,5368/s`. Todas as quatro passagens completaram A
+  60/60; B registrou 173/180 efeitos em R1b e 161/171 em R2, sem recusa terminal, com verify live+cold e
+  fonte imutável. O único retry tipado ocorreu no RAW R2 e sua cauda B (`p99 7.392,2 ms`, máximo
+  `11.489,2 ms`) é variabilidade real, não descartada. Uma tentativa anterior, SHA-256
+  `a270b74b5efdee630059b2d2211a387ce3a3752202debaa16fe31e8183d84dba`, ficou apenas diagnóstica:
+  funcionalmente passou, mas CPU inicial `43,2%` invalidou seu uso como evidência de performance.
+
+  Nos seis checkpoints H8 válidos, as fases cercadas A/C duraram `1.086,6–2.059,2 ms`; as 978
+  chamadas de barreira ficaram integralmente fora do lease e do `COMMIT_SECTION`, somando
+  `497,8–622,5 ms` por checkpoint, e três commits estrangeiros normais concluíram nessas janelas.
+  Contra quatro fences monolíticos históricos, a maior exclusão contínua caiu `49,26%` na mediana e
+  `45,80%` no máximo. Isso não tornou o checkpoint global mais rápido — sua duração total mediana
+  cresceu cerca de `38%` — nem produziu ganho de throughput reproduzível; o RAW variou `4,02x`
+  entre R1b e R2 no mesmo SHA. A atribuição do commit normal também permaneceu inconclusiva pelo
+  limite do próprio instrumento (`2/62` seções conclusivas). Assim, CN-2 provou somente o efeito
+  local pretendido, sem enfraquecer a concorrência: nenhuma passagem atingiu o piso congelado
+  `7,5/s`. A matriz CE-3 completa e o M-PULSE-7 10k permanecem bloqueados.
+  O próximo survivor preexistente é ST-2, porém ele continua fora desta autorização: exige decisão
+  explícita para a emenda A66.1/CF-12, prova F4 multiprocesso e nova repetição do mesmo `same-10`.
 - **O ratchet de entrada do M-PULSE-7 está certificado; ele não é o run de 10.000 operações.** No
   Community `6595abdcfa788dfa2cc8da1a53ff96c378790531` (base
   `d44c82155e9884c556813ea96dec829be567c236`, branch
@@ -2683,6 +2711,7 @@ nenhum resultado delegado é integrado sem validação final do Codex e sem o ga
 | CN-1 — leasing durável de identidades | concluído, publicado, auditado e medido; não é o blocker residual | commits `40b2b43` + evidência documental `6fd26f9` em `origin/perf/w8-ce1-production`; desenho final `docs/architecture/CN1_IDENTITY_RANGE_LEASING.md`; auditorias Nexus `hof_8867688a5b9649d4a718fbf6eec91a63`, `hof_9e0acf09542a47bd9873a04fea7b0d51` e `hof_c03087626717449ea68b8fc595345fdf` concluídas/verificadas/PASS | `identity_lease_size=64` parametrizável; piso multi-tabela COW em `heap.dat/0`; subcommit privado `WRITE_PAGE+COMMIT` sob participant/lease/`COMMIT_SECTION`/WAL-tail; barrier/apply/publish antes do uso; primeiro OCC antes de consumo; a emenda OCC posterior remove o bypass do LSN e revalida interesses antigos incrementalmente; cache local burn-only; explicit `< floor` recusa e `>= floor` exige avanço durável; primeira extensão permanece atômica no commit do usuário; manager herdado após fork falha fechado. Gates: 8/8 identidade, 4/4 falhas, 4/4 multiprocesso, 449/449 transacionais não-multiprocesso e 523/523 de composição; Ruff/compileall/diff-check verdes. Medição autenticada: A 19→46 operações e page 0 fatal→1/807 commits de B; residual deslocou-se para a tail data page, como previsto |
 | OCC-MB1 — baseline de materialização da segunda OCC | concluído, publicado, auditado e medido | `origin/perf/w8-ce1-production@9498554e1c59f49a946571e9f281e5533ab2904b`; autorização explícita do usuário; auditorias Nexus `hof_cb653c8a25fd479098fc31a5ac8415f9` e `hof_d8b8484183d24ee882daf12151854f37` PASS; gates 100/100 focados, 454/454 txn não-multiprocesso, 17/17 multiprocesso, 8/8 CN-1 failure/concurrency e 9/9 cleanup/relink | Primeira OCC usa conjunto congelado desde o snapshot; avanço CN-1 revalida esse conjunto sem bypass; somente novas localizações físicas medidas e não pré-staged usam o LSN durável atual. Interesses lógicos tardios e overlap/drift de página falham fechado. WAL/payload, durabilidade, readers e multiwriter não mudam. O `same-10` passou funcionalmente 60/60 + 187/187 sem conflitos/retries; deixou apenas a taxa como shortfall |
 | CE-3 — invalidação bounded por delta WAL (produto) | publicada; correção de header esparso publicada, auditada e validada funcionalmente no Pulse | base `9498554`; produto `2feb579`; sucessor test-only `61485d9`; fix `origin/perf/ce3-bounded-invalidation@5b73890bdfddf9763c2b46514fc2c41c07ee30a4`; auditorias Nexus `hof_75a8a1e43bc24f1790b9a79d75d3749d`, `hof_7c7f3a4b3a9c470ea1d5886445cf233b` e `hof_e890ffe523ac4023aee333a8b094c8e8` PASS | Intervalo WAL limitado, classificação fail-closed e invalidação seletiva permanecem intactos. O fix acrescenta somente headers registrados quando há efeito de heap e declina para refresh completo se o inventário não puder ser provado. Red-first e mutation kill confirmados; 15/15 combinados, 7/7 pós-formatação, txn 476/476, index+vector 100%/exit 0 e checks estáticos verdes. M4 permanece dívida de cobertura não bloqueante. Primeira OCC, páginas pré-staged, WAL/durabilidade e multiwriter/multireader não mudaram. Próximo gate fixo: gargalo residual medido no H8; sem matriz completa antes de `same-10 >= 7,5/s` |
+| CN-2 — barreiras de checkpoint fora do fence | implementado, auditado e medido; efeito local aprovado, gate agregado ainda vermelho | candidato medido `7acb9d869a7a6b9a533033309a3126f4de704f5b`; produto `e202324`; instrumento `c739733`; contrato de cauda `f872fbe`; R1b `b4d1fa1cff1de76f5ea9a5b21452e5f07ea4dea0897b73ed0274aa583d227e95`; R2 `fdf28373c49e11fa4b19420fee8e170c2ebc5a1a2e8bdfe22a49ffd08b4612b6`; auditorias Nexus `hof_3781b51dbb77417cb899c50d1775cd29` e `hof_8d1bcdb495ab497c91869f300d4688e2` PASS | A/B/C preserva autoridade, WAL e horizonte; 978 barriers ficaram fora do fence e três commits estrangeiros progrediram em seis checkpoints. A exclusão contínua caiu ~49% na mediana, mas o checkpoint total mediano cresceu ~38% e não houve ganho reproduzível de throughput. RAW/H8 foram `5,3178/4,1577/s` em R1b e `1,3218/4,5368/s` em R2, todos abaixo de `7,5/s`; verify live+cold e finalização passaram. Esta é a disposição atual e substitui o status de taxa histórico das linhas M-PULSE-7/CE-3 acima. Matriz completa/10k seguem bloqueados; ST-2 é o próximo survivor, mas requer autorização separada, emenda A66.1/CF-12 e F4 |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
