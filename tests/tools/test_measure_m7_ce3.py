@@ -803,7 +803,7 @@ def test_frozen_matrix_and_pins_are_literal() -> None:
     assert ce3.EXPECTED_OPERATION_SET_SHA256 == (
         "c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81"
     )
-    assert ce3.PINNED_HARNESS_HEAD == "b07bf3ef8cdd05bc1365a46c2411bca857ab2bb0"
+    assert ce3.PINNED_HARNESS_HEAD == "050ced9b79533d50efed453d53ed450984f75cf3"
     assert ce3.PINNED_HARNESS_BLOB == "a02b86dce098ceec3fdbd10a820a4dd6f9e2a7b1"
     assert [
         (scenario.relation, scenario.table, scenario.target_rate_per_second)

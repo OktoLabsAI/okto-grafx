@@ -47,7 +47,7 @@ from types import ModuleType
 from typing import Any, Iterable, Mapping, Sequence
 
 SCHEMA = "okto-grafx.ce3-m7-multiprocess.v7"
-PINNED_HARNESS_HEAD = "b07bf3ef8cdd05bc1365a46c2411bca857ab2bb0"
+PINNED_HARNESS_HEAD = "050ced9b79533d50efed453d53ed450984f75cf3"
 PINNED_HARNESS_BLOB = "a02b86dce098ceec3fdbd10a820a4dd6f9e2a7b1"
 REQUIRED_DESCRIPTOR_REVALIDATION = "generation"
 EXPECTED_OPERATION_SET_SHA256 = (
