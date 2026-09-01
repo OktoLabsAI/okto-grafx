@@ -626,6 +626,7 @@ def _verifier_factory(
         }
 
         def is_committed(index: object) -> bool:
+            """Return whether ``index`` exactly belongs to the durable catalog."""
             definition = getattr(index, "definition", None)
             table = committed_tables.get(
                 (

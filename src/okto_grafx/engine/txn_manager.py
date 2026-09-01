@@ -410,6 +410,7 @@ class TransactionManager:
             construction_identity = coordinator.owner_id()
 
             def provider() -> object:
+                """Return the process identity captured for direct composition."""
                 return construction_identity
         else:
             provider = process_identity_provider
