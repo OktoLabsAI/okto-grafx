@@ -224,10 +224,11 @@ class StorageDevice(Protocol):
         """`data` must be exactly page_size bytes and page_index must already be allocated,
         else GrafxCorruptionDetected / IndexError-free typed failure."""
 
-    # --- append-only log space ---
+    # --- bounded byte reads and append-only log writes ---
     def append_log(self, file: str, payload: bytes) -> int:
         """Append and return the new total size. Partial append must raise GrafxDeviceFull."""
-    def read_log(self, file: str, offset: int, length: int) -> bytes: ...
+    def read_log(self, file: str, offset: int, length: int) -> bytes:
+        """Fill length bytes from any named file unless EOF is reached; never change it."""
     def log_size(self, file: str) -> int: ...
     def truncate_log(self, file: str, size: int) -> None:
         """Shrink only. Growing is a programming error -> GrafxUnsupportedOperation."""
@@ -437,6 +438,14 @@ in-place. A registry passed by the caller stays caller-owned after `Database.clo
 released by that caller. Marked Python examples in `README.md` and `docs/PORTS.md` are executed by
 `tests/foundation/test_public_adapter_docs.py`, while the 53 frozen port signatures remain pinned by
 `tests/foundation/test_port_signatures.py`.
+
+The historical `read_log` name does not restrict reads to files written by `append_log`: it is the
+existing bounded, non-mutating byte-range read over the unified namespace. It fills the requested
+range unless it reaches the actual EOF. Legacy control migration already used it on control files,
+and ST-2 coalesces a fixed v2 control image plus a one-byte length sentinel through the same
+operation. Custom storage adapters may distinguish file kinds internally, but must allow this read
+on allocated paged files and preserve fill-until-EOF. Append-only restrictions belong to
+`append_log` and `truncate_log`; the 53 frozen signatures do not change.
 
 **ST-2 — descriptor revalidation selector.** `descriptor_revalidation` is one exact built-in string:
 `"strict"` (default) or `"generation"`. It is not persisted and is not a format field. With the

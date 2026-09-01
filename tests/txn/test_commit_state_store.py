@@ -114,6 +114,23 @@ def test_checkpoint_hint_is_explicitly_lenient_without_weakening_strict_read() -
         store.read()
 
 
+def test_format_two_checkpoint_hint_hides_length_damage_but_strict_read_refuses() -> None:
+    device = MemoryStorageDevice()
+    store = CommitStateStore(
+        device,
+        owner_id=OWNER,
+        database_uuid=b"d" * 16,
+        file_nonce=17,
+        control_format_version=2,
+    )
+    store.publish(CommitState(last_committed_lsn=7, last_csn=7, checkpoint_lsn=4))
+    device.append_log(COMMIT_STATE_FILE, b"unexpected-suffix")
+
+    assert store.checkpoint_hint() == 0
+    with pytest.raises(GrafxCorruptionDetected):
+        store.read()
+
+
 def test_publish_uses_an_owner_exclusive_temporary_and_the_frozen_durability_order() -> (
     None
 ):

@@ -26,6 +26,70 @@ TEMP = "control/unit.state.test.tmp"
 DATABASE_UUID = bytes.fromhex("00112233445566778899aabbccddeeff")
 
 
+class _FirstImageDamagedDevice:
+    """Return one damaged exact image before exposing the wrapped bytes unchanged."""
+
+    def __init__(self, inner: MemoryStorageDevice) -> None:
+        self._inner = inner
+        self._first_image = True
+
+    @property
+    def page_size(self) -> int:
+        """Forward the immutable page size."""
+        return self._inner.page_size
+
+    def read_log(self, file: str, offset: int, length: int) -> bytes:
+        """Damage both slots on the first image read, then forward later reads."""
+        image = self._inner.read_log(file, offset, length)
+        if not self._first_image:
+            return image
+        self._first_image = False
+        damaged = bytearray(image[: CONTROL_FILE_PAGES * self.page_size])
+        damaged[2 * self.page_size - 1] ^= 1
+        damaged[3 * self.page_size - 1] ^= 2
+        return bytes(damaged)
+
+    def __getattr__(self, name: str) -> object:
+        """Forward the remaining storage port for this read-only regression fixture."""
+        return getattr(self._inner, name)
+
+
+class _FirstImageShortDevice:
+    """Return one artificial short image while the wrapped file remains exact length."""
+
+    def __init__(self, inner: MemoryStorageDevice) -> None:
+        self._inner = inner
+        self._first_image = True
+
+    @property
+    def page_size(self) -> int:
+        """Forward the immutable page size."""
+        return self._inner.page_size
+
+    def read_log(self, file: str, offset: int, length: int) -> bytes:
+        """Shorten only the first read to reproduce an inconsistent adapter observation."""
+        image = self._inner.read_log(file, offset, length)
+        if not self._first_image:
+            return image
+        self._first_image = False
+        return image[:-1]
+
+    def __getattr__(self, name: str) -> object:
+        """Forward the remaining storage port for this read-only regression fixture."""
+        return getattr(self._inner, name)
+
+
+class _FirstImageTinyDevice(_FirstImageShortDevice):
+    """Return a tiny first image regardless of the wrapped file's larger length."""
+
+    def read_log(self, file: str, offset: int, length: int) -> bytes:
+        """Return six bytes once, then forward complete bounded reads."""
+        if not self._first_image:
+            return self._inner.read_log(file, offset, length)
+        self._first_image = False
+        return b"legacy"
+
+
 def _store(
     storage: object,
     *,
@@ -70,15 +134,34 @@ def test_a_warm_publication_is_exactly_one_page_write_and_one_barrier() -> None:
 
     assert store.publish(b"second") == 2
 
-    writes = [
+    operations = [
         (call.method, call.file)
         for call in device.trail()
-        if call.method in {"write_page", "durable_barrier", "atomic_replace"}
+        if call.method
+        in {
+            "read_log",
+            "read_page",
+            "file_size",
+            "write_page",
+            "durable_barrier",
+            "atomic_replace",
+        }
     ]
-    assert writes == [("write_page", FILE), ("durable_barrier", FILE)]
+    assert operations == [
+        ("read_log", FILE),
+        ("write_page", FILE),
+        ("durable_barrier", FILE),
+    ]
+    device.clear_trail()
     observed = store.read()
     assert observed is not None
     assert (observed.payload, observed.generation) == (b"second", 2)
+    reads = [
+        (call.method, call.file)
+        for call in device.trail()
+        if call.method in {"read_log", "read_page", "file_size"}
+    ]
+    assert reads == [("read_log", FILE)]
 
 
 def test_a_legacy_record_is_read_without_guessing_and_migrated_on_publish() -> None:
@@ -103,6 +186,85 @@ def test_a_legacy_record_is_read_without_guessing_and_migrated_on_publish() -> N
         2,
         1,
     )
+
+
+def test_a_stable_legacy_record_uses_the_explicit_short_read_path() -> None:
+    device = FaultInjectingStorageDevice(MemoryStorageDevice())
+    device.create(FILE)
+    device.append_log(FILE, b"legacy")
+    device.clear_trail()
+
+    observed = _store(device).read()
+
+    assert observed is not None
+    assert (observed.payload, observed.format_version) == (b"legacy", 1)
+    reads = [
+        (call.method, call.file)
+        for call in device.trail()
+        if call.method in {"read_log", "read_page", "file_size"}
+    ]
+    assert reads == [("read_log", FILE), ("file_size", FILE)]
+
+
+def test_an_oversized_legacy_record_is_not_silently_decoded_as_a_v2_prefix() -> None:
+    device = MemoryStorageDevice()
+    payload = b"legacy" + bytes(CONTROL_FILE_PAGES * device.page_size)
+    device.create(FILE)
+    device.append_log(FILE, payload)
+
+    observed = _store(device).read()
+
+    assert observed is not None
+    assert (observed.payload, observed.format_version) == (payload, 1)
+
+
+def test_migrating_an_oversized_legacy_record_does_not_materialise_it_in_full() -> None:
+    inner = MemoryStorageDevice()
+    device = FaultInjectingStorageDevice(inner)
+    payload = b"legacy" + bytes(CONTROL_FILE_PAGES * device.page_size)
+    device.create(FILE)
+    device.append_log(FILE, payload)
+    device.clear_trail()
+
+    assert _store(device).publish(b"migrated") == 1
+
+    reads = [call for call in device.trail() if call.method == "read_log"]
+    assert len(reads) == 1
+    assert reads[0].args_summary.endswith(
+        f"length={CONTROL_FILE_PAGES * device.page_size + 1}"
+    )
+    observed = _store(inner).read()
+    assert observed is not None
+    assert (observed.payload, observed.format_version) == (b"migrated", 2)
+
+
+def test_a_v2_retry_refuses_an_oversized_replacement_with_a_valid_prefix() -> None:
+    inner = MemoryStorageDevice()
+    assert _store(inner).publish(b"valid-prefix") == 1
+    inner.append_log(FILE, b"unexpected-suffix")
+    device = _FirstImageDamagedDevice(inner)
+
+    with pytest.raises(GrafxCorruptionDetected, match="changed length"):
+        _store(device).read()
+
+
+def test_an_initial_short_v2_read_fails_closed_when_the_file_is_exact_length() -> None:
+    inner = MemoryStorageDevice()
+    assert _store(inner).publish(b"exact") == 1
+
+    with pytest.raises(GrafxCorruptionDetected, match="changed while it was read"):
+        _store(_FirstImageShortDevice(inner)).read()
+
+
+def test_publish_refuses_a_short_observation_whose_current_file_is_oversized() -> None:
+    inner = MemoryStorageDevice()
+    payload = b"oversized" + bytes(CONTROL_FILE_PAGES * inner.page_size)
+    inner.create(FILE)
+    inner.append_log(FILE, payload)
+
+    with pytest.raises(GrafxCorruptionDetected, match="changed while it was read"):
+        _store(_FirstImageTinyDevice(inner)).publish(b"must-not-replace")
+    assert inner.read_log(FILE, 0, len(payload)) == payload
 
 
 def test_a_torn_older_slot_is_ignored_and_repaired_by_the_next_publication() -> None:

@@ -7,6 +7,10 @@ from pathlib import Path
 import pytest
 
 from okto_grafx.adapters.storage_local import LocalStorageDevice
+from okto_grafx.domain.control_record import (
+    ControlRecordKind,
+    TwoSlotControlRecordStore,
+)
 from okto_grafx.domain.errors import GrafxConfigurationError
 
 
@@ -16,6 +20,8 @@ CATALOG: str = "catalog.dat"
 CONTROL: str = "control/commit.state"
 SEGMENT: str = "wal/000000000001.wal"
 INDEX: str = "index/person_name.idx"
+CONTROL_TEMP: str = "control/commit.state.test.tmp"
+DATABASE_UUID: bytes = bytes.fromhex("00112233445566778899aabbccddeeff")
 
 
 def _seed(root: Path, *files: tuple[str, bytes]) -> None:
@@ -269,3 +275,38 @@ def test_generation_mode_still_observes_a_control_replacement_on_the_next_hit(
             publisher.atomic_replace("control/commit.state.next", CONTROL)
 
         assert reader.read_log(CONTROL, 0, 11) == b"new-control"
+
+
+@pytest.mark.parametrize("policy", ["strict", "generation"])
+def test_two_slot_control_io_keeps_one_strict_proof_per_actual_descriptor_hit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+) -> None:
+    root = tmp_path / "database"
+    with LocalStorageDevice(
+        root,
+        page_size=PAGE_SIZE,
+        descriptor_revalidation=policy,  # type: ignore[arg-type]
+    ) as device:
+        store = TwoSlotControlRecordStore(
+            device,
+            file=CONTROL,
+            record_kind=ControlRecordKind.COMMIT_STATE,
+            database_uuid=DATABASE_UUID,
+            file_nonce=17,
+            temporary=CONTROL_TEMP,
+        )
+        assert store.publish(b"one") == 1
+        assert store.read() is not None  # cold descriptor admission
+        calls = _count_warm_identity_proofs(monkeypatch)
+
+        observed = store.read()
+
+        assert observed is not None
+        assert observed.payload == b"one"
+        assert calls == [CONTROL]
+
+        calls.clear()
+        assert store.publish(b"two") == 2
+        assert calls == [CONTROL, CONTROL, CONTROL]

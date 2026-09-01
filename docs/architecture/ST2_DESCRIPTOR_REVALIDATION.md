@@ -51,6 +51,36 @@ non-ASCII digits, temporary/staging names, `index_orphan/**`, control records, `
 registrations, leases, ledger/quarantine files and every unknown name remain in `strict` behaviour
 even when the selected mode is `generation`. A caller cannot extend this set by configuration.
 
+## Strict control records and bounded image reads
+
+Control records never use generation-amortized identity stamps. In both modes, every actual storage
+operation on `control/**` proves that the cached descriptor still belongs to the logical name. A
+v2 two-slot record has one immutable header page and two independently checksummed slot pages. Its
+read path fetches that fixed three-page image through one bounded `read_log` call instead of opening
+the same descriptor separately for three `read_page` calls. This is one descriptor hit and therefore
+one strict physical-identity proof; it is not three logical operations whose checks were skipped.
+
+The bounded read asks for the format-derived image size plus one byte. Exactly the three-page size
+and relies on the port's fill-until-EOF rule: a conforming adapter returns the sentinel byte when it
+exists rather than an arbitrary short chunk. Exactly three pages is decoded as v2. A short image is
+accepted as legacy v1 only after `file_size` confirms that the
+current logical file reports the same short length. A supported atomic replacement between these
+calls may select either complete old or new bytes; a length disagreement fails closed, and the
+strict proof makes the next descriptor hit follow the current name. An image longer than v2 is read
+in full for a caller that needs its v1 payload and is never silently truncated to a valid-looking
+v2 prefix. Migration publication only needs its shape, so it does not materialise an oversized v1
+payload that it will immediately replace. Once a read has been classified as v2, every corruption
+retry requires the exact three-page length and refuses a short or oversized replacement, including
+an oversized image with a valid-looking v2 prefix. Header/database binding, slot CRC, generation
+monotonicity and the rule that two populated slots cannot claim the same generation are unchanged.
+
+A warm publication remains three independent storage operations: one bounded image read, one slot
+page write and one durability barrier. Each operation receives its own strict descriptor proof in
+both modes. The batching does not combine a read with a write or barrier, does not cache control
+bytes across calls and does not acknowledge a generation before the existing write-plus-barrier
+sequence succeeds. It bypasses the buffer pool exactly as the former direct page reads did, so it
+does not add a stale buffer-pool view or alter WAL, OCC, lease or checkpoint ordering.
+
 ## Generation and invalidation contract
 
 The “global generation” is global only inside one `LocalStorageDevice` instance. It is
@@ -173,7 +203,11 @@ With the default registry, bootstrap passes the option to `LocalStorageDevice`, 
 device wrapped for `read_only=True`. With a caller-supplied `PortRegistry`, configuration validation
 still occurs, but `descriptor_revalidation` does **not** reconfigure the supplied storage adapter.
 Custom storage remains trusted host code and is responsible for its own descriptor/cache semantics.
-The frozen `StorageDevice` protocol is unchanged. An adapter may optionally expose
+The frozen `StorageDevice` signature set is unchanged. Its existing `read_log` member is the
+bounded, non-mutating byte-range read over the unified namespace (legacy control migration already
+used it this way). It must fill the requested range unless it reaches the actual EOF, so a custom
+adapter must also allow and fully serve that read over an allocated control file.
+An adapter may optionally expose
 `invalidate_descriptor_identity(file: str | None = None)` to consume the buffer pool's cache-only
 invalidation signals; wrappers that want to preserve the optimization must forward it.
 

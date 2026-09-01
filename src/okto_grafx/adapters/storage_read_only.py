@@ -98,7 +98,7 @@ class ReadOnlyStorageDevice:
         self._refuse("append_log")
 
     def read_log(self, file: str, offset: int, length: int) -> bytes:
-        """Return the exact log bytes produced by the wrapped device."""
+        """Return the fill-until-EOF byte range produced by the wrapped device."""
         return self.__device.read_log(file, offset, length)
 
     def log_size(self, file: str) -> int:

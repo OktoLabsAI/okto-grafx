@@ -6,6 +6,18 @@ Origem: `GRAFX_PERFORMANCE_NEXT_STEPS.md` §5b (CE-1 = ST-5 / RC1-C), `GRAFX-CON
 
 Premissa que este documento **não relativiza**: muitos escritores E muitos leitores em processos distintos sobre o mesmo diretório (produto). Nada aqui introduz dono único, lock exclusivo de SO na abertura, bloqueio de leitores por escritores, nem servidor intermediário; a única serialização de escrita continua sendo a que já existe (§8.5 passo 3 = `COMMIT_SECTION`; `LEASE_SECTION` para o read-modify-write da lease).
 
+**Adendo ST-2 (2026-09-01):** as referências abaixo a duas/três chamadas `read_page` descrevem o
+primeiro aceite CE-1 e ficam substituídas somente no lado de leitura. O formato v2 continua sendo a
+imagem fixa de três páginas, mas a implementação atual lê essa imagem em uma chamada bounded
+`read_log(expected_size + 1)`, que é o byte-range read não mutante já usado pela migração v1 no
+namespace unificado da porta. Exigir exatamente três páginas detecta short e oversized; retries
+repetem o mesmo probe. Cabeçalho, CRCs, escolha de slot e número de tentativas não mudam. O lado de
+publicação continua uma leitura, um `write_page` e um `durable_barrier`, cada qual com prova strict
+independente para `control/**` em ambos os modos ST-2. A assinatura congelada da porta não muda;
+adapters customizados devem cumprir a semântica bounded de `read_log` também sobre arquivo paginado,
+incluindo preencher o range solicitado até o EOF, como os quatro adapters entregues e o teste de
+conformidade fazem.
+
 ---
 
 ## 0. O que está medido e o que é hipótese (leia antes de qualquer número)

@@ -1096,7 +1096,7 @@ class LocalStorageDevice:
             return self._append(name, descriptor, data, rollback_to=size)
 
     def read_log(self, file: str, offset: int, length: int) -> bytes:
-        """Return up to length bytes starting at offset; a read past the end returns what is there."""
+        """Fill length bytes from offset unless EOF is reached, then return what remains."""
         name = normalize_logical_name(file)
         validate_read_range(name, offset, length)
         with self._lock:

@@ -156,6 +156,16 @@ def test_write_page_then_read_page_returns_the_same_bytes(device: Any) -> None:
     assert device.read_page(HEAP, 0) == bytes(PAGE_SIZE)
 
 
+def test_a_bounded_byte_read_can_coalesce_adjacent_paged_bytes(device: Any) -> None:
+    device.create(HEAP)
+    device.allocate(HEAP, 4)
+    pages = (_page(0x11), _page(0x22), _page(0x33), _page(0x44))
+    for index, image in enumerate(pages):
+        device.write_page(HEAP, index, image)
+
+    assert device.read_log(HEAP, 0, 3 * PAGE_SIZE + 1) == b"".join(pages[:3]) + b"\x44"
+
+
 def test_writing_a_page_that_was_never_allocated_is_refused(device: Any) -> None:
     device.create(HEAP)
     device.allocate(HEAP)

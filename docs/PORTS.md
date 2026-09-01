@@ -54,8 +54,9 @@ signatures, return values or runtime behaviour.
 
 ### `storage` — `StorageDevice`
 
-Everything that is a file. Paged random access for the data files, append-only access for the log,
-plus the two operations that carry the durability and atomicity guarantees.
+Everything that is a file. Paged random access for data files, bounded byte-range reads for any
+named file, append-only writes for logs, plus the two operations that carry the durability and
+atomicity guarantees.
 
 ```
 name                                  page_size
@@ -71,6 +72,15 @@ durable_barrier(file=None)
 ```
 
 Two members deserve their own note, because the engine's guarantees rest on them.
+
+**`read_log`** is historically named for its main consumer, but it is the port's non-mutating,
+bounded byte-range read over the unified file namespace. It fills the requested range unless it
+reaches the actual EOF, in which case it returns the remaining bytes. It may therefore read an
+allocated paged file without changing it; CE-1 legacy control migration already depended on this
+property, and ST-2 uses it to fetch one exact three-page control image plus a one-byte length
+sentinel. Only the write-side `append_log`/`truncate_log` operations impose append-only log
+semantics. A custom storage adapter must preserve this fill-until-EOF behaviour even when it
+internally distinguishes file kinds.
 
 **`durable_barrier`** must not return until what was written is on the platter. A failure must be
 raised as `GrafxDurabilityBarrierFailed` — never swallowed — because a failed barrier means nothing

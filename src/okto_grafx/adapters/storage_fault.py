@@ -590,7 +590,7 @@ class FaultInjectingStorageDevice:
         )
 
     def read_log(self, file: str, offset: int, length: int) -> bytes:
-        """Return bytes of a log from the wrapped device."""
+        """Return one fill-until-EOF byte range from the wrapped device."""
         sequence = self._enter("read_log", file, f"offset={offset},length={length}")
         self._before(sequence, "read_log", file)
         answer = self._run(sequence, lambda: self._inner.read_log(file, offset, length))

@@ -386,25 +386,16 @@ class TwoSlotControlRecordStore:
 
     def read(self) -> ControlRecordRead | None:
         """Return the newest whole payload, a legacy payload, or None when absent."""
-        if not self._storage.exists(self._file):
+        image = self._read_file_image()
+        if image is None:
             return None
-        size = self._storage.file_size(self._file)
-        if size != CONTROL_FILE_PAGES * self._storage.page_size:
-            payload = self._storage.read_log(self._file, 0, size)
-            if len(payload) != size:
-                raise GrafxCorruptionDetected(
-                    "A legacy control record changed while it was read.",
-                    file=self._file,
-                    field="length",
-                    expected=size,
-                    value=len(payload),
-                )
-            return ControlRecordRead(bytes(payload), 1, 0)
+        expected_size = CONTROL_FILE_PAGES * self._storage.page_size
+        if len(image) != expected_size:
+            return ControlRecordRead(image, 1, 0)
         damage: GrafxCorruptionDetected | None = None
-        for _ in range(CONTROL_READ_ATTEMPTS):
+        for attempt in range(CONTROL_READ_ATTEMPTS):
             try:
-                header = self._read_header()
-                chosen, _target = self._read_slots(header)
+                _header, chosen, _target = self._decode_complete_image(image)
                 if chosen is None:
                     raise GrafxCorruptionDetected(
                         "Both slots of the control record are invalid or empty.",
@@ -423,6 +414,8 @@ class TwoSlotControlRecordStore:
                 return ControlRecordRead(chosen.payload, 2, chosen.generation)
             except GrafxCorruptionDetected as failure:
                 damage = failure
+                if attempt + 1 < CONTROL_READ_ATTEMPTS:
+                    image = self._read_exact_image()
         if damage is None:  # pragma: no cover - the loop always records its refusal
             raise AssertionError("unreachable control record read")
         raise damage
@@ -436,15 +429,12 @@ class TwoSlotControlRecordStore:
                 value=type(payload).__name__,
             )
         expected_size = CONTROL_FILE_PAGES * self._storage.page_size
-        if (
-            not self._storage.exists(self._file)
-            or self._storage.file_size(self._file) != expected_size
-        ):
+        image = self._read_file_image(complete_legacy=False)
+        if image is None or len(image) != expected_size:
             self._bootstrap(payload)
             self._last_seen = 1
             return 1
-        header = self._read_header()
-        chosen, target = self._read_slots(header)
+        header, chosen, target = self._decode_complete_image(image)
         if chosen is None:
             raise GrafxCorruptionDetected(
                 "Both slots of the control record are invalid or empty.",
@@ -459,16 +449,128 @@ class TwoSlotControlRecordStore:
                 value=chosen.generation,
             )
         generation = chosen.generation + 1
-        image = _encode_slot(
+        slot_image = _encode_slot(
             header=header,
             generation=generation,
             payload=payload,
             page_size=self._storage.page_size,
         )
-        self._storage.write_page(self._file, target, image)
+        self._storage.write_page(self._file, target, slot_image)
         self._storage.durable_barrier(self._file)
         self._last_seen = generation
         return generation
+
+    def _read_file_image(self, *, complete_legacy: bool = True) -> bytes | None:
+        """Read one stable legacy payload or complete slot image through one proved descriptor.
+
+        A two-slot record is exactly ``CONTROL_FILE_PAGES`` pages.  Reading that bounded byte
+        range in one storage call performs one strict descriptor-identity proof and cannot mix
+        bytes from different descriptors.  It bypasses the buffer pool just as the previous
+        three ``read_page`` calls did.  Publication still uses its independent ``write_page``
+        and ``durable_barrier`` descriptor proofs; only that completed sequence is acknowledged
+        as durable by this store.
+
+        ``read_log`` deliberately permits a short result.  A confirmed short file is the legacy
+        v1 representation and remains migration-compatible.  A length disagreement with the
+        current logical name fails closed rather than being misclassified as legacy.  Publication
+        only needs the v1/v2 shape and may decline to materialise an oversized legacy payload that
+        it will replace immediately.
+        """
+        storage = self._storage
+        if not storage.exists(self._file):
+            return None
+        expected_size = CONTROL_FILE_PAGES * storage.page_size
+        image = bytes(storage.read_log(self._file, 0, expected_size + 1))
+        if len(image) == expected_size:
+            return image
+        observed_size = storage.file_size(self._file)
+        if observed_size <= expected_size:
+            if observed_size == len(image):
+                return image
+            raise GrafxCorruptionDetected(
+                "A legacy control record changed while it was read.",
+                file=self._file,
+                field="length",
+                expected=observed_size,
+                value=len(image),
+            )
+        if len(image) != expected_size + 1:
+            raise GrafxCorruptionDetected(
+                "A legacy control record changed while it was read.",
+                file=self._file,
+                field="length",
+                expected=observed_size,
+                value=len(image),
+            )
+        if not complete_legacy:
+            return image
+        complete = bytes(storage.read_log(self._file, 0, observed_size))
+        if len(complete) != observed_size:
+            raise GrafxCorruptionDetected(
+                "A legacy control record changed while it was read.",
+                file=self._file,
+                field="length",
+                expected=observed_size,
+                value=len(complete),
+            )
+        return complete
+
+    def _read_exact_image(self) -> bytes:
+        """Re-read a v2 image after a transient refusal, rejecting any length change."""
+        expected_size = CONTROL_FILE_PAGES * self._storage.page_size
+        image = bytes(self._storage.read_log(self._file, 0, expected_size + 1))
+        if len(image) != expected_size:
+            raise GrafxCorruptionDetected(
+                "A two-slot control record changed length while it was read.",
+                file=self._file,
+                field="length",
+                expected=expected_size,
+                value=len(image),
+            )
+        return image
+
+    def _decode_complete_image(self, image: bytes) -> tuple[_Header, _Slot | None, int]:
+        """Decode one exact three-page image without taking another storage descriptor."""
+        page_size = self._storage.page_size
+        expected_size = CONTROL_FILE_PAGES * page_size
+        if len(image) != expected_size:
+            raise GrafxCorruptionDetected(
+                "A two-slot control record image is not exactly three complete pages.",
+                file=self._file,
+                field="length",
+                expected=expected_size,
+                value=len(image),
+            )
+        header_start = CONTROL_HEADER_PAGE * page_size
+        header = _decode_header(
+            image[header_start : header_start + page_size],
+            database_uuid=self._database_uuid,
+            record_kind=self._kind,
+            page_size=page_size,
+            file=self._file,
+        )
+        slots = (
+            _decode_slot(
+                image[
+                    CONTROL_SLOT_PAGES[0] * page_size : (CONTROL_SLOT_PAGES[0] + 1)
+                    * page_size
+                ],
+                header=header,
+                page_size=page_size,
+                file=self._file,
+            ),
+            _decode_slot(
+                image[
+                    CONTROL_SLOT_PAGES[1] * page_size : (CONTROL_SLOT_PAGES[1] + 1)
+                    * page_size
+                ],
+                header=header,
+                page_size=page_size,
+                file=self._file,
+            ),
+        )
+        chosen, target = self._select_slot(slots)
+        return header, chosen, target
 
     def _read_header(self) -> _Header:
         """Read and decode the immutable page-zero binding."""
@@ -491,6 +593,10 @@ class TwoSlotControlRecordStore:
             )
             for page in CONTROL_SLOT_PAGES
         )
+        return self._select_slot(slots)
+
+    def _select_slot(self, slots: tuple[_Slot, _Slot]) -> tuple[_Slot | None, int]:
+        """Select the newest valid slot and the other page as the overwrite target."""
         populated = [
             (page, slot)
             for page, slot in zip(CONTROL_SLOT_PAGES, slots, strict=True)

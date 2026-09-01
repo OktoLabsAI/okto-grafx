@@ -77,6 +77,12 @@ including the on-disk format.
   the read-only `Database.descriptor_revalidation` property without entering the persisted
   `DatabaseIdentity`. WAL, OCC, durability, multiwriter/multireader and BR-10 semantics are
   unchanged.
+- **Two-slot control reads coalesce their fixed three-page image without weakening ST-2.** Control
+  names remain strict in both descriptor modes, but one logical image read now takes one bounded
+  `read_log` descriptor acquisition rather than three separate page acquisitions. Short v1 and
+  oversized legacy images are length-confirmed, v2 retries refuse both short and oversized
+  replacements, and header, CRC and generation validation are unchanged. A publication still
+  performs independently proved read, page-write and durability-barrier calls.
 - **Cross-writer DDL now proves the exact physical artifact before WAL.** Index headers carry a
   non-zero artifact nonce in format v2 while v1 remains readable and is upgraded only on writable
   startup under the commit fence. Durable foreign artifacts are synchronized only after the first

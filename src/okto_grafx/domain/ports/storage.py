@@ -93,14 +93,14 @@ class StorageDevice(Protocol):
         otherwise the device raises a typed failure such as GrafxCorruptionDetected."""
         ...
 
-    # --- append-only log space ---
+    # --- bounded byte reads and append-only log writes ---
 
     def append_log(self, file: str, payload: bytes) -> int:
         """Append and return the new total size. A partial append must raise GrafxDeviceFull."""
         ...
 
     def read_log(self, file: str, offset: int, length: int) -> bytes:
-        """Return length bytes starting at offset of an append-only file."""
+        """Fill length bytes from any named file unless EOF is reached; never change its shape."""
         ...
 
     def log_size(self, file: str) -> int:

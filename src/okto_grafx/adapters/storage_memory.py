@@ -220,7 +220,7 @@ class MemoryStorageDevice:
             return len(buffer)
 
     def read_log(self, file: str, offset: int, length: int) -> bytes:
-        """Return up to length bytes starting at offset; a read past the end returns what is there."""
+        """Fill length bytes from offset unless EOF is reached, then return what remains."""
         with self._lock:
             name = normalize_logical_name(file)
             validate_read_range(name, offset, length)
