@@ -241,7 +241,9 @@ def test_a_budget_below_one_page_is_refused() -> None:
         )
 
 
-@pytest.mark.parametrize("label", ["", "a" * 65, "C:/data/db", "db name", "db/1", "\u00e9"])
+@pytest.mark.parametrize(
+    "label", ["", "a" * 65, "C:/data/db", "db name", "db/1", "\u00e9"]
+)
 def test_a_database_label_that_is_not_short_and_bounded_is_refused(label: str) -> None:
     device = MemoryDevice()
     with pytest.raises(GrafxConfigurationError):
@@ -347,7 +349,9 @@ def test_invalidate_forces_a_re_read_and_keeps_what_was_written() -> None:
         assert page.read_slot(1) == b"kept"
 
 
-def test_a_fresh_page_observation_bypasses_a_resident_frame_without_replacing_it() -> None:
+def test_a_fresh_page_observation_bypasses_a_resident_frame_without_replacing_it() -> (
+    None
+):
     """A cross-process certificate must come from the device, not from the cache it certifies."""
     device = MemoryDevice()
     reader = make_pool(device, RecordingMetrics())
@@ -364,7 +368,9 @@ def test_a_fresh_page_observation_bypasses_a_resident_frame_without_replacing_it
     observed = reader.read_fresh_page(FILE, 0)
 
     assert observed.read_slot(0) == b"foreign"
-    assert tuple(device.write_calls) == writes_before, "a read-only observation wrote a page"
+    assert tuple(device.write_calls) == writes_before, (
+        "a read-only observation wrote a page"
+    )
     with reader.pinned(FILE, 0) as still_cached:
         assert still_cached.read_slot(0) == original, (
             "observing the device silently replaced a frame another caller may still rely on"
@@ -404,7 +410,9 @@ def test_discard_clean_file_forgets_clean_frames_without_writing_them_back() -> 
     assert pool.cache_drop_epoch(FILE) == epoch_before + 1
 
 
-def test_discard_clean_file_refuses_dirty_frames_atomically_and_without_writeback() -> None:
+def test_discard_clean_file_refuses_dirty_frames_atomically_and_without_writeback() -> (
+    None
+):
     device = MemoryDevice()
     pool = make_pool(device, RecordingMetrics())
     seed_pages(pool, 2)
@@ -430,7 +438,9 @@ def test_discard_clean_file_refuses_dirty_frames_atomically_and_without_writebac
         pool.unpin(FILE, 1, page=held_clean)
 
 
-def test_discard_clean_file_dooms_clean_pins_and_releases_the_exact_object_unwritten() -> None:
+def test_discard_clean_file_dooms_clean_pins_and_releases_the_exact_object_unwritten() -> (
+    None
+):
     device = MemoryDevice()
     pool = make_pool(device, RecordingMetrics())
     seed_pages(pool, 2)
@@ -457,6 +467,21 @@ def test_discard_clean_file_dooms_clean_pins_and_releases_the_exact_object_unwri
     assert pool.pin_count(FILE, 1) == 1
     assert (FILE, 1) not in pool._doomed
     pool.unpin(FILE, 1, page=fresh)
+
+
+def test_discard_clean_file_accepts_a_dirty_frame_already_marked_discard_only() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    held = pool.pin(FILE, 0)
+    writes_before = tuple(device.write_calls)
+    assert pool.discard_clean_file(FILE) == 1
+    held.update_slot(0, b"late-stale-holder")
+
+    assert pool.discard_clean_file(FILE) == 0
+
+    pool.unpin(FILE, 0, dirty=True, page=held)
+    assert tuple(device.write_calls) == writes_before
 
 
 def test_discard_clean_file_keeps_existing_pinned_doomed_frames_only() -> None:
@@ -535,7 +560,9 @@ def test_discard_clean_page_dooms_a_clean_pin_and_never_writes_it_on_release() -
     assert pool.discard_clean_page(FILE, 0) is True
 
     assert not pool.is_resident(FILE, 0)
-    assert pool.is_resident(FILE, 1), "the page-scoped refresh dropped an unrelated frame"
+    assert pool.is_resident(FILE, 1), (
+        "the page-scoped refresh dropped an unrelated frame"
+    )
     assert pool.cache_drop_epoch(FILE) == epoch_before + 1
     assert pool._doomed[(FILE, 0)][0].page is held
     held.update_slot(0, b"stale-header")
@@ -547,7 +574,9 @@ def test_discard_clean_page_dooms_a_clean_pin_and_never_writes_it_on_release() -
     pool.unpin(FILE, 0, page=fresh)
 
 
-def test_discard_clean_page_refuses_dirty_among_doomed_and_resident_atomically() -> None:
+def test_discard_clean_page_refuses_dirty_among_doomed_and_resident_atomically() -> (
+    None
+):
     device = MemoryDevice()
     pool = make_pool(device, RecordingMetrics())
     seed_pages(pool, 1)
@@ -567,10 +596,262 @@ def test_discard_clean_page_refuses_dirty_among_doomed_and_resident_atomically()
         assert pool.cache_drop_epoch(FILE) == epoch_before
         assert pool.is_resident(FILE, 0)
         assert pool._doomed[(FILE, 0)][0].page is held_clean
-        assert pool._doomed[(FILE, 0)][0].discard_unwritten is False
+        assert pool._doomed[(FILE, 0)][0].discard_unwritten is True
     finally:
         pool.unpin(FILE, 0, page=held_clean)
         pool.unpin(FILE, 0, page=fresh_dirty)
+
+
+def test_bounded_read_view_discards_only_proved_pages_files_and_catalog() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics(), budget_pages=8)
+    index_file = "indexes/person-name.dat"
+    catalog_file = "catalog/catalog.dat"
+    seed_pages(pool, 3)
+    seed_pages(pool, 2, file=index_file)
+    seed_pages(pool, 1, file=catalog_file)
+    pool.begin_read_view("old")
+    for file, pages in ((FILE, 3), (index_file, 2), (catalog_file, 1)):
+        for page_index in range(pages):
+            page = pool.pin(file, page_index)
+            pool.unpin(file, page_index, page=page)
+    epochs = {
+        file: pool.cache_drop_epoch(file) for file in (FILE, index_file, catalog_file)
+    }
+    writes_before = tuple(device.write_calls)
+
+    assert pool.begin_read_view(
+        "new",
+        changed_pages={(FILE, 1)},
+        changed_files={index_file},
+        unfenced_file=catalog_file,
+        expected_previous="old",
+    )
+
+    assert pool.read_view_token() == "new"
+    assert pool.is_resident(FILE, 0)
+    assert not pool.is_resident(FILE, 1)
+    assert pool.is_resident(FILE, 2)
+    assert not pool.is_resident(index_file, 0)
+    assert not pool.is_resident(index_file, 1)
+    assert not pool.is_resident(catalog_file, 0)
+    assert tuple(device.write_calls) == writes_before
+    for file in (FILE, index_file, catalog_file):
+        assert pool.cache_drop_epoch(file) == epochs[file] + 1
+
+
+def test_bounded_read_view_preflights_every_target_before_moving_token_or_frame() -> (
+    None
+):
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 3)
+    pool.begin_read_view("old")
+    for page_index in range(3):
+        page = pool.pin(FILE, page_index)
+        pool.unpin(FILE, page_index, page=page)
+    dirty = pool.pin(FILE, 2)
+    dirty.update_slot(0, b"local-work")
+    pool.unpin(FILE, 2, dirty=True, page=dirty)
+    epoch_before = pool.cache_drop_epoch(FILE)
+    writes_before = tuple(device.write_calls)
+
+    with pytest.raises(GrafxUnsupportedOperation) as refused:
+        pool.begin_read_view(
+            "new",
+            changed_pages={(FILE, 0), (FILE, 2)},
+            expected_previous="old",
+        )
+
+    assert refused.value.details["field"] == "dirty"
+    assert pool.read_view_token() == "old"
+    assert all(pool.is_resident(FILE, page_index) for page_index in range(3))
+    assert pool.cache_drop_epoch(FILE) == epoch_before
+    assert tuple(device.write_calls) == writes_before
+
+
+def test_bounded_read_view_dooms_a_changed_pin_and_never_writes_it_later() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 2)
+    pool.begin_read_view("old")
+    held = pool.pin(FILE, 0)
+    sibling = pool.pin(FILE, 1)
+    pool.unpin(FILE, 1, page=sibling)
+    writes_before = tuple(device.write_calls)
+
+    assert pool.begin_read_view(
+        "new", changed_pages={(FILE, 0)}, expected_previous="old"
+    )
+
+    assert not pool.is_resident(FILE, 0)
+    assert pool.is_resident(FILE, 1)
+    assert pool._doomed[(FILE, 0)][0].page is held
+    assert pool._doomed[(FILE, 0)][0].discard_unwritten is True
+    held.update_slot(0, b"late-stale-holder")
+    pool.unpin(FILE, 0, dirty=True, page=held)
+    assert tuple(device.write_calls) == writes_before
+    assert (FILE, 0) not in pool._doomed
+
+
+def test_same_token_still_refreshes_the_explicitly_unfenced_file() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    catalog_file = "catalog/catalog.dat"
+    seed_pages(pool, 1)
+    seed_pages(pool, 1, file=catalog_file)
+    pool.begin_read_view("stable")
+    for file in (FILE, catalog_file):
+        page = pool.pin(file, 0)
+        pool.unpin(file, 0, page=page)
+    catalog_epoch = pool.cache_drop_epoch(catalog_file)
+
+    assert pool.begin_read_view("stable", unfenced_file=catalog_file)
+
+    assert pool.is_resident(FILE, 0)
+    assert not pool.is_resident(catalog_file, 0)
+    assert pool.cache_drop_epoch(catalog_file) == catalog_epoch + 1
+
+
+def test_partial_refresh_without_a_bound_baseline_falls_back_to_every_file() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    other = "other.dat"
+    seed_pages(pool, 2)
+    seed_pages(pool, 1, file=other)
+
+    assert pool.begin_read_view("first", changed_pages={(FILE, 0)})
+
+    assert not pool.is_resident(FILE, 0)
+    assert not pool.is_resident(FILE, 1)
+    assert not pool.is_resident(other, 0)
+
+    for file, page_index in ((FILE, 0), (FILE, 1), (other, 0)):
+        page = pool.pin(file, page_index)
+        pool.unpin(file, page_index, page=page)
+    assert pool.begin_read_view("second", changed_pages={(FILE, 0)})
+    assert not pool.is_resident(FILE, 0)
+    assert not pool.is_resident(FILE, 1)
+    assert not pool.is_resident(other, 0)
+
+    for file, page_index in ((FILE, 0), (other, 0)):
+        page = pool.pin(file, page_index)
+        pool.unpin(file, page_index, page=page)
+    assert pool.begin_read_view(None, changed_pages=())
+    assert not pool.is_resident(FILE, 0)
+    assert not pool.is_resident(other, 0)
+
+
+def test_stale_partial_baseline_falls_back_atomically_instead_of_regressing_partially() -> (
+    None
+):
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 2)
+    pool.begin_read_view("t1")
+    for page_index in range(2):
+        page = pool.pin(FILE, page_index)
+        pool.unpin(FILE, page_index, page=page)
+    pool.begin_read_view(
+        "t3",
+        changed_pages={(FILE, 1)},
+        expected_previous="t1",
+    )
+    page = pool.pin(FILE, 1)
+    pool.unpin(FILE, 1, page=page)
+    assert pool.is_resident(FILE, 0)
+    assert pool.is_resident(FILE, 1)
+
+    pool.begin_read_view(
+        "t2",
+        changed_pages={(FILE, 0)},
+        expected_previous="t1",
+    )
+
+    assert pool.read_view_token() == "t2"
+    assert not pool.is_resident(FILE, 0)
+    assert not pool.is_resident(FILE, 1)
+
+
+def test_repeated_delta_accepts_a_dirty_doomed_frame_that_is_already_discard_only() -> (
+    None
+):
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    pool.begin_read_view("t0")
+    held = pool.pin(FILE, 0)
+    writes_before = tuple(device.write_calls)
+    pool.begin_read_view("t1", changed_pages={(FILE, 0)}, expected_previous="t0")
+    held.update_slot(0, b"late-stale-holder")
+
+    pool.begin_read_view("t2", changed_pages={(FILE, 0)}, expected_previous="t1")
+
+    assert pool.read_view_token() == "t2"
+    assert pool._doomed[(FILE, 0)][0].discard_unwritten is True
+    pool.unpin(FILE, 0, dirty=True, page=held)
+    assert tuple(device.write_calls) == writes_before
+
+
+def test_foreign_full_fallback_makes_a_clean_pin_discard_only() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    pool.begin_read_view("t0")
+    held = pool.pin(FILE, 0)
+    writes_before = tuple(device.write_calls)
+
+    pool.begin_read_view("t1")
+
+    assert pool._doomed[(FILE, 0)][0].discard_unwritten is True
+    held.update_slot(0, b"late-stale-holder")
+    pool.unpin(FILE, 0, dirty=True, page=held)
+    assert tuple(device.write_calls) == writes_before
+
+
+def test_invalid_partial_targets_refuse_before_token_frame_or_epoch_moves() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 2)
+    pool.begin_read_view("old")
+    for page_index in range(2):
+        page = pool.pin(FILE, page_index)
+        pool.unpin(FILE, page_index, page=page)
+    epoch_before = pool.cache_drop_epoch(FILE)
+    writes_before = tuple(device.write_calls)
+
+    with pytest.raises(GrafxConfigurationError):
+        pool.begin_read_view("new", changed_pages=(), changed_files=FILE)
+
+    assert pool.read_view_token() == "old"
+    assert pool.is_resident(FILE, 0)
+    assert pool.is_resident(FILE, 1)
+    assert pool.cache_drop_epoch(FILE) == epoch_before
+    assert tuple(device.write_calls) == writes_before
+
+
+def test_partial_target_iterables_are_bounded_before_pool_state_moves() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    pool.begin_read_view("old")
+    page = pool.pin(FILE, 0)
+    pool.unpin(FILE, 0, page=page)
+    epoch_before = pool.cache_drop_epoch(FILE)
+    writes_before = tuple(device.write_calls)
+
+    with pytest.raises(GrafxConfigurationError) as refused:
+        pool.begin_read_view(
+            "new",
+            changed_pages=((FILE, page_index) for page_index in range(1025)),
+            expected_previous="old",
+        )
+
+    assert refused.value.details == {"field": "read_view_changes", "limit": 1024}
+    assert pool.read_view_token() == "old"
+    assert pool.is_resident(FILE, 0)
+    assert pool.cache_drop_epoch(FILE) == epoch_before
+    assert tuple(device.write_calls) == writes_before
 
 
 def test_discarded_header_page_is_never_settled_as_detached_abandoned_space() -> None:
@@ -740,7 +1021,11 @@ def test_the_pool_exposes_the_ports_the_stores_need() -> None:
     device = MemoryDevice()
     codec = PageCodecV1(device.page_size)
     pool = BufferPool(
-        device, codec, RecordingMetrics(), budget_bytes=device.page_size * 4, db_label="alpha"
+        device,
+        codec,
+        RecordingMetrics(),
+        budget_bytes=device.page_size * 4,
+        db_label="alpha",
     )
     assert pool.storage is device
     assert pool.codec is codec
@@ -974,9 +1259,19 @@ def test_a_refused_pin_does_not_grow_the_file_either() -> None:
 
 @pytest.mark.parametrize(
     ("current", "expected"),
-    [(0, 2), (2, 4), (7, 8), (1, 2), (0xFFFFFFFE, 0), (0xFFFFFFFF, 0), (0xFFFFFFFD, 0xFFFFFFFE)],
+    [
+        (0, 2),
+        (2, 4),
+        (7, 8),
+        (1, 2),
+        (0xFFFFFFFE, 0),
+        (0xFFFFFFFF, 0),
+        (0xFFFFFFFD, 0xFFFFFFFE),
+    ],
 )
-def test_the_sequence_counter_always_lands_on_an_even_value(current: int, expected: int) -> None:
+def test_the_sequence_counter_always_lands_on_an_even_value(
+    current: int, expected: int
+) -> None:
     assert next_seq(current) == expected
     assert next_seq(current) % 2 == 0
 
@@ -1015,7 +1310,9 @@ def test_a_page_that_was_allocated_and_never_written_reads_as_free() -> None:
     assert page.slot_count == 0
     assert page.page_lsn == 0
     assert not page.dirty
-    assert len(device.read_calls) == 1, "the retry budget is not spent on a page nobody wrote"
+    assert len(device.read_calls) == 1, (
+        "the retry budget is not spent on a page nobody wrote"
+    )
 
 
 def test_a_written_page_can_never_look_like_an_unwritten_one() -> None:
@@ -1045,7 +1342,9 @@ def test_a_short_read_is_still_corruption_and_not_an_unwritten_page() -> None:
 # --- the redo rule -------------------------------------------------------------------------------
 
 
-def image_with_lsn(pool: BufferPool, page_lsn: int, payload: bytes, seq: int = 0) -> bytes:
+def image_with_lsn(
+    pool: BufferPool, page_lsn: int, payload: bytes, seq: int = 0
+) -> bytes:
     """Return an encoded page image carrying that log position and payload."""
     page = Page(int(PageType.HEAP), page_size=pool.page_size)
     page.page_lsn = page_lsn
@@ -1059,7 +1358,9 @@ def test_redo_installs_an_image_over_a_page_that_was_never_written() -> None:
     pool = make_pool(device, RecordingMetrics())
     device.create(FILE)
     device.allocate(FILE, 3)
-    assert apply_page_image(pool, FILE, 2, image_with_lsn(pool, 500, b"replayed")) is True
+    assert (
+        apply_page_image(pool, FILE, 2, image_with_lsn(pool, 500, b"replayed")) is True
+    )
     with pool.pinned(FILE, 2) as page:
         assert page.page_lsn == 500
         assert page.read_slot(0) == b"replayed"
@@ -1094,12 +1395,16 @@ def test_redo_never_installs_an_odd_sequence_counter() -> None:
     pool = make_pool(device, RecordingMetrics())
     device.create(FILE)
     device.allocate(FILE, 1)
-    assert apply_page_image(pool, FILE, 0, image_with_lsn(pool, 9, b"odd", seq=7)) is True
+    assert (
+        apply_page_image(pool, FILE, 0, image_with_lsn(pool, 9, b"odd", seq=7)) is True
+    )
     with pool.pinned(FILE, 0) as page:
         assert page.seq % 2 == 0
     pool.flush(FILE)
     pool.invalidate()
-    assert pool.pin(FILE, 0).read_slot(0) == b"odd", "an odd counter would be unreadable for good"
+    assert pool.pin(FILE, 0).read_slot(0) == b"odd", (
+        "an odd counter would be unreadable for good"
+    )
 
 
 def test_redo_refuses_a_damaged_image() -> None:
@@ -1136,7 +1441,9 @@ def test_a_page_image_may_be_any_byte_buffer() -> None:
 
 
 @pytest.mark.parametrize("page_index", [True, False, "0", 1.0, None, -1, 1 << 32])
-def test_a_page_index_that_is_not_an_unsigned_integer_is_refused(page_index: object) -> None:
+def test_a_page_index_that_is_not_an_unsigned_integer_is_refused(
+    page_index: object,
+) -> None:
     # A bool is the dangerous one: True would silently mean page 1, so a flag passed where an
     # index belongs would grow a file and write a page nobody asked for.
     device = MemoryDevice()
@@ -1275,16 +1582,22 @@ def test_dropping_the_cache_of_a_file_that_has_nothing_resident_still_says_so() 
     pool = make_pool(device, RecordingMetrics(), budget_pages=2)
     seed_pages(pool, 3, file="resident.dat")
     empty = "no-frames.dat"
-    assert not pool.is_resident(empty, 0), "the file under test must hold no frame at all"
+    assert not pool.is_resident(empty, 0), (
+        "the file under test must hold no frame at all"
+    )
     before = pool.cache_drop_epoch(empty)
 
     pool.invalidate(empty)
-    assert pool.cache_drop_epoch(empty) == before + 1, "an empty cache still had to be dropped"
+    assert pool.cache_drop_epoch(empty) == before + 1, (
+        "an empty cache still had to be dropped"
+    )
     pool.invalidate()
     assert pool.cache_drop_epoch(empty) == before + 2
 
 
-def test_dropping_every_cache_moves_the_epoch_of_a_pool_that_has_never_been_read() -> None:
+def test_dropping_every_cache_moves_the_epoch_of_a_pool_that_has_never_been_read() -> (
+    None
+):
     """The every-file branch, measured from a pool whose counters have never been written.
 
     invalidate(file) and invalidate() must be the same strength, and only the branch under test
@@ -1318,7 +1631,9 @@ def test_dropping_every_cache_speaks_for_a_file_this_pool_has_never_touched() ->
     assert pool.cache_drop_epoch("created-later.dat") == created_later + 1
 
 
-def test_the_every_file_branch_and_the_one_file_branch_move_a_reading_by_the_same_step() -> None:
+def test_the_every_file_branch_and_the_one_file_branch_move_a_reading_by_the_same_step() -> (
+    None
+):
     """Two spellings of one statement must not have two strengths (A66.1)."""
     one_file = make_pool(MemoryDevice(), RecordingMetrics())
     every_file = make_pool(MemoryDevice(), RecordingMetrics())
@@ -1359,7 +1674,9 @@ def test_a_redo_says_the_structure_of_the_file_may_have_changed() -> None:
     device.create(FILE)
     device.allocate(FILE, 1)
     before = pool.structure_epoch(FILE)
-    assert apply_page_image(pool, FILE, 0, image_with_lsn(pool, 500, b"replayed")) is True
+    assert (
+        apply_page_image(pool, FILE, 0, image_with_lsn(pool, 500, b"replayed")) is True
+    )
     assert pool.structure_epoch(FILE) == before + 1
     # An image that is refused changes nothing, so it says nothing.
     assert apply_page_image(pool, FILE, 0, image_with_lsn(pool, 100, b"older")) is False
@@ -1401,13 +1718,17 @@ def test_a_chain_refuses_a_reuse_list_that_names_one_page_twice() -> None:
     before = device.page_count(FILE)
 
     with pytest.raises(GrafxCorruptionDetected) as raised:
-        write_chain(pool, FILE, payload, page_type=int(PageType.OVERFLOW), reuse=(1, 1, 1))
+        write_chain(
+            pool, FILE, payload, page_type=int(PageType.OVERFLOW), reuse=(1, 1, 1)
+        )
     assert raised.value.details["field"] == "reuse"
     assert raised.value.details["page"] == 1
     assert device.page_count(FILE) == before, "a refused chain grew the file"
 
     # A list of distinct pages is written whole, which is what the refusal is protecting.
-    pages = write_chain(pool, FILE, payload, page_type=int(PageType.OVERFLOW), reuse=(1, 2, 3))
+    pages = write_chain(
+        pool, FILE, payload, page_type=int(PageType.OVERFLOW), reuse=(1, 2, 3)
+    )
     assert read_chain(pool, FILE, pages[0], page_type=int(PageType.OVERFLOW)) == payload
 
 
@@ -1504,7 +1825,9 @@ def test_a_relink_moves_both_the_structure_reading_and_the_conservative_one() ->
 # --- C6: a decoded page must not name page zero -------------------------------------------------
 
 
-def test_a_page_decoded_through_the_port_reports_page_zero_until_it_is_stamped() -> None:
+def test_a_page_decoded_through_the_port_reports_page_zero_until_it_is_stamped() -> (
+    None
+):
     """The defect C6 met, pinned as a property of the PORT rather than of any C1 door.
 
     decode_page cannot take a page index -- section 4 is frozen -- so every page it returns
@@ -1624,7 +1947,6 @@ def test_a_growing_chain_names_the_pages_the_file_does_not_have_yet() -> None:
     assert device.page_count(FILE) == present, "planning the change grew the file"
     assert grown, "the payload has to need a page the file does not have"
 
-
     for index, image in images:
         apply_page_image(pool, FILE, index, _later(pool, image))
     assert read_chain(pool, FILE, images[0][0]) == b"y" * 2000
@@ -1642,7 +1964,9 @@ def _later(pool: BufferPool, image: bytes) -> bytes:
     return pool.codec.encode_page(page)
 
 
-def test_building_images_refuses_a_reuse_list_that_names_the_reserved_header_page() -> None:
+def test_building_images_refuses_a_reuse_list_that_names_the_reserved_header_page() -> (
+    None
+):
     device = MemoryDevice()
     pool = make_pool(device, RecordingMetrics())
     reserve_header(pool)
@@ -1712,7 +2036,9 @@ def test_an_empty_payload_still_gets_one_image() -> None:
 # --- threads of one participant: the guard, and frames doomed by a read view ---------------------
 
 
-def test_page_write_fence_orders_guard_then_section_and_allows_nested_write_back() -> None:
+def test_page_write_fence_orders_guard_then_section_and_allows_nested_write_back() -> (
+    None
+):
     """A rebuild can hold one page section while a nested page-0 CAS re-enters both locks."""
     entered: list[str] = []
 
@@ -1736,7 +2062,9 @@ def test_page_write_fence_orders_guard_then_section_and_allows_nested_write_back
     section = RecordingReentrantLock("section")
 
     def page_section(_file: str, _page_index: PageIndex) -> RecordingReentrantLock:
-        assert guard.depth > 0, "the cross-process section was requested before the local guard"
+        assert guard.depth > 0, (
+            "the cross-process section was requested before the local guard"
+        )
         return section
 
     device = MemoryDevice()

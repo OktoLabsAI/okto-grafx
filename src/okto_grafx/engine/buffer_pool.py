@@ -16,9 +16,10 @@ declared corrupt and the location is named.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import wraps
+from itertools import islice
 
 from okto_grafx.domain.errors import (
     GrafxBufferBudgetExceeded,
@@ -84,6 +85,9 @@ and honouring it would allocate zero-filled pages that G6 then forbids reclaimin
 MAX_SEQ: int = 0xFFFFFFFF
 """The write sequence counter is a 32-bit header field and wraps inside it."""
 
+_READ_VIEW_BASELINE_UNSET: object = object()
+_READ_VIEW_MAX_TARGETS: int = 1024
+
 BUFFER_BUDGET_USED_BYTES: str = "oktografx_buffer_budget_used_bytes"
 BUFFER_BUDGET_EXCEEDED_TOTAL: str = "oktografx_buffer_budget_exceeded_total"
 CHECKSUM_VERIFICATIONS_TOTAL: str = "oktografx_checksum_verifications_total"
@@ -129,6 +133,81 @@ def _require_page_index(field: str, page_index: PageIndex) -> PageIndex:
             value=page_index,
         )
     return page_index
+
+
+def _require_read_view_file(field: str, file: object) -> str:
+    """Return one internal read-view file name, refusing an ambiguous proof target."""
+
+    if not isinstance(file, str) or not file or "\x00" in file:
+        raise GrafxConfigurationError(
+            f"The {field} read-view target must be a non-empty file name; got {file!r}.",
+            field=field,
+            value=repr(file),
+        )
+    return file
+
+
+def _read_view_targets(
+    changed_pages: Iterable[tuple[str, PageIndex]],
+    changed_files: Iterable[str],
+) -> tuple[frozenset[tuple[str, PageIndex]], frozenset[str]]:
+    """Materialise and validate a CE-3 proof before any resident state can move."""
+
+    if isinstance(changed_pages, (str, bytes, bytearray, memoryview)):
+        raise GrafxConfigurationError(
+            "changed_pages must be an iterable of (file, page_index) pairs.",
+            field="changed_pages",
+            value=type(changed_pages).__name__,
+        )
+    if isinstance(changed_files, (str, bytes, bytearray, memoryview)):
+        raise GrafxConfigurationError(
+            "changed_files must be an iterable of complete file names, not one string.",
+            field="changed_files",
+            value=type(changed_files).__name__,
+        )
+    try:
+        offered_pages = tuple(islice(iter(changed_pages), _READ_VIEW_MAX_TARGETS + 1))
+        offered_files = tuple(islice(iter(changed_files), _READ_VIEW_MAX_TARGETS + 1))
+    except TypeError as failure:
+        raise GrafxConfigurationError(
+            "Read-view change targets must be finite iterables.",
+            field="read_view_changes",
+        ) from failure
+    if (
+        len(offered_pages) > _READ_VIEW_MAX_TARGETS
+        or len(offered_files) > _READ_VIEW_MAX_TARGETS
+    ):
+        raise GrafxConfigurationError(
+            "A read-view proof exceeds the bounded target budget.",
+            field="read_view_changes",
+            limit=_READ_VIEW_MAX_TARGETS,
+        )
+
+    pages: set[tuple[str, PageIndex]] = set()
+    for position, target in enumerate(offered_pages):
+        if not isinstance(target, tuple) or len(target) != 2:
+            raise GrafxConfigurationError(
+                "Each changed page must be exactly a (file, page_index) tuple.",
+                field="changed_pages",
+                position=position,
+                value=repr(target),
+            )
+        file = _require_read_view_file(f"changed_pages[{position}].file", target[0])
+        page_index = _require_page_index(
+            f"changed_pages[{position}].page_index", target[1]
+        )
+        pages.add((file, page_index))
+    files = frozenset(
+        _require_read_view_file(f"changed_files[{position}]", file)
+        for position, file in enumerate(offered_files)
+    )
+    if len(pages) + len(files) > _READ_VIEW_MAX_TARGETS:
+        raise GrafxConfigurationError(
+            "A read-view proof exceeds the bounded target budget.",
+            field="read_view_changes",
+            limit=_READ_VIEW_MAX_TARGETS,
+        )
+    return frozenset(pages), files
 
 
 def _require_image(file: str, page_index: PageIndex, image: object) -> bytes:
@@ -177,7 +256,9 @@ class _Frame:
         # The sequence observed on the device when this frame was admitted (or after its last
         # successful write-back). It is separate from ``page.seq`` because redo may replace the
         # mutable page with a newer logged image before publishing it.
-        self.device_base_seq: int = page.seq if device_base_seq is None else device_base_seq
+        self.device_base_seq: int = (
+            page.seq if device_base_seq is None else device_base_seq
+        )
 
 
 def _guarded(method: Callable[..., object]) -> Callable[..., object]:
@@ -243,9 +324,7 @@ class BufferPool:
         budget_bytes: int,
         db_label: str,
         guard: AbstractContextManager[object] | None = None,
-        page_write_section: Callable[
-            [str, PageIndex], AbstractContextManager[object]
-        ]
+        page_write_section: Callable[[str, PageIndex], AbstractContextManager[object]]
         | None = None,
         page_sequence_fence: Callable[[str, PageIndex], bool] | None = None,
     ) -> None:
@@ -447,7 +526,12 @@ class BufferPool:
 
     @_guarded
     def unpin(
-        self, file: str, page_index: PageIndex, *, dirty: bool = False, page: Page | None = None
+        self,
+        file: str,
+        page_index: PageIndex,
+        *,
+        dirty: bool = False,
+        page: Page | None = None,
     ) -> None:
         """Release one pin on the page, marking it dirty when the caller changed it.
 
@@ -602,7 +686,9 @@ class BufferPool:
         for a fresh page and link whatever they are given. For every one of those, reuse is the
         point.
         """
-        prospective = self._storage.page_count(file) if self._storage.exists(file) else 0
+        prospective = (
+            self._storage.page_count(file) if self._storage.exists(file) else 0
+        )
         self._make_room(file, prospective)
         page_index = self._reusable_index(file) if reuse else None
         if page_index is None:
@@ -648,7 +734,9 @@ class BufferPool:
         return written
 
     @_guarded
-    def modified_pages(self, file: str | None = None) -> frozenset[tuple[str, PageIndex]]:
+    def modified_pages(
+        self, file: str | None = None
+    ) -> frozenset[tuple[str, PageIndex]]:
         """Return every page this pool has CHANGED since the last :meth:`forget_modified`.
 
         This exists so a caller can learn what its own work actually changed, instead of
@@ -694,7 +782,9 @@ class BufferPool:
         )
 
     @_guarded
-    def pages_written_back(self, file: str | None = None) -> frozenset[tuple[str, PageIndex]]:
+    def pages_written_back(
+        self, file: str | None = None
+    ) -> frozenset[tuple[str, PageIndex]]:
         """Return the pages this pool has WRITTEN OUT since the last :meth:`forget_modified`.
 
         The other half of :meth:`modified_pages`, and the caller that needs it apart is the one
@@ -804,6 +894,9 @@ class BufferPool:
         *,
         own: bool = False,
         unfenced_file: str | None = None,
+        changed_pages: Iterable[tuple[str, PageIndex]] | None = None,
+        changed_files: Iterable[str] = (),
+        expected_previous: object = _READ_VIEW_BASELINE_UNSET,
     ) -> bool:
         """Start a fresh read view over this database, and say whether anything was dropped.
 
@@ -827,8 +920,10 @@ class BufferPool:
         token, or no token at all, means assume it has, which is the safe default for a caller
         that has nothing to watch.
 
-        Dirty frames are written back before they are dropped, exactly as invalidate does: this
-        forgets what was read, never what was written.
+        A conservative full refresh retains invalidate's established behaviour and writes dirty
+        unpinned frames before dropping them; direct engine composition relies on that door to
+        publish legitimate local work. A proved bounded foreign delta is zero-write and refuses
+        any targeted dirty frame capable of publication before moving a frame or the token.
 
         ``own`` is the caller SAYING the token moved only because this participant itself
         published a commit (CQ-2/QW-4): the resident frames are the very committed state this
@@ -839,12 +934,41 @@ class BufferPool:
         without moving the token (the catalog has no page-0 sequence fence), so its frames are
         dropped and its epoch bumped even in an own view; a foreign mutation that moves no LSN
         anywhere else remains the business of the page-0 certificates, as it is today.
+
+        ``changed_pages`` is CE-3's optional proof of the exact committed WAL delta between the
+        previous token and this one. ``None`` retains the conservative full-pool drop. A concrete
+        iterable permits a zero-write discard of only those pages plus every file named by
+        ``changed_files``; the caller must fall back to ``None`` whenever the WAL interval is not
+        complete. ``unfenced_file`` is always added as a whole-file target because its device
+        image can move without a page-zero certificate. All targets are preflighted before the
+        first frame moves. A dirty target therefore refuses without advancing the token, while
+        unrelated dirty work remains resident. ``expected_previous`` is required for a partial
+        proof and atomically binds it to the token from which the caller derived it; omission or
+        mismatch takes the conservative full foreign refresh rather than applying an unbound or
+        stale partial interval.
         """
-        if token is not None and token == self._read_view_token:
-            return False
         previous = self._read_view_token
-        self._read_view_token = token
-        if (
+        pages: frozenset[tuple[str, PageIndex]] | None = None
+        files: frozenset[str] = frozenset()
+        if changed_pages is not None:
+            pages, files = _read_view_targets(changed_pages, changed_files)
+        if unfenced_file is not None:
+            unfenced_file = _require_read_view_file("unfenced_file", unfenced_file)
+
+        # A token says nothing about this file: a vector-space/catalog save can move it without
+        # appending WAL.  Same-token views remain free for every fenced file, but not for this
+        # explicitly unfenced one.
+        if token is not None and token == previous:
+            if unfenced_file is None:
+                return False
+            return bool(
+                self._discard_clean_changes(
+                    pages=frozenset(),
+                    files=frozenset({unfenced_file}),
+                )
+            )
+
+        own_proved = (
             own
             and previous is not None
             and not any(
@@ -852,22 +976,148 @@ class BufferPool:
                 for key, frame in self._frames.items()
                 if key[0] != unfenced_file
             )
-        ):
+        )
+        if own_proved:
             if self._metrics.enabled:
                 self._metrics.increment(
                     READ_VIEW_DROPS_TOTAL, 1.0, {"view_origin": "own"}
                 )
             if unfenced_file is None:
+                self._read_view_token = token
                 return False
-            had_frames = any(key[0] == unfenced_file for key in self._frames)
-            self._invalidate(unfenced_file, doom_pinned=True)
-            return had_frames
-        self._invalidate(None, doom_pinned=True)
+            dropped = self._discard_clean_changes(
+                pages=frozenset(),
+                files=frozenset({unfenced_file}),
+            )
+            self._read_view_token = token
+            return bool(dropped)
+
+        partial_proved = (
+            pages is not None
+            and token is not None
+            and previous is not None
+            and expected_previous is not _READ_VIEW_BASELINE_UNSET
+            and expected_previous == previous
+        )
+        if not partial_proved:
+            baseline_mismatch = (
+                pages is not None
+                and previous is not None
+                and expected_previous is not _READ_VIEW_BASELINE_UNSET
+                and expected_previous != previous
+            )
+            if baseline_mismatch:
+                # Applying a late partial proof to a newer local view could omit the intervening
+                # change. Refuse dirty state and take a zero-write full refresh instead.
+                self._discard_clean_changes(
+                    pages=frozenset(),
+                    files=frozenset(),
+                    every_file=True,
+                )
+            else:
+                # No bounded proof is available. Preserve the established full-refresh
+                # semantics, including publication of legitimate local dirty work. Clean pinned
+                # readers are made discard-only by _invalidate before they can mutate late.
+                self._invalidate(None, doom_pinned=True)
+        else:
+            if unfenced_file is not None:
+                files = files | {unfenced_file}
+            self._discard_clean_changes(
+                pages=frozenset(key for key in pages if key[0] not in files),
+                files=files,
+            )
+        self._read_view_token = token
         if self._metrics.enabled:
             self._metrics.increment(
                 READ_VIEW_DROPS_TOTAL, 1.0, {"view_origin": "foreign"}
             )
         return True
+
+    @_guarded
+    def read_view_token(self) -> object:
+        """Return the exact token currently attached to resident frames.
+
+        TransactionManager uses this only while its participant section is held, immediately
+        before deriving a bounded WAL delta. Exposing the value through the pool keeps one owner
+        of the token and avoids a second process-local cache whose drift would turn a partial
+        interval into a false proof.
+        """
+
+        return self._read_view_token
+
+    def _discard_clean_changes(
+        self,
+        *,
+        pages: frozenset[tuple[str, PageIndex]],
+        files: frozenset[str],
+        every_file: bool = False,
+    ) -> int:
+        """Discard one proved foreign change-set atomically and without write-back.
+
+        The caller already owns the pool guard. File targets dominate page targets. Every
+        resident and previously doomed target is proved clean before anything moves, so a late
+        dirty target cannot leave a partially advanced read view. Clean pinned frames are doomed
+        and marked discard-only; their eventual release can never overwrite the foreign commit.
+        """
+
+        target_keys: set[tuple[str, PageIndex]] = set()
+        if every_file:
+            target_keys.update(self._frames)
+            target_keys.update(self._doomed)
+        else:
+            for key in pages:
+                if key in self._frames or key in self._doomed:
+                    target_keys.add(key)
+            if files:
+                target_keys.update(key for key in self._frames if key[0] in files)
+                target_keys.update(key for key in self._doomed if key[0] in files)
+
+        for file, page_index in target_keys:
+            resident = self._frames.get((file, page_index))
+            candidates = (
+                *((resident,) if resident is not None else ()),
+                *self._doomed.get((file, page_index), ()),
+            )
+            for frame in candidates:
+                if not frame.page.dirty or frame.discard_unwritten:
+                    continue
+                raise GrafxUnsupportedOperation(
+                    f"Page {page_index} of {file!r} is dirty and cannot be discarded for a "
+                    "foreign refresh without losing or writing local work.",
+                    field="dirty",
+                    file=file,
+                    page=page_index,
+                )
+
+        dropped = 0
+        for key in target_keys:
+            resident = self._frames.get(key)
+            if resident is not None:
+                dropped += 1
+                if resident.pins:
+                    resident.doomed = True
+                    resident.discard_unwritten = True
+                    self._doomed.setdefault(key, []).append(resident)
+                del self._frames[key]
+            retained = self._doomed.get(key)
+            if retained is not None:
+                for frame in tuple(retained):
+                    if frame.pins:
+                        frame.discard_unwritten = True
+                    else:
+                        retained.remove(frame)
+                if not retained:
+                    del self._doomed[key]
+
+        if every_file:
+            self._bump_every_file_drop_epoch()
+        else:
+            changed_names = files | {file for file, _page_index in pages}
+            for file in sorted(changed_names):
+                self._bump_drop_epoch(file)
+        if dropped:
+            self._report_usage()
+        return dropped
 
     @_guarded
     def discard(self, file: str, page_index: PageIndex) -> bool:
@@ -888,7 +1138,9 @@ class BufferPool:
         invisible. Returns True when the frame was actually dropped.
         """
         for doomed in self._doomed.pop((file, page_index), ()):
-            doomed.page.dirty = False  # an abandoned attempt's bytes, never written back
+            doomed.page.dirty = (
+                False  # an abandoned attempt's bytes, never written back
+            )
         frame = self._frames.get((file, page_index))
         if frame is None:
             return False
@@ -924,7 +1176,7 @@ class BufferPool:
             for frame in frames
         ]
         for (name, page_index), frame in (*targets, *doomed):
-            if frame.page.dirty:
+            if frame.page.dirty and not frame.discard_unwritten:
                 raise GrafxUnsupportedOperation(
                     f"Page {page_index} of {name!r} is dirty and cannot be discarded for a "
                     "foreign refresh without losing or writing local work.",
@@ -973,7 +1225,7 @@ class BufferPool:
         doomed = list(self._doomed.get(key, ()))
         frames.extend(doomed)
         for frame in frames:
-            if frame.page.dirty:
+            if frame.page.dirty and not frame.discard_unwritten:
                 raise GrafxUnsupportedOperation(
                     f"Page {page_index} of {file!r} is dirty and cannot be discarded for a "
                     "foreign refresh without losing or writing local work.",
@@ -1043,6 +1295,13 @@ class BufferPool:
         for (name, page_index), frame in targets:
             if frame.pins:
                 frame.doomed = True
+                # A frame that was clean at the foreign read-view boundary contains only an old
+                # observation. Its holder may mutate the Page object after this call and release
+                # it as dirty; marking it now prevents that late stale write from overwriting the
+                # commit which caused the refresh. A frame already dirty is legitimate local
+                # work under the established full-refresh contract and remains publishable.
+                if doom_pinned and not frame.page.dirty:
+                    frame.discard_unwritten = True
                 self._doomed.setdefault((name, page_index), []).append(frame)
                 del self._frames[(name, page_index)]
                 continue
@@ -1072,7 +1331,9 @@ class BufferPool:
             victim = self._find_victim()
             if victim is None:
                 if self._metrics.enabled:
-                    self._metrics.increment(BUFFER_BUDGET_EXCEEDED_TOTAL, 1.0, self._labels)
+                    self._metrics.increment(
+                        BUFFER_BUDGET_EXCEEDED_TOTAL, 1.0, self._labels
+                    )
                 raise GrafxBufferBudgetExceeded(
                     f"Database {self._db_label!r} holds {len(self._frames)} pinned pages of "
                     f"{self._page_size} bytes and cannot admit page {page_index} of {file!r} "
@@ -1110,13 +1371,17 @@ class BufferPool:
                     int(PageType.FREE), page_size=self._page_size, page_index=page_index
                 )
             if self._metrics.enabled:
-                self._metrics.increment(CHECKSUM_VERIFICATIONS_TOTAL, 1.0, self._page_labels)
+                self._metrics.increment(
+                    CHECKSUM_VERIFICATIONS_TOTAL, 1.0, self._page_labels
+                )
             try:
                 page = self._codec.decode_page(raw, verify=True)
             except GrafxCorruptionDetected as detected:
                 failure = detected
                 if self._metrics.enabled:
-                    self._metrics.increment(CHECKSUM_FAILURES_TOTAL, 1.0, self._page_labels)
+                    self._metrics.increment(
+                        CHECKSUM_FAILURES_TOTAL, 1.0, self._page_labels
+                    )
                 continue
             if page.seq % 2 == 1:
                 # An odd sequence counter says a writer is in the middle of this page. There is
@@ -1198,9 +1463,7 @@ class BufferPool:
             file, page_index
         )
         section = (
-            self._page_write_section(file, page_index)
-            if fenced
-            else nullcontext()
+            self._page_write_section(file, page_index) if fenced else nullcontext()
         )
         with section:
             publish_base = page.seq
@@ -1350,9 +1613,7 @@ def _require_reserved_header_page(pool: BufferPool, file: str) -> None:
         )
 
 
-def _require_distinct_reusable_pages(
-    file: str, reuse: tuple[PageIndex, ...]
-) -> None:
+def _require_distinct_reusable_pages(file: str, reuse: tuple[PageIndex, ...]) -> None:
     """Refuse a reuse list that names page 0, or names any page more than once.
 
     Written once and reached from both chain doors -- the one that writes through the pool and
@@ -1451,7 +1712,9 @@ def build_chain_images(
     images: list[tuple[PageIndex, bytes]] = []
     for position, index in enumerate(indices):
         page = Page(page_type, page_size=pool.page_size, page_index=index)
-        page.next_page = indices[position + 1] if position + 1 < len(indices) else NO_PAGE
+        page.next_page = (
+            indices[position + 1] if position + 1 < len(indices) else NO_PAGE
+        )
         page.insert_slot(chunks[position])
         images.append((index, pool.codec.encode_page(page)))
     return tuple(images)
@@ -1504,7 +1767,9 @@ def write_chain(
         with pool.pinned(file, index) as page:
             page.clear()
             page.page_type = page_type
-            page.next_page = indices[position + 1] if position + 1 < len(indices) else NO_PAGE
+            page.next_page = (
+                indices[position + 1] if position + 1 < len(indices) else NO_PAGE
+            )
             page.insert_slot(chunks[position])
     return tuple(indices)
 
@@ -1576,7 +1841,9 @@ def apply_page_image(
     # Checking it twice with the same predicate and the same message made neither check
     # demonstrable: break either and the other answers identically (A67).
     try:
-        decoded = pool.codec.decode_page(_require_image(file, page_index, image), verify=True)
+        decoded = pool.codec.decode_page(
+            _require_image(file, page_index, image), verify=True
+        )
     except GrafxCorruptionDetected as damaged:
         # The codec port carries no page index, so a decode failure names no location; the
         # caller of this door knows both and C6 cannot build a finding without them.

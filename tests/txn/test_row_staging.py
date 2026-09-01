@@ -183,7 +183,9 @@ def test_a_refused_commit_writes_no_row(make_stack) -> None:
     loser.note_write(shared)
 
     winner = first.manager.begin("write")
-    winner.owner._stage_page_image(winner, HEAP, 9, make_page_image(first.codec, [b"w"], page_index=9))
+    winner.owner._stage_page_image(
+        winner, HEAP, 9, make_page_image(first.codec, [b"w"], page_index=9)
+    )
     winner.note_write(shared)
     first.manager.commit(winner)
 
@@ -205,7 +207,9 @@ def test_an_identity_is_not_handed_out_twice(stack: Stack) -> None:
     for round_number in range(4):
         txn = stack.manager.begin("write")
         txn.stage_row_insert(table, (round_number, f"row-{round_number}"))
-        txn.note_write(stack.manager.partition_of(table.table_id, bytes([round_number])))
+        txn.note_write(
+            stack.manager.partition_of(table.table_id, bytes([round_number]))
+        )
         stack.manager.commit(txn)
         identities.append(stack.heap.read(txn.row_refs[0]).record_id)
     assert len(set(identities)) == len(identities)
@@ -339,7 +343,9 @@ def test_a_row_written_by_a_commit_that_then_failed_is_unreachable(
     reader = build_stack(database_root, storage=device, owner_id="reader")
     fresh = reader.manager.begin("read")
     seen = [found.values for _ref, found in reader.heap.scan(table, fresh.snapshot)]
-    assert seen == [(2, "kept")], "the abandoned row must not be visible to any snapshot"
+    assert seen == [(2, "kept")], (
+        "the abandoned row must not be visible to any snapshot"
+    )
     stored = [version.xmin for _ref, version in reader.heap.scan_all(table)]
     assert report.csn in stored
     # Every version the device ended up holding is either this commit's or unreachable. The
@@ -432,8 +438,9 @@ def test_a_read_view_is_not_dropped_when_nothing_has_committed(
     _registered(stack, _table())
     first = stack.manager.begin("read")
     stack.manager.rollback(first)
-    assert stack.pool.begin_read_view(stack.manager.published_lsn()) is False
-    assert stack.pool.begin_read_view(stack.manager.published_lsn() + 1) is True
+    current = stack.pool.read_view_token()
+    assert stack.pool.begin_read_view(current) is False
+    assert stack.pool.begin_read_view(object()) is True
 
 
 def test_two_participants_inserting_from_one_old_extent_view_both_commit(
@@ -465,16 +472,18 @@ def test_two_participants_inserting_from_one_old_extent_view_both_commit(
     first_report = first.manager.commit(winner)
 
     # The logical row partitions really are disjoint; the shared physical page is proven below.
-    assert first.manager.partition_of(table.table_id, b"1") != second.manager.partition_of(
-        table.table_id, b"2"
-    )
+    assert first.manager.partition_of(
+        table.table_id, b"1"
+    ) != second.manager.partition_of(table.table_id, b"2")
     second_report = second.manager.commit(loser)
     assert second_report.csn > first_report.csn
     assert loser.row_refs[0].page == winner.row_refs[0].page
 
     reader = build_stack(second.root, owner_id="third")
     fresh = reader.manager.begin("read")
-    seen = sorted(found.values for _ref, found in reader.heap.scan(table, fresh.snapshot))
+    seen = sorted(
+        found.values for _ref, found in reader.heap.scan(table, fresh.snapshot)
+    )
     assert seen == [(1, "first"), (2, "second")], "neither commit may be lost"
     reader.manager.rollback(fresh)
 
@@ -536,9 +545,7 @@ def test_provisional_rows_remain_logically_invisible_when_all_cleanup_fails(
     ) -> None:
         raise cleanup_failure
 
-    def fail_write_back(
-        _pool: BufferPool, _file: str, _page_index: int
-    ) -> bool:
+    def fail_write_back(_pool: BufferPool, _file: str, _page_index: int) -> bool:
         raise cleanup_failure
 
     monkeypatch.setattr(stack.wal, "append_many", persist_provisional_then_fail)
@@ -555,14 +562,21 @@ def test_provisional_rows_remain_logically_invisible_when_all_cleanup_fails(
 
     reopened = build_stack(database_root, owner_id="post-crash-reader")
     reader = reopened.manager.begin("read")
-    seen = [version.values for _ref, version in reopened.heap.scan(table, reader.snapshot)]
+    seen = [
+        version.values for _ref, version in reopened.heap.scan(table, reader.snapshot)
+    ]
     assert seen == expected
-    assert Verifier(
-        reopened.pool,
-        reopened.metrics,
-        heap=reopened.heap,
-        catalog=reopened.catalog,
-    ).verify().findings == ()
+    assert (
+        Verifier(
+            reopened.pool,
+            reopened.metrics,
+            heap=reopened.heap,
+            catalog=reopened.catalog,
+        )
+        .verify()
+        .findings
+        == ()
+    )
     reopened.manager.rollback(reader)
 
 
@@ -602,9 +616,9 @@ def test_exactly_one_version_is_live_at_every_snapshot_across_an_update(
     report = stack.manager.commit(txn)
     after = stack.manager.begin("read")
 
-    assert [found.values for _ref, found in stack.heap.scan(table, before.snapshot)] == [
-        (1, "ada")
-    ]
+    assert [
+        found.values for _ref, found in stack.heap.scan(table, before.snapshot)
+    ] == [(1, "ada")]
     assert [found.values for _ref, found in stack.heap.scan(table, after.snapshot)] == [
         (1, "ADA")
     ]
@@ -660,9 +674,9 @@ def test_a_snapshot_older_than_a_delete_still_reads_the_row(stack: Stack) -> Non
     stack.manager.commit(txn)
     after = stack.manager.begin("read")
 
-    assert [found.values for _ref, found in stack.heap.scan(table, before.snapshot)] == [
-        (1, "ada")
-    ]
+    assert [
+        found.values for _ref, found in stack.heap.scan(table, before.snapshot)
+    ] == [(1, "ada")]
     assert list(stack.heap.scan(table, after.snapshot)) == []
     stack.manager.rollback(before)
     stack.manager.rollback(after)
@@ -711,7 +725,9 @@ def test_a_rolled_back_update_leaves_exactly_one_live_version(stack: Stack) -> N
 # --- a statement is the unit a caller discards --------------------------------------------------
 
 
-def test_a_statement_that_refuses_halfway_leaves_nothing_of_itself(stack: Stack) -> None:
+def test_a_statement_that_refuses_halfway_leaves_nothing_of_itself(
+    stack: Stack,
+) -> None:
     """A statement that stages part of itself and then refuses must leave nothing behind.
 
     C10 found a pattern staging its first node before refusing its second, so a caller that
@@ -765,14 +781,20 @@ def test_the_page_of_the_version_an_update_ended_is_logged(stack: Stack) -> None
     report = stack.manager.commit(txn)
 
     written = {
-        decode_page_write(record.payload).page_index: decode_page_write(record.payload).image
+        decode_page_write(record.payload).page_index: decode_page_write(
+            record.payload
+        ).image
         for record in stack.wal.records()
         if record.record_type == WalRecordType.WRITE_PAGE and record.lsn <= report.csn
     }
-    assert original.page in written, "the page of the version this update ended was never logged"
+    assert original.page in written, (
+        "the page of the version this update ended was never logged"
+    )
     page = stack.codec.decode_page(written[original.page], verify=True)
     header = RecordHeader.decode(page.read_slot(original.slot)[:RECORD_HEADER_SIZE])
-    assert header.xmax == report.csn, "the logged image must carry the end of the old version"
+    assert header.xmax == report.csn, (
+        "the logged image must carry the end of the old version"
+    )
 
 
 def test_the_page_of_the_version_a_delete_ended_is_logged(stack: Stack) -> None:
@@ -788,7 +810,9 @@ def test_the_page_of_the_version_a_delete_ended_is_logged(stack: Stack) -> None:
     report = stack.manager.commit(txn)
 
     written = {
-        decode_page_write(record.payload).page_index: decode_page_write(record.payload).image
+        decode_page_write(record.payload).page_index: decode_page_write(
+            record.payload
+        ).image
         for record in stack.wal.records()
         if record.record_type == WalRecordType.WRITE_PAGE and record.lsn <= report.csn
     }
@@ -798,7 +822,9 @@ def test_the_page_of_the_version_a_delete_ended_is_logged(stack: Stack) -> None:
     assert header.xmax == report.csn
 
 
-def test_two_transactions_inserting_one_primary_key_cannot_both_commit(make_stack) -> None:
+def test_two_transactions_inserting_one_primary_key_cannot_both_commit(
+    make_stack,
+) -> None:
     """Where PRIMARY KEY uniqueness has to be enforced, and what this component already gives.
 
     A uniqueness check taken under a SNAPSHOT can never be sufficient on its own: two concurrent

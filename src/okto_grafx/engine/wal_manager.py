@@ -341,6 +341,18 @@ def _require_lsn(field: str, value: object) -> int:
     return value
 
 
+def _require_positive_limit(field: str, value: object) -> int:
+    """Return a positive integer work limit, refusing zero and non-integers."""
+    limit = _require_lsn(field, value)
+    if limit == 0:
+        raise GrafxConfigurationError(
+            f"The {field} must be greater than zero; got {limit}.",
+            field=field,
+            value=limit,
+        )
+    return limit
+
+
 class WalManager:
     """The segmented write-ahead log of one database."""
 
@@ -695,27 +707,37 @@ class WalManager:
         finally:
             self._tail_hold_depth -= 1
 
-    def _refresh_tail_if_needed(self) -> None:
-        """Refresh unless the caller already holds the section's freshly derived tail."""
-        if self._tail_hold_depth == 0:
-            self._refresh_tail()
+    def _refresh_tail_if_needed(
+        self, *, max_read_bytes: int | None = None
+    ) -> int | None:
+        """Refresh unless the section holds the tail, returning physical bytes consumed.
 
-    def _refresh_tail(self) -> None:
-        """Bring the index up to date with what the device now holds."""
+        A finite limit makes this an optional bounded refresh. ``None`` then means the index
+        cannot be made current without exceeding the limit or taking a full rebuild; no WAL byte
+        was read and the caller must use its conservative fallback.
+        """
+        if self._tail_hold_depth == 0:
+            return self._refresh_tail(max_read_bytes=max_read_bytes)
+        return 0
+
+    def _refresh_tail(self, *, max_read_bytes: int | None = None) -> int | None:
+        """Bring the index up to date and return bytes read, or decline a bounded rebuild."""
         if not self._indexed:
             # open() surveyed the segments and left what is INSIDE them unread. There is no
             # remembered tail to bring up to date yet, so this is the pass that reads them.
+            if max_read_bytes is not None:
+                return None
             self._rebuild()
-            return
+            return 0
         discovered = self._discover()
         names = [name for _, name in discovered]
         known = {segment.name: segment for segment in self._segments}
         if names == [segment.name for segment in self._segments]:
             if not names:
-                return
+                return 0
             tail = self._segments[-1]
             if self._storage.log_size(tail.name) == tail.size_bytes:
-                return
+                return 0
         cached = [segment.name for segment in self._segments]
         if cached and cached[-1] not in set(names):
             # The segment this participant's numbering is anchored in is gone: a repair rolled
@@ -723,8 +745,10 @@ class WalManager:
             # survives that, so the answer comes from a full pass rather than from an anchor
             # that no longer exists. Trusting the anchor here is how a healthy log gets called
             # damaged and how a repair aimed at a stale number destroys a live one.
+            if max_read_bytes is not None:
+                return None
             self._rebuild()
-            return
+            return 0
         sizes = {name: self._storage.log_size(name) for name in names}
         # Bytes appended by another participant are no more provably durable than bytes appended
         # through this object.  Remember every new or grown segment so gap completion's barrier
@@ -740,17 +764,24 @@ class WalManager:
             # suffix (often one checksum byte) as a fresh record and preserve invented damage.
             # Once a damaged observation changes, no offset beyond its last good record is a
             # trustworthy incremental anchor; re-derive the segment from byte zero.
+            if max_read_bytes is not None:
+                return None
             self._rebuild()
-            return
+            return 0
         pending = [name for name in self._unflushed if name in sizes]
         pending.extend(name for name in changed if name not in pending)
         self._unflushed = pending
         if any(sizes[name] < known[name].size_bytes for name in names if name in known):
             # A segment lost bytes, so what this participant remembers about the records inside
             # it may be wrong anywhere, not only past the end. Only a full pass can say.
+            if max_read_bytes is not None:
+                return None
             self._rebuild()
-            return
+            return 0
         starts = {name: known[name].size_bytes for name in names if name in known}
+        planned_read_bytes = sum(sizes[name] - starts.get(name, 0) for name in names)
+        if max_read_bytes is not None and planned_read_bytes > max_read_bytes:
+            return None
         # The marks of a segment nobody removed still describe bytes nobody rewrote, so they
         # carry over; a name that has gone takes its marks with it.
         marks = {name: self._marks[name] for name in names if name in self._marks}
@@ -823,6 +854,7 @@ class WalManager:
         self._next_number = discovered[-1][0] + 1 if discovered else MIN_SEGMENT_NUMBER
         self._unflushed = [name for name in self._unflushed if name in sizes]
         self._publish_size_metrics()
+        return planned_read_bytes
 
     def _discover(self) -> list[tuple[int, str]]:
         """Return every segment file of the directory, ordered by number."""
@@ -1306,6 +1338,96 @@ class WalManager:
         start = _require_lsn("lsn", lsn)
         self._refresh_tail_if_needed()
         return self._read_from(start)
+
+    def read_bounded(
+        self,
+        first_lsn: Lsn,
+        through_lsn: Lsn,
+        *,
+        max_records: int,
+        max_bytes: int,
+    ) -> tuple[WalRecord, ...] | None:
+        """Return one exact WAL interval when it fits fixed work budgets.
+
+        This is the fail-closed door for optional optimisations that may use a WAL delta only
+        when every record in ``[first_lsn, through_lsn]`` is still retained.  ``None`` means
+        the caller must use its conservative fallback: the range is absent or recycled, the
+        manager already knows the WAL is damaged or append-uncertain, or either budget would be
+        exceeded.  A tuple is returned only after sequence-number contiguity and the terminal
+        record have both been proved.
+
+        The byte budget covers both bringing an already-indexed foreign tail current and reading
+        the requested interval. It is checked against frozen physical plans before either phase
+        reads a segment byte. A fresh/unindexed manager or a refresh that would require a full
+        rebuild declines with ``None``. The interval plan starts at the same verified sparse mark
+        as :meth:`read_from` and ends in the segment that contains ``through_lsn``. Bytes before
+        the first record because of that mark, and bytes after the terminal in its segment, count
+        as work too. Concurrent append cannot enlarge the frozen sizes; recycle, truncate or an
+        unreadable segment either declines the optimisation or preserves strict typed failure.
+        """
+        self._require_open()
+        first = _require_lsn("first_lsn", first_lsn)
+        through = _require_lsn("through_lsn", through_lsn)
+        record_limit = _require_positive_limit("max_records", max_records)
+        byte_limit = _require_positive_limit("max_bytes", max_bytes)
+        if through < first:
+            raise GrafxConfigurationError(
+                "The through_lsn of a bounded WAL read must not precede first_lsn.",
+                field="through_lsn",
+                first_lsn=first,
+                through_lsn=through,
+            )
+        if through - first + 1 > record_limit:
+            return None
+
+        refreshed_bytes = self._refresh_tail_if_needed(max_read_bytes=byte_limit)
+        if refreshed_bytes is None:
+            return None
+        if self._damage is not None or self._append_uncertain:
+            return None
+        if not self._segments or through > self._last_lsn:
+            return None
+        retained_first = self._segments[0].first_lsn
+        if retained_first == NO_LSN or first < retained_first:
+            return None
+
+        names, sizes, starts = self._read_plan(first)
+        by_name = {segment.name: segment for segment in self._segments}
+        selected: list[str] = []
+        for name in names:
+            selected.append(name)
+            segment = by_name.get(name)
+            if segment is None:
+                return None
+            if segment.last_lsn >= through:
+                break
+        else:
+            return None
+
+        frozen_names = tuple(selected)
+        frozen_sizes = {name: sizes[name] for name in frozen_names}
+        frozen_starts = {name: starts[name] for name in frozen_names if name in starts}
+        planned_bytes = sum(
+            frozen_sizes[name] - frozen_starts.get(name, 0) for name in frozen_names
+        )
+        if planned_bytes > byte_limit - refreshed_bytes:
+            return None
+
+        expected = first
+        result: list[WalRecord] = []
+        for item in self._walk(frozen_names, frozen_sizes, starts=frozen_starts):
+            if item.failure is not None:
+                raise item.failure.as_error()
+            record = item.record
+            if record is None or record.lsn < first:
+                continue
+            if record.lsn != expected:
+                return None
+            result.append(record)
+            if record.lsn == through:
+                return tuple(result)
+            expected += 1
+        return None
 
     def _read_from(self, start: Lsn) -> Iterator[WalRecord]:
         """Yield the records at or above the sequence number, raising at the first damage."""

@@ -88,6 +88,7 @@ from okto_grafx.domain.ids import (
     RecordRef,
     TxnId,
 )
+from okto_grafx.domain.index.records import change_of
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.coordination import ProcessCoordinator
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
@@ -179,6 +180,19 @@ needed and can never cost a correctness property, which is why 32 bits are enoug
 
 _NO_EPOCH: Epoch = 0
 
+_READ_VIEW_MAX_RECORDS: int = 512
+_READ_VIEW_MAX_BYTES: int = 2 * 1024 * 1024
+_READ_VIEW_MAX_TARGETS: int = 1024
+_READ_VIEW_DELTA_TYPES: frozenset[int] = frozenset(
+    {
+        int(WalRecordType.WRITE_PAGE),
+        int(WalRecordType.COMMIT),
+        int(WalRecordType.INDEX_WRITE),
+        int(WalRecordType.INDEX_RECONCILE),
+        int(WalRecordType.SEGMENT_HEADER),
+    }
+)
+
 _LIVE_FLAGS: int = ~1
 """Mask that clears the deleted bit of a record header, from CONTRACT.md section 6.4."""
 
@@ -221,6 +235,22 @@ class _IdentityPlan:
     record_ids: dict[int, int]
     leased_positions: frozenset[int]
     reservation_lsn: Lsn | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadViewToken:
+    """The durable publication that every frame in one local read view may reflect."""
+
+    last_committed_lsn: Lsn
+    checkpoint_lsn: Lsn
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadViewChanges:
+    """Exact physical targets proved to have changed between two durable publications."""
+
+    pages: frozenset[tuple[str, PageIndex]]
+    files: frozenset[str]
 
 
 class _ReaderPin:
@@ -653,6 +683,146 @@ class TransactionManager:
             checkpoint_lsn=durable.checkpoint_lsn,
         )
 
+    @staticmethod
+    def _read_view_token_of(state: CommitState) -> _ReadViewToken:
+        """Return the complete durable identity of one cache read view."""
+
+        return _ReadViewToken(
+            last_committed_lsn=state.last_committed_lsn,
+            checkpoint_lsn=state.checkpoint_lsn,
+        )
+
+    def _read_view_changes(
+        self,
+        previous: _ReadViewToken,
+        current: _ReadViewToken,
+    ) -> _ReadViewChanges | None:
+        """Prove a bounded committed WAL delta, or decline the optimisation.
+
+        ``None`` is deliberately not an error: it tells BufferPool to retain the conservative
+        full refresh.  The proof is accepted only when the exact contiguous interval after the
+        previous publication is still retained, ends at the current COMMIT, contains only record
+        kinds this build can classify, and fits all three internal work budgets.  No commit,
+        checkpoint, recovery or WAL-format rule is weakened by this fast path.
+        """
+
+        if (
+            previous.checkpoint_lsn != current.checkpoint_lsn
+            or current.last_committed_lsn <= previous.last_committed_lsn
+        ):
+            return None
+        read_bounded = getattr(self._wal, "read_bounded", None)
+        if not callable(read_bounded):
+            return None
+        first = previous.last_committed_lsn + 1
+        through = current.last_committed_lsn
+        try:
+            records = read_bounded(
+                first,
+                through,
+                max_records=_READ_VIEW_MAX_RECORDS,
+                max_bytes=_READ_VIEW_MAX_BYTES,
+            )
+            if (
+                not isinstance(records, tuple)
+                or not records
+                or len(records) > _READ_VIEW_MAX_RECORDS
+                or not all(isinstance(record, WalRecord) for record in records)
+            ):
+                return None
+            if any(
+                record.lsn != first + offset for offset, record in enumerate(records)
+            ):
+                return None
+            if records[-1].lsn != through:
+                return None
+            if records[-1].record_type != int(WalRecordType.COMMIT):
+                return None
+            if any(
+                record.record_type not in _READ_VIEW_DELTA_TYPES for record in records
+            ):
+                return None
+
+            replay = committed_replay(records)
+            if replay.incomplete_effects or replay.last_committed_lsn != through:
+                return None
+
+            pages: set[tuple[str, PageIndex]] = set()
+            files: set[str] = set()
+            for record in replay.effects:
+                if record.record_type == int(WalRecordType.WRITE_PAGE):
+                    write = decode_page_write(record.payload)
+                    if (
+                        not isinstance(write.file, str)
+                        or not write.file
+                        or "\x00" in write.file
+                    ):
+                        return None
+                    pages.add((write.file, write.page_index))
+                    continue
+                if record.record_type not in (
+                    int(WalRecordType.INDEX_WRITE),
+                    int(WalRecordType.INDEX_RECONCILE),
+                ):
+                    return None
+                manager = self._index_manager
+                if manager is None:
+                    return None
+                change = change_of(record)
+                index_file = getattr(manager.index(change.index), "file", None)
+                if (
+                    not isinstance(index_file, str)
+                    or not index_file
+                    or "\x00" in index_file
+                ):
+                    return None
+                files.add(index_file)
+
+            # The catalog has no page-zero freshness certificate and is therefore always a
+            # whole-file target when a foreign publication moves.  Count it in the proof budget
+            # even though BufferPool also adds it defensively at the mutation boundary.
+            budget_files = files | {self._file_ids.catalog_file}
+            pages = {key for key in pages if key[0] not in budget_files}
+            if len(budget_files) + len(pages) > _READ_VIEW_MAX_TARGETS:
+                return None
+            return _ReadViewChanges(pages=frozenset(pages), files=frozenset(files))
+        except (AttributeError, GrafxError, KeyError, OSError, TypeError, ValueError):
+            # A stale/shape-incompatible optional collaborator, recycled interval, malformed
+            # payload, storage race or WAL damage can only disable the optimisation. The existing
+            # full refresh remains authoritative; process-control failures still propagate.
+            return None
+
+    def _establish_read_view(self, state: CommitState, *, own: bool) -> None:
+        """Attach the pool to ``state``, using CE-3 only for a proved foreign delta."""
+
+        token = self._read_view_token_of(state)
+        changes: _ReadViewChanges | None = None
+        with self._close_wait_hazard():
+            previous = self._pool.read_view_token()
+            effective_own = (
+                own
+                and isinstance(previous, _ReadViewToken)
+                and previous.checkpoint_lsn == token.checkpoint_lsn
+            )
+            if (
+                not effective_own
+                and isinstance(previous, _ReadViewToken)
+                and previous != token
+            ):
+                changes = self._read_view_changes(previous, token)
+            self._pool.begin_read_view(
+                token,
+                own=effective_own,
+                unfenced_file=self._file_ids.catalog_file,
+                changed_pages=None if changes is None else changes.pages,
+                changed_files=() if changes is None else changes.files,
+                expected_previous=previous,
+            )
+        if not effective_own:
+            # A foreign view consumes any previous own-publication provenance. A later numeric
+            # coincidence is not proof that the resident frames came from this participant.
+            self._own_published_lsn = None
+
     def recyclable_horizon(self) -> Lsn:
         """Return the LSN below which a WAL segment may be recycled (BR-10, CF-11).
 
@@ -723,19 +893,11 @@ class TransactionManager:
                 self._require_not_closed("access database pages")
                 self._require_recovery_complete()
                 if fresh_read_view:
-                    published = self._published_state_in_section().last_committed_lsn
-                    own_view = published == self._own_published_lsn
-                    with self._close_wait_hazard():
-                        self._pool.begin_read_view(
-                            published,
-                            own=own_view,
-                            unfenced_file=self._file_ids.catalog_file,
-                        )
-                    if not own_view:
-                        # A foreign view consumes any previous own-publication provenance just
-                        # like begin() and commit(): a later numeric coincidence is not proof
-                        # that the resident frames came from this participant.
-                        self._own_published_lsn = None
+                    published = self._published_state_in_section()
+                    self._establish_read_view(
+                        published,
+                        own=published.last_committed_lsn == self._own_published_lsn,
+                    )
                 yield
 
     def _require_recovery_complete(self) -> None:
@@ -827,7 +989,7 @@ class TransactionManager:
         transaction: TransactionContext | None = None
         counted = False
         try:
-            floor = self._published_state_in_section().last_committed_lsn
+            floor = self._published_state_in_section()
             self._require_not_closed("begin a transaction")
             # CE-2: the participant registration answers for every transaction. When one is
             # already standing, its pin is at or below this floor by monotonicity (it only
@@ -842,30 +1004,25 @@ class TransactionManager:
                 self._participant_pin is not None
                 and not self._participant_pin.registration.closed
             )
-            self._ensure_participant_pin(floor)
+            self._ensure_participant_pin(floor.last_committed_lsn)
             if standing:
-                self._refresh_due_readers(floor=floor)
+                self._refresh_due_readers(floor=floor.last_committed_lsn)
             self._require_not_closed("begin a transaction")
-            selected = self._published_state_in_section().last_committed_lsn
+            selected = self._published_state_in_section()
             self._require_not_closed("begin a transaction")
-            read_lsn = selected if selected > floor else floor
+            view = (
+                selected
+                if selected.last_committed_lsn >= floor.last_committed_lsn
+                else floor
+            )
+            read_lsn = view.last_committed_lsn
             # L22: derived state needs a SHARED signal to invalidate it, and the published
             # commit number is the one this component already watches -- it moves whenever any
             # participant commits and nowhere else. Without this, a transaction opened in a
             # participant that had already read a table answers from frames cached before
             # somebody else committed: no error, no missing file, just fewer rows than exist.
             own_view = read_lsn == self._own_published_lsn
-            with self._close_wait_hazard():
-                self._pool.begin_read_view(
-                    read_lsn,
-                    own=own_view,
-                    unfenced_file=self._file_ids.catalog_file,
-                )
-            if not own_view:
-                # The token was met without provenance once; a later token that happens to
-                # return to the old own number (a foreign recovery can republish it) must
-                # not be met as own either. Only the next _publish_commit_state re-arms.
-                self._own_published_lsn = None
+            self._establish_read_view(view, own=own_view)
             self._require_not_closed("begin a transaction")
             transaction = TransactionContext(
                 txn_id=self._next_txn_id,
@@ -1109,11 +1266,7 @@ class TransactionManager:
             pin = self._participant_pin
             if pin is None or pin.registration.closed:
                 return 0
-            now = (
-                self._monotonic()
-                if now_monotonic is None
-                else float(now_monotonic)
-            )
+            now = self._monotonic() if now_monotonic is None else float(now_monotonic)
             if now < pin.last_refresh + self._refresh_interval:
                 return 0
             floor = None
@@ -1270,9 +1423,7 @@ class TransactionManager:
             ):
                 published = self._published_state_in_section().last_committed_lsn
                 registered = tuple(manager.indexes())
-                stale = tuple(
-                    manager.open(published, persist_stale=persist_stale)
-                )
+                stale = tuple(manager.open(published, persist_stale=persist_stale))
         return registered, stale
 
     def checkpoint_and_claim_index_rebuild(self, index: Any, reason: str) -> int:
@@ -1392,9 +1543,7 @@ class TransactionManager:
                     # prunes it, so it is advanced HERE, before the horizon is computed --
                     # otherwise this manager would hold its own recycling hostage forever.
                     # The floor handed over is the number this checkpoint just published.
-                    self._advance_participant_pin(
-                        floor=published.last_committed_lsn
-                    )
+                    self._advance_participant_pin(floor=published.last_committed_lsn)
                     reader_present = self._reader_horizon() is not None
                     with self._close_wait_hazard():
                         state["recycled"] = self._wal.recycle(
@@ -1817,14 +1966,7 @@ class TransactionManager:
                     # and a stale one makes a correct predicate decide against the wrong picture
                     # (defect E1, second half; LESSONS L22).
                     own_view = current == self._own_published_lsn
-                    with self._close_wait_hazard():
-                        self._pool.begin_read_view(
-                            current,
-                            own=own_view,
-                            unfenced_file=self._file_ids.catalog_file,
-                        )
-                    if not own_view:
-                        self._own_published_lsn = None
+                    self._establish_read_view(durable, own=own_view)
                     validated_through = current
                     # Validation has two tiers, and the first is not redundant. Caller-declared
                     # logical interests and pre-staged pages are known now, so validate them
@@ -2984,7 +3126,9 @@ class TransactionManager:
                 # The first row of a table has no extent to reserve yet.  Its ordinary insert
                 # creates the extent and advances the floor atomically with the user commit;
                 # leasing starts on the next transaction.
-                reference = heap.insert(intent.table, record_id, intent.values, provisional)
+                reference = heap.insert(
+                    intent.table, record_id, intent.values, provisional
+                )
             written.append(
                 _RowWrite(
                     born=reference,
@@ -3083,7 +3227,9 @@ class TransactionManager:
             )
             for position in explicit:
                 planned[position] = intents[position].record_id  # type: ignore[assignment]
-            implicit = tuple(position for position in positions if position not in explicit)
+            implicit = tuple(
+                position for position in positions if position not in explicit
+            )
             if explicit:
                 # A named id invalidates every local inference about the shared floor.  Burn the
                 # cached remainder first, then fail early when our current durable view already
@@ -3143,12 +3289,16 @@ class TransactionManager:
         current view.
         """
         intents = tuple(reduce_row_intents(txn.row_intents))
-        for table_id, (table, identities) in self._reserved_record_ids(txn, intents).items():
+        for table_id, (table, identities) in self._reserved_record_ids(
+            txn, intents
+        ).items():
             extent = self._heap.extent_of(table)
             if extent is None:
                 continue
             floor = int(extent.next_record_id)
-            below = tuple(sorted(identity for identity in identities if identity < floor))
+            below = tuple(
+                sorted(identity for identity in identities if identity < floor)
+            )
             if below:
                 self._raise_explicit_below_identity_floor(
                     txn, table, table_id, below, floor
@@ -3206,7 +3356,10 @@ class TransactionManager:
                     )
                     if extent is None:
                         cursor = max(
-                            (FIRST_RECORD_ID, *(identity + 1 for identity in explicit_ids))
+                            (
+                                FIRST_RECORD_ID,
+                                *(identity + 1 for identity in explicit_ids),
+                            )
                         )
                         for position in explicit:
                             identity = int(base.intents[position].record_id)
@@ -3225,14 +3378,18 @@ class TransactionManager:
                         continue
 
                     floor = int(extent.next_record_id)
-                    below = tuple(identity for identity in explicit_ids if identity < floor)
+                    below = tuple(
+                        identity for identity in explicit_ids if identity < floor
+                    )
                     if below:
                         self._raise_explicit_below_identity_floor(
                             txn, table, table_id, below, floor
                         )
                     for position in explicit:
                         identity = int(base.intents[position].record_id)
-                        self._require_unexhausted_identity(txn, table, table_id, identity)
+                        self._require_unexhausted_identity(
+                            txn, table, table_id, identity
+                        )
                         planned[position] = identity
 
                     if explicit_ids:
