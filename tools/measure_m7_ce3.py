@@ -46,9 +46,10 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable, Mapping, Sequence
 
-SCHEMA = "okto-grafx.ce3-m7-multiprocess.v6"
-PINNED_HARNESS_HEAD = "0dfb5269dd8531fd4db2679fc80b649c64bd9b09"
+SCHEMA = "okto-grafx.ce3-m7-multiprocess.v7"
+PINNED_HARNESS_HEAD = "b07bf3ef8cdd05bc1365a46c2411bca857ab2bb0"
 PINNED_HARNESS_BLOB = "a02b86dce098ceec3fdbd10a820a4dd6f9e2a7b1"
+REQUIRED_DESCRIPTOR_REVALIDATION = "generation"
 EXPECTED_OPERATION_SET_SHA256 = (
     "c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81"
 )
@@ -964,34 +965,54 @@ async def _open_warm(
 ) -> tuple[Any, Any, dict[str, Any]]:
     opened_at = time.perf_counter_ns()
     backend, context = await harness._open_backend(runner, backends, "grafx", workspace)
-    await harness._read_rows(backend, "MATCH (m:BoardMeta) RETURN m.board_id", {})
-    origins = {
-        "okto_grafx": _require_module_origin("okto_grafx", Path(harness.GRAFX)),
-        "okto_pulse.community": _require_module_origin(
-            "okto_pulse.community", Path(harness.COMMUNITY)
-        ),
-        "okto_pulse.core": _require_module_origin(
-            "okto_pulse.core", Path(harness.CORE)
-        ),
-    }
-    from okto_grafx.domain.page.checksum import crc32c_implementation
+    try:
+        identity = await runner._backend_identity(backend, context)
+        descriptor_revalidation = identity.get("descriptor_revalidation")
+        if descriptor_revalidation != REQUIRED_DESCRIPTOR_REVALIDATION:
+            raise MeasurementRefused(
+                "the opened Pulse Grafx provider did not authenticate "
+                f"descriptor_revalidation={REQUIRED_DESCRIPTOR_REVALIDATION!r}: "
+                f"observed {descriptor_revalidation!r}"
+            )
+        await harness._read_rows(backend, "MATCH (m:BoardMeta) RETURN m.board_id", {})
+        origins = {
+            "okto_grafx": _require_module_origin("okto_grafx", Path(harness.GRAFX)),
+            "okto_pulse.community": _require_module_origin(
+                "okto_pulse.community", Path(harness.COMMUNITY)
+            ),
+            "okto_pulse.core": _require_module_origin(
+                "okto_pulse.core", Path(harness.CORE)
+            ),
+        }
+        from okto_grafx.domain.page.checksum import crc32c_implementation
 
-    checksum = crc32c_implementation()
-    if checksum != "native":
-        raise MeasurementRefused(
-            f"[accel] was requested but the opened database installed checksum={checksum!r}"
+        checksum = crc32c_implementation()
+        if checksum != "native":
+            raise MeasurementRefused(
+                "[accel] was requested but the opened database installed "
+                f"checksum={checksum!r}"
+            )
+        return (
+            backend,
+            context,
+            {
+                "opened_at_ns": opened_at,
+                "warm_completed_at_ns": time.perf_counter_ns(),
+                "imports": origins,
+                "checksum_implementation": checksum,
+                "descriptor_revalidation": descriptor_revalidation,
+                "environment": _environment(),
+            },
         )
-    return (
-        backend,
-        context,
-        {
-            "opened_at_ns": opened_at,
-            "warm_completed_at_ns": time.perf_counter_ns(),
-            "imports": origins,
-            "checksum_implementation": checksum,
-            "environment": _environment(),
-        },
-    )
+    except BaseException as failure:
+        try:
+            await runner._close_backend(backend)
+        except BaseException as cleanup:
+            failure.add_note(
+                "closing the backend after warm-open authentication also failed: "
+                f"{type(cleanup).__name__}: {cleanup}"
+            )
+        raise
 
 
 def _extract_hooks(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -2566,6 +2587,12 @@ def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
         for participant in (a, b, verifier)
     ):
         shortfalls.append("child_accel_checksum_not_native")
+    if any(
+        participant.get("handle", {}).get("descriptor_revalidation")
+        != REQUIRED_DESCRIPTOR_REVALIDATION
+        for participant in (a, b, verifier)
+    ):
+        shortfalls.append("child_descriptor_revalidation_not_generation")
     child_environments = [
         participant.get("handle", {}).get("environment", {})
         for participant in (a, b, verifier)
@@ -2824,6 +2851,8 @@ def official_shortfalls(report: Mapping[str, Any]) -> list[str]:
         shortfalls.append("check_only_has_no_measurements")
     if inputs.get("per_family") != OFFICIAL_PER_FAMILY:
         shortfalls.append("per_family_not_pf5")
+    if inputs.get("descriptor_revalidation") != REQUIRED_DESCRIPTOR_REVALIDATION:
+        shortfalls.append("descriptor_revalidation_input_mismatch")
     if provenance.get("operation_set_sha256") != EXPECTED_OPERATION_SET_SHA256:
         shortfalls.append("logical_pf5_digest_mismatch")
     identity = _mapping_or_empty(provenance.get("identity"))
@@ -3419,6 +3448,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "inputs": {
             "per_family": args.per_family,
             "method_path": "scope",
+            "descriptor_revalidation": REQUIRED_DESCRIPTOR_REVALIDATION,
             "scenario_selector": args.scenario,
             "machine_idle_asserted": bool(args.machine_idle_asserted),
             "maximum_initial_cpu_percent": args.maximum_initial_cpu_percent,

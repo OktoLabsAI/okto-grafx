@@ -78,6 +78,62 @@ class _RunnerDouble:
             raise outcome
 
 
+class _WarmBackendDouble:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class _WarmRunnerDouble:
+    def __init__(
+        self,
+        identity: dict[str, object] | None = None,
+        *,
+        identity_failure: BaseException | None = None,
+    ) -> None:
+        self.identity = dict(identity or {})
+        self.identity_failure = identity_failure
+        self.identity_calls: list[tuple[object, object]] = []
+        self.close_calls: list[object] = []
+
+    async def _backend_identity(
+        self, backend: object, context: object
+    ) -> dict[str, object]:
+        self.identity_calls.append((backend, context))
+        if self.identity_failure is not None:
+            raise self.identity_failure
+        return dict(self.identity)
+
+    async def _close_backend(self, backend: _WarmBackendDouble) -> None:
+        self.close_calls.append(backend)
+        await backend.close()
+
+
+class _WarmHarnessDouble:
+    def __init__(self, root: Path, backend: _WarmBackendDouble) -> None:
+        self.GRAFX = root / "grafx"
+        self.COMMUNITY = root / "community"
+        self.CORE = root / "core"
+        self.backend = backend
+        self.context = object()
+        self.open_calls: list[tuple[object, str, Path]] = []
+        self.read_calls: list[tuple[object, str, dict[str, object]]] = []
+
+    async def _open_backend(
+        self, runner: object, backends: object, name: str, workspace: Path
+    ) -> tuple[object, object]:
+        self.open_calls.append((backends, name, workspace))
+        return self.backend, self.context
+
+    async def _read_rows(
+        self, backend: object, statement: str, params: dict[str, object]
+    ) -> list[list[object]]:
+        self.read_calls.append((backend, statement, params))
+        return [["board"]]
+
+
 def _install_graph_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     real_import = ce3.importlib.import_module
 
@@ -361,6 +417,7 @@ def _scenario_result(pass_name: str, scenario: ce3.Scenario) -> dict[str, object
             "opened_at_ns": 1,
             "closed_at_ns": 21_000_000_000,
             "checksum_implementation": "native",
+            "descriptor_revalidation": ce3.REQUIRED_DESCRIPTOR_REVALIDATION,
             "environment": copy.deepcopy(environment),
         },
         "active_start_ns": active_start,
@@ -407,6 +464,7 @@ def _scenario_result(pass_name: str, scenario: ce3.Scenario) -> dict[str, object
             "opened_at_ns": 2,
             "closed_at_ns": 22_000_000_000,
             "checksum_implementation": "native",
+            "descriptor_revalidation": ce3.REQUIRED_DESCRIPTOR_REVALIDATION,
             "environment": copy.deepcopy(environment),
         },
         "active_start_ns": active_start,
@@ -445,6 +503,7 @@ def _scenario_result(pass_name: str, scenario: ce3.Scenario) -> dict[str, object
         "cold_open": True,
         "handle": {
             "checksum_implementation": "native",
+            "descriptor_revalidation": ce3.REQUIRED_DESCRIPTOR_REVALIDATION,
             "environment": copy.deepcopy(environment),
         },
         "verification": dict(verification),
@@ -513,6 +572,7 @@ def _official_report() -> dict[str, object]:
         "check_only": False,
         "inputs": {
             "per_family": 5,
+            "descriptor_revalidation": ce3.REQUIRED_DESCRIPTOR_REVALIDATION,
             "maximum_initial_cpu_percent": 20.0,
             "tool_commit": "tool-commit",
             "tool_blob": "tool-blob",
@@ -737,12 +797,13 @@ def test_failed_post_cleanup_write_cannot_leave_an_official_pending_artifact(
 
 
 def test_frozen_matrix_and_pins_are_literal() -> None:
-    assert ce3.SCHEMA == "okto-grafx.ce3-m7-multiprocess.v6"
+    assert ce3.SCHEMA == "okto-grafx.ce3-m7-multiprocess.v7"
+    assert ce3.REQUIRED_DESCRIPTOR_REVALIDATION == "generation"
     assert ce3.MAX_OPERATION_ATTEMPTS == 60
     assert ce3.EXPECTED_OPERATION_SET_SHA256 == (
         "c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81"
     )
-    assert ce3.PINNED_HARNESS_HEAD == "0dfb5269dd8531fd4db2679fc80b649c64bd9b09"
+    assert ce3.PINNED_HARNESS_HEAD == "b07bf3ef8cdd05bc1365a46c2411bca857ab2bb0"
     assert ce3.PINNED_HARNESS_BLOB == "a02b86dce098ceec3fdbd10a820a4dd6f9e2a7b1"
     assert [
         (scenario.relation, scenario.table, scenario.target_rate_per_second)
@@ -760,6 +821,68 @@ def test_frozen_matrix_and_pins_are_literal() -> None:
         for scenario in ce3.SCENARIOS
     )
     assert all(scenario.meaning for scenario in ce3.SCENARIOS)
+
+
+def test_open_warm_authenticates_and_records_generation_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _WarmBackendDouble()
+    runner = _WarmRunnerDouble(
+        {
+            "backend": "grafx",
+            "descriptor_revalidation": ce3.REQUIRED_DESCRIPTOR_REVALIDATION,
+        }
+    )
+    harness = _WarmHarnessDouble(tmp_path, backend)
+    monkeypatch.setattr(
+        ce3,
+        "_require_module_origin",
+        lambda module_name, repo: str(Path(repo) / module_name),
+    )
+    monkeypatch.setattr(ce3, "_environment", lambda: {"status": "authenticated"})
+    from okto_grafx.domain.page import checksum as checksum_module
+
+    monkeypatch.setattr(checksum_module, "crc32c_implementation", lambda: "native")
+
+    opened, context, handle = asyncio.run(
+        ce3._open_warm(harness, runner, object(), tmp_path / "workspace")
+    )
+
+    assert opened is backend
+    assert context is harness.context
+    assert handle["descriptor_revalidation"] == "generation"
+    assert runner.identity_calls == [(backend, harness.context)]
+    assert len(harness.read_calls) == 1
+    assert runner.close_calls == []
+    assert backend.close_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("identity", "identity_failure"),
+    [
+        ({"backend": "grafx"}, None),
+        ({"backend": "grafx", "descriptor_revalidation": "strict"}, None),
+        (None, GateFailure("provider identity refused")),
+    ],
+    ids=("missing", "strict", "provider-refusal"),
+)
+def test_open_warm_fails_closed_and_closes_unauthenticated_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identity: dict[str, object] | None,
+    identity_failure: BaseException | None,
+) -> None:
+    backend = _WarmBackendDouble()
+    runner = _WarmRunnerDouble(identity, identity_failure=identity_failure)
+    harness = _WarmHarnessDouble(tmp_path, backend)
+
+    with pytest.raises((ce3.MeasurementRefused, GateFailure)):
+        asyncio.run(ce3._open_warm(harness, runner, object(), tmp_path / "workspace"))
+
+    assert harness.read_calls == []
+    assert runner.close_calls == [backend]
+    assert backend.close_calls == 1
 
 
 def test_typed_pre_durable_contention_retries_whole_operation_on_same_handle(
@@ -1288,6 +1411,24 @@ def test_each_critical_false_pass_mutation_is_rejected(mutation, expected: str) 
     mutation(result)
 
     assert expected in ce3._scenario_shortfalls(result)
+
+
+@pytest.mark.parametrize("participant", ("process_a", "process_b", "verifier"))
+@pytest.mark.parametrize("mode", (None, "strict"), ids=("missing", "strict"))
+def test_each_participant_must_authenticate_generation_mode(
+    participant: str,
+    mode: str | None,
+) -> None:
+    result = _scenario_result("raw", ce3.SCENARIOS[0])
+    handle = result[participant]["handle"]
+    if mode is None:
+        handle.pop("descriptor_revalidation")
+    else:
+        handle["descriptor_revalidation"] = mode
+
+    assert "child_descriptor_revalidation_not_generation" in (
+        ce3._scenario_shortfalls(result)
+    )
 
 
 def test_instrumented_requires_all_three_ce3_hooks_and_raw_has_none() -> None:
@@ -1942,6 +2083,14 @@ def test_official_shortfalls_is_total_over_malformed_nested_evidence(
         (
             lambda value: value["provenance"].update(operation_set_sha256="wrong"),
             "logical_pf5_digest_mismatch",
+        ),
+        (
+            lambda value: value["inputs"].update(descriptor_revalidation="strict"),
+            "descriptor_revalidation_input_mismatch",
+        ),
+        (
+            lambda value: value["inputs"].pop("descriptor_revalidation"),
+            "descriptor_revalidation_input_mismatch",
         ),
         (
             lambda value: value["provenance"]["harness"].update(profile_blob="wrong"),
