@@ -606,6 +606,35 @@
   `finalization.status=passed`, zero erros, scratch removido, fonte inalterada e identidade estável.
   Como o gate de taxa falhou, a matriz CE-3 completa não foi iniciada; o próximo passo é somente o
   gargalo residual medido no H8, sem alterar workload, retry, tolerância ou garantias de produto.
+
+  **Probe finito F2/CN-2 implementado e publicado em 2026-09-01, sem mudança de produto.** A
+  reconciliação local e com Claude concluiu que o artefato anterior não separava o wall normal do
+  commit das duas janelas globais compatíveis com checkpoint; portanto ainda não justificava CN-2
+  nem ST-2. O consenso imutável está em
+  `D:\Projetos\Techridy\claude-scratch\CE3-NEXT-GATE-RECOMMENDATION.md`. O instrumento v4 foi
+  publicado em
+  `origin/perf/ce3-bounded-invalidation@321b2f02051849806d734759395d80140845da35` (tool blob
+  `d00884277bbbbf30e34023ce2bfa2f4f10ec2d78`, test blob
+  `e510c819fe440efc2b334ff63a0b42e5d912da8c`) e toca somente `tools/` e `tests/tools/`; o diff em
+  `src/` é vazio. RAW não instala hook algum e essa condição é presa por prova AST; somente H8
+  instrumenta A e B. Os 25 hooks medem, por intervalo e relógio absoluto, a seção de commit já
+  adquirida, OCC, WAL append/barrier, aplicação/publicação e checkpoint redo/flush/publicação/
+  recycle. Totais, união dos intervalos e resíduo são recomputados na validação; captura forjada,
+  contexto ausente ou resíduo incoerente falha fechado. O motor real capturou commit+checkpoint,
+  a restauração dos 25 métodos preservou as identidades originais, 171/171 testes passaram e Ruff,
+  compile, format-check e diff-check ficaram verdes; auditoria independente retornou PASS nos blobs
+  acima. Não houve alteração em OCC, WAL, durabilidade, multiwriter ou multireader.
+
+  O próximo gate permanece único e congelado: repetir **duas vezes** somente
+  `same-10/per_family=5`, cada vez com pares RAW+H8 autenticados e os mesmos corpus, harness, Core,
+  retries e piso `7,5/s`. RAW nunca será corrigido ou inferido a partir do custo H8. Em cada
+  intervalo, resíduo acima de 15% torna a atribuição inconclusiva e proíbe escolher uma otimização
+  semântica; uma fase só domina se reproduzir em ambas as repetições, incluindo a cauda. O p50 B
+  RAW histórico de `147,6 ms` impõe teto aproximado de `6,77/s`, logo eliminar apenas outliers não
+  basta: o caminho normal precisa demonstrar redução de pelo menos `14,6 ms` para alcançar o piso.
+  CN-2 só entra em produção se esse probe atribuir causalmente checkpoint; ST-2 continua fora do
+  escopo porque estreitaria a detecção fail-closed de substituição externa de inode. A matriz CE-3
+  completa e o M-PULSE-7 10k continuam bloqueados até `same-10 >= 7,5/s`.
 - **O ratchet de entrada do M-PULSE-7 está certificado; ele não é o run de 10.000 operações.** No
   Community `6595abdcfa788dfa2cc8da1a53ff96c378790531` (base
   `d44c82155e9884c556813ea96dec829be567c236`, branch
