@@ -60,6 +60,7 @@ from okto_grafx.domain.errors import (
     GrafxSchemaVersionMismatch,
     GrafxUnsupportedOperation,
 )
+from okto_grafx.domain.index.definition import index_definition_matches_table
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.codec import PageCodec
@@ -357,7 +358,9 @@ def assemble_database(
         ledger = LedgerStore(storage, clock, metrics, quarantine=quarantine)
         catalog = CatalogStore(pool)
         heap = HeapStore(pool, catalog)
-        indexes = IndexManager(pool, heap, metrics)
+        indexes = IndexManager(
+            pool, heap, metrics, artifact_nonce=_new_control_file_nonce
+        )
         vectors = VectorEngine(
             catalog=catalog,
             heap=heap,
@@ -405,6 +408,8 @@ def assemble_database(
                 existing_only=existing_only,
                 existing_files=existing_files,
             )
+            if not existing_only:
+                indexes.ensure_artifact_identities()
             for name in newly_attached:
                 if name not in attached_names:
                     attached_names.append(name)
@@ -465,11 +470,6 @@ def assemble_database(
             # from WAL.
             pool.checkpoint()
 
-        # After recovery has published, a writable open may create a missing accelerator, but it
-        # will be checked stale against the recovered LSN below. A read-only open adopts existing
-        # files only and never manufactures an index as a side effect of inspection.
-        sync_indexes(existing_only=config.read_only)
-
         transactions = TransactionManager(
             wal,
             pool,
@@ -495,6 +495,15 @@ def assemble_database(
             control_file_nonce=_new_control_file_nonce(),
             process_identity_provider=os.getpid,
         )
+        # A writable open may create a missing accelerator only under the same artifact section
+        # as DDL attach and commit publication.  That section first adopts existing files and
+        # rebases the durable catalog, then holds COMMIT_SECTION through create/legacy-nonce
+        # upgrade.  Read-only open performs only the non-mutating existing-file adoption.
+        if config.read_only:
+            sync_indexes(existing_only=True)
+        else:
+            with transactions.schema_artifact_section(sync_if=lambda: True):
+                sync_indexes(existing_only=False)
         queries = QueryEngine(
             catalog=catalog,
             heap=heap,
@@ -504,6 +513,7 @@ def assemble_database(
             indexes=indexes,
             vectors=vectors,
             page_stager=transactions._stage_page_image,
+            schema_artifact_section=transactions.schema_artifact_section,
             max_statement_writes=config.max_statement_writes,
             max_result_rows=config.max_result_rows,
             max_intermediate_rows=config.max_intermediate_rows,
@@ -599,22 +609,43 @@ def _verifier_factory(
     catalog: CatalogStore,
     indexes: IndexManager,
 ) -> Callable[[], Verifier]:
-    """Return a callable that builds a verifier over the index set registered AT THAT MOMENT.
+    """Return a callable that builds a verifier over committed indexes registered then.
 
     A verifier is handed the indexes it must walk, and a database registers indexes for as long as
     it is open. Capturing the set here, at open, would make ``verify("indexes")`` report a clean
     walk of an empty set for every index registered afterwards -- a wrong answer rather than a
-    missing one, which is the one outcome verification may never produce.
+    missing one, which is the one outcome verification may never produce. Query DDL also
+    registers speculative indexes before commit; the complete table identity filters those from
+    the durable database being verified even when a foreign table reused their numeric id.
     """
 
     def build() -> Verifier:
         """Return a verifier over the index set registered at this moment."""
+        committed_tables = {
+            (table.table_id, table.name): table for table in catalog.catalog.tables()
+        }
+
+        def is_committed(index: object) -> bool:
+            definition = getattr(index, "definition", None)
+            table = committed_tables.get(
+                (
+                    getattr(definition, "table_id", None),
+                    getattr(definition, "table_name", None),
+                )
+            )
+            return table is not None and index_definition_matches_table(
+                definition, table
+            )
+
+        committed_indexes = tuple(
+            index for index in indexes.indexes() if is_committed(index)
+        )
         return Verifier(
             pool,
             metrics,
             heap=heap,
             catalog=catalog,
-            indexes=indexes.indexes(),
+            indexes=committed_indexes,
         )
 
     return build
@@ -645,11 +676,16 @@ def _attach_primary_key_indexes(
     to do.
     """
     attached: list[str] = []
-    known = {index.name.lower() for index in indexes.indexes()}
     for table in catalog.catalog.tables():
         try:
             for endpoint in relationship_endpoint_indexes(table, pool, metrics):
-                if endpoint.name.lower() in known:
+                try:
+                    current = indexes.index(endpoint.name)
+                except GrafxIndexError as failure:
+                    if failure.details.get("field") != "name":
+                        raise
+                    current = None
+                if current is not None and current.definition == endpoint.definition:
                     continue
                 proved_present = (
                     existing_files is not None and endpoint.file in existing_files
@@ -661,18 +697,31 @@ def _attach_primary_key_indexes(
                 ):
                     continue
                 attached.append(
-                    indexes.register(
-                        endpoint,
-                        existing_only=existing_only,
-                        persist_stale=not existing_only,
-                        proved_present=proved_present,
+                    (
+                        indexes.adopt_committed(
+                            endpoint,
+                            persist_stale=False,
+                            proved_present=proved_present,
+                        )
+                        if existing_only
+                        else indexes.register(
+                            endpoint,
+                            existing_only=existing_only,
+                            persist_stale=not existing_only,
+                            proved_present=proved_present,
+                        )
                     ).name
                 )
-                known.add(endpoint.name.lower())
             index = primary_key_index(table, pool, metrics)
             if index is None:
                 continue
-            if index.name.lower() in known:
+            try:
+                current = indexes.index(index.name)
+            except GrafxIndexError as failure:
+                if failure.details.get("field") != "name":
+                    raise
+                current = None
+            if current is not None and current.definition == index.definition:
                 continue
             proved_present = existing_files is not None and index.file in existing_files
             if existing_only and (
@@ -682,14 +731,21 @@ def _attach_primary_key_indexes(
             ):
                 continue
             attached.append(
-                indexes.register(
-                    index,
-                    existing_only=existing_only,
-                    persist_stale=not existing_only,
-                    proved_present=proved_present,
+                (
+                    indexes.adopt_committed(
+                        index,
+                        persist_stale=False,
+                        proved_present=proved_present,
+                    )
+                    if existing_only
+                    else indexes.register(
+                        index,
+                        existing_only=existing_only,
+                        persist_stale=not existing_only,
+                        proved_present=proved_present,
+                    )
                 ).name
             )
-            known.add(index.name.lower())
         except (GrafxIndexError, GrafxUnsupportedOperation):
             # AN INDEX MAY NEVER MAKE A DATABASE UNOPENABLE. A catalog can hold a table whose
             # index name is illegal or collides -- two names differing only by case fold to one
@@ -724,15 +780,12 @@ def _attach_declared_vector_indexes(
     :attr:`okto_grafx.engine.database.Database.stale_indexes` rather than silently rebuilt.
     """
     attached: list[str] = []
-    known = {index.name.lower() for index in vectors.indexes()}
     for table in catalog.catalog.tables():
         for column in table.columns:
             space = column.vector_space
             if space is None:
                 continue
             name = f"vector_{table.name}_{space}"
-            if name.lower() in known:
-                continue
             file = index_file(name)
             proved_present = existing_files is not None and file in existing_files
             if existing_only and (
@@ -751,7 +804,6 @@ def _attach_declared_vector_indexes(
                         proved_present=proved_present,
                     ).name
                 )
-                known.add(name.lower())
             except (GrafxIndexError, GrafxUnsupportedOperation):
                 # A derived accelerator that cannot be adopted must not make the authoritative
                 # catalog and heap unreachable. Vector search will refuse the unattached space;
@@ -900,7 +952,10 @@ def _open_identity(
 
 def _new_control_file_nonce() -> int:
     """Return one host-generated nonce for a control file that may need bootstrapping."""
-    return int.from_bytes(uuid.uuid4().bytes[:8], "little")
+    nonce = 0
+    while nonce == 0:
+        nonce = int.from_bytes(uuid.uuid4().bytes[:8], "little")
+    return nonce
 
 
 def _identity_with_format(

@@ -51,6 +51,7 @@ with a located error instead of hanging (amendment A42).
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TypeVar
@@ -78,10 +79,13 @@ from okto_grafx.domain.index.contract import SecondaryIndex, StagingTransaction
 from okto_grafx.domain.index.definition import (
     INDEX_DIRECTORY,
     IndexDefinition,
+    automatic_index_definitions,
+    index_definition_matches_table,
     index_file,
 )
 from okto_grafx.domain.index.entry import INDEX_ENTRY_HEADER_SIZE, IndexEntry
 from okto_grafx.domain.index.header import (
+    INDEX_HEADER_FORMAT_VERSION,
     INDEX_HEADER_SLOT,
     IndexHeader,
 )
@@ -215,6 +219,7 @@ class _Staged:
     """
 
     txn_id: int
+    artifact_nonce: int
     changes: list[IndexChange] = field(default_factory=list)
     defer_clear: bool = False
     """Whether this transaction's RESET leaves the stale refusal standing for its caller.
@@ -232,6 +237,21 @@ class _IndexReadCertificate:
 
     seq: int
     header: IndexHeader
+
+
+@dataclass(frozen=True, slots=True)
+class _SpeculativeIndexArtifact:
+    """Exact registry object and durable generation installed by one DDL effect.
+
+    The token is deliberately opaque outside this module.  A rollback may release the
+    process-local registration only while it still names this exact object; it may regard the
+    canonical file as private only while page zero still has this exact durable generation.
+    """
+
+    index: IndexStore
+    generation: _IndexReadCertificate
+    created_file: bool
+    owner: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +292,7 @@ class IndexStore:
 
     __slots__ = (
         "_definition",
+        "_creation_nonce",
         "_pool",
         "_metrics",
         "_staged",
@@ -299,6 +320,7 @@ class IndexStore:
                 value=type(definition).__name__,
             )
         self._definition: IndexDefinition = definition
+        self._creation_nonce: int = 0
         self._pool: BufferPool = pool
         self._metrics: MetricsSink = metrics
         self._staged: dict[int, _Staged] = {}
@@ -348,6 +370,59 @@ class IndexStore:
     def definition(self) -> IndexDefinition:
         """Return the definition this store was built for."""
         return self._definition
+
+    def _set_creation_nonce(self, nonce: int) -> None:
+        """Set the nonce used only if this handle wins exclusive file creation."""
+        if (
+            isinstance(nonce, bool)
+            or not isinstance(nonce, int)
+            or not 0 <= nonce <= 0xFFFFFFFFFFFFFFFF
+        ):
+            raise GrafxIndexError(
+                "An index artifact nonce must be an unsigned 64-bit integer.",
+                field="artifact_nonce",
+                value=repr(nonce),
+            )
+        self._creation_nonce = nonce
+
+    def _ensure_artifact_nonce(self, nonce: int) -> _IndexReadCertificate:
+        """Claim a legacy v1 artifact once and return its fresh persisted identity.
+
+        The manager calls this only from a create-capable registration under
+        ``COMMIT_SECTION``.  Version-1 files remain readable, but nonce zero never authorises a
+        speculative owner or pre-WAL validation because recreate-to-identical would be ABA.
+        """
+        if (
+            isinstance(nonce, bool)
+            or not isinstance(nonce, int)
+            or not 1 <= nonce <= 0xFFFFFFFFFFFFFFFF
+        ):
+            raise GrafxIndexError(
+                "Claiming an index artifact needs a non-zero unsigned 64-bit nonce.",
+                field="artifact_nonce",
+                value=repr(nonce),
+            )
+        self._publish_header_transition(
+            lambda header: (
+                header
+                if header.artifact_nonce != 0
+                else replace(
+                    header,
+                    artifact_nonce=nonce,
+                    format_version=INDEX_HEADER_FORMAT_VERSION,
+                )
+            )
+        )
+        certificate = self._fresh_certificate()
+        if certificate.header.artifact_nonce == 0:
+            raise GrafxIndexError(
+                f"Index {self.name!r} did not persist its physical artifact nonce.",
+                field="artifact_nonce",
+                index=self.name,
+                file=self.file,
+                retryable=True,
+            )
+        return certificate
 
     @property
     def name(self) -> str:
@@ -443,11 +518,30 @@ class IndexStore:
         A true ``proved_present`` is the same short-lived directory proof accepted by
         :meth:`is_created`; it never turns a missing/torn structure into a created one.
         """
+        header, _created = self._create_with_provenance(proved_present=proved_present)
+        return header
+
+    def _create_with_provenance(
+        self, *, proved_present: bool = False
+    ) -> tuple[IndexHeader, bool]:
+        """Create/open this file and say whether this call won exclusive name creation.
+
+        A preceding ``exists`` observation is not ownership: another participant can create the
+        canonical name between that observation and ``create``.  The exclusive create outcome is
+        the only proof a schema journal may retain.  A participant that loses the race adopts the
+        resulting complete file; it never records the other participant's bytes as its own.
+        """
         storage = self._pool.storage
+        created = False
         if not proved_present and not storage.exists(self.file):
-            storage.create(self.file)
+            try:
+                storage.create(self.file)
+                created = True
+            except GrafxUnsupportedOperation as failure:
+                if failure.details.get("reason") != "file_exists":
+                    raise
         if self.is_created(proved_present=proved_present):
-            return self.open(proved_present=proved_present)
+            return self.open(proved_present=proved_present), created
         self._reserve_header_page()
         self._grow_buckets()
         header = self.open()
@@ -463,7 +557,7 @@ class IndexStore:
         # durability of the ENTRIES is the log's business; this only has to make the structure
         # that holds them visible to every other process.
         self._pool.flush(self.file)
-        return header
+        return header, created
 
     def _reserve_header_page(self) -> None:
         """Turn page 0 into the reserved header page of this index file."""
@@ -474,6 +568,7 @@ class IndexStore:
             table_id=self._definition.table_id,
             bucket_count=self._definition.bucket_count,
             digest=self._definition.digest(),
+            artifact_nonce=self._creation_nonce,
         )
         if storage.page_count(self.file) == 0:
             page = self._pool.allocate(self.file, int(PageType.META))
@@ -685,9 +780,7 @@ class IndexStore:
             )
         fenced_through = self._completed_rebuild_through
         rebuild_required = (
-            required_lsn
-            if rebuild_required_lsn is None
-            else rebuild_required_lsn
+            required_lsn if rebuild_required_lsn is None else rebuild_required_lsn
         )
         if fenced_through is not None and rebuild_required > fenced_through:
             # A rebuild this handle completed derived its entries at ``fenced_through``. The
@@ -1274,9 +1367,12 @@ class IndexStore:
             )
         token = certificate.seq if rebuild_token == 0 else rebuild_token
         if defer_clear:
-            self._staged.setdefault(
-                self._require_txn(txn), _Staged(txn_id=self._require_txn(txn))
-            ).defer_clear = True
+            txn_id = self._require_txn(txn)
+            staged = self._staged.get(txn_id)
+            if staged is None:
+                staged = self._new_staged(txn_id)
+                self._staged[txn_id] = staged
+            staged.defer_clear = True
         return self._stage(
             txn,
             IndexChange(
@@ -1313,13 +1409,13 @@ class IndexStore:
         )
         staged = self._staged.get(txn_id)
         if staged is None:
-            staged = _Staged(txn_id=txn_id)
+            staged = self._new_staged(txn_id)
             self._staged[txn_id] = staged
         staged.changes.append(change)
         txn.stage_record(record)
         return record
 
-    def stage_empty_observation(self, txn: StagingTransaction) -> None:
+    def stage_empty_observation(self, txn: StagingTransaction) -> bool:
         """Record that a covered row was examined but owed this sparse index no entry.
 
         The log records changes, so an omitted sparse entry has no logical index record.  The
@@ -1331,7 +1427,43 @@ class IndexStore:
 
         txn_id = self._require_txn(txn)
         if txn_id not in self._staged:
-            self._staged[txn_id] = _Staged(txn_id=txn_id)
+            self._staged[txn_id] = self._new_staged(txn_id)
+            return True
+        return False
+
+    def _new_staged(self, txn_id: int) -> _Staged:
+        """Bind new private staging to this file's non-repeating physical identity."""
+        certificate = self._fresh_certificate()
+        return _Staged(
+            txn_id=txn_id,
+            artifact_nonce=certificate.header.artifact_nonce,
+        )
+
+    def discard_empty_observation(self, txn: StagingTransaction) -> bool:
+        """Undo an empty observation created by one refused schema statement only."""
+        txn_id = self._require_txn(txn)
+        staged = self._staged.get(txn_id)
+        if staged is None or staged.changes:
+            return False
+        return self._staged.pop(txn_id, None) is staged
+
+    def validate_staged_artifact(self, txn: StagingTransaction) -> None:
+        """Prove this transaction still stages against the same physical index artifact."""
+        txn_id = self._require_txn(txn)
+        staged = self._staged.get(txn_id)
+        if staged is None:
+            return
+        certificate = self._fresh_certificate()
+        if certificate.header.artifact_nonce != staged.artifact_nonce:
+            raise GrafxIndexError(
+                f"Index {self.name!r} was replaced after transaction {txn_id} staged it.",
+                field="artifact_nonce",
+                index=self.name,
+                file=self.file,
+                expected=staged.artifact_nonce,
+                observed=certificate.header.artifact_nonce,
+                retryable=True,
+            )
 
     def pending(self, txn: StagingTransaction) -> tuple[IndexChange, ...]:
         """Return the changes this transaction has staged into this index, in order."""
@@ -2695,14 +2827,32 @@ class ProximityIndex(IndexStore):
         )
 
 
-def _tables_written_by(txn: object) -> frozenset[int] | None:
-    """Return effective row-intent table ids, or None when they cannot be proved.
+_TableIdentity = tuple[int, str]
 
-    The heap writer caches the ids from the already-reduced intents it actually materialized.
-    Consume that certificate first: reducing the public intent history again here would add an
-    avoidable O(n) pass inside the cross-process commit section, after the WAL barrier. Direct
-    index callers and lightweight doubles have no certificate, so retain the conservative
-    reducer/raw-intent fallback for those compatibility shapes.
+
+def _table_identity(table: object) -> _TableIdentity | None:
+    """Return the complete catalog identity needed to distinguish reused table ids."""
+    table_id = getattr(table, "table_id", None)
+    table_name = getattr(table, "name", None)
+    if (
+        isinstance(table_id, bool)
+        or not isinstance(table_id, int)
+        or table_id < 1
+        or not isinstance(table_name, str)
+        or not table_name
+    ):
+        return None
+    return table_id, table_name
+
+
+def _tables_written_by(txn: object) -> frozenset[_TableIdentity] | None:
+    """Return effective row-intent table identities, or None when they cannot be proved.
+
+    The heap writer caches the id-and-name pairs from the already-reduced intents it actually
+    materialized. Consume that certificate first: reducing the public intent history again here
+    would add an avoidable O(n) pass inside the cross-process commit section, after the WAL
+    barrier. Direct index callers and lightweight doubles have no certificate, so retain the
+    conservative reducer/raw-intent fallback for those compatibility shapes.
 
     Real transactions retain their raw intent history until commit. A pending INSERT followed
     by its DELETE is therefore present in that history even though the shared reducer correctly
@@ -2714,8 +2864,13 @@ def _tables_written_by(txn: object) -> frozenset[int] | None:
     """
     certified = getattr(txn, "_effective_row_tables", None)
     if isinstance(certified, frozenset) and all(
-        isinstance(table_id, int) and not isinstance(table_id, bool)
-        for table_id in certified
+        isinstance(identity, tuple)
+        and len(identity) == 2
+        and isinstance(identity[0], int)
+        and not isinstance(identity[0], bool)
+        and isinstance(identity[1], str)
+        and bool(identity[1])
+        for identity in certified
     ):
         return certified
     intents = getattr(txn, "row_intents", None)
@@ -2727,12 +2882,12 @@ def _tables_written_by(txn: object) -> frozenset[int] | None:
         if all(isinstance(intent, RowIntent) for intent in captured)
         else captured
     )
-    tables: set[int] = set()
+    tables: set[_TableIdentity] = set()
     for intent in effective:
-        table_id = getattr(getattr(intent, "table", None), "table_id", None)
-        if not isinstance(table_id, int) or isinstance(table_id, bool):
+        identity = _table_identity(getattr(intent, "table", None))
+        if identity is None:
             return None
-        tables.add(table_id)
+        tables.add(identity)
     return frozenset(tables)
 
 
@@ -2868,9 +3023,19 @@ class IndexManager:
         "_published_lsn",
         "_table_watermarks",
         "_heap_cache_certificates",
+        "_artifact_nonce",
+        "_artifact_claims",
+        "_schema_observed",
     )
 
-    def __init__(self, pool: BufferPool, heap: HeapStore, metrics: MetricsSink) -> None:
+    def __init__(
+        self,
+        pool: BufferPool,
+        heap: HeapStore,
+        metrics: MetricsSink,
+        *,
+        artifact_nonce: Callable[[], int] | None = None,
+    ) -> None:
         """Build the registry over the pool and heap of one database."""
         self._pool: BufferPool = pool
         self._heap: HeapStore = heap
@@ -2884,6 +3049,9 @@ class IndexManager:
         # visible.  A new certificate drops clean heap frames before they can confirm a deleted
         # or superseded version from another process.
         self._heap_cache_certificates: dict[str, _IndexReadCertificate] = {}
+        self._artifact_nonce = artifact_nonce
+        self._artifact_claims: dict[IndexStore, set[object]] = {}
+        self._schema_observed: dict[int, dict[IndexStore, int]] = {}
 
     # --- registry ---------------------------------------------------------------------------
 
@@ -2895,6 +3063,7 @@ class IndexManager:
         existing_only: bool = False,
         persist_stale: bool = True,
         proved_present: bool = False,
+        _creation: list[bool] | None = None,
     ) -> IndexStore:
         """Register an index, optionally requiring a complete existing file, and check freshness.
 
@@ -2936,6 +3105,10 @@ class IndexManager:
                 value=index.name,
                 index=existing.name,
             )
+        created_file = False
+        nonce = self._artifact_nonce() if self._artifact_nonce is not None else 0
+        index._set_creation_nonce(nonce)
+        header: IndexHeader
         if existing_only:
             # A read-only composition may inspect an existing accelerator, but it must never
             # repair a zero-length/torn one as a side effect of opening the database. ``create``
@@ -2951,10 +3124,51 @@ class IndexManager:
                     file=index.file,
                     index=index.name,
                 )
-            index.open(proved_present=proved_present)
+            header = index.open(proved_present=proved_present)
         else:
-            index.create(proved_present=proved_present)
+            header, created_file = index._create_with_provenance(
+                proved_present=proved_present
+            )
+            if header.artifact_nonce == 0 and nonce != 0:
+                header = index._ensure_artifact_nonce(nonce).header
         self._indexes[key] = index
+        try:
+            self._finish_registration(
+                index,
+                complete_through=complete_through,
+                persist_stale=persist_stale,
+            )
+        except BaseException:
+            # Physical creation precedes registry publication and is intentionally preserved:
+            # without a cross-process delete CAS those bytes may already have an adopter.  The
+            # process-local publication is different.  Until every post-registration proof has
+            # succeeded no DDL journal owns it, so compensate only this exact object and the
+            # companion cache it may have published.
+            self._discard_unclaimed_registration(index)
+            raise
+        if _creation is not None:
+            _creation.append(created_file)
+        return index
+
+    def _discard_unclaimed_registration(self, index: IndexStore) -> bool:
+        """Compensate one exact provisional registry publication and its cache binding."""
+        key = index.definition.registry_key
+        if self._indexes.get(key) is not index:
+            # A re-entrant host callback may have installed a replacement.  This failure owns
+            # neither that object nor the companion certificate it published.
+            return False
+        self._indexes.pop(key, None)
+        self._heap_cache_certificates.pop(index.file, None)
+        return True
+
+    def _finish_registration(
+        self,
+        index: IndexStore,
+        *,
+        complete_through: Lsn | None,
+        persist_stale: bool,
+    ) -> None:
+        """Complete freshness and heap-view publication for one provisional registry entry."""
         if complete_through is not None:
             index.advance_built_through(complete_through)
         # Startup registers durable files before recovery has loaded the authoritative published
@@ -3017,7 +3231,429 @@ class IndexManager:
                 # Leave the companion generation unbound; the first authoritative lookup will
                 # fail closed unless a successful local commit binds it first.
                 self._heap_cache_certificates.pop(index.file, None)
-        return index
+
+    def equivalent_registered(self, candidate: IndexStore) -> IndexStore | None:
+        """Return the exact equivalent already registered, or refuse a name collision.
+
+        Schema DDL is idempotent only for a complete durable definition.  Numeric table ids and
+        names can both be reused by concurrent speculative catalogs, so neither is sufficient;
+        dataclass equality includes positions, visibility, bucket layout and key derivation.
+        """
+        existing = self._indexes.get(candidate.definition.registry_key)
+        if existing is None:
+            return None
+        if existing.definition == candidate.definition:
+            return existing
+        same_table = (
+            existing.definition.table_id == candidate.definition.table_id
+            and existing.definition.table_name == candidate.definition.table_name
+        )
+        raise GrafxIndexError(
+            f"Index {existing.name!r} is already registered under a different definition.",
+            field="definition" if same_table else "name",
+            value=candidate.name,
+            index=existing.name,
+        )
+
+    def register_speculative(
+        self,
+        index: IndexStore,
+        *,
+        complete_through: Lsn | None = None,
+        equivalent: Callable[[IndexStore], bool] | None = None,
+    ) -> tuple[IndexStore, _SpeculativeIndexArtifact | None]:
+        """Register one DDL index and return its exact rollback authority.
+
+        Every equivalent process-local adoption acquires its own claim.  The final rollback may
+        release the registration only if no claimant committed it and its physical generation is
+        unchanged.  A newly registered object also carries the exclusive-create result and its
+        initial durable page-zero generation, never an ``exists`` guess made outside the creation
+        door.
+        """
+        key = index.definition.registry_key
+        existing = self._indexes.get(key)
+        if existing is not None:
+            same_definition = existing.definition == index.definition
+            same_semantics = equivalent is None or equivalent(existing)
+            if same_definition and same_semantics:
+                return existing, self._claim_speculative(
+                    existing,
+                    generation=existing._fresh_certificate(),
+                    created_file=False,
+                )
+
+            # Two schema transactions may allocate the same table id/name from the same durable
+            # snapshot yet declare different key positions or vector-space semantics.  Neither
+            # has won catalog OCC, so the later statement must be allowed to install its own
+            # candidate.  Preserve the first candidate's bytes outside the canonical namespace;
+            # its transaction retains the old object+nonce and will receive a retryable conflict
+            # if it later attempts to publish.  A case-fold collision belonging to another table
+            # is the supported unindexed-table regime and is never displaced here.
+            same_table = (
+                existing.definition.table_id == index.definition.table_id
+                and existing.definition.table_name == index.definition.table_name
+            )
+            if not same_table or not self._preserve_unclaimed_canonical(index.file):
+                raise GrafxIndexError(
+                    f"Index {existing.name!r} is already registered under a different "
+                    "definition.",
+                    field="definition" if same_table else "name",
+                    value=index.name,
+                    index=existing.name,
+                )
+            if self._indexes.get(key) is existing:
+                self._indexes.pop(key, None)
+                self._heap_cache_certificates.pop(existing.file, None)
+        creation: list[bool] = []
+        try:
+            registered = self.register(
+                index,
+                complete_through=complete_through,
+                _creation=creation,
+            )
+        except GrafxIndexError as failure:
+            if failure.details.get("field") not in {"digest", "visibility"}:
+                raise
+            if not self._preserve_unclaimed_canonical(index.file):
+                raise
+            creation.clear()
+            registered = self.register(
+                index,
+                complete_through=complete_through,
+                _creation=creation,
+            )
+        try:
+            generation = registered._fresh_certificate()
+            artifact = self._claim_speculative(
+                registered,
+                generation=generation,
+                created_file=bool(creation and creation[0]),
+            )
+        except BaseException:
+            # ``register`` has published process-local state but QueryEngine still has no
+            # journal token.  A failed fresh generation proof must therefore unwind the exact
+            # candidate just like a failed registration finalizer, while preserving a
+            # re-entrant replacement and all canonical physical bytes.
+            self._discard_unclaimed_registration(registered)
+            raise
+        return registered, artifact
+
+    def _claim_speculative(
+        self,
+        index: IndexStore,
+        *,
+        generation: _IndexReadCertificate,
+        created_file: bool,
+    ) -> _SpeculativeIndexArtifact:
+        """Acquire one process-local DDL claim over an exact registry object."""
+        owner = object()
+        owners = self._artifact_claims.setdefault(index, set())
+        try:
+            owners.add(owner)
+            return _SpeculativeIndexArtifact(
+                index=index,
+                generation=generation,
+                created_file=created_file,
+                owner=owner,
+            )
+        except BaseException:
+            owners.discard(owner)
+            if self._artifact_claims.get(index) is owners and not owners:
+                self._artifact_claims.pop(index, None)
+            raise
+
+    def adopt_committed(
+        self,
+        index: IndexStore,
+        *,
+        persist_stale: bool = False,
+        proved_present: bool = False,
+        replace_equivalent: bool = False,
+    ) -> IndexStore:
+        """Replace a process-local speculative registration with one proved by the catalog.
+
+        The composition builds ``index`` from the freshly rebased durable catalog and calls this
+        only through its existing-only sync route.  Opening the candidate proves the canonical
+        bytes before the registry changes.  If validation fails, the former object is restored;
+        no file is created or repaired.  ``replace_equivalent`` lets the vector layer rebind an
+        equal physical definition to different committed runtime space semantics.
+        """
+        if not isinstance(index, IndexStore):
+            raise GrafxIndexError(
+                "A committed index adoption needs a paged IndexStore candidate.",
+                field="index",
+                value=type(index).__name__,
+            )
+        key = index.definition.registry_key
+        existing = self._indexes.get(key)
+        if (
+            existing is not None
+            and existing.definition == index.definition
+            and not replace_equivalent
+        ):
+            # Re-read the canonical identity even for an equivalent wrapper.  A foreign DDL may
+            # have recreated the same definition with another physical nonce.
+            existing.open(proved_present=proved_present)
+            return existing
+        if existing is not None:
+            self._indexes.pop(key, None)
+            self._heap_cache_certificates.pop(existing.file, None)
+        try:
+            return self.register(
+                index,
+                existing_only=True,
+                persist_stale=persist_stale,
+                proved_present=proved_present,
+            )
+        except BaseException:
+            if self._indexes.get(key) is index:
+                self._indexes.pop(key, None)
+            if existing is not None:
+                self._indexes[key] = existing
+            raise
+
+    def ensure_artifact_identities(self) -> None:
+        """Upgrade every registered legacy artifact to a non-repeatable physical identity.
+
+        The writable composition calls this only inside ``schema_artifact_section``.  Read-only
+        opens continue to decode v1 with nonce zero and never mutate it.
+        """
+        if self._artifact_nonce is None:
+            return
+        for index in self.indexes():
+            # The immediately preceding sync proved one complete directory inventory.  Reuse
+            # that proof instead of doubling every per-file existence probe merely to inspect
+            # the nonce.
+            header = index.open(proved_present=True)
+            if header.artifact_nonce == 0:
+                index._ensure_artifact_nonce(self._artifact_nonce())
+
+    def discard_speculative(self, artifact: object) -> bool:
+        """Release only the unchanged process-local object named by one DDL journal.
+
+        This never deletes the canonical file.  Cross-process speculative claimants are not
+        enumerable through this process-local registry, so even an unchanged page-zero token is
+        not a delete-CAS proof.  Canonical orphan reclamation is a separate attach-time operation
+        under ``COMMIT_SECTION`` that first proves no committed catalog definition owns the name.
+
+        If another participant durably advanced the same definition, the object has been adopted
+        and is retained.  If the canonical name now contains a different definition, the local
+        object is obsolete and is unregistered, but those foreign bytes remain untouched.
+        """
+        return self.settle_speculative(artifact, committed=False)
+
+    def settle_speculative(self, artifact: object, *, committed: bool) -> bool:
+        """Release one exact DDL claim and conditionally retire its unowned registration."""
+        if not isinstance(artifact, _SpeculativeIndexArtifact):
+            return False
+        expected = artifact.index
+        claims = self._artifact_claims.get(expected)
+        if claims is None or artifact.owner not in claims:
+            return False
+        claims.remove(artifact.owner)
+        if not claims:
+            self._artifact_claims.pop(expected, None)
+        if committed:
+            return True
+        if claims:
+            return False
+        key = expected.definition.registry_key
+        current = self._indexes.get(key)
+        if current is not expected:
+            return False
+        if self._definition_is_durable(expected):
+            return False
+        try:
+            observed = expected._fresh_certificate()
+        except GrafxIndexError as failure:
+            if failure.details.get("field") not in {"digest", "visibility"}:
+                return False
+            self._indexes.pop(key, None)
+            self._heap_cache_certificates.pop(expected.file, None)
+            return True
+        except GrafxError:
+            return False
+        if observed != artifact.generation:
+            # Same definition, newer durable generation: another completed transaction adopted
+            # the object/file.  It is no longer this rollback's state to release.
+            return False
+        removed = self._indexes.pop(key, None)
+        if (
+            removed is not expected
+        ):  # pragma: no cover - participant section serialises locals
+            if removed is not None:
+                self._indexes[key] = removed
+            return False
+        self._heap_cache_certificates.pop(expected.file, None)
+        return True
+
+    def _definition_is_durable(self, index: IndexStore) -> bool:
+        """Prove that the refreshed committed catalog declares this automatic definition."""
+        try:
+            table = self._heap.catalog.catalog.table_by_id(index.definition.table_id)
+            definitions = automatic_index_definitions(table)
+        except GrafxError:
+            return False
+        return any(definition == index.definition for definition in definitions)
+
+    def stage_schema_observation(
+        self, index: IndexStore, txn: StagingTransaction
+    ) -> bool:
+        """Stage and track one DDL empty observation even when the object was adopted."""
+        txn_id = index._require_txn(txn)
+        created = index.stage_empty_observation(txn)
+        observed = self._schema_observed.setdefault(txn_id, {})
+        observed[index] = observed.get(index, 0) + 1
+        return created
+
+    def discard_schema_observation(
+        self,
+        index: object,
+        txn: StagingTransaction,
+        *,
+        created: bool,
+    ) -> bool:
+        """Release exactly one statement's observation claim during schema unwind."""
+        if not isinstance(index, IndexStore):
+            return False
+        txn_id = index._require_txn(txn)
+        observed = self._schema_observed.get(txn_id)
+        if observed is None or observed.get(index, 0) <= 0:
+            return False
+        remaining = observed[index] - 1
+        if remaining:
+            observed[index] = remaining
+        else:
+            observed.pop(index, None)
+            if not observed:
+                self._schema_observed.pop(txn_id, None)
+        if created:
+            index.discard_empty_observation(txn)
+        return True
+
+    def validate_staged_artifacts(
+        self,
+        txn: StagingTransaction,
+        *,
+        row_tables: Sequence[object] = (),
+    ) -> None:
+        """Prove every schema/row staging object still owns its persisted physical nonce.
+
+        The transaction manager calls this under the same ``COMMIT_SECTION`` it retains through
+        WAL append and publication.  An ABA replacement can repeat a definition and page
+        sequence, but it cannot repeat the composition-root nonce.
+        """
+        # Concrete stores validate the full staging protocol below.  The manager owns only the
+        # registry, so it validates the identifier without pretending to be an IndexStore.
+        txn_id = getattr(txn, "txn_id", None)
+        if isinstance(txn_id, bool) or not isinstance(txn_id, int) or txn_id < 0:
+            raise GrafxIndexError(
+                "Index artifact validation needs a transaction with a non-negative txn_id.",
+                field="txn_id",
+                value=repr(txn_id),
+            )
+        schema_indexes = tuple(self._schema_observed.get(txn_id, ()))
+        staged_indexes = tuple(index for index in self.indexes() if index.observed(txn))
+        row_indexes = tuple(
+            index
+            for table in row_tables
+            for index in self.indexes_for(
+                getattr(table, "table_id", -1),
+                table_name=getattr(table, "name", None),
+                table=table,
+            )
+        )
+        for index in dict.fromkeys((*schema_indexes, *staged_indexes, *row_indexes)):
+            if self._indexes.get(index.definition.registry_key) is not index:
+                raise GrafxIndexError(
+                    f"Index {index.name!r} is no longer the registered artifact staged by "
+                    f"transaction {txn_id}.",
+                    field="index_registry",
+                    index=index.name,
+                    file=index.file,
+                    txn_id=txn_id,
+                    retryable=True,
+                )
+            index.validate_staged_artifact(txn)
+            if index in row_indexes and self._artifact_nonce is not None:
+                certificate = index._fresh_certificate()
+                if certificate.header.artifact_nonce == 0:
+                    raise GrafxIndexError(
+                        f"Index {index.name!r} has no non-repeatable physical identity for "
+                        f"transaction {txn_id}.",
+                        field="artifact_nonce",
+                        index=index.name,
+                        file=index.file,
+                        observed=0,
+                        retryable=True,
+                    )
+
+    def _preserve_unclaimed_canonical(self, file: str) -> bool:
+        """Move an undeclared canonical index aside for a new speculative definition.
+
+        The caller is ``register_speculative`` while QueryEngine owns ``COMMIT_SECTION``.  No
+        commit can publish between the committed-catalog proof and the rename.  The bytes are
+        preserved outside ``index/`` because active speculative claimants in other processes are
+        not visible here; their later pre-WAL artifact validation will refuse rather than append
+        a record naming the displaced canonical file.
+        """
+        if self._canonical_file_is_declared(file):
+            return False
+        storage = self._pool.storage
+        if not storage.exists(file):
+            return True
+        try:
+            page_zero = storage.read_page(file, HEADER_PAGE_INDEX)
+        except GrafxError:
+            return False
+        fingerprint = hashlib.blake2b(
+            file.encode("utf-8") + page_zero, digest_size=16
+        ).hexdigest()
+        orphan: str | None = None
+        for ordinal in range(0x10000):
+            suffix = "" if ordinal == 0 else f".{ordinal:04x}"
+            orphan = f"index_orphan/{fingerprint}{suffix}.idx"
+            if not storage.exists(orphan):
+                break
+        else:
+            # Fixed-width names keep the quarantine namespace bounded. Exhaustion refuses the
+            # replacement and preserves the canonical bytes rather than inventing an overwrite.
+            return False
+        assert (
+            orphan is not None
+        )  # the bounded loop always assigns before its first check
+        for page_index in range(storage.page_count(file)):
+            self._pool.discard(file, page_index)
+        storage.atomic_replace(file, orphan)
+        self._heap_cache_certificates.pop(file, None)
+        return True
+
+    def _canonical_file_is_declared(self, file: str) -> bool:
+        """Say whether the committed catalog assigns this case-folded name to an index."""
+        wanted = file.casefold()
+        try:
+            tables = self._heap.catalog.catalog.tables()
+        except GrafxError:
+            return True
+        for table in tables:
+            names: list[str] = []
+            if getattr(table, "kind", None) == "rel":
+                names.extend(
+                    (edge_from_index_name(table.name), edge_to_index_name(table.name))
+                )
+            elif getattr(table, "primary_key", None) is not None:
+                names.append(primary_key_index_name(table.name))
+            for column in getattr(table, "columns", ()):
+                space = getattr(column, "vector_space", None)
+                if isinstance(space, str) and space:
+                    names.append(f"vector_{table.name}_{space}")
+            for name in names:
+                try:
+                    if index_file(name).casefold() == wanted:
+                        return True
+                except GrafxIndexError:
+                    continue
+        return False
 
     def unregister(self, name: str) -> bool:
         """Forget one registered index, leaving its file alone, and say whether one was held.
@@ -3061,11 +3697,81 @@ class IndexManager:
             )
         return found
 
-    def indexes_for(self, table_id: int) -> tuple[IndexStore, ...]:
-        """Return every registered index that covers this table."""
+    def indexes_for(
+        self,
+        table_id: int,
+        *,
+        table_name: str | None = None,
+        table: object | None = None,
+    ) -> tuple[IndexStore, ...]:
+        """Return registered indexes owned by this complete table identity.
+
+        ``table_id`` alone remains the compatibility shape for component callers.  The commit
+        path also supplies the case-sensitive catalog name because concurrent speculative and
+        durable DDL can legitimately allocate the same numeric id from the same snapshot.
+        """
         return tuple(
-            index for index in self.indexes() if index.definition.table_id == table_id
+            index
+            for index in self.indexes()
+            if index.definition.table_id == table_id
+            and (table_name is None or index.definition.table_name == table_name)
+            and (
+                table is None
+                or not hasattr(table, "columns")
+                or index_definition_matches_table(index.definition, table)
+            )
         )
+
+    def unregistered_persistent_indexes_for(
+        self, tables: Sequence[object]
+    ) -> tuple[str, ...]:
+        """Name durable automatic indexes of ``tables`` absent from this registry.
+
+        A long-lived participant can adopt a table committed by another process while its
+        process-local index registry still predates that DDL.  In that state row materialisation
+        is able to update the heap, but index staging has no object on which to record either the
+        logical change or a durable stale verdict.  Recovery can then mistake the resulting WAL
+        silence for a complete replay and certify a short index.
+
+        This is the pre-WAL proof used by the transaction manager after its existing-only
+        registry synchronisation.  Only files that actually exist are obligations: an automatic
+        accelerator that was deliberately skipped because its name is illegal or collides keeps
+        the established scan fallback.  A path alone is not proof: the registry definition and
+        the durable header must both match the complete automatic definition, so a speculative
+        artifact that reused the same folded name cannot satisfy another table's obligation.
+        """
+
+        persisted = frozenset(self._pool.storage.list_files(f"{INDEX_DIRECTORY}/"))
+        missing: list[str] = []
+        seen: set[str] = set()
+        for table in tables:
+            try:
+                definitions = automatic_index_definitions(table)  # type: ignore[arg-type]
+            except GrafxError:
+                continue
+            for definition in definitions:
+                file = definition.file
+                if file in seen or file not in persisted:
+                    continue
+                seen.add(file)
+                current = self._indexes.get(definition.registry_key)
+                if current is not None and current.definition == definition:
+                    continue
+                try:
+                    page = self._pool.read_fresh_page(file, HEADER_PAGE_INDEX)
+                    header = IndexHeader.decode(page.read_slot(INDEX_HEADER_SLOT))
+                except GrafxError:
+                    # An unreadable/torn file was not proved to be this automatic accelerator;
+                    # the normal sync/open refusal retains its own classification.
+                    continue
+                if (
+                    header.digest == definition.digest()
+                    and header.visibility is definition.visibility
+                    and header.table_id == definition.table_id
+                    and header.bucket_count == definition.bucket_count
+                ):
+                    missing.append(definition.name)
+        return tuple(missing)
 
     # --- freshness --------------------------------------------------------------------------
 
@@ -3096,17 +3802,40 @@ class IndexManager:
         for index in self.indexes():
             index._table_high_water = high_waters.get(index.definition.table_id)
 
-    def _record_table_watermark(self, table_id: int, lsn: Lsn) -> None:
+    def _record_table_watermark(
+        self, table_id: int, lsn: Lsn, *, table_name: str | None = None
+    ) -> None:
         """Advance one locally observed table floor and bind all of its indexes to it."""
         position = max(self._table_watermarks.get(table_id, NO_LSN), lsn)
         self._table_watermarks[table_id] = position
-        for index in self.indexes_for(table_id):
+        for index in self.indexes_for(table_id, table_name=table_name):
             index._table_high_water = position
 
     @property
     def published_lsn(self) -> Lsn:
         """Return the log position this manager was last told the database had published."""
         return self._published_lsn
+
+    def observe_published_lsn(self, published_lsn: Lsn) -> None:
+        """Advance the registry's publication ceiling without certifying any index.
+
+        Dynamic registration happens after a transaction manager has selected a newer durable
+        cross-process view.  ``register`` must judge a newly adopted file against that view, not
+        the position this registry happened to see when the process opened.  Merely recording the
+        ceiling grants no freshness: each registration still reads its table watermark and index
+        header, and :meth:`open` remains the door that validates the complete inventory.
+        """
+
+        published = _require_position("published_lsn", published_lsn)
+        if published < self._published_lsn:
+            raise GrafxIndexError(
+                f"The index registry has already observed published position "
+                f"{self._published_lsn}, so it cannot move back to {published}.",
+                field="published_lsn",
+                value=published,
+                observed=self._published_lsn,
+            )
+        self._published_lsn = published
 
     def open(
         self,
@@ -3417,12 +4146,19 @@ class IndexManager:
 
     # --- staging ----------------------------------------------------------------------------
 
-    def row_entry_count(self, table_id: int, values: Sequence[object]) -> int:
+    def row_entry_count(
+        self,
+        table_id: int,
+        values: Sequence[object],
+        *,
+        table_name: str | None = None,
+        table: object | None = None,
+    ) -> int:
         """Count entries this row owes without deriving or hashing their keys."""
 
         return sum(
             1
-            for index in self.indexes_for(table_id)
+            for index in self.indexes_for(table_id, table_name=table_name, table=table)
             if index.definition.owes_entry(values)
         )
 
@@ -3433,10 +4169,13 @@ class IndexManager:
         ref: RecordRef,
         values: Sequence[object],
         csn: Csn,
+        *,
+        table_name: str | None = None,
+        table: object | None = None,
     ) -> tuple[WalRecord, ...]:
         """Stage, on every index of the table, the entry this new row version owes it."""
         records: list[WalRecord] = []
-        for index in self.indexes_for(table_id):
+        for index in self.indexes_for(table_id, table_name=table_name, table=table):
             definition = index.definition
             if not definition.owes_entry(values):
                 index.stage_empty_observation(txn)
@@ -3453,10 +4192,13 @@ class IndexManager:
         ref: RecordRef,
         values: Sequence[object],
         csn: Csn,
+        *,
+        table_name: str | None = None,
+        table: object | None = None,
     ) -> tuple[WalRecord, ...]:
         """Stage, on every index of the table, the end of the entry this row version had."""
         records: list[WalRecord] = []
-        for index in self.indexes_for(table_id):
+        for index in self.indexes_for(table_id, table_name=table_name, table=table):
             definition = index.definition
             if not definition.owes_entry(values):
                 index.stage_empty_observation(txn)
@@ -3475,6 +4217,9 @@ class IndexManager:
         new_ref: RecordRef,
         new_values: Sequence[object],
         csn: Csn,
+        *,
+        table_name: str | None = None,
+        table: object | None = None,
     ) -> tuple[WalRecord, ...]:
         """Stage both halves of an update on every index of the table.
 
@@ -3484,7 +4229,7 @@ class IndexManager:
         key looks the same would leave the index pointing at a version the row no longer has.
         """
         records: list[WalRecord] = []
-        for index in self.indexes_for(table_id):
+        for index in self.indexes_for(table_id, table_name=table_name, table=table):
             definition = index.definition
             owes_old = definition.owes_entry(old_values)
             owes_new = definition.owes_entry(new_values)
@@ -3515,7 +4260,7 @@ class IndexManager:
         applied = 0
         touched: list[str] = []
         written_tables = _tables_written_by(txn)
-        observed_tables: set[int] = set(written_tables or ())
+        observed_tables: set[_TableIdentity] = set(written_tables or ())
         indexes = self.indexes()
         observations = {index.name: index.observed(txn) for index in indexes}
         staged_tables = {
@@ -3524,12 +4269,13 @@ class IndexManager:
         for index in indexes:
             observed = observations[index.name]
             moved = index.commit(txn, csn)
+            identity = (
+                index.definition.table_id,
+                index.definition.table_name,
+            )
             if observed:
-                observed_tables.add(index.definition.table_id)
-            elif (
-                written_tables is not None
-                and index.definition.table_id in written_tables
-            ) or (
+                observed_tables.add(identity)
+            elif (written_tables is not None and identity in written_tables) or (
                 written_tables is None and index.definition.table_id in staged_tables
             ):
                 # A row intent without even an empty observation is a short index, not an
@@ -3549,8 +4295,8 @@ class IndexManager:
             if moved:
                 applied += moved
                 touched.append(index.file)
-        for table_id in observed_tables:
-            self._record_table_watermark(table_id, csn)
+        for table_id, table_name in observed_tables:
+            self._record_table_watermark(table_id, csn, table_name=table_name)
         for file in touched:
             # A page applied into this process's pool is invisible to every other process until
             # it reaches the device, and the commit is about to publish a position that says the
@@ -3562,11 +4308,14 @@ class IndexManager:
         # generation differs and takes the zero-write rebase path before validation.
         for index in indexes:
             self._bind_local_heap_view(index)
+        self._schema_observed.pop(int(txn.txn_id), None)
         return applied
 
     def rollback(self, txn: StagingTransaction) -> int:
         """Drop what this transaction staged into every index, and return how many were dropped."""
-        return sum(index.rollback(txn) for index in self.indexes())
+        dropped = sum(index.rollback(txn) for index in self.indexes())
+        self._schema_observed.pop(int(txn.txn_id), None)
+        return dropped
 
     def apply(self, record: WalRecord) -> bool:
         """Redo one index record against the index it names, and say whether it was dispatched.
@@ -4010,16 +4759,7 @@ def _with_flags(header: IndexHeader, flags: int) -> IndexHeader:
     the stale bit on and off would otherwise each enumerate every other field -- and a field one
     of them forgot would be silently reset by the very operation that says nothing else changed.
     """
-    return IndexHeader(
-        visibility=header.visibility,
-        table_id=header.table_id,
-        bucket_count=header.bucket_count,
-        digest=header.digest,
-        built_through_lsn=header.built_through_lsn,
-        reconciled_through_lsn=header.reconciled_through_lsn,
-        format_version=header.format_version,
-        flags=flags,
-    )
+    return replace(header, flags=flags)
 
 
 def _page_of(failure: GrafxCorruptionDetected) -> PageIndex:

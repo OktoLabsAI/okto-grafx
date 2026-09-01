@@ -31,7 +31,6 @@ from okto_grafx.domain.errors import (
     GrafxError,
     GrafxRecoveryRefused,
     GrafxUnsupportedOperation,
-    GrafxWriteConflict,
 )
 from okto_grafx.domain.index import index_file
 from okto_grafx.domain.index.header import INDEX_HEADER_SLOT
@@ -663,7 +662,7 @@ def test_flush_cannot_race_a_post_barrier_recovery_latch(
 def test_an_already_open_participant_completes_a_foreign_gap_before_same_page_write() -> (
     None
 ):
-    """A later full-page image cannot permanently replace an unapplied durable commit."""
+    """A fresh materialization may share a page after it first completes the durable gap."""
     memory = MemoryStorageDevice(page_size=PAGE_SIZE)
     fault = _PersistentPageWriteFailure(memory)
     with _connect(fault, namespace=memory) as setup:
@@ -688,18 +687,18 @@ def test_an_already_open_participant_completes_a_foreign_gap_before_same_page_wr
         assert _published(memory) == state_before
 
         # This participant predates the foreign COMMIT and therefore begins from the old
-        # publication. Its first attempt must complete that COMMIT and then conflict on the heap
-        # page, instead of publishing a replacement image over the missing row.
+        # publication. Its commit first completes that durable gap and establishes the resulting
+        # read view. The two inserts have disjoint logical partitions, while the shared heap page
+        # is discovered only by materialising from that current durable image. The bounded second
+        # OCC may therefore use the refreshed baseline: success, not a false conflict, is the
+        # authorised outcome, and retaining both rows proves it did not overwrite the gap.
         stale = later_writer.begin("write")
         stale.execute("CREATE (:P {id: 8, name: 'after'})")
-        with pytest.raises(GrafxWriteConflict):
-            stale.commit()
-        stale.rollback()
-        assert _published(memory).last_committed_lsn == foreign_commit
+        report = stale.commit()
+        assert report.durable is True
+        assert _published(memory).last_committed_lsn > foreign_commit
         assert later_writer.execute(KEYED_READ, {"id": 7}).rows == (("before",),)
-
-        with later_writer.begin("write") as retry:
-            retry.execute("CREATE (:P {id: 8, name: 'after'})")
+        assert later_writer.execute(KEYED_READ, {"id": 8}).rows == (("after",),)
         later_writer.checkpoint()
         assert later_writer.execute(KEYED_READ, {"id": 7}).rows == (("before",),)
         assert later_writer.execute(KEYED_READ, {"id": 8}).rows == (("after",),)

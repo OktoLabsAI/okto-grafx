@@ -65,6 +65,7 @@ from okto_grafx.domain.ids import (
     RecordRef,
     is_provisional_csn,
 )
+from okto_grafx.domain.index.definition import index_definition_matches_table
 from okto_grafx.domain.index.keys import index_key
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
 from okto_grafx.domain.model.schema import TableDef
@@ -1106,15 +1107,26 @@ class Verifier:
             return []
         positions = getattr(definition, "positions", None)
         table_id = getattr(definition, "table_id", None)
-        if not positions or not isinstance(table_id, int):
+        table_name = getattr(definition, "table_name", None)
+        if (
+            not positions
+            or not isinstance(table_id, int)
+            or not isinstance(table_name, str)
+        ):
             return []
         try:
             catalog = self._catalog.read_from_pages()
             table = next(
-                (found for found in catalog.tables() if found.table_id == table_id),
+                (
+                    found
+                    for found in catalog.tables()
+                    if found.table_id == table_id and found.name == table_name
+                ),
                 None,
             )
             if table is None:
+                return []
+            if not index_definition_matches_table(definition, table):
                 return []
             versions = list(self._heap.scan_all(table))
         except GrafxError as failure:

@@ -1457,16 +1457,14 @@ class Database:
             # the caller sees, and revalidate its epoch beside the registry snapshot.
             while True:
                 catalog, epoch = self._catalog_snapshot()
-                table_ids = frozenset(
-                    table.table_id for table in catalog.catalog.table_definitions
-                )
+                tables = catalog.catalog.table_definitions
                 with self._transactions._participant_section():
                     if (
                         _builtin_int(self._catalog._view_epoch(), field="catalog.epoch")
                         != epoch
                     ):
                         continue
-                    return _indexes_view(indexes, table_ids)
+                    return _indexes_view(indexes, tables)
 
     @property
     def ledger(self) -> LedgerView:
@@ -1522,9 +1520,7 @@ class Database:
         # land in the small gap and produce spaces from one side with indexes from the other.
         while True:
             catalog, epoch = self._catalog_snapshot()
-            tables = frozenset(
-                table.table_id for table in catalog.catalog.table_definitions
-            )
+            tables = catalog.catalog.table_definitions
             spaces = catalog.catalog.space_definitions
             with self._transactions._participant_section():
                 if (
@@ -2634,9 +2630,9 @@ class Database:
 
         TransactionManager owns the terminal latch and reaches quiescence first. Schema unwind
         is a distinct QueryEngine responsibility, however: rollback can already have released
-        its reader pin when it starts removing speculative index files. Keeping every adopted
-        context until that second phase succeeds lets close wait for an in-flight unwind or do
-        the unwind itself, before the pool and storage closers run.
+        its reader pin when it starts settling speculative registry and vector-map claims.
+        Keeping every adopted context until that second phase succeeds lets close wait for an
+        in-flight unwind or do the unwind itself, before the pool and storage closers run.
         """
         failure: BaseException | None = None
         try:
@@ -2645,8 +2641,9 @@ class Database:
             failure = close_failure
 
         # A failed pre-enter means manager close has not proved quiescence. Touching QueryEngine
-        # journals (which can remove index files) would race the still-active winner just as
-        # surely as flushing the pool, so leave every journal tracked for the retrying close.
+        # journals (which inspect durable index identity and mutate process-local ownership)
+        # would race the still-active winner just as surely as flushing the pool, so leave every
+        # journal tracked for the retrying close.
         if self._transactions.close_complete and self._public_contexts:
             try:
                 with self._transactions._participant_section():
@@ -2676,9 +2673,9 @@ class Database:
         On a rollback this is what takes back the two side effects a DDL statement makes outside
         the transaction -- the indexes it registered and the vector engine's space map -- and
         drops the working catalog copy. It shares the participant section with close so storage
-        cannot be released between manager rollback and removal of speculative index files. The
-        context remains tracked if a foreign failure interrupts settlement, allowing close to
-        retry the cleanup instead of losing it.
+        cannot be released between manager rollback and the durable-identity proof that releases
+        process-local ownership. The context remains tracked if a foreign failure interrupts
+        settlement, allowing close to retry the cleanup instead of losing it.
         """
         # A wrapper can return from manager commit/rollback after a racing close has already
         # drained this exact context and released its resources. The absent-id fast path is what

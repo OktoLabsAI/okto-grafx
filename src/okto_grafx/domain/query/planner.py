@@ -36,7 +36,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 
 from okto_grafx.domain.errors import GrafxEmbeddingSpaceMismatch, GrafxPlanError
-from okto_grafx.domain.index.definition import IndexDefinition
+from okto_grafx.domain.index.definition import (
+    IndexDefinition,
+    index_definition_matches_table,
+)
 from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import VECTOR_DTYPES, ValueType, value_type_of
@@ -1204,7 +1207,7 @@ class _Planner:
             by_position[position] = name
         candidates: list[tuple[int, str, IndexDefinition, tuple[str, ...]]] = []
         for definition in self.indexes:
-            if definition.table_id != table.table_id:
+            if not index_definition_matches_table(definition, table):
                 continue
             if not all(position in by_position for position in definition.positions):
                 continue

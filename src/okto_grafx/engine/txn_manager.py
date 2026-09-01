@@ -69,6 +69,7 @@ from typing import Any
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxError,
+    GrafxIndexError,
     GrafxLeaseStolen,
     GrafxLeaseTimeout,
     GrafxRecoveryRefused,
@@ -861,6 +862,113 @@ class TransactionManager:
             # coincidence is not proof that the resident frames came from this participant.
             self._own_published_lsn = None
 
+    def _synchronize_committed_indexes(
+        self, txn: TransactionContext, published_lsn: Lsn
+    ) -> None:
+        """Adopt foreign DDL before a row commit can build its WAL batch.
+
+        CatalogStore refreshes its derived catalog when a foreign read view drops the catalog
+        frames, but the index registry is process-local.  A participant opened before that DDL
+        could therefore resolve and materialise the new table while staging no index record at
+        all.  With no registered object, IndexManager's missing-observation guard also had
+        nowhere to persist a stale verdict; a cold recovery could then certify the short file as
+        a complete replay.
+
+        This door runs only inside the existing cross-process COMMIT_SECTION, after the first
+        OCC pass has accepted the transaction's original snapshot and before provenance checks
+        or row materialisation.  It creates no index: production's callback is the existing-only
+        composition route.  The final inventory proof is deliberately pre-WAL and limited to
+        committed tables this transaction writes, so speculative indexes of another local DDL
+        transaction remain registered and a deliberately unindexed table keeps its scan fallback.
+        """
+
+        reduced_intents = reduce_row_intents(txn.row_intents)
+        if not reduced_intents:
+            # A pre-staged physical/catalog transaction has no heap/index effect to protect.
+            # In particular, do not interpret pages it deliberately staged before the first OCC
+            # pass has had the opportunity to reject a foreign winner at the original snapshot.
+            return
+
+        catalog = self._catalog
+        refresh = getattr(catalog, "refresh", None)
+        if callable(refresh):
+            refresh()
+
+        manager = self._index_manager
+        observe = getattr(manager, "observe_published_lsn", None)
+        if callable(observe):
+            observe(published_lsn)
+        if self._index_sync is not None:
+            self._index_sync()
+        if manager is None:
+            return
+
+        committed_catalog = getattr(catalog, "catalog", None)
+        tables_of = getattr(committed_catalog, "tables", None)
+        if not callable(tables_of):
+            return
+        written_table_identities = {
+            (
+                getattr(intent.table, "table_id", None),
+                getattr(intent.table, "name", None),
+            )
+            for intent in reduced_intents
+        }
+        written_tables = tuple(
+            table
+            for table in tables_of()
+            if (
+                getattr(table, "table_id", None),
+                getattr(table, "name", None),
+            )
+            in written_table_identities
+        )
+        missing_for = getattr(manager, "unregistered_persistent_indexes_for", None)
+        if not written_tables or not callable(missing_for):
+            return
+        missing = tuple(missing_for(written_tables))
+        if not missing:
+            return
+        raise GrafxTransactionStateError(
+            "A row commit reached a committed table whose persistent automatic index exists "
+            "but is still absent from this process's registry. The commit was refused before "
+            "WAL append so recovery can never certify an omitted index effect.",
+            field="index_registry",
+            indexes=list(missing),
+            table_ids=sorted(getattr(table, "table_id") for table in written_tables),
+            txn_id=txn.txn_id,
+        )
+
+    def _staged_artifact_conflict(
+        self, txn: TransactionContext
+    ) -> tuple[int, ...] | None:
+        """Translate displaced physical index ownership into ordinary pre-WAL OCC.
+
+        Only the two provenance refusals are retryable conflicts.  Digest, visibility, page or
+        structural failures retain their original terminal/corruption classification.
+        """
+        validate = getattr(self._index_manager, "validate_staged_artifacts", None)
+        if not callable(validate):
+            return None
+        row_tables: dict[tuple[object, object], object] = {}
+        for intent in reduce_row_intents(txn.row_intents):
+            table = intent.table
+            row_tables[(getattr(table, "table_id", None), getattr(table, "name", None))] = table
+        try:
+            validate(txn, row_tables=tuple(row_tables.values()))
+        except GrafxIndexError as failure:
+            if (
+                failure.retryable is not True
+                or failure.details.get("field")
+                not in {"index_registry", "artifact_nonce"}
+            ):
+                raise
+            file = failure.details.get("file")
+            if not isinstance(file, str) or not file:
+                raise
+            return (page_partition(file, HEADER_PAGE_INDEX),)
+        return None
+
     def recyclable_horizon(self) -> Lsn:
         """Return the LSN below which a WAL segment may be recycled (BR-10, CF-11).
 
@@ -937,6 +1045,43 @@ class TransactionManager:
                         own=published.last_committed_lsn == self._own_published_lsn,
                     )
                 yield
+
+    @contextmanager
+    def schema_artifact_section(
+        self, *, sync_if: Callable[[], bool] | None = None
+    ) -> Iterator[None]:
+        """Serialize DDL artifact attach/reclaim/unwind with every commit publisher.
+
+        The caller already owns this participant's section.  This adds only the same
+        cross-process ``COMMIT_SECTION`` used by commit; it is never entered by begin or an
+        ordinary read.  Keeping creation, orphan displacement and rollback release in this
+        authority closes the namespace race without holding a lock across user transaction time.
+        """
+        with (
+            self._coordinator_section(
+                COMMIT_SECTION, timeout=self._commit_lock_timeout
+            ),
+            self._hold_wal_tail(),
+        ):
+            durable = self._complete_committed_gap()
+            self._establish_read_view(
+                durable,
+                own=durable.last_committed_lsn == self._own_published_lsn,
+            )
+            refresh = getattr(self._catalog, "refresh", None)
+            if callable(refresh):
+                refresh()
+            observe = getattr(self._index_manager, "observe_published_lsn", None)
+            if callable(observe):
+                observe(durable.last_committed_lsn)
+            if (
+                self._index_sync is not None
+                and sync_if is not None
+                and sync_if()
+            ):
+                with self._close_wait_hazard():
+                    self._index_sync()
+            yield
 
     def _require_recovery_complete(self) -> None:
         """Refuse work that could publish over a durable commit missing from the pages."""
@@ -2023,10 +2168,24 @@ class TransactionManager:
                         txn.read_partitions | txn.write_partitions
                     )
                     pre_staged_pages = frozenset(txn.staged_pages())
-                    with self._close_wait_hazard():
-                        conflict = self._find_conflict(
-                            txn, interested_partitions=snapshot_interest
-                        )  # step 3.3
+                    if conflict is None:
+                        with self._close_wait_hazard():
+                            conflict = self._find_conflict(
+                                txn, interested_partitions=snapshot_interest
+                            )  # step 3.3
+                    if conflict is None:
+                        # A stale logical snapshot must lose at the first OCC gate before any
+                        # catalog/index synchronization can touch the pool or invoke host
+                        # observability. A surviving row writer still adopts every committed
+                        # persistent artifact here, before provenance validation,
+                        # materialisation or a WAL byte.
+                        with self._close_wait_hazard():
+                            self._synchronize_committed_indexes(txn, current)
+                    if conflict is None:
+                        # Physical ownership is a second, pre-materialisation gate.  The first
+                        # logical OCC above remains integral and decides every stale snapshot
+                        # before nonce/registry provenance is consulted.
+                        conflict = self._staged_artifact_conflict(txn)
                     if conflict is None:
                         identities, pending_identity_ranges = (
                             self._prepare_identity_plan(txn)
@@ -2912,10 +3071,23 @@ class TransactionManager:
             table_id = getattr(row.table, "table_id", None)
             if table_id is None:
                 continue
+            table_name = getattr(row.table, "name", None)
+            if not isinstance(table_name, str):
+                table_name = None
             if row.ended is not None:
-                total += manager.row_entry_count(table_id, row.ended_values)
+                total += manager.row_entry_count(
+                    table_id,
+                    row.ended_values,
+                    table_name=table_name,
+                    table=row.table,
+                )
             if row.born is not None:
-                total += manager.row_entry_count(table_id, row.born_values)
+                total += manager.row_entry_count(
+                    table_id,
+                    row.born_values,
+                    table_name=table_name,
+                    table=row.table,
+                )
         return total
 
     def _stage_index_changes(
@@ -2944,12 +3116,29 @@ class TransactionManager:
             table_id = getattr(row.table, "table_id", None)
             if table_id is None:
                 continue
+            table_name = getattr(row.table, "name", None)
+            if not isinstance(table_name, str):
+                table_name = None
             if row.ended is not None:
                 manager.stage_row_delete(
-                    txn, table_id, row.ended, row.ended_values, csn
+                    txn,
+                    table_id,
+                    row.ended,
+                    row.ended_values,
+                    csn,
+                    table_name=table_name,
+                    table=row.table,
                 )
             if row.born is not None:
-                manager.stage_row_insert(txn, table_id, row.born, row.born_values, csn)
+                manager.stage_row_insert(
+                    txn,
+                    table_id,
+                    row.born,
+                    row.born_values,
+                    csn,
+                    table_name=table_name,
+                    table=row.table,
+                )
         produced = len(txn.pending_records) - before
         if produced != expected:
             raise GrafxTransactionStateError(
@@ -2993,11 +3182,17 @@ class TransactionManager:
         manager = self._index_manager
         if manager is None:
             return False
-        tables = {getattr(row.table, "table_id", None) for row in rows}
-        for table_id in tables:
-            if table_id is None:
+        tables = {
+            (
+                getattr(row.table, "table_id", None),
+                getattr(row.table, "name", None),
+            )
+            for row in rows
+        }
+        for table_id, table_name in tables:
+            if table_id is None or not isinstance(table_name, str):
                 continue
-            for index in manager.indexes_for(table_id):
+            for index in manager.indexes_for(table_id, table_name=table_name):
                 try:
                     index.mark_stale(
                         f"commit {committed} was durable but could not be applied to this index "
@@ -3121,11 +3316,11 @@ class TransactionManager:
         provisional: Csn,
         written: list[_RowWrite],
         identities: _IdentityPlan,
-    ) -> frozenset[int]:
-        """Write settled intents and return the exact table ids that materialized rows."""
-        effective_row_tables: set[int] = set()
+    ) -> frozenset[tuple[int, str]]:
+        """Write settled intents and return complete identities of materialized tables."""
+        effective_row_tables: set[tuple[int, str]] = set()
         for position, intent in enumerate(self._resolved_intents(txn, identities)):
-            effective_row_tables.add(intent.table.table_id)
+            effective_row_tables.add((intent.table.table_id, intent.table.name))
             if intent.operation is RowOperation.DELETE:
                 ending = self._values_at(intent.reference)
                 heap.delete(intent.table, intent.reference, provisional)

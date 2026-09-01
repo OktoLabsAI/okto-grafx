@@ -16,7 +16,7 @@ single entry:
 Layout, little-endian::
 
     format_version u16 | visibility u8 | flags u8 | table_id u32 | bucket_count u32 |
-    built_through_lsn u64 | reconciled_through_lsn u64 | digest 16B
+    built_through_lsn u64 | reconciled_through_lsn u64 | digest 16B | artifact_nonce u64
 """
 
 from __future__ import annotations
@@ -43,10 +43,11 @@ __all__ = [
 INDEX_HEADER_SLOT: int = 1
 """Slot 1 of the reserved header page. Slot 0 belongs to the file header C1 writes."""
 
-INDEX_HEADER_FORMAT_VERSION: int = 1
-"""The version this build writes. Every earlier version stays readable."""
+INDEX_HEADER_FORMAT_VERSION: int = 2
+"""The version this build writes. Version 1 remains readable with nonce zero."""
 
-_HEADER_STRUCT: struct.Struct = struct.Struct("<HBBIIQQ16s")
+_HEADER_V1_STRUCT: struct.Struct = struct.Struct("<HBBIIQQ16s")
+_HEADER_STRUCT: struct.Struct = struct.Struct("<HBBIIQQ16sQ")
 
 INDEX_HEADER_SIZE: int = _HEADER_STRUCT.size
 """Bytes of the encoded index header record."""
@@ -79,6 +80,7 @@ class IndexHeader:
     digest: bytes
     built_through_lsn: Lsn = NO_LSN
     reconciled_through_lsn: Lsn = NO_LSN
+    artifact_nonce: int = 0
     format_version: int = INDEX_HEADER_FORMAT_VERSION
     flags: int = 0
 
@@ -112,6 +114,7 @@ class IndexHeader:
             ("bucket_count", self.bucket_count, _MAX_U32),
             ("built_through_lsn", self.built_through_lsn, _MAX_U64),
             ("reconciled_through_lsn", self.reconciled_through_lsn, _MAX_U64),
+            ("artifact_nonce", self.artifact_nonce, _MAX_U64),
         ):
             if (
                 isinstance(value, bool)
@@ -175,6 +178,24 @@ class IndexHeader:
 
     def encode(self) -> bytes:
         """Return the encoded index header record."""
+        if self.format_version < 2:
+            if self.artifact_nonce != 0:
+                raise GrafxIndexError(
+                    "Index header format 1 cannot encode an artifact nonce.",
+                    field="artifact_nonce",
+                    value=self.artifact_nonce,
+                    format_version=self.format_version,
+                )
+            return _HEADER_V1_STRUCT.pack(
+                self.format_version,
+                _VISIBILITY_CODES[self.visibility],
+                self.flags,
+                self.table_id,
+                self.bucket_count,
+                self.built_through_lsn,
+                self.reconciled_through_lsn,
+                self.digest,
+            )
         return _HEADER_STRUCT.pack(
             self.format_version,
             _VISIBILITY_CODES[self.visibility],
@@ -184,6 +205,7 @@ class IndexHeader:
             self.built_through_lsn,
             self.reconciled_through_lsn,
             self.digest,
+            self.artifact_nonce,
         )
 
     @classmethod
@@ -196,22 +218,14 @@ class IndexHeader:
                 value=type(raw).__name__,
             )
         image = bytes(raw)
-        if len(image) < INDEX_HEADER_SIZE:
+        if len(image) < _HEADER_V1_STRUCT.size:
             raise GrafxCorruptionDetected(
-                f"An index header needs {INDEX_HEADER_SIZE} bytes; got {len(image)}.",
+                f"An index header needs at least {_HEADER_V1_STRUCT.size} bytes; got "
+                f"{len(image)}.",
                 field="index_header",
                 value=len(image),
             )
-        (
-            format_version,
-            visibility,
-            flags,
-            table_id,
-            bucket_count,
-            built_through_lsn,
-            reconciled_through_lsn,
-            digest,
-        ) = _HEADER_STRUCT.unpack_from(image, 0)
+        format_version = struct.unpack_from("<H", image, 0)[0]
         if format_version > INDEX_HEADER_FORMAT_VERSION:
             raise GrafxSchemaVersionMismatch(
                 f"This build reads index format {INDEX_HEADER_FORMAT_VERSION} and below; the "
@@ -219,6 +233,37 @@ class IndexHeader:
                 field="format_version",
                 value=format_version,
             )
+        if format_version >= 2:
+            if len(image) < INDEX_HEADER_SIZE:
+                raise GrafxCorruptionDetected(
+                    f"An index header at format {format_version} needs {INDEX_HEADER_SIZE} "
+                    f"bytes; got {len(image)}.",
+                    field="index_header",
+                    value=len(image),
+                )
+            (
+                format_version,
+                visibility,
+                flags,
+                table_id,
+                bucket_count,
+                built_through_lsn,
+                reconciled_through_lsn,
+                digest,
+                artifact_nonce,
+            ) = _HEADER_STRUCT.unpack_from(image, 0)
+        else:
+            (
+                format_version,
+                visibility,
+                flags,
+                table_id,
+                bucket_count,
+                built_through_lsn,
+                reconciled_through_lsn,
+                digest,
+            ) = _HEADER_V1_STRUCT.unpack_from(image, 0)
+            artifact_nonce = 0
         known = _VISIBILITY_BY_CODE.get(visibility)
         if known is None:
             raise GrafxCorruptionDetected(
@@ -248,6 +293,7 @@ class IndexHeader:
             digest=digest,
             built_through_lsn=built_through_lsn,
             reconciled_through_lsn=reconciled_through_lsn,
+            artifact_nonce=artifact_nonce,
             format_version=format_version,
             flags=flags,
         )

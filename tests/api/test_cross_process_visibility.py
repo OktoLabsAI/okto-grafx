@@ -14,7 +14,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from okto_grafx import connect
+from okto_grafx.domain.errors import GrafxTransactionStateError
+from okto_grafx.domain.index import IndexOperation, change_of
+from okto_grafx.domain.wal.record import WalRecordType
 
 _CHILD = r'''
 import sys
@@ -139,3 +144,212 @@ def test_verify_on_a_long_lived_handle_walks_the_latest_foreign_commit(
     assert live.findings == ()
     assert live.records_checked == cold.records_checked
     assert live.index_entries_checked == cold.index_entries_checked
+
+
+def test_a_writer_opened_before_foreign_ddl_adopts_its_index_before_commit(
+    tmp_path: Path,
+) -> None:
+    """A foreign table cannot receive a heap-only commit from an old participant.
+
+    The first handle opens an empty database, so its process-local index registry is empty.
+    Another handle then publishes both a keyed table and its first row.  The old handle must
+    adopt that durable index inside the commit section before materialising its own update and
+    insert; otherwise its WAL contains heap pages but no index effects and a cold recovery can
+    falsely certify the resulting short index as fresh.
+    """
+    root = tmp_path / "foreign-ddl-index"
+    options = {"page_size": 512, "checkpoint_interval_records": 1_000_000}
+    old = connect(root, **options)
+    publisher = connect(root, **options)
+    fresh = None
+    try:
+        assert old.indexes.indexes() == ()
+        with publisher.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))")
+            txn.execute("CREATE (:P {id: 1, name: 'before'})")
+
+        before = publisher.transactions.published_lsn()
+        with old.begin("write") as txn:
+            txn.execute("MATCH (p:P) WHERE p.id = 1 SET p.name = 'after'")
+            txn.execute("CREATE (:P {id: 2, name: 'inserted'})")
+
+        index_records = tuple(
+            record
+            for record in old._wal.read_from(before + 1)
+            if record.record_type == int(WalRecordType.INDEX_WRITE)
+        )
+        changes = tuple(change_of(record) for record in index_records)
+        assert [change.index for change in changes] == ["pk_P", "pk_P", "pk_P"]
+        assert sorted(change.operation for change in changes) == [
+            IndexOperation.INSERT,
+            IndexOperation.INSERT,
+            IndexOperation.TOMBSTONE,
+        ]
+        assert not old.indexes.index("pk_P").stale
+
+        expected = [(1, "after"), (2, "inserted")]
+        assert sorted(old.execute("MATCH (p:P) RETURN p.id, p.name").rows) == expected
+        assert old.execute("MATCH (p:P) WHERE p.id = 1 RETURN p.id, p.name").rows == (
+            (1, "after"),
+        )
+        assert old.execute("MATCH (p:P) WHERE p.id = 2 RETURN p.id, p.name").rows == (
+            (2, "inserted"),
+        )
+        assert old.verify("all").clean is True
+        assert old.verify("all").findings == ()
+
+        # Open while both participants remain live and before either performs a close-time
+        # checkpoint.  This exercises recovery from the retained WAL, including INDEX_WRITE.
+        fresh = connect(root, **options)
+        assert fresh.stale_indexes == ()
+        assert sorted(fresh.execute("MATCH (p:P) RETURN p.id, p.name").rows) == expected
+        assert fresh.execute("MATCH (p:P) WHERE p.id = 1 RETURN p.id, p.name").rows == (
+            (1, "after"),
+        )
+        assert fresh.execute("MATCH (p:P) WHERE p.id = 2 RETURN p.id, p.name").rows == (
+            (2, "inserted"),
+        )
+        assert fresh.verify("all").clean is True
+        assert fresh.verify("all").findings == ()
+    finally:
+        if fresh is not None:
+            fresh.close()
+        publisher.close()
+        old.close()
+
+    with connect(root, **options) as cold:
+        assert cold.stale_indexes == ()
+        assert sorted(cold.execute("MATCH (p:P) RETURN p.id, p.name").rows) == [
+            (1, "after"),
+            (2, "inserted"),
+        ]
+        assert cold.execute("MATCH (p:P) WHERE p.id = 1 RETURN p.id, p.name").rows == (
+            (1, "after"),
+        )
+        assert cold.execute("MATCH (p:P) WHERE p.id = 2 RETURN p.id, p.name").rows == (
+            (2, "inserted"),
+        )
+        assert cold.verify("all").clean is True
+        assert cold.verify("all").findings == ()
+
+
+def test_a_foreign_persistent_index_missing_after_sync_refuses_before_wal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final inventory proof fails closed if dynamic registration does not happen."""
+    root = tmp_path / "foreign-ddl-index-invariant"
+    options = {"page_size": 512, "checkpoint_interval_records": 1_000_000}
+    old = connect(root, **options)
+    publisher = connect(root, **options)
+    pending = None
+    try:
+        with publisher.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))")
+            txn.execute("CREATE (:P {id: 1, name: 'before'})")
+
+        pending = old.begin("write")
+        pending.execute("MATCH (p:P) WHERE p.id = 1 SET p.name = 'never-published'")
+        before_published = old.transactions.published_lsn()
+        before_wal = old._wal.last_lsn
+        monkeypatch.setattr(old._transactions, "_index_sync", lambda: ())
+
+        with pytest.raises(GrafxTransactionStateError) as refused:
+            pending.commit()
+        assert refused.value.details["field"] == "index_registry"
+        assert refused.value.details["indexes"] == ["pk_P"]
+        assert old.transactions.published_lsn() == before_published
+        assert old._wal.last_lsn == before_wal
+        assert old.execute("MATCH (p:P) RETURN p.id, p.name").rows == ((1, "before"),)
+    finally:
+        if pending is not None and pending.active:
+            pending.rollback()
+        publisher.close()
+        old.close()
+
+
+def test_a_speculative_index_with_a_reused_table_id_never_indexes_foreign_rows(
+    tmp_path: Path,
+) -> None:
+    """A local DDL loser and a foreign winner may allocate the same numeric table id.
+
+    Index ownership is the complete catalog identity, not its reusable integer alone.  The
+    speculative ``pk_Q`` must therefore remain available to its declaring transaction without
+    receiving either observations or WAL effects for the durable foreign table ``P``.
+    """
+    root = tmp_path / "foreign-ddl-speculative-index"
+    options = {"page_size": 512, "checkpoint_interval_records": 1_000_000}
+    old = connect(root, **options)
+    publisher = None
+    fresh = None
+    local_ddl = old.begin("write")
+    try:
+        local_ddl.execute("CREATE NODE TABLE Q(id INT64, PRIMARY KEY(id))")
+        assert old._indexes.index("pk_Q").definition.table_id == 1
+
+        publisher = connect(root, **options)
+        with publisher.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")
+            txn.execute("CREATE (:P {id: 1})")
+        assert publisher.catalog.catalog.table("P").table_id == 1
+
+        # A read happens before any old-handle commit has synchronized the foreign index.  Its
+        # registry still contains only speculative pk_Q, which must be withheld from both the
+        # planner and the public committed inventory even though Q and P reuse table id 1.
+        assert tuple(index.name for index in old._indexes.indexes()) == ("pk_Q",)
+        assert old.indexes.indexes() == ()
+        assert old.execute("MATCH (p:P) WHERE p.id = 1 RETURN p.id").rows == ((1,),)
+        assert tuple(index.name for index in old._indexes.indexes()) == ("pk_Q",)
+        coexistence = old.verify("all")
+        assert coexistence.clean is True
+        assert coexistence.findings == ()
+        assert tuple(index.name for index in old._indexes.indexes()) == ("pk_Q",)
+
+        before = publisher.transactions.published_lsn()
+        with old.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 2})")
+
+        changes = tuple(
+            change_of(record)
+            for record in old._wal.read_from(before + 1)
+            if record.record_type == int(WalRecordType.INDEX_WRITE)
+        )
+        assert [change.index for change in changes] == ["pk_P"]
+
+        local_ddl.rollback()
+        assert tuple(index.name for index in old.indexes.indexes()) == ("pk_P",)
+        assert sorted(old.execute("MATCH (p:P) RETURN p.id").rows) == [(1,), (2,)]
+        assert old.execute("MATCH (p:P) WHERE p.id = 1 RETURN p.id").rows == ((1,),)
+        assert old.execute("MATCH (p:P) WHERE p.id = 2 RETURN p.id").rows == ((2,),)
+        live = old.verify("all")
+        assert live.clean is True
+        assert live.findings == ()
+
+        fresh = connect(root, **options)
+        assert fresh.attached_indexes == ("pk_P",)
+        assert fresh.stale_indexes == ()
+        assert sorted(fresh.execute("MATCH (p:P) RETURN p.id").rows) == [(1,), (2,)]
+        assert fresh.execute("MATCH (p:P) WHERE p.id = 1 RETURN p.id").rows == (
+            (1,),
+        )
+        assert fresh.execute("MATCH (p:P) WHERE p.id = 2 RETURN p.id").rows == (
+            (2,),
+        )
+        assert fresh.verify("all").clean is True
+        assert fresh.verify("all").findings == ()
+    finally:
+        if local_ddl.active:
+            local_ddl.rollback()
+        if fresh is not None:
+            fresh.close()
+        if publisher is not None:
+            publisher.close()
+        old.close()
+
+    with connect(root, **options) as cold:
+        assert cold.attached_indexes == ("pk_P",)
+        assert cold.stale_indexes == ()
+        assert sorted(cold.execute("MATCH (p:P) RETURN p.id").rows) == [(1,), (2,)]
+        assert cold.execute("MATCH (p:P) WHERE p.id = 1 RETURN p.id").rows == ((1,),)
+        assert cold.execute("MATCH (p:P) WHERE p.id = 2 RETURN p.id").rows == ((2,),)
+        assert cold.verify("all").clean is True
+        assert cold.verify("all").findings == ()

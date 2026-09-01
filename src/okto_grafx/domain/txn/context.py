@@ -308,10 +308,12 @@ class TransactionContext:
         # cannot distinguish another handle's first insert from this handle's first insert.
         self._pending_row_refs: dict[int, PendingRowRef] = {}
         # Filled only by the heap writer, from the reduced intents it actually materialized.
-        # Index maintenance consumes this private certificate so it need not reduce the public
-        # intent history again after the WAL barrier. ``None`` means no writer certificate exists;
-        # an empty frozenset is the proved result of a fully cancelled row batch.
-        self._effective_row_tables: frozenset[int] | None = None
+        # The pair is the complete catalog identity: concurrent schema transactions can reuse
+        # one numeric id for differently named tables. Index maintenance consumes this private
+        # certificate so it need not reduce the public intent history again after the WAL
+        # barrier. ``None`` means no writer certificate exists; an empty frozenset is the proved
+        # result of a fully cancelled row batch.
+        self._effective_row_tables: frozenset[tuple[int, str]] | None = None
         self.row_intents: list[RowIntent] = []
         self.row_refs: list[object] = []
 

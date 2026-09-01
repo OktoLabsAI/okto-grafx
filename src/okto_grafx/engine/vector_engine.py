@@ -78,7 +78,10 @@ from okto_grafx.domain.errors import (
     GrafxVectorValidationError,
 )
 from okto_grafx.domain.ids import NO_LSN, Csn, Lsn, RecordId, RecordRef
-from okto_grafx.domain.index.definition import IndexDefinition
+from okto_grafx.domain.index.definition import (
+    IndexDefinition,
+    index_definition_matches_table,
+)
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.records import IndexChange, IndexOperation
 from okto_grafx.domain.index.visibility import (
@@ -498,6 +501,7 @@ class VectorHnswIndex(ProximityIndex):
         "_dimension",
         "_metric",
         "_storage_dtype",
+        "_normalized",
         "_math",
         "_resolve",
         "_seed",
@@ -523,6 +527,7 @@ class VectorHnswIndex(ProximityIndex):
         dimension: int,
         metric_of_space: DistanceMetric,
         storage_dtype: str,
+        normalized: bool,
         math: VectorMath,
         resolve: VectorResolver,
         seed: int = DEFAULT_INDEX_SEED,
@@ -544,6 +549,7 @@ class VectorHnswIndex(ProximityIndex):
         self._dimension = dimension
         self._metric = metric_of_space
         self._storage_dtype = storage_dtype
+        self._normalized = normalized
         self._math = math
         self._resolve = resolve
         self._seed = seed
@@ -591,6 +597,11 @@ class VectorHnswIndex(ProximityIndex):
     def storage_dtype(self) -> str:
         """Return the dtype the components of this index are stored in."""
         return self._storage_dtype
+
+    @property
+    def normalized(self) -> bool:
+        """Return whether the owning space requires unit-length stored vectors."""
+        return self._normalized
 
     @property
     def ef_search(self) -> int:
@@ -1155,6 +1166,10 @@ class VectorEngine:
         "_ef_construction",
         "_ef_search",
         "_by_space",
+        "_map_claims",
+        "_map_epochs",
+        "_next_map_epoch",
+        "_durable_by_space",
         "_maintained_at",
         "_guard",
     )
@@ -1213,6 +1228,10 @@ class VectorEngine:
         self._ef_construction = ef_construction
         self._ef_search = search_width
         self._by_space: dict[str, VectorHnswIndex] = {}
+        self._map_claims: dict[str, dict[VectorHnswIndex, set[object]]] = {}
+        self._map_epochs: dict[str, int] = {}
+        self._next_map_epoch = 0
+        self._durable_by_space: dict[str, VectorHnswIndex] = {}
         self._maintained_at: dict[str, float] = {}
         self._guard = guard
 
@@ -1289,6 +1308,97 @@ class VectorEngine:
         ``proved_present`` transports the composition root's exact index-directory listing to
         the shared registry; it does not bypass any header or freshness validation.
         """
+        index, _artifact, _previous = self._attach(
+            table,
+            space_name,
+            catalog,
+            existing_only=existing_only,
+            persist_stale=persist_stale,
+            proved_present=proved_present,
+            speculative=False,
+        )
+        return index
+
+    def _attach_speculative(
+        self,
+        table: TableDef,
+        space_name: str,
+        catalog: object,
+    ) -> tuple[
+        VectorHnswIndex,
+        object | None,
+        VectorHnswIndex | None,
+        object,
+    ]:
+        """Attach DDL state and return exact registry/map provenance for its journal."""
+        index, artifact, previous = self._attach(
+            table,
+            space_name,
+            catalog,
+            speculative=True,
+        )
+        owner = object()
+        previous_maintained = self._maintained_at.get(space_name)
+        had_previous_maintained = space_name in self._maintained_at
+        previous_epoch = self._map_epochs.get(space_name)
+        installed_epoch: int | None = None
+        try:
+            claims = self._map_claims.setdefault(space_name, {})
+            claims.setdefault(index, set()).add(owner)
+            self._by_space[space_name] = index
+            installed_epoch = self._advance_map_epoch(space_name)
+            self._maintained_at[space_name] = self._clock.monotonic()
+            self._publish_space_metrics()
+        except BaseException as failure:
+            # QueryEngine cannot journal an attach whose call never returned. Compensate every
+            # exact process-local effect here, while the caller still owns the schema artifact
+            # section, and preserve a re-entrant replacement if a host callback installed one.
+            self._release_map_claim(space_name, index, owner)
+            if (
+                installed_epoch is not None
+                and self._by_space.get(space_name) is index
+                and self._map_epochs.get(space_name) == installed_epoch
+            ):
+                if previous is None:
+                    self._by_space.pop(space_name, None)
+                else:
+                    self._by_space[space_name] = previous
+                if previous_epoch is None:
+                    self._map_epochs.pop(space_name, None)
+                else:
+                    self._map_epochs[space_name] = previous_epoch
+                if had_previous_maintained:
+                    assert previous_maintained is not None
+                    self._maintained_at[space_name] = previous_maintained
+                else:
+                    self._maintained_at.pop(space_name, None)
+            settle = getattr(self._require_registry(), "settle_speculative", None)
+            if artifact is not None and callable(settle):
+                try:
+                    settle(artifact, committed=False)
+                except BaseException as cleanup_failure:
+                    try:
+                        failure.add_note(
+                            "Releasing the failed speculative vector registry claim also "
+                            f"failed: {cleanup_failure!r}"
+                        )
+                    except BaseException:
+                        pass
+            raise
+        return index, artifact, previous, owner
+
+    def _attach(
+        self,
+        table: TableDef,
+        space_name: str,
+        catalog: object = None,
+        *,
+        existing_only: bool = False,
+        persist_stale: bool = True,
+        proved_present: bool = False,
+        speculative: bool,
+    ) -> tuple[VectorHnswIndex, object | None, VectorHnswIndex | None]:
+        """Implement normal adoption and tokenised speculative attachment once."""
         source = catalog if catalog is not None else self._catalog.catalog
         space = source.space(space_name)
         position = self._vector_column_of(table, space)
@@ -1308,6 +1418,7 @@ class VectorEngine:
             dimension=space.dimension,
             metric_of_space=space.metric,
             storage_dtype=space.storage_dtype,
+            normalized=space.normalized,
             math=self._math,
             resolve=self._resolver_for(space),
             seed=self._seed,
@@ -1317,23 +1428,191 @@ class VectorEngine:
             guard=self._guard,
             refresh=self._refresh_heap_view,
         )
-        registry.register(
-            index,
-            complete_through=(
-                registry.published_lsn
-                if catalog is not None and not existing_only
-                else None
-            ),
-            existing_only=existing_only,
-            persist_stale=persist_stale,
-            proved_present=proved_present,
+        complete_through = (
+            registry.published_lsn
+            if catalog is not None and not existing_only
+            else None
         )
+        artifact: object | None = None
+        if speculative:
+            index, artifact = registry.register_speculative(
+                index,
+                complete_through=complete_through,
+                equivalent=lambda existing: (
+                    isinstance(existing, VectorHnswIndex)
+                    and self._same_vector_identity(existing, index)
+                ),
+            )
+        else:
+            if existing_only:
+                try:
+                    existing = registry.index(index.name)
+                except GrafxIndexError as failure:
+                    if failure.details.get("field") != "name":
+                        raise
+                    existing = None
+                same_semantics = isinstance(
+                    existing, VectorHnswIndex
+                ) and self._same_vector_identity(existing, index)
+                index = registry.adopt_committed(
+                    index,
+                    persist_stale=persist_stale,
+                    proved_present=proved_present,
+                    replace_equivalent=existing is not None and not same_semantics,
+                )
+            else:
+                existing = registry.equivalent_registered(index)
+                if existing is not None:
+                    if not isinstance(
+                        existing, VectorHnswIndex
+                    ) or not self._same_vector_identity(existing, index):
+                        raise GrafxIndexError(
+                            f"Vector index {index.name!r} is registered for a different space "
+                            "definition.",
+                            field="definition",
+                            index=index.name,
+                        )
+                    index = existing
+                else:
+                    index = registry.register(
+                        index,
+                        complete_through=complete_through,
+                        existing_only=False,
+                        persist_stale=persist_stale,
+                        proved_present=proved_present,
+                    )
+        previous = self._by_space.get(space.name)
+        if speculative:
+            # The journal owner does not exist until _attach_speculative regains control. Do not
+            # expose the map or invoke a fallible clock/metrics callback before that method can
+            # compensate a call that never returns to QueryEngine.
+            return index, artifact, previous
         self._by_space[space.name] = index
+        self._advance_map_epoch(space.name)
+        self._durable_by_space[space.name] = index
         self._maintained_at[space.name] = self._clock.monotonic()
         self._publish_space_metrics()
-        return index
+        return index, artifact, previous
 
-    def detach(self, space_name: str) -> bool:
+    def _advance_map_epoch(self, space_name: str) -> int:
+        """Publish a non-repeating identity for one process-local map replacement."""
+        self._next_map_epoch += 1
+        epoch = self._next_map_epoch
+        self._map_epochs[space_name] = epoch
+        return epoch
+
+    def _release_map_claim(
+        self, space_name: str, index: VectorHnswIndex, owner: object
+    ) -> bool:
+        """Release one exact map owner and prune even a partially-created empty claim path."""
+        by_index = self._map_claims.get(space_name)
+        owners = None if by_index is None else by_index.get(index)
+        held = owners is not None and owner in owners
+        if held:
+            owners.remove(owner)
+        if owners is not None and not owners:
+            by_index.pop(index, None)
+        if by_index is not None and not by_index:
+            self._map_claims.pop(space_name, None)
+        return held
+
+    def _settle_attachment(
+        self,
+        space_name: str,
+        *,
+        expected: object,
+        owner: object,
+        previous: object | None,
+        committed: bool,
+    ) -> bool:
+        """Release one exact speculative map claim without removing an adopter's mapping."""
+        if not isinstance(expected, VectorHnswIndex):
+            return False
+        if not self._release_map_claim(space_name, expected, owner):
+            return False
+
+        current = self._by_space.get(space_name)
+        if committed:
+            if current is expected:
+                self._durable_by_space[space_name] = expected
+            return True
+        if current is not expected:
+            return True
+        if self._durable_by_space.get(space_name) is expected:
+            return True
+        remaining = self._map_claims.get(space_name, {}).get(expected)
+        if remaining:
+            return True
+        if self._matches_committed_mapping(expected, space_name):
+            # A process with another registry can publish the exact catalog definition while
+            # this process still holds the speculative object that originally installed the
+            # shared canonical file.  The freshly refreshed catalog, rather than local object
+            # ownership, is the authority that turns that identical mapping durable.
+            self._durable_by_space[space_name] = expected
+            return True
+
+        replacement = previous if isinstance(previous, VectorHnswIndex) else None
+        if replacement is expected:
+            # An idempotent adopter observed the same object as both old and new mapping.  Once
+            # its last claim is released that self-reference is not a predecessor to restore.
+            replacement = None
+        if replacement is not None:
+            try:
+                if self._require_registry().index(replacement.name) is not replacement:
+                    replacement = None
+            except GrafxError:
+                replacement = None
+        if replacement is None:
+            self._by_space.pop(space_name, None)
+            self._map_epochs.pop(space_name, None)
+            self._maintained_at.pop(space_name, None)
+        else:
+            self._by_space[space_name] = replacement
+            self._advance_map_epoch(space_name)
+            self._maintained_at[space_name] = self._clock.monotonic()
+        self._publish_space_metrics()
+        return True
+
+    @staticmethod
+    def _same_vector_identity(left: VectorHnswIndex, right: VectorHnswIndex) -> bool:
+        """Compare every space/runtime field an IndexDefinition does not carry."""
+        return (
+            left.definition == right.definition
+            and left.space_id == right.space_id
+            and left.space_name == right.space_name
+            and left.dimension == right.dimension
+            and left.metric_of_space == right.metric_of_space
+            and left.storage_dtype == right.storage_dtype
+            and left.normalized == right.normalized
+            and left.ef_search == right.ef_search
+            and left._seed == right._seed
+            and left._neighbours == right._neighbours
+            and left._ef_construction == right._ef_construction
+        )
+
+    def _matches_committed_mapping(
+        self, index: VectorHnswIndex, space_name: str
+    ) -> bool:
+        """Return whether one local wrapper exactly describes the current durable catalog."""
+        try:
+            space = self._catalog.catalog.space(space_name)
+            table = self._catalog.catalog.table_by_id(index.definition.table_id)
+        except GrafxError:
+            return False
+        return (
+            table.name == index.definition.table_name
+            and index_definition_matches_table(index.definition, table)
+            and index.space_id == space.space_id
+            and index.space_name == space.name
+            and index.dimension == space.dimension
+            and index.metric_of_space == space.metric
+            and index.storage_dtype == space.storage_dtype
+            and index.normalized == space.normalized
+        )
+
+    def detach(
+        self, space_name: str, *, expected: VectorHnswIndex | None = None
+    ) -> bool:
         """Forget this engine's per-space state for ONE space, and say whether any was held.
 
         The caller is the undo of a refused schema STATEMENT: ``attach`` ran for a space the
@@ -1343,7 +1622,14 @@ class VectorEngine:
         transaction, whose spaces are not in this one's base picture either. Registry entries
         are the index manager's and are unwound there by name. Never raises.
         """
-        held = self._by_space.pop(space_name, None) is not None
+        current = self._by_space.get(space_name)
+        if current is None or (expected is not None and current is not expected):
+            return False
+        held = self._by_space.pop(space_name, None) is current
+        if held and self._durable_by_space.get(space_name) is current:
+            self._durable_by_space.pop(space_name, None)
+        if held:
+            self._map_epochs.pop(space_name, None)
         self._maintained_at.pop(space_name, None)
         return held
 
@@ -1364,6 +1650,8 @@ class VectorEngine:
         dropped = tuple(name for name in self._by_space if name not in alive)
         for name in dropped:
             self._by_space.pop(name, None)
+            self._map_epochs.pop(name, None)
+            self._durable_by_space.pop(name, None)
             self._maintained_at.pop(name, None)
         return dropped
 
@@ -1550,6 +1838,7 @@ class VectorEngine:
         _require_snapshot(snapshot)
         components = validate_query_components(definition, query)
         index = self.index(space)
+        self._require_committed_search_index(index, definition)
         # ``live_count`` is itself generation-fenced. It either rebases a handle that observed a
         # foreign rebuild or refuses while the durable index is unavailable, before regime
         # selection can turn stale cardinality into either scan or traversal work.
@@ -1576,6 +1865,22 @@ class VectorEngine:
             space=definition.name,
             filter_cardinality=plan.filter_cardinality,
         )
+
+    def _require_committed_search_index(
+        self, index: VectorHnswIndex, space: EmbeddingSpaceDef
+    ) -> None:
+        """Refuse a process-local mapping that belongs to speculative reused identities."""
+        if space.name != index.space_name or not self._matches_committed_mapping(
+            index, space.name
+        ):
+            raise GrafxIndexError(
+                f"Vector index {index.name!r} is not the committed artifact of space "
+                f"{space.name!r}.",
+                field="index_provenance",
+                index=index.name,
+                space=space.name,
+                retryable=True,
+            )
 
     def _search_exactly(
         self,

@@ -30,6 +30,8 @@ from okto_grafx.domain.model.schema import MAX_IDENTIFIER_LENGTH, TableDef, is_i
 from okto_grafx.domain.model.value import Value
 
 __all__ = [
+    "automatic_index_definitions",
+    "index_definition_matches_table",
     "COLUMN_KEY_DERIVATION",
     "DEFINITION_DIGEST_SIZE",
     "INDEX_DIRECTORY",
@@ -309,3 +311,82 @@ class IndexDefinition:
         return hashlib.blake2b(
             material.encode("utf-8"), digest_size=DEFINITION_DIGEST_SIZE
         ).digest()
+
+
+def automatic_index_definitions(table: TableDef) -> tuple[IndexDefinition, ...]:
+    """Return the exact automatic definitions this table's committed schema declares.
+
+    Concurrent speculative catalogs may reuse both a numeric id and a table name.  Positions,
+    visibility and key derivation are therefore part of provenance too; returning value objects
+    here lets planning, DML staging, public inventory and verification share that complete test.
+    """
+    if not isinstance(table, TableDef):
+        return ()
+    definitions: list[IndexDefinition] = []
+    if table.kind == "rel":
+        definitions.extend(
+            (
+                IndexDefinition(
+                    name=f"ef_{table.name}",
+                    table_id=table.table_id,
+                    table_name=table.name,
+                    positions=(0,),
+                    visibility=IndexVisibility.EXACT,
+                ),
+                IndexDefinition(
+                    name=f"et_{table.name}",
+                    table_id=table.table_id,
+                    table_name=table.name,
+                    positions=(1,),
+                    visibility=IndexVisibility.EXACT,
+                ),
+            )
+        )
+    elif table.primary_key is not None:
+        definitions.append(
+            IndexDefinition(
+                name=f"pk_{table.name}",
+                table_id=table.table_id,
+                table_name=table.name,
+                positions=(table.column_index(table.primary_key),),
+                visibility=IndexVisibility.EXACT,
+            )
+        )
+    # Local import breaks the intentional definition -> vector-definition inheritance cycle.
+    from okto_grafx.domain.vector.key import VectorIndexDefinition
+
+    for position, column in enumerate(table.columns):
+        if column.vector_space is None:
+            continue
+        definitions.append(
+            VectorIndexDefinition(
+                name=f"vector_{table.name}_{column.vector_space}",
+                table_id=table.table_id,
+                table_name=table.name,
+                positions=(position,),
+                visibility=IndexVisibility.PROXIMITY,
+            )
+        )
+    return tuple(definitions)
+
+
+def index_definition_matches_table(
+    definition: IndexDefinition, table: TableDef
+) -> bool:
+    """Match complete provenance for automatic names and positional semantics for custom ones."""
+    if (
+        not isinstance(definition, IndexDefinition)
+        or not isinstance(table, TableDef)
+        or definition.table_id != table.table_id
+        or definition.table_name != table.name
+    ):
+        return False
+    automatic = {
+        candidate.registry_key: candidate
+        for candidate in automatic_index_definitions(table)
+    }
+    expected = automatic.get(definition.registry_key)
+    if expected is not None:
+        return definition == expected
+    stored_arity = len(table.columns) + (2 if table.kind == "rel" else 0)
+    return all(position < stored_arity for position in definition.positions)

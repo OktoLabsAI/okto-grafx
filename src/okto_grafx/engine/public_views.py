@@ -31,7 +31,10 @@ from okto_grafx.domain.errors import (
     GrafxRecoveryRefused,
     GrafxVectorValidationError,
 )
-from okto_grafx.domain.index.definition import IndexDefinition
+from okto_grafx.domain.index.definition import (
+    IndexDefinition,
+    index_definition_matches_table,
+)
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.header import INDEX_HEADER_SLOT, IndexHeader
 from okto_grafx.domain.index.visibility import IndexVisibility
@@ -3598,17 +3601,22 @@ def _index_view(index: Any, definition: IndexDefinition | None = None) -> IndexV
     )
 
 
-def _indexes_view(indexes: Any, table_ids: frozenset[int]) -> IndexRegistryView:
+def _indexes_view(indexes: Any, tables: Sequence[TableDef]) -> IndexRegistryView:
     """Snapshot registrations whose tables belong to the validated committed catalog."""
+    by_identity = {(table.table_id, table.name): table for table in tables}
     captured: list[IndexView] = []
     for index in indexes.indexes():
         observed_definition = index.definition
-        definition = _domain_value(
-            observed_definition, IndexDefinition, field="index.definition"
-        )
-        table_id = _builtin_int(_domain_field(definition, IndexDefinition, "table_id"))
-        if table_id in table_ids:
-            captured.append(_index_view(index, _index_definition(observed_definition)))
+        # Canonicalize before provenance comparisons.  A collaborating store may return a
+        # legitimate IndexDefinition subclass whose numeric/text leaves override comparison;
+        # invoking those hooks would turn an observational public property into executable host
+        # code.  The exact rebuilt value is both the comparison input and the published view.
+        definition = _index_definition(observed_definition)
+        table_id = definition.table_id
+        table_name = definition.table_name
+        table = by_identity.get((table_id, table_name))
+        if table is not None and index_definition_matches_table(definition, table):
+            captured.append(_index_view(index, definition))
     return IndexRegistryView(
         tuple(captured),
         _builtin_int(indexes.published_lsn),
@@ -3714,23 +3722,48 @@ def _resident_index_positions(index: Any, file: str) -> tuple[int | None, int | 
 
 
 def _vectors_view(
-    vectors: Any, spaces: Any, table_ids: frozenset[int]
+    vectors: Any,
+    spaces: Any,
+    tables: Sequence[TableDef],
 ) -> VectorEngineView:
     """Snapshot vector configuration against caller-validated catalog spaces."""
     captured_spaces = tuple(_space_definition(space) for space in spaces)
-    space_ids = frozenset(space.space_id for space in captured_spaces)
+    spaces_by_identity = {
+        (space.space_id, space.name): space for space in captured_spaces
+    }
+    tables_by_identity = {(table.table_id, table.name): table for table in tables}
     captured_indexes: list[VectorIndexView] = []
     for index in vectors.indexes():
         space_id = _builtin_int(index.space_id)
         observed_definition = index.definition
-        definition = _domain_value(
-            observed_definition, IndexDefinition, field="index.definition"
+        definition = _index_definition(observed_definition)
+        table_id = definition.table_id
+        table_name = definition.table_name
+        space_name = _builtin_text(
+            index.space_name, field="vector.index.space_name", empty=False
         )
-        table_id = _builtin_int(_domain_field(definition, IndexDefinition, "table_id"))
-        if space_id in space_ids and table_id in table_ids:
-            captured_indexes.append(
-                _vector_index_view(index, _index_definition(observed_definition))
+        space = spaces_by_identity.get((space_id, space_name))
+        table = tables_by_identity.get((table_id, table_name))
+        if (
+            space is not None
+            and table is not None
+            and index_definition_matches_table(definition, table)
+            and _builtin_int(index.dimension) == space.dimension
+            and _string_enum(
+                index.metric_of_space,
+                DistanceMetric,
+                field="vector.index.metric",
             )
+            is space.metric
+            and _builtin_text(
+                index.storage_dtype,
+                field="vector.index.storage_dtype",
+                empty=False,
+            )
+            == space.storage_dtype
+            and _builtin_bool(index.normalized) == space.normalized
+        ):
+            captured_indexes.append(_vector_index_view(index, definition))
     return VectorEngineView(
         _builtin_int(vectors.exact_scan_threshold),
         captured_spaces,

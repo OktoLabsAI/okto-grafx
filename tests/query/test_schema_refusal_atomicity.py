@@ -128,27 +128,65 @@ def test_the_read_door_refuses_a_schema_statement_before_any_side_effect(
         ]
 
 
-def test_a_rolled_back_ddl_removes_the_index_files_its_statements_created(
+def test_a_rolled_back_ddl_releases_indexes_without_blocking_a_retry(
     tmp_path: Path,
 ) -> None:
-    """The transaction journal closes what the residue list called 'harmless orphan files'.
+    """Rollback releases public/registry ownership and preserved bytes remain reclaimable.
 
-    They were not harmless: the vector attach has no decline guard by design, so an orphan file
-    under a definition whose ids can no longer recur refused every later CREATE of the same
-    shape. Rollback now replays the whole transaction's journal, files included.
+    Canonical deletion cannot be a cross-process compare-and-swap: another speculative DDL may
+    already have adopted the same bytes.  Rollback therefore removes only the exact local
+    registration/map claims. A later incompatible definition must move the preserved artifacts
+    aside under the artifact section and remain correct both live and after a cold reopen.
     """
-    with okto_grafx.connect(tmp_path / "db", page_size=512) as db:
+    root = tmp_path / "db"
+    with okto_grafx.connect(root, page_size=512) as db:
         doomed = db.begin("write")
         doomed.execute("CREATE VECTOR SPACE s {dimension: 4, metric: 'cosine'}")
         doomed.execute("CREATE NODE TABLE V(id INT64, body VECTOR(s), PRIMARY KEY(id))")
         doomed.rollback()
-        assert not db.storage.exists("index/vector_V_s.idx")
-        assert not db.storage.exists("index/pk_V.idx")
+        assert db.indexes.indexes() == ()
+        assert db.vectors.spaces() == ()
+        assert db.vectors.indexes() == ()
+        assert db.storage.exists("index/vector_V_s.idx")
+        assert db.storage.exists("index/pk_V.idx")
+        assert db.verify("all").findings == ()
 
         with db.begin("write") as retry:
-            retry.execute("CREATE VECTOR SPACE s {dimension: 4, metric: 'cosine'}")
-            retry.execute("CREATE NODE TABLE V(id INT64, body VECTOR(s), PRIMARY KEY(id))")
+            retry.execute(
+                "CREATE VECTOR SPACE s {dimension: 3, metric: 'euclidean', "
+                "storage_dtype: 'float64'}"
+            )
+            retry.execute(
+                "CREATE NODE TABLE V("
+                "business_key STRING, id INT64, body VECTOR(s), PRIMARY KEY(id))"
+            )
         with db.begin("write") as writer:
-            writer.execute("CREATE (:V {id: 1, body: [1.0, 0.0, 0.0, 0.0]})")
-        assert db.execute("MATCH (v:V) RETURN v.id").rows == ((1,),)
+            writer.execute(
+                "CREATE (:V {business_key: 'new', id: 1, body: [1.0, 0.0, 0.0]})"
+            )
+        assert db.indexes.index("pk_V").definition.positions == (1,)
+        assert db.indexes.index("vector_V_s").definition.positions == (2,)
+        vector = db.vectors.index("s")
+        assert (vector.dimension, vector.metric_of_space.value, vector.storage_dtype) == (
+            3,
+            "euclidean",
+            "float64",
+        )
+        assert db.execute(
+            "MATCH (v:V) WHERE v.id = 1 RETURN v.business_key, v.id"
+        ).rows == (("new", 1),)
         assert db.verify("all").findings == ()
+
+    with okto_grafx.connect(root, page_size=512) as cold:
+        assert cold.indexes.index("pk_V").definition.positions == (1,)
+        assert cold.indexes.index("vector_V_s").definition.positions == (2,)
+        vector = cold.vectors.index("s")
+        assert (vector.dimension, vector.metric_of_space.value, vector.storage_dtype) == (
+            3,
+            "euclidean",
+            "float64",
+        )
+        assert cold.execute(
+            "MATCH (v:V) WHERE v.id = 1 RETURN v.business_key, v.id"
+        ).rows == (("new", 1),)
+        assert cold.verify("all").findings == ()

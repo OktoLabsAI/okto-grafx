@@ -527,7 +527,11 @@ def test_invalid_retry_keeps_speculative_ddl_intact_until_real_rollback() -> Non
         assert transaction.txn_id not in database._queries._working
         assert transaction.txn_id not in database._queries._txn_effects
         assert "pk_pending" not in database._indexes._indexes
-        assert not storage.exists("index/pk_Pending.idx")
+        # Rollback releases only the exact process-local claim.  Canonical bytes are preserved:
+        # no storage adapter offers delete-CAS proof that another speculative transaction has
+        # not already adopted them.  A later attach either adopts or quarantines them under the
+        # serialized artifact section.
+        assert storage.exists("index/pk_Pending.idx")
     finally:
         database.close()
         release_ports(registry)
@@ -880,7 +884,9 @@ def test_rollback_cleanup_failure_after_abort_still_unwinds_schema_and_finishes_
         assert transaction.txn_id not in database._queries._working
         assert transaction.txn_id not in database._queries._txn_effects
         assert "pk_ghost" not in database._indexes._indexes
-        assert not storage.exists("index/pk_Ghost.idx")
+        # Rollback releases the exact registry claim but preserves canonical bytes: deleting
+        # them cannot prove that a foreign speculative DDL has not already adopted the file.
+        assert storage.exists("index/pk_Ghost.idx")
     finally:
         database.close()
         release_ports(registry)
@@ -889,7 +895,7 @@ def test_rollback_cleanup_failure_after_abort_still_unwinds_schema_and_finishes_
 def test_close_drains_an_active_ddl_before_releasing_storage_and_late_rollback_is_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Terminal close removes every speculative registration/file/journal before lower release."""
+    """Terminal close drains speculative ownership/journals before lower release."""
     database, registry, storage, _metrics = _instrumented_database()
     transaction = database.begin("write")
     transaction.execute("CREATE NODE TABLE Ghost(id INT64, PRIMARY KEY(id))")
@@ -911,7 +917,9 @@ def test_close_drains_an_active_ddl_before_releasing_storage_and_late_rollback_i
         assert txn_id not in database._queries._working
         assert txn_id not in database._queries._txn_effects
         assert "pk_ghost" not in database._indexes._indexes
-        assert not storage.exists("index/pk_Ghost.idx")
+        # The registry exposure is gone, while the physical orphan remains available for a
+        # later serialized adopt/quarantine decision.
+        assert storage.exists("index/pk_Ghost.idx")
 
         # Close already owns and removed this journal. A tardy wrapper observes ABORTED and its
         # absent-id settlement must not touch QueryEngine or storage after lower release.
@@ -1351,16 +1359,24 @@ def test_storage_append_can_wait_for_cross_thread_close_without_deadlock(
 def test_index_unwind_storage_can_wait_for_cross_thread_close_without_deadlock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Rollback marks QueryEngine's index/file unwind, not all schema settlement."""
+    """Rollback marks QueryEngine's physical provenance read as a close-wait hazard."""
     database, registry, storage, _metrics = _instrumented_database()
     close_joined: list[bool] = []
     close_failures: list[BaseException] = []
     close_workers: list[threading.Thread] = []
-    original_remove = FaultInjectingStorageDevice.remove
+    original_read_page = FaultInjectingStorageDevice.read_page
     fired = [False]
+    armed = [False]
 
-    def remove(self: FaultInjectingStorageDevice, file: str) -> None:
-        if self is storage and not fired[0] and file.startswith("index/"):
+    def read_page(
+        self: FaultInjectingStorageDevice, file: str, page_index: int
+    ) -> bytes:
+        if (
+            self is storage
+            and armed[0]
+            and not fired[0]
+            and file.startswith("index/")
+        ):
             fired[0] = True
 
             def close() -> None:
@@ -1374,9 +1390,9 @@ def test_index_unwind_storage_can_wait_for_cross_thread_close_without_deadlock(
             worker.start()
             worker.join(_WAIT_SECONDS)
             close_joined.append(not worker.is_alive())
-        original_remove(self, file)
+        return original_read_page(self, file, page_index)
 
-    monkeypatch.setattr(FaultInjectingStorageDevice, "remove", remove)
+    monkeypatch.setattr(FaultInjectingStorageDevice, "read_page", read_page)
     transaction = database.begin("write")
     transaction.execute(
         "CREATE VECTOR SPACE transient {dimension: 2, metric: 'cosine'}"
@@ -1385,6 +1401,7 @@ def test_index_unwind_storage_can_wait_for_cross_thread_close_without_deadlock(
         "CREATE NODE TABLE V(id INT64, e VECTOR(transient), PRIMARY KEY(id))"
     )
     try:
+        armed[0] = True
         transaction.rollback()
     finally:
         database.close()
