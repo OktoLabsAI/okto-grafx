@@ -117,6 +117,7 @@ def test_foreign_tail_refresh_and_interval_share_one_physical_byte_budget(
     appended_bytes = memory_device.log_size(tail) - before
     interval_bytes = memory_device.log_size(tail)
     assert appended_bytes > 1
+    assert interval_bytes > appended_bytes
 
     device.reads.clear()
     assert (
@@ -136,7 +137,9 @@ def test_foreign_tail_refresh_and_interval_share_one_physical_byte_budget(
             foreign_lsn,
             foreign_lsn,
             max_records=1,
-            max_bytes=appended_bytes,
+            # Each phase fits this budget by itself; only their sum exceeds it. A mutant that
+            # restarts the counter after refreshing the foreign tail would incorrectly succeed.
+            max_bytes=interval_bytes,
         )
         is None
     )
