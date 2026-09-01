@@ -322,7 +322,7 @@ by 4.02x, and normal-commit phase attribution remained inconclusive (2/62 conclu
 No throughput delta is reproducible, and every pass remained below the frozen `7.5/s` floor. The
 full CE-3 matrix and M-PULSE-7 10k run therefore remain blocked.
 
-### ST-2 dual descriptor revalidation — implementation gate
+### ST-2 dual descriptor revalidation — accepted structural gate
 
 ST-2 was explicitly authorised after the CN-2 disposition. It adds two public modes without
 changing durable bytes or concurrency semantics: `strict` remains the Grafx default and proves the
@@ -344,11 +344,44 @@ The full repository suite, with the pinned Pulse baselines explicitly supplied, 
 nodeids to 100% with exit 0. Ruff, compileall and diff-check also passed; an independent differential
 review concluded GO with no high/medium generation-only defect.
 
-No ST-2 throughput number exists yet. Provenance is frozen before measurement: Grafx's default
-remains `strict`; the next authenticated `same-10` and any later M-PULSE matrix will select and
-record `descriptor_revalidation="generation"`, because they certify the controlled Pulse
-deployment that opts into this policy. A strict control, if repeated, is a separate labelled
-artifact. Generation numbers must never be presented as default-strict numbers.
+The ST-2 structural PF5 gate is now closed on the immutable operation set
+`c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81`, in `continuous` mode with
+`per_family=5`. The authenticated checkouts are Grafx
+`f0b55b7b6facc916118f342c774cb06e56bf17e3`, Community
+`050ced9b79533d50efed453d53ed450984f75cf3` and Core
+`ccc1f345ece1db89a274cfdd634bd4da27028f63`. Across the 12 instrumented family medians,
+`_still_names` remained `424` (`<500`), `os.lstat` remained `4,137` (`<8,000`) and `os.stat`
+fell from `2,393` to `1,727` (`<2,000`). The logical work is discriminated by unchanged counts:
+`_read_page=323`, `read_fresh_page=146`, `write_page=96`, `acquire_board_binding=123` and
+`Database._run_statement=148`. The largest family, `delete_edges_by_session`, changed only
+`os.stat`, from `752` to `326`.
+
+The full-route control artifact is
+`D:\GrafxBenchEvidence\st2-control-batch-20260901-final-a01\st2-control-batch-generation-profile-pf5.json`
+(967,588 bytes, SHA-256
+`e4845553628ab217bcfbb74694e43103f418bd4c9c3a6b6760f10caf42c2c5a1`). It uses the same Grafx,
+Core, operation set, mode and sample count; its Community checkout is the pre-patch
+`b07bf3ef8cdd05bc1365a46c2411bca857ab2bb0`.
+
+The production delta does not remove a statement fence. For a Board/Grafx transaction it reuses
+the physical-route proof from the freshly authenticated binding while the exact database remains
+pool-pinned, then compares the complete route snapshot and re-admits that handle by canonical path
+and page size. Generic Board and every Global revalidation retain the full resolver component walk.
+A real symlink/junction regression proves the pinned route still fails closed on a physical alias.
+The final artifact is
+`D:\GrafxBenchEvidence\st2-pinned-route-20260901-final-a01\st2-pinned-route-generation-profile-pf5.json`
+(969,630 bytes, SHA-256
+`384a7722ff6772a2e89ca95225ab759ec5c7cab5af9939f405ef7b5ec2802aae`). Its
+`machine_idle_asserted` value is false, so it certifies the deterministic structural counters only;
+it is not a temporal throughput result. Nexus handoff
+`hof_566e4a5333b54b55946b5dc7ad416b36` independently recomputed the hash, checkout pins, three
+gates and five invariant counters and was verified PASS.
+
+No ST-2 throughput number exists yet. Grafx's default remains `strict`; the next authenticated
+`same-10` and any later M-PULSE matrix must select and record
+`descriptor_revalidation="generation"`, because they certify the controlled Pulse deployment that
+opts into this policy. A strict control, if repeated, is a separate labelled artifact. Generation
+numbers must never be presented as default-strict numbers.
 
 ### F1, CE-3 and M-PULSE-7 gate chain
 
@@ -376,10 +409,11 @@ integration tools gate passed 136/136. The clean check-only artifact
 `ce3-checkonly-da7f5e4/ce3-check-only.json` has SHA-256
 `c2a643652caf6bd83748624f5a2808396c40c1467ae39bc190e9021242be1324` and only the expected
 `check_only_has_no_measurements` shortfall. It authenticates the instrument but contains no
-measurement. The authenticated `same-10` disposition is now recorded above. The next surviving
-roadmap item is ST-2, but it requires a separate A66.1/CF-12 contract decision and its F4
-multiprocess proof. If authorised, the binding order is **ST-2 + F4 -> repeat `same-10` -> official
-CE-3 matrix -> M-PULSE-7 10k**. No result exists yet for the full matrix or the 10,000-operation run.
+measurement. The authenticated `same-10` disposition is now recorded above. ST-2, its A96/CF-12
+contract and F4 multiprocess proof are complete, and the structural PF5 gate above passed. The
+remaining fixed order is **repeat `same-10` with authenticated `generation` -> official CE-3
+matrix -> M-PULSE-7 10k**; the latter two remain blocked until the unchanged `7.5/s` entry floor
+passes. No result exists yet for the full matrix or the 10,000-operation run.
 
 ---
 

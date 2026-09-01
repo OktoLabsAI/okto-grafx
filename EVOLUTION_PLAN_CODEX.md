@@ -9,7 +9,8 @@
 
 ## Estado de execução — 2026-09-01
 
-- **ST-2 autorizado, implementado e certificado; medição `same-10` é o próximo passo finito.**
+- **ST-2 autorizado, implementado e certificado; o gate estrutural PF5 passou e `same-10` é o
+  próximo passo finito.**
   A autorização posterior do usuário congelou dois modos públicos de
   `descriptor_revalidation`: `"strict"` permanece o padrão e revalida cada hit; `"generation"`
   é opt-in para o diretório exclusivamente gerido por Grafx/Pulse e amortiza a prova somente para
@@ -31,7 +32,25 @@
   proveniência não seja apenas declaratória, o handle expõe o modo efetivo process-local pela
   propriedade read-only `Database.descriptor_revalidation`, fora da identidade persistida; o
   provider Pulse deve comparar solicitado e observado antes de admitir o handle e o runner deve
-  recusar artefatos sem essa prova.
+  recusar artefatos sem essa prova. O fechamento estrutural foi medido no conjunto imutável
+  `c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81`, em modo `continuous`,
+  `per_family=5`, com Grafx `f0b55b7b6facc916118f342c774cb06e56bf17e3`, Community
+  `050ced9b79533d50efed453d53ed450984f75cf3` e Core
+  `ccc1f345ece1db89a274cfdd634bd4da27028f63`. Nas 12 famílias, a soma das medianas manteve
+  `_still_names=424` (`<500`) e `os.lstat=4.137` (`<8.000`), enquanto `os.stat` caiu
+  `2.393 -> 1.727` e passou o limite `<2.000`. `_read_page=323`, `read_fresh_page=146`,
+  `write_page=96`, 123 aquisições autenticadas de binding e 148 statements ficaram idênticos ao
+  controle. O fast path é somente Board/Grafx com o database exato já pinado: cada fence continua
+  lendo/autenticando o binding, recusando cutover CAS visível, comparando o snapshot completo,
+  exigindo o diretório físico canônico e readmitindo path/page size; Global e revalidações genéricas
+  mantêm a caminhada integral. Um alias físico real (symlink/junction) é recusado por regressão.
+  Artefato `D:\GrafxBenchEvidence\st2-pinned-route-20260901-final-a01\st2-pinned-route-generation-profile-pf5.json`,
+  969.630 bytes, SHA-256
+  `384a7722ff6772a2e89ca95225ab759ec5c7cab5af9939f405ef7b5ec2802aae`. A recomputação
+  independente do handoff Nexus `hof_566e4a5333b54b55946b5dc7ad416b36` confirmou hash, pins,
+  gates e os cinco contadores invariantes, e foi verificada/PASS pelo Codex. Como
+  `machine_idle_asserted=false`, esta evidência aprova somente contagens estruturais e não publica
+  throughput temporal.
 - **M0 estabilização: concluído e publicado** em
   `milestone/m0-stabilization@e2d6a22da8ec2571127fc9d1533995d40330c632`. Os cinco P0
   reproduzidos, as fronteiras públicas, o primeiro open durável, read-only observacional, fencing
@@ -53,7 +72,9 @@
   `hof_13e2e4033b704687a1cb4051bc31988a` separa: (A) otimizações que preservam integralmente
   multi-writer/multi-reader; (B) mudanças que preservam os invariantes, mas exigem emenda numerada;
   e (C) hipóteses que estreitam contrato ou podem degradar concorrência e não serão iniciadas sem
-  decisão do usuário. ST-2, CM-1/2/3 como redigidas ficam fora da execução; CM-4 fica deferida.
+  decisão do usuário. ST-2, CM-1/2/3 como então redigidas ficaram fora daquela execução; a
+  autorização explícita posterior de ST-2, registrada acima, supersede somente esse veto histórico.
+  CM-1/2/3 continuam fora e CM-4 fica deferida.
   CE-1 exige, antes do código de produção, spike NTFS, emenda de formato/porta e matriz de crash.
   Todo ganho inferido serve apenas para ordenar: promoção exige delta RAW patch-a-patch mais os
   contadores discriminantes. A onda 0 versiona o harness H1-H8; QW-1 abriu a primeira frente segura
@@ -2736,7 +2757,8 @@ nenhum resultado delegado é integrado sem validação final do Codex e sem o ga
 | CN-1 — leasing durável de identidades | concluído, publicado, auditado e medido; não é o blocker residual | commits `40b2b43` + evidência documental `6fd26f9` em `origin/perf/w8-ce1-production`; desenho final `docs/architecture/CN1_IDENTITY_RANGE_LEASING.md`; auditorias Nexus `hof_8867688a5b9649d4a718fbf6eec91a63`, `hof_9e0acf09542a47bd9873a04fea7b0d51` e `hof_c03087626717449ea68b8fc595345fdf` concluídas/verificadas/PASS | `identity_lease_size=64` parametrizável; piso multi-tabela COW em `heap.dat/0`; subcommit privado `WRITE_PAGE+COMMIT` sob participant/lease/`COMMIT_SECTION`/WAL-tail; barrier/apply/publish antes do uso; primeiro OCC antes de consumo; a emenda OCC posterior remove o bypass do LSN e revalida interesses antigos incrementalmente; cache local burn-only; explicit `< floor` recusa e `>= floor` exige avanço durável; primeira extensão permanece atômica no commit do usuário; manager herdado após fork falha fechado. Gates: 8/8 identidade, 4/4 falhas, 4/4 multiprocesso, 449/449 transacionais não-multiprocesso e 523/523 de composição; Ruff/compileall/diff-check verdes. Medição autenticada: A 19→46 operações e page 0 fatal→1/807 commits de B; residual deslocou-se para a tail data page, como previsto |
 | OCC-MB1 — baseline de materialização da segunda OCC | concluído, publicado, auditado e medido | `origin/perf/w8-ce1-production@9498554e1c59f49a946571e9f281e5533ab2904b`; autorização explícita do usuário; auditorias Nexus `hof_cb653c8a25fd479098fc31a5ac8415f9` e `hof_d8b8484183d24ee882daf12151854f37` PASS; gates 100/100 focados, 454/454 txn não-multiprocesso, 17/17 multiprocesso, 8/8 CN-1 failure/concurrency e 9/9 cleanup/relink | Primeira OCC usa conjunto congelado desde o snapshot; avanço CN-1 revalida esse conjunto sem bypass; somente novas localizações físicas medidas e não pré-staged usam o LSN durável atual. Interesses lógicos tardios e overlap/drift de página falham fechado. WAL/payload, durabilidade, readers e multiwriter não mudam. O `same-10` passou funcionalmente 60/60 + 187/187 sem conflitos/retries; deixou apenas a taxa como shortfall |
 | CE-3 — invalidação bounded por delta WAL (produto) | publicada; correção de header esparso publicada, auditada e validada funcionalmente no Pulse | base `9498554`; produto `2feb579`; sucessor test-only `61485d9`; fix `origin/perf/ce3-bounded-invalidation@5b73890bdfddf9763c2b46514fc2c41c07ee30a4`; auditorias Nexus `hof_75a8a1e43bc24f1790b9a79d75d3749d`, `hof_7c7f3a4b3a9c470ea1d5886445cf233b` e `hof_e890ffe523ac4023aee333a8b094c8e8` PASS | Intervalo WAL limitado, classificação fail-closed e invalidação seletiva permanecem intactos. O fix acrescenta somente headers registrados quando há efeito de heap e declina para refresh completo se o inventário não puder ser provado. Red-first e mutation kill confirmados; 15/15 combinados, 7/7 pós-formatação, txn 476/476, index+vector 100%/exit 0 e checks estáticos verdes. M4 permanece dívida de cobertura não bloqueante. Primeira OCC, páginas pré-staged, WAL/durabilidade e multiwriter/multireader não mudaram. Próximo gate fixo: gargalo residual medido no H8; sem matriz completa antes de `same-10 >= 7,5/s` |
-| CN-2 — barreiras de checkpoint fora do fence | implementado, auditado e medido; efeito local aprovado, gate agregado ainda vermelho | candidato medido `7acb9d869a7a6b9a533033309a3126f4de704f5b`; produto `e202324`; instrumento `c739733`; contrato de cauda `f872fbe`; R1b `b4d1fa1cff1de76f5ea9a5b21452e5f07ea4dea0897b73ed0274aa583d227e95`; R2 `fdf28373c49e11fa4b19420fee8e170c2ebc5a1a2e8bdfe22a49ffd08b4612b6`; auditorias Nexus `hof_3781b51dbb77417cb899c50d1775cd29` e `hof_8d1bcdb495ab497c91869f300d4688e2` PASS | A/B/C preserva autoridade, WAL e horizonte; 978 barriers ficaram fora do fence e três commits estrangeiros progrediram em seis checkpoints. A exclusão contínua caiu ~49% na mediana, mas o checkpoint total mediano cresceu ~38% e não houve ganho reproduzível de throughput. RAW/H8 foram `5,3178/4,1577/s` em R1b e `1,3218/4,5368/s` em R2, todos abaixo de `7,5/s`; verify live+cold e finalização passaram. Esta é a disposição atual e substitui o status de taxa histórico das linhas M-PULSE-7/CE-3 acima. Matriz completa/10k seguem bloqueados; ST-2 é o próximo survivor, mas requer autorização separada, emenda A66.1/CF-12 e F4 |
+| CN-2 — barreiras de checkpoint fora do fence | implementado, auditado e medido; efeito local aprovado, gate agregado ainda vermelho | candidato medido `7acb9d869a7a6b9a533033309a3126f4de704f5b`; produto `e202324`; instrumento `c739733`; contrato de cauda `f872fbe`; R1b `b4d1fa1cff1de76f5ea9a5b21452e5f07ea4dea0897b73ed0274aa583d227e95`; R2 `fdf28373c49e11fa4b19420fee8e170c2ebc5a1a2e8bdfe22a49ffd08b4612b6`; auditorias Nexus `hof_3781b51dbb77417cb899c50d1775cd29` e `hof_8d1bcdb495ab497c91869f300d4688e2` PASS | A/B/C preserva autoridade, WAL e horizonte; 978 barriers ficaram fora do fence e três commits estrangeiros progrediram em seis checkpoints. A exclusão contínua caiu ~49% na mediana, mas o checkpoint total mediano cresceu ~38% e não houve ganho reproduzível de throughput. RAW/H8 foram `5,3178/4,1577/s` em R1b e `1,3218/4,5368/s` em R2, todos abaixo de `7,5/s`; verify live+cold e finalização passaram. Esta é a disposição atual e substitui o status de taxa histórico das linhas M-PULSE-7/CE-3 acima. Matriz completa/10k seguem bloqueados pelo piso `7,5/s`; a indicação histórica de que ST-2 ainda exigia autorização/F4 foi supersedida pela autorização e pelo fechamento registrados na linha seguinte. |
+| ST-2 — dual descriptor revalidation + pinned-route fence | concluído, publicado nos branches de milestone e aceito no gate estrutural; `same-10` temporal permanece o próximo gate finito | Grafx `perf/st2-descriptor-revalidation@f0b55b7b6facc916118f342c774cb06e56bf17e3`; Community `perf/st2-pulse-generation@050ced9b79533d50efed453d53ed450984f75cf3` (produção `cea13b8`, alias test `050ced9`); Core `ccc1f345ece1db89a274cfdd634bd4da27028f63`; artefato PF5 SHA-256 `384a7722ff6772a2e89ca95225ab759ec5c7cab5af9939f405ef7b5ec2802aae`, 969.630 bytes; operação `c994255b...`; auditoria de segurança Nexus `hof_b69cf41505824beda52a25b29b37a8aa` PASS | `strict` continua default e `generation` é opt-in exclusivo Grafx/Pulse. PF5 `continuous`, 12 famílias x 5: `_still_names 424<500`, `os.lstat 4.137<8.000`, `os.stat 2.393->1.727<2.000`; `_read_page/read_fresh_page/write_page=323/146/96`, 123 bindings e 148 statements inalterados. Nenhum fence foi removido: Board/Grafx reutiliza a prova física do binding autenticado com o handle exato pinado/readmitido; genérico/Global preservam caminhada completa; CAS visível, path/page size, missing e alias real permanecem fail-closed. 59 testes focados finais e suíte relevante 253/253 passaram. `machine_idle_asserted=false`: aceite estrutural, sem alegação de throughput. |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria

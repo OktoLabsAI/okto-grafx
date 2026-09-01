@@ -1040,7 +1040,7 @@ happened keeps reading what it opened"): rewritten to assert the published conte
 an unlinked file still readable through the held descriptor: now refuses missing, which is the same
 honesty. New: `tests/api/test_cross_process_visibility.py` (fails with the check reverted).
 
-### ST-2 — strict/default and generation/opt-in descriptor proofs (C0/C1/C2)
+### ST-2 — strict/default and generation/opt-in descriptor proofs (C0/C1/C2, CLOSED)
 
 CF-12 remains the baseline and the default. `DatabaseConfig.descriptor_revalidation` accepts only
 `"strict"` and `"generation"`; strict performs CF-12's identity proof at every cache hit. Generation
@@ -1070,6 +1070,15 @@ No WAL ordering, OCC pass, checkpoint barrier, multiwriter/multireader rule or B
 under ST-2. The exact whitelist, transition matrix, external-replacement risk and operator guidance
 are normative in
 [`ST2_DESCRIPTOR_REVALIDATION.md`](ST2_DESCRIPTOR_REVALIDATION.md) and CONTRACT A96.
+
+The final Pulse structural PF5 gate used the fixed operation digest `c994255b...`, 12 families and
+five samples per family. `_still_names` remained `424`, `os.lstat` remained `4,137`, and `os.stat`
+fell `2,393 -> 1,727`, passing the frozen `<500`, `<8,000` and `<2,000` limits. Logical reads,
+fresh reads, writes, binding acquisitions and statements were unchanged (`323/146/96/123/148`).
+The optimized Community path retains every Board/Grafx statement fence and merely transfers the
+freshly authenticated route proof to the exact pool-pinned database; Global and generic routes keep
+the complete walk. A real physical alias is refused in the focused regression. The evidence and
+its exact checkout pins are recorded in `ST2_DESCRIPTOR_REVALIDATION.md`.
 
 ### C9 round 3 — B5 and B6 CLOSED (coordinator)
 

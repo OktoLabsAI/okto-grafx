@@ -60,9 +60,9 @@ read path fetches that fixed three-page image through one bounded `read_log` cal
 the same descriptor separately for three `read_page` calls. This is one descriptor hit and therefore
 one strict physical-identity proof; it is not three logical operations whose checks were skipped.
 
-The bounded read asks for the format-derived image size plus one byte. Exactly the three-page size
-and relies on the port's fill-until-EOF rule: a conforming adapter returns the sentinel byte when it
-exists rather than an arbitrary short chunk. Exactly three pages is decoded as v2. A short image is
+The bounded read asks for the format-derived image size plus one byte and relies on the port's
+fill-until-EOF rule: a conforming adapter returns the sentinel byte when it exists rather than an
+arbitrary short chunk. Exactly three pages is decoded as v2. A short image is
 accepted as legacy v1 only after `file_size` confirms that the
 current logical file reports the same short length. A supported atomic replacement between these
 calls may select either complete old or new bytes; a length disagreement fails closed, and the
@@ -222,3 +222,33 @@ OCC proof and cannot replace one.
 Choosing `generation` therefore cannot fix a WAL, OCC, recovery, locking or BR-10 problem. Choosing
 `strict` cannot make an unsupported external in-place mutation safe. The only choice here is how
 often a cached logical name is re-proved against its open physical descriptor.
+
+## Final acceptance evidence — 2026-09-01
+
+The safety gate passed in both modes. The final F4 DDL matrix proves that a foreign canonical-index
+replacement is observed before WAL append, with the losing writer refused and WAL/LSN unchanged.
+The reader-retention F4 keeps a real reader pinned while checkpoint/recycle advances below its
+horizon, kills an unflushed writer and recovers all durable rows on a cold reopen. The authenticated
+full Grafx regression traversed 11,357 nodeids with exit 0; Ruff, compileall and diff-check passed.
+
+The Pulse-oriented `generation` structural gate used the fixed operation digest
+`c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81`, `continuous` mode and five
+samples for each of 12 families. Relative to its full-route `generation` control, `_still_names`
+remained 424, `os.lstat` remained 4,137 and `os.stat` fell from 2,393 to 1,727. The frozen limits are
+respectively
+`<500`, `<8,000` and `<2,000`. Logical work did not move: `_read_page=323`,
+`read_fresh_page=146`, `write_page=96`, 123 authenticated binding acquisitions and 148 statements
+in both artifacts. Board/Grafx statement fences remain present; the optimization removes only the
+second resolver component walk after the binding has already authenticated the route and the exact
+pool-pinned database has been re-admitted. Generic and Global routes remain unchanged, and a real
+symlink/junction test pins alias refusal on the optimized path.
+
+The final evidence names Grafx `f0b55b7b6facc916118f342c774cb06e56bf17e3`, Community
+`050ced9b79533d50efed453d53ed450984f75cf3` and Core
+`ccc1f345ece1db89a274cfdd634bd4da27028f63`. Artifact:
+`D:\GrafxBenchEvidence\st2-pinned-route-20260901-final-a01\st2-pinned-route-generation-profile-pf5.json`,
+969,630 bytes, SHA-256
+`384a7722ff6772a2e89ca95225ab759ec5c7cab5af9939f405ef7b5ec2802aae`. Because the report records
+`machine_idle_asserted=false`, these are structural acceptance counts, not a throughput claim. The
+paired control artifact and full reproduction provenance are recorded in
+[`docs/PERFORMANCE.md`](../PERFORMANCE.md).
