@@ -679,6 +679,33 @@
   durabilidade, multiwriter e multireader permanecem invariantes. O gate não autoriza ST-2, mover
   redo para fora da fase A, nem escolher uma otimização semântica do commit normal. A matriz CE-3
   completa e o M-PULSE-7 10k continuam bloqueados até `same-10 >= 7,5/s`.
+
+  **CN-2 implementado e funcionalmente certificado no candidato integrado
+  `afb95b3ff0fa1efb02a09a7ef16a9764061138be` em 2026-09-01; medição `same-10` ainda é o
+  próximo gate fixo.** O P0 de proveniência física/DDL veio de
+  `8ec5322751632c37f81fe74044efd090abeff344` e foi reaplicado sem diferença de árvore em
+  `53fa576`; o split CN-2 está em `e202324`, o instrumento de medição em `c739733`, a expectativa
+  estrita de uma derivação da cauda do WAL por seção A/C em `f872fbe` e duas docstrings exigidas
+  pelo gate público em `afb95b3`. No checkpoint normal, A congela target e inventário sob
+  lease+`COMMIT_SECTION`+cauda do WAL; B executa somente barreiras de dados sem esses fences; C
+  readquire autoridade, recusa regressão, refaz o sufixo, publica no máximo o target efetivamente
+  barrierado e só então recicla. Claim/clear de rebuild permanecem monolíticos. No commit, a
+  primeira OCC continua integral no snapshot original; sync/proveniência ocorre somente depois
+  dela; a segunda OCC recebe exclusivamente o delta de páginas físicas materializadas da visão
+  durável atual, nunca páginas pré-staged ou interesses lógicos tardios; WAL
+  `append→barrier→apply→publish` não mudou.
+
+  A certificação integrada passou 298/298 testes focados, mais 50/50 de checkpoint/rebuild em
+  revisão independente. Três auditorias read-only locais e o handoff Nexus
+  `hof_3781b51dbb77417cb899c50d1775cd29` com Claude concluíram PASS sem blocker. A regressão global
+  coletou 11.306 nodeids: o prefixo até o único gate documental percorreu 9.308 nodeids sem falha
+  funcional; depois das duas docstrings, `tests/test_language_surface.py` completo e os 1.998
+  nodeids da fronteira restante passaram. A única outra interrupção foi ambiental — venv `uv` sem
+  `pip` para o teste hermético de wheel — e o mesmo teste passou após completar a venv ignorada.
+  `ruff check src tests tools`, `compileall src tools` e `git diff --check` passaram; a árvore ficou
+  limpa. O `ruff format --check` global continua apontando a dívida preexistente de 254 arquivos e
+  não foi convertido em alvo desta etapa. Nenhum benchmark, push ou promoção é alegado por este
+  parágrafo: a próxima operação é a repetição autenticada `same-10` no SHA final documentado.
 - **O ratchet de entrada do M-PULSE-7 está certificado; ele não é o run de 10.000 operações.** No
   Community `6595abdcfa788dfa2cc8da1a53ff96c378790531` (base
   `d44c82155e9884c556813ea96dec829be567c236`, branch

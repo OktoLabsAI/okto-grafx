@@ -62,6 +62,21 @@ including the on-disk format.
 
 ### Changed
 
+- **Cross-writer DDL now proves the exact physical artifact before WAL.** Index headers carry a
+  non-zero artifact nonce in format v2 while v1 remains readable and is upgraded only on writable
+  startup under the commit fence. Durable foreign artifacts are synchronized only after the first
+  OCC succeeds; exact definitions, registry claims and vector-map epochs make speculative adoption
+  and rollback compensable without deleting another writer's canonical bytes. Incompatible
+  orphans are quarantined and any pre-WAL mismatch is a retryable write conflict.
+- **The second OCC has a narrow materialization baseline.** The first OCC still validates every
+  logical and pre-staged interest at the transaction's original snapshot. Only newly discovered
+  physical pages materialized from the current durable view use that view for the second OCC; late
+  logical interests, overlap and drift fail closed. WAL order and durability are unchanged.
+- **Normal checkpoints release writers while data files cross their durability barriers (CN-2).**
+  Phase A freezes and flushes an immutable target under the lease and commit section; phase B runs
+  only the captured data barriers without either fence; phase C reacquires authority, replays the
+  suffix, publishes no further than the barriered target and recycles only afterwards. Failures
+  publish nothing, and index rebuild claim/clear remains monolithic.
 - **Reader horizon publication is now per database participant, not per transaction (E-CE2-1).**
   The first transaction opens one standing registration; later begins inside the configured
   refresh interval publish nothing, and commit/rollback no longer unregister it. A deferred,

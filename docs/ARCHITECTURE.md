@@ -159,8 +159,8 @@ with db.begin("write") as txn:
  3. enter the COMMIT SECTION (exclusive across processes)
     3.1  validate the lease again
     3.2  read the published position; pool.begin_read_view    ← decide against NOW, not the cache
-    3.3  OCC, row half: does a COMMIT after my snapshot write a partition I read or wrote?
-    3.4  write the rows; declare every page they landed on; OCC again, page half
+    3.3  freeze original interests; run OCC against the transaction snapshot
+    3.4  sync durable artifacts; materialize rows from NOW; OCC only the new physical-page delta
     3.5  append the records; wal.barrier()                    ← DURABLE HERE
     3.6  apply the page images and index changes; flush to the device
     3.7  publish the new commit state
@@ -172,6 +172,14 @@ Three properties of that ordering are worth stating because everything else foll
 **A page image replaces the whole page.** So two commits that write one page conflict however
 disjoint the rows they thought they were touching were, and the pages a row write lands on are only
 known *after* the row is written — which is why validation runs twice.
+
+The two validations do not share a moving baseline. The first one always covers the complete
+logical and pre-staged interest frozen at the transaction's original snapshot. Only physical pages
+that did not exist in that frozen set and were discovered while materializing from the current
+durable view use that current view as the second validation's baseline. A pre-staged page, a late
+logical interest or a page that overlaps the frozen set cannot move to the newer baseline. Durable
+index adoption and artifact-provenance checks happen only after the first validation and before any
+WAL byte is appended.
 
 **The data files are not fsynced at 3.6, but they are written.** The log is the authority on
 durability and the redo is idempotent, so a barrier on the data files would buy nothing. But a page
@@ -260,6 +268,23 @@ read holds the log down and why a stalled reader is eventually released.
 Record types: `WRITE_PAGE` (a whole page image), `INDEX_WRITE`, `INDEX_RECONCILE`, `PAGE_ALLOC`,
 `COMMIT` (carrying the snapshot position and the read and write partition sets that OCC validates
 against).
+
+### Checkpoint data barriers
+
+A normal checkpoint with no transaction open in that participant is split into three phases so a
+slow data-file durability barrier does not hold the cross-process writer fence:
+
+1. **A, fenced:** take the writer lease, `COMMIT_SECTION` and one WAL-tail picture; complete any
+   durable gap, redo and flush; freeze an immutable target and exact paged-file inventory.
+2. **B, unfenced:** release both lease and commit section, then run only the data-file durability
+   barriers captured by A. This phase never publishes state or recycles WAL.
+3. **C, fenced:** reacquire and revalidate all authority and current state, redo any suffix that
+   arrived during B, publish the maximum of the already-published checkpoint and A's barriered
+   target, advance the participant pin and only then recycle.
+
+A failure in B publishes nothing; a regression observed in C is refused. Commits completed during
+B may be replayed for visibility but are not certified by A's barriers. Index rebuild claim/clear
+and any checkpoint while the participant owns an open transaction retain the monolithic path.
 
 ---
 
