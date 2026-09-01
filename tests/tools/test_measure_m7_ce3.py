@@ -4,12 +4,14 @@ import asyncio
 import copy
 import inspect
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from okto_grafx import connect
 from okto_grafx.errors import GrafxWriteConflict
 from tools import measure_m7_ce3 as ce3
 
@@ -103,9 +105,7 @@ def _typed_contention(
     include_backend_cause: bool = True,
     rollback_note: bool = False,
 ) -> GateFailure:
-    backend = GrafxWriteConflict(
-        "optimistic conflict", retryable=backend_retryable
-    )
+    backend = GrafxWriteConflict("optimistic conflict", retryable=backend_retryable)
     contention = GraphLockContention(
         retryable=core_retryable, commit_durable=commit_durable
     )
@@ -197,6 +197,86 @@ def _environment_evidence(*, executor: str = "executor") -> dict[str, object]:
     }
 
 
+def _phase_capture(started: int, ended: int, section_id: int) -> dict[str, object]:
+    child_started = started + max(1, (ended - started) // 10)
+    child_ended = min(ended, child_started + max(1, (ended - started) // 5))
+    context_started = started + 1
+    context_ended = ended - 1
+    root_ms = (ended - started) / 1e6
+    context_ms = (context_ended - context_started) / 1e6
+    child_ms = (child_ended - child_started) / 1e6
+    covered_ms = context_ms
+    residual_ms = root_ms - covered_ms
+    residual_ratio = residual_ms / root_ms
+    body_residual_ms = context_ms - child_ms
+    body_residual_ratio = body_residual_ms / context_ms
+    root_phase = "TransactionManager._commit_with_writing"
+    context_phase = "TransactionManager._coordinator_section"
+    child_phase = "TransactionManager._complete_committed_gap"
+    return {
+        "capture_status": "captured_after_reset",
+        "events": [
+            {
+                "scope": "commit",
+                "section_id": section_id,
+                "phase": root_phase,
+                "root": True,
+                "started_at_ns": started,
+                "ended_at_ns": ended,
+                "inclusive_ms": root_ms,
+                "outcome": "returned",
+            },
+            {
+                "scope": "commit",
+                "section_id": section_id,
+                "phase": context_phase,
+                "root": False,
+                "started_at_ns": context_started,
+                "ended_at_ns": context_ended,
+                "inclusive_ms": context_ms,
+                "outcome": "returned",
+                "detail": "commit",
+            },
+            {
+                "scope": "commit",
+                "section_id": section_id,
+                "phase": child_phase,
+                "root": False,
+                "started_at_ns": child_started,
+                "ended_at_ns": child_ended,
+                "inclusive_ms": child_ms,
+                "outcome": "returned",
+            },
+        ],
+        "inclusive_totals": {
+            root_phase: {"calls": 1, "inclusive_ms": root_ms},
+            context_phase: {"calls": 1, "inclusive_ms": context_ms},
+            child_phase: {"calls": 1, "inclusive_ms": child_ms},
+        },
+        "sections": [
+            {
+                "scope": "commit",
+                "section_id": section_id,
+                "root_ms": root_ms,
+                "covered_ms": covered_ms,
+                "residual_ms": residual_ms,
+                "residual_ratio": residual_ratio,
+                "reconciliation_limit": 0.15,
+                "reconciliation_conclusive": residual_ratio <= 0.15,
+                "commit_section": {
+                    "root_ms": context_ms,
+                    "covered_ms": child_ms,
+                    "residual_ms": body_residual_ms,
+                    "residual_ratio": body_residual_ratio,
+                    "reconciliation_limit": 0.15,
+                    "reconciliation_conclusive": body_residual_ratio <= 0.15,
+                },
+            }
+        ],
+        "inclusive_not_additive": True,
+    }
+
+
 def _samples(*, instrumented: bool, per_family: int = 5) -> list[dict[str, object]]:
     samples: list[dict[str, object]] = []
     stamp = 10_000_000_000
@@ -226,6 +306,11 @@ def _samples(*, instrumented: bool, per_family: int = 5) -> list[dict[str, objec
                     "inclusive_ms": {name: 0.1 for name in ce3.REQUIRED_HOOKS},
                     "observed_hooks": list(ce3.REQUIRED_HOOKS),
                 }
+                sample["phase_probe"] = _phase_capture(
+                    int(sample["started_at_ns"]),
+                    int(sample["ended_at_ns"]),
+                    len(samples) + 1,
+                )
             samples.append(sample)
             stamp += 20_000_000
     return samples
@@ -254,6 +339,12 @@ def _scenario_result(pass_name: str, scenario: ce3.Scenario) -> dict[str, object
                     "last_refusal": None,
                 }
             )
+            if pass_name == "instrumented":
+                commits[-1]["phase_probe"] = _phase_capture(
+                    int(commits[-1]["started_at_ns"]),
+                    int(commits[-1]["ended_at_ns"]),
+                    index + 1,
+                )
     environment = _environment_evidence()
     verification = {
         "engine": "okto-grafx",
@@ -286,7 +377,12 @@ def _scenario_result(pass_name: str, scenario: ce3.Scenario) -> dict[str, object
         },
         "instrumentation": {
             "enabled": pass_name == "instrumented",
-            "installed": list(ce3.REQUIRED_HOOKS) if pass_name == "instrumented" else [],
+            "installed": list(ce3.REQUIRED_HOOKS)
+            if pass_name == "instrumented"
+            else [],
+            "phase_probe_installed": (
+                list(ce3.PHASE_PROBE_HOOKS) if pass_name == "instrumented" else []
+            ),
             "raw_contaminated": False,
         },
         "operation_set_sha256": ce3.EXPECTED_OPERATION_SET_SHA256,
@@ -318,6 +414,13 @@ def _scenario_result(pass_name: str, scenario: ce3.Scenario) -> dict[str, object
         "reopens_during_measured_window": 0,
         "operation_set_sha256": ce3.EXPECTED_OPERATION_SET_SHA256,
         "scenario": scenario.as_dict(),
+        "instrumentation": {
+            "enabled": pass_name == "instrumented",
+            "phase_probe_installed": (
+                list(ce3.PHASE_PROBE_HOOKS) if pass_name == "instrumented" else []
+            ),
+            "raw_contaminated": False,
+        },
         "commits": commits,
         "effects": {
             "expected_nodes": len(commits),
@@ -485,7 +588,9 @@ def _install_official_run_doubles(
     }
 
     monkeypatch.setattr(ce3, "_assert_output_outside_inputs", lambda *_args: None)
-    monkeypatch.setattr(ce3, "_capture_identity", lambda **_kwargs: copy.deepcopy(identity))
+    monkeypatch.setattr(
+        ce3, "_capture_identity", lambda **_kwargs: copy.deepcopy(identity)
+    )
     monkeypatch.setattr(ce3, "_git", lambda *_args: ce3.PINNED_HARNESS_BLOB)
     monkeypatch.setattr(
         ce3,
@@ -631,14 +736,17 @@ def test_failed_post_cleanup_write_cannot_leave_an_official_pending_artifact(
 
 
 def test_frozen_matrix_and_pins_are_literal() -> None:
-    assert ce3.SCHEMA == "okto-grafx.ce3-m7-multiprocess.v3"
+    assert ce3.SCHEMA == "okto-grafx.ce3-m7-multiprocess.v4"
     assert ce3.MAX_OPERATION_ATTEMPTS == 60
     assert ce3.EXPECTED_OPERATION_SET_SHA256 == (
         "c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81"
     )
     assert ce3.PINNED_HARNESS_HEAD == "0dfb5269dd8531fd4db2679fc80b649c64bd9b09"
     assert ce3.PINNED_HARNESS_BLOB == "a02b86dce098ceec3fdbd10a820a4dd6f9e2a7b1"
-    assert [(scenario.relation, scenario.table, scenario.target_rate_per_second) for scenario in ce3.SCENARIOS] == [
+    assert [
+        (scenario.relation, scenario.table, scenario.target_rate_per_second)
+        for scenario in ce3.SCENARIOS
+    ] == [
         ("idle", None, 0.0),
         ("same", "Decision", 1.0),
         ("same", "Decision", 10.0),
@@ -686,9 +794,9 @@ def test_typed_pre_durable_contention_retries_whole_operation_on_same_handle(
     assert {item["code"] for item in outcome["retryable_refusals"]} == {
         "graph_lock_contention"
     }
-    assert {
-        item["classification"] for item in outcome["retryable_refusals"]
-    } == {"typed_pre_durable_grafx_write_conflict"}
+    assert {item["classification"] for item in outcome["retryable_refusals"]} == {
+        "typed_pre_durable_grafx_write_conflict"
+    }
     assert {item["attempt_scope"] for item in outcome["retryable_refusals"]} == {
         "fresh_transaction"
     }
@@ -787,10 +895,7 @@ def test_retry_budget_exhaustion_remains_a_terminal_failure(
 ) -> None:
     _install_graph_errors(monkeypatch)
     runner = _RunnerDouble(
-        [
-            _typed_contention()
-            for index in range(ce3.MAX_OPERATION_ATTEMPTS)
-        ]
+        [_typed_contention() for index in range(ce3.MAX_OPERATION_ATTEMPTS)]
     )
     randomizer = _RandomizerDouble()
     backend = object()
@@ -811,7 +916,9 @@ def test_retry_budget_exhaustion_remains_a_terminal_failure(
     assert len(runner.calls) == ce3.MAX_OPERATION_ATTEMPTS
     assert len(randomizer.calls) == ce3.MAX_OPERATION_ATTEMPTS - 1
     assert all(call == (backend, context, operation) for call in runner.calls)
-    assert len({id(scope) for scope in runner.scope_tokens}) == ce3.MAX_OPERATION_ATTEMPTS
+    assert (
+        len({id(scope) for scope in runner.scope_tokens}) == ce3.MAX_OPERATION_ATTEMPTS
+    )
 
 
 def test_b_can_close_its_window_after_a_pre_durable_conflict(
@@ -1014,9 +1121,7 @@ def test_any_terminal_refusal_ledger_keeps_the_scenario_failed(
         lambda refusal: refusal["chain"][1]["details"].update(
             backend_error_code="forged"
         ),
-        lambda refusal: refusal["chain"][1].update(
-            notes=["rollback also failed"]
-        ),
+        lambda refusal: refusal["chain"][1].update(notes=["rollback also failed"]),
         lambda refusal: refusal["chain"][2].update(retryable=False),
     ],
     ids=(
@@ -1108,22 +1213,73 @@ def test_gate_accepts_absent_commit_durable_evidence() -> None:
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [
-        (lambda value: value["copy_authentication"].update(initial_matches_base=False), "scenario_copy_not_authenticated"),
-        (lambda value: value["barrier"].update(parent_participated=False), "spawn_barrier_parent_not_proved"),
-        (lambda value: value["process_b"].update(pid=101), "distinct_real_processes_not_proved"),
-        (lambda value: value["process_a"].update(reopens_during_measured_window=1), "measured_handle_reopened"),
+        (
+            lambda value: value["copy_authentication"].update(
+                initial_matches_base=False
+            ),
+            "scenario_copy_not_authenticated",
+        ),
+        (
+            lambda value: value["barrier"].update(parent_participated=False),
+            "spawn_barrier_parent_not_proved",
+        ),
+        (
+            lambda value: value["process_b"].update(pid=101),
+            "distinct_real_processes_not_proved",
+        ),
+        (
+            lambda value: value["process_a"].update(reopens_during_measured_window=1),
+            "measured_handle_reopened",
+        ),
         (lambda value: value["process_a"]["samples"].pop(), "a_did_not_run_exact_pf5"),
-        (lambda value: value["process_a"]["samples"][0].update(postcondition_status="skipped"), "a_postcondition_status_not_passed"),
-        (lambda value: value["process_a"].update(refusals=["retryable"]), "refusal_was_not_fail_closed"),
-        (lambda value: value["process_exitcodes"].update(a=1), "child_process_exit_nonzero"),
-        (lambda value: value["process_b"].update(operation_set_sha256="wrong"), "child_operation_set_digest_disagrees"),
-        (lambda value: value["scenario"].update(table="Assumption"), "result_scenario_not_canonical"),
-        (lambda value: value["process_b"]["effects"].update(observed_nodes=0), "b_effects_not_proved"),
-        (lambda value: value["process_a"]["instrumentation"].update(enabled=True), "raw_pass_contaminated_by_hooks"),
-        (lambda value: value["verifier"]["verification"].update(pages_checked=0, records_checked=0, index_entries_checked=0), "cold_verify_all_clean_coverage_not_proved"),
-        (lambda value: value["rate"].update(effective_rate_per_second=99.0), "effective_rate_not_reproducible_from_timestamps"),
-        (lambda value: value["process_b"]["commits"].clear(), "foreign_commit_not_observed"),
-        (lambda value: value["process_b"]["handle"].update(closed_at_ns=1), "b_handle_did_not_cover_a_window"),
+        (
+            lambda value: value["process_a"]["samples"][0].update(
+                postcondition_status="skipped"
+            ),
+            "a_postcondition_status_not_passed",
+        ),
+        (
+            lambda value: value["process_a"].update(refusals=["retryable"]),
+            "refusal_was_not_fail_closed",
+        ),
+        (
+            lambda value: value["process_exitcodes"].update(a=1),
+            "child_process_exit_nonzero",
+        ),
+        (
+            lambda value: value["process_b"].update(operation_set_sha256="wrong"),
+            "child_operation_set_digest_disagrees",
+        ),
+        (
+            lambda value: value["scenario"].update(table="Assumption"),
+            "result_scenario_not_canonical",
+        ),
+        (
+            lambda value: value["process_b"]["effects"].update(observed_nodes=0),
+            "b_effects_not_proved",
+        ),
+        (
+            lambda value: value["process_a"]["instrumentation"].update(enabled=True),
+            "raw_pass_contaminated_by_hooks",
+        ),
+        (
+            lambda value: value["verifier"]["verification"].update(
+                pages_checked=0, records_checked=0, index_entries_checked=0
+            ),
+            "cold_verify_all_clean_coverage_not_proved",
+        ),
+        (
+            lambda value: value["rate"].update(effective_rate_per_second=99.0),
+            "effective_rate_not_reproducible_from_timestamps",
+        ),
+        (
+            lambda value: value["process_b"]["commits"].clear(),
+            "foreign_commit_not_observed",
+        ),
+        (
+            lambda value: value["process_b"]["handle"].update(closed_at_ns=1),
+            "b_handle_did_not_cover_a_window",
+        ),
     ],
 )
 def test_each_critical_false_pass_mutation_is_rejected(mutation, expected: str) -> None:
@@ -1160,6 +1316,187 @@ def test_instrumented_requires_all_three_ce3_hooks_and_raw_has_none() -> None:
     )
 
 
+def test_phase_probe_records_only_nested_commit_work_and_reconciles_it(
+    monkeypatch,
+) -> None:
+    boundary: dict[str, int] = {}
+
+    class Section:
+        def __enter__(self) -> None:
+            boundary["entered_at_ns"] = time.perf_counter_ns()
+
+        def __exit__(self, *_failure: object) -> None:
+            boundary["exited_at_ns"] = time.perf_counter_ns()
+
+    class Fake:
+        def root(self) -> None:
+            with self.section("commit", timeout=1.0):
+                self.phase()
+
+        def phase(self) -> None:
+            return None
+
+        def section(self, _name: str, *, timeout: float):
+            assert timeout == 1.0
+            return Section()
+
+    module = SimpleNamespace(Fake=Fake)
+    monkeypatch.setattr(
+        ce3,
+        "PHASE_PROBE_ROOTS",
+        (("fake", "Fake", "root", "commit"),),
+    )
+    monkeypatch.setattr(
+        ce3,
+        "PHASE_PROBE_TARGETS",
+        (("fake", "Fake", "phase"),),
+    )
+    monkeypatch.setattr(
+        ce3,
+        "PHASE_PROBE_CONTEXT_TARGET",
+        ("fake", "Fake", "section"),
+    )
+    monkeypatch.setattr(ce3.importlib, "import_module", lambda _name: module)
+    original_root = Fake.root
+    probe = ce3._SectionPhaseProbe()
+
+    probe.install()
+    try:
+        Fake().phase()
+        assert probe.snapshot()["events"] == []
+        probe.reset()
+        Fake().root()
+        captured = probe.snapshot()
+    finally:
+        probe.uninstall()
+
+    assert Fake.root is original_root
+    assert [event["phase"] for event in captured["events"]] == [
+        "Fake.root",
+        "Fake.section",
+        "Fake.phase",
+    ]
+    assert {event["section_id"] for event in captured["events"]} == {1}
+    assert captured["sections"][0]["scope"] == "commit"
+    assert "commit_section" in captured["sections"][0]
+    assert captured["inclusive_not_additive"] is True
+    context_event = next(
+        event for event in captured["events"] if event["phase"] == "Fake.section"
+    )
+    assert context_event["started_at_ns"] >= boundary["entered_at_ns"]
+    assert context_event["ended_at_ns"] <= boundary["exited_at_ns"]
+
+
+def test_phase_probe_installs_on_the_real_engine_and_captures_auto_checkpoint() -> None:
+    with connect(":memory:", checkpoint_interval_records=1) as database:
+        with database.begin("write") as transaction:
+            transaction.execute(
+                "CREATE NODE TABLE PhaseProbe(id INT64, PRIMARY KEY(id))"
+            )
+        probe = ce3._SectionPhaseProbe()
+        probe.install()
+        try:
+            probe.reset()
+            started = time.perf_counter_ns()
+            with database.begin("write") as transaction:
+                transaction.execute("CREATE (:PhaseProbe {id: 1})")
+            ended = time.perf_counter_ns()
+            captured = probe.snapshot()
+        finally:
+            probe.uninstall()
+
+    assert ce3._phase_probe_capture_valid(
+        captured, started_at_ns=started, ended_at_ns=ended
+    )
+    roots = {event["scope"] for event in captured["events"] if event["root"]}
+    assert roots == {"commit", "checkpoint"}
+
+    reconciled = next(
+        section for section in captured["sections"] if "commit_section" in section
+    )
+    reconciled["commit_section"]["residual_ms"] += 1.0
+    assert not ce3._phase_probe_capture_valid(
+        captured, started_at_ns=started, ended_at_ns=ended
+    )
+
+
+def test_phase_probe_rejects_returned_commit_without_commit_section() -> None:
+    started = 10_000
+    ended = 20_000
+    root_ms = (ended - started) / 1e6
+    root_phase = "TransactionManager._commit_with_writing"
+    capture = {
+        "capture_status": "captured_after_reset",
+        "events": [
+            {
+                "scope": "commit",
+                "section_id": 1,
+                "phase": root_phase,
+                "root": True,
+                "started_at_ns": started,
+                "ended_at_ns": ended,
+                "inclusive_ms": root_ms,
+                "outcome": "returned",
+            }
+        ],
+        "inclusive_totals": {root_phase: {"calls": 1, "inclusive_ms": root_ms}},
+        "sections": [
+            {
+                "scope": "commit",
+                "section_id": 1,
+                "root_ms": root_ms,
+                "covered_ms": 0.0,
+                "residual_ms": root_ms,
+                "residual_ratio": 1.0,
+                "reconciliation_limit": 0.15,
+                "reconciliation_conclusive": False,
+            }
+        ],
+        "inclusive_not_additive": True,
+    }
+
+    assert not ce3._phase_probe_capture_valid(
+        capture, started_at_ns=started, ended_at_ns=ended
+    )
+
+
+def test_phase_probe_evidence_is_required_in_both_instrumented_processes() -> None:
+    result = _scenario_result("instrumented", ce3.SCENARIOS[2])
+    assert ce3._scenario_shortfalls(result) == []
+
+    result["process_b"]["instrumentation"]["phase_probe_installed"].pop()
+    assert (
+        "instrumented_phase_probe_installation_not_proved"
+        in ce3._scenario_shortfalls(result)
+    )
+
+    malformed = _scenario_result("instrumented", ce3.SCENARIOS[2])
+    malformed["process_a"]["samples"][0]["phase_probe"]["events"][0]["phase"] = (
+        "unknown.phase"
+    )
+    assert "instrumented_phase_probe_evidence_incomplete" in ce3._scenario_shortfalls(
+        malformed
+    )
+
+    missing_totals = _scenario_result("instrumented", ce3.SCENARIOS[2])
+    missing_totals["process_a"]["samples"][0]["phase_probe"]["inclusive_totals"] = {}
+    assert "instrumented_phase_probe_evidence_incomplete" in ce3._scenario_shortfalls(
+        missing_totals
+    )
+
+    forged_reconciliation = _scenario_result("instrumented", ce3.SCENARIOS[2])
+    forged_reconciliation["process_b"]["commits"][0]["phase_probe"]["sections"][0][
+        "root_ms"
+    ] = -1.0
+    assert "instrumented_phase_probe_evidence_incomplete" in ce3._scenario_shortfalls(
+        forged_reconciliation
+    )
+
+    raw = _scenario_result("raw", ce3.SCENARIOS[2])
+    raw["process_b"]["commits"][0]["phase_probe"] = _phase_capture(1, 2, 1)
+    assert "raw_samples_contain_phase_probe_output" in ce3._scenario_shortfalls(raw)
+
+
 def test_hook_extraction_does_not_fabricate_zero_valued_presence() -> None:
     extracted = ce3._extract_hooks(
         {
@@ -1188,8 +1525,9 @@ def test_one_good_hook_sample_and_fifty_nine_missing_or_zero_cannot_pass() -> No
                 "observed_hooks": [],
             }
 
-    assert "instrumented_per_operation_hook_evidence_incomplete" in ce3._scenario_shortfalls(
-        result
+    assert (
+        "instrumented_per_operation_hook_evidence_incomplete"
+        in ce3._scenario_shortfalls(result)
     )
 
 
@@ -1216,7 +1554,9 @@ def test_every_scenario_coordinate_is_bound_to_the_canonical_id(
     field: str, location: str
 ) -> None:
     result = _scenario_result("raw", ce3.SCENARIOS[1])
-    target = result["scenario"] if location == "result" else result["process_b"]["scenario"]
+    target = (
+        result["scenario"] if location == "result" else result["process_b"]["scenario"]
+    )
     target[field] = "mutated" if field != "target_rate_per_second" else 7.0
 
     shortfalls = ce3._scenario_shortfalls(result)
@@ -1238,7 +1578,9 @@ def test_scenario_target_rate_type_is_part_of_exact_canonical_equality() -> None
 @pytest.mark.parametrize("location", ["result", "process_b"])
 def test_canonical_scenario_rejects_meaning_as_an_extra_field(location: str) -> None:
     result = _scenario_result("raw", ce3.SCENARIOS[1])
-    target = result["scenario"] if location == "result" else result["process_b"]["scenario"]
+    target = (
+        result["scenario"] if location == "result" else result["process_b"]["scenario"]
+    )
     target["meaning"] = ce3.SCENARIOS[1].meaning
 
     assert f"{location}_scenario_not_canonical" in ce3._scenario_shortfalls(result)
@@ -1247,7 +1589,9 @@ def test_canonical_scenario_rejects_meaning_as_an_extra_field(location: str) -> 
 @pytest.mark.parametrize("location", ["result", "process_b"])
 def test_canonical_scenario_rejects_any_other_extra_field(location: str) -> None:
     result = _scenario_result("raw", ce3.SCENARIOS[1])
-    target = result["scenario"] if location == "result" else result["process_b"]["scenario"]
+    target = (
+        result["scenario"] if location == "result" else result["process_b"]["scenario"]
+    )
     target["extra"] = "forged"
 
     assert f"{location}_scenario_not_canonical" in ce3._scenario_shortfalls(result)
@@ -1401,7 +1745,9 @@ def test_cold_verifier_preserves_structural_success_when_applicable_observer_fai
     assert payload["whole_profile_observation"]["failure"]["type"] == "GateFailure"
 
 
-def test_incomplete_profile_observation_is_not_applicable_but_never_passes_gate() -> None:
+def test_incomplete_profile_observation_is_not_applicable_but_never_passes_gate() -> (
+    None
+):
     result = _scenario_result("raw", ce3.SCENARIOS[2])
     result["process_a"].update(status="failed", postconditions_passed=0)
     del result["process_a"]["samples"]
@@ -1478,16 +1824,16 @@ def test_live_verify_must_finish_before_both_measured_handles_close() -> None:
     result = _scenario_result("raw", ce3.SCENARIOS[0])
     result["process_b"]["handle"]["closed_at_ns"] = 20_150_000_000
 
-    assert "live_verify_not_inside_open_handle_window" in ce3._scenario_shortfalls(result)
+    assert "live_verify_not_inside_open_handle_window" in ce3._scenario_shortfalls(
+        result
+    )
 
 
 @pytest.mark.parametrize(
     "mutation",
     [
         lambda report: report["finalization"].update(errors=None),
-        lambda report: report["provenance"]["identity"]["start"].update(
-            tool=[]
-        ),
+        lambda report: report["provenance"]["identity"]["start"].update(tool=[]),
         lambda report: report["provenance"]["source_provenance"].update(
             semantic_checks=None
         ),
@@ -1517,16 +1863,49 @@ def test_official_shortfalls_is_total_over_malformed_nested_evidence(
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [
-        (lambda value: value["provenance"].update(operation_set_sha256="wrong"), "logical_pf5_digest_mismatch"),
-        (lambda value: value["provenance"]["harness"].update(profile_blob="wrong"), "harness_pin_mismatch"),
-        (lambda value: value["provenance"]["source_workspace"].update(expected_sha256="wrong"), "source_workspace_not_authenticated"),
-        (lambda value: value["provenance"]["source_provenance"].update(expected_sha256="wrong"), "source_provenance_not_authenticated"),
-        (lambda value: value.update(source_unchanged_after_run=False), "source_workspace_changed"),
-        (lambda value: value["machine"].update(machine_idle_asserted=False), "machine_idle_not_asserted"),
-        (lambda value: value["machine"]["before"].update(cpu_percent=99.0), "machine_idle_sample_failed"),
-        (lambda value: value["provenance"]["environment"].update(accel_ready=False), "accel_environment_not_proved"),
+        (
+            lambda value: value["provenance"].update(operation_set_sha256="wrong"),
+            "logical_pf5_digest_mismatch",
+        ),
+        (
+            lambda value: value["provenance"]["harness"].update(profile_blob="wrong"),
+            "harness_pin_mismatch",
+        ),
+        (
+            lambda value: value["provenance"]["source_workspace"].update(
+                expected_sha256="wrong"
+            ),
+            "source_workspace_not_authenticated",
+        ),
+        (
+            lambda value: value["provenance"]["source_provenance"].update(
+                expected_sha256="wrong"
+            ),
+            "source_provenance_not_authenticated",
+        ),
+        (
+            lambda value: value.update(source_unchanged_after_run=False),
+            "source_workspace_changed",
+        ),
+        (
+            lambda value: value["machine"].update(machine_idle_asserted=False),
+            "machine_idle_not_asserted",
+        ),
+        (
+            lambda value: value["machine"]["before"].update(cpu_percent=99.0),
+            "machine_idle_sample_failed",
+        ),
+        (
+            lambda value: value["provenance"]["environment"].update(accel_ready=False),
+            "accel_environment_not_proved",
+        ),
         (lambda value: value["results"].pop(), "raw_instrumented_matrix_incomplete"),
-        (lambda value: value["results"][1].update(copy_id=value["results"][0]["copy_id"]), "raw_and_instrumented_copies_not_distinct"),
+        (
+            lambda value: value["results"][1].update(
+                copy_id=value["results"][0]["copy_id"]
+            ),
+            "raw_and_instrumented_copies_not_distinct",
+        ),
     ],
 )
 def test_official_report_mutations_cannot_false_pass(mutation, expected: str) -> None:
@@ -1542,9 +1921,9 @@ def test_official_report_mutations_cannot_false_pass(mutation, expected: str) ->
     ("mutation", "expected"),
     [
         (
-            lambda value: value["provenance"]["environment"]["official_baseline_checks"].update(
-                python_3_13_1=False
-            ),
+            lambda value: value["provenance"]["environment"][
+                "official_baseline_checks"
+            ].update(python_3_13_1=False),
             "official_environment_baseline_mismatch",
         ),
         (
@@ -1572,15 +1951,15 @@ def test_official_report_mutations_cannot_false_pass(mutation, expected: str) ->
             "child_environment_differs_from_launcher",
         ),
         (
-            lambda value: value["provenance"]["environment"]["official_baseline"].update(
-                numpy="2.5.0"
-            ),
+            lambda value: value["provenance"]["environment"][
+                "official_baseline"
+            ].update(numpy="2.5.0"),
             "official_environment_baseline_mismatch",
         ),
         (
-            lambda value: value["provenance"]["environment"]["official_baseline"].update(
-                ladybug="0.15.0"
-            ),
+            lambda value: value["provenance"]["environment"][
+                "official_baseline"
+            ].update(ladybug="0.15.0"),
             "official_environment_baseline_mismatch",
         ),
         (
@@ -1614,14 +1993,16 @@ def test_official_report_mutations_cannot_false_pass(mutation, expected: str) ->
             "executor_identity_not_pinned",
         ),
         (
-            lambda value: value["results"][0]["process_a"]["handle"]["environment"].update(
-                python_executable_sha256="other-executor"
-            ),
+            lambda value: value["results"][0]["process_a"]["handle"][
+                "environment"
+            ].update(python_executable_sha256="other-executor"),
             "child_executor_differs_from_launcher",
         ),
     ],
 )
-def test_environment_and_end_identity_mutations_are_fail_closed(mutation, expected: str) -> None:
+def test_environment_and_end_identity_mutations_are_fail_closed(
+    mutation, expected: str
+) -> None:
     report = _official_report()
     assert ce3.official_shortfalls(report) == []
 
@@ -1630,20 +2011,22 @@ def test_environment_and_end_identity_mutations_are_fail_closed(mutation, expect
     assert expected in ce3.official_shortfalls(report)
 
 
-def test_child_environment_observed_versions_cannot_disagree_with_asserted_checks() -> None:
+def test_child_environment_observed_versions_cannot_disagree_with_asserted_checks() -> (
+    None
+):
     result = _scenario_result("raw", ce3.SCENARIOS[0])
-    result["process_a"]["handle"]["environment"]["modules"]["ladybug"][
-        "version"
-    ] = "0.15.0"
+    result["process_a"]["handle"]["environment"]["modules"]["ladybug"]["version"] = (
+        "0.15.0"
+    )
 
     assert "child_official_environment_mismatch" in ce3._scenario_shortfalls(result)
 
 
 def test_child_module_origins_must_agree_with_each_other() -> None:
     result = _scenario_result("raw", ce3.SCENARIOS[0])
-    result["process_a"]["handle"]["environment"]["modules"]["numpy"][
-        "origin"
-    ] = "forged-origin"
+    result["process_a"]["handle"]["environment"]["modules"]["numpy"]["origin"] = (
+        "forged-origin"
+    )
 
     assert "child_environment_identity_disagrees" in ce3._scenario_shortfalls(result)
 
@@ -1665,7 +2048,9 @@ def test_content_digest_authenticates_names_sizes_and_bytes(tmp_path: Path) -> N
     assert before["files"] == changed_name["files"] == 1
 
 
-def test_source_provenance_is_semantically_bound_to_board_and_pf5(tmp_path: Path) -> None:
+def test_source_provenance_is_semantically_bound_to_board_and_pf5(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "board.bin").write_bytes(b"board")
@@ -1710,13 +2095,19 @@ def test_raw_hook_guard_has_a_pinned_semantic_ast_digest() -> None:
 
     assert evidence == {
         "status": "passed",
-        "semantic": "if-body\nhooks is not None\nhooks.install()",
+        "semantic": (
+            "_run_process_a_async\nif-body\nhooks is not None\nhooks.install()\n"
+            "_run_process_a_async\nif-body\nhooks is not None\nphase_probe.install()\n"
+            "_run_process_b_async\nif-body\ninstrumented\nphase_probe.install()"
+        ),
         "sha256": ce3.RAW_HOOK_GUARD_SHA256,
         "expected_sha256": ce3.RAW_HOOK_GUARD_SHA256,
     }
 
 
-def test_mutant_moving_install_outside_the_raw_guard_is_rejected(tmp_path: Path) -> None:
+def test_mutant_moving_install_outside_the_raw_guard_is_rejected(
+    tmp_path: Path,
+) -> None:
     source = Path(ce3.__file__).read_text(encoding="utf-8")
     guarded = (
         "        if hooks is not None:\n"
@@ -1736,7 +2127,9 @@ def test_mutant_moving_install_outside_the_raw_guard_is_rejected(tmp_path: Path)
         ce3.raw_hook_guard_ast_evidence(mutated)
 
 
-def test_mutant_installing_hooks_in_the_guard_else_branch_is_rejected(tmp_path: Path) -> None:
+def test_mutant_installing_hooks_in_the_guard_else_branch_is_rejected(
+    tmp_path: Path,
+) -> None:
     source = Path(ce3.__file__).read_text(encoding="utf-8")
     guarded = (
         "        if hooks is not None:\n"
@@ -1756,4 +2149,41 @@ def test_mutant_installing_hooks_in_the_guard_else_branch_is_rejected(tmp_path: 
     mutated.write_text(source.replace(guarded, mutant), encoding="utf-8")
 
     with pytest.raises(ce3.MeasurementRefused, match="positive body"):
+        ce3.raw_hook_guard_ast_evidence(mutated)
+
+
+@pytest.mark.parametrize(
+    ("guard", "replacement"),
+    (
+        (
+            "        if hooks is not None:\n"
+            "            hooks.install()\n"
+            "            installed_hooks = _installed_required_hooks(hooks)\n",
+            "        phase_probe = _SectionPhaseProbe()\n"
+            "        phase_probe.install()\n"
+            "        if hooks is not None:\n"
+            "            hooks.install()\n"
+            "            installed_hooks = _installed_required_hooks(hooks)\n",
+        ),
+        (
+            "        if instrumented:\n"
+            "            phase_probe = _SectionPhaseProbe()\n"
+            "            phase_probe.install()\n",
+            "        phase_probe = _SectionPhaseProbe()\n"
+            "        phase_probe.install()\n"
+            "        if instrumented:\n",
+        ),
+    ),
+)
+def test_mutant_moving_phase_probe_outside_raw_guard_is_rejected(
+    tmp_path: Path, guard: str, replacement: str
+) -> None:
+    source = Path(ce3.__file__).read_text(encoding="utf-8")
+    assert source.count(guard) == 1
+    mutated = tmp_path / "measure_m7_ce3_phase_mutant.py"
+    mutated.write_text(source.replace(guard, replacement), encoding="utf-8")
+
+    with pytest.raises(
+        ce3.MeasurementRefused, match="not nested under an if guard|needs exactly one"
+    ):
         ce3.raw_hook_guard_ast_evidence(mutated)

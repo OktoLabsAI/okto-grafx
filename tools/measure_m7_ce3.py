@@ -5,8 +5,9 @@ process A runs all twelve M-PULSE-7 families on a continuously open, warm Grafx 
 process B either keeps an idle handle open or commits small writes in the same (``Decision``) or
 an unrelated (``Assumption``) table at an aggregate target of 1/s or 10/s.
 
-The RAW and instrumented passes always use different copies.  Only the instrumented A process
-installs the versioned H8 hooks; RAW therefore contains no monkeypatch, profiler or phase timer.
+The RAW and instrumented passes always use different copies.  Only instrumented process A
+installs the versioned H8 hooks; both instrumented participants install the F2/CN-2 commit and
+checkpoint phase probe.  RAW therefore contains no monkeypatch, profiler or phase timer.
 Every official input and every copy is authenticated, every operation is checked through the
 versioned harness postcondition, and every resulting database is cold-opened for ``verify(all)``.
 No measured handle is reopened.  A retryable, pre-durable ``GraphLockContention`` retries the
@@ -21,11 +22,13 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import functools
 import hashlib
 import importlib
 import importlib.metadata
 import importlib.util
 import json
+import math
 import multiprocessing
 import os
 import platform
@@ -37,12 +40,13 @@ import sys
 import tempfile
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable, Mapping, Sequence
 
-SCHEMA = "okto-grafx.ce3-m7-multiprocess.v3"
+SCHEMA = "okto-grafx.ce3-m7-multiprocess.v4"
 PINNED_HARNESS_HEAD = "0dfb5269dd8531fd4db2679fc80b649c64bd9b09"
 PINNED_HARNESS_BLOB = "a02b86dce098ceec3fdbd10a820a4dd6f9e2a7b1"
 EXPECTED_OPERATION_SET_SHA256 = (
@@ -67,13 +71,78 @@ REQUIRED_HOOKS = (
     "LocalStorageDevice._still_names",
     "BufferPool._invalidate",
 )
+PHASE_PROBE_ROOTS = (
+    (
+        "okto_grafx.engine.txn_manager",
+        "TransactionManager",
+        "_commit_with_writing",
+        "commit",
+    ),
+    (
+        "okto_grafx.engine.txn_manager",
+        "TransactionManager",
+        "_checkpoint_in_section",
+        "checkpoint",
+    ),
+)
+PHASE_PROBE_TARGETS = (
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_hold_lease"),
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_complete_committed_gap"),
+    (
+        "okto_grafx.engine.txn_manager",
+        "TransactionManager",
+        "_redo_onto_device",
+    ),
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_establish_read_view"),
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_find_conflict"),
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_reserve_identity_plan"),
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_write_rows"),
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_build_records"),
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_retarget_commit_batch"),
+    ("okto_grafx.engine.wal_manager", "WalManager", "append_many"),
+    ("okto_grafx.engine.wal_manager", "WalManager", "barrier"),
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_apply_images"),
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_apply_index_changes"),
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_publish_commit_state"),
+    ("okto_grafx.engine.buffer_pool", "BufferPool", "checkpoint"),
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_publish"),
+    ("okto_grafx.engine.wal_manager", "WalManager", "recycle"),
+    ("okto_grafx.engine.index_manager", "IndexManager", "table_watermark_photo"),
+    ("okto_grafx.engine.index_manager", "IndexManager", "check_replay_floor"),
+    ("okto_grafx.engine.index_manager", "IndexManager", "mark_built_through"),
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_release_reader"),
+    ("okto_grafx.engine.txn_manager", "TransactionManager", "_drop_lease"),
+)
+PHASE_PROBE_CONTEXT_TARGET = (
+    "okto_grafx.engine.txn_manager",
+    "TransactionManager",
+    "_coordinator_section",
+)
+
+
+def _phase_name(owner: str, method: str) -> str:
+    return f"{owner}.{method}"
+
+
+PHASE_PROBE_HOOKS = (
+    tuple(
+        _phase_name(owner, method)
+        for _module, owner, method, _scope in PHASE_PROBE_ROOTS
+    )
+    + tuple(
+        _phase_name(owner, method) for _module, owner, method in PHASE_PROBE_TARGETS
+    )
+    + (_phase_name(PHASE_PROBE_CONTEXT_TARGET[1], PHASE_PROBE_CONTEXT_TARGET[2]),)
+)
 OFFICIAL_PER_FAMILY = 5
 OFFICIAL_RATE_TOLERANCE = 0.25
 DEFAULT_CHILD_TIMEOUT_SECONDS = 1800.0
 OFFICIAL_PYTHON_VERSION = "3.13.1"
 OFFICIAL_NUMPY_VERSION = "2.5.1"
 OFFICIAL_LADYBUG_VERSION = "0.16.0"
-RAW_HOOK_GUARD_SHA256 = "a1f1e7f4cdb544a0d74a99168a04790dd32810906c9a695c7cbcb48d24a9e870"
+RAW_HOOK_GUARD_SHA256 = (
+    "395a173ed3c00376a7d58c2e6981bfca8dfe8d86cff2cfe3bf038fbcae3c7d37"
+)
 TOOL_RELATIVE_PATH = "tools/measure_m7_ce3.py"
 MAX_OPERATION_ATTEMPTS = 60
 RETRY_BACKOFF_BASE_SECONDS = 0.08
@@ -134,6 +203,321 @@ SCENARIOS = (
 )
 
 
+class _SectionPhaseProbe:
+    """Time commit/checkpoint phases only while an instrumented root is active.
+
+    The probe lives entirely in this measurement process.  It neither registers product metrics
+    nor changes the RAW pass.  Absolute ``perf_counter_ns`` stamps use the same clock already used
+    to correlate process A and B, while ``section_id`` groups nested events without pretending
+    inclusive durations are additive.
+    """
+
+    def __init__(self) -> None:
+        self._active: list[tuple[str, int]] = []
+        self._events: list[dict[str, Any]] = []
+        self._installed: list[str] = []
+        self._next_section_id = 1
+        self._restore: list[tuple[Any, str, Any]] = []
+
+    @property
+    def installed(self) -> tuple[str, ...]:
+        return tuple(self._installed)
+
+    def install(self) -> None:
+        if self._restore:
+            raise MeasurementRefused("the phase probe is already installed")
+        try:
+            for module_name, owner_name, method, scope in PHASE_PROBE_ROOTS:
+                owner = getattr(importlib.import_module(module_name), owner_name)
+                self._install_root(owner, owner_name, method, scope)
+            for module_name, owner_name, method in PHASE_PROBE_TARGETS:
+                owner = getattr(importlib.import_module(module_name), owner_name)
+                self._install_phase(owner, owner_name, method)
+            module_name, owner_name, method = PHASE_PROBE_CONTEXT_TARGET
+            owner = getattr(importlib.import_module(module_name), owner_name)
+            self._install_context(owner, owner_name, method)
+        except BaseException:
+            self.uninstall()
+            raise
+
+    def _install_root(
+        self, owner: Any, owner_name: str, method: str, scope: str
+    ) -> None:
+        original = getattr(owner, method)
+        phase = _phase_name(owner_name, method)
+        probe = self
+
+        @functools.wraps(original)
+        def measured(instance: Any, *args: Any, **kwargs: Any) -> Any:
+            section_id = probe._next_section_id
+            probe._next_section_id += 1
+            probe._active.append((scope, section_id))
+            started = time.perf_counter_ns()
+            outcome = "returned"
+            failure_type: str | None = None
+            try:
+                return original(instance, *args, **kwargs)
+            except BaseException as failure:
+                outcome = "raised"
+                failure_type = type(failure).__name__
+                raise
+            finally:
+                ended = time.perf_counter_ns()
+                probe._active.pop()
+                probe._record(
+                    scope,
+                    section_id,
+                    phase,
+                    started,
+                    ended,
+                    outcome,
+                    failure_type=failure_type,
+                    root=True,
+                )
+
+        self._restore.append((owner, method, original))
+        setattr(owner, method, measured)
+        self._installed.append(phase)
+
+    def _install_phase(self, owner: Any, owner_name: str, method: str) -> None:
+        original = getattr(owner, method)
+        phase = _phase_name(owner_name, method)
+        probe = self
+
+        @functools.wraps(original)
+        def measured(instance: Any, *args: Any, **kwargs: Any) -> Any:
+            if not probe._active:
+                return original(instance, *args, **kwargs)
+            scope, section_id = probe._active[-1]
+            started = time.perf_counter_ns()
+            outcome = "returned"
+            failure_type: str | None = None
+            try:
+                return original(instance, *args, **kwargs)
+            except BaseException as failure:
+                outcome = "raised"
+                failure_type = type(failure).__name__
+                raise
+            finally:
+                probe._record(
+                    scope,
+                    section_id,
+                    phase,
+                    started,
+                    time.perf_counter_ns(),
+                    outcome,
+                    failure_type=failure_type,
+                )
+
+        self._restore.append((owner, method, original))
+        setattr(owner, method, measured)
+        self._installed.append(phase)
+
+    def _install_context(self, owner: Any, owner_name: str, method: str) -> None:
+        original = getattr(owner, method)
+        phase = _phase_name(owner_name, method)
+        probe = self
+
+        @functools.wraps(original)
+        def measured(instance: Any, *args: Any, **kwargs: Any) -> Any:
+            section = original(instance, *args, **kwargs)
+            if not probe._active:
+                return section
+            scope, section_id = probe._active[-1]
+            raw_name = args[0] if args else kwargs.get("name")
+            detail = raw_name if isinstance(raw_name, str) else type(raw_name).__name__
+
+            @contextmanager
+            def timed_section() -> Iterable[Any]:
+                with section as entered:
+                    started = time.perf_counter_ns()
+                    outcome = "returned"
+                    failure_type: str | None = None
+                    try:
+                        yield entered
+                    except BaseException as failure:
+                        outcome = "raised"
+                        failure_type = type(failure).__name__
+                        raise
+                    finally:
+                        probe._record(
+                            scope,
+                            section_id,
+                            phase,
+                            started,
+                            time.perf_counter_ns(),
+                            outcome,
+                            failure_type=failure_type,
+                            detail=detail,
+                        )
+
+            return timed_section()
+
+        self._restore.append((owner, method, original))
+        setattr(owner, method, measured)
+        self._installed.append(phase)
+
+    def _record(
+        self,
+        scope: str,
+        section_id: int,
+        phase: str,
+        started: int,
+        ended: int,
+        outcome: str,
+        *,
+        failure_type: str | None = None,
+        root: bool = False,
+        detail: str | None = None,
+    ) -> None:
+        event: dict[str, Any] = {
+            "scope": scope,
+            "section_id": section_id,
+            "phase": phase,
+            "root": root,
+            "started_at_ns": started,
+            "ended_at_ns": ended,
+            "inclusive_ms": (ended - started) / 1e6,
+            "outcome": outcome,
+        }
+        if failure_type is not None:
+            event["failure_type"] = failure_type
+        if detail is not None:
+            event["detail"] = detail
+        self._events.append(event)
+
+    def reset(self) -> None:
+        if self._active:
+            raise MeasurementRefused(
+                "cannot reset a phase probe inside an active section"
+            )
+        self._events.clear()
+
+    def snapshot(self) -> dict[str, Any]:
+        events = sorted(
+            (dict(event) for event in self._events),
+            key=lambda event: (
+                int(event["started_at_ns"]),
+                -int(event["ended_at_ns"]),
+                str(event["phase"]),
+            ),
+        )
+        totals: dict[str, dict[str, float | int]] = {}
+        for event in events:
+            phase = str(event["phase"])
+            bucket = totals.setdefault(phase, {"calls": 0, "inclusive_ms": 0.0})
+            bucket["calls"] = int(bucket["calls"]) + 1
+            bucket["inclusive_ms"] = float(bucket["inclusive_ms"]) + float(
+                event["inclusive_ms"]
+            )
+        sections: list[dict[str, Any]] = []
+        for root in (event for event in events if event["root"]):
+            children = [
+                event
+                for event in events
+                if not event["root"]
+                and event["scope"] == root["scope"]
+                and event["section_id"] == root["section_id"]
+            ]
+            covered = self._union_ns(
+                children,
+                lower=int(root["started_at_ns"]),
+                upper=int(root["ended_at_ns"]),
+            )
+            duration = int(root["ended_at_ns"]) - int(root["started_at_ns"])
+            residual = max(0, duration - covered)
+            section: dict[str, Any] = {
+                "scope": root["scope"],
+                "section_id": root["section_id"],
+                "root_ms": duration / 1e6,
+                "covered_ms": covered / 1e6,
+                "residual_ms": residual / 1e6,
+                "residual_ratio": residual / duration if duration else 0.0,
+                "reconciliation_limit": 0.15,
+                "reconciliation_conclusive": bool(
+                    duration and residual / duration <= 0.15
+                ),
+            }
+            commit_contexts = [
+                event
+                for event in children
+                if event["phase"]
+                == _phase_name(
+                    PHASE_PROBE_CONTEXT_TARGET[1], PHASE_PROBE_CONTEXT_TARGET[2]
+                )
+                and event.get("detail") == "commit"
+            ]
+            if commit_contexts:
+                context = max(
+                    commit_contexts,
+                    key=lambda event: (
+                        int(event["ended_at_ns"]) - int(event["started_at_ns"])
+                    ),
+                )
+                body_children = [event for event in children if event is not context]
+                body_covered = self._union_ns(
+                    body_children,
+                    lower=int(context["started_at_ns"]),
+                    upper=int(context["ended_at_ns"]),
+                )
+                body_duration = int(context["ended_at_ns"]) - int(
+                    context["started_at_ns"]
+                )
+                body_residual = max(0, body_duration - body_covered)
+                section["commit_section"] = {
+                    "root_ms": body_duration / 1e6,
+                    "covered_ms": body_covered / 1e6,
+                    "residual_ms": body_residual / 1e6,
+                    "residual_ratio": (
+                        body_residual / body_duration if body_duration else 0.0
+                    ),
+                    "reconciliation_limit": 0.15,
+                    "reconciliation_conclusive": bool(
+                        body_duration and body_residual / body_duration <= 0.15
+                    ),
+                }
+            sections.append(section)
+        return {
+            "capture_status": "captured_after_reset",
+            "events": events,
+            "inclusive_totals": totals,
+            "sections": sections,
+            "inclusive_not_additive": True,
+        }
+
+    @staticmethod
+    def _union_ns(
+        events: Sequence[Mapping[str, Any]], *, lower: int, upper: int
+    ) -> int:
+        intervals = sorted(
+            (
+                max(lower, int(event["started_at_ns"])),
+                min(upper, int(event["ended_at_ns"])),
+            )
+            for event in events
+            if int(event["ended_at_ns"]) > lower and int(event["started_at_ns"]) < upper
+        )
+        covered = 0
+        cursor_start = cursor_end = lower
+        for started, ended in intervals:
+            if ended <= started:
+                continue
+            if started > cursor_end:
+                covered += cursor_end - cursor_start
+                cursor_start, cursor_end = started, ended
+            else:
+                cursor_end = max(cursor_end, ended)
+        covered += cursor_end - cursor_start
+        return max(0, covered)
+
+    def uninstall(self) -> None:
+        for owner, method, original in reversed(self._restore):
+            setattr(owner, method, original)
+        self._restore.clear()
+        self._installed.clear()
+        self._active.clear()
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -151,7 +535,9 @@ def content_digest(root: Path) -> dict[str, Any]:
     outer = hashlib.sha256()
     files = 0
     total = 0
-    for path in sorted(candidate for candidate in resolved.rglob("*") if candidate.is_file()):
+    for path in sorted(
+        candidate for candidate in resolved.rglob("*") if candidate.is_file()
+    ):
         size = path.stat().st_size
         inner = _sha256_file(path)
         relative = path.relative_to(resolved).as_posix()
@@ -187,7 +573,9 @@ def checkout_evidence(
 
     resolved = repo.resolve()
     head = _git(resolved, "rev-parse", "HEAD")
-    dirty = [line for line in _git(resolved, "status", "--porcelain").splitlines() if line]
+    dirty = [
+        line for line in _git(resolved, "status", "--porcelain").splitlines() if line
+    ]
     if dirty:
         raise MeasurementRefused(
             f"{name} checkout is dirty ({len(dirty)} entries; first={dirty[:4]}): {resolved}"
@@ -206,63 +594,87 @@ def checkout_evidence(
 
 
 def raw_hook_guard_ast_evidence(path: Path) -> dict[str, Any]:
-    """Pin the semantic guard that keeps Hooks.install unreachable in RAW."""
+    """Pin every semantic guard that keeps instrumentation unreachable in RAW."""
 
     source = path.resolve().read_text(encoding="utf-8")
     tree = ast.parse(source)
-    function = next(
-        (
-            node
-            for node in tree.body
-            if isinstance(node, ast.AsyncFunctionDef)
-            and node.name == "_run_process_a_async"
-        ),
-        None,
+    specifications = (
+        ("_run_process_a_async", "hooks", "hooks is not None"),
+        ("_run_process_a_async", "phase_probe", "hooks is not None"),
+        ("_run_process_b_async", "phase_probe", "instrumented"),
     )
-    if function is None:
-        raise MeasurementRefused("_run_process_a_async is missing from the launcher AST")
-    parents = {
-        child: parent for parent in ast.walk(function) for child in ast.iter_child_nodes(parent)
-    }
-    installs = [
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "hooks"
-        and node.func.attr == "install"
-    ]
-    if len(installs) != 1:
-        raise MeasurementRefused(
-            f"RAW hook guard needs exactly one hooks.install call; found {len(installs)}"
+    semantics: list[str] = []
+    for function_name, receiver, expected_guard in specifications:
+        function = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == function_name
+            ),
+            None,
         )
-    install = installs[0]
-    ancestor = parents.get(install)
-    guarded_by: ast.If | None = None
-    while ancestor is not None:
-        if isinstance(ancestor, ast.If):
-            guarded_by = ancestor
-            break
-        ancestor = parents.get(ancestor)
-    if guarded_by is None:
-        raise MeasurementRefused("hooks.install is not nested under an if guard")
-    branch_node: ast.AST = install
-    while parents.get(branch_node) is not guarded_by:
-        parent = parents.get(branch_node)
-        if parent is None:
-            raise MeasurementRefused("cannot bind hooks.install to its guarding branch")
-        branch_node = parent
-    if branch_node not in guarded_by.body:
-        raise MeasurementRefused("hooks.install is not in the positive body of its guard")
-    semantic = f"if-body\n{ast.unparse(guarded_by.test)}\n{ast.unparse(install)}"
+        if function is None:
+            raise MeasurementRefused(
+                f"{function_name} is missing from the launcher AST"
+            )
+        parents = {
+            child: parent
+            for parent in ast.walk(function)
+            for child in ast.iter_child_nodes(parent)
+        }
+        installs = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == receiver
+            and node.func.attr == "install"
+        ]
+        if len(installs) != 1:
+            raise MeasurementRefused(
+                f"RAW guard needs exactly one {receiver}.install call in {function_name}; "
+                f"found {len(installs)}"
+            )
+        install = installs[0]
+        ancestor = parents.get(install)
+        guarded_by: ast.If | None = None
+        while ancestor is not None:
+            if isinstance(ancestor, ast.If):
+                guarded_by = ancestor
+                break
+            ancestor = parents.get(ancestor)
+        if guarded_by is None:
+            raise MeasurementRefused(
+                f"{receiver}.install is not nested under an if guard"
+            )
+        branch_node: ast.AST = install
+        while parents.get(branch_node) is not guarded_by:
+            parent = parents.get(branch_node)
+            if parent is None:
+                raise MeasurementRefused(
+                    f"cannot bind {receiver}.install to its guarding branch"
+                )
+            branch_node = parent
+        if branch_node not in guarded_by.body:
+            raise MeasurementRefused(
+                f"{receiver}.install is not in the positive body of its guard"
+            )
+        guard = ast.unparse(guarded_by.test)
+        call = ast.unparse(install)
+        expected_call = f"{receiver}.install()"
+        if guard != expected_guard or call != expected_call:
+            raise MeasurementRefused(
+                f"RAW guard changed for {function_name}:{receiver}: "
+                f"guard={guard!r}, call={call!r}"
+            )
+        semantics.append(f"{function_name}\nif-body\n{guard}\n{call}")
+    semantic = "\n".join(semantics)
     digest = hashlib.sha256(semantic.encode()).hexdigest()
-    if (
-        semantic != "if-body\nhooks is not None\nhooks.install()"
-        or digest != RAW_HOOK_GUARD_SHA256
-    ):
+    if digest != RAW_HOOK_GUARD_SHA256:
         raise MeasurementRefused(
-            f"RAW hook guard semantic digest {digest} != pinned {RAW_HOOK_GUARD_SHA256}"
+            f"RAW instrumentation guard semantic digest {digest} != pinned "
+            f"{RAW_HOOK_GUARD_SHA256}"
         )
     return {
         "status": "passed",
@@ -413,9 +825,7 @@ def _load_harness(config: Mapping[str, Any]) -> ModuleType:
     head = _git(harness_repo, "rev-parse", "HEAD")
     blob = _git(harness_repo, "hash-object", str(profile))
     if head != PINNED_HARNESS_HEAD:
-        raise MeasurementRefused(
-            f"harness HEAD {head} != frozen {PINNED_HARNESS_HEAD}"
-        )
+        raise MeasurementRefused(f"harness HEAD {head} != frozen {PINNED_HARNESS_HEAD}")
     if blob != PINNED_HARNESS_BLOB:
         raise MeasurementRefused(
             f"profile_m7_families.py blob {blob} != frozen {PINNED_HARNESS_BLOB}"
@@ -455,7 +865,10 @@ def _runtime(config: Mapping[str, Any]) -> tuple[Any, Any, Any, Any, dict[str, A
             f"harness families changed: {tuple(families)!r} != {EXPECTED_FAMILIES!r}"
         )
     plan = {
-        family: [fixtures.measured(family, index) for index in range(int(config["per_family"]))]
+        family: [
+            fixtures.measured(family, index)
+            for index in range(int(config["per_family"]))
+        ]
         for family in families
     }
     digest = harness._plan_digest(plan, families, "scope")
@@ -463,13 +876,21 @@ def _runtime(config: Mapping[str, Any]) -> tuple[Any, Any, Any, Any, dict[str, A
         raise MeasurementRefused(
             f"logical operation set {digest} != frozen pf5 {EXPECTED_OPERATION_SET_SHA256}"
         )
-    return harness, runner, backends, fixtures, {"families": families, "plan": plan, "digest": digest}
+    return (
+        harness,
+        runner,
+        backends,
+        fixtures,
+        {"families": families, "plan": plan, "digest": digest},
+    )
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8"
+    )
     temporary.replace(path)
 
 
@@ -507,7 +928,9 @@ def _barrier_wait(barrier: Any, timeout_seconds: float) -> int:
     try:
         return int(barrier.wait(timeout=timeout_seconds))
     except BaseException as failure:
-        raise MeasurementRefused(f"spawn barrier failed: {type(failure).__name__}: {failure}") from failure
+        raise MeasurementRefused(
+            f"spawn barrier failed: {type(failure).__name__}: {failure}"
+        ) from failure
 
 
 async def _open_warm(
@@ -520,9 +943,7 @@ async def _open_warm(
     backend, context = await harness._open_backend(runner, backends, "grafx", workspace)
     await harness._read_rows(backend, "MATCH (m:BoardMeta) RETURN m.board_id", {})
     origins = {
-        "okto_grafx": _require_module_origin(
-            "okto_grafx", Path(harness.GRAFX)
-        ),
+        "okto_grafx": _require_module_origin("okto_grafx", Path(harness.GRAFX)),
         "okto_pulse.community": _require_module_origin(
             "okto_pulse.community", Path(harness.COMMUNITY)
         ),
@@ -537,13 +958,17 @@ async def _open_warm(
         raise MeasurementRefused(
             f"[accel] was requested but the opened database installed checksum={checksum!r}"
         )
-    return backend, context, {
-        "opened_at_ns": opened_at,
-        "warm_completed_at_ns": time.perf_counter_ns(),
-        "imports": origins,
-        "checksum_implementation": checksum,
-        "environment": _environment(),
-    }
+    return (
+        backend,
+        context,
+        {
+            "opened_at_ns": opened_at,
+            "warm_completed_at_ns": time.perf_counter_ns(),
+            "imports": origins,
+            "checksum_implementation": checksum,
+            "environment": _environment(),
+        },
+    )
 
 
 def _extract_hooks(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -595,7 +1020,9 @@ def _failure_chain_evidence(failure: BaseException) -> list[dict[str, Any]]:
                 "code": getattr(candidate, "code", None),
                 "retryable": getattr(candidate, "retryable", None),
                 "details": dict(details) if isinstance(details, Mapping) else None,
-                "notes": [str(note) for note in notes] if isinstance(notes, (list, tuple)) else [],
+                "notes": [str(note) for note in notes]
+                if isinstance(notes, (list, tuple))
+                else [],
                 "message": str(candidate),
             }
         )
@@ -616,9 +1043,7 @@ def _retryable_contention(failure: BaseException) -> BaseException | None:
     ``GrafxWriteConflict`` and the adapter's machine-readable mapping agrees with it.
     """
 
-    graph_errors = importlib.import_module(
-        "okto_pulse.core.kg.interfaces.graph_errors"
-    )
+    graph_errors = importlib.import_module("okto_pulse.core.kg.interfaces.graph_errors")
     grafx_errors = importlib.import_module("okto_grafx.errors")
     contention_type = graph_errors.GraphLockContention
     write_conflict_type = grafx_errors.GrafxWriteConflict
@@ -636,7 +1061,9 @@ def _retryable_contention(failure: BaseException) -> BaseException | None:
         ):
             return None
 
-    contentions = [candidate for candidate in chain if isinstance(candidate, contention_type)]
+    contentions = [
+        candidate for candidate in chain if isinstance(candidate, contention_type)
+    ]
     write_conflicts = [
         candidate for candidate in chain if isinstance(candidate, write_conflict_type)
     ]
@@ -782,6 +1209,8 @@ async def _run_process_a_async(
     barrier_passed = False
     handle: dict[str, Any] = {}
     installed_hooks: list[str] = []
+    phase_probe: _SectionPhaseProbe | None = None
+    installed_phase_hooks: list[str] = []
     retryable_refusals: list[dict[str, Any]] = []
     randomizer = _retry_randomizer(config["copy_id"], "A")
     try:
@@ -792,6 +1221,14 @@ async def _run_process_a_async(
                 raise MeasurementRefused(
                     f"instrumented hook installation incomplete: {installed_hooks!r}"
                 )
+            phase_probe = _SectionPhaseProbe()
+            phase_probe.install()
+            installed_phase_hooks = list(phase_probe.installed)
+            if tuple(installed_phase_hooks) != PHASE_PROBE_HOOKS:
+                raise MeasurementRefused(
+                    "instrumented phase-probe installation incomplete: "
+                    f"{installed_phase_hooks!r}"
+                )
         backend, context, handle = await _open_warm(
             harness, runner, backends, workspace
         )
@@ -799,7 +1236,9 @@ async def _run_process_a_async(
         barrier_passed = True
         active_start = time.perf_counter_ns()
         for family in plan_info["families"]:
-            for index, (operation, postcondition) in enumerate(plan_info["plan"][family]):
+            for index, (operation, postcondition) in enumerate(
+                plan_info["plan"][family]
+            ):
                 if postcondition.get("type") and postcondition.get("id"):
                     await harness._read_rows(
                         backend,
@@ -809,6 +1248,8 @@ async def _run_process_a_async(
                 before = await harness._pre(backend, postcondition)
                 if hooks is not None:
                     hooks.reset()
+                if phase_probe is not None:
+                    phase_probe.reset()
                 started = time.perf_counter_ns()
                 retry = await _execute_with_retry(
                     runner,
@@ -822,7 +1263,12 @@ async def _run_process_a_async(
                     raise MeasurementRefused(
                         f"A operation {operation['operation_id']} did not commit"
                     )
-                hook_result = _extract_hooks(hooks.snapshot()) if hooks is not None else None
+                hook_result = (
+                    _extract_hooks(hooks.snapshot()) if hooks is not None else None
+                )
+                phase_result = (
+                    phase_probe.snapshot() if phase_probe is not None else None
+                )
                 if hook_result is not None:
                     hook_result["applicability"] = {
                         "BufferPool._read_page": "recorded_when_the_operation_reads_a_page",
@@ -852,12 +1298,16 @@ async def _run_process_a_async(
                 }
                 if hook_result is not None:
                     sample["hooks"] = hook_result
+                if phase_result is not None:
+                    sample["phase_probe"] = phase_result
                 samples.append(sample)
                 retryable_refusals.extend(retry["retryable_refusals"])
         active_end = time.perf_counter_ns()
         stop_event.set()
         if not b_quiescent_event.wait(float(config["barrier_timeout_seconds"])):
-            raise MeasurementRefused("B did not quiesce with its handle open before live verify(all)")
+            raise MeasurementRefused(
+                "B did not quiesce with its handle open before live verify(all)"
+            )
         live_started = time.perf_counter_ns()
         live_verification = dict(await backend._verify_all())
         live_verification["clean"] = True
@@ -889,6 +1339,7 @@ async def _run_process_a_async(
             "instrumentation": {
                 "enabled": instrumented,
                 "installed": installed_hooks,
+                "phase_probe_installed": installed_phase_hooks,
                 "raw_contaminated": False,
             },
             "operation_set_sha256": plan_info["digest"],
@@ -908,6 +1359,8 @@ async def _run_process_a_async(
     finally:
         stop_event.set()
         live_verify_done_event.set()
+        if phase_probe is not None:
+            phase_probe.uninstall()
         if backend is not None:
             await backend.close()
         if hooks is not None:
@@ -956,6 +1409,7 @@ async def _run_process_b_async(
     b_quiescent_event: Any,
     live_verify_done_event: Any,
     scenario: Scenario,
+    instrumented: bool,
 ) -> dict[str, Any]:
     harness, runner, backends, fixtures, plan_info = _runtime(config)
     backend: Any = None
@@ -965,8 +1419,18 @@ async def _run_process_b_async(
     handle: dict[str, Any] = {}
     retryable_refusals: list[dict[str, Any]] = []
     interrupted_operation: dict[str, Any] | None = None
+    phase_probe: _SectionPhaseProbe | None = None
+    installed_phase_hooks: list[str] = []
     randomizer = _retry_randomizer(config["copy_id"], "B")
     try:
+        if instrumented:
+            phase_probe = _SectionPhaseProbe()
+            phase_probe.install()
+            installed_phase_hooks = list(phase_probe.installed)
+            if tuple(installed_phase_hooks) != PHASE_PROBE_HOOKS:
+                raise MeasurementRefused(
+                    f"B phase-probe installation incomplete: {installed_phase_hooks!r}"
+                )
         backend, context, handle = await _open_warm(
             harness, runner, backends, workspace
         )
@@ -994,6 +1458,8 @@ async def _run_process_b_async(
                 operation = harness._op(
                     "create_node", payload, "scope", 1_000_000 + sequence
                 )
+                if phase_probe is not None:
+                    phase_probe.reset()
                 started = time.perf_counter_ns()
                 retry = await _execute_with_retry(
                     runner,
@@ -1004,6 +1470,9 @@ async def _run_process_b_async(
                     stop_event=stop_event,
                 )
                 ended = time.perf_counter_ns()
+                phase_result = (
+                    phase_probe.snapshot() if phase_probe is not None else None
+                )
                 retryable_refusals.extend(retry["retryable_refusals"])
                 if retry["status"] == "window_closed":
                     interrupted_operation = {
@@ -1022,24 +1491,27 @@ async def _run_process_b_async(
                         "last_refusal": retry["last_refusal"],
                         "status": "window_closed_pre_durable",
                     }
+                    if phase_result is not None:
+                        interrupted_operation["phase_probe"] = phase_result
                     break
-                commits.append(
-                    {
-                        "sequence": sequence,
-                        "node_id": node_id,
-                        "scheduled_at_ns": due,
-                        "started_at_ns": started,
-                        "ended_at_ns": ended,
-                        "wall_ms": (ended - started) / 1e6,
-                        "schedule_lag_ms": (started - due) / 1e6,
-                        "attempts": retry["attempts"],
-                        "conflicts": retry["conflicts"],
-                        "retries": retry["retries"],
-                        "retryable_refusal_count": retry["retryable_refusal_count"],
-                        "retryable_refusals": retry["retryable_refusals"],
-                        "last_refusal": retry["last_refusal"],
-                    }
-                )
+                commit = {
+                    "sequence": sequence,
+                    "node_id": node_id,
+                    "scheduled_at_ns": due,
+                    "started_at_ns": started,
+                    "ended_at_ns": ended,
+                    "wall_ms": (ended - started) / 1e6,
+                    "schedule_lag_ms": (started - due) / 1e6,
+                    "attempts": retry["attempts"],
+                    "conflicts": retry["conflicts"],
+                    "retries": retry["retries"],
+                    "retryable_refusal_count": retry["retryable_refusal_count"],
+                    "retryable_refusals": retry["retryable_refusals"],
+                    "last_refusal": retry["last_refusal"],
+                }
+                if phase_result is not None:
+                    commit["phase_probe"] = phase_result
+                commits.append(commit)
                 # Never burst to hide an unattainable target.  The effective rate is evidence.
                 due = max(due + interval_ns, ended + 1)
         active_end = time.perf_counter_ns()
@@ -1059,7 +1531,9 @@ async def _run_process_b_async(
             )
         b_quiescent_event.set()
         if not live_verify_done_event.wait(float(config["barrier_timeout_seconds"])):
-            raise MeasurementRefused("A did not complete live verify(all) while B remained open")
+            raise MeasurementRefused(
+                "A did not complete live verify(all) while B remained open"
+            )
         await backend.close()
         backend = None
         handle["closed_at_ns"] = time.perf_counter_ns()
@@ -1077,6 +1551,11 @@ async def _run_process_b_async(
             "operation_set_sha256": plan_info["digest"],
             "scenario": scenario.as_dict(),
             "session": session,
+            "instrumentation": {
+                "enabled": instrumented,
+                "phase_probe_installed": installed_phase_hooks,
+                "raw_contaminated": False,
+            },
             "commits": commits,
             "interrupted_operation": interrupted_operation,
             "effects": {
@@ -1096,6 +1575,8 @@ async def _run_process_b_async(
         }
     finally:
         b_quiescent_event.set()
+        if phase_probe is not None:
+            phase_probe.uninstall()
         if backend is not None:
             await backend.close()
 
@@ -1109,6 +1590,7 @@ def _process_b_worker(
     b_quiescent_event: Any,
     live_verify_done_event: Any,
     scenario_payload: dict[str, Any],
+    instrumented: bool,
 ) -> None:
     result = Path(result_text)
     scenario = Scenario(
@@ -1127,6 +1609,7 @@ def _process_b_worker(
                 b_quiescent_event,
                 live_verify_done_event,
                 scenario,
+                instrumented,
             )
         )
     except BaseException as failure:
@@ -1160,9 +1643,9 @@ async def _verify_async(
             except Exception as failure:
                 observation = {
                     "status": "failed",
-                    "failure": _failure_payload(
-                        "whole_profile_observation", failure
-                    )["failure"],
+                    "failure": _failure_payload("whole_profile_observation", failure)[
+                        "failure"
+                    ],
                 }
                 status = "failed"
             else:
@@ -1239,7 +1722,10 @@ def _read_child_result(path: Path, role: str) -> dict[str, Any]:
         return {
             "role": role,
             "status": "failed",
-            "failure": {"type": "InvalidResult", "message": "child JSON is not an object"},
+            "failure": {
+                "type": "InvalidResult",
+                "message": "child JSON is not an object",
+            },
         }
     return value
 
@@ -1255,7 +1741,9 @@ def _terminate_exact(processes: Iterable[multiprocessing.Process]) -> None:
             process.join(timeout=10)
 
 
-def _join_until(processes: Sequence[multiprocessing.Process], timeout_seconds: float) -> None:
+def _join_until(
+    processes: Sequence[multiprocessing.Process], timeout_seconds: float
+) -> None:
     deadline = time.monotonic() + timeout_seconds
     for process in processes:
         process.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -1352,7 +1840,9 @@ def _summarize_a_samples(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]
                         else None
                     ),
                     "inclusive_ms_median_when_observed": (
-                        statistics.median(sample["inclusive_ms"][hook] for sample in observed)
+                        statistics.median(
+                            sample["inclusive_ms"][hook] for sample in observed
+                        )
                         if observed
                         else None
                     ),
@@ -1406,7 +1896,9 @@ def _official_environment_matches(value: object) -> bool:
     numpy = modules.get("numpy")
     ladybug = modules.get("ladybug")
     google_crc32c = modules.get("google_crc32c")
-    if not all(isinstance(module, Mapping) for module in (numpy, ladybug, google_crc32c)):
+    if not all(
+        isinstance(module, Mapping) for module in (numpy, ladybug, google_crc32c)
+    ):
         return False
     return bool(
         value.get("python_release") == OFFICIAL_PYTHON_VERSION
@@ -1512,8 +2004,7 @@ def _retry_record_is_consistent(record: object, *, committed: bool) -> bool:
             or type(refusal.get("attempt")) is not int
             or refusal.get("attempt") != expected_attempt
             or refusal.get("attempt_scope") != "fresh_transaction"
-            or refusal.get("classification")
-            != "typed_pre_durable_grafx_write_conflict"
+            or refusal.get("classification") != "typed_pre_durable_grafx_write_conflict"
             or not isinstance(refusal.get("message"), str)
             or not isinstance(chain, list)
         ):
@@ -1643,8 +2134,10 @@ def _profile_completion(
         reasons.append("process_a_not_passed")
     if not valid_per_family:
         reasons.append("per_family_invalid")
-    if not samples_known or len(samples) != expected or not all(
-        isinstance(sample, Mapping) for sample in samples
+    if (
+        not samples_known
+        or len(samples) != expected
+        or not all(isinstance(sample, Mapping) for sample in samples)
     ):
         reasons.append("operation_set_incomplete")
     if tuple(process_a.get("families", ())) != EXPECTED_FAMILIES:
@@ -1668,7 +2161,10 @@ def _profile_completion(
     operation_set = process_a.get("operation_set_sha256")
     if not isinstance(operation_set, str) or not operation_set:
         reasons.append("operation_set_digest_missing")
-    elif per_family == OFFICIAL_PER_FAMILY and operation_set != EXPECTED_OPERATION_SET_SHA256:
+    elif (
+        per_family == OFFICIAL_PER_FAMILY
+        and operation_set != EXPECTED_OPERATION_SET_SHA256
+    ):
         reasons.append("operation_set_digest_mismatch")
     return {
         "status": "complete" if not reasons else "incomplete",
@@ -1677,6 +2173,222 @@ def _profile_completion(
         "completed_operations": len(samples) if samples_known else None,
         "reasons": reasons,
     }
+
+
+def _close_phase_number(value: object, expected: float) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    observed = float(value)
+    return (
+        math.isfinite(observed)
+        and math.isfinite(expected)
+        and abs(observed - expected) <= max(1e-6, abs(expected) * 1e-12)
+    )
+
+
+def _phase_probe_capture_valid(
+    capture: object, *, started_at_ns: object, ended_at_ns: object
+) -> bool:
+    """Validate one instrumented interval without requiring a checkpoint to occur."""
+
+    if (
+        not isinstance(capture, Mapping)
+        or capture.get("capture_status") != "captured_after_reset"
+        or capture.get("inclusive_not_additive") is not True
+        or not isinstance(started_at_ns, int)
+        or isinstance(started_at_ns, bool)
+        or not isinstance(ended_at_ns, int)
+        or isinstance(ended_at_ns, bool)
+        or ended_at_ns < started_at_ns
+    ):
+        return False
+    events = capture.get("events")
+    totals = capture.get("inclusive_totals")
+    sections = capture.get("sections")
+    if (
+        not isinstance(events, list)
+        or not isinstance(totals, Mapping)
+        or not isinstance(sections, list)
+    ):
+        return False
+    allowed = set(PHASE_PROBE_HOOKS)
+    root_by_scope = {
+        scope: _phase_name(owner, method)
+        for _module, owner, method, scope in PHASE_PROBE_ROOTS
+    }
+    roots: dict[tuple[str, int], Mapping[str, Any]] = {}
+    ordering: list[tuple[int, int, str]] = []
+    recomputed_totals: dict[str, dict[str, float | int]] = {}
+    for event in events:
+        if not isinstance(event, Mapping):
+            return False
+        scope = event.get("scope")
+        section_id = event.get("section_id")
+        phase = event.get("phase")
+        started = event.get("started_at_ns")
+        ended = event.get("ended_at_ns")
+        duration = event.get("inclusive_ms")
+        is_root = event.get("root")
+        if (
+            scope not in root_by_scope
+            or not isinstance(section_id, int)
+            or isinstance(section_id, bool)
+            or section_id <= 0
+            or phase not in allowed
+            or not isinstance(started, int)
+            or isinstance(started, bool)
+            or not isinstance(ended, int)
+            or isinstance(ended, bool)
+            or not started_at_ns <= started <= ended <= ended_at_ns
+            or not isinstance(duration, (int, float))
+            or isinstance(duration, bool)
+            or abs(float(duration) - (ended - started) / 1e6) > 1e-6
+            or not isinstance(is_root, bool)
+            or event.get("outcome") not in {"returned", "raised"}
+        ):
+            return False
+        ordering.append((started, -ended, str(phase)))
+        bucket = recomputed_totals.setdefault(
+            str(phase), {"calls": 0, "inclusive_ms": 0.0}
+        )
+        bucket["calls"] = int(bucket["calls"]) + 1
+        bucket["inclusive_ms"] = float(bucket["inclusive_ms"]) + float(duration)
+        if is_root:
+            if phase != root_by_scope[scope] or (scope, section_id) in roots:
+                return False
+            roots[(str(scope), section_id)] = event
+    if ordering != sorted(ordering) or not any(
+        scope == "commit" for scope, _id in roots
+    ):
+        return False
+    for event in events:
+        if event["root"]:
+            continue
+        root = roots.get((str(event["scope"]), int(event["section_id"])))
+        if root is None or not (
+            int(root["started_at_ns"])
+            <= int(event["started_at_ns"])
+            <= int(event["ended_at_ns"])
+            <= int(root["ended_at_ns"])
+        ):
+            return False
+    if set(totals) != set(recomputed_totals):
+        return False
+    for phase, expected in recomputed_totals.items():
+        actual = totals.get(phase)
+        if (
+            not isinstance(actual, Mapping)
+            or set(actual) != {"calls", "inclusive_ms"}
+            or actual.get("calls") != expected["calls"]
+            or not _close_phase_number(
+                actual.get("inclusive_ms"), float(expected["inclusive_ms"])
+            )
+        ):
+            return False
+    if len(sections) != len(roots):
+        return False
+    section_keys: set[tuple[str, int]] = set()
+    for section in sections:
+        if not isinstance(section, Mapping):
+            return False
+        section_scope = section.get("scope")
+        section_id = section.get("section_id")
+        if (
+            section_scope not in root_by_scope
+            or not isinstance(section_id, int)
+            or isinstance(section_id, bool)
+            or section_id <= 0
+        ):
+            return False
+        key = (str(section_scope), section_id)
+        root = roots.get(key)
+        ratio = section.get("residual_ratio")
+        if (
+            root is None
+            or key in section_keys
+            or not isinstance(ratio, (int, float))
+            or isinstance(ratio, bool)
+            or not 0.0 <= float(ratio) <= 1.0
+            or section.get("reconciliation_limit") != 0.15
+            or section.get("reconciliation_conclusive") is not (float(ratio) <= 0.15)
+        ):
+            return False
+        section_keys.add(key)
+        children = [
+            event
+            for event in events
+            if not event["root"]
+            and event["scope"] == root["scope"]
+            and event["section_id"] == root["section_id"]
+        ]
+        root_started = int(root["started_at_ns"])
+        root_ended = int(root["ended_at_ns"])
+        root_duration = root_ended - root_started
+        covered = _SectionPhaseProbe._union_ns(
+            children, lower=root_started, upper=root_ended
+        )
+        residual = max(0, root_duration - covered)
+        expected_ratio = residual / root_duration if root_duration else 0.0
+        if (
+            not _close_phase_number(section.get("root_ms"), root_duration / 1e6)
+            or not _close_phase_number(section.get("covered_ms"), covered / 1e6)
+            or not _close_phase_number(section.get("residual_ms"), residual / 1e6)
+            or not _close_phase_number(ratio, expected_ratio)
+            or section.get("reconciliation_conclusive")
+            is not bool(root_duration and expected_ratio <= 0.15)
+        ):
+            return False
+        commit_section = section.get("commit_section")
+        commit_contexts = [
+            event
+            for event in children
+            if event["phase"]
+            == _phase_name(PHASE_PROBE_CONTEXT_TARGET[1], PHASE_PROBE_CONTEXT_TARGET[2])
+            and event.get("detail") == "commit"
+        ]
+        if len(commit_contexts) > 1:
+            return False
+        if not commit_contexts:
+            if root.get("outcome") == "returned" or commit_section is not None:
+                return False
+            continue
+        if not isinstance(commit_section, Mapping):
+            return False
+        context = max(
+            commit_contexts,
+            key=lambda event: int(event["ended_at_ns"]) - int(event["started_at_ns"]),
+        )
+        body_started = int(context["started_at_ns"])
+        body_ended = int(context["ended_at_ns"])
+        body_duration = body_ended - body_started
+        body_covered = _SectionPhaseProbe._union_ns(
+            [event for event in children if event is not context],
+            lower=body_started,
+            upper=body_ended,
+        )
+        body_residual = max(0, body_duration - body_covered)
+        expected_body_ratio = body_residual / body_duration if body_duration else 0.0
+        body_ratio = commit_section.get("residual_ratio")
+        if (
+            not isinstance(body_ratio, (int, float))
+            or isinstance(body_ratio, bool)
+            or not 0.0 <= float(body_ratio) <= 1.0
+            or commit_section.get("reconciliation_limit") != 0.15
+            or not _close_phase_number(
+                commit_section.get("root_ms"), body_duration / 1e6
+            )
+            or not _close_phase_number(
+                commit_section.get("covered_ms"), body_covered / 1e6
+            )
+            or not _close_phase_number(
+                commit_section.get("residual_ms"), body_residual / 1e6
+            )
+            or not _close_phase_number(body_ratio, expected_body_ratio)
+            or commit_section.get("reconciliation_conclusive")
+            is not bool(body_duration and expected_body_ratio <= 0.15)
+        ):
+            return False
+    return section_keys == set(roots)
 
 
 def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
@@ -1693,10 +2405,9 @@ def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
     if verifier.get("status") != "passed":
         shortfalls.append("post_run_verifier_failed")
     copy_auth = result.get("copy_authentication", {})
-    if (
-        copy_auth.get("initial_matches_base") is not True
-        or copy_auth.get("initial") != copy_auth.get("base")
-    ):
+    if copy_auth.get("initial_matches_base") is not True or copy_auth.get(
+        "initial"
+    ) != copy_auth.get("base"):
         shortfalls.append("scenario_copy_not_authenticated")
     if result.get("barrier", {}).get("parent_participated") is not True:
         shortfalls.append("spawn_barrier_parent_not_proved")
@@ -1704,12 +2415,17 @@ def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
         shortfalls.append("spawn_barrier_not_proved")
     if a.get("pid") == b.get("pid") or not a.get("pid") or not b.get("pid"):
         shortfalls.append("distinct_real_processes_not_proved")
-    if a.get("reopens_during_measured_window") != 0 or b.get("reopens_during_measured_window") != 0:
+    if (
+        a.get("reopens_during_measured_window") != 0
+        or b.get("reopens_during_measured_window") != 0
+    ):
         shortfalls.append("measured_handle_reopened")
     per_family = result.get("per_family")
     expected_samples = (
         int(per_family) * len(EXPECTED_FAMILIES)
-        if isinstance(per_family, int) and not isinstance(per_family, bool) and per_family > 0
+        if isinstance(per_family, int)
+        and not isinstance(per_family, bool)
+        and per_family > 0
         else OFFICIAL_PER_FAMILY * len(EXPECTED_FAMILIES)
     )
     profile_completion = _profile_completion(a, per_family)
@@ -1761,9 +2477,9 @@ def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
         shortfalls.append("a_family_sample_counts_changed")
     if a.get("refusals") or b.get("refusals"):
         shortfalls.append("refusal_was_not_fail_closed")
-    if not _retry_evidence_is_consistent(a, list(a.get("samples", []))) or not _retry_evidence_is_consistent(
-        b, list(b.get("commits", []))
-    ):
+    if not _retry_evidence_is_consistent(
+        a, list(a.get("samples", []))
+    ) or not _retry_evidence_is_consistent(b, list(b.get("commits", []))):
         shortfalls.append("retry_evidence_inconsistent")
     if any(
         result.get("process_exitcodes", {}).get(role) != 0
@@ -1775,7 +2491,10 @@ def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
         for participant in (b, verifier)
     ):
         shortfalls.append("child_operation_set_digest_disagrees")
-    if per_family == OFFICIAL_PER_FAMILY and a.get("operation_set_sha256") != EXPECTED_OPERATION_SET_SHA256:
+    if (
+        per_family == OFFICIAL_PER_FAMILY
+        and a.get("operation_set_sha256") != EXPECTED_OPERATION_SET_SHA256
+    ):
         shortfalls.append("child_logical_pf5_digest_mismatch")
     if any(
         participant.get("handle", {}).get("checksum_implementation") != "native"
@@ -1786,7 +2505,10 @@ def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
         participant.get("handle", {}).get("environment", {})
         for participant in (a, b, verifier)
     ]
-    if any(not _official_environment_matches(environment) for environment in child_environments):
+    if any(
+        not _official_environment_matches(environment)
+        for environment in child_environments
+    ):
         shortfalls.append("child_official_environment_mismatch")
     child_runtime_identities = [
         _environment_runtime_identity(environment) for environment in child_environments
@@ -1797,13 +2519,18 @@ def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
     ):
         shortfalls.append("child_environment_identity_disagrees")
     executor_hashes = {
-        environment.get("python_executable_sha256") for environment in child_environments
+        environment.get("python_executable_sha256")
+        for environment in child_environments
     }
     if len(executor_hashes) != 1 or None in executor_hashes:
         shortfalls.append("child_executor_identity_disagrees")
     scenario = result.get("scenario", {})
     canonical = next(
-        (candidate for candidate in SCENARIOS if candidate.identifier == scenario.get("id")),
+        (
+            candidate
+            for candidate in SCENARIOS
+            if candidate.identifier == scenario.get("id")
+        ),
         None,
     )
     if canonical is None:
@@ -1821,22 +2548,43 @@ def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
     ):
         shortfalls.append("b_effects_not_proved")
     instrumentation = a.get("instrumentation", {})
+    b_instrumentation = b.get("instrumentation", {})
     measured_pass = result.get("pass")
     if measured_pass == "raw":
-        if instrumentation.get("enabled") is not False or instrumentation.get("installed"):
+        if (
+            instrumentation.get("enabled") is not False
+            or instrumentation.get("installed")
+            or instrumentation.get("phase_probe_installed")
+            or b_instrumentation.get("enabled") is not False
+            or b_instrumentation.get("phase_probe_installed")
+        ):
             shortfalls.append("raw_pass_contaminated_by_hooks")
         if any("hooks" in sample for sample in a.get("samples", [])):
             shortfalls.append("raw_samples_contain_hook_output")
+        if any("phase_probe" in sample for sample in a.get("samples", [])) or any(
+            "phase_probe" in commit for commit in b.get("commits", [])
+        ):
+            shortfalls.append("raw_samples_contain_phase_probe_output")
     elif measured_pass == "instrumented":
         if instrumentation.get("enabled") is not True:
             shortfalls.append("instrumented_pass_missing_hooks")
         if tuple(instrumentation.get("installed", ())) != REQUIRED_HOOKS:
             shortfalls.append("instrumented_hook_installation_not_proved")
+        if (
+            tuple(instrumentation.get("phase_probe_installed", ())) != PHASE_PROBE_HOOKS
+            or b_instrumentation.get("enabled") is not True
+            or tuple(b_instrumentation.get("phase_probe_installed", ()))
+            != PHASE_PROBE_HOOKS
+        ):
+            shortfalls.append("instrumented_phase_probe_installation_not_proved")
         per_operation_complete = True
         observed_totals = {hook: 0 for hook in REQUIRED_HOOKS}
         for sample in samples:
             captured = sample.get("hooks")
-            if not isinstance(captured, Mapping) or captured.get("capture_status") != "captured_after_reset":
+            if (
+                not isinstance(captured, Mapping)
+                or captured.get("capture_status") != "captured_after_reset"
+            ):
                 per_operation_complete = False
                 continue
             calls = captured.get("calls", {})
@@ -1873,6 +2621,28 @@ def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
             shortfalls.append("instrumented_per_operation_hook_evidence_incomplete")
         if any(total <= 0 for total in observed_totals.values()):
             shortfalls.append("instrumented_required_hook_never_observed")
+        phase_captures = [
+            (
+                sample.get("phase_probe"),
+                sample.get("started_at_ns"),
+                sample.get("ended_at_ns"),
+            )
+            for sample in samples
+        ] + [
+            (
+                commit.get("phase_probe"),
+                commit.get("started_at_ns"),
+                commit.get("ended_at_ns"),
+            )
+            for commit in b.get("commits", [])
+        ]
+        if not phase_captures or any(
+            not _phase_probe_capture_valid(
+                capture, started_at_ns=started, ended_at_ns=ended
+            )
+            for capture, started, ended in phase_captures
+        ):
+            shortfalls.append("instrumented_phase_probe_evidence_incomplete")
     else:
         shortfalls.append("unknown_pass")
     live_verifier = a.get("live_verifier", {})
@@ -1924,21 +2694,31 @@ def _scenario_shortfalls(result: Mapping[str, Any]) -> list[str]:
         "effective_rate_per_second",
         "effective_to_target_ratio",
     )
-    if any(rate.get(name) != recomputed_rate.get(name) for name in comparable_rate_fields):
+    if any(
+        rate.get(name) != recomputed_rate.get(name) for name in comparable_rate_fields
+    ):
         shortfalls.append("effective_rate_not_reproducible_from_timestamps")
         rate = recomputed_rate
     target = float(scenario.get("target_rate_per_second", -1))
     effective = float(rate.get("effective_rate_per_second", -1))
-    if rate.get("status") != "measured" or float(rate.get("intersection_seconds", 0)) <= 0:
+    if (
+        rate.get("status") != "measured"
+        or float(rate.get("intersection_seconds", 0)) <= 0
+    ):
         shortfalls.append("effective_rate_intersection_missing")
     elif target == 0:
-        if int(rate.get("commits_completed_in_intersection", -1)) != 0 or effective != 0:
+        if (
+            int(rate.get("commits_completed_in_intersection", -1)) != 0
+            or effective != 0
+        ):
             shortfalls.append("idle_scenario_committed")
     else:
         ratio = rate.get("effective_to_target_ratio")
         if int(rate.get("commits_completed_in_intersection", 0)) <= 0:
             shortfalls.append("foreign_commit_not_observed")
-        if ratio is None or not (1 - OFFICIAL_RATE_TOLERANCE <= float(ratio) <= 1 + OFFICIAL_RATE_TOLERANCE):
+        if ratio is None or not (
+            1 - OFFICIAL_RATE_TOLERANCE <= float(ratio) <= 1 + OFFICIAL_RATE_TOLERANCE
+        ):
             shortfalls.append("effective_rate_outside_frozen_target_tolerance")
     if not (
         int(b.get("handle", {}).get("opened_at_ns", 2**63 - 1))
@@ -2018,10 +2798,15 @@ def official_shortfalls(report: Mapping[str, Any]) -> list[str]:
         ):
             shortfalls.append("executor_identity_not_pinned")
     harness = _mapping_or_empty(provenance.get("harness"))
-    if harness.get("head") != PINNED_HARNESS_HEAD or harness.get("profile_blob") != PINNED_HARNESS_BLOB:
+    if (
+        harness.get("head") != PINNED_HARNESS_HEAD
+        or harness.get("profile_blob") != PINNED_HARNESS_BLOB
+    ):
         shortfalls.append("harness_pin_mismatch")
     source = _mapping_or_empty(provenance.get("source_workspace"))
-    if not source.get("expected_sha256") or source.get("sha256") != source.get("expected_sha256"):
+    if not source.get("expected_sha256") or source.get("sha256") != source.get(
+        "expected_sha256"
+    ):
         shortfalls.append("source_workspace_not_authenticated")
     source_provenance = _mapping_or_empty(provenance.get("source_provenance"))
     semantic_checks = _mapping_or_empty(source_provenance.get("semantic_checks"))
@@ -2045,7 +2830,11 @@ def official_shortfalls(report: Mapping[str, Any]) -> list[str]:
         shortfalls.append("machine_idle_not_asserted")
     before_cpu = machine_before.get("cpu_percent")
     maximum_cpu = inputs.get("maximum_initial_cpu_percent")
-    if before_cpu is None or maximum_cpu is None or float(before_cpu) > float(maximum_cpu):
+    if (
+        before_cpu is None
+        or maximum_cpu is None
+        or float(before_cpu) > float(maximum_cpu)
+    ):
         shortfalls.append("machine_idle_sample_failed")
     checkouts = _mapping_or_empty(provenance.get("checkouts"))
     if checkouts != identity_start.get("checkouts"):
@@ -2054,7 +2843,9 @@ def official_shortfalls(report: Mapping[str, Any]) -> list[str]:
         checkout = _mapping_or_empty(checkouts.get(name))
         if checkout.get("status") != "clean":
             shortfalls.append(f"{name}_checkout_not_clean")
-        if not checkout.get("expected_head") or checkout.get("head") != checkout.get("expected_head"):
+        if not checkout.get("expected_head") or checkout.get("head") != checkout.get(
+            "expected_head"
+        ):
             shortfalls.append(f"{name}_checkout_pin_mismatch")
     environment = _mapping_or_empty(provenance.get("environment"))
     if environment.get("accel_ready") is not True:
@@ -2078,9 +2869,9 @@ def official_shortfalls(report: Mapping[str, Any]) -> list[str]:
     copy_ids = [result.get("copy_id") for result in results]
     if len(set(copy_ids)) != len(copy_ids) or None in copy_ids:
         shortfalls.append("raw_and_instrumented_copies_not_distinct")
-    launcher_executor_sha256 = _mapping_or_empty(
-        identity_start.get("executor")
-    ).get("sha256")
+    launcher_executor_sha256 = _mapping_or_empty(identity_start.get("executor")).get(
+        "sha256"
+    )
     launcher_environment_identity = _environment_runtime_identity(environment)
     if (
         launcher_environment_identity is None
@@ -2197,6 +2988,7 @@ def _run_scenario(
             b_quiescent_event,
             live_verify_done_event,
             _scenario_payload(scenario),
+            pass_name == "instrumented",
         ),
     )
     released_at: int | None = None
@@ -2215,9 +3007,13 @@ def _run_scenario(
     a = _read_child_result(a_result, "A")
     b = _read_child_result(b_result, "B")
     if process_a.exitcode != 0 and a.get("status") == "passed":
-        a = _failure_payload("A", MeasurementRefused(f"unexpected exit code {process_a.exitcode}"))
+        a = _failure_payload(
+            "A", MeasurementRefused(f"unexpected exit code {process_a.exitcode}")
+        )
     if process_b.exitcode != 0 and b.get("status") == "passed":
-        b = _failure_payload("B", MeasurementRefused(f"unexpected exit code {process_b.exitcode}"))
+        b = _failure_payload(
+            "B", MeasurementRefused(f"unexpected exit code {process_b.exitcode}")
+        )
     profile_completion = _profile_completion(a, int(config["per_family"]))
     verifier_process = context.Process(
         target=_verify_worker,
@@ -2234,7 +3030,8 @@ def _run_scenario(
     verifier = _read_child_result(verifier_result, "verifier")
     if verifier_process.exitcode != 0 and verifier.get("status") == "passed":
         verifier = _failure_payload(
-            "verifier", MeasurementRefused(f"unexpected exit code {verifier_process.exitcode}")
+            "verifier",
+            MeasurementRefused(f"unexpected exit code {verifier_process.exitcode}"),
         )
     if a.get("status") == "passed":
         a = dict(a)
@@ -2277,8 +3074,12 @@ def _run_scenario(
     result["shortfalls"] = _scenario_shortfalls(result)
     result["status"] = "passed" if not result["shortfalls"] else "failed"
     scenario_root = workspace.parent
-    if scenario_root.parent != scratch or not scenario_root.name.startswith("m7profile-ce3-"):
-        raise MeasurementRefused(f"refusing to remove unexpected scenario root {scenario_root}")
+    if scenario_root.parent != scratch or not scenario_root.name.startswith(
+        "m7profile-ce3-"
+    ):
+        raise MeasurementRefused(
+            f"refusing to remove unexpected scenario root {scenario_root}"
+        )
     shutil.rmtree(scenario_root)
     return result
 
@@ -2324,7 +3125,8 @@ def _environment() -> dict[str, Any]:
     python_release = platform.python_version()
     baseline_checks = {
         "python_3_13_1": python_release == OFFICIAL_PYTHON_VERSION,
-        "numpy_2_5_1": modules.get("numpy", {}).get("version") == OFFICIAL_NUMPY_VERSION,
+        "numpy_2_5_1": modules.get("numpy", {}).get("version")
+        == OFFICIAL_NUMPY_VERSION,
         "ladybug_0_16_0": modules.get("ladybug", {}).get("version")
         == OFFICIAL_LADYBUG_VERSION,
         "google_crc32c_available": "error" not in modules.get("google_crc32c", {}),
@@ -2351,17 +3153,27 @@ def _environment() -> dict[str, Any]:
 
 
 def _source_binding(source_workspace: Path) -> dict[str, Any]:
-    roots = [path for path in (source_workspace / ".mp7" / "g").iterdir() if path.is_dir()]
+    roots = [
+        path for path in (source_workspace / ".mp7" / "g").iterdir() if path.is_dir()
+    ]
     if len(roots) != 1:
         raise MeasurementRefused(
             f"expected one Grafx root under {source_workspace / '.mp7' / 'g'}, found {len(roots)}"
         )
-    binding_path = roots[0] / "kg" / "boards" / "m-pulse-7-acceptance" / "graph_backend_binding.json"
+    binding_path = (
+        roots[0]
+        / "kg"
+        / "boards"
+        / "m-pulse-7-acceptance"
+        / "graph_backend_binding.json"
+    )
     if not binding_path.is_file():
         raise MeasurementRefused(f"M-PULSE-7 Grafx binding missing: {binding_path}")
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
     if binding.get("backend") != "grafx":
-        raise MeasurementRefused(f"source binding backend is not grafx: {binding.get('backend')!r}")
+        raise MeasurementRefused(
+            f"source binding backend is not grafx: {binding.get('backend')!r}"
+        )
     physical = roots[0] / "kg" / str(binding.get("physical_path", ""))
     if not physical.is_dir():
         raise MeasurementRefused(f"source binding physical_path is missing: {physical}")
@@ -2411,7 +3223,8 @@ def source_provenance_evidence(
         "workspace_path_matches": declared_workspace == source_workspace.resolve(),
         "workspace_digest_matches": forensic.get("content_sha256")
         == source_digest.get("sha256"),
-        "workspace_file_count_matches": forensic.get("files") == source_digest.get("files"),
+        "workspace_file_count_matches": forensic.get("files")
+        == source_digest.get("files"),
         "workspace_bytes_match": forensic.get("bytes") == source_digest.get("bytes"),
     }
     if not all(semantic_checks.values()):
@@ -2439,14 +3252,18 @@ def _assert_output_outside_inputs(
     resolved_out = out.resolve()
     resolved_work = work_root.resolve()
     if _is_within(resolved_out, source):
-        raise MeasurementRefused("report path must be outside the source workspace/database")
+        raise MeasurementRefused(
+            "report path must be outside the source workspace/database"
+        )
     for checkout in checkouts:
         if _is_within(resolved_out, checkout) or _is_within(resolved_work, checkout):
             raise MeasurementRefused(
                 f"official report/work paths must be outside measured checkout {checkout.resolve()}"
             )
     if _is_within(resolved_work, source) or _is_within(source, resolved_work):
-        raise MeasurementRefused("work root and source workspace must not contain each other")
+        raise MeasurementRefused(
+            "work root and source workspace must not contain each other"
+        )
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -2481,7 +3298,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"profile harness blob {profile_blob} != frozen {PINNED_HARNESS_BLOB}"
         )
     source_before = content_digest(source)
-    if args.source_workspace_sha256 and source_before["sha256"] != args.source_workspace_sha256:
+    if (
+        args.source_workspace_sha256
+        and source_before["sha256"] != args.source_workspace_sha256
+    ):
         raise MeasurementRefused(
             f"source workspace digest {source_before['sha256']} != expected {args.source_workspace_sha256}"
         )
@@ -2495,7 +3315,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     work_root.mkdir(parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(prefix="grafx-ce3-", dir=work_root)).resolve()
-    profile_run_id = f"m7-ce3-{hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:20]}"
+    profile_run_id = (
+        f"m7-ce3-{hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:20]}"
+    )
     config: dict[str, Any] = {
         "harness_repo": str(harness_repo),
         "grafx_repo": str(grafx_repo),
@@ -2636,9 +3458,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "status": "passed",
                 "scratch_retained": False,
-                "completed_at_utc": time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                ),
+                "completed_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
         )
         _atomic_json(out, report)
@@ -2661,7 +3481,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         selected = (
             list(SCENARIOS)
             if args.scenario == "all"
-            else [scenario for scenario in SCENARIOS if scenario.identifier == args.scenario]
+            else [
+                scenario
+                for scenario in SCENARIOS
+                if scenario.identifier == args.scenario
+            ]
         )
         if not selected:
             raise MeasurementRefused(f"unknown scenario selector {args.scenario!r}")
@@ -2735,8 +3559,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         report["provenance"]["identity"]["end"] = identity_end
         report["provenance"]["identity"]["stable"] = (
-            identity_start["fingerprint_sha256"]
-            == identity_end["fingerprint_sha256"]
+            identity_start["fingerprint_sha256"] == identity_end["fingerprint_sha256"]
         )
     except BaseException as failure:
         report["provenance"]["identity"]["stable"] = False
@@ -2748,9 +3571,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if cleanup_candidate
         else ("failed" if finalization_errors else "passed")
     )
-    finalization["scratch_retained"] = (
-        "cleanup_pending" if cleanup_candidate else True
-    )
+    finalization["scratch_retained"] = "cleanup_pending" if cleanup_candidate else True
     finalization["completed_at_utc"] = (
         None
         if cleanup_candidate
@@ -2769,7 +3590,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "official_shortfalls_evaluation_failed",
                 "finalization_incomplete",
-                *(["measurement_run_failed"] if measurement_failure is not None else []),
+                *(
+                    ["measurement_run_failed"]
+                    if measurement_failure is not None
+                    else []
+                ),
             }
         )
     # This checkpoint is deliberately never official.  If cleanup or the final atomic write
@@ -2811,7 +3636,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         try:
             report["official_shortfalls"] = official_shortfalls(report)
         except BaseException as failure:
-            record_finalization_failure("official_shortfalls_evaluation_failed", failure)
+            record_finalization_failure(
+                "official_shortfalls_evaluation_failed", failure
+            )
             finalization["status"] = "failed"
             report["official_shortfalls"] = [
                 "finalization_incomplete",
@@ -2880,7 +3707,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--child-timeout-seconds", type=float, default=DEFAULT_CHILD_TIMEOUT_SECONDS
     )
     parser.add_argument("--check-only", action="store_true")
-    parser.add_argument("--fail-fast", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--fail-fast", action=argparse.BooleanOptionalAction, default=True
+    )
     return parser
 
 
