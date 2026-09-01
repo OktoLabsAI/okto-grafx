@@ -64,7 +64,7 @@
   gates e os cinco contadores invariantes, e foi verificada/PASS pelo Codex. Como
   `machine_idle_asserted=false`, esta evidência aprova somente contagens estruturais e não publica
   throughput temporal.
-- **M-PULSE-7 — primeira passagem de qualidade preservada e falso timeout do harness corrigido.**
+- **M-PULSE-7 — falso timeout corrigido e lifecycle do harness endurecido antes do run definitivo.**
   O run `D:\GrafxBenchEvidence\mpulse7-quality-20260901-a01` completou os dois traces de 10.000
   mutações e os 11 cenários de crash/recovery; auditoria independente confirmou os 11 PASS, os
   fingerprints contra o oracle, autoridade dos 22 workers, ausência física nos dois casos de
@@ -73,15 +73,27 @@
   worker Ladybug, importação e duas validações de autoridade ocorriam dentro do mesmo `join(30)`;
   o preâmbulo medido levou `54,074 s`, enquanto `find_by_topic` levou `84,6 ms` no Ladybug e
   `59,4 ms` no Grafx, com resultado e fingerprints bilaterais idênticos. Os tempos são diagnóstico,
-  não SLO. Community `perf/st2-pulse-generation@1d2a25d` introduz um handshake fail-closed: spawn,
+  não SLO. Community `perf/st2-pulse-generation@1d2a25d` introduziu um handshake fail-closed: spawn,
   autoridade integral, open, identidade e fingerprint precedem a prontidão; somente a operação
   semântica usa os `30 s`; identidade/fingerprint finais, close e receipt permanecem obrigatórios
   sob contenção operacional separada. Timestamps monotônicos publicados pelo filho fecham a corrida
   de fronteira, e terminate/kill precisa comprovar a morte. Setup/finalização acima do timeout da
-  operação passam; operações lentas em Board/Pulse são encerradas. A regressão pinada do harness
-  terminou **73/73**, com py_compile, Ruff (somente E402 histórico ignorado) e diff-check limpos;
-  revisão independente não encontrou blocker. O próximo passo é somente repetir M-PULSE-7 e auditar
-  o receipt, sem matriz ou piso de performance intermediário.
+  operação passam; operações lentas em Board/Pulse são encerradas. A regressão pinada desse primeiro
+  patch terminou **73/73**, com py_compile, Ruff (somente E402 histórico ignorado) e diff-check
+  limpos. O run `D:\GrafxBenchEvidence\mpulse7-quality-20260901-a02` concluiu o trace Ladybug e
+  entrou no trace Grafx sem divergência, mas foi interrompido deliberadamente, sem receipt e sem
+  processo órfão, quando a revisão adversarial Nexus `hof_cb1563e7aeed47c9a13eff733334ef66`
+  encontrou dois defeitos estruturais do supervisor: um filho que saísse `0` sem publicar `ready`
+  podia saltar o watchdog, e uma exceção rara do supervisor pós-`start()` podia deixar o filho vivo.
+  O milestone Community `perf/st2-pulse-generation@4086ad732249709013e108728af5afea09610954`
+  torna `ready` obrigatório em todos os caminhos, recolhe/termina o filho em toda exceção pós-start e
+  acrescenta regressões para recibo `ok` sem prontidão e falha do supervisor com operação bloqueada.
+  Gate focado **7/7**, suíte M-PULSE-7 integral **75/75** em `454,75 s`, py_compile, Ruff e
+  diff-check passaram; commit e remoto coincidem. O manifesto v1 permanece inalterado: sua expressão
+  `isolated-process-watchdog-*` continua descrevendo watchdog externo por caso em processo isolado,
+  enquanto este documento fixa que os `30 s` abrangem somente a operação semântica. O próximo passo
+  é somente repetir M-PULSE-7 no SHA final e auditar o receipt, sem matriz ou piso de performance
+  intermediário.
 - **Passo futuro — cache/bundle autenticado da autoridade do harness M-PULSE-7 (não bloqueante para
   `0.0.1`).** A correção corrente permanece deliberadamente limitada ao protocolo de fases do
   subprocesso: pré-validação integral de autoridade, abertura, identidade e fingerprint; operação
@@ -98,7 +110,10 @@
   divergente antes/depois da ativação; modificação TOCTOU persistente; e preservação dos PIDs
   isolados e do digest de autoridade em Board/Pulse. Essa otimização é de custo operacional do
   harness, não gate de performance, não muda o watchdog semântico e não condiciona a compatibilidade
-  Pulse, a auditoria integrada ou a publicação conjunta de `0.0.1`.
+  Pulse, a auditoria integrada ou a publicação conjunta de `0.0.1`. Uma futura revisão do formato
+  do manifesto deverá explicitar separadamente o isolamento por processo, a janela de `30 s` da
+  operação semântica e as contenções fail-closed de pré/pós-validação; isso não altera nem bloqueia o
+  manifesto v1 usado na certificação corrente.
 - **M0 estabilização: concluído e publicado** em
   `milestone/m0-stabilization@e2d6a22da8ec2571127fc9d1533995d40330c632`. Os cinco P0
   reproduzidos, as fronteiras públicas, o primeiro open durável, read-only observacional, fencing
@@ -2751,7 +2766,7 @@ nenhum resultado delegado é integrado sem validação final do Codex e sem o ga
 **Leitura normativa do quadro:** estados temporais antigos nas linhas M-PULSE-7, CE-3, CN-2 e ST-2
 foram preservados como histórico, mas seus pisos/razões de performance não são mais blockers. O
 estado vigente é o do topo deste documento: `same-10` aceito em qualidade, harness de timeout
-corrigido em Community `1d2a25d`, regressão pinada `73/73` e M-PULSE-7 como próximo gate funcional
+endurecido em Community `4086ad7`, regressão pinada `75/75` e M-PULSE-7 como próximo gate funcional
 único. A matriz CE-3 temporal tornou-se evidência opcional.
 
 | Marco | Estado | Evidência integrada | Validação registrada |
@@ -2813,6 +2828,7 @@ corrigido em Community `1d2a25d`, regressão pinada `73/73` e M-PULSE-7 como pr�
 | CE-3 — invalidação bounded por delta WAL (produto) | publicada; correção de header esparso publicada, auditada e validada funcionalmente no Pulse | base `9498554`; produto `2feb579`; sucessor test-only `61485d9`; fix `origin/perf/ce3-bounded-invalidation@5b73890bdfddf9763c2b46514fc2c41c07ee30a4`; auditorias Nexus `hof_75a8a1e43bc24f1790b9a79d75d3749d`, `hof_7c7f3a4b3a9c470ea1d5886445cf233b` e `hof_e890ffe523ac4023aee333a8b094c8e8` PASS | Intervalo WAL limitado, classificação fail-closed e invalidação seletiva permanecem intactos. O fix acrescenta somente headers registrados quando há efeito de heap e declina para refresh completo se o inventário não puder ser provado. Red-first e mutation kill confirmados; 15/15 combinados, 7/7 pós-formatação, txn 476/476, index+vector 100%/exit 0 e checks estáticos verdes. M4 permanece dívida de cobertura não bloqueante. Primeira OCC, páginas pré-staged, WAL/durabilidade e multiwriter/multireader não mudaram. Próximo gate fixo: gargalo residual medido no H8; sem matriz completa antes de `same-10 >= 7,5/s` |
 | CN-2 — barreiras de checkpoint fora do fence | implementado, auditado e medido; efeito local aprovado, gate agregado ainda vermelho | candidato medido `7acb9d869a7a6b9a533033309a3126f4de704f5b`; produto `e202324`; instrumento `c739733`; contrato de cauda `f872fbe`; R1b `b4d1fa1cff1de76f5ea9a5b21452e5f07ea4dea0897b73ed0274aa583d227e95`; R2 `fdf28373c49e11fa4b19420fee8e170c2ebc5a1a2e8bdfe22a49ffd08b4612b6`; auditorias Nexus `hof_3781b51dbb77417cb899c50d1775cd29` e `hof_8d1bcdb495ab497c91869f300d4688e2` PASS | A/B/C preserva autoridade, WAL e horizonte; 978 barriers ficaram fora do fence e três commits estrangeiros progrediram em seis checkpoints. A exclusão contínua caiu ~49% na mediana, mas o checkpoint total mediano cresceu ~38% e não houve ganho reproduzível de throughput. RAW/H8 foram `5,3178/4,1577/s` em R1b e `1,3218/4,5368/s` em R2, todos abaixo de `7,5/s`; verify live+cold e finalização passaram. Esta é a disposição atual e substitui o status de taxa histórico das linhas M-PULSE-7/CE-3 acima. Matriz completa/10k seguem bloqueados pelo piso `7,5/s`; a indicação histórica de que ST-2 ainda exigia autorização/F4 foi supersedida pela autorização e pelo fechamento registrados na linha seguinte. |
 | ST-2 — dual descriptor revalidation + pinned-route fence | concluído, publicado nos branches de milestone e aceito no gate estrutural; `same-10` temporal permanece o próximo gate finito | Grafx `perf/st2-descriptor-revalidation@f0b55b7b6facc916118f342c774cb06e56bf17e3`; Community `perf/st2-pulse-generation@050ced9b79533d50efed453d53ed450984f75cf3` (produção `cea13b8`, alias test `050ced9`); Core `ccc1f345ece1db89a274cfdd634bd4da27028f63`; artefato PF5 SHA-256 `384a7722ff6772a2e89ca95225ab759ec5c7cab5af9939f405ef7b5ec2802aae`, 969.630 bytes; operação `c994255b...`; auditoria de segurança Nexus `hof_b69cf41505824beda52a25b29b37a8aa` PASS | `strict` continua default e `generation` é opt-in exclusivo Grafx/Pulse. PF5 `continuous`, 12 famílias x 5: `_still_names 424<500`, `os.lstat 4.137<8.000`, `os.stat 2.393->1.727<2.000`; `_read_page/read_fresh_page/write_page=323/146/96`, 123 bindings e 148 statements inalterados. Nenhum fence foi removido: Board/Grafx reutiliza a prova física do binding autenticado com o handle exato pinado/readmitido; genérico/Global preservam caminhada completa; CAS visível, path/page size, missing e alias real permanecem fail-closed. 59 testes focados finais e suíte relevante 253/253 passaram. `machine_idle_asserted=false`: aceite estrutural, sem alegação de throughput. |
+| M-PULSE-7 — certificação somente por qualidade | harness corrigido e endurecido; run definitivo pendente | Community `perf/st2-pulse-generation@4086ad732249709013e108728af5afea09610954`; Grafx candidato exato `a1c3c496fe21d8e9f86953ca3932aced5917fb22`; Core `ccc1f345ece1db89a274cfdd634bd4da27028f63`; revisão Nexus `hof_cb1563e7aeed47c9a13eff733334ef66` concluída/verificada | `a01` provou 2 traces e 11/11 crash/recovery, mas expôs timeout falso antes da operação; `a02` foi interrompido sem receipt/órfão após a auditoria do supervisor. `4086ad7` exige readiness e cleanup fail-closed em toda exceção pós-start; focados 7/7 e suíte M7 75/75. Próximo e único gate: rerun M-PULSE-7, auditoria do receipt e divergências funcionais. Métricas temporais são informativas. |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
