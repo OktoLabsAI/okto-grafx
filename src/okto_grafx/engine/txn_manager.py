@@ -254,6 +254,16 @@ class _ReadViewChanges:
     files: frozenset[str]
 
 
+@dataclass(frozen=True, slots=True)
+class _CheckpointTarget:
+    """The exact durable prefix whose data writes phase B puts on the platter."""
+
+    target_lsn: Lsn
+    target_csn: Csn
+    base_checkpoint_lsn: Lsn
+    barrier_files: tuple[str, ...]
+
+
 class _ReaderPin:
     """One live reader registration together with the reading at which it was last refreshed."""
 
@@ -1553,8 +1563,7 @@ class TransactionManager:
         ``recyclable_horizon`` existed and nothing called either, so the log grew without bound.
         The checkpoint is also what lets recovery start somewhere other than the first record.
 
-        Three steps, in this order, under the commit section so no commit is half-published while
-        the checkpoint decides what is safe:
+        Three steps, in this order, with only the state-sensitive parts under the commit section:
 
         1. **Redo the log onto the device from the old checkpoint.** This is not optional and it
            is not a performance choice. The commit protocol applies a commit's page images to the
@@ -1566,9 +1575,12 @@ class TransactionManager:
            would be gone. Replaying the images here through the same idempotent door recovery
            uses (``apply_page_image``) makes the device complete for EVERY commit at or below the
            number about to be published, whatever any other process holds in memory.
-        2. **Flush and barrier every dirty page of this pool** (``BufferPool.checkpoint``), which
-           now includes the pages the redo installed.
-        3. **Publish** ``checkpoint_lsn = last_committed_lsn`` beside the unchanged commit numbers.
+        2. **Flush every dirty page, release the writer/commit fences, and barrier the data.**
+           The immutable target from step 1 is the only prefix that barrier may certify. Other
+           processes may commit while the device is busy, but their newer WAL remains retained.
+        3. **Reacquire current writer/commit authority** and publish the greater of this target
+           and an already-newer checkpoint, beside the current commit numbers. The checkpoint
+           never advances to a commit that arrived during the unfenced barrier.
 
         Only then is the log asked to recycle, up to the horizon the reader registry and the new
         checkpoint allow together. A reader still pinned below the checkpoint holds the horizon
@@ -1576,7 +1588,7 @@ class TransactionManager:
         """
         manager = self._index_manager
         transition = None if manager is None else manager.open
-        return self._checkpoint(transition)[0]
+        return self._checkpoint(transition, concurrent_data_barrier=True)[0]
 
     def refresh_index_inventory(
         self, *, persist_stale: bool = True
@@ -1653,6 +1665,7 @@ class TransactionManager:
         transition: Callable[[int], Any] | None,
         *,
         transition_is_commit_point: bool = False,
+        concurrent_data_barrier: bool = False,
     ) -> tuple[RecycleReport, Any]:
         """Run the checkpoint, keeping a completed commit point above its own cleanup.
 
@@ -1664,7 +1677,10 @@ class TransactionManager:
         state: dict[str, Any] = {"completed": False, "recycled": None, "outcome": None}
         try:
             return self._checkpoint_in_section(
-                transition, state, transition_is_commit_point
+                transition,
+                state,
+                transition_is_commit_point,
+                concurrent_data_barrier,
             )
         except BaseException as failure:
             if (
@@ -1682,6 +1698,7 @@ class TransactionManager:
         transition: Callable[[int], Any] | None,
         state: dict[str, Any],
         transition_is_commit_point: bool,
+        concurrent_data_barrier: bool = False,
     ) -> tuple[RecycleReport, Any]:
         """Run the checkpoint, running one index transition before the section is left.
 
@@ -1694,6 +1711,16 @@ class TransactionManager:
         with self._participant_section():
             self._require_not_closed("checkpoint")
             self._require_recovery_complete()
+            # A split checkpoint cannot keep this participant's reader registration refreshed
+            # while one device barrier is blocked. If a transaction is open long enough for a
+            # foreign observer to prune that pin, the unfenced phase would let another
+            # checkpoint recycle WAL beneath its live snapshot. Keep the original monolithic
+            # fence whenever this handle owns an open transaction; ordinary maintenance, which
+            # has no live snapshot to protect, takes the concurrent path.
+            if concurrent_data_barrier and not self._open:
+                return self._checkpoint_with_concurrent_barrier_in_section(
+                    transition, state
+                )
             lease = self._hold_lease()
             try:
                 self._validate_lease(lease)
@@ -1765,6 +1792,171 @@ class TransactionManager:
                 # Same rule, the ordinary exit: the lease is in doubt but the commit
                 # point stands, so latch the doubt and return the success that happened.
                 self._recovery_required = True
+        return state["recycled"], state["outcome"]
+
+    def _checkpoint_with_concurrent_barrier_in_section(
+        self,
+        transition: Callable[[int], Any] | None,
+        state: dict[str, Any],
+    ) -> tuple[RecycleReport, Any]:
+        """Barrier one frozen prefix without blocking foreign writers on the device wait.
+
+        The caller holds only this participant's local section across A/B/C. Phase A freezes and
+        flushes a target while holding the writer lease, COMMIT_SECTION and the WAL tail. Phase B
+        holds none of those cross-process fences. Phase C reacquires fresh authority, catches up
+        the local view, and publishes only the prefix phase B proved durable.
+
+        Index rebuild claim/clear never enter this method: their durable generation transition
+        depends on the original monolithic section and remains on that path deliberately.
+        """
+        # Phase A: make one exact committed prefix complete on the device and write every dirty
+        # frame, but do not claim durability or reclaim its WAL yet.
+        lease = self._hold_lease()
+        try:
+            self._validate_lease(lease)
+            with (
+                self._coordinator_section(
+                    COMMIT_SECTION, timeout=self._commit_lock_timeout
+                ),
+                self._hold_wal_tail(),
+            ):
+                self._validate_lease(lease)
+                published = self._complete_committed_gap()
+                with self._close_wait_hazard():
+                    self._pool.begin_read_view(published.last_committed_lsn)
+                self._redo_onto_device(
+                    published.checkpoint_lsn, published.last_committed_lsn
+                )
+                with self._close_wait_hazard():
+                    self._pool.flush()
+                barrier_files = {
+                    self._file_ids.heap_file,
+                    self._file_ids.catalog_file,
+                }
+                # Preserve the old global checkpoint's coverage for every paged extension this
+                # pool actually wrote, even when it is not part of today's built-in registry.
+                # Bootstrap staging names can remain in the modification ledger after atomic
+                # rename, so only names that still exist are durable targets. Foreign images
+                # skipped as already-newer are covered by the canonical inventory below.
+                with self._close_wait_hazard():
+                    barrier_files.update(
+                        file
+                        for file, _page_index in self._pool.modified_pages()
+                        if self._pool.storage.exists(file)
+                    )
+                manager = self._index_manager
+                if manager is not None:
+                    barrier_files.update(index.file for index in manager.indexes())
+                target = _CheckpointTarget(
+                    target_lsn=published.last_committed_lsn,
+                    target_csn=published.last_csn,
+                    base_checkpoint_lsn=published.checkpoint_lsn,
+                    barrier_files=tuple(sorted(barrier_files)),
+                )
+        except BaseException as failure:
+            cleanup_failure = self._drop_lease(lease, force=True)
+            if cleanup_failure is not None:
+                self._recovery_required = True
+                _note_cleanup_failure(failure, cleanup_failure)
+            raise
+        cleanup_failure = self._drop_lease(lease, force=True)
+        if cleanup_failure is not None:
+            # The target is not published, but an uncertain writer authority must not be
+            # followed by an intentionally unfenced device wait on this handle.
+            self._recovery_required = True
+            raise cleanup_failure
+
+        # Phase B: the slow data barrier is the entire unfenced region. WAL remains the durable
+        # authority until phase C publishes the frozen target, so failure or process death here
+        # leaves the previous checkpoint and every required log record intact.
+        with self._close_wait_hazard():
+            # A foreign process may already have written an equal-or-newer page image through
+            # its own storage instance. Redo then correctly skips the image, but this instance's
+            # ordinary dirty set cannot know that the foreign write still needs a data barrier.
+            # Name every paged file whose state phase A accepted. A trailing global barrier would
+            # fsync all of these descriptors a second time on LocalStorageDevice because its
+            # conservative global target is ``dirty | open handles``; the named inventory is the
+            # complete supported paged-file set (heap, catalog and every registered index).
+            for file in target.barrier_files:
+                self._pool.durability_barrier(file)
+
+        # Phase C: a foreign writer or checkpoint may have advanced the durable publication
+        # during B. Reacquire a fresh lease and stable WAL picture, never regress that state, and
+        # never promote a commit beyond the prefix phase B actually barriered.
+        lease = self._hold_lease()
+        try:
+            self._validate_lease(lease)
+            with (
+                self._coordinator_section(
+                    COMMIT_SECTION, timeout=self._commit_lock_timeout
+                ),
+                self._hold_wal_tail(),
+            ):
+                self._validate_lease(lease)
+                current = self._complete_committed_gap()
+                if (
+                    current.last_committed_lsn < target.target_lsn
+                    or current.last_csn < target.target_csn
+                    or current.checkpoint_lsn < target.base_checkpoint_lsn
+                ):
+                    self._recovery_required = True
+                    raise GrafxRecoveryRefused(
+                        "The durable publication moved behind the checkpoint target while its "
+                        "data barrier was in progress; no checkpoint was published or recycled.",
+                        field="checkpoint_target",
+                        target_lsn=target.target_lsn,
+                        target_csn=target.target_csn,
+                        base_checkpoint_lsn=target.base_checkpoint_lsn,
+                        current_last_committed_lsn=current.last_committed_lsn,
+                        current_last_csn=current.last_csn,
+                        current_checkpoint_lsn=current.checkpoint_lsn,
+                    )
+
+                # A commit published during B may exist only in WAL and another participant's
+                # pool. Drop the phase-A view, then replay exactly the suffix still above the
+                # newest published checkpoint. A concurrent checkpoint may already have recycled
+                # the older prefix, which is why replay starts at the larger physical proof.
+                self._establish_read_view(current, own=False)
+                replay_from = _larger(
+                    target.target_lsn, current.checkpoint_lsn
+                )
+                # Even an empty suffix performs the registry synchronisation owned by the redo
+                # door. A newer checkpoint may have installed foreign DDL and recycled its WAL
+                # while B was running; skipping the empty range would leave this long-lived
+                # handle without the newly durable indexes.
+                self._redo_onto_device(
+                    replay_from, current.last_committed_lsn
+                )
+
+                checkpoint_lsn = _larger(
+                    current.checkpoint_lsn, target.target_lsn
+                )
+                self._publish(
+                    CommitState(
+                        last_committed_lsn=current.last_committed_lsn,
+                        last_csn=current.last_csn,
+                        checkpoint_lsn=checkpoint_lsn,
+                    )
+                )
+                self._advance_participant_pin(floor=checkpoint_lsn)
+                reader_present = self._reader_horizon() is not None
+                with self._close_wait_hazard():
+                    state["recycled"] = self._wal.recycle(
+                        self._recyclable_horizon_in_section(),
+                        reader_present=reader_present,
+                    )
+                if transition is not None:
+                    state["outcome"] = transition(current.last_committed_lsn)
+                    state["completed"] = True
+        except BaseException as failure:
+            cleanup_failure = self._drop_lease(lease)
+            if cleanup_failure is not None:
+                self._recovery_required = True
+                _note_cleanup_failure(failure, cleanup_failure)
+            raise
+        cleanup_failure = self._drop_lease(lease)
+        if cleanup_failure is not None:
+            raise cleanup_failure
         return state["recycled"], state["outcome"]
 
     def _complete_committed_gap(self) -> CommitState:
@@ -4438,10 +4630,24 @@ class TransactionManager:
         self._lease_guard = guard
         return guard
 
-    def _drop_lease(self, lease: LeaseGuard) -> BaseException | None:
-        """Give the lease up and return, rather than raise, a foreign cleanup failure."""
-        if self._retain_lease and lease is self._lease_guard and not lease.released:
+    def _drop_lease(
+        self, lease: LeaseGuard, *, force: bool = False
+    ) -> BaseException | None:
+        """Give the lease up and return, rather than raise, a foreign cleanup failure.
+
+        ``force`` is reserved for the A/B checkpoint boundary. A retained lease there would
+        keep every other process out for the whole data barrier and defeat the concurrency the
+        split exists to provide, so the cached guard is detached before release is attempted.
+        """
+        if (
+            not force
+            and self._retain_lease
+            and lease is self._lease_guard
+            and not lease.released
+        ):
             return None
+        if force and lease is self._lease_guard:
+            self._lease_guard = None
         with self._close_wait_hazard():
             return _release_quietly(lease)
 

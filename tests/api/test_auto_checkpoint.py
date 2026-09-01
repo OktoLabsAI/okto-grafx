@@ -89,19 +89,24 @@ class _HostileGrafxError(GrafxError):
 
 
 class _RefuseNextCheckpointBarrier(FaultInjectingStorageDevice):
-    """Refuse one pool-wide barrier while leaving WAL/commit-state barriers honest."""
+    """Refuse one data-file barrier while leaving WAL/commit-state barriers honest."""
 
     def __init__(self, inner: Any) -> None:
         super().__init__(inner, seed=1)
-        self._refuse_global_barrier = False
+        self._refuse_data_barrier = False
         self.refusals = 0
 
     def arm(self) -> None:
-        self._refuse_global_barrier = True
+        self._refuse_data_barrier = True
 
     def durable_barrier(self, file: str | None = None) -> None:
-        if self._refuse_global_barrier and file is None:
-            self._refuse_global_barrier = False
+        if (
+            self._refuse_data_barrier
+            and file is not None
+            and not file.startswith("wal/")
+            and not file.startswith("control/")
+        ):
+            self._refuse_data_barrier = False
             self.refusals += 1
             raise GrafxDurabilityBarrierFailed(
                 "The injected checkpoint barrier did not complete.",

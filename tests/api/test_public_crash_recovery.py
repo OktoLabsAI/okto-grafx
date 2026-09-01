@@ -659,10 +659,10 @@ def test_flush_cannot_race_a_post_barrier_recovery_latch(
         database.close()
 
 
-def test_an_already_open_participant_completes_a_foreign_gap_before_same_page_write() -> (
+def test_an_already_open_participant_materializes_after_completing_a_foreign_gap() -> (
     None
 ):
-    """A fresh materialization may share a page after it first completes the durable gap."""
+    """A fresh page image is based on the durable gap it completes, preserving both rows."""
     memory = MemoryStorageDevice(page_size=PAGE_SIZE)
     fault = _PersistentPageWriteFailure(memory)
     with _connect(fault, namespace=memory) as setup:
@@ -687,16 +687,16 @@ def test_an_already_open_participant_completes_a_foreign_gap_before_same_page_wr
         assert _published(memory) == state_before
 
         # This participant predates the foreign COMMIT and therefore begins from the old
-        # publication. Its commit first completes that durable gap and establishes the resulting
-        # read view. The two inserts have disjoint logical partitions, while the shared heap page
-        # is discovered only by materialising from that current durable image. The bounded second
-        # OCC may therefore use the refreshed baseline: success, not a false conflict, is the
-        # authorised outcome, and retaining both rows proves it did not overwrite the gap.
+        # publication, but it has staged only a logical row intent -- no page image from that
+        # snapshot. The authorised materialisation baseline first completes the durable gap and
+        # builds the newly discovered physical page from that current image, preserving both
+        # rows without weakening first-pass OCC or forgiving any pre-staged page.
         stale = later_writer.begin("write")
         stale.execute("CREATE (:P {id: 8, name: 'after'})")
-        report = stale.commit()
-        assert report.durable is True
-        assert _published(memory).last_committed_lsn > foreign_commit
+        settled = stale.commit()
+        assert settled.durable is True
+        assert settled.csn > foreign_commit
+        assert _published(memory).last_committed_lsn == settled.csn
         assert later_writer.execute(KEYED_READ, {"id": 7}).rows == (("before",),)
         assert later_writer.execute(KEYED_READ, {"id": 8}).rows == (("after",),)
         later_writer.checkpoint()

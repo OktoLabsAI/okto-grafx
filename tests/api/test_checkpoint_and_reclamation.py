@@ -20,7 +20,9 @@ import pytest
 
 from okto_grafx import connect
 from okto_grafx.domain.errors import GrafxDeviceFull, GrafxError, GrafxUnsupportedOperation
+from okto_grafx.domain.page import PageType
 from okto_grafx.domain.txn.commit_state import CommitState
+from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.commit_state_store import CommitStateStore
 from okto_grafx.engine.index_manager import IndexManager
 
@@ -81,6 +83,383 @@ def test_a_second_checkpoint_with_nothing_new_reclaims_nothing(tmp_path: Path) -
         second = database.checkpoint()
         assert second.recycled == ()
         assert _segments(root) == held
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("retain_lease", (False, True), ids=("per-call", "retained"))
+def test_a_foreign_writer_commits_during_the_checkpoint_data_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retain_lease: bool,
+) -> None:
+    """Phase B holds neither COMMIT_SECTION nor the writer lease.
+
+    The foreign commit U is newer than the immutable target T barriered by the checkpoint. Phase
+    C must preserve U as the published tail, publish only T as the checkpoint, and open indexes
+    against U. Running the retained-lease variant proves phase A forces a turnover rather than
+    silently carrying its cached guard across the barrier.
+    """
+    root = tmp_path / "db"
+    checkpointer = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    writer = None
+    barrier_entered = threading.Event()
+    release_barrier = threading.Event()
+    checkpoint_done = threading.Event()
+    checkpoint_failures: list[BaseException] = []
+    original_barrier = BufferPool.durability_barrier
+    paused = False
+    try:
+        _schema(checkpointer)
+        with checkpointer.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 1, name: 'before'})")
+        target = checkpointer.transactions.published_state().last_committed_lsn
+        # Open after the schema exists so this test isolates the checkpoint split. A handle
+        # opened before a foreign DDL currently has a separate registry-refresh defect: it can
+        # write the heap without staging the index effect. That defect is real, but it is not a
+        # valid source of an INDEX_WRITE for the phase-B concurrency scenario exercised here.
+        writer = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+        checkpointer._transactions._retain_lease = retain_lease
+
+        def pause_first_checkpoint_barrier(
+            pool: BufferPool, file: str | None = None
+        ) -> None:
+            nonlocal paused
+            if pool is checkpointer._pool and not paused:
+                paused = True
+                barrier_entered.set()
+                if not release_barrier.wait(timeout=5.0):
+                    raise AssertionError("the test did not release checkpoint phase B")
+            original_barrier(pool, file)
+
+        def run_checkpoint() -> None:
+            try:
+                checkpointer.checkpoint()
+            except BaseException as failure:  # pragma: no cover - asserted below
+                checkpoint_failures.append(failure)
+            finally:
+                checkpoint_done.set()
+
+        monkeypatch.setattr(BufferPool, "durability_barrier", pause_first_checkpoint_barrier)
+        checkpoint_thread = threading.Thread(
+            target=run_checkpoint, name="concurrent-data-barrier"
+        )
+        checkpoint_thread.start()
+        assert barrier_entered.wait(timeout=5.0)
+
+        with writer.begin("write") as txn:
+            txn.execute("MATCH (p:P {id: 1}) SET p.name = 'during-barrier'")
+        current = writer.transactions.published_state().last_committed_lsn
+        assert current > target
+        assert writer.execute("MATCH (p:P) RETURN p.id, p.name").rows == (
+            (1, "during-barrier"),
+        )
+        assert writer.execute("MATCH (p:P {id: 1}) RETURN p.name").rows == (
+            ("during-barrier",),
+        )
+        assert not checkpoint_done.is_set(), "the checkpoint must still be inside phase B"
+
+        release_barrier.set()
+        checkpoint_thread.join(timeout=10.0)
+        assert checkpoint_done.is_set()
+        assert checkpoint_failures == []
+        published = checkpointer.transactions.published_state()
+        assert published.last_committed_lsn == current
+        assert published.last_csn == current
+        assert published.checkpoint_lsn == target
+        assert checkpointer.execute("MATCH (p:P) RETURN p.id, p.name").rows == (
+            (1, "during-barrier"),
+        )
+        assert checkpointer.stale_indexes == ()
+        assert checkpointer._indexes.index("pk_P").built_through_lsn >= current
+        assert checkpointer.verify("all").findings == ()
+    finally:
+        release_barrier.set()
+        if writer is not None:
+            writer.close()
+        checkpointer.close()
+
+    reopened = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        assert reopened.execute("MATCH (p:P) RETURN p.id, p.name").rows == (
+            (1, "during-barrier"),
+        )
+        assert reopened.verify("all").findings == ()
+    finally:
+        reopened.close()
+
+
+def test_a_checkpoint_finishing_after_a_newer_checkpoint_never_regresses_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow target T preserves a checkpoint of U published while T was in phase B."""
+    root = tmp_path / "db"
+    slow = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    faster = None
+    barrier_entered = threading.Event()
+    release_barrier = threading.Event()
+    slow_done = threading.Event()
+    slow_failures: list[BaseException] = []
+    original_barrier = BufferPool.durability_barrier
+    paused = False
+    try:
+        _schema(slow)
+        with slow.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 1, name: 'target-t'})")
+        target = slow.transactions.published_state().last_committed_lsn
+        faster = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+
+        def pause_slow_barrier(pool: BufferPool, file: str | None = None) -> None:
+            nonlocal paused
+            if pool is slow._pool and not paused:
+                paused = True
+                barrier_entered.set()
+                if not release_barrier.wait(timeout=5.0):
+                    raise AssertionError("the test did not release the slow checkpoint")
+            original_barrier(pool, file)
+
+        def run_slow_checkpoint() -> None:
+            try:
+                slow.checkpoint()
+            except BaseException as failure:  # pragma: no cover - asserted below
+                slow_failures.append(failure)
+            finally:
+                slow_done.set()
+
+        monkeypatch.setattr(BufferPool, "durability_barrier", pause_slow_barrier)
+        slow_thread = threading.Thread(
+            target=run_slow_checkpoint, name="slow-target-t-checkpoint"
+        )
+        slow_thread.start()
+        assert barrier_entered.wait(timeout=5.0)
+
+        with faster.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 2, name: 'target-u'})")
+        newer = faster.transactions.published_state().last_committed_lsn
+        assert newer > target
+        faster.checkpoint()
+        assert faster.transactions.published_state().checkpoint_lsn == newer
+        assert not slow_done.is_set()
+
+        release_barrier.set()
+        slow_thread.join(timeout=10.0)
+        assert slow_done.is_set()
+        assert slow_failures == []
+        published = slow.transactions.published_state()
+        assert published.last_committed_lsn == newer
+        assert published.last_csn == newer
+        assert published.checkpoint_lsn == newer
+        assert slow.execute("MATCH (p:P) RETURN p.id").rows == ((1,), (2,))
+        assert slow.verify("all").findings == ()
+    finally:
+        release_barrier.set()
+        if faster is not None:
+            faster.close()
+        slow.close()
+
+    reopened = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        assert reopened.execute("MATCH (p:P) RETURN p.id").rows == ((1,), (2,))
+        assert reopened.transactions.published_state().checkpoint_lsn == newer
+        assert reopened.verify("all").findings == ()
+    finally:
+        reopened.close()
+
+
+def test_a_checkpoint_adopts_ddl_already_retired_by_a_newer_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty phase-C redo still synchronizes indexes introduced during phase B."""
+    root = tmp_path / "db"
+    slow = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    newer = None
+    barrier_entered = threading.Event()
+    release_barrier = threading.Event()
+    slow_done = threading.Event()
+    slow_failures: list[BaseException] = []
+    original_barrier = BufferPool.durability_barrier
+    paused = False
+    try:
+        assert slow.attached_indexes == ()
+
+        def pause_slow_barrier(pool: BufferPool, file: str | None = None) -> None:
+            nonlocal paused
+            if pool is slow._pool and not paused:
+                paused = True
+                barrier_entered.set()
+                if not release_barrier.wait(timeout=5.0):
+                    raise AssertionError("the test did not release the slow checkpoint")
+            original_barrier(pool, file)
+
+        def run_slow_checkpoint() -> None:
+            try:
+                slow.checkpoint()
+            except BaseException as failure:  # pragma: no cover - asserted below
+                slow_failures.append(failure)
+            finally:
+                slow_done.set()
+
+        monkeypatch.setattr(BufferPool, "durability_barrier", pause_slow_barrier)
+        slow_thread = threading.Thread(
+            target=run_slow_checkpoint, name="slow-pre-ddl-checkpoint"
+        )
+        slow_thread.start()
+        assert barrier_entered.wait(timeout=5.0)
+
+        newer = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+        _schema(newer)
+        with newer.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 7, name: 'foreign-ddl'})")
+        newer.checkpoint()
+        newest_state = newer.transactions.published_state()
+        assert newest_state.checkpoint_lsn == newest_state.last_committed_lsn
+        assert not slow_done.is_set()
+
+        release_barrier.set()
+        slow_thread.join(timeout=10.0)
+        assert slow_done.is_set()
+        assert slow_failures == []
+        assert slow.transactions.published_state() == newest_state
+        assert slow.attached_indexes == ("pk_P",)
+        assert slow.execute("MATCH (p:P {id: 7}) RETURN p.name").rows == (
+            ("foreign-ddl",),
+        )
+        assert slow.verify("all").findings == ()
+    finally:
+        release_barrier.set()
+        if newer is not None:
+            newer.close()
+        slow.close()
+
+    reopened = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        assert reopened.attached_indexes == ("pk_P",)
+        assert reopened.execute("MATCH (p:P {id: 7}) RETURN p.name").rows == (
+            ("foreign-ddl",),
+        )
+        assert reopened.verify("all").findings == ()
+    finally:
+        reopened.close()
+
+
+def test_a_checkpoint_with_a_live_local_snapshot_keeps_the_monolithic_fence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The split cannot expose a reader pin that phase B is unable to refresh."""
+    root = tmp_path / "db"
+    checkpointer = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    writer = None
+    reader = None
+    writer_txn = None
+    barrier_entered = threading.Event()
+    release_barrier = threading.Event()
+    checkpoint_done = threading.Event()
+    commit_done = threading.Event()
+    checkpoint_failures: list[BaseException] = []
+    commit_failures: list[BaseException] = []
+    original_barrier = BufferPool.durability_barrier
+    paused = False
+    try:
+        _schema(checkpointer)
+        checkpointer.checkpoint()
+        writer = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+        reader = checkpointer.begin("read")
+        writer_txn = writer.begin("write")
+        writer_txn.execute("CREATE (:P {id: 9, name: 'waited'})")
+
+        def pause_checkpoint_barrier(
+            pool: BufferPool, file: str | None = None
+        ) -> None:
+            nonlocal paused
+            if pool is checkpointer._pool and not paused:
+                paused = True
+                barrier_entered.set()
+                if not release_barrier.wait(timeout=5.0):
+                    raise AssertionError("the test did not release the monolithic checkpoint")
+            original_barrier(pool, file)
+
+        def run_checkpoint() -> None:
+            try:
+                checkpointer.checkpoint()
+            except BaseException as failure:  # pragma: no cover - asserted below
+                checkpoint_failures.append(failure)
+            finally:
+                checkpoint_done.set()
+
+        def run_commit() -> None:
+            try:
+                writer_txn.commit()
+            except BaseException as failure:  # pragma: no cover - asserted below
+                commit_failures.append(failure)
+            finally:
+                commit_done.set()
+
+        monkeypatch.setattr(BufferPool, "durability_barrier", pause_checkpoint_barrier)
+        checkpoint_thread = threading.Thread(
+            target=run_checkpoint, name="checkpoint-with-live-snapshot"
+        )
+        checkpoint_thread.start()
+        assert barrier_entered.wait(timeout=5.0)
+
+        commit_thread = threading.Thread(target=run_commit, name="foreign-writer")
+        commit_thread.start()
+        assert not commit_done.wait(timeout=0.2), (
+            "a checkpoint with a live local snapshot released its cross-process fence"
+        )
+
+        release_barrier.set()
+        checkpoint_thread.join(timeout=10.0)
+        commit_thread.join(timeout=10.0)
+        assert checkpoint_done.is_set() and commit_done.is_set()
+        assert checkpoint_failures == []
+        assert commit_failures == []
+        reader.rollback()
+        reader = None
+        writer_txn = None
+        assert checkpointer.execute("MATCH (p:P {id: 9}) RETURN p.name").rows == (
+            ("waited",),
+        )
+        assert checkpointer.verify("all").findings == ()
+    finally:
+        release_barrier.set()
+        if reader is not None and reader.active:
+            reader.rollback()
+        if writer_txn is not None and writer_txn.active:
+            writer_txn.rollback()
+        if writer is not None:
+            writer.close()
+        checkpointer.close()
+
+
+def test_a_split_checkpoint_barriers_every_existing_paged_file_it_flushed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A future paged extension cannot silently fall outside phase B's named inventory."""
+    database = connect(str(tmp_path / "db"), wal_segment_bytes=SEGMENT_BYTES)
+    custom_file = "extension/custom.dat"
+    barrier_files: list[str | None] = []
+    original_barrier = BufferPool.durability_barrier
+    try:
+        _schema(database)
+        database._storage.create(custom_file, exclusive=True)
+        page = database._pool.allocate(custom_file, int(PageType.FREE))
+        database._pool.unpin(custom_file, page.page_index, dirty=True, page=page)
+
+        def record_barrier(pool: BufferPool, file: str | None = None) -> None:
+            if pool is database._pool:
+                barrier_files.append(file)
+            original_barrier(pool, file)
+
+        monkeypatch.setattr(BufferPool, "durability_barrier", record_barrier)
+        database.checkpoint()
+
+        assert barrier_files.count(custom_file) == 1
+        assert None not in barrier_files
+        assert {"heap.dat", "catalog.dat", custom_file}.issubset(barrier_files)
     finally:
         database.close()
 
@@ -454,6 +833,117 @@ db._transactions.refresh_due_readers(
 print("COMMITTED", flush=True)
 time.sleep(60)   # hold the pages in memory; the test kills this process before it flushes
 '''
+
+
+_CHECKPOINT_CRASH_PROCESS = r'''
+import os, sys
+sys.path.insert(0, sys.argv[2])
+from okto_grafx import connect
+from okto_grafx.engine.buffer_pool import BufferPool
+from okto_grafx.engine.wal_manager import WalManager
+
+db = connect(sys.argv[1], wal_segment_bytes=65536)
+phase = sys.argv[3]
+if phase == "before_data_barrier":
+    original = BufferPool.durability_barrier
+    def crash_before(pool, file=None):
+        if pool is db._pool:
+            os._exit(71)
+        return original(pool, file)
+    BufferPool.durability_barrier = crash_before
+elif phase == "after_data_barrier":
+    original = BufferPool.durability_barrier
+    expected = 2 + len(db._indexes.indexes())
+    observed = 0
+    def crash_after(pool, file=None):
+        global observed
+        result = original(pool, file)
+        if pool is db._pool:
+            observed += 1
+            if observed == expected:
+                os._exit(72)
+        return result
+    BufferPool.durability_barrier = crash_after
+elif phase == "after_publish":
+    original = WalManager.recycle
+    def crash_before_recycle(manager, *args, **kwargs):
+        if manager is db._wal:
+            os._exit(73)
+        return original(manager, *args, **kwargs)
+    WalManager.recycle = crash_before_recycle
+else:
+    os._exit(98)
+
+db.checkpoint()
+os._exit(99)
+'''
+
+
+@pytest.mark.parametrize(
+    ("phase", "exit_code", "checkpoint_published"),
+    (
+        ("before_data_barrier", 71, False),
+        ("after_data_barrier", 72, False),
+        ("after_publish", 73, True),
+    ),
+)
+def test_checkpoint_crash_windows_preserve_the_proved_prefix(
+    tmp_path: Path,
+    phase: str,
+    exit_code: int,
+    checkpoint_published: bool,
+) -> None:
+    """A process death exposes either the old checkpoint or the completely proved target."""
+    root = tmp_path / phase
+    source = str(Path(connect.__code__.co_filename).resolve().parents[1])
+    seeded = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        _schema(seeded)
+        seeded.checkpoint()
+        previous = seeded.transactions.published_state().checkpoint_lsn
+        for identity in range(1, 9):
+            with seeded.begin("write") as txn:
+                txn.execute(f"CREATE (:P {{id: {identity}, name: 'kept'}})")
+        target = seeded.transactions.published_state().last_committed_lsn
+        assert target > previous
+    finally:
+        seeded.close()
+
+    crashed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _CHECKPOINT_CRASH_PROCESS,
+            str(root),
+            source,
+            phase,
+        ],
+        check=False,
+        timeout=120,
+    )
+    assert crashed.returncode == exit_code
+
+    reopened = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        state = reopened.transactions.published_state()
+        assert state.last_committed_lsn == target
+        assert state.last_csn == target
+        assert state.checkpoint_lsn == (target if checkpoint_published else previous)
+        assert _people(reopened) == 8
+        assert reopened.execute("MATCH (p:P {id: 8}) RETURN p.name").rows == (
+            ("kept",),
+        )
+        assert reopened.verify("all").findings == ()
+        reopened.checkpoint()
+    finally:
+        reopened.close()
+
+    cold = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        assert _people(cold) == 8
+        assert cold.verify("all").findings == ()
+    finally:
+        cold.close()
 
 
 def test_a_checkpoint_never_reclaims_a_page_another_process_has_not_flushed(

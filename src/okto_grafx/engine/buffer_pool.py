@@ -871,12 +871,23 @@ class BufferPool:
         acknowledged as durable.
         """
         written = self.flush(file)
+        self.durability_barrier(file)
+        return written
+
+    @_guarded
+    def durability_barrier(self, file: str | None = None) -> None:
+        """Put prior data writes on the platter without flushing a second time.
+
+        The ordinary checkpoint door remains ``flush + barrier``.  TransactionManager's
+        concurrent checkpoint uses the two halves separately so another process may commit
+        while the device performs the slow durability barrier; this method deliberately owns
+        the exact same timer and failure counter as :meth:`checkpoint`.
+        """
         if self._metrics.enabled:
             with self._metrics.time(FSYNC_DURATION_SECONDS, self._data_labels):
                 self._barrier(file)
         else:
             self._barrier(file)
-        return written
 
     def _barrier(self, file: str | None) -> None:
         """Ask the device for a durability barrier, counting a failure before re-raising it."""
