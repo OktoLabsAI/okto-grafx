@@ -46,7 +46,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable, Mapping, Sequence
 
-SCHEMA = "okto-grafx.ce3-m7-multiprocess.v5"
+SCHEMA = "okto-grafx.ce3-m7-multiprocess.v6"
 PINNED_HARNESS_HEAD = "0dfb5269dd8531fd4db2679fc80b649c64bd9b09"
 PINNED_HARNESS_BLOB = "a02b86dce098ceec3fdbd10a820a4dd6f9e2a7b1"
 EXPECTED_OPERATION_SET_SHA256 = (
@@ -104,6 +104,8 @@ PHASE_PROBE_TARGETS = (
     ("okto_grafx.engine.txn_manager", "TransactionManager", "_apply_images"),
     ("okto_grafx.engine.txn_manager", "TransactionManager", "_apply_index_changes"),
     ("okto_grafx.engine.txn_manager", "TransactionManager", "_publish_commit_state"),
+    ("okto_grafx.engine.buffer_pool", "BufferPool", "flush"),
+    ("okto_grafx.engine.buffer_pool", "BufferPool", "durability_barrier"),
     ("okto_grafx.engine.buffer_pool", "BufferPool", "checkpoint"),
     ("okto_grafx.engine.txn_manager", "TransactionManager", "_publish"),
     ("okto_grafx.engine.wal_manager", "WalManager", "recycle"),
@@ -452,20 +454,15 @@ class _SectionPhaseProbe:
                 if event["phase"] == context_phase and event.get("detail") == "commit"
             ]
             if commit_contexts:
-                context = max(
+                commit_windows = self._merged_intervals(
                     commit_contexts,
-                    key=lambda event: (
-                        int(event["ended_at_ns"]) - int(event["started_at_ns"])
-                    ),
+                    lower=int(root["started_at_ns"]),
+                    upper=int(root["ended_at_ns"]),
                 )
-                body_covered = self._union_ns(
-                    coverage_children,
-                    lower=int(context["started_at_ns"]),
-                    upper=int(context["ended_at_ns"]),
+                body_covered = self._union_inside_windows_ns(
+                    coverage_children, commit_windows
                 )
-                body_duration = int(context["ended_at_ns"]) - int(
-                    context["started_at_ns"]
-                )
+                body_duration = sum(end - start for start, end in commit_windows)
                 body_residual = max(0, body_duration - body_covered)
                 section["commit_section"] = {
                     "root_ms": body_duration / 1e6,
@@ -489,9 +486,9 @@ class _SectionPhaseProbe:
         }
 
     @staticmethod
-    def _union_ns(
+    def _merged_intervals(
         events: Sequence[Mapping[str, Any]], *, lower: int, upper: int
-    ) -> int:
+    ) -> tuple[tuple[int, int], ...]:
         intervals = sorted(
             (
                 max(lower, int(event["started_at_ns"])),
@@ -500,18 +497,41 @@ class _SectionPhaseProbe:
             for event in events
             if int(event["ended_at_ns"]) > lower and int(event["started_at_ns"]) < upper
         )
-        covered = 0
+        merged: list[tuple[int, int]] = []
         cursor_start = cursor_end = lower
         for started, ended in intervals:
             if ended <= started:
                 continue
             if started > cursor_end:
-                covered += cursor_end - cursor_start
+                if cursor_end > cursor_start:
+                    merged.append((cursor_start, cursor_end))
                 cursor_start, cursor_end = started, ended
             else:
                 cursor_end = max(cursor_end, ended)
-        covered += cursor_end - cursor_start
-        return max(0, covered)
+        if cursor_end > cursor_start:
+            merged.append((cursor_start, cursor_end))
+        return tuple(merged)
+
+    @staticmethod
+    def _union_ns(
+        events: Sequence[Mapping[str, Any]], *, lower: int, upper: int
+    ) -> int:
+        return sum(
+            ended - started
+            for started, ended in _SectionPhaseProbe._merged_intervals(
+                events, lower=lower, upper=upper
+            )
+        )
+
+    @staticmethod
+    def _union_inside_windows_ns(
+        events: Sequence[Mapping[str, Any]],
+        windows: Sequence[tuple[int, int]],
+    ) -> int:
+        return sum(
+            _SectionPhaseProbe._union_ns(events, lower=lower, upper=upper)
+            for lower, upper in windows
+        )
 
     def uninstall(self) -> None:
         for owner, method, original in reversed(self._restore):
@@ -2353,25 +2373,63 @@ def _phase_probe_capture_valid(
             for event in children
             if event["phase"] == context_phase and event.get("detail") == "commit"
         ]
-        if len(commit_contexts) > 1:
+        ordered_contexts = sorted(
+            commit_contexts, key=lambda event: int(event["started_at_ns"])
+        )
+        if any(
+            int(left["ended_at_ns"]) > int(right["started_at_ns"])
+            for left, right in zip(ordered_contexts, ordered_contexts[1:])
+        ):
             return False
+        if root.get("outcome") == "returned":
+            expected_contexts = 1 if section_scope == "commit" else 2
+            if len(ordered_contexts) != expected_contexts:
+                return False
+            if section_scope == "checkpoint":
+                first, second = ordered_contexts
+                first_started = int(first["started_at_ns"])
+                first_ended = int(first["ended_at_ns"])
+                second_started = int(second["started_at_ns"])
+                second_ended = int(second["ended_at_ns"])
+                flushes = [
+                    event
+                    for event in children
+                    if event["phase"] == "BufferPool.flush"
+                ]
+                barriers = [
+                    event
+                    for event in children
+                    if event["phase"] == "BufferPool.durability_barrier"
+                ]
+                if not any(
+                    first_started <= int(event["started_at_ns"])
+                    and int(event["ended_at_ns"]) <= first_ended
+                    for event in flushes
+                ):
+                    return False
+                if not barriers or not all(
+                    first_ended <= int(event["started_at_ns"])
+                    <= int(event["ended_at_ns"])
+                    <= second_started
+                    for event in barriers
+                ):
+                    return False
+                if second_ended > int(root["ended_at_ns"]):
+                    return False
         if not commit_contexts:
             if root.get("outcome") == "returned" or commit_section is not None:
                 return False
             continue
         if not isinstance(commit_section, Mapping):
             return False
-        context = max(
+        commit_windows = _SectionPhaseProbe._merged_intervals(
             commit_contexts,
-            key=lambda event: int(event["ended_at_ns"]) - int(event["started_at_ns"]),
+            lower=int(root["started_at_ns"]),
+            upper=int(root["ended_at_ns"]),
         )
-        body_started = int(context["started_at_ns"])
-        body_ended = int(context["ended_at_ns"])
-        body_duration = body_ended - body_started
-        body_covered = _SectionPhaseProbe._union_ns(
-            coverage_children,
-            lower=body_started,
-            upper=body_ended,
+        body_duration = sum(end - start for start, end in commit_windows)
+        body_covered = _SectionPhaseProbe._union_inside_windows_ns(
+            coverage_children, commit_windows
         )
         body_residual = max(0, body_duration - body_covered)
         expected_body_ratio = body_residual / body_duration if body_duration else 0.0
@@ -2747,6 +2805,8 @@ def official_shortfalls(report: Mapping[str, Any]) -> list[str]:
     shortfalls: list[str] = []
     inputs = _mapping_or_empty(report.get("inputs"))
     provenance = _mapping_or_empty(report.get("provenance"))
+    if report.get("schema") != SCHEMA:
+        shortfalls.append("report_schema_mismatch")
     if report.get("run_failure"):
         shortfalls.append("measurement_run_failed")
     finalization = _mapping_or_empty(report.get("finalization"))

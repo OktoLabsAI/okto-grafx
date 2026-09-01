@@ -508,6 +508,7 @@ def _official_report() -> dict[str, object]:
     identity_capture["fingerprint_sha256"] = ce3._identity_fingerprint(identity_capture)
     environment = _environment_evidence()
     return {
+        "schema": ce3.SCHEMA,
         "official_requested": True,
         "check_only": False,
         "inputs": {
@@ -736,7 +737,7 @@ def test_failed_post_cleanup_write_cannot_leave_an_official_pending_artifact(
 
 
 def test_frozen_matrix_and_pins_are_literal() -> None:
-    assert ce3.SCHEMA == "okto-grafx.ce3-m7-multiprocess.v5"
+    assert ce3.SCHEMA == "okto-grafx.ce3-m7-multiprocess.v6"
     assert ce3.MAX_OPERATION_ATTEMPTS == 60
     assert ce3.EXPECTED_OPERATION_SET_SHA256 == (
         "c994255b0bf695040c972ce339cc5d580ec253d2146674664e7722cf6b5a7f81"
@@ -1420,12 +1421,67 @@ def test_phase_probe_installs_on_the_real_engine_and_captures_auto_checkpoint() 
     roots = {event["scope"] for event in captured["events"] if event["root"]}
     assert roots == {"commit", "checkpoint"}
 
+    checkpoint_root = next(
+        event
+        for event in captured["events"]
+        if event["root"] and event["scope"] == "checkpoint"
+    )
+    checkpoint_children = [
+        event
+        for event in captured["events"]
+        if not event["root"]
+        and event["scope"] == "checkpoint"
+        and event["section_id"] == checkpoint_root["section_id"]
+    ]
+    commit_contexts = [
+        event
+        for event in checkpoint_children
+        if event["phase"] == "TransactionManager._coordinator_section"
+        and event.get("detail") == "commit"
+    ]
+    data_barriers = [
+        event
+        for event in checkpoint_children
+        if event["phase"] == "BufferPool.durability_barrier"
+    ]
+    assert len(commit_contexts) == 2
+    assert data_barriers
+    assert all(
+        barrier["ended_at_ns"] <= section["started_at_ns"]
+        or barrier["started_at_ns"] >= section["ended_at_ns"]
+        for barrier in data_barriers
+        for section in commit_contexts
+    )
+
     reconciled = next(
         section for section in captured["sections"] if "commit_section" in section
     )
     reconciled["commit_section"]["residual_ms"] += 1.0
     assert not ce3._phase_probe_capture_valid(
         captured, started_at_ns=started, ended_at_ns=ended
+    )
+
+
+def test_v6_phase_validation_rejects_the_single_section_v5_checkpoint_shape() -> None:
+    started = 10_000
+    ended = 20_000
+    legacy = _phase_capture(started, ended, 1)
+    old_root = "TransactionManager._commit_with_writing"
+    old_child = "TransactionManager._complete_committed_gap"
+    new_root = "TransactionManager._checkpoint_in_section"
+    new_child = "BufferPool.checkpoint"
+    for event in legacy["events"]:
+        event["scope"] = "checkpoint"
+        if event["phase"] == old_root:
+            event["phase"] = new_root
+        elif event["phase"] == old_child:
+            event["phase"] = new_child
+    legacy["inclusive_totals"][new_root] = legacy["inclusive_totals"].pop(old_root)
+    legacy["inclusive_totals"][new_child] = legacy["inclusive_totals"].pop(old_child)
+    legacy["sections"][0]["scope"] = "checkpoint"
+
+    assert not ce3._phase_probe_capture_valid(
+        legacy, started_at_ns=started, ended_at_ns=ended
     )
 
 
@@ -1879,6 +1935,10 @@ def test_official_shortfalls_is_total_over_malformed_nested_evidence(
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [
+        (
+            lambda value: value.update(schema="okto-grafx.ce3-m7-multiprocess.v5"),
+            "report_schema_mismatch",
+        ),
         (
             lambda value: value["provenance"].update(operation_set_sha256="wrong"),
             "logical_pf5_digest_mismatch",
