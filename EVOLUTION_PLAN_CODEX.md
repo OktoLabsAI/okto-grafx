@@ -152,12 +152,12 @@
   `GET_RELATED_CONTEXT`; todos os demais resultados comparáveis são iguais. O modo Grafx observado
   é `descriptor_revalidation="generation"`; fontes carregadas, worktrees e pins foram autenticados
   no início e no fim. Após o run, os três worktrees continuavam limpos e não havia processo órfão.
-  M-PULSE-7 está encerrado por qualidade; o próximo passo finito é a regressão ampla Community nos
-  mesmos pins, seguida da construção/auditoria instalável de Grafx `0.0.1`. Não há matriz nem piso de
-  performance intermediário, e o upload ao PyPI continua reservado para execução conjunta com o
-  usuário.
-- **Pré-release `0.0.1` — cinco bloqueios da primeira regressão ampla fechados; rerun integral é o
-  único gate corrente.** A primeira execução Community pós-M-PULSE-7 terminou em `5 failed, 5183
+  M-PULSE-7 está encerrado por qualidade; a regressão ampla Community também foi fechada pela
+  evidência composta descrita abaixo. O próximo passo finito é somente a construção/auditoria
+  instalável de Grafx `0.0.1`. Não há matriz nem piso de performance intermediário, e o upload ao
+  PyPI continua reservado para execução conjunta com o usuário.
+- **Pré-release `0.0.1` — regressão Community fechada; construção/auditoria dos artefatos é o único
+  gate corrente.** A primeira execução Community pós-M-PULSE-7 terminou em `5 failed, 5183
   passed, 3 skipped, 13 deselected`: dois números documentais estavam cinco linhas atrás do oráculo
   executável (`1236 -> 1241`), dois subprocessos herdavam checkouts não pinados ou contenção curta
   demais, e o teste de wheel offline não encontrava as wheels nativas de `ladybug==0.16.0` e
@@ -170,9 +170,34 @@
   3.13, os cinco casos originalmente falhos passaram; também passou o segundo cenário do helper de
   autoridade, totalizando documentação/F16 `2/2`, M7 subprocessos `2/2`, supervisor semântico `1/1`
   e launcher instalado `1/1`. O diagnóstico independente Nexus
-  `hof_1b1010756f4e49d59a5985b98992d4dc` foi verificado/PASS. O próximo passo não muda: repetir uma
-  única vez a regressão Community ampla sobre esses commits; se verde, construir e auditar os
-  artefatos Grafx `0.0.1`, sem upload automático ao PyPI.
+  `hof_1b1010756f4e49d59a5985b98992d4dc` foi verificado/PASS. A segunda execução ampla terminou em
+  `1 failed, 5187 passed, 3 skipped, 13 deselected`: o único vermelho era a asserção que comparava o
+  HEAD Core certificado `ccc1f345` ao sucessor `341bccd`, cujo único delta é a linha documental do
+  README exigida pelo F16. Não houve falha de produto, e a suíte semântica antes limitada a 240 s
+  passou sob a contenção de 600 s.
+  Community `perf/st2-pulse-generation@159ef75328dc68493379d95b9f72826b660b8d84`
+  fecha essa única ocorrência sem tornar o runner permissivo: o teste prova que o runner de produção
+  continua rejeitando `341bccd` contra o pin `ccc1f345` e admite o carry-forward da release somente
+  se `ccc1f345` for ancestral imediato, o diff for exatamente `M README.md`, ambas as árvores `src`
+  forem `a83336036c1276f6582261579cf60d45883cb084` e o catálogo produtivo completo continuar idêntico
+  ao receipt `a05` — hash geral `689dee55bef6b28cae87400aa168a33fc0b88a07c6c050e608999ed04544f6ac`,
+  com `309/757/129` fontes Community/Core/Grafx. O happy path exato e as recusas de pins Core/Grafx
+  forjados permanecem testados; runner, manifesto v3 e código produtivo não mudaram. O fechamento
+  focado persistente passou **10/10** em `123,74 s`; JUnit
+  `D:\GrafxBenchEvidence\mpulse7-release-carry-forward\focused-regression.xml`, SHA-256
+  `9fdfa522c70202d93e03c04af51f1f0810fc331b22402206597d293be4bdd1f6`. A revisão Nexus
+  `hof_e31712f8b255489aa1834b5454be10b9` foi verificada/PASS. A conclusão é por composição explícita
+  da regressão ampla `5187 + 1` com a repetição direcionada do único caso alterado, não por alegação
+  de uma terceira execução integral. O próximo passo é construir e auditar os artefatos Grafx
+  `0.0.1`, sem upload automático ao PyPI.
+- **Passo futuro pós-`0.0.1` — remover o acoplamento documental F16 entre Community e Core.** O
+  inventário `Community-to-Core import rows` é fato calculado no Community, mas hoje também integra
+  o bloco gerado no README do Core. Isso obriga um commit documental Core sempre que imports do
+  Community mudam, enquanto a certificação M-PULSE-7 pina o Core por HEAD. A solução estrutural deve
+  ser desenhada com ADR e nova certificação na linha `0.0.2`, pois o gerador/validador reside em
+  `okto_pulse.core.application.boundary.saas_closure_report` e uma correção honesta altera `src/` do
+  Core. Até lá, o carry-forward acima é deliberadamente exato, autoexpirável e fail-closed; qualquer
+  novo commit ou mudança em catálogo produtivo exige nova decisão, nunca atualização automática.
 - **Passo futuro — cache/bundle autenticado da autoridade do harness M-PULSE-7 (não bloqueante para
   `0.0.1`).** Decisão de implementação congelada para o gate atual: embora seja tecnicamente
   possível, não será introduzido agora um cache/bundle do catálogo de autoridade, pois ele não é
@@ -2930,7 +2955,7 @@ construção/auditoria do artefato instalável. A matriz CE-3 temporal tornou-se
 | CN-2 — barreiras de checkpoint fora do fence | implementado, auditado e medido; efeito local aprovado, gate agregado ainda vermelho | candidato medido `7acb9d869a7a6b9a533033309a3126f4de704f5b`; produto `e202324`; instrumento `c739733`; contrato de cauda `f872fbe`; R1b `b4d1fa1cff1de76f5ea9a5b21452e5f07ea4dea0897b73ed0274aa583d227e95`; R2 `fdf28373c49e11fa4b19420fee8e170c2ebc5a1a2e8bdfe22a49ffd08b4612b6`; auditorias Nexus `hof_3781b51dbb77417cb899c50d1775cd29` e `hof_8d1bcdb495ab497c91869f300d4688e2` PASS | A/B/C preserva autoridade, WAL e horizonte; 978 barriers ficaram fora do fence e três commits estrangeiros progrediram em seis checkpoints. A exclusão contínua caiu ~49% na mediana, mas o checkpoint total mediano cresceu ~38% e não houve ganho reproduzível de throughput. RAW/H8 foram `5,3178/4,1577/s` em R1b e `1,3218/4,5368/s` em R2, todos abaixo de `7,5/s`; verify live+cold e finalização passaram. Esta é a disposição atual e substitui o status de taxa histórico das linhas M-PULSE-7/CE-3 acima. Matriz completa/10k seguem bloqueados pelo piso `7,5/s`; a indicação histórica de que ST-2 ainda exigia autorização/F4 foi supersedida pela autorização e pelo fechamento registrados na linha seguinte. |
 | ST-2 — dual descriptor revalidation + pinned-route fence | concluído, publicado nos branches de milestone e aceito no gate estrutural; `same-10` temporal permanece o próximo gate finito | Grafx `perf/st2-descriptor-revalidation@f0b55b7b6facc916118f342c774cb06e56bf17e3`; Community `perf/st2-pulse-generation@050ced9b79533d50efed453d53ed450984f75cf3` (produção `cea13b8`, alias test `050ced9`); Core `ccc1f345ece1db89a274cfdd634bd4da27028f63`; artefato PF5 SHA-256 `384a7722ff6772a2e89ca95225ab759ec5c7cab5af9939f405ef7b5ec2802aae`, 969.630 bytes; operação `c994255b...`; auditoria de segurança Nexus `hof_b69cf41505824beda52a25b29b37a8aa` PASS | `strict` continua default e `generation` é opt-in exclusivo Grafx/Pulse. PF5 `continuous`, 12 famílias x 5: `_still_names 424<500`, `os.lstat 4.137<8.000`, `os.stat 2.393->1.727<2.000`; `_read_page/read_fresh_page/write_page=323/146/96`, 123 bindings e 148 statements inalterados. Nenhum fence foi removido: Board/Grafx reutiliza a prova física do binding autenticado com o handle exato pinado/readmitido; genérico/Global preservam caminhada completa; CAS visível, path/page size, missing e alias real permanecem fail-closed. 59 testes focados finais e suíte relevante 253/253 passaram. `machine_idle_asserted=false`: aceite estrutural, sem alegação de throughput. |
 | M-PULSE-7 — certificação somente por qualidade | concluído e auditado; `a05` PASS com receipt canônico, sem blocker funcional | Community `perf/st2-pulse-generation@23f9927ba5ac84424821b42aeac37528996b12e7`; Grafx `8cee82b9b92529f2ba767519c01c161f20876dce`; Core `ccc1f345ece1db89a274cfdd634bd4da27028f63`; manifesto físico/canônico `f4caf1236104e9bb410462b6e5ef3541bec04f4fd591b8e6870b4bb0939a70b1` / `3160a8cdde56feab41b425182e1c41f1b323aeb5b1e91a00cadffb2ff94d6a83`; queries `02c3b06dd71a0f66e04afbf64d33c203ef53d985d8912edb738e6519a6a29a7d`; receipt `D:\GrafxBenchEvidence\mpulse7-quality-20260902-a05\receipt.json` SHA-256 `f08c8be63ea2cd7abf6c6ffbb0deef5203169ed22c5b42a2c34ac290d90b77f1`; autoridade `34605c59f8d99894f40ffe7bb988eccedef8fea6d7cf3951d28f2126eaf859b4`; revisões Nexus `hof_cb1563e7aeed47c9a13eff733334ef66` e `hof_a411cbd75a984035b1d09d14f6cbb546` verificadas/PASS | `a01`–`a03` fecharam falso timeout, lifecycle do supervisor e threshold vetorial; `a04` isolou as duas divergências Board e a fixture v3 aplicou a correção híbrida mínima sem mudar Core/queries nem inventar ranking. `a05` terminou exit 0: dois traces de 10.000, três reopen/recovery por backend, 11/11 crash points, 19/19 Board, 97 Pulse, 21 famílias raw e quatro cenários receipt-bound por backend. Auditoria independente 27/27: JSON canônico + LF, hash recomposto, pins/worktrees e fontes carregadas autenticados, `descriptor_revalidation=generation`, fingerprints finais idênticos e zero crash/timeout/verify/divergência inexplicada. As três diferenças são somente os `generic_gap` congelados `I64`, `EXPLAIN_CONSTRAINT_ORIGINS` e `GET_RELATED_CONTEXT`. Após o run, worktrees limpos e zero processo órfão. Métricas temporais e os dois casos vetoriais vazios permanecem observações/dívida futura, não blockers de `0.0.1`. |
-| RELEASE-0.0.1 — regressão Community pós-M-PULSE-7 | cinco bloqueios focados fechados; rerun amplo pendente | Community `perf/st2-pulse-generation@ae94845`; Core `milestone/grafx-mpulse6-logical-transfer-manifest@341bccd`; Grafx preservado em `8cee82b9`; diagnóstico Nexus `hof_1b1010756f4e49d59a5985b98992d4dc` verificado/PASS | O primeiro run amplo teve 5 falhas e 5.183 passes. As causas foram dois drifts documentais, herança não hermética de checkout em subprocesso, contenção curta do supervisor de pytest aninhado e duas wheels nativas ausentes do cache offline; zero defeito de produto. Após os patches mínimos e a pré-carga operacional, os cinco casos falhos e o segundo consumidor do helper de autoridade passaram. Nenhuma asserção funcional foi removida, o watchdog semântico continua em 30 s e o upload PyPI permanece manual/conjunto. |
+| RELEASE-0.0.1 — regressão Community pós-M-PULSE-7 | fechada por regressão ampla + repetição focada do único caso residual; artefatos instaláveis são o próximo gate | Community `perf/st2-pulse-generation@159ef75328dc68493379d95b9f72826b660b8d84`; Core `milestone/grafx-mpulse6-logical-transfer-manifest@341bccdbb1232ee7ed6a9bcce380fdf9616c1600`; Grafx preservado em `8cee82b9b92529f2ba767519c01c161f20876dce`; diagnósticos Nexus `hof_1b1010756f4e49d59a5985b98992d4dc` e `hof_e31712f8b255489aa1834b5454be10b9` verificados/PASS; JUnit focado SHA-256 `9fdfa522c70202d93e03c04af51f1f0810fc331b22402206597d293be4bdd1f6` | O primeiro run amplo teve 5 falhas e 5.183 passes; todas foram fechadas sem remover asserções. O segundo teve 5.187 passes e uma única incompatibilidade de HEAD provocada pelo commit Core documental exigido pelo F16. O teste final mantém o runner fail-closed, prova ancestralidade imediata, diff exclusivo em README, `src` Core bit-idêntico e catálogo produtivo integral idêntico ao receipt a05; happy path e pins forjados continuam cobertos. O lote final passou 10/10. A conclusão `5187 + 1` é composição explícita, não uma terceira corrida ampla. Código produtivo, manifesto, watchdog semântico de 30 s e receipt não mudaram; upload PyPI permanece manual/conjunto. |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
