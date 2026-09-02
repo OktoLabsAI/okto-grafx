@@ -55,6 +55,12 @@ __all__ = [
 PROGRAM_NAME: str = "oktografx"
 """The name this tool reports itself under, in usage lines and in the version banner."""
 
+_ATTRIBUTION_LINES: tuple[str, ...] = (
+    "Okto Grafx by Okto Labs.",
+    "Copyright 2026 Okto Labs. Licensed under Elastic License 2.0 + SaaS/Branding Addendum.",
+)
+"""Notices the project license requires every CLI help/version surface to preserve."""
+
 MAX_ARGUMENT_LENGTH: int = 1 << 16
 """Longest single argument this tool accepts before refusing it as a command-line mistake.
 
@@ -723,12 +729,18 @@ def _usage_summary() -> str:
         lines.append(f"  {spec.label} {spec.shape}".rstrip())
     lines.append("")
     lines.append(f"Run '{PROGRAM_NAME} --help' for the full description.")
-    return "\n".join(lines)
+    return _with_attribution(lines)
 
 
 def _version_text() -> str:
     """Return the version banner, reading the version the package itself declares."""
-    return f"{PROGRAM_NAME} {__version__}"
+    return "\n".join((f"{PROGRAM_NAME} {__version__}", *_ATTRIBUTION_LINES))
+
+
+def _with_attribution(lines: Sequence[str]) -> str:
+    """Append the immutable product, licensor, copyright and license notices."""
+
+    return "\n".join((*lines, "", *_ATTRIBUTION_LINES))
 
 
 def command_help(spec: CommandSpec) -> str:
@@ -747,7 +759,7 @@ def command_help(spec: CommandSpec) -> str:
             if option.choices:
                 summary = f"{summary} One of: {', '.join(option.choices)}."
             lines.append(f"  {usage}  {summary}")
-    return "\n".join(lines)
+    return _with_attribution(lines)
 
 
 def help_text() -> str:
@@ -781,4 +793,4 @@ def help_text() -> str:
             f"Run '{PROGRAM_NAME} <command> --help' for the options of one command.",
         ]
     )
-    return "\n".join(lines)
+    return _with_attribution(lines)

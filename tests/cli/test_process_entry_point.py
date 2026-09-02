@@ -55,7 +55,11 @@ def _run(*argv: str) -> subprocess.CompletedProcess[str]:
 def test_the_module_entry_point_answers_a_shell() -> None:
     finished = _run("--version")
     assert finished.returncode == OK
-    assert finished.stdout.strip() == f"oktografx {__version__}"
+    assert finished.stdout.splitlines()[0] == f"oktografx {__version__}"
+    assert "Okto Grafx" in finished.stdout
+    assert "Okto Labs" in finished.stdout
+    assert "Copyright 2026 Okto Labs" in finished.stdout
+    assert "Elastic License 2.0 + SaaS/Branding Addendum" in finished.stdout
     assert finished.stderr == ""
 
 

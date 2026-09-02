@@ -22,8 +22,14 @@ from okto_grafx.cli.parser import (
     parse,
     wants_machine_output,
 )
-
 from tests.cli.conftest import CliRunner
+
+
+def _assert_required_attribution(text: str) -> None:
+    assert "Okto Grafx" in text
+    assert "Okto Labs" in text
+    assert "Copyright 2026 Okto Labs" in text
+    assert "Elastic License 2.0 + SaaS/Branding Addendum" in text
 
 
 def test_the_command_table_covers_the_operator_surface() -> None:
@@ -61,10 +67,12 @@ def test_every_command_documents_itself_and_accepts_the_shared_options(spec: obj
     text = command_help(spec)
     assert PROGRAM_NAME in text
     assert spec.summary in text
+    _assert_required_attribution(text)
 
 
 def test_the_full_help_names_every_command_and_every_exit_code() -> None:
     text = help_text()
+    _assert_required_attribution(text)
     for spec in COMMANDS:
         assert spec.label in text
     for code in (0, 1, 2, 3, 4, 5, 6, 70, 130):
@@ -76,6 +84,7 @@ def test_asking_for_help_is_a_success_on_standard_output(token: str, cli: CliRun
     run = cli(token)
     assert run.code == OK
     assert PROGRAM_NAME in run.out
+    _assert_required_attribution(run.out)
     assert run.err == ""
 
 
@@ -83,7 +92,8 @@ def test_asking_for_help_is_a_success_on_standard_output(token: str, cli: CliRun
 def test_asking_for_the_version_reports_the_package_version(token: str, cli: CliRunner) -> None:
     run = cli(token)
     assert run.code == OK
-    assert run.out.strip() == f"{PROGRAM_NAME} {__version__}"
+    assert run.out.splitlines()[0] == f"{PROGRAM_NAME} {__version__}"
+    _assert_required_attribution(run.out)
 
 
 def test_help_for_one_command_describes_only_that_command(cli: CliRunner) -> None:
@@ -159,6 +169,7 @@ def test_a_command_line_that_cannot_be_read_is_refused_by_name(
     run = cli(*argv)
     assert run.code == USAGE
     assert fragment in run.err, run.err
+    _assert_required_attribution(run.err)
     assert run.out == "", "a text refusal must not be written to standard output"
 
 

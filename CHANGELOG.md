@@ -7,6 +7,13 @@ including the on-disk format.
 
 ## [Unreleased]
 
+No changes yet.
+
+## [0.0.1] — 2026-09-01
+
+First public release. **Pre-alpha**: the on-disk format, the public API and the query surface may
+all change, and there is no migration path yet.
+
 ### Added
 
 - **Pulse whole-node payload replacement is pinned at the public boundary.** One
@@ -276,12 +283,12 @@ including the on-disk format.
   or `SystemExit`, then preserve the first failure; cleanup can no longer strand later locks or
   handles merely because the first closer was foreign.
 
-## [0.0.1] — 2026-08-23
+### Initial pre-alpha baseline
 
-First published release. **Pre-alpha**: the on-disk format, the public API and the query surface may
-all change, and there is no migration path yet.
+The initial baseline below is included in the same `0.0.1` release; later entries above record the
+stabilization and Pulse-compatibility work completed before publication.
 
-### Added
+#### Added
 
 - **Embedded graph database** with a public API (`connect`, `Database`, `Transaction`,
   `QueryResult`) and an `oktografx` command line whose exit codes are a contract.
@@ -340,7 +347,7 @@ all change, and there is no migration path yet.
   [`docs/PORTS.md`](docs/PORTS.md), the frozen `docs/architecture/CONTRACT.md`, the component
   register, the lessons, and the punch list of known gaps.
 
-### Known limitations
+#### Known limitations
 
 - The on-disk format is not stable and there is no migration path.
 - Performance on Windows does not meet the D5 ceilings; POSIX with `[accel]` does. Windows
