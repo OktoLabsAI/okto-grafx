@@ -95,6 +95,7 @@ _SCALAR_DATABASE_PROPERTIES: frozenset[str] = frozenset(
         "attached_indexes",
         "close_complete",
         "closed",
+        "descriptor_revalidation",
         "identity",
         "label",
         "metrics_endpoint",
