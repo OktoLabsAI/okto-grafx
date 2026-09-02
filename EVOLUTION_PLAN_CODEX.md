@@ -7,7 +7,7 @@
 **Ambiente principal:** Windows, Python 3.13.1
 **Escopo:** integridade, recuperação, concorrência, estabilidade, performance, API, configuração e novas capacidades.
 
-## Estado de execução — 2026-09-01
+## Estado de execução — 2026-09-02
 
 - **Decisão normativa de 2026-09-01 — gates de performance aposentados.** Throughput, latências,
   RSS, CPU, contadores de syscall, o antigo piso `same-10 >= 7,5/s`, D5 e paridade temporal com
@@ -97,11 +97,24 @@
   contrato público Pulse normalize scores e thresholds no intervalo `[0,1]`. A revisão independente
   confirmou que `0.0` preserva exatamente a intenção inclusiva — inclusive cossenos brutos negativos,
   que são clampados para zero — e que o Grafx já traduz esse valor para o threshold bruto `-1.0`.
-  Não será criada exceção mágica nem ampliado o contrato do adapter. O gate congelado será ratcheted
-  como uma nova revisão explícita da fixture, com digest/autoridades atualizados e uma validação
-  fail-closed de todos os argumentos `vector_search`; isso corrige uma entrada impossível sem reduzir
-  cobertura. Depois dos testes focados, o próximo passo é repetir M-PULSE-7 no SHA final e auditar o
-  receipt, sem matriz ou piso de performance intermediário.
+  Não foi criada exceção mágica nem ampliado o contrato do adapter. O milestone Community
+  `perf/st2-pulse-generation@18478ede9528556ef5e59fa7f91c72f4ccba2a5e` publicou a revisão de
+  conteúdo `m_pulse_7_acceptance_gate_v2.json`: o formato do manifesto continua
+  `okto-pulse-community-m-pulse-7-acceptance-gate/1`, enquanto o suplemento passa a `/2`. A revisão
+  fixa `min_similarity=0.0`, pina o candidato Grafx
+  `8cee82b9b92529f2ba767519c01c161f20876dce` e valida fail-closed que todo argumento vetorial é
+  numérico, não booleano, finito e pertence a `[0,1]`; o teste negativo recompõe o digest antes de
+  provar a recusa de `-1.0`. Autoridades recompostas: manifesto físico
+  `e5c9ef4432b2c550e8ba22fc57ee607a0eabdb8cf6e49a87ae080d50c726ee66`, canônico
+  `ea7b070b8e98b3a53b12bfe89cc4ff4355c5c433da03b8bcf681733398bd199e` e queries
+  `f0f50de41464a112147d1d13552fcb4b964022799959f5b64c64ca68df3ac2cd`. Passaram **38/38**
+  focados, **76/76** na suíte M-PULSE-7 integral e **49/49** nas matrizes vetoriais dedicadas com
+  resultados materiais, ranking, score e desempate. Os dois casos vetoriais do suplemento ainda
+  produzem `[]` bilateralmente: é dívida preexistente, não regressão nem blocker desta revisão. Uma
+  futura revisão explícita deverá semear embeddings no bootstrap real e exigir IDs esperados não
+  vazios nos dois backends, sem alterar silenciosamente fingerprints congelados agora. O próximo
+  passo finito é repetir M-PULSE-7 como `a04` nesses SHAs e auditar o receipt, sem matriz ou piso de
+  performance intermediário.
 - **Passo futuro — cache/bundle autenticado da autoridade do harness M-PULSE-7 (não bloqueante para
   `0.0.1`).** A correção corrente permanece deliberadamente limitada ao protocolo de fases do
   subprocesso: pré-validação integral de autoridade, abertura, identidade e fingerprint; operação
@@ -131,7 +144,8 @@
   `CHANGELOG` também foi consolidado em uma única seção `0.0.1` datada de 2026-09-01, sem manter uma
   falsa publicação em 2026-08-23 nem deixar mudanças já integrantes da release sob `Unreleased`.
   Essas são correções de distribuição/CLI; nenhum arquivo do engine, storage, WAL ou query foi
-  alterado. O SHA resultante será pinado pela nova revisão da fixture antes do próximo run longo.
+  alterado. O SHA resultante `8cee82b9b92529f2ba767519c01c161f20876dce` está pinado pela fixture
+  v2 e preservado em worktree detached como candidato exato do próximo run e dos artefatos de release.
 - **M0 estabilização: concluído e publicado** em
   `milestone/m0-stabilization@e2d6a22da8ec2571127fc9d1533995d40330c632`. Os cinco P0
   reproduzidos, as fronteiras públicas, o primeiro open durável, read-only observacional, fencing
@@ -2693,8 +2707,15 @@ O ratchet que autentica as entradas deste gate está certificado no Community
 `1e6e92fc3bae3b54d3052ca9055b7682a9d518927573e0ffcbfcbb4568cf9f93`; corpus físico/lógico:
 `0997747ed8bb9172d05781a62e5f81e7694630b173aaa152ac9ea28daec9d13f` /
 `b29334edf6e7c1e6b9419a4f3add84ede4baad94fdeaecb0c679261a78f241cc`. O gate focado passou
-12/12 e a auditoria independente 39/39. Essa certificação autentica as entradas; o run 10k ainda
-não foi iniciado.
+12/12 e a auditoria independente 39/39. Naquele checkpoint, essa certificação autenticava as
+entradas e o run 10k ainda não havia sido iniciado. A autoridade corrente é a fixture de conteúdo
+v2 no schema `/1`, Community `18478ede9528556ef5e59fa7f91c72f4ccba2a5e`, Grafx
+`8cee82b9b92529f2ba767519c01c161f20876dce` e Core
+`ccc1f345ece1db89a274cfdd634bd4da27028f63`, com manifesto físico/canônico
+`e5c9ef4432b2c550e8ba22fc57ee607a0eabdb8cf6e49a87ae080d50c726ee66` /
+`ea7b070b8e98b3a53b12bfe89cc4ff4355c5c433da03b8bcf681733398bd199e` e queries
+`f0f50de41464a112147d1d13552fcb4b964022799959f5b64c64ca68df3ac2cd`. Os runs `a01` e
+`a03` já executaram bilateralmente o trace de 10.000; `a04` é a repetição definitiva nesses pins.
 
 Antes da execução, o trace de 10.000 operações é congelado com fixture, distribuição, seed,
 fingerprints esperados, cobertura de cada família de mutação e pontos de crash. “Representativo”
@@ -2784,8 +2805,9 @@ nenhum resultado delegado é integrado sem validação final do Codex e sem o ga
 **Leitura normativa do quadro:** estados temporais antigos nas linhas M-PULSE-7, CE-3, CN-2 e ST-2
 foram preservados como histórico, mas seus pisos/razões de performance não são mais blockers. O
 estado vigente é o do topo deste documento: `same-10` aceito em qualidade, harness de timeout
-endurecido em Community `4086ad7`, regressão pinada `75/75` e M-PULSE-7 como próximo gate funcional
-único. A matriz CE-3 temporal tornou-se evidência opcional.
+endurecido e fixture v2 publicados em Community `18478ed`, Grafx pinado em `8cee82b`, gates
+**38/38** focados, **76/76** M-PULSE-7 e **49/49** vetoriais dedicados; o run `a04` é o próximo gate
+funcional único. A matriz CE-3 temporal tornou-se evidência opcional.
 
 | Marco | Estado | Evidência integrada | Validação registrada |
 |---|---|---|---|
@@ -2846,7 +2868,7 @@ endurecido em Community `4086ad7`, regressão pinada `75/75` e M-PULSE-7 como pr
 | CE-3 — invalidação bounded por delta WAL (produto) | publicada; correção de header esparso publicada, auditada e validada funcionalmente no Pulse | base `9498554`; produto `2feb579`; sucessor test-only `61485d9`; fix `origin/perf/ce3-bounded-invalidation@5b73890bdfddf9763c2b46514fc2c41c07ee30a4`; auditorias Nexus `hof_75a8a1e43bc24f1790b9a79d75d3749d`, `hof_7c7f3a4b3a9c470ea1d5886445cf233b` e `hof_e890ffe523ac4023aee333a8b094c8e8` PASS | Intervalo WAL limitado, classificação fail-closed e invalidação seletiva permanecem intactos. O fix acrescenta somente headers registrados quando há efeito de heap e declina para refresh completo se o inventário não puder ser provado. Red-first e mutation kill confirmados; 15/15 combinados, 7/7 pós-formatação, txn 476/476, index+vector 100%/exit 0 e checks estáticos verdes. M4 permanece dívida de cobertura não bloqueante. Primeira OCC, páginas pré-staged, WAL/durabilidade e multiwriter/multireader não mudaram. Próximo gate fixo: gargalo residual medido no H8; sem matriz completa antes de `same-10 >= 7,5/s` |
 | CN-2 — barreiras de checkpoint fora do fence | implementado, auditado e medido; efeito local aprovado, gate agregado ainda vermelho | candidato medido `7acb9d869a7a6b9a533033309a3126f4de704f5b`; produto `e202324`; instrumento `c739733`; contrato de cauda `f872fbe`; R1b `b4d1fa1cff1de76f5ea9a5b21452e5f07ea4dea0897b73ed0274aa583d227e95`; R2 `fdf28373c49e11fa4b19420fee8e170c2ebc5a1a2e8bdfe22a49ffd08b4612b6`; auditorias Nexus `hof_3781b51dbb77417cb899c50d1775cd29` e `hof_8d1bcdb495ab497c91869f300d4688e2` PASS | A/B/C preserva autoridade, WAL e horizonte; 978 barriers ficaram fora do fence e três commits estrangeiros progrediram em seis checkpoints. A exclusão contínua caiu ~49% na mediana, mas o checkpoint total mediano cresceu ~38% e não houve ganho reproduzível de throughput. RAW/H8 foram `5,3178/4,1577/s` em R1b e `1,3218/4,5368/s` em R2, todos abaixo de `7,5/s`; verify live+cold e finalização passaram. Esta é a disposição atual e substitui o status de taxa histórico das linhas M-PULSE-7/CE-3 acima. Matriz completa/10k seguem bloqueados pelo piso `7,5/s`; a indicação histórica de que ST-2 ainda exigia autorização/F4 foi supersedida pela autorização e pelo fechamento registrados na linha seguinte. |
 | ST-2 — dual descriptor revalidation + pinned-route fence | concluído, publicado nos branches de milestone e aceito no gate estrutural; `same-10` temporal permanece o próximo gate finito | Grafx `perf/st2-descriptor-revalidation@f0b55b7b6facc916118f342c774cb06e56bf17e3`; Community `perf/st2-pulse-generation@050ced9b79533d50efed453d53ed450984f75cf3` (produção `cea13b8`, alias test `050ced9`); Core `ccc1f345ece1db89a274cfdd634bd4da27028f63`; artefato PF5 SHA-256 `384a7722ff6772a2e89ca95225ab759ec5c7cab5af9939f405ef7b5ec2802aae`, 969.630 bytes; operação `c994255b...`; auditoria de segurança Nexus `hof_b69cf41505824beda52a25b29b37a8aa` PASS | `strict` continua default e `generation` é opt-in exclusivo Grafx/Pulse. PF5 `continuous`, 12 famílias x 5: `_still_names 424<500`, `os.lstat 4.137<8.000`, `os.stat 2.393->1.727<2.000`; `_read_page/read_fresh_page/write_page=323/146/96`, 123 bindings e 148 statements inalterados. Nenhum fence foi removido: Board/Grafx reutiliza a prova física do binding autenticado com o handle exato pinado/readmitido; genérico/Global preservam caminhada completa; CAS visível, path/page size, missing e alias real permanecem fail-closed. 59 testes focados finais e suíte relevante 253/253 passaram. `machine_idle_asserted=false`: aceite estrutural, sem alegação de throughput. |
-| M-PULSE-7 — certificação somente por qualidade | harness corrigido; `a03` fechou fail-closed em fixture vetorial inválida; revisão explícita e novo freeze em curso | Community `perf/st2-pulse-generation@4086ad732249709013e108728af5afea09610954`; Grafx candidato anterior `a1c3c496fe21d8e9f86953ca3932aced5917fb22`; Core `ccc1f345ece1db89a274cfdd634bd4da27028f63`; revisão Nexus `hof_cb1563e7aeed47c9a13eff733334ef66` concluída/verificada | `a01` provou 2 traces e 11/11 crash/recovery, mas expôs timeout falso antes da operação; `a02` foi interrompido sem receipt/órfão após a auditoria do supervisor; `a03` repetiu traces/crashes, passou o protocolo de fases e executou 19 casos Board Ladybug + 8 Grafx, então recusou corretamente `min_similarity=-1.0` no 9º Grafx. Não houve receipt nem órfão. O contrato é `[0,1]` e `0.0` preserva a inclusão total; a fixture será revisada sem relaxar o adapter, com digest e autoridade novos. Métricas temporais continuam apenas informativas. |
+| M-PULSE-7 — certificação somente por qualidade | harness corrigido; `a03` fechou fail-closed; fixture v2 auditada, testada e publicada; `a04` é o próximo gate finito | Community `perf/st2-pulse-generation@18478ede9528556ef5e59fa7f91c72f4ccba2a5e`; Grafx candidato exato `8cee82b9b92529f2ba767519c01c161f20876dce`; Core `ccc1f345ece1db89a274cfdd634bd4da27028f63`; manifesto físico/canônico `e5c9ef4432b2c550e8ba22fc57ee607a0eabdb8cf6e49a87ae080d50c726ee66` / `ea7b070b8e98b3a53b12bfe89cc4ff4355c5c433da03b8bcf681733398bd199e`; queries `f0f50de41464a112147d1d13552fcb4b964022799959f5b64c64ca68df3ac2cd`; revisão Nexus `hof_cb1563e7aeed47c9a13eff733334ef66` concluída/verificada | `a01` provou 2 traces e 11/11 crash/recovery, mas expôs timeout falso antes da operação; `a02` foi interrompido sem receipt/órfão após a auditoria do supervisor; `a03` repetiu traces/crashes, passou o protocolo de fases e executou 19 casos Board Ladybug + 8 Grafx, então recusou corretamente `min_similarity=-1.0` no 9º Grafx. Não houve receipt nem órfão. A fixture v2 mantém o schema `/1`, ratcheta o suplemento para `/2`, usa `0.0` sem relaxar o adapter e valida o intervalo público fail-closed. Gates **38/38**, M7 **76/76**, vetorial dedicado material **49/49** e auditoria independente PASS. Os dois casos vetoriais vazios do suplemento são dívida futura explícita de integração com embeddings reais e expectativas bilaterais não vazias; não bloqueiam `a04`. Métricas temporais continuam apenas informativas. |
 | Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
