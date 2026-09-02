@@ -152,10 +152,10 @@
   `GET_RELATED_CONTEXT`; todos os demais resultados comparáveis são iguais. O modo Grafx observado
   é `descriptor_revalidation="generation"`; fontes carregadas, worktrees e pins foram autenticados
   no início e no fim. Após o run, os três worktrees continuavam limpos e não havia processo órfão.
-  M-PULSE-7 está encerrado por qualidade; a regressão ampla Community e a auditoria dos artefatos
-  instaláveis também foram fechadas pelas evidências compostas descritas abaixo. O próximo passo
-  finito é somente o checkpoint interativo de publicação. Não há matriz nem piso de performance
-  intermediário, e o upload ao PyPI continua reservado para execução conjunta com o usuário.
+  M-PULSE-7 está encerrado por qualidade; a regressão ampla Community, a auditoria dos artefatos,
+  a publicação conjunta e a reinstalação pública também foram fechadas pelas evidências compostas
+  descritas abaixo. A linha `0.0.1` está concluída. Não há matriz nem piso de performance
+  intermediário; os roadmaps `0.0.2` estão liberados pelo gate, mas ainda não foram iniciados.
 - **Pré-release `0.0.1` — regressão Community fechada; artefatos auditados no marco seguinte.** A
   primeira execução Community pós-M-PULSE-7 terminou em `5 failed, 5183
   passed, 3 skipped, 13 deselected`: dois números documentais estavam cinco linhas atrás do oráculo
@@ -218,8 +218,26 @@
   Community `159ef75328dc68493379d95b9f72826b660b8d84`, Core
   `341bccdbb1232ee7ed6a9bcce380fdf9616c1600`, Grafx `0.0.1`, payloads byte-idênticos, matriz
   instalada, concorrência/crash-resume SQLite, paridade de projeção e MCP HTTP. Não há blocker
-  objetivo aberto nem upload realizado; a depreciação futura da forma TOML de `project.license` e a
-  consolidação das duas fontes de versão ficam como manutenção pós-`0.0.1`, sem ampliar este gate.
+  objetivo aberto nem upload realizado naquele checkpoint; a depreciação futura da forma TOML de
+  `project.license` e a consolidação das duas fontes de versão ficam como manutenção pós-`0.0.1`,
+  sem ampliar este gate.
+- **Release `0.0.1` — publicada no PyPI e reinstalada com sucesso.** O checkpoint conjunto de
+  2026-09-02 criou o projeto público `okto-grafx` e publicou exatamente os dois artefatos auditados:
+  wheel SHA-256 `3acc1bbc17bb4629caea3cbca60ff503c5cea1f8891cd829227a08eb5bc75070`
+  e sdist SHA-256 `ccdc368cb73781f04512023f4cfa54aaf89f6e7dab0881a86112ad8bdff9359e`.
+  A API pública do PyPI confirma nome `okto-grafx`, versão `0.0.1`, `Requires-Python >=3.11`, nomes,
+  tamanhos e ambos os digests. Uma venv nova baixou sem cache `okto-grafx[accel]==0.0.1` diretamente
+  de `https://pypi.org/simple/`; o wheel obtido repetiu o SHA auditado, `pip check` ficou limpo e a
+  origem foi `site-packages`, não qualquer checkout. Versão, CLI/branding, CRC-32C nativo, NumPy,
+  criação e consulta vetorial, `verify`, checkpoint e cold read-only reopen passaram. O token foi
+  mantido somente na memória do processo de upload e removido do ambiente ao final; nenhum segredo
+  foi gravado no repositório ou nos artefatos. O `uv.lock` Community, que antes não podia resolver
+  um projeto ainda inexistente, passou a registrar o wheel/sdist Grafx e `google-crc32c` com URLs e
+  hashes públicos em `perf/st2-pulse-generation@92ece5d`; `uv lock --check` passou sem alterar as
+  demais 152 resoluções. A instalação operacional do usuário também foi atualizada de Pulse/Core
+  `0.3.1` para `0.3.3`, com Grafx `0.0.1` público e `[accel]`; `uv pip check` validou 121 pacotes.
+  O diretório de dados preexistente não foi tocado nem teve backend alterado implicitamente. O gate
+  de publicação `0.0.1` está concluído.
 - **Passo futuro pós-`0.0.1` — remover o acoplamento documental F16 entre Community e Core.** O
   inventário `Community-to-Core import rows` é fato calculado no Community, mas hoje também integra
   o bloco gerado no README do Core. Isso obriga um commit documental Core sempre que imports do
@@ -2852,6 +2870,10 @@ sozinho não pode ser usado para mudar o gate durante a rodada.
 `okto-grafx[accel]==0.0.1` instalável do PyPI. Nenhum item `GX-CAP-*`, `GX-AGENT-*` ou `AGENT-*` começa
 antes desse gate. A evolução complementar subsequente pertence à versão `0.0.2`.
 
+**Estado do gate em 2026-09-02:** concluído. Os dois artefatos auditados foram publicados sem
+alteração, reinstalados do índice público com `[accel]` e submetidos ao smoke previsto. A linha
+`0.0.2` está liberada, mas não é iniciada implicitamente por este registro.
+
 #### PULSE-GRAFX-ONLY — retirada futura de Ladybug/Kuzu
 
 Esta é uma direção pós-`0.0.1`, não um atalho para M-PULSE-6/7. A dependência e os providers
@@ -2922,9 +2944,9 @@ endurecido e correção mínima das duas divergências Board publicada na fixtur
 `23f9927`. O run integral `a05` passou no Grafx `8cee82b` e Core `ccc1f345`, com receipt canônico
 `f08c8be63ea2cd7abf6c6ffbb0deef5203169ed22c5b42a2c34ac290d90b77f1`, dois traces de 10k,
 11/11 crash/recovery, 19/19 Board e 97 casos Pulse sem divergência inexplicada. M-PULSE-7, a
-regressão ampla Community e a construção/auditoria instalável estão concluídos. Antes da publicação
-conjunta de `0.0.1`, resta somente promover o SHA candidato imutável ao branch de release e realizar
-o checkpoint interativo; a matriz CE-3 temporal tornou-se evidência opcional.
+regressão ampla Community, a construção/auditoria instalável, a promoção a `main`, a publicação de
+`okto-grafx==0.0.1` e a reinstalação pública com `[accel]` estão concluídos. A linha `0.0.2` pode
+começar sob seus roadmaps versionados; a matriz CE-3 temporal tornou-se evidência opcional.
 
 | Marco | Estado | Evidência integrada | Validação registrada |
 |---|---|---|---|
@@ -2987,8 +3009,9 @@ o checkpoint interativo; a matriz CE-3 temporal tornou-se evidência opcional.
 | ST-2 — dual descriptor revalidation + pinned-route fence | concluído, publicado nos branches de milestone e aceito no gate estrutural; `same-10` temporal permanece o próximo gate finito | Grafx `perf/st2-descriptor-revalidation@f0b55b7b6facc916118f342c774cb06e56bf17e3`; Community `perf/st2-pulse-generation@050ced9b79533d50efed453d53ed450984f75cf3` (produção `cea13b8`, alias test `050ced9`); Core `ccc1f345ece1db89a274cfdd634bd4da27028f63`; artefato PF5 SHA-256 `384a7722ff6772a2e89ca95225ab759ec5c7cab5af9939f405ef7b5ec2802aae`, 969.630 bytes; operação `c994255b...`; auditoria de segurança Nexus `hof_b69cf41505824beda52a25b29b37a8aa` PASS | `strict` continua default e `generation` é opt-in exclusivo Grafx/Pulse. PF5 `continuous`, 12 famílias x 5: `_still_names 424<500`, `os.lstat 4.137<8.000`, `os.stat 2.393->1.727<2.000`; `_read_page/read_fresh_page/write_page=323/146/96`, 123 bindings e 148 statements inalterados. Nenhum fence foi removido: Board/Grafx reutiliza a prova física do binding autenticado com o handle exato pinado/readmitido; genérico/Global preservam caminhada completa; CAS visível, path/page size, missing e alias real permanecem fail-closed. 59 testes focados finais e suíte relevante 253/253 passaram. `machine_idle_asserted=false`: aceite estrutural, sem alegação de throughput. |
 | M-PULSE-7 — certificação somente por qualidade | concluído e auditado; `a05` PASS com receipt canônico, sem blocker funcional | Community `perf/st2-pulse-generation@23f9927ba5ac84424821b42aeac37528996b12e7`; Grafx `8cee82b9b92529f2ba767519c01c161f20876dce`; Core `ccc1f345ece1db89a274cfdd634bd4da27028f63`; manifesto físico/canônico `f4caf1236104e9bb410462b6e5ef3541bec04f4fd591b8e6870b4bb0939a70b1` / `3160a8cdde56feab41b425182e1c41f1b323aeb5b1e91a00cadffb2ff94d6a83`; queries `02c3b06dd71a0f66e04afbf64d33c203ef53d985d8912edb738e6519a6a29a7d`; receipt `D:\GrafxBenchEvidence\mpulse7-quality-20260902-a05\receipt.json` SHA-256 `f08c8be63ea2cd7abf6c6ffbb0deef5203169ed22c5b42a2c34ac290d90b77f1`; autoridade `34605c59f8d99894f40ffe7bb988eccedef8fea6d7cf3951d28f2126eaf859b4`; revisões Nexus `hof_cb1563e7aeed47c9a13eff733334ef66` e `hof_a411cbd75a984035b1d09d14f6cbb546` verificadas/PASS | `a01`–`a03` fecharam falso timeout, lifecycle do supervisor e threshold vetorial; `a04` isolou as duas divergências Board e a fixture v3 aplicou a correção híbrida mínima sem mudar Core/queries nem inventar ranking. `a05` terminou exit 0: dois traces de 10.000, três reopen/recovery por backend, 11/11 crash points, 19/19 Board, 97 Pulse, 21 famílias raw e quatro cenários receipt-bound por backend. Auditoria independente 27/27: JSON canônico + LF, hash recomposto, pins/worktrees e fontes carregadas autenticados, `descriptor_revalidation=generation`, fingerprints finais idênticos e zero crash/timeout/verify/divergência inexplicada. As três diferenças são somente os `generic_gap` congelados `I64`, `EXPLAIN_CONSTRAINT_ORIGINS` e `GET_RELATED_CONTEXT`. Após o run, worktrees limpos e zero processo órfão. Métricas temporais e os dois casos vetoriais vazios permanecem observações/dívida futura, não blockers de `0.0.1`. |
 | RELEASE-0.0.1 — regressão Community pós-M-PULSE-7 | fechada por regressão ampla + repetição focada do único caso residual; auditoria instalável fechada na linha seguinte | Community `perf/st2-pulse-generation@159ef75328dc68493379d95b9f72826b660b8d84`; Core `milestone/grafx-mpulse6-logical-transfer-manifest@341bccdbb1232ee7ed6a9bcce380fdf9616c1600`; Grafx preservado em `8cee82b9b92529f2ba767519c01c161f20876dce`; diagnósticos Nexus `hof_1b1010756f4e49d59a5985b98992d4dc` e `hof_e31712f8b255489aa1834b5454be10b9` verificados/PASS; JUnit focado SHA-256 `9fdfa522c70202d93e03c04af51f1f0810fc331b22402206597d293be4bdd1f6` | O primeiro run amplo teve 5 falhas e 5.183 passes; todas foram fechadas sem remover asserções. O segundo teve 5.187 passes e uma única incompatibilidade de HEAD provocada pelo commit Core documental exigido pelo F16. O teste final mantém o runner fail-closed, prova ancestralidade imediata, diff exclusivo em README, `src` Core bit-idêntico e catálogo produtivo integral idêntico ao receipt a05; happy path e pins forjados continuam cobertos. O lote final passou 10/10. A conclusão `5187 + 1` é composição explícita, não uma terceira corrida ampla. Código produtivo, manifesto, watchdog semântico de 30 s e receipt não mudaram; upload PyPI permanece manual/conjunto. |
-| RELEASE-0.0.1 — auditoria dos artefatos e smoke instalado | concluída; candidata pronta para checkpoint conjunto, sem upload | Grafx `perf/st2-descriptor-revalidation@744d450f5c199d06fa34e2f831dd443fbd15375d`; árvore produtiva `a00e55461daf93e3ab639790899079ad30a699b8`; wheel SHA-256 `3acc1bbc17bb4629caea3cbca60ff503c5cea1f8891cd829227a08eb5bc75070`; sdist SHA-256 `ccdc368cb73781f04512023f4cfa54aaf89f6e7dab0881a86112ad8bdff9359e`; JUnit Pulse instalado `0f2e6f7a170833a4b80de20d54ea7db3c0cd055cf2898ec9e4a3faade020a9ff`; evidência `821e42136ed9c8ea04671cb2bc93fbc6dc2668c14dc33e3c7d0b393bc7d27b3c`; auditoria Nexus `hof_a8c2280dc3be489792d4f51b54ba8a69` PASS | Regressão Grafx fechada honestamente por `11381 + 1`, com 485/485 no lote afetado após correção exclusiva do allowlist de teste. Build isolado, `twine check --strict`, inventário/metadata/licença e smokes core-only/`[accel]` verdes. O gate Pulse offline instalou os três wheels fora dos checkouts e passou 1/1 em 277,82 s, autenticando versões, origens, payloads, runtime Python 3.11, MCP, paridade de projeção, concorrência e crash-resume. Zero blocker objetivo aberto; publicar e reinstalar do PyPI continuam passos manuais conjuntos. |
-| Roadmaps complementares pós-Pulse | incorporados por referência; implementação bloqueada até M-PULSE-7 + run/auditoria + publicação verificada de `0.0.1` | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
+| RELEASE-0.0.1 — auditoria dos artefatos e smoke instalado | concluída; artefatos posteriormente publicados sem alteração | Grafx `perf/st2-descriptor-revalidation@744d450f5c199d06fa34e2f831dd443fbd15375d`; árvore produtiva `a00e55461daf93e3ab639790899079ad30a699b8`; wheel SHA-256 `3acc1bbc17bb4629caea3cbca60ff503c5cea1f8891cd829227a08eb5bc75070`; sdist SHA-256 `ccdc368cb73781f04512023f4cfa54aaf89f6e7dab0881a86112ad8bdff9359e`; JUnit Pulse instalado `0f2e6f7a170833a4b80de20d54ea7db3c0cd055cf2898ec9e4a3faade020a9ff`; evidência `821e42136ed9c8ea04671cb2bc93fbc6dc2668c14dc33e3c7d0b393bc7d27b3c`; auditoria Nexus `hof_a8c2280dc3be489792d4f51b54ba8a69` PASS | Regressão Grafx fechada honestamente por `11381 + 1`, com 485/485 no lote afetado após correção exclusiva do allowlist de teste. Build isolado, `twine check --strict`, inventário/metadata/licença e smokes core-only/`[accel]` verdes. O gate Pulse offline instalou os três wheels fora dos checkouts e passou 1/1 em 277,82 s, autenticando versões, origens, payloads, runtime Python 3.11, MCP, paridade de projeção, concorrência e crash-resume. Zero blocker objetivo aberto. |
+| RELEASE-0.0.1 — publicação e reinstalação do PyPI | concluída em 2026-09-02; release pública verificada | `https://pypi.org/project/okto-grafx/0.0.1/`; wheel SHA-256 `3acc1bbc17bb4629caea3cbca60ff503c5cea1f8891cd829227a08eb5bc75070`; sdist SHA-256 `ccdc368cb73781f04512023f4cfa54aaf89f6e7dab0881a86112ad8bdff9359e`; venv `D:\GrafxBenchEvidence\grafx-0.0.1-release-audit-20260902\venv-pypi-a01`; lock Community `92ece5d` | A API pública confirma `okto-grafx==0.0.1` e os dois artefatos exatos. Download sem cache repetiu o SHA do wheel; instalação pública `[accel]`, `pip check`, origem/version/CLI, checksum nativo, NumPy, busca vetorial, verify, checkpoint e cold reopen passaram. O lock passou a conter URLs/hashes públicos sem mudar as demais resoluções. A ferramenta do usuário foi atualizada para Pulse/Core `0.3.3` + Grafx `0.0.1`; o diretório de dados existente permaneceu intocado. Nenhum segredo foi persistido. |
+| Roadmaps complementares pós-Pulse | incorporados por referência; gate `0.0.1` cumprido, linha `0.0.2` liberada e ainda não iniciada | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um
