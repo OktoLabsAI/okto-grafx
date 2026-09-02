@@ -9,6 +9,18 @@
 
 ## Estado de execução — 2026-09-02
 
+- **Run real do Pulse 0.3.3 na pasta padrão — reconstrução Grafx em andamento, SQLite preservado.**
+  Antes da troca foi criado backup consistente do SQLite (`quick_check=ok`, zero violações de FK)
+  e os artefatos Ladybug foram movidos, sem exclusão, para quarentena operacional. Os bindings de
+  Board e Global foram materializados com `backend=grafx` e `descriptor_revalidation=generation`.
+  O run real revelou e fechou dois defeitos no Pulse Community: o `kg backfill --apply` standalone
+  não registrava o provider de coordenação antes de adquirir o writer lease, e o fechamento terminal
+  da transação tentava resetar em worker thread um token `ContextVar` criado no contexto async. As
+  correções estão em `okto-pulse@d50c034`; 54 testes focados passaram. O limite textual abaixo está
+  em `okto-grafx@58e2e7d`; 367 testes focados e Ruff passaram. A fila interrompida por reboot é
+  retomada pelo protocolo público de expiração/recuperação de claim, preservando at-least-once e a
+  serialização por board. Auditoria final e liberação para uso só ocorrem após a fila chegar a zero.
+
 - **Hotfix de integração Pulse — limite textual corrigido localmente; I64 permanece gap explícito.**
   A criação do refinement `876eb7b0-189c-4499-8bb8-9ca8c6568d82` expôs que o limite léxico de
   16.384 caracteres estava sendo reutilizado indevidamente para dados parametrizados: no SQLite
