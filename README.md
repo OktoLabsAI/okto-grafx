@@ -561,6 +561,7 @@ refused with the field name the caller actually wrote.
 | `max_statement_writes` | `None` | Optional hard limit on logical row writes retained by one statement |
 | `max_result_rows` | `None` | Optional hard limit on public result rows; row N+1 is refused before it is retained and before any remaining input is consumed |
 | `max_intermediate_rows` | `None` | Optional hard limit per non-terminal physical operator over one execution; it is not a cumulative query-wide count |
+| `max_query_value_characters` | `65536` | Per-string parameter/result boundary; configurable from 1 through the hard 1,048,576-character guard; query-source literals keep their separate 16,384-character ceiling |
 | `max_transaction_rows` | `None` | Optional hard limit on retained `row_intents` in one transaction |
 | `max_transaction_bytes` | `None` | Optional hard limit on encoded row tuples, staged logical-record `encoded_length()` values and retained page-image generations; ordinary replacement charges the byte delta, while a rollback preimage held by a live statement mark remains charged until settle/discard |
 | `max_wal_batch_bytes` | `None` | Optional hard limit on the sum of final record `encoded_length()` values, including `COMMIT` and excluding `SEGMENT_HEADER`; checked before WAL append |
@@ -616,6 +617,12 @@ rest of the stream and before `context.release()`. `max_intermediate_rows` count
 physical operator separately for the whole execution. A public terminal is charged only as result;
 a terminal with no public columns is charged as intermediate. Overrun raises the non-retryable
 `GrafxQueryBudgetExceeded`, without truncating state or releasing a partial write statement.
+
+`max_query_value_characters` bounds each string parameter and each string copied across the public
+query-result boundary. It defaults to 65,536 characters, while query-source string literals retain
+their independent 16,384-character lexer ceiling. Applications may lower the value or raise it up
+to the hard 1,048,576-character guard; values above the effective ceiling are refused before page
+access. The option is process-local and does not change the on-disk format.
 
 These are row-admission limits, not a complete query-memory budget. They do not bound cumulative
 work, payload bytes, internal structures, auxiliary scans, RSS, deadlines, traversal work, spill or

@@ -19,6 +19,10 @@ from okto_grafx.domain.ports.storage import (
     DESCRIPTOR_REVALIDATION_MODES,
     DescriptorRevalidationMode,
 )
+from okto_grafx.domain.query.limits import (
+    DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+    MAX_QUERY_VALUE_CHARACTERS,
+)
 from okto_grafx.domain.vector.hnsw import DEFAULT_EF_SEARCH, MAX_EF_SEARCH
 from okto_grafx.engine.catalog_store import MINIMUM_FRAMES as CATALOG_FRAMES
 from okto_grafx.engine.heap_store import MINIMUM_FRAMES as HEAP_FRAMES
@@ -278,6 +282,7 @@ class DatabaseConfig:
     vector_ef_search: int = DEFAULT_EF_SEARCH
     read_only: bool = False
     descriptor_revalidation: DescriptorRevalidationMode = "strict"
+    max_query_value_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS
 
     def __post_init__(self) -> None:
         """Reject any unusable field with a GrafxConfigurationError that names it."""
@@ -316,6 +321,7 @@ class DatabaseConfig:
             "max_open_files",
             "wal_segment_bytes",
             "checkpoint_interval_records",
+            "max_query_value_characters",
         ):
             object.__setattr__(
                 self, field, _require_positive_int(field, getattr(self, field))
@@ -335,6 +341,12 @@ class DatabaseConfig:
                 "wal_segment_bytes",
                 self.wal_segment_bytes,
                 f"a value between {MIN_SEGMENT_BYTES} and {MAX_SEGMENT_READ_BYTES} is required.",
+            )
+        if self.max_query_value_characters > MAX_QUERY_VALUE_CHARACTERS:
+            raise _reject(
+                "max_query_value_characters",
+                self.max_query_value_characters,
+                f"a value of at most {MAX_QUERY_VALUE_CHARACTERS} is required.",
             )
         for field in (
             "wal_max_bytes",

@@ -17,7 +17,9 @@ from okto_grafx.domain.query.lexer import INTEGER_MAGNITUDE_LIMIT
 from okto_grafx.domain.query.plan import MAX_PLAN_DEPTH
 
 EXPECTED: dict[str, int] = {
+    "DEFAULT_MAX_QUERY_VALUE_CHARACTERS": 65536,
     "MAX_QUERY_CHARACTERS": 65536,
+    "MAX_QUERY_VALUE_CHARACTERS": 1048576,
     "MAX_RENDERED_QUERY_CHARACTERS": 1048576,
     "MAX_TOKENS": 8192,
     "MAX_EXPRESSION_DEPTH": 48,

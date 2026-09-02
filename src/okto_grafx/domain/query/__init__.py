@@ -75,6 +75,7 @@ from okto_grafx.domain.query.ast import (
 )
 from okto_grafx.domain.query.lexer import tokenize
 from okto_grafx.domain.query.limits import (
+    DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     MAX_CLAUSES,
     MAX_COLUMN_DEFINITIONS,
     MAX_EXPRESSION_DEPTH,
@@ -87,6 +88,7 @@ from okto_grafx.domain.query.limits import (
     MAX_PATTERNS_PER_CLAUSE,
     MAX_PROJECTION_ITEMS,
     MAX_QUERY_CHARACTERS,
+    MAX_QUERY_VALUE_CHARACTERS,
     MAX_RENDERED_QUERY_CHARACTERS,
     MAX_SORT_KEYS,
     MAX_STRING_CHARACTERS,
@@ -156,6 +158,7 @@ __all__ = [
     "COLUMN_TYPE_NAMES",
     "COLUMN_VALUE_TYPES",
     "COALESCE_FUNCTION",
+    "DEFAULT_MAX_QUERY_VALUE_CHARACTERS",
     "ENTITY_NODE",
     "ENTITY_RELATIONSHIP",
     "KEYWORDS",
@@ -173,6 +176,7 @@ __all__ = [
     "MAX_PLAN_DEPTH",
     "MAX_PROJECTION_ITEMS",
     "MAX_QUERY_CHARACTERS",
+    "MAX_QUERY_VALUE_CHARACTERS",
     "MAX_RENDERED_QUERY_CHARACTERS",
     "MAX_SORT_KEYS",
     "MAX_STRING_CHARACTERS",

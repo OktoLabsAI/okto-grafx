@@ -422,6 +422,7 @@ class DatabaseConfig:
     vector_ef_search: int = 320                # calibrated HNSW beam, 1..1_048_576
     read_only: bool = False
     descriptor_revalidation: str = "strict"  # "strict" | "generation"; local adapter policy
+    max_query_value_characters: int = 65536  # per-string; configurable maximum 1048576
 
 class PortRegistry:
     """Fail-closed (G5). Every required slot must be bound before open_database returns."""
@@ -498,6 +499,13 @@ does not release any write from the refused statement. These are not cumulative-
 RSS, streaming, deadline, traversal or spill limits. Sort, aggregate, distinct and eager operators
 may retain up to the configured rows or states before their first yield; the payload bytes, internal
 structures and auxiliary scans behind those rows are not bounded by these two fields.
+
+`max_query_value_characters` is a separate public-boundary guard. It defaults to 65,536 and may be
+configured from 1 through 1,048,576 characters. It applies to every string parameter (including a
+string nested in a list or map) and every string value copied into a public result. Refusal happens
+before page access for input parameters. It does not widen the lexer: a string literal written in
+query source remains limited to `MAX_STRING_CHARACTERS == 16,384`. This is process-local policy,
+not persisted identity or format state.
 
 Recall has no runtime configuration field. Its floor belongs to the offline calibration gate,
 `bench.harness.gate --recall-target`; it cannot honestly promise recall for an individual query

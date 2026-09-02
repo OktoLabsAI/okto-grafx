@@ -23,6 +23,7 @@ from okto_grafx.domain.model.value import (
     ValueType,
 )
 from okto_grafx.domain.query.limits import (
+    DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     MAX_LIST_ELEMENTS,
     MAX_MAP_ENTRIES,
     MAX_NAME_CHARACTERS,
@@ -307,14 +308,14 @@ def test_list_map_string_and_parameter_limits_have_live_edges() -> None:
             == 256
         )
         assert database.execute(
-            "RETURN $x AS x", {"x": "s" * MAX_STRING_CHARACTERS}
-        ).rows == (("s" * 16384,),)
+            "RETURN $x AS x", {"x": "s" * DEFAULT_MAX_QUERY_VALUE_CHARACTERS}
+        ).rows == (("s" * DEFAULT_MAX_QUERY_VALUE_CHARACTERS,),)
         assert database.execute("RETURN $x AS x", accepted_parameters).rows == ((1,),)
 
         refused = (
             list(range(MAX_LIST_ELEMENTS + 1)),
             {str(index): index for index in range(MAX_MAP_ENTRIES + 1)},
-            "s" * (MAX_STRING_CHARACTERS + 1),
+            "s" * (DEFAULT_MAX_QUERY_VALUE_CHARACTERS + 1),
         )
         for value in refused:
             with pytest.raises(GrafxConfigurationError):
@@ -323,6 +324,58 @@ def test_list_map_string_and_parameter_limits_have_live_edges() -> None:
         excessive_parameters["overflow"] = 1
         with pytest.raises(GrafxConfigurationError):
             database.execute("RETURN $x AS x", excessive_parameters)
+
+
+def test_query_value_string_limit_is_configurable_without_becoming_unbounded() -> None:
+    with connect(":memory:", max_query_value_characters=17_000) as database:
+        accepted = "x" * 17_000
+        assert database.execute("RETURN $x AS x", {"x": accepted}).rows == (
+            (accepted,),
+        )
+        with pytest.raises(GrafxConfigurationError) as caught:
+            database.execute("RETURN $x AS x", {"x": "x" * 17_001})
+        assert caught.value.details == {
+            "field": "parameters.x",
+            "value": 17_001,
+            "limit": 17_000,
+        }
+
+    expanded = "x" * (DEFAULT_MAX_QUERY_VALUE_CHARACTERS + 1)
+    with connect(
+        ":memory:", max_query_value_characters=len(expanded)
+    ) as database:
+        assert database.execute("RETURN $x AS x", {"x": expanded}).rows == (
+            (expanded,),
+        )
+
+
+def test_query_value_string_limit_applies_inside_nested_parameter_values() -> None:
+    with connect(":memory:", max_query_value_characters=20_000) as database:
+        accepted = "x" * 20_000
+        assert database.execute("RETURN $x AS x", {"x": [{"body": accepted}]}).rows
+        with pytest.raises(GrafxConfigurationError) as caught:
+            database.execute(
+                "RETURN $x AS x", {"x": [{"body": "x" * 20_001}]}
+            )
+        assert caught.value.details["limit"] == 20_000
+
+
+def test_pulse_sized_string_parameter_crosses_the_create_boundary() -> None:
+    content = "x" * 27_825
+    with connect(":memory:") as database:
+        with database.begin("write") as transaction:
+            transaction.execute(
+                "CREATE NODE TABLE Artifact(id STRING, content STRING, PRIMARY KEY(id))"
+            )
+        with database.begin("write") as transaction:
+            transaction.execute(
+                "CREATE (n:Artifact {id: $id, content: $content})",
+                {"id": "refinement", "content": content},
+            )
+        assert database.execute(
+            "MATCH (n:Artifact {id: $id}) RETURN n.content",
+            {"id": "refinement"},
+        ).rows == ((content,),)
 
 
 def _nested_list(depth: int) -> object:

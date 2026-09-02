@@ -9,6 +9,10 @@ import pytest
 
 from okto_grafx.domain.errors import GrafxConfigurationError
 from okto_grafx.domain.page import validate_page_size
+from okto_grafx.domain.query.limits import (
+    DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+    MAX_QUERY_VALUE_CHARACTERS,
+)
 from okto_grafx.engine.wal_manager import MAX_SEGMENT_READ_BYTES, MIN_SEGMENT_BYTES
 from okto_grafx.runtime.config import (
     CORE_MAX_PAGE_SIZE,
@@ -46,6 +50,7 @@ def test_defaults_match_the_contract() -> None:
     assert config.max_statement_writes is None
     assert config.max_result_rows is None
     assert config.max_intermediate_rows is None
+    assert config.max_query_value_characters == DEFAULT_MAX_QUERY_VALUE_CHARACTERS
     assert config.max_transaction_rows is None
     assert config.max_transaction_bytes is None
     assert config.max_wal_batch_bytes is None
@@ -68,12 +73,13 @@ def test_descriptor_revalidation_extends_the_positional_surface_only_at_its_tail
     """An old positional call must still bind its last argument to ``read_only``."""
     configured = DatabaseConfig(path=":memory:", read_only=True)
     fields = dataclasses.fields(DatabaseConfig)
-    assert tuple(field.name for field in fields[-2:]) == (
+    assert tuple(field.name for field in fields[-3:]) == (
         "read_only",
         "descriptor_revalidation",
+        "max_query_value_characters",
     )
 
-    legacy_arguments = dataclasses.astuple(configured)[:-1]
+    legacy_arguments = dataclasses.astuple(configured)[:-2]
     legacy = DatabaseConfig(*legacy_arguments)
     assert legacy == configured
     assert legacy.read_only is True
@@ -82,6 +88,25 @@ def test_descriptor_revalidation_extends_the_positional_surface_only_at_its_tail
     opted_in = DatabaseConfig(*(legacy_arguments + ("generation",)))
     assert opted_in.read_only is True
     assert opted_in.descriptor_revalidation == "generation"
+
+
+def test_query_value_character_limit_is_bounded_and_extends_the_positional_tail() -> None:
+    configured = DatabaseConfig(
+        ":memory:",
+        *(
+            dataclasses.astuple(DatabaseConfig(path=":memory:"))[1:-2]
+            + ("generation", 70_000)
+        ),
+    )
+    assert configured.descriptor_revalidation == "generation"
+    assert configured.max_query_value_characters == 70_000
+
+    for rejected in (0, -1, MAX_QUERY_VALUE_CHARACTERS + 1):
+        with pytest.raises(GrafxConfigurationError) as caught:
+            DatabaseConfig(
+                path=":memory:", max_query_value_characters=rejected
+            )
+        assert caught.value.details["field"] == "max_query_value_characters"
 
 
 def test_the_config_is_a_frozen_value() -> None:
@@ -731,6 +756,7 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         max_statement_writes=_HostileInt(64),
         max_result_rows=_HostileInt(256),
         max_intermediate_rows=_HostileInt(512),
+        max_query_value_characters=_HostileInt(65_536),
         max_transaction_rows=_HostileInt(128),
         max_transaction_bytes=_HostileInt(16384),
         max_wal_batch_bytes=_HostileInt(8192),
@@ -749,6 +775,7 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         "max_statement_writes",
         "max_result_rows",
         "max_intermediate_rows",
+        "max_query_value_characters",
         "max_transaction_rows",
         "max_transaction_bytes",
         "max_wal_batch_bytes",

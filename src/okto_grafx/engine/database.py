@@ -64,6 +64,10 @@ from okto_grafx.domain.ports.events import EventSink
 from okto_grafx.domain.ports.metrics import MetricsSink
 from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.ports.vectormath import VectorMath
+from okto_grafx.domain.query.limits import (
+    DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+    MAX_QUERY_VALUE_CHARACTERS,
+)
 from okto_grafx.domain.query.plan import PlanNode
 from okto_grafx.domain.recovery.report import RecoveryReport
 from okto_grafx.domain.txn.context import (
@@ -1069,6 +1073,7 @@ class Database:
         "_descriptor_revalidation",
         "_checkpoint_interval_records",
         "_wal_max_bytes",
+        "_max_query_value_characters",
         "_wal_bytes_latched",
         "_checkpointing",
         "_checkpoint_retry_pending",
@@ -1111,6 +1116,7 @@ class Database:
         label: str,
         checkpoint_interval_records: int = 512,
         wal_max_bytes: int | None = None,
+        max_query_value_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
         read_only: bool = False,
         descriptor_revalidation: str = "strict",
         metrics_endpoint: str | None = None,
@@ -1188,6 +1194,18 @@ class Database:
                     field="wal_max_bytes",
                     value=self._wal_max_bytes,
                 )
+        self._max_query_value_characters = _builtin_int(
+            max_query_value_characters, field="max_query_value_characters"
+        )
+        if not 1 <= self._max_query_value_characters <= MAX_QUERY_VALUE_CHARACTERS:
+            raise GrafxConfigurationError(
+                "The query value string ceiling must be between 1 and "
+                f"{MAX_QUERY_VALUE_CHARACTERS} characters.",
+                field="max_query_value_characters",
+                value=self._max_query_value_characters,
+                minimum=1,
+                maximum=MAX_QUERY_VALUE_CHARACTERS,
+            )
         self._checkpointing: bool = False
         self._wal_bytes_latched: bool = False
         self._checkpoint_retry_pending: bool = False
@@ -1708,7 +1726,10 @@ class Database:
                 "queries", self._queries, "the query engine (C10)"
             )
             statement = _query_text_snapshot(text)
-            detached_parameters = _query_parameters_snapshot(parameters)
+            detached_parameters = _query_parameters_snapshot(
+                parameters,
+                max_string_characters=self._max_query_value_characters,
+            )
             with self._transactions.page_access_section():
                 self._require_open()
                 if not context.active:
@@ -1728,7 +1749,10 @@ class Database:
             # A collaborator result may itself be a hostile Mapping/Sequence. Rebuild it only
             # after leaving page access, while _public_operation still translates ordinary host
             # failures and deliberately lets process-control signals pass unchanged.
-            return _query_result_view(raw_result)
+            return _query_result_view(
+                raw_result,
+                max_string_characters=self._max_query_value_characters,
+            )
 
     def _scan_rows_v1(
         self,
@@ -1817,6 +1841,7 @@ class Database:
                                 field=f"scan.rows[{row_position}].values[{value_position}]",
                                 depth=0,
                                 active=active,
+                                max_string_characters=self._max_query_value_characters,
                             )
                             for value_position, value in enumerate(version.values)
                         ),

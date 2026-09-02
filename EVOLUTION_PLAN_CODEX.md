@@ -9,6 +9,18 @@
 
 ## Estado de execução — 2026-09-02
 
+- **Hotfix de integração Pulse — limite textual corrigido localmente; I64 permanece gap explícito.**
+  A criação do refinement `876eb7b0-189c-4499-8bb8-9ca8c6568d82` expôs que o limite léxico de
+  16.384 caracteres estava sendo reutilizado indevidamente para dados parametrizados: no SQLite
+  preservado, `screen_mockups` tem 27.825 e `description` 18.718 caracteres. A correção separa as
+  superfícies: literais na query continuam em 16.384, enquanto `max_query_value_characters` passa a
+  governar parâmetros/resultados com default 65.536 e hard cap configurável de 1.048.576, sem mudar
+  formato ou tocar WAL/durabilidade. A outra mensagem observada, `kg.scoring.fetch_failed`, vem da
+  consulta `_fetch_node_inputs` com três `OPTIONAL MATCH` encadeados e dois `WITH` agregadores; ela é
+  exatamente a família I64 já congelada como `generic_gap/runtime_current`, não uma regressão do
+  subconjunto prometido. Portanto I64 continua dívida funcional declarada e não foi mascarada por
+  widening parcial do parser neste hotfix.
+
 - **Decisão normativa de 2026-09-01 — gates de performance aposentados.** Throughput, latências,
   RSS, CPU, contadores de syscall, o antigo piso `same-10 >= 7,5/s`, D5 e paridade temporal com
   Ladybug continuam registrados como observações, mas não bloqueiam M-PULSE-7, compatibilidade

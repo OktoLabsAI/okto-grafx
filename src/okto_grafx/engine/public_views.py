@@ -84,6 +84,7 @@ from okto_grafx.domain.query.ast import (
     Variable,
 )
 from okto_grafx.domain.query.limits import (
+    DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     MAX_EXPRESSION_DEPTH,
     MAX_LIST_ELEMENTS,
     MAX_MAP_ENTRIES,
@@ -1610,6 +1611,8 @@ def _metric_value(value: object, *, field: str, active: set[int]) -> object:
 
 def _query_parameters_snapshot(
     value: Mapping[str, object] | None,
+    *,
+    max_string_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
 ) -> dict[str, Value]:
     """Return one bounded, deeply owned parameter mapping before page access begins.
 
@@ -1656,6 +1659,7 @@ def _query_parameters_snapshot(
             field=f"parameters.{name}",
             depth=0,
             active=active,
+            max_string_characters=max_string_characters,
         )
     return detached
 
@@ -1734,6 +1738,7 @@ def _path_properties_snapshot(
     depth: int,
     active: set[int],
     detached: dict[Value, Value],
+    max_string_characters: int,
 ) -> None:
     """Append exact ordered user properties to one path entity map."""
     pairs = _tuple_items(value, field=field)
@@ -1775,6 +1780,7 @@ def _path_properties_snapshot(
             field=f"{field}.{name}",
             depth=depth,
             active=active,
+            max_string_characters=max_string_characters,
         )
 
 
@@ -1786,6 +1792,7 @@ def _path_node_snapshot(
     field: str,
     depth: int,
     active: set[int],
+    max_string_characters: int,
 ) -> dict[Value, Value]:
     """Rebuild one node of a projected path in Kuzu-compatible key order."""
     source = _path_exact_value(value, node_type, field=field)
@@ -1805,6 +1812,7 @@ def _path_node_snapshot(
         depth=depth,
         active=active,
         detached=detached,
+        max_string_characters=max_string_characters,
     )
     return detached
 
@@ -1817,6 +1825,7 @@ def _path_relationship_snapshot(
     field: str,
     depth: int,
     active: set[int],
+    max_string_characters: int,
 ) -> dict[Value, Value]:
     """Rebuild one relationship of a projected path in Kuzu-compatible key order."""
     source = _path_exact_value(value, relationship_type, field=field)
@@ -1847,6 +1856,7 @@ def _path_relationship_snapshot(
         depth=depth,
         active=active,
         detached=detached,
+        max_string_characters=max_string_characters,
     )
     return detached
 
@@ -1857,6 +1867,7 @@ def _query_path_snapshot(
     field: str,
     depth: int,
     active: set[int],
+    max_string_characters: int,
 ) -> dict[Value, Value]:
     """Detach the engine's nominal one-hop path into maps and immutable sequences."""
     from okto_grafx.engine.query_engine import (
@@ -1907,6 +1918,7 @@ def _query_path_snapshot(
                 field=f"{field}._NODES[{position}]",
                 depth=depth + 3,
                 active=active,
+                max_string_characters=max_string_characters,
             )
             for position, raw_node in enumerate(raw_nodes)
         )
@@ -1918,6 +1930,7 @@ def _query_path_snapshot(
                 field=f"{field}._RELS[{position}]",
                 depth=depth + 3,
                 active=active,
+                max_string_characters=max_string_characters,
             )
             for position, raw_relationship in enumerate(raw_relationships)
         )
@@ -1941,6 +1954,7 @@ def _query_value_snapshot(
     field: str,
     depth: int,
     active: set[int],
+    max_string_characters: int = MAX_STRING_CHARACTERS,
 ) -> Value:
     """Copy one query value into an exact, bounded and capability-free value graph."""
     if depth > MAX_VALUE_DEPTH:
@@ -1968,12 +1982,12 @@ def _query_value_snapshot(
         return float.__float__(value)
     if issubclass(value_type, str):
         plain_text = _builtin_text(value, field=field)
-        if len(plain_text) > MAX_STRING_CHARACTERS:
+        if len(plain_text) > max_string_characters:
             raise GrafxConfigurationError(
-                f"A query string may carry at most {MAX_STRING_CHARACTERS} characters.",
+                f"A query string may carry at most {max_string_characters} characters.",
                 field=field,
                 value=len(plain_text),
-                limit=MAX_STRING_CHARACTERS,
+                limit=max_string_characters,
             )
         return plain_text
     if issubclass(value_type, (bytes, bytearray, memoryview)):
@@ -2003,11 +2017,29 @@ def _query_value_snapshot(
     from okto_grafx.engine.query_engine import _PathValue
 
     if value_type is _PathValue:
-        return _query_path_snapshot(value, field=field, depth=depth, active=active)
+        return _query_path_snapshot(
+            value,
+            field=field,
+            depth=depth,
+            active=active,
+            max_string_characters=max_string_characters,
+        )
     if isinstance(value, Mapping):
-        return _query_mapping_snapshot(value, field=field, depth=depth, active=active)
+        return _query_mapping_snapshot(
+            value,
+            field=field,
+            depth=depth,
+            active=active,
+            max_string_characters=max_string_characters,
+        )
     if isinstance(value, Sequence):
-        return _query_sequence_snapshot(value, field=field, depth=depth, active=active)
+        return _query_sequence_snapshot(
+            value,
+            field=field,
+            depth=depth,
+            active=active,
+            max_string_characters=max_string_characters,
+        )
     observed = _builtin_type_name(value)
     raise GrafxConfigurationError(
         f"The query value at {field} cannot retain a {observed} capability.",
@@ -2023,6 +2055,7 @@ def _query_mapping_snapshot(
     field: str,
     depth: int,
     active: set[int],
+    max_string_characters: int,
 ) -> dict[Value, Value]:
     """Copy one bounded map, rejecting cycles and canonical-key collisions."""
     marker = id(value)
@@ -2043,12 +2076,14 @@ def _query_mapping_snapshot(
                 field=f"{field}.key[{position}]",
                 depth=depth + 1,
                 active=active,
+                max_string_characters=max_string_characters,
             )
             item = _query_value_snapshot(
                 raw_value,
                 field=f"{field}[{position}]",
                 depth=depth + 1,
                 active=active,
+                max_string_characters=max_string_characters,
             )
             try:
                 duplicate = key in detached
@@ -2077,6 +2112,7 @@ def _query_sequence_snapshot(
     field: str,
     depth: int,
     active: set[int],
+    max_string_characters: int,
 ) -> tuple[Value, ...]:
     """Copy one bounded sequence without invoking list or tuple subclass overrides."""
     marker = id(value)
@@ -2110,6 +2146,7 @@ def _query_sequence_snapshot(
                     field=f"{field}[{len(detached)}]",
                     depth=depth + 1,
                     active=active,
+                    max_string_characters=max_string_characters,
                 )
             )
         return tuple(detached)
@@ -2538,10 +2575,16 @@ def _query_plan_field_snapshot(
     )
 
 
-def _query_result_view(value: object) -> QueryResult:
+def _query_result_view(
+    value: object,
+    *,
+    max_string_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+) -> QueryResult:
     """Rebuild one result and normalize every malformed collaborator shape as a plan error."""
     try:
-        return _query_result_snapshot(value)
+        return _query_result_snapshot(
+            value, max_string_characters=max_string_characters
+        )
     except GrafxPlanError:
         raise
     except Exception as failure:  # noqa: BLE001 - collaborator output is an untrusted plan
@@ -2554,7 +2597,11 @@ def _query_result_view(value: object) -> QueryResult:
         ) from failure
 
 
-def _query_result_snapshot(value: object) -> QueryResult:
+def _query_result_snapshot(
+    value: object,
+    *,
+    max_string_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+) -> QueryResult:
     """Rebuild one fully materialised query result outside the page-access section."""
     # Local import avoids making the query engine depend on the public-view module that rebuilds
     # its output.  Database calls this only after composition has finished importing both modules.
@@ -2616,6 +2663,7 @@ def _query_result_snapshot(value: object) -> QueryResult:
                     field=f"query.result.rows[{row_position}][{column_position}]",
                     depth=0,
                     active=active,
+                    max_string_characters=max_string_characters,
                 )
                 for column_position, item in enumerate(row_items)
             )
