@@ -957,6 +957,17 @@ def _refuse_unmatched_sort_retention(root: PlanNode) -> None:
     ancestors: list[PlanNode] = []
     for node, depth in root.traverse():
         del ancestors[depth:]
+        if (
+            isinstance(node, SortRows)
+            and node.retained_limit is None
+            and node.retained_skip is not None
+        ):
+            raise GrafxPlanError(
+                "A bounded sort cannot retain SKIP without an accompanying LIMIT.",
+                field="operator",
+                value=node.label,
+                reason="unmatched_retention",
+            )
         if isinstance(node, SortRows) and node.retained_limit is not None:
             parent = ancestors[-1] if ancestors else None
             if node.retained_skip is None:

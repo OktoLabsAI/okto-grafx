@@ -4291,8 +4291,8 @@ def _top_rows(
         elif candidate.precedes(heap[0]):
             heapreplace(heap, candidate)
 
-    # The heap yields worst first under its reversed comparator; reversing those pops restores
-    # exact query order without another O(K log K) sort.
+    # The heap yields worst first under its reversed comparator. Popping all K entries and
+    # reversing them restores exact query order in O(K log K), within the O(N log K) bound.
     worst_first = [heappop(heap).row for _ in range(len(heap))]
     yield from reversed(worst_first)
 

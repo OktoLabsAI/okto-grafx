@@ -175,6 +175,43 @@ def test_top_n_preserves_the_total_order_across_mixed_runtime_kinds() -> None:
     assert retained[1:] == complete[1:4]
 
 
+@pytest.mark.parametrize("descending", [False, True])
+def test_top_n_uses_the_canonical_stable_nan_order(descending: bool) -> None:
+    """The heap and full sort share NaN totalization and stable ties from item 1."""
+    child = SingleRow()
+    values = (float("nan"), 2.0, -1.0, float("nan"), 0.0)
+    rows = tuple(
+        _Row(bindings={}, columns={"identity": identity, "value": value})
+        for identity, value in enumerate(values)
+    )
+
+    class Rows:
+        def _rows(self, node: PlanNode, context: _Context) -> Iterator[_Row]:
+            assert node is child
+            del context
+            yield from rows
+
+    keys = (SortItem(expression=Variable(name="value"), descending=descending),)
+    context = cast(_Context, SimpleNamespace(parameters={}))
+    engine = cast(QueryEngine, Rows())
+    complete = tuple(_sort_rows(engine, SortRows(child=child, keys=keys), context))
+    retained = tuple(
+        _sort_rows(
+            engine,
+            SortRows(
+                child=child,
+                keys=keys,
+                retained_skip=Literal(value=1),
+                retained_limit=Literal(value=2),
+            ),
+            context,
+        )
+    )
+    assert tuple(row.columns["identity"] for row in retained) == tuple(
+        row.columns["identity"] for row in complete[:3]
+    )
+
+
 def test_top_n_handles_a_window_at_least_as_large_as_the_input(
     stack: QueryStack,
 ) -> None:
@@ -285,6 +322,15 @@ def test_a_physical_retention_without_its_exact_window_is_refused() -> None:
     with pytest.raises(GrafxPlanError) as mismatched:
         validate_plan(wrong)
     assert mismatched.value.details["reason"] == "unmatched_retention"
+
+    orphan_skip = SortRows(
+        child=SingleRow(),
+        keys=(SortItem(expression=Literal(value=1)),),
+        retained_skip=Literal(value=1),
+    )
+    with pytest.raises(GrafxPlanError) as orphaned:
+        validate_plan(ProduceResults(child=orphan_skip))
+    assert orphaned.value.details["reason"] == "unmatched_retention"
 
 
 def test_an_exact_skip_and_limit_window_validates() -> None:
