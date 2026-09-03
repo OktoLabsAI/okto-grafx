@@ -2110,19 +2110,23 @@ def _index_lookup_versions(
     snapshot: object,
     *,
     exact: bool,
-) -> tuple[tuple[object, HeapVersion], ...]:
-    """Return index hits with their versions, reusing exact-index validation when available.
+) -> Iterator[tuple[object, HeapVersion]]:
+    """Yield index hits with their versions, reusing exact validation when available.
 
     ``IndexManager.lookup_versions`` is deliberately internal.  The fallback keeps QueryEngine's
     existing collaborator boundary working for a custom manager that only implements the frozen
-    ``lookup`` door; the built-in exact path never takes it.  Proximity indexes must take the
-    fallback because their contract intentionally performs no heap validation in the manager.
+    ``lookup`` door; the built-in exact path never takes it.  That fallback remains deliberately
+    lazy: ``LIMIT`` and owner overlays must be able to stop before a later hit is read, exactly as
+    before this optimisation. Proximity indexes take the same lazy fallback because their
+    contract intentionally performs no heap validation in the manager.
     """
     lookup_versions = getattr(manager, "lookup_versions", None)
     if exact and callable(lookup_versions):
-        return tuple(lookup_versions(name, key, snapshot))
+        yield from lookup_versions(name, key, snapshot)
+        return
     lookup = getattr(manager, "lookup")
-    return tuple((ref, engine.heap.read(ref)) for ref in lookup(name, key, snapshot))
+    for ref in lookup(name, key, snapshot):
+        yield ref, engine.heap.read(ref)
 
 
 def _index_seek(
