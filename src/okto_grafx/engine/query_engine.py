@@ -50,6 +50,7 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
+from math import isnan
 from typing import cast
 
 from okto_grafx.domain.errors import (
@@ -3968,14 +3969,28 @@ def _aggregate_rows(
 class _Accumulator:
     """The running state of one aggregate over one group."""
 
-    __slots__ = ("_aggregation", "_seen", "_values", "_count", "_total")
+    __slots__ = (
+        "_aggregation",
+        "_function",
+        "_seen",
+        "_values",
+        "_count",
+        "_total",
+        "_extreme",
+        "_extreme_key",
+    )
 
     def __init__(self, aggregation: Aggregation) -> None:
         self._aggregation = aggregation
-        self._seen: set[object] = set()
-        self._values: list[object] = []
+        self._function = aggregation.function
+        self._seen: set[object] | None = set() if aggregation.call.distinct else None
+        self._values: list[object] | None = (
+            [] if self._function == "COLLECT" else None
+        )
         self._count = 0
         self._total: float = 0.0
+        self._extreme: object = None
+        self._extreme_key: tuple[int, object] | None = None
 
     def add(self, row: _Row, context: _Context) -> None:
         """Fold one row into this aggregate."""
@@ -3988,29 +4003,48 @@ class _Accumulator:
             return
         if call.distinct:
             frozen = _freeze(value)
-            if frozen in self._seen:
+            seen = self._seen
+            assert seen is not None
+            if frozen in seen:
                 return
-            self._seen.add(frozen)
+            seen.add(frozen)
         self._count += 1
-        self._values.append(value)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        name = self._function
+        if name == "COLLECT":
+            values = self._values
+            assert values is not None
+            values.append(value)
+        elif name in ("MIN", "MAX"):
+            key = _sort_key(value)
+            extreme_key = self._extreme_key
+            if extreme_key is None or (
+                key < extreme_key if name == "MIN" else not key < extreme_key
+            ):
+                self._extreme = value
+                self._extreme_key = key
+        elif (
+            name in ("SUM", "AVG")
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ):
             self._total += float(value)
 
     def result(self) -> object:
         """Return what this aggregate reports for its group."""
-        name = self._aggregation.function
+        name = self._function
         if name == "COUNT":
             return self._count
         if name == "COLLECT":
-            return tuple(self._values)
-        if not self._values:
+            values = self._values
+            assert values is not None
+            return tuple(values)
+        if not self._count:
             return None
         if name == "SUM":
             return self._total
         if name == "AVG":
-            return self._total / self._count if self._count else None
-        ordered = sorted(self._values, key=_sort_key)
-        return ordered[0] if name == "MIN" else ordered[-1]
+            return self._total / self._count
+        return self._extreme
 
 
 def _project_rows(
@@ -8020,6 +8054,8 @@ def _sort_key(value: object) -> tuple[int, object]:
 
     Ordering ACROSS kinds is decided by the rank alone, which is what makes the comparison total:
     two values of different kinds are never handed to an operator that has no meaning for them.
+    A NaN sorts after every other number rather than inheriting Python's unordered comparison;
+    equal NaNs remain stable, like every other equal key.
     Null sorts last ascending, which is the reference dialect's rule and puts it first when the
     direction is reversed.
     """
@@ -8028,7 +8064,9 @@ def _sort_key(value: object) -> tuple[int, object]:
     if isinstance(value, bool):
         return (0, int(value))
     if isinstance(value, (int, float)):
-        return (1, value)
+        if isinstance(value, float) and isnan(value):
+            return (1, (1, 0.0))
+        return (1, (0, value))
     if isinstance(value, str):
         return (2, value)
     if isinstance(value, (bytes, bytearray)):
