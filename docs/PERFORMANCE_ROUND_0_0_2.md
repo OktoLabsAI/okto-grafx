@@ -48,6 +48,28 @@ copied while mutable, or profiled. Read-only operating-system counters remain ob
 Development of isolated P1 branches may proceed after this freeze, but none may be benchmarked,
 promoted or integrated until P0.1–P0.4 are closed as specified by the governing plan.
 
+## P0.1 — H5 attach/rebuild diagnosis
+
+Status: **complete** for the isolated engine protocol; static Pulse-flow relevance is recorded
+separately and does not change the result below.
+
+- Generic attach followed by commits on unrelated tables preserved exact seeks
+  (`rows_seeked=1`, `rows_scanned=0`); that broad form of H5 was falsified.
+- A handle that itself completes a vector rebuild retains the existing process-local rebuild
+  fence at the scan position. Reads above that position remain retryably refused until indexed
+  work advances the generation or the handle is reopened. This is distinct from durable STALE
+  state and from insufficient header coverage; the round did not relax that fail-closed contract.
+- The experiment did reproduce a separate availability defect: after a foreign cold open moved
+  the durable page-0 sequence, a live writer could reuse its clean resident page 0 and fail after
+  the WAL barrier. The commit path now discards/rebases that clean frame; a pinned clean frame is
+  doomed until its holder releases it, while any dirty page 0 remains refused.
+- The literal three-process arm creates/rebuilds/closes in A, attaches/rebuilds/commits elsewhere
+  in B, then performs a cold verification in C. It records all three refusal sites, bounded retry
+  behaviour, seek/scan statistics, stale state and a clean `verify("all")` result using only a
+  temporary database.
+
+Promoted commits: `7a9414c`, `e8c3583`, `cef70db`.
+
 ## Test cadence
 
 - Each implementation gets focused tests for its changed contract and nearby regressions.
@@ -61,4 +83,4 @@ promoted or integrated until P0.1–P0.4 are closed as specified by the governin
 | Date | Milestone | Result |
 |---|---|---|
 | 2026-09-02 | Version bump and branch bootstrap | packaging and CLI version tests passed |
-
+| 2026-09-03 | P0.1 H5 diagnosis and page-0 repair | 14 isolated multiprocess tests, neighboring index/recovery suites and Ruff passed; no live board accessed |
