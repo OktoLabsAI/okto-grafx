@@ -411,6 +411,8 @@ class DatabaseConfig:
     max_statement_writes: int | None = None
     max_result_rows: int | None = None
     max_intermediate_rows: int | None = None
+    max_traversal_expansions: int | None = None
+    max_traversal_paths: int | None = None
     max_transaction_rows: int | None = None
     max_transaction_bytes: int | None = None
     max_wal_batch_bytes: int | None = None
@@ -484,7 +486,8 @@ An exceeded limit raises non-retryable `GrafxTransactionBudgetExceeded`. Stateme
 restored to its exact pre-statement staging on refusal. The final WAL-batch limit is checked before
 `append_many`; no budget refusal truncates the WAL or persists a partial statement.
 
-The two query row limits are positive integers when set and disabled by `None`:
+The four query admission limits are positive integers when set and disabled by `None`. The row
+limits are:
 
 * `max_result_rows` incrementally counts rows from the public terminal. It consumes row N+1 only
   to refuse it, before retaining it, before consuming any remaining stream and before
@@ -494,11 +497,29 @@ The two query row limits are positive integers when set and disabled by `None`:
   result is charged only to `max_result_rows`; when there are no public columns, that terminal node
   is instead charged as intermediate.
 
-Either overrun raises non-retryable `GrafxQueryBudgetExceeded`. Refusal does not truncate state and
-does not release any write from the refused statement. These are not cumulative-work, payload-byte,
-RSS, streaming, deadline, traversal or spill limits. Sort, aggregate, distinct and eager operators
-may retain up to the configured rows or states before their first yield; the payload bytes, internal
-structures and auxiliary scans behind those rows are not bounded by these two fields.
+The traversal limits are cumulative across every graph-pattern operator in one execution:
+
+* `max_traversal_expansions` charges variable and untyped traversal as soon as the selected endpoint
+  source yields a candidate, before repeat-edge and landing checks. `RelationshipScan` instead
+  charges each stored or pending relationship it encounters, before its pushed predicate and
+  endpoint checks.
+* `max_traversal_paths` charges a path only after its applicable pushed predicate and landing-node
+  visibility checks, immediately before it can be retained in a variable-length frontier or
+  returned by a one-hop operator.
+
+The N+1 unit is refused before retention or return. These two limits cover Cypher relationship
+traversal and relationship scans; HNSW navigation internal to vector search has its own execution
+regime and is not charged. A candidate is what the selected adjacency source yields; physical rows
+read once while constructing a grouped-scan fallback are auxiliary scan work rather than candidate
+expansions. Disabled traversal limits preserve the previous statistics surface; when enabled, a
+successful query reports the corresponding admitted `traversal_expansions` or `traversal_paths`
+count.
+
+Any overrun raises non-retryable `GrafxQueryBudgetExceeded`. Refusal does not truncate state and
+does not release any write from the refused statement. These are not payload-byte, RSS, streaming,
+deadline or spill limits. Sort, aggregate, distinct and eager operators may retain up to configured
+rows or states before their first yield; payload bytes, internal structures and auxiliary scans
+behind those rows are not bounded by these fields.
 
 `max_query_value_characters` is a separate public-boundary guard. It defaults to 65,536 and may be
 configured from 1 through 1,048,576 characters. It applies to every string parameter (including a
@@ -992,7 +1013,9 @@ class VectorEngine:
 class QueryEngine:
     def __init__(..., *, max_statement_writes: int | None = None,
                  max_result_rows: int | None = None,
-                 max_intermediate_rows: int | None = None)
+                 max_intermediate_rows: int | None = None,
+                 max_traversal_expansions: int | None = None,
+                 max_traversal_paths: int | None = None)
     def parse(self, text: str) -> "Statement"
     def plan(self, statement: "Statement", snapshot: Snapshot) -> "PlanNode"
     def execute(self, text: str, txn, parameters: Mapping[str, object] | None = None) -> "QueryResult"

@@ -257,6 +257,45 @@ def test_the_intermediate_budget_is_charged_once_at_the_traversal(
         wide.close()
 
 
+def test_untyped_traversal_uses_the_same_cumulative_work_budgets(tmp_path: Path) -> None:
+    """Candidates from distinct relationship tables share one query-wide counter."""
+    where = tmp_path / "untyped-budget"
+    seeded = okto_grafx.connect(where, page_size=512)
+    _seed(seeded)
+    seeded.close()
+
+    narrow = okto_grafx.connect(
+        where,
+        page_size=512,
+        max_traversal_expansions=2,
+        max_traversal_paths=3,
+    )
+    try:
+        with pytest.raises(GrafxQueryBudgetExceeded) as raised:
+            narrow.execute(ADMITTED)
+    finally:
+        narrow.close()
+    assert raised.value.details == {
+        "field": "max_traversal_expansions",
+        "limit": 2,
+        "observed": 3,
+    }
+
+    exact = okto_grafx.connect(
+        where,
+        page_size=512,
+        max_traversal_expansions=3,
+        max_traversal_paths=3,
+    )
+    try:
+        found = exact.execute(ADMITTED)
+    finally:
+        exact.close()
+    assert found.rows == (("d1",), ("d1",), ("d1",))
+    assert found.statistics["traversal_expansions"] == 3
+    assert found.statistics["traversal_paths"] == 3
+
+
 # --- the statements that only resemble the admitted one -------------------------------------------
 
 

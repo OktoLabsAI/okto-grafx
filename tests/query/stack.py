@@ -477,6 +477,8 @@ def build_query_stack(
     with_indexes: bool = True,
     max_result_rows: int | None = None,
     max_intermediate_rows: int | None = None,
+    max_traversal_expansions: int | None = None,
+    max_traversal_paths: int | None = None,
 ) -> QueryStack:
     """Assemble a database with a person table, a chunk table and one embedding space."""
     device = MemoryDevice()
@@ -603,6 +605,8 @@ def build_query_stack(
         endpoint_locator_guard=threading.RLock(),
         max_result_rows=max_result_rows,
         max_intermediate_rows=max_intermediate_rows,
+        max_traversal_expansions=max_traversal_expansions,
+        max_traversal_paths=max_traversal_paths,
     )
     return QueryStack(
         device=device,

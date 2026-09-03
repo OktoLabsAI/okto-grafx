@@ -270,6 +270,8 @@ class DatabaseConfig:
     max_statement_writes: int | None = None
     max_result_rows: int | None = None
     max_intermediate_rows: int | None = None
+    max_traversal_expansions: int | None = None
+    max_traversal_paths: int | None = None
     max_transaction_rows: int | None = None
     max_transaction_bytes: int | None = None
     max_wal_batch_bytes: int | None = None
@@ -353,6 +355,8 @@ class DatabaseConfig:
             "max_statement_writes",
             "max_result_rows",
             "max_intermediate_rows",
+            "max_traversal_expansions",
+            "max_traversal_paths",
             "max_transaction_rows",
             "max_transaction_bytes",
             "max_wal_batch_bytes",

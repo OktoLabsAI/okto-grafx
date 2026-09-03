@@ -50,6 +50,8 @@ def test_defaults_match_the_contract() -> None:
     assert config.max_statement_writes is None
     assert config.max_result_rows is None
     assert config.max_intermediate_rows is None
+    assert config.max_traversal_expansions is None
+    assert config.max_traversal_paths is None
     assert config.max_query_value_characters == DEFAULT_MAX_QUERY_VALUE_CHARACTERS
     assert config.max_transaction_rows is None
     assert config.max_transaction_bytes is None
@@ -255,9 +257,17 @@ def test_an_invalid_transaction_budget_is_rejected(field: str, value: object) ->
     assert raised.value.details["field"] == field
 
 
-@pytest.mark.parametrize("field", ["max_result_rows", "max_intermediate_rows"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_result_rows",
+        "max_intermediate_rows",
+        "max_traversal_expansions",
+        "max_traversal_paths",
+    ],
+)
 @pytest.mark.parametrize("value", [0, -1, "1024", 1024.5, True])
-def test_an_invalid_query_row_budget_is_rejected(field: str, value: object) -> None:
+def test_an_invalid_query_budget_is_rejected(field: str, value: object) -> None:
     with pytest.raises(GrafxConfigurationError) as raised:
         DatabaseConfig(path=":memory:", **{field: value})
     assert raised.value.details["field"] == field
@@ -756,6 +766,8 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         max_statement_writes=_HostileInt(64),
         max_result_rows=_HostileInt(256),
         max_intermediate_rows=_HostileInt(512),
+        max_traversal_expansions=_HostileInt(1024),
+        max_traversal_paths=_HostileInt(2048),
         max_query_value_characters=_HostileInt(65_536),
         max_transaction_rows=_HostileInt(128),
         max_transaction_bytes=_HostileInt(16384),
@@ -775,6 +787,8 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         "max_statement_writes",
         "max_result_rows",
         "max_intermediate_rows",
+        "max_traversal_expansions",
+        "max_traversal_paths",
         "max_query_value_characters",
         "max_transaction_rows",
         "max_transaction_bytes",

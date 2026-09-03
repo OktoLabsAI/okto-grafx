@@ -595,6 +595,8 @@ class _Context:
     result_node: PlanNode | None = None
     union_coercions: tuple[bool, ...] = ()
     intermediate_rows: dict[int, int] = field(default_factory=dict)
+    traversal_expansions: int = 0
+    traversal_paths: int = 0
     staged_rows: list[_HeldRow] = field(default_factory=list)
     staged_partitions: list[tuple[int, bytes]] = field(default_factory=list)
     staged_reads: list[tuple[int, bytes]] = field(default_factory=list)
@@ -833,6 +835,39 @@ class _Context:
                 operator=node.label,
             )
         self.intermediate_rows[identity] = observed
+
+    def admit_traversal_expansion(self) -> None:
+        """Charge one candidate edge before traversal performs work derived from it."""
+        limit = self.engine._max_traversal_expansions
+        if limit is None:
+            return
+        observed = self.traversal_expansions + 1
+        if observed > limit:
+            raise GrafxQueryBudgetExceeded(
+                f"Query would exceed max_traversal_expansions: limit {limit}, "
+                f"observed {observed}.",
+                field="max_traversal_expansions",
+                limit=limit,
+                observed=observed,
+            )
+        self.traversal_expansions = observed
+        self.count("traversal_expansions")
+
+    def admit_traversal_path(self) -> None:
+        """Charge one visible path before retaining it in a frontier or returning it."""
+        limit = self.engine._max_traversal_paths
+        if limit is None:
+            return
+        observed = self.traversal_paths + 1
+        if observed > limit:
+            raise GrafxQueryBudgetExceeded(
+                f"Query would exceed max_traversal_paths: limit {limit}, observed {observed}.",
+                field="max_traversal_paths",
+                limit=limit,
+                observed=observed,
+            )
+        self.traversal_paths = observed
+        self.count("traversal_paths")
 
 
 def _intent_table_ids(txn: object) -> frozenset[int]:
@@ -1759,6 +1794,8 @@ class QueryEngine:
         "_max_statement_writes",
         "_max_result_rows",
         "_max_intermediate_rows",
+        "_max_traversal_expansions",
+        "_max_traversal_paths",
     )
 
     def __init__(
@@ -1777,6 +1814,8 @@ class QueryEngine:
         max_statement_writes: int | None = None,
         max_result_rows: int | None = None,
         max_intermediate_rows: int | None = None,
+        max_traversal_expansions: int | None = None,
+        max_traversal_paths: int | None = None,
     ) -> None:
         """Adopt one catalog, one heap, one pool and whichever engines this composition has."""
         self._catalog = catalog
@@ -1837,6 +1876,12 @@ class QueryEngine:
         )
         self._max_intermediate_rows = _require_optional_positive_limit(
             "max_intermediate_rows", max_intermediate_rows
+        )
+        self._max_traversal_expansions = _require_optional_positive_limit(
+            "max_traversal_expansions", max_traversal_expansions
+        )
+        self._max_traversal_paths = _require_optional_positive_limit(
+            "max_traversal_paths", max_traversal_paths
         )
         self._metrics = MetricEmitter(metrics)
         self._clock = clock
@@ -3371,6 +3416,8 @@ def _traverse(
     very row.
     """
     path_variable = node.path_variable
+    charge_expansions = engine._max_traversal_expansions is not None
+    charge_paths = engine._max_traversal_paths is not None
     if path_variable is not None:
         if type(path_variable) is not str or not path_variable:
             raise GrafxPlanError(
@@ -3448,6 +3495,8 @@ def _traverse(
             for record_id, _table, path in frontier:
                 taken = {edge.ref for edge in path}
                 for ref, version, next_table, next_id in steps(record_id):
+                    if charge_expansions:
+                        context.admit_traversal_expansion()
                     if ref in taken:
                         continue
                     if (
@@ -3463,6 +3512,8 @@ def _traverse(
                         landing = node_at(next_table, next_id)
                     if landing is None:
                         continue
+                    if charge_paths:
+                        context.admit_traversal_path()
                     edge = RowBinding(
                         variable=node.relationship or "",
                         table=relationship,
@@ -3525,6 +3576,8 @@ def _traverse_any(
     here by construction rather than by omission.
     """
     catalog = context.schema()
+    charge_expansions = engine._max_traversal_expansions is not None
+    charge_paths = engine._max_traversal_paths is not None
     ended = _ended_by_this_transaction(context)
     dirty_tables = _intent_table_ids(context.txn)
     landing_views: dict[int, _OwnerLandingView] = {}
@@ -3573,9 +3626,13 @@ def _traverse_any(
         identity = _overlay_identity(start)
         for table, steps in walkers:
             for ref, version, next_table, next_id in steps(identity):
+                if charge_expansions:
+                    context.admit_traversal_expansion()
                 landing = node_at(next_table, next_id)
                 if landing is None:
                     continue
+                if charge_paths:
+                    context.admit_traversal_path()
                 landing_ref, landing_version = landing
                 bindings = dict(row.bindings)
                 bindings[node.target] = RowBinding(
@@ -3609,6 +3666,8 @@ def _relationship_scan(
     row passes the same single admission point every scan uses.
     """
     relationship = node.table
+    charge_expansions = engine._max_traversal_expansions is not None
+    charge_paths = engine._max_traversal_paths is not None
     dirty_tables = _intent_table_ids(context.txn)
     changed: Mapping[object, tuple[Value, ...] | None] = {}
     pending: tuple[tuple[object, HeapVersion], ...] = ()
@@ -3652,6 +3711,8 @@ def _relationship_scan(
     for row in engine._rows(node.child, context):
         context.count("edge_scans")
         for ref, version in engine.heap.scan(relationship, context.snapshot):
+            if charge_expansions:
+                context.admit_traversal_expansion()
             if ref in ended:
                 continue
             if ref in changed:
@@ -3680,6 +3741,8 @@ def _relationship_scan(
             landing_to = node_at(node.to_table, version.values[1])
             if landing_to is None:
                 continue
+            if charge_paths:
+                context.admit_traversal_path()
             bindings = {} if single_child else dict(row.bindings)
             bindings[node.from_variable] = RowBinding(
                 variable=node.from_variable,
@@ -3698,6 +3761,8 @@ def _relationship_scan(
             context.count("rows_scanned")
             yield _Row(bindings=bindings)
         for reference, version in pending:
+            if charge_expansions:
+                context.admit_traversal_expansion()
             edge = judged(version, reference)
             if edge is None:
                 continue
@@ -3707,6 +3772,8 @@ def _relationship_scan(
             landing_to = node_at(node.to_table, version.values[1])
             if landing_to is None:
                 continue
+            if charge_paths:
+                context.admit_traversal_path()
             bindings = {} if single_child else dict(row.bindings)
             bindings[node.from_variable] = RowBinding(
                 variable=node.from_variable,

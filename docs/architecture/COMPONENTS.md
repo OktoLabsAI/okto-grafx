@@ -724,7 +724,7 @@ restores the exact staging it received, while a final-batch refusal neither appe
 the WAL; neither path can persist half a statement. This is transaction admission only: it does not
 claim query streaming, query-memory/RSS enforcement or chunked WAL commits.
 
-### F1 query row budgets — per-operator admission (C0/C10; CLOSED)
+### F1 query and traversal budgets — bounded admission (C0/C10; CLOSED)
 
 `max_result_rows` and `max_intermediate_rows` are opt-in positive integers defaulting to `None`.
 The result counter advances while the public terminal is consumed: row N+1 is consumed only far
@@ -734,11 +734,22 @@ for the full execution rather than one cumulative query-wide count. The node fee
 is charged only as result; a terminal with no public columns is charged as intermediate.
 
 Both paths raise non-retryable `GrafxQueryBudgetExceeded` and neither truncates state nor hands a
-partial write statement to its transaction. The scope is deliberately rows, not RSS or total work:
-there is no streaming-result, deadline, traversal, spill or cumulative budget here. Sort, aggregate,
-distinct and eager operators may retain up to the admitted rows or states before their first yield;
-payload bytes, internal structures and auxiliary scans are not charged, so these fields are not a
-complete query-memory budget.
+partial write statement to its transaction.
+
+`max_traversal_expansions` and `max_traversal_paths` add two independent, opt-in cumulative budgets
+for graph-pattern work over the whole query. The first charges each relationship candidate before
+the remaining operator-local landing/repeat or pushed-predicate work; the second charges a visible,
+pushed-predicate-admitted path before frontier retention or return. Limit N refuses unit N+1 before
+that unit is retained. They cover
+typed, untyped and relationship-scan Cypher operators, not HNSW's internal graph. Disabled fields
+preserve the old statistics surface; enabled fields report their admitted counters on success.
+For a grouped endpoint fallback the candidate is what its adjacency map yields, not every physical
+relationship row read once to construct that map; the underlying auxiliary scan remains uncharged.
+
+The scope is deliberately admission, not complete query memory: there is no streaming-result,
+deadline, spill or byte/RSS budget here. Sort, aggregate, distinct and eager operators may retain up
+to the admitted rows or states before their first yield; payload bytes, internal structures and
+non-traversal auxiliary scans are not charged.
 
 ### Fase 1.4 / P1.15 — OpenMetrics loopback-by-default bind (C0/C8/C11; CLOSED)
 

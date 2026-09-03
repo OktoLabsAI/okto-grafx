@@ -561,6 +561,8 @@ refused with the field name the caller actually wrote.
 | `max_statement_writes` | `None` | Optional hard limit on logical row writes retained by one statement |
 | `max_result_rows` | `None` | Optional hard limit on public result rows; row N+1 is refused before it is retained and before any remaining input is consumed |
 | `max_intermediate_rows` | `None` | Optional hard limit per non-terminal physical operator over one execution; it is not a cumulative query-wide count |
+| `max_traversal_expansions` | `None` | Optional cumulative per-query limit on relationship candidates examined by graph-pattern operators; candidate N+1 is refused before derived landing/filter work |
+| `max_traversal_paths` | `None` | Optional cumulative per-query limit on visible paths admitted by graph-pattern operators; path N+1 is refused before frontier retention or return |
 | `max_query_value_characters` | `65536` | Per-string parameter/result boundary; configurable from 1 through the hard 1,048,576-character guard; query-source literals keep their separate 16,384-character ceiling |
 | `max_transaction_rows` | `None` | Optional hard limit on retained `row_intents` in one transaction |
 | `max_transaction_bytes` | `None` | Optional hard limit on encoded row tuples, staged logical-record `encoded_length()` values and retained page-image generations; ordinary replacement charges the byte delta, while a rollback preimage held by a live statement mark remains charged until settle/discard |
@@ -611,12 +613,26 @@ raises the non-retryable `GrafxTransactionBudgetExceeded`. A refused statement r
 pre-statement staging, and a refused final WAL batch is rejected before append; these refusals do
 not truncate the WAL or persist a partial statement.
 
-The two query row limits are also opt-in positive integers. `max_result_rows` counts the public
+The two query row limits are opt-in positive integers. `max_result_rows` counts the public
 terminal incrementally; it consumes row N+1 only to refuse it, before retaining it or consuming the
 rest of the stream and before `context.release()`. `max_intermediate_rows` counts each non-terminal
 physical operator separately for the whole execution. A public terminal is charged only as result;
 a terminal with no public columns is charged as intermediate. Overrun raises the non-retryable
 `GrafxQueryBudgetExceeded`, without truncating state or releasing a partial write statement.
+
+The two traversal limits are likewise opt-in positive integers, but are cumulative across every
+graph-pattern operator in one query. Variable and untyped traversal charge an expansion for each
+candidate yielded by their selected endpoint source, before repeat-edge and landing checks; a
+fixed relationship scan charges each stored or pending relationship it encounters, before its
+pushed predicate and endpoint checks. A path is charged only after the applicable pushed predicate
+and landing visibility checks, immediately before the path can enter a variable-length frontier or
+be returned by a one-hop scan. The first over-limit unit is refused before it is retained or
+returned. These limits cover Cypher relationship traversal and scans, not the separate internal
+HNSW navigation performed by a vector-search operator. Physical rows read once to construct a
+grouped endpoint fallback are auxiliary scan work and are not charged as candidate expansions.
+When disabled the limits do not add traversal counters to `QueryResult.statistics`; when enabled,
+the corresponding `traversal_expansions` or `traversal_paths` statistic records admitted work on
+successful queries.
 
 `max_query_value_characters` bounds each string parameter and each string copied across the public
 query-result boundary. It defaults to 65,536 characters, while query-source string literals retain
@@ -624,10 +640,10 @@ their independent 16,384-character lexer ceiling. Applications may lower the val
 to the hard 1,048,576-character guard; values above the effective ceiling are refused before page
 access. The option is process-local and does not change the on-disk format.
 
-These are row-admission limits, not a complete query-memory budget. They do not bound cumulative
-work, payload bytes, internal structures, auxiliary scans, RSS, deadlines, traversal work, spill or
-stream results. Sort, aggregate, distinct and eager operators may retain up to the configured rows
-or states before their first yield; the memory of those payloads and structures is not bounded here.
+These are admission limits, not a complete query-memory budget. They do not bound payload bytes,
+internal structures, auxiliary scans, RSS, deadlines, spill or stream results. Sort,
+aggregate, distinct and eager operators may retain up to the configured rows or states before their
+first yield; the memory of those payloads and structures is not bounded here.
 
 ---
 

@@ -520,6 +520,8 @@ def assemble_database(
             max_statement_writes=config.max_statement_writes,
             max_result_rows=config.max_result_rows,
             max_intermediate_rows=config.max_intermediate_rows,
+            max_traversal_expansions=config.max_traversal_expansions,
+            max_traversal_paths=config.max_traversal_paths,
         )
         attached = tuple(attached_names)
         adopted = set(attached)

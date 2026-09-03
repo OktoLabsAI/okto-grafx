@@ -76,6 +76,23 @@ def _reached(handle: object, spelling: str) -> list[str]:
     return sorted(row[0] for row in rows)
 
 
+def _bounded_cycle(tmp_path: Path, **options: object) -> object:
+    """Build the cycle under one optional set of execution budgets."""
+    handle = okto_grafx.connect(tmp_path / "bounded-cycle", page_size=512, **options)
+    with handle.begin("write") as schema:
+        schema.execute("CREATE NODE TABLE A(id STRING, PRIMARY KEY(id))")
+        schema.execute("CREATE REL TABLE R(FROM A TO A, layer STRING)")
+    with handle.begin("write") as seed:
+        for identity in ("a1", "a2", "a3"):
+            seed.execute("CREATE (:A {id: $id})", {"id": identity})
+        for source, target in (("a1", "a2"), ("a2", "a3"), ("a3", "a1")):
+            seed.execute(
+                "MATCH (x:A {id: $s}), (y:A {id: $t}) CREATE (x)-[:R {layer: 'l'}]->(y)",
+                {"s": source, "t": target},
+            )
+    return handle
+
+
 # --- the three spellings the endpoint normalises ------------------------------------------------
 
 
@@ -201,6 +218,77 @@ def test_the_intermediate_budget_still_counts_what_the_walk_produces(
         assert raised.value.details["operator"] == "TraverseRelationship"
     finally:
         handle.close()
+
+
+def test_traversal_budgets_count_candidate_edges_and_retained_paths(
+    tmp_path: Path,
+) -> None:
+    """The counters are cumulative per query and include a reused-edge attempt."""
+    handle = _bounded_cycle(
+        tmp_path, max_traversal_expansions=4, max_traversal_paths=3
+    )
+    try:
+        found = handle.execute(
+            "MATCH (x:A {id: 'a1'})-[r:R*]->(y:A) RETURN y.id ORDER BY y.id"
+        )
+    finally:
+        handle.close()
+
+    assert found.rows == (("a1",), ("a2",), ("a3",))
+    assert found.statistics["traversal_expansions"] == 4
+    assert found.statistics["traversal_paths"] == 3
+
+
+def test_disabled_traversal_budgets_preserve_the_statistics_surface(
+    tmp_path: Path,
+) -> None:
+    handle = _bounded_cycle(tmp_path)
+    try:
+        found = handle.execute(
+            "MATCH (x:A {id: 'a1'})-[r:R*]->(y:A) RETURN y.id ORDER BY y.id"
+        )
+    finally:
+        handle.close()
+
+    assert "traversal_expansions" not in found.statistics
+    assert "traversal_paths" not in found.statistics
+
+
+@pytest.mark.parametrize(
+    ("option", "limit", "field", "observed"),
+    (
+        ("max_traversal_expansions", 3, "max_traversal_expansions", 4),
+        ("max_traversal_paths", 2, "max_traversal_paths", 3),
+    ),
+)
+def test_a_traversal_budget_refuses_limit_plus_one_before_returning_a_result(
+    tmp_path: Path, option: str, limit: int, field: str, observed: int
+) -> None:
+    handle = _bounded_cycle(tmp_path, **{option: limit})
+    try:
+        with pytest.raises(GrafxQueryBudgetExceeded) as raised:
+            handle.execute("MATCH (x:A {id: 'a1'})-[r:R*]->(y:A) RETURN y.id")
+    finally:
+        handle.close()
+
+    assert raised.value.details == {"field": field, "limit": limit, "observed": observed}
+
+
+def test_relationship_scan_charges_filtered_candidates_but_no_paths(tmp_path: Path) -> None:
+    """A filter cannot hide work already spent reading a relationship candidate."""
+    handle = _bounded_cycle(
+        tmp_path, max_traversal_expansions=3, max_traversal_paths=3
+    )
+    try:
+        found = handle.execute(
+            "MATCH (x:A)-[r:R]->(y:A) WHERE r.layer = 'missing' RETURN y.id"
+        )
+    finally:
+        handle.close()
+
+    assert found.rows == ()
+    assert found.statistics["traversal_expansions"] == 3
+    assert found.statistics.get("traversal_paths", 0) == 0
 
 
 # --- what is still refused --------------------------------------------------------------------
