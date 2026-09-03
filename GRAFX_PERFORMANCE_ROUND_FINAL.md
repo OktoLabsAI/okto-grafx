@@ -198,11 +198,12 @@ Nenhum sink/callback roda sob lease ou section; a emissão ocorre após `txn_man
 #### P1.4 — locator especializado para endpoint (D-02 corrigido)
 
 - não alterar `HeapStore.lookup` nem a ordem pública de scan;
-- introduzir `contains_visible_record` ou `lookup_with_ref` somente para os consumidores necessários;
-- caminhar cauda-primeiro apenas nessa porta;
-- primeiro implementar sem cache de cadeia;
-- permitir cache de cadeia somente se ao menos 50% dos acertos reais estiverem nas últimas 10% das páginas e se `derived_epoch` + dois processos provarem invalidação correta;
-- incluir IDs antigos, snapshots antigos, updates e duplicidade/corrupção nos testes.
+- introduzir `_lookup_with_ref` somente para os consumidores internos necessários;
+- caminhar cabeça→cauda por um cursor de prefixo canônico, concluindo o `peek` de toda a página antes de devolver um candidato;
+- revalidar e decodificar integralmente apenas o candidato solicitado; corrupção nunca vira fallback;
+- limitar todo estado retido por handle — memo, slot de tabela, identidade/ref e prova de páginas — com accounting atômico sob guard injetado, sem I/O do heap sob esse guard;
+- usar o lookup canônico em saturação, estado derivado stale ou uso concorrente do mesmo cursor;
+- incluir IDs antigos, snapshots antigos, updates, duplicidade/corrupção e o mesmo reader antes/depois de reconciliação multiprocesso nos testes.
 
 #### P1.5 — pouso preguiçoso e limitado (D-03 corrigido)
 
@@ -365,7 +366,7 @@ O consenso não autoriza mudança de formato, redução das garantias concorrent
 | 2026-09-03 | P1.1 — D-26 | promovido | origem `perf/v002-d26-commit-metrics@5abfd396`; integrado em `7aa410d` e corrigido em `59020a4` para classificar completion estrangeiro como `other`, não OCC; focado 18/18 pós-integração, Ruff e diff-check verdes |
 | 2026-09-03 | P1.2 — D-01 | promovido | origem `perf/v002-d01-header-peek@1239a0e`; integrado em `b23bcbc` + `07dfb02`; suíte focada de heap e Ruff verdes |
 | 2026-09-03 | P1.3 — D-04 | promovido e limitado por cardinalidade | origem `perf/v002-d04-index-version@e898fe7`; integrado em `2e6bbf9` + `f6e7531` + `873f419` + `bc3ede4`; somente PK automática reutiliza a versão, enquanto endpoint/índice geral preserva leitura lazy e memória limitada; gates focados verdes |
-| 2026-09-03 | P1.4 — D-02 | protótipo cauda-primeiro rejeitado; substituição estrita em implementação | o protótipo ocultou uma duplicata corrupta visível no início da cadeia. A substituição escolhida mantém cursor incremental cabeça→cauda, memo por transação/snapshot/tabela, quota e fallback ao lookup canônico, visando `O(N+E)` sem mudar a superfície fail-closed |
+| 2026-09-03 | P1.4 — D-02 | promovido e endurecido | o protótipo cauda-primeiro foi rejeitado por ocultar duplicata corrupta; `49a9b03` integrou o cursor incremental cabeça→cauda e `e26af74` fechou hard cap/atomicidade/settlement e os dois momentos do reader multiprocesso. `fb984a7` alinhou a documentação da carga conservadora. Isolado 16/16, bateria agrupada 60/60, pós-integração 35/35, probe concorrente, Ruff e diff-check verdes; dentro da quota o custo repetido passa de `O(E*N)` para `O(N+E)`, com fallback canônico honesto quando ela satura |
 | 2026-09-03 | lane vetorial — D-12 | promovido e endurecido | `df09c2e` integrou a contagem cercada; a revisão adversarial recusou deltas identificados apenas por `ref`; `6f6b410` alinhou a identidade a `(key, ref)` sem retirar o update incremental do HNSW e `16fbc0a` tornou falhas do cache derivado conservadoras, nunca falhas pós-barreira. Regressão integrada dos três arquivos afetados verde, Ruff e diff-check verdes; nenhum formato/WAL/protocolo de concorrência mudou |
 | 2026-09-03 | P1.7 — D-09 | promovido e verificado | origem `perf/v002-d09-single-wal-image@765cd07` + `56e7883`; integrado em `c3ef29f` + `69368c3`. Cópia profunda da página local elimina um encode+decode verificado antes da imagem WAL; pré-staged externo preserva verificação integral; retarget reutiliza somente `(txn_id, csn)` exatos. Diferencial byte-idêntico, 6 mutantes mortos, 8/8 focados e 75/75 com commit/WAL vizinhos, Ruff e diff-check verdes. Microbench sintético carregado: p50 `5009→2031 µs/página` (`2,47x` nessa etapa), sem alegar a mesma razão para o commit completo |
 | 2026-09-03 | P0.2 — instrumentos reproduzíveis | concluído; execução pós-drain permanece em P0.3/P0.4 | primitivas integradas em `c276dec`; driver autenticado integrado em `be286fa` + `2d43d75`, com origem imutável `perf/v002-p0-card-driver@e8a6be0`. Cada run usa clone integral descartável, pins separados de Community/Core, rota Grafx autenticada, lifecycle público de exatamente um card, oráculos de ACK/audit, RAW sem hooks e instrumentação bounded/reversível. `warm` é leitura sequencial provada, `mixed` é cache não controlado, `cold` é recusado; budget diferente dos 64 MiB realmente suportados também é recusado. Regressão focada 46/46, Ruff, `py_compile`, diff-check e duas auditorias adversariais PASS; smokes sintéticos RAW/instrumentado passaram, sem acesso ao board vivo e sem comparação inválida entre os dois modos |

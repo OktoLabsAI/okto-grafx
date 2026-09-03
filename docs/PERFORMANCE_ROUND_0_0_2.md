@@ -211,12 +211,16 @@ Status: **integrated on `feature/v0.0.2`**.
 
 The D-02 tail-first endpoint prototype was not retained: with a corrupt visible duplicate near the
 head, it could accept a later row and hide the corruption currently surfaced by the public scan
-order. It remains rejected. P1.4 is instead implementing a transaction-private, budgeted canonical
-prefix locator: it preserves head-to-tail validation and amortizes repeated endpoint checks from
-`O(E*N)` to `O(N+E)` when a transaction shares a snapshot, falling back to the unchanged canonical
-lookup on quota exhaustion. P1.5 follows that port; P1.6 remains conditional. P1.7 is being handled
-as the already-selected, byte-equivalent single-WAL-image change rather than waiting on a release
-performance gate.
+order. Its strict replacement is integrated as `49a9b03` + `e26af74` (with the conservative quota
+comment aligned in `fb984a7`). A transaction/snapshot/table-private canonical-prefix cursor keeps
+head-to-tail order, peeks a whole page before returning a candidate and fully revalidates only the
+requested physical row. Memo, table slot, identity/ref and visited-page proof are admitted under a
+64 MiB/1M-entry per-handle cap; accounting and registry operations share an injected `RLock`, while
+heap I/O stays outside it. Saturation, stale state or a concurrently active cursor uses the
+unchanged canonical lookup; stored-data errors remain fail-closed. This amortizes repeated endpoint
+checks from `O(E*N)` to `O(N+E)` while the working set fits, with the fallback worst case stated
+honestly. The same reader was proved before and after a foreign-process reconciliation without
+crossing its old snapshot. P1.5 follows this internal port; P1.6 remains conditional.
 
 ## Vector lane — exact fenced live cardinality (D-12)
 
@@ -274,7 +278,7 @@ commit/WAL integration batch, Ruff and diff-check passed; no Pulse data was acce
 | 2026-09-03 | P1.1 D-26 integrated | `7aa410d` + `59020a4`; focused commit/metrics/containment/catalog tests and Ruff passed; foreign gap is not charged to OCC |
 | 2026-09-03 | P1.2 D-01 integrated | `b23bcbc` + `07dfb02`; full focused heap suite and Ruff passed |
 | 2026-09-03 | P1.3 D-04 integrated | `2e6bbf9` + `f6e7531` + `873f419` + `bc3ede4`; focused PK/endpoint/visibility suites and Ruff passed; high-cardinality indexes remain lazy |
-| 2026-09-03 | P1.4 D-02 tail-first prototype | rejected because it could mask visible duplicate corruption; strict canonical-prefix replacement in progress |
+| 2026-09-03 | P1.4 D-02 canonical-prefix locator | `49a9b03` + `e26af74` + `fb984a7`; hard-capped per handle, atomic registry/accounting, no heap I/O under its guard, canonical fallback on saturation/stale/busy; isolated 16/16, grouped 60/60, integrated 35/35, multiprocess old-snapshot and adversarial concurrency proofs, Ruff/diff-check passed |
 | 2026-09-03 | P0.2 fail-closed primitives | receipts, authenticated copy and independent-series runner integrated at `c276dec`; 31 focused tests and static checks passed; driver completion is recorded in the next row |
 | 2026-09-03 | P0.2 authenticated Pulse card driver | integrated at `be286fa` + `2d43d75` from `perf/v002-p0-card-driver@e8a6be0`; 46 focused tests and static checks passed; synthetic RAW/instrumented lifecycle smokes passed without touching the live board; P0.3/P0.4 execution remains pending |
 | 2026-09-03 | P0.3 profiler/census tooling | published on `perf/v002-p0-census@222a854`; endpoint locality, dynamic vector activity, guarded py-spy capture and reconciled read-only census implemented; combined milestone regression 98/98 passed; real corpus execution waits for the live backfill to drain |

@@ -19,7 +19,13 @@
   construção de headers rejeitados; D-04 reutiliza a versão validada somente no acerto de PK,
   mantendo índices de alta cardinalidade no modo lazy e limitado. O protótipo D-02 cauda-primeiro
   foi descartado porque poderia ocultar duplicata corrupta; a substituição estrita por prefixo
-  canônico, budgetada e por transação está em implementação. D-12 também foi promovido em
+  canônico entrou em `49a9b03` + `e26af74` e teve o comentário de quota alinhado em `fb984a7`.
+  Ela mantém `HeapStore.lookup` e a ordem pública intactos, amortiza resoluções repetidas para
+  `O(N+E)` enquanto o working set cabe na quota e cai no lookup canônico quando a quota satura.
+  Memo, tabela, identidade, referência e páginas visitadas são cobrados antes da retenção por um
+  teto global por handle; registro e accounting usam `RLock` injetado sem manter o guard durante
+  I/O. O mesmo reader multiprocesso preservou seu snapshot antes da reconciliação e invalidou para
+  fallback canônico depois dela. D-12 também foi promovido em
   `df09c2e` + `6f6b410` + `16fbc0a`: depois da primeira contagem canônica, o planejador vetorial
   reutiliza cardinalidade exata cercada por page 0, invalida em rebase estrangeiro e mantém os
   deltas locais pelo identificador durável `(key, ref)`. Uma revisão adversarial encontrou e
