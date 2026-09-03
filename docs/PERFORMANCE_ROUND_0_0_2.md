@@ -46,8 +46,9 @@ The live Pulse backfill is still consuming CPU in the default data home. P0.3 pr
 same-code baselines are therefore deferred until it drains. The live board must not be opened,
 copied while mutable, or profiled. Read-only operating-system counters remain observational only.
 
-Development of isolated P1 branches may proceed after this freeze, but none may be benchmarked,
-promoted or integrated until P0.1–P0.4 are closed as specified by the governing plan.
+The original order blocked P1 promotion until P0.1–P0.4 closed. The user's later decision removed
+performance gates: P0.3/P0.4 remain post-backfill evidence, while H5 and every quality gate remain
+mandatory before promotion.
 
 ## P0.1 — H5 attach/rebuild diagnosis
 
@@ -157,7 +158,12 @@ by the frozen plan without conflating either with a baseline:
 - `pulse_graph_census_once.py` performs one separate, untimed structural census. It launches the
   hash-pinned census child on another byte-identical clone, authenticates the Grafx binding, opens
   it read-only with `recovery_policy="refuse"`, requires clean positive page and record verification,
-  and independently proves that the clone and serve-lock inventory stayed unchanged.
+  and inventories the clone without wildcard exclusions. Every pre-existing file and all durable
+  graph bytes must remain unchanged. Raw before/after digests, counts and sizes are reported
+  honestly. The only admitted delta is zero with the exact lock already present and empty, or one
+  newly created `<authenticated graph>/control/txn-<8hex>.lock` for the handle's participant
+  section, regular, zero-byte and carrying the SHA-256 of empty content; every other delta fails
+  closed. The independent parent authenticates the persisted board binding before reconciling it.
 - The census walks only private headers with `copy_content=False` and emits aggregates, never record
   IDs, page IDs, references, CSNs or payloads. MVCC “dead” means only “not live under the current
   `HeapVersion.live` predicate”; it does not prove vacuum eligibility. Vector counts are static
@@ -170,6 +176,10 @@ message, any launcher that starts Python as a grandchild (uv trampoline, `py` la
 alias), because the PID/READY/GO proof and the attach would otherwise target the wrong
 process; and endpoint locality is aggregated incrementally per page, so the former 100 000-hit
 cap and its truncation failure no longer exist.
+
+Zero-byte participant locks may accumulate across processes. Cleanup is future control-plane
+hygiene, not a current engine correction, and requires a concurrency-safe ADR plus multiprocess
+proof that reclamation cannot create split-lock behavior.
 
 The milestone regression covered 98 focused instrument tests in one combined run. Ruff,
 `py_compile`, `git diff --check`, command-line contract checks, an isolated real-Grafx census smoke
@@ -346,3 +356,7 @@ commit/WAL integration batch, Ruff and diff-check passed; no Pulse data was acce
 | 2026-09-03 | P0.3 profiler/census hardening | `89cb893`; exact per-page endpoint weights replace the 100k-hit cap, direct-interpreter preflight prevents wrong-PID attach; focused 28/28 and Ruff passed; no Pulse data accessed |
 | 2026-09-03 | Vector D-12 integrated | `df09c2e` + `6f6b410` + `16fbc0a`; exact page-0-fenced count becomes hot `O(1)`, entry identity is `(key, ref)`, local HNSW updates stay incremental, foreign/recovery changes fall back to an exact walk; integrated focused vector/concurrency suite, Ruff and diff-check passed |
 | 2026-09-03 | P1.7 D-09 integrated | `c3ef29f` + `69368c3`; local WAL image is copied/stamped/encoded once, external bytes remain fully verified, retarget cache is attempt-bound; 8 focused + 75 commit/WAL neighboring tests, six mutants, Ruff and diff-check passed |
+| 2026-09-03 | Cold read-only census hardening | `b445736`; v2 receipts retain raw before/after inventory and admit only the exact empty participant lock under the independently authenticated Grafx binding. A disposable real-process proof added one lock with total bytes unchanged (`41,944 -> 41,944`) and clean `verify("all")`; 43/43 focused tests, Ruff lint/format, `py_compile`, diff-check and local/Nexus adversarial reviews passed |
+| 2026-09-03 | Grouped P1 regression closeout | the broad run ended with `9,628 passed, 17 skipped, 1 failed`; the sole failure was a missing docstring on nested callback `count`. Commit `8f0af84` fixed only that documentation and the affected slice passed 66/66. The full suite was not rerun after the behavior-neutral fix |
+| 2026-09-03 | Multiprocess quality gate | 500/500 operations acknowledged in 46.6 s, 510 stored rows including ten contention seeds, 44 retryable conflicts absorbed, zero loss/duplicate/phantom/torn read, and clean live/reopen `verify("all")` |
+| 2026-09-03 | Finite P2 selection | `none`; P2-ID, P2-DIRTY and P2-VAC did not meet their frozen post-P1 evidence triggers, so no structural change was implemented by hypothesis |

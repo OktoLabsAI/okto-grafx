@@ -249,9 +249,19 @@ assintótica: `DETACH DELETE` continua `O(|R| + bytes dos payloads visíveis)`.
 
 #### P1.7 — gerar a imagem WAL uma vez, condicional (D-09 corrigido)
 
-Só implementar se P1.1 mostrar que geração/materialização de imagens é componente material da writer lease. O novo gerador deve ser byte-idêntico ao gerador antigo **antes do flush**, inclusive padding, slots, flags e `page_lsn`; imagens externas pré-staged continuam passando pelo caminho de validação integral.
+A condição original exigia que P1.1 demonstrasse materialidade na writer lease; esse gate temporal
+foi supersedido pela decisão posterior de promover por qualidade e evidência direcional. O novo
+gerador ainda deve ser byte-idêntico ao gerador antigo **antes do flush**, inclusive padding, slots,
+flags e `page_lsn`; imagens externas pré-staged continuam passando pelo caminho de validação
+integral.
 
-Branches de P1.2 e P1.3 podem ser desenvolvidas em paralelo após P0.0, sem usar o worker ou o store vivo. Nenhum resultado P1 pode ser benchmarkado, promovido ou integrado antes de P0.1–P0.4 terminarem e de H5 estar corrigido ou formalmente falsificado. P1.4 depende de P1.2; P1.5 depende da porta de P1.4; P1.6 depende do censo; P1.7 depende de P1.1.
+Branches de P1.2 e P1.3 podem ser desenvolvidas em paralelo após P0.0, sem usar o worker ou o store
+vivo. A ordem original condicionava a promoção a P0.1–P0.4; a decisão explícita posterior de retirar
+os gates de performance a supersedeu, mantendo P0.3/P0.4 como evidência e exigindo os gates de
+qualidade antes da promoção. H5 permaneceu obrigatório e foi fechado. P1.4 depende de P1.2; P1.5
+depende da porta de P1.4. As condições temporais de P1.6 sobre o censo real e de P1.7 sobre a
+materialidade medida por P1.1 também foram supersedidas; seus contratos técnicos e gates de
+qualidade permaneceram integrais.
 
 ### P2 — no máximo uma solução estrutural
 
@@ -265,6 +275,12 @@ Depois de P1, selecionar exatamente uma opção abaixo, ou selecionar “nenhuma
 | **Nenhuma** | nenhum residual superar a faixa de ruído ou as pré-condições não estiverem prontas | registrar o resultado e encerrar a rodada sem inventar nova meta |
 
 D-08 original não é uma opção: com 64 buckets continua `O(N/64)` e sua chave assinada não cobre o domínio de `RecordId`. P2-ID é a substituição tecnicamente válida. Qualquer variante que altere formato/capability ou as premissas de concorrência exige ADR e autorização antes do código.
+
+**Seleção final de P2: nenhuma.** Não existe evidência pós-P1 dos gatilhos congelados: P2-ID não
+demonstrou lookup/landing em pelo menos 25% da parede com baixa localidade; P2-DIRTY não demonstrou
+enumeração material de frames dentro da writer lease; e P2-VAC não possui censo pós-P1 mostrando
+predominância de versões mortas nem suas pré-condições de segurança. Implementar uma opção
+estrutural agora seria trabalhar por hipótese, não por evidência.
 
 ## 7. Política de medição e decisão
 
@@ -293,13 +309,20 @@ Testes focados rodam por item. Suítes longas podem ser acumuladas após P1.2–
 1. testes focados de storage/index/query e regressões novas;
 2. oráculo antigo × novo para resultados, refs, overlays e erros tipados;
 3. corrupção: mesma classe, mensagem e `details` nas superfícies alteradas;
-4. `verify --read-only` frio, com hash/inventário antes e depois idênticos;
+4. `verify --read-only` frio, com todos os arquivos preexistentes e bytes duráveis inalterados; o
+   inventário bruto antes/depois continua publicado e só pode divergir pela criação de exatamente
+   um `<grafo autenticado>/control/txn-<8hex>.lock` correspondente à participant section capturada
+   do próprio handle, arquivo regular de 0 B e SHA-256 vazio — ou por delta zero quando esse lock já
+   existia vazio; qualquer remoção, alteração ou outro acréscimo falha fechado;
 5. recovery e danos de WAL apenas em cópias descartáveis, com arquivos mutáveis declarados;
 6. crash/fault injection e mutantes para D-09, D-10 ou qualquer mudança em recovery;
 7. multiprocesso com writers/readers, zero torn read, duplicata, phantom ou row perdida, e total 500/500 no instrumento atual;
 8. exact-view/stale/rebuild em dois processos para D-02, H5 e P2-ID;
 9. `strict` e `generation` cobertos separadamente;
-10. full suite, lint, type/format checks aplicáveis e `verify` após cold reopen.
+10. full suite, lint, type/format checks aplicáveis e `verify` após cold reopen; neste fechamento, a
+    única falha da corrida ampla foi uma docstring e a composição explícita `9.628/17/1 + 66/66`
+    após a correção neutra substitui uma repetição integral — nenhuma falha comportamental recebe
+    essa exceção;
 
 ## 9. Rastreabilidade das direções D-01..D-37
 
@@ -348,6 +371,9 @@ Os seguintes itens permanecem normativos no `EVOLUTION_PLAN_CODEX.md`, mas não 
 - plan cache — continua hipótese a medir, não ideia refutada;
 - capabilities, temporal, FTS, Arrow, backup/migração e WAL futuro;
 - overhead e escalabilidade da camada agent-first.
+- higiene futura de `control/txn-*.lock`: arquivos vazios podem acumular entre participantes;
+  qualquer coleta exige ADR e provas multiprocesso contra split-lock ou reuso concorrente antes de
+  alterar seu lifecycle.
 
 P2 pode puxar somente o item estrutural vencedor descrito na seção 6. Todo o restante conserva seu proprietário e ordem nos roadmaps existentes.
 
@@ -358,10 +384,15 @@ Cada milestone deve produzir código/testes, atualização de `docs/PERFORMANCE.
 A rodada termina quando:
 
 1. H5 estiver reproduzido e corrigido, ou formalmente falsificado;
-2. P0 e P1 estiverem encerrados com cada item marcado `mantido`, `revertido` ou `não selecionado`;
+2. P0.0–P0.2 e P1 estiverem encerrados com cada item marcado `mantido`, `revertido` ou
+   `não selecionado`; P0.3/P0.4 podem permanecer como evidência pós-backfill, não gate;
 3. no máximo uma opção P2 tiver sido implementada e validada, ou “nenhuma” estiver registrada;
-4. todos os gates de qualidade estiverem verdes;
-5. o relatório before/after publicar performance, RSS, conflitos e write amplification sem misturar `strict`, `generation`, RAW ou instrumentado;
+4. todos os gates de qualidade estiverem verdes, incluindo a composição explicitamente limitada e
+   registrada no item 10 da seção 8;
+5. instrumentos before/after permanecerem versionados e aptos a publicar performance, RSS,
+   conflitos e write amplification sem misturar `strict`, `generation`, RAW ou instrumentado; as
+   execuções reais P0.3/P0.4 podem permanecer evidência pós-backfill e não gate, conforme a decisão
+   explícita posterior registrada na seção 7;
 6. não restar blocker de integridade, recovery ou disponibilidade descoberto pela rodada;
 7. itens deferidos continuarem nos roadmaps proprietários, sem serem promovidos implicitamente para o escopo corrente.
 
@@ -394,8 +425,12 @@ O consenso não autoriza mudança de formato, redução das garantias concorrent
 | 2026-09-03 | lane vetorial — D-12 | promovido e endurecido | `df09c2e` integrou a contagem cercada; a revisão adversarial recusou deltas identificados apenas por `ref`; `6f6b410` alinhou a identidade a `(key, ref)` sem retirar o update incremental do HNSW e `16fbc0a` tornou falhas do cache derivado conservadoras, nunca falhas pós-barreira. Regressão integrada dos três arquivos afetados verde, Ruff e diff-check verdes; nenhum formato/WAL/protocolo de concorrência mudou |
 | 2026-09-03 | P1.7 — D-09 | promovido e verificado | origem `perf/v002-d09-single-wal-image@765cd07` + `56e7883`; integrado em `c3ef29f` + `69368c3`. Cópia profunda da página local elimina um encode+decode verificado antes da imagem WAL; pré-staged externo preserva verificação integral; retarget reutiliza somente `(txn_id, csn)` exatos. Diferencial byte-idêntico, 6 mutantes mortos, 8/8 focados e 75/75 com commit/WAL vizinhos, Ruff e diff-check verdes. Microbench sintético carregado: p50 `5009→2031 µs/página` (`2,47x` nessa etapa), sem alegar a mesma razão para o commit completo |
 | 2026-09-03 | P0.2 — instrumentos reproduzíveis | concluído; execução pós-drain permanece em P0.3/P0.4 | primitivas integradas em `c276dec`; driver autenticado integrado em `be286fa` + `2d43d75`, com origem imutável `perf/v002-p0-card-driver@e8a6be0`. Cada run usa clone integral descartável, pins separados de Community/Core, rota Grafx autenticada, lifecycle público de exatamente um card, oráculos de ACK/audit, RAW sem hooks e instrumentação bounded/reversível. `warm` é leitura sequencial provada, `mixed` é cache não controlado, `cold` é recusado; budget diferente dos 64 MiB realmente suportados também é recusado. Regressão focada 46/46, Ruff, `py_compile`, diff-check e duas auditorias adversariais PASS; smokes sintéticos RAW/instrumentado passaram, sem acesso ao board vivo e sem comparação inválida entre os dois modos |
-| 2026-09-03 | P0.3 — perfil/censo | instrumentos concluídos; execução pós-drain pendente | `perf/v002-p0-census@222a854`: localidade dinâmica de endpoint e atividade vetorial no replay, profiler py-spy one-shot com READY/GO e contadores pré-GO, além de censo agregado read-only com inventário imutável e reconciliação independente. Regressão combinada 98/98, Ruff, `py_compile`, diff-check e smokes sintéticos/isolados verdes; nenhum acesso ao board vivo |
+| 2026-09-03 | P0.3 — perfil/censo | instrumentos concluídos; execução pós-drain pendente | `perf/v002-p0-census@222a854`: localidade dinâmica de endpoint e atividade vetorial no replay, profiler py-spy one-shot com READY/GO e contadores pré-GO, além de censo agregado read-only com inventário integral e reconciliação independente. Regressão combinada 98/98, Ruff, `py_compile`, diff-check e smokes sintéticos/isolados verdes; nenhum acesso ao board vivo |
 | 2026-09-03 | P0.3 — hardening adversarial | promovido | `89cb893` removeu o limite de 100 mil hits por agregação exata `(table_id, page) -> peso` e adicionou preflight que recusa launchers/trampolines antes do attach py-spy; focado 28/28, Ruff, py_compile e diff-check verdes; nenhum dado Pulse acessado |
+| 2026-09-03 | censo read-only frio | corrigido e verificado | `b445736` preserva todo arquivo preexistente e byte durável, admite somente o lock vazio da participant section no caminho exato do binding Grafx autenticado e publica os inventários brutos; schemas elevados a v2. Prova real descartável: um único lock novo, `41.944 -> 41.944` bytes e `verify("all")` limpo; 43/43 focados, Ruff lint/format, `py_compile`, diff-check e auditorias local/Nexus `hof_b0100393646349f095544abdd6137a58` PASS |
+| 2026-09-03 | fechamento agrupado de P1 | concluído por composição explícita | a regressão ampla terminou com `9.628 passed, 17 skipped, 1 failed`; a única falha foi a ausência de docstring no callback aninhado `count`, corrigida sem mudança de comportamento em `8f0af84`; o lote afetado passou 66/66. A suíte completa não foi reexecutada após essa correção documental |
+| 2026-09-03 | gate multiprocesso | concluído | 500/500 operações reconhecidas em 46,6 s, 510 registros incluindo dez seeds de contenção, 44 conflitos retryable absorvidos, zero perda, duplicata, phantom ou torn read e `verify("all")` limpo em live e reopen |
+| 2026-09-03 | seleção finita de P2 | nenhuma | nenhuma das três opções atingiu seu gatilho congelado; a rodada encerra sem mudança estrutural por hipótese |
 
 Esta seção registra fatos concluídos e trabalho explicitamente em andamento. H5 foi fechado. Por
 decisão explícita posterior do usuário, P0.3/P0.4 continuam evidência de engenharia, mas não são
