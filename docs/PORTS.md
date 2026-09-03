@@ -274,6 +274,18 @@ disagrees on any input *before* it becomes the implementation. A provider either
 byte-identical digests or never gets installed — so there is no machine-dependent answer to protect
 against, and accelerating is free.
 
+**The corpus proof runs once per process per provider identity (D-29).** `NativeCrc32c` proves the
+closed-list provider (`google_crc32c`, declared in `[accel]`) against the whole acceptance corpus
+when it is constructed, and `connect()` constructs one per open. That proof is memoized under the
+provider's strong identity -- module name, attribute, the file it was loaded from, its version and
+the exact function object -- so the second open in a process pays nothing for it. Only a
+successful proof is memoized; a refusal is reproduced on the next construction. An injected
+provider and an explicit `verify_runtime=True` are never memoized: they keep the per-construction
+proof and the per-call oracle. The domain's installer door keeps an independent memo of its own:
+the adapter names the same strong identity explicitly, and the door skips its replay only for the
+exact wrapper it already proved -- an injected callable never names an identity, so `install_crc32c`
+and the closed-list door prove it every time, as before.
+
 **One consequence a caller should know:** two databases in one process do not get independent
 checksum implementations. `connect(a, checksum="pure")` followed by `connect(b)` leaves both on
 whatever the second call installed. No digest changes — they are byte-identical by construction —

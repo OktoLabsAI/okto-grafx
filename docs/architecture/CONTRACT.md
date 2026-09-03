@@ -16,7 +16,7 @@ this contract is the single agreed realization of them.
 | G1 | **All product surfaces are en-US**: class names, function names, exception messages, metric names & descriptions, CLI help, docstrings. | Code review + `tests/test_language_surface.py` |
 | G2 | **Hexagonal**: `okto_grafx/domain/**` and `okto_grafx/engine/**` contain NO mechanism. Forbidden: `open()`, `os`, `pathlib` I/O, `mmap`, `socket`, `sys.platform`, `os.name`, `threading`, `time.time`, `time.monotonic`, `random` (unseeded), any third-party import. **D-26 diagnostic exception:** only the exact, unaliased import `okto_grafx.engine.txn_manager <- time.perf_counter_ns` is allowed, solely for outcome-neutral commit timings; it never supplies lease/liveness, storage, WAL or visibility decisions. This avoids invoking the host `Clock` under an exclusive window. | `tests/test_import_boundary.py`, budget **ZERO**, fails closed |
 | G2b | **No `random` in the domain.** Anything needing randomness (HNSW level assignment, sampling) uses `okto_grafx.domain.rand.SplitMix64` — an explicitly seeded, deterministic, reproducible PRNG owned by C1. Reproducibility is a spec requirement (seeded interleavings, seeded corpora), not a preference. | `tests/test_import_boundary.py` |
-| G3 | **Pure-Python core, single universal wheel.** Runtime deps: stdlib only. `numpy` only under extra `[accel]`, imported only in `adapters/vectormath_numpy.py`. `ladybug` only under extra `[bench]`. | `pyproject.toml` + import-boundary test |
+| G3 | **Pure-Python core, single universal wheel.** Runtime deps: stdlib only. `numpy` only under extra `[accel]`, imported only in `adapters/vectormath_numpy.py`. `google-crc32c` only under extra `[accel]`, imported only in `adapters/checksum_native.py`, and admitted only after the acceptance corpus proves it byte-identical to the pure reference (its successful proof is memoized per process under the provider's strong identity, D-29). `ladybug` only under extra `[bench]`. | `pyproject.toml` + import-boundary test |
 | G4 | **Windows and POSIX are equal citizens.** No test may be silently skipped on a family; a family-specific test must be explicitly marked `@pytest.mark.platform_specific` and have a counterpart. **Extended by A32 (runtime observation, not static prediction) and REPLACED in its attribution rule by A54 (three registered markers: `platform_specific` with a family condition + counterpart, `optional_dependency("<module>")`, `pending`/`xfail`).** | `tests/test_platform_parity.py` |
 | G5 | **Fail-closed ports**: an unfilled port slot refuses startup with `GrafxPortNotConfigured`. No silent default, no no-op fallback (except the explicitly selected `NoOpMetricsSink`). | `runtime/registry.py` + tests |
 | G6 | **No sanctioned operation destroys the main data file.** Recovery, quarantine, recycling and purge never move/rename/delete `heap.dat`, `catalog.dat` or `index/*`. | `tests/test_main_file_untouched.py` |
@@ -1814,6 +1814,11 @@ runtime result shape.
   the `VectorMath` port). Its additional presence in `[bench]` satisfies SPEC-M1 TR-9 because the
   harness needs it too, and is a convenience rather than a second home. No contradiction exists in
   `pyproject.toml`; this records which clause is authoritative if they ever diverge.
+  `google-crc32c` shares that home: it is the optional accelerator behind the checksum slot
+  (PORTS.md), imported only in `adapters/checksum_native.py`, proved against the acceptance corpus
+  before it can be installed, and since D-29 that successful proof is memoized per process under
+  the provider's strong identity (module, attribute, origin, version, function object) -- never for
+  an injected callable, never for `verify_runtime=True`, and never after a refusal.
 * **A53 (the battery lock fails CLOSED).** Two hardening rules for the A39-revised lock, after a
   review flagged stale-break logic as the risky part -- correctly, even though the implementation
   refuses while the owner is alive:
@@ -2026,7 +2031,7 @@ runtime result shape.
   never be completed; that is A54's own text, and A54 then rested on one anyway.
   **The argument of `optional_dependency` MUST name a distribution declared in
   `[project.optional-dependencies]` in `pyproject.toml`, and the gate MUST read that table.** Today
-  that set is exactly `{numpy, ladybug}`. A marker naming anything else is a hard failure, whatever
+  that set is exactly `{numpy, google-crc32c, ladybug}`. A marker naming anything else is a hard failure, whatever
   `find_spec` says about it. Absence is then still verified -- a declared dependency that IS
   installed cannot excuse a skip -- but absence is no longer sufficient. The claim becomes checkable
   against a set the author does not control, which is the property the previous three rules lacked.
