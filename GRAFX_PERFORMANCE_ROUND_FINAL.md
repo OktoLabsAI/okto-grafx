@@ -349,5 +349,7 @@ O consenso não autoriza mudança de formato, redução das garantias concorrent
 |---|---|---|---|
 | 2026-09-02 | P0.0 — branch e ambiente da rodada | concluído | `feature/v0.0.2` criada diretamente de `c5ab19d874e59962ba1b66eaa7ab682d1e8b7fac`; ambiente/configuração em `docs/PERFORMANCE_ROUND_0_0_2.md` |
 | 2026-09-02 | versão de desenvolvimento | concluído | `pyproject.toml`, pacote e README em `0.0.2`; testes pontuais de packaging/CLI verdes |
+| 2026-09-03 | P0.1 — H5 e relevância para o Pulse | concluído | reprodução multiprocesso e correção de page 0 promovidas em `7a9414c`, `e8c3583`, `cef70db`; auditoria estática independente do Pulse `d50c034` confirmou que o backfill não chama `rebuild_vector_index` e não alcança a cerca process-local remanescente (`hof_5278e93d6f09409cbce04bbbcbe787f1`, verificada pelo Codex) |
+| 2026-09-03 | P1.1 — D-26 | desenvolvido, não promovido | instrumentação e testes focados publicados em `perf/v002-d26-commit-metrics` / `5abfd396ea352eb4eac9e20902d4ab55f0bc8898`; medição P0.4 e decisão de promoção permanecem pendentes |
 
 Esta seção registra somente fatos concluídos. Resultados P1 não serão promovidos antes do restante de P0 e do fechamento de H5, conforme a seção 6.

@@ -70,6 +70,28 @@ separately and does not change the result below.
 
 Promoted commits: `7a9414c`, `e8c3583`, `cef70db`.
 
+Static review of the pinned Pulse Community tree at
+`d50c03404bd72873b596596f1c4848d56dbcd437` found no production call to
+`rebuild_vector_index` or to the Grafx maintenance facade. Pulse rejects a candidate with stale
+indexes instead of rebuilding one in-process. Therefore the same-handle rebuild fence is not
+reachable from the pinned backfill flow and is not a remaining Pulse P0 blocker. The review used
+source code only, did not access the live data home, and was independently checked before Nexus
+handoff `hof_5278e93d6f09409cbce04bbbcbe787f1` was accepted.
+
+## P1.1 — commit-window instrumentation (D-26)
+
+Status: **developed on an isolated branch; not promoted**.
+
+Branch `perf/v002-d26-commit-metrics`, commit
+`5abfd396ea352eb4eac9e20902d4ab55f0bc8898`, adds closed-cardinality timings for writer-lease and
+commit-section wait/hold windows, timings for the ten internal commit phases, and counters for WAL
+pages/bytes, examined frames, flush calls, foreign commits and retargets. Metric delivery remains
+outside the exclusive sections and uncertain acquisition/release paths suppress the local trace.
+
+Focused commit, containment, catalog and import-boundary tests passed, together with Ruff and
+dashboard JSON validation. Promotion remains deferred until P0.3/P0.4 can run after the live
+backfill drains, as required by the governing plan.
+
 ## Test cadence
 
 - Each implementation gets focused tests for its changed contract and nearby regressions.
@@ -84,3 +106,5 @@ Promoted commits: `7a9414c`, `e8c3583`, `cef70db`.
 |---|---|---|
 | 2026-09-02 | Version bump and branch bootstrap | packaging and CLI version tests passed |
 | 2026-09-03 | P0.1 H5 diagnosis and page-0 repair | 14 isolated multiprocess tests, neighboring index/recovery suites and Ruff passed; no live board accessed |
+| 2026-09-03 | P0.1 Pulse-flow relevance audit | pinned Community source contains no production vector-index rebuild call; H5 same-handle fence is not on the backfill path |
+| 2026-09-03 | P1.1 D-26 isolated implementation | focused commit/metrics/containment/catalog tests and Ruff passed; branch published, promotion pending P0.3/P0.4 |
