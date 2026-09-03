@@ -694,6 +694,7 @@ class VectorHnswIndex(ProximityIndex):
         """
 
         def count(certificate: object) -> tuple[int, Lsn, object]:
+            """Resolve the exact count bound to one validated index certificate."""
             mark = getattr(getattr(certificate, "header", None), "built_through_lsn", None)
             if not isinstance(mark, int):
                 raise GrafxIndexError(
