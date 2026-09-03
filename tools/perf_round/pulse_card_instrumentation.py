@@ -23,6 +23,7 @@ from typing import Any
 MAX_SAMPLES = 100_000
 MAX_STATEMENTS = 100_000
 MAX_DATABASE_OPENS = 64
+MAX_ENDPOINT_HITS = 100_000
 
 _INSTALL_LOCK = threading.Lock()
 _ACTIVE_INSTRUMENTATION: PulseCardInstrumentation | None = None
@@ -90,6 +91,9 @@ class PulseCardInstrumentation:
         self._index_candidates = _BoundedSamples()
         self._query_duration_ns = _BoundedSamples()
         self._commit_duration_ns = _BoundedSamples()
+        self._endpoint_hit_coordinates: list[tuple[int, int]] = []
+        self._endpoint_hit_total = 0
+        self._target_heap: Any | None = None
 
     def __enter__(self) -> PulseCardInstrumentation:
         self.install()
@@ -136,12 +140,112 @@ class PulseCardInstrumentation:
         setattr(owner, name, replacement)
         self._patches.append((owner, name, original, replacement))
 
-    def _lookup_stack(self) -> list[dict[str, int]]:
+    def _lookup_stack(self) -> list[dict[str, Any]]:
         stack = getattr(self._lookup_local, "stack", None)
         if stack is None:
             stack = []
             self._lookup_local.stack = stack
         return stack
+
+    def _endpoint_context_active(self) -> bool:
+        try:
+            return int(getattr(self._lookup_local, "endpoint_depth", 0)) > 0
+        except BaseException:
+            self._mark_observation_failure("endpoint_context")
+            return False
+
+    def _record_endpoint_hit(
+        self, store: Any, table: Any, state: Mapping[str, Any]
+    ) -> None:
+        """Retain a bounded private coordinate for post-workload aggregation.
+
+        Coordinates never enter :meth:`report`.  The P0.3 driver resolves them against
+        ``HeapStore.pages_of`` only after the timed workload and publishes an aggregate
+        distance histogram, never table/page/slot identifiers.
+        """
+
+        try:
+            if self._target_heap is None or store is not self._target_heap:
+                raise ValueError("endpoint hit came from an unbound heap store")
+            table_id = getattr(table, "table_id")
+            page = state.get("hit_page")
+            if (
+                type(table_id) is not int
+                or type(page) is not int
+                or table_id < 0
+                or page < 0
+            ):
+                raise ValueError("invalid endpoint hit coordinate")
+            with self._event_lock:
+                self._endpoint_hit_total += 1
+                if len(self._endpoint_hit_coordinates) < MAX_ENDPOINT_HITS:
+                    self._endpoint_hit_coordinates.append((table_id, page))
+        except BaseException:
+            self._mark_observation_failure("endpoint_hit_coordinate")
+
+    def _endpoint_hit_snapshot(self) -> tuple[tuple[int, int], ...]:
+        """Freeze private coordinates after every hook and workload thread stopped."""
+        self._counter_snapshot()
+        with self._event_lock:
+            return tuple(self._endpoint_hit_coordinates)
+
+    def endpoint_hit_locality(self, database: Any) -> dict[str, Any]:
+        """Resolve actual endpoint hits against post-workload chain order.
+
+        This is deliberately called after :meth:`close`, outside the timed card operation.  It
+        performs the extra ``pages_of`` walks needed to turn private coordinates into a safe
+        aggregate.  A truncated or unreconciled coordinate set is refused rather than presented
+        as evidence for the P1.4 locality threshold.
+        """
+
+        from tools.perf_round.heap_census import summarize_tail_distances
+
+        if self._target_heap is None or database._heap is not self._target_heap:
+            raise InstrumentationError(
+                "endpoint locality was requested for a database other than the observed target"
+            )
+        coordinates = self._endpoint_hit_snapshot()
+        with self._event_lock:
+            total = self._endpoint_hit_total
+        if len(coordinates) != total:
+            raise InstrumentationError(
+                "endpoint hit coordinates were truncated; locality is not exact"
+            )
+
+        counters = self._counter_snapshot()
+        if counters.get("endpoint_lookup_hits", 0) != total:
+            raise InstrumentationError(
+                "endpoint hit coordinates do not reconcile with observed lookup hits"
+            )
+
+        table_weights: dict[int, dict[int, int]] = {}
+        for table_id, page in coordinates:
+            weights = table_weights.setdefault(table_id, {})
+            weights[page] = weights.get(page, 0) + 1
+
+        tables = {
+            int(table.table_id): table for table in database.catalog.catalog.tables()
+        }
+        samples = []
+        for table_id, weights in table_weights.items():
+            table = tables.get(table_id)
+            if table is None:
+                raise InstrumentationError(
+                    "an endpoint hit names a table absent after the workload"
+                )
+            samples.append((database._heap.pages_of(table), weights))
+
+        aggregate = summarize_tail_distances(samples).as_dict()
+        ratio = aggregate["last_10_percent_ratio"]
+        return {
+            "semantics": "actual_endpoint_lookup_hits_to_post_workload_tail_pages",
+            "exact": True,
+            "extra_reads_outside_timed_workload": True,
+            "total": total,
+            "distance_pages": aggregate,
+            "p1_4_last_10_percent_threshold_met": (ratio is not None and ratio >= 0.50),
+            "p1_4_threshold_evaluable": total > 0,
+        }
 
     def install(self) -> None:
         global _ACTIVE_INSTRUMENTATION
@@ -255,6 +359,19 @@ class PulseCardInstrumentation:
             try:
                 for item in original_walk(store, *args, **kwargs):
                     self._bump("heap_walk_yields")
+                    try:
+                        stack = self._lookup_stack()
+                        if (
+                            stack
+                            and stack[-1].get("endpoint") is True
+                            and stack[-1].get("store") is store
+                            and args
+                            and stack[-1].get("table") is args[0]
+                            and "hit_page" not in stack[-1]
+                        ):
+                            stack[-1]["hit_page"] = int(item[0].page)
+                    except BaseException:
+                        self._mark_observation_failure("endpoint_hit_observation")
                     yield item
             except GeneratorExit:
                 raise
@@ -282,14 +399,50 @@ class PulseCardInstrumentation:
 
         self._patch(HeapStore, "scan", scan)
 
+        original_require_endpoints = inspect.getattr_static(
+            HeapStore, "require_endpoints"
+        )
+
+        @functools.wraps(original_require_endpoints)
+        def require_endpoints(store: Any, *args: object, **kwargs: object) -> Any:
+            self._bump("endpoint_validation_calls")
+            context_installed = False
+            previous_depth = 0
+            try:
+                previous_depth = int(getattr(self._lookup_local, "endpoint_depth", 0))
+                self._lookup_local.endpoint_depth = previous_depth + 1
+                context_installed = True
+            except BaseException:
+                self._mark_observation_failure("endpoint_context")
+            try:
+                result = original_require_endpoints(store, *args, **kwargs)
+            except BaseException:
+                self._bump("endpoint_validation_failed")
+                raise
+            finally:
+                if context_installed:
+                    try:
+                        self._lookup_local.endpoint_depth = previous_depth
+                    except BaseException:
+                        self._mark_observation_failure("endpoint_context")
+            self._bump("endpoint_validation_succeeded")
+            return result
+
+        self._patch(HeapStore, "require_endpoints", require_endpoints)
+
         original_lookup = inspect.getattr_static(HeapStore, "lookup")
 
         @functools.wraps(original_lookup)
         def lookup(store: Any, table: Any, record_id: int, snapshot: Any) -> Any:
-            state: dict[str, int] | None = None
-            stack: list[dict[str, int]] | None = None
+            state: dict[str, Any] | None = None
+            stack: list[dict[str, Any]] | None = None
             try:
-                state = {"headers": 0}
+                state = {
+                    "headers": 0,
+                    "endpoint": self._endpoint_context_active(),
+                    "store": store,
+                    "table": table,
+                }
                 stack = self._lookup_stack()
                 stack.append(state)
             except BaseException:
@@ -297,10 +450,14 @@ class PulseCardInstrumentation:
                 stack = None
                 self._mark_observation_failure("lookup_stack")
             self._bump("heap_lookup_calls")
+            if state is not None and state.get("endpoint") is True:
+                self._bump("endpoint_lookup_calls")
             try:
                 result = original_lookup(store, table, record_id, snapshot)
             except BaseException:
                 self._bump("heap_lookup_failed")
+                if state is not None and state.get("endpoint") is True:
+                    self._bump("endpoint_lookup_failed")
                 raise
             finally:
                 if stack is not None and state is not None:
@@ -316,6 +473,12 @@ class PulseCardInstrumentation:
             self._bump(
                 "heap_lookup_hits" if result is not None else "heap_lookup_misses"
             )
+            if state is not None and state.get("endpoint") is True:
+                if result is None:
+                    self._bump("endpoint_lookup_misses")
+                else:
+                    self._bump("endpoint_lookup_hits")
+                    self._record_endpoint_hit(store, table, state)
             return result
 
         self._patch(HeapStore, "lookup", lookup)
@@ -451,6 +614,12 @@ class PulseCardInstrumentation:
         try:
             observation = self._database_observation(database)
             with self._event_lock:
+                heap = database._heap
+                if self._target_heap is not None and self._target_heap is not heap:
+                    raise InstrumentationError(
+                        "more than one target heap was bound to the instrumentation"
+                    )
+                self._target_heap = heap
                 self._baseline_handle_total += 1
                 if len(self._baseline_handles) < MAX_DATABASE_OPENS:
                     self._baseline_handles.append(observation)
@@ -558,6 +727,13 @@ class PulseCardInstrumentation:
                 "baseline_handle_total": self._baseline_handle_total,
                 "baseline_handles_truncated": self._baseline_handle_total
                 > len(self._baseline_handles),
+                "endpoint_hit_coordinates": {
+                    "total": self._endpoint_hit_total,
+                    "retained": len(self._endpoint_hit_coordinates),
+                    "truncated": self._endpoint_hit_total
+                    > len(self._endpoint_hit_coordinates),
+                    "serialized": False,
+                },
                 "lookup_headers_examined": self._lookup_headers.report(),
                 "index_candidates_returned": self._index_candidates.report(),
                 "query_duration_ns": self._query_duration_ns.report(),

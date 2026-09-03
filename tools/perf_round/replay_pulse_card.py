@@ -347,13 +347,13 @@ def _warm_graph_files(root: Path) -> dict[str, Any]:
             try:
                 resolved.relative_to(root.resolve())
             except ValueError as failure:
-                raise DriverRefused("the graph warmup path escapes its root") from failure
+                raise DriverRefused(
+                    "the graph warmup path escapes its root"
+                ) from failure
             info = os.lstat(candidate)
-            if (
-                getattr(info, "st_file_attributes", 0)
-                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-                or not stat.S_ISREG(info.st_mode)
-            ):
+            if getattr(info, "st_file_attributes", 0) & getattr(
+                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0
+            ) or not stat.S_ISREG(info.st_mode):
                 raise DriverRefused("the graph warmup tree contains an alias")
             observed = 0
             with candidate.open("rb", buffering=0) as handle:
@@ -364,9 +364,11 @@ def _warm_graph_files(root: Path) -> dict[str, Any]:
             files_read += 1
             bytes_read += observed
     after = _tree_size(root)
-    if after != before or files_read != before["file_count"] or bytes_read != before[
-        "total_bytes"
-    ]:
+    if (
+        after != before
+        or files_read != before["file_count"]
+        or bytes_read != before["total_bytes"]
+    ):
         raise DriverRefused("the graph tree changed while warming the cache")
     return {
         "strategy": "sequential_read_active_graph_before_open",
@@ -413,7 +415,9 @@ def _validate_runner_parent() -> None:
     try:
         expected_parent = int(raw) if raw is not None else -1
     except ValueError as failure:
-        raise DriverRefused("the performance runner parent marker is invalid") from failure
+        raise DriverRefused(
+            "the performance runner parent marker is invalid"
+        ) from failure
     if expected_parent <= 0 or expected_parent != os.getppid():
         raise DriverRefused(
             "this child must be launched directly by tools/perf_round/baseline_runs.py"
@@ -886,13 +890,13 @@ async def _run(
             )
             if instrument_report.get("instrumentation_complete") is not True:
                 raise DriverRefused("the instrumentation sample is incomplete")
-            if instrumentation is not None and instrument_report.get(
-                "baseline_handle_total"
-            ) != 1:
+            if (
+                instrumentation is not None
+                and instrument_report.get("baseline_handle_total") != 1
+            ):
                 raise DriverRefused(
                     "the instrument did not observe exactly one pre-existing pooled handle"
                 )
-
             route_after = bundle.resolver.revalidate_snapshot(
                 route_before,
                 require_physical=True,
@@ -905,6 +909,19 @@ async def _run(
                 page_size=args.page_size,
                 buffer_budget_bytes=args.buffer_budget_bytes,
                 mode=args.mode,
+            )
+            endpoint_lookup_locality = (
+                instrumentation.endpoint_hit_locality(database)
+                if instrumentation is not None
+                else {
+                    "semantics": "not_collected_in_raw_run",
+                    "exact": False,
+                    "extra_reads_outside_timed_workload": False,
+                    "total": 0,
+                    "distance_pages": None,
+                    "p1_4_last_10_percent_threshold_met": False,
+                    "p1_4_threshold_evaluable": False,
+                }
             )
 
         queue_after, audit_after = await _verify_relational_after(
@@ -962,6 +979,7 @@ async def _run(
             "engine": {"before": engine_before, "after": engine_after},
             "wal_tree": {"before": wal_tree_before, "after": wal_tree_after},
             "instrumentation": instrument_report,
+            "endpoint_lookup_locality": endpoint_lookup_locality,
         }
     finally:
         await _close_runtime(

@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
+from okto_grafx.errors import GrafxConfigurationError
 from okto_grafx.domain.model.record import RecordHeader
 from okto_grafx.engine import heap_store
 from okto_grafx.engine.buffer_pool import BufferPool
@@ -50,6 +51,9 @@ def _descriptors() -> dict[str, object]:
         "heap_walk": inspect.getattr_static(HeapStore, "_walk"),
         "heap_read": inspect.getattr_static(HeapStore, "read"),
         "heap_scan": inspect.getattr_static(HeapStore, "scan"),
+        "heap_require_endpoints": inspect.getattr_static(
+            HeapStore, "require_endpoints"
+        ),
         "heap_lookup": inspect.getattr_static(HeapStore, "lookup"),
         "index_lookup": inspect.getattr_static(IndexManager, "lookup"),
         "query_execute": inspect.getattr_static(QueryEngine, "execute"),
@@ -109,6 +113,135 @@ def test_nested_instrumentation_is_refused_and_first_instance_restores() -> None
     finally:
         first.close()
     assert _descriptors() == before
+
+
+def test_instrumentation_counts_actual_endpoint_lookups_without_serializing_refs() -> (
+    None
+):
+    probe = PulseCardInstrumentation()
+    secret = "endpoint-value-must-not-leak"
+    with okto_grafx.connect(":memory:") as database:
+        with database.begin("write") as transaction:
+            transaction.execute(
+                "CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))"
+            )
+            transaction.execute(
+                "CREATE REL TABLE Knows(FROM Person TO Person, note STRING)"
+            )
+            transaction.execute(
+                f"CREATE (:Person {{id: 1, name: '{secret}'}}), "
+                "(:Person {id: 2, name: 'other'})"
+            )
+
+        probe.observe_database(database)
+        probe.install()
+        try:
+            with database.begin("write") as transaction:
+                transaction.execute(
+                    "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
+                    "CREATE (a)-[:Knows {note: 'observed'}]->(b)"
+                )
+        finally:
+            probe.close()
+
+        locality = probe.endpoint_hit_locality(database)
+
+    report = probe.report()
+    assert report["counters"]["endpoint_validation_calls"] == 1
+    assert report["counters"]["endpoint_lookup_calls"] == 2
+    assert report["counters"]["endpoint_lookup_hits"] == 2
+    assert report["endpoint_hit_coordinates"] == {
+        "total": 2,
+        "retained": 2,
+        "truncated": False,
+        "serialized": False,
+    }
+    assert locality == {
+        "semantics": "actual_endpoint_lookup_hits_to_post_workload_tail_pages",
+        "exact": True,
+        "extra_reads_outside_timed_workload": True,
+        "total": 2,
+        "distance_pages": {
+            "total": 2,
+            "min": 0,
+            "p50": 0,
+            "p90": 0,
+            "p99": 0,
+            "max": 0,
+            "last_10_percent": 2,
+            "last_10_percent_ratio": 1.0,
+        },
+        "p1_4_last_10_percent_threshold_met": True,
+        "p1_4_threshold_evaluable": True,
+    }
+    rendered = json.dumps(report, sort_keys=True)
+    assert secret not in rendered
+    assert "table_id" not in rendered
+    assert "page_id" not in rendered
+
+
+def test_failed_endpoint_validation_restores_context_and_preserves_error() -> None:
+    probe = PulseCardInstrumentation()
+    with okto_grafx.connect(":memory:") as database:
+        with database.begin("write") as transaction:
+            transaction.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
+            transaction.execute("CREATE REL TABLE Knows(FROM Person TO Person)")
+            transaction.execute("CREATE (:Person {id: 1})")
+        person = database.catalog.catalog.table("Person")
+        knows = database.catalog.catalog.table("Knows")
+        with database.begin("read") as transaction:
+            probe.observe_database(database)
+            probe.install()
+            try:
+                with pytest.raises(GrafxConfigurationError) as raised:
+                    database._heap.require_endpoints(
+                        knows, (99, 100), transaction.snapshot
+                    )
+                assert raised.value.code == "configuration_error"
+                assert getattr(probe._lookup_local, "endpoint_depth", 0) == 0
+                assert (
+                    database._heap.lookup(person, 1, transaction.snapshot) is not None
+                )
+            finally:
+                probe.close()
+
+    report = probe.report()
+    assert report["instrumentation_complete"] is True
+    assert report["counters"]["endpoint_validation_failed"] == 1
+    assert report["counters"]["endpoint_lookup_calls"] == 1
+    assert report["counters"]["endpoint_lookup_misses"] == 1
+    assert report["counters"]["heap_lookup_calls"] == 2
+
+
+def test_endpoint_hit_from_an_unbound_database_invalidates_the_sample() -> None:
+    probe = PulseCardInstrumentation()
+    with (
+        okto_grafx.connect(":memory:") as target,
+        okto_grafx.connect(":memory:") as foreign,
+    ):
+        for database in (target, foreign):
+            with database.begin("write") as transaction:
+                transaction.execute(
+                    "CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))"
+                )
+                transaction.execute("CREATE REL TABLE Knows(FROM Person TO Person)")
+                transaction.execute("CREATE (:Person {id: 1}), (:Person {id: 2})")
+
+        probe.observe_database(target)
+        probe.install()
+        try:
+            with foreign.begin("write") as transaction:
+                transaction.execute(
+                    "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
+                    "CREATE (a)-[:Knows]->(b)"
+                )
+        finally:
+            probe.close()
+
+    report = probe.report()
+    assert report["instrumentation_complete"] is False
+    assert report["observation_failures"] == {"endpoint_hit_coordinate": 2}
+    assert report["endpoint_hit_coordinates"]["total"] == 0
 
 
 def test_preexisting_handle_is_not_reported_as_a_database_open() -> None:
