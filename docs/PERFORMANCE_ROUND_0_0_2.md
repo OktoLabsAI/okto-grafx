@@ -232,6 +232,25 @@ proved that `ref` alone is not an index-entry identity. The promoted sequence is
 can never fail an already durable commit. The incremental HNSW update remains intact, so the change
 does not trade the removed count walk for an `O(N)` rebuild after each local write.
 
+## P1.7 — single WAL image per materialised page (D-09)
+
+Status: **implemented on `perf/v002-d09-single-wal-image`; not benchmarked; not promoted**.
+
+- A page this process materialised is now logged from an independent copy of its resident
+  frame (`Page.copy()`), stamped with the predicted commit number and encoded once, instead of
+  encode → decode(verify) → encode. The frame stays provisional until the WAL barrier returns.
+- A page a collaborator pre-staged as bytes keeps the full `decode_page(verify=True)` before
+  anything is stamped; a corrupt pre-staged image is still refused before the log is touched.
+- A WAL segment roll re-stamps and re-encodes the already validated page values; it no longer
+  decodes the logged bytes again. `apply_page_image` is untouched and still decodes with
+  verification after the barrier (A22).
+- The new generator is proved byte-identical to the old one, before the flush, over a page
+  corpus with free and relocated slots, compaction, flags, reserved word, `next_page`, page LSN,
+  sequence, overflow/index page types and both page sizes; mutants that drop a copied field or
+  share the payload buffer are caught. Gain is measured only by the synthetic microbench
+  (`tools/perf_round/microbench_wal_image.py`, `[MEDIDO-micro]`); the hold fraction stays
+  `A_MEDIR` under the D-26 instrumentation.
+
 ## Test cadence
 
 - Each implementation gets focused tests for its changed contract and nearby regressions.

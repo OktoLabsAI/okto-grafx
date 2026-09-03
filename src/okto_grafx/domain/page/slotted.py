@@ -435,6 +435,30 @@ class Page:
         self._free_start = other._free_start
         self._dirty = True
 
+    def copy(self) -> Page:
+        """Return an independent page value carrying every field this page holds.
+
+        The commit path stamps the predicted commit number into a copy of the resident frame
+        and encodes that copy once; the frame itself must stay provisional until the WAL
+        barrier returns, so nothing may be shared: the slot directory and the payload buffer
+        are duplicated, and the identity, header fields and reserved word are carried whole.
+        ``to_bytes`` of the copy is byte-identical to ``to_bytes`` of the original.
+        """
+        clone = Page.__new__(Page)
+        clone._page_size = self._page_size
+        clone._page_index = self._page_index
+        clone._page_type = self._page_type
+        clone._flags = self._flags
+        clone._page_lsn = self._page_lsn
+        clone._seq = self._seq
+        clone._next_page = self._next_page
+        clone._reserved = self._reserved
+        clone._slots = list(self._slots)
+        clone._data = bytearray(self._data)
+        clone._free_start = self._free_start
+        clone._dirty = False
+        return clone
+
     # --- serialisation --------------------------------------------------------------------
 
     def to_bytes(self) -> bytes:
