@@ -31,7 +31,8 @@ Não entram nesta rodada codecs nativos, mudança de formato, FTS, Arrow, compre
 
 - Base pública analisada pelo FABLE: Grafx `origin/main@ead05a4cfad5f5ca60c8677b330cc16bb6824b9b`.
 - Base funcional usada no run real do Pulse: Grafx `c5ab19d`, que contém `ead05a4` + `58e2e7d` (admissão limitada dos valores documentais do Pulse) + documentação.
-- Contraparte Pulse do run: `d50c03404bd72873b596596f1c4848d56dbcd437`.
+- Contraparte Pulse Community do run: `d50c03404bd72873b596596f1c4848d56dbcd437`.
+- Contraparte Pulse Core do run: `f602c7cc2f6a9f5ef446d4c991309196bd4667c7`.
 - O checkout primário atual `perf/a-index-freshness@4c474b5` está 96 commits atrás de `origin/main` e **não pode ser usado como base de implementação ou benchmark**.
 
 A branch da rodada deve nascer do commit que promover `c5ab19d` para a linha canônica. Até essa promoção, `c5ab19d` é a base provisória exata. Rebase, merge ou avanço de `main` exige registrar um novo SHA e repetir somente o baseline afetado; nenhuma base pode mudar silenciosamente durante a rodada.

@@ -13,7 +13,8 @@ Status: **complete**.
 | Grafx public ancestor | `ead05a4cfad5f5ca60c8677b330cc16bb6824b9b` |
 | Working branch | `feature/v0.0.2` |
 | First round commit | `7f2a692` |
-| Pulse counterpart | `d50c03404bd72873b596596f1c4848d56dbcd437` |
+| Pulse Community counterpart | `d50c03404bd72873b596596f1c4848d56dbcd437` |
+| Pulse Core counterpart | `f602c7cc2f6a9f5ef446d4c991309196bd4667c7` |
 | Python | CPython 3.13.1, 64-bit |
 | Operating system | Windows 11 `10.0.26200`, build `26200` |
 | Filesystem | NTFS on drive `D:` |
@@ -129,6 +130,12 @@ census; P0.4 still owns the independent same-code series.
 
 Status: **tooling complete and published; execution on the Pulse corpus remains pending until the
 live backfill drains**.
+
+The clean local source roots selected for the eventual run are
+`D:\Projetos\Techridy\okto-pulse-perf-st2` (Community `d50c034`) and
+`D:\Projetos\Techridy\okto-pulse-core-corpus-baseline` (Core `f602c7c`, version 0.3.3).
+The runners re-check both SHAs, package origins and source-subtree cleanliness before every run;
+these recorded paths are not a substitute for that admission check.
 
 Branch `perf/v002-p0-census`, through commit `222a854`, adds the two distinct observations required
 by the frozen plan without conflating either with a baseline:
