@@ -22,11 +22,13 @@ cannot repair.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import okto_grafx
 import okto_grafx.engine.index_manager as index_manager_module
+import okto_grafx.engine.query_engine as query_engine_module
 from okto_grafx.domain.errors import GrafxQueryError
 from okto_grafx.domain.query.plan import IndexSeek, NodeScan
 from okto_grafx.engine.heap_store import HeapStore
@@ -184,6 +186,32 @@ def test_an_exact_seek_reuses_the_heap_version_validated_by_the_index(
         ("ada",),
     )
     assert len(reads) == 1
+
+
+@pytest.mark.parametrize("exact", (False, True), ids=("proximity", "lookup-only-exact"))
+def test_index_version_fallback_reads_hits_lazily(exact: bool) -> None:
+    """A LIMIT may stop before a later fallback hit, preserving its corruption surface."""
+    reads: list[str] = []
+
+    class LookupOnlyManager:
+        def lookup(self, name: str, key: bytes, snapshot: object) -> tuple[str, ...]:
+            del name, key, snapshot
+            return ("first", "second", "corrupt-third")
+
+    def read(ref: str) -> str:
+        reads.append(ref)
+        if ref == "corrupt-third":
+            raise AssertionError("a bounded consumer must not read the third hit")
+        return f"version-{ref}"
+
+    engine = SimpleNamespace(heap=SimpleNamespace(read=read))
+    hits = query_engine_module._index_lookup_versions(
+        engine, LookupOnlyManager(), "idx", b"key", object(), exact=exact
+    )
+
+    assert reads == [], "constructing the fallback must not touch the heap"
+    assert next(hits) == ("first", "version-first")
+    assert reads == ["first"]
 
 
 def test_a_deleted_row_is_not_returned_by_a_seek(database) -> None:
