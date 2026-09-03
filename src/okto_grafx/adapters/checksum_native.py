@@ -28,6 +28,19 @@ universally available:
 * ``crc32c`` -- ``crc32c(data, value)``, same convention with the arguments the other way round.
 
 Both are adapted to ``(data, crc) -> int`` here, which is the only signature the domain knows.
+
+**The corpus proof of a closed-list provider is memoized per process (D-29).** Every
+``connect()`` builds a fresh :class:`NativeCrc32c`, and proving the whole corpus against the
+pure reference costs tens of milliseconds each time -- paid for the same ``google_crc32c``
+function object over and over. The memo is keyed on the provider's STRONG identity (module
+name, attribute, the file the module was loaded from, the version it reports and the exact
+function object), never on the adapted callable, which ``load_provider`` creates anew per
+call. Only a successful proof enters; a refusal leaves nothing behind. An injected provider
+and an explicit ``verify_runtime=True`` keep their per-construction and per-call semantics
+untouched. The domain's installer door keeps its own, independent proof: the adapter hands it
+the same strong identity explicitly, and it too skips the replay only for the exact wrapper
+it already proved -- so a second ``connect()`` over the same provider costs no corpus in
+either door, while a replaced function, an injected callable or a refusal proves again.
 """
 
 from __future__ import annotations
@@ -52,6 +65,7 @@ __all__ = [
     "CRC32C_PROVIDERS",
     "NativeCrc32c",
     "load_provider",
+    "validated_closed_providers",
 ]
 
 NATIVE_ADAPTER_NAME: str = "native"
@@ -77,6 +91,11 @@ def _builtin_type_name(value: object) -> str:
     return str.__str__(declared)
 
 
+def _crc_first(module_name: str) -> bool:
+    """Return whether this provider takes the running CRC before the data."""
+    return module_name == "google_crc32c"
+
+
 def _adapt(
     module_name: str, attribute: str, provider: object
 ) -> Callable[[bytes, int], int]:
@@ -91,9 +110,102 @@ def _adapt(
         raise ImportError(
             f"{module_name}.{attribute} is not callable, so it cannot compute a checksum."
         )
-    if module_name == "google_crc32c":
+    if _crc_first(module_name):
         return lambda data, crc=CRC32C_INITIAL: provider(crc, data)
     return lambda data, crc=CRC32C_INITIAL: provider(data, crc)
+
+
+def _closed_provider_identity(
+    module_name: str, attribute: str, module: object, function: object
+) -> tuple[str, str, str | None, str | None, object]:
+    """Return the strong identity the corpus memo is keyed on.
+
+    The function OBJECT is part of the key and is held strongly by the memo, so its id can
+    never be recycled onto something else while the entry lives. The module origin and
+    version separate two builds that expose an equally named function. Anything that is not
+    a plain string is recorded as absent rather than guessed at.
+    """
+    spec = getattr(module, "__spec__", None)
+    origin = getattr(spec, "origin", None)
+    version = getattr(module, "__version__", None)
+    return (
+        module_name,
+        attribute,
+        origin if type(origin) is str else None,
+        version if type(version) is str else None,
+        function,
+    )
+
+
+class _ClosedProvider:
+    """A closed-list provider adapted to ``(data, crc) -> int`` that knows its identity.
+
+    ``load_provider`` used to hand back a bare lambda, a new object on every call, so nothing
+    about it could key a memo. This carries the strong identity of the underlying function
+    alongside the same call semantics; an injected callable never gets one, which is exactly
+    what keeps injected providers on the per-construction, per-call path.
+    """
+
+    __slots__ = ("_crc_first", "_function", "identity", "module_name")
+
+    def __init__(
+        self, module_name: str, attribute: str, module: object, function: object
+    ) -> None:
+        if not callable(function):
+            raise ImportError(
+                f"{module_name}.{attribute} is not callable, so it cannot compute a checksum."
+            )
+        self.module_name: str = module_name
+        self._function: Callable[..., object] = function
+        self._crc_first: bool = _crc_first(module_name)
+        self.identity = _closed_provider_identity(
+            module_name, attribute, module, function
+        )
+
+    def __call__(self, data: bytes, crc: int = CRC32C_INITIAL) -> object:
+        if self._crc_first:
+            return self._function(crc, data)
+        return self._function(data, crc)
+
+    def __repr__(self) -> str:
+        return f"_ClosedProvider(module_name={self.module_name!r})"
+
+
+_closed_providers: dict[
+    tuple[str, str, str | None, str | None, object], _ClosedProvider
+] = {}
+"""One adapted wrapper per strong identity, so the same provider is the same object.
+
+``load_provider`` hands the cached wrapper back while module, attribute, origin, version and
+the raw function object are all unchanged; any of them changing yields a new wrapper. The
+domain door memoizes by identity AND by the exact callable it proved, so this cache is what
+lets a second ``connect()`` skip the corpus there as well. Bounded like the memo below.
+"""
+
+_validated_closed_providers: dict[
+    tuple[str, str, str | None, str | None, object], str
+] = {}
+"""Closed-list provider identities this process has already proved against the corpus.
+
+Only a SUCCESSFUL proof is recorded, only for a provider ``load_provider`` resolved (never an
+injected callable) and only when runtime verification resolved off. A refusal records
+nothing, so the next construction proves again. The dictionary is bounded by the closed
+provider list times the distinct builds one process can load, which is a handful.
+"""
+
+
+def validated_closed_providers() -> tuple[str, ...]:
+    """Return the closed-list providers this process has memoized, in first-proved order."""
+    return tuple(dict.fromkeys(_validated_closed_providers.values()))
+
+
+def _forget_validated_closed_providers() -> None:
+    """Drop every memoized proof and cached wrapper so the corpus is replayed (tests)."""
+    from okto_grafx.domain.page.checksum import _forget_closed_proofs
+
+    _validated_closed_providers.clear()
+    _closed_providers.clear()
+    _forget_closed_proofs()
 
 
 def load_provider() -> tuple[str, Callable[[bytes, int], int]]:
@@ -110,7 +222,12 @@ def load_provider() -> tuple[str, Callable[[bytes, int], int]]:
         function = getattr(module, attribute, None)
         if function is None:
             continue
-        return module_name, _adapt(module_name, attribute, function)
+        identity = _closed_provider_identity(module_name, attribute, module, function)
+        cached = _closed_providers.get(identity)
+        if cached is None:
+            cached = _ClosedProvider(module_name, attribute, module, function)
+            _closed_providers[identity] = cached
+        return module_name, cached
     wanted = ", ".join(name for name, _attribute in CRC32C_PROVIDERS)
     raise ImportError(
         f"No native CRC-32C provider is installed. Install the [accel] extra, which brings one "
@@ -121,7 +238,7 @@ def load_provider() -> tuple[str, Callable[[bytes, int], int]]:
 class NativeCrc32c:
     """A native CRC-32C, proved byte-identical to the pure reference before it is usable."""
 
-    __slots__ = ("_provider", "_provider_name", "_verify_runtime")
+    __slots__ = ("_memo_identity", "_provider", "_provider_name", "_verify_runtime")
 
     def __init__(
         self,
@@ -144,6 +261,11 @@ class NativeCrc32c:
         extension it trusts in-process, or ``True`` to put even a closed-list package behind the
         per-call oracle; the latter trades away acceleration deliberately.
 
+        The corpus proof of a closed-list provider is memoized per process under the provider's
+        strong identity (D-29): a second construction over the very same function object skips
+        the replay, a refusal never enters the memo, and neither an injected provider nor an
+        explicit ``verify_runtime=True`` ever reads it.
+
         The check runs HERE as well as inside :func:`install_crc32c`, and that is not redundant
         defence: this one makes a wrong provider fail where it is CONSTRUCTED, naming the
         provider, while the installer's protects the domain from any candidate at all, including
@@ -160,8 +282,11 @@ class NativeCrc32c:
         verify_answers = (
             provider is not None if verify_runtime is None else verify_runtime
         )
+        identity: tuple[str, str, str | None, str | None, object] | None = None
         if provider is None:
             resolved_name, resolved = load_provider()
+            if isinstance(resolved, _ClosedProvider):
+                identity = resolved.identity
         else:
             if not callable(provider):
                 observed = _builtin_type_name(provider)
@@ -190,7 +315,15 @@ class NativeCrc32c:
         self._provider: Callable[[bytes, int], int] = resolved
         self._provider_name: str = resolved_name
         self._verify_runtime: bool = verify_answers
+        memo_key = identity if not verify_answers else None
+        self._memo_identity = memo_key
+        if memo_key is not None and memo_key in _validated_closed_providers:
+            # Proved earlier in this process over this exact function object; the corpus
+            # answer cannot have changed underneath the same identity.
+            return
         self._require_agreement()
+        if memo_key is not None:
+            _validated_closed_providers[memo_key] = resolved_name
 
     def _raw_answer(self, data: bytes, crc: int) -> int:
         """Call the provider and return an exact bounded checksum or a typed refusal."""
@@ -292,10 +425,16 @@ class NativeCrc32c:
 
         The full acceptance corpus runs inside :func:`install_crc32c`. It is the last thing that
         happens before any real page is checksummed by this provider, and a provider that fails
-        it anywhere is not installed at all.
+        it anywhere is not installed at all. For a closed-list provider on the default path the
+        strong identity travels with the callable, and the door skips the replay only when this
+        exact wrapper already passed under it (D-29); an injected provider never carries one.
         """
         if not self._verify_runtime:
-            return _install_validated_crc32c(self._provider, name=NATIVE_ADAPTER_NAME)
+            return _install_validated_crc32c(
+                self._provider,
+                name=NATIVE_ADAPTER_NAME,
+                memo_identity=self._memo_identity,
+            )
         return install_crc32c(self._provider, name=NATIVE_ADAPTER_NAME)
 
     def __repr__(self) -> str:

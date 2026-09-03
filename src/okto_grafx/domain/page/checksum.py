@@ -434,14 +434,63 @@ def install_crc32c(function: Callable[[bytes, int], int], *, name: str) -> str:
     )
 
 
+_validated_closed_identities: tuple[
+    tuple[object, Callable[[bytes, int], int]], ...
+] = ()
+"""Closed-list provider identities this door has proved, paired with the exact callable proved.
+
+The identity is the strong one the native adapter hands over explicitly (module, attribute,
+origin, version and the raw function object); the callable is the one that passed, so a
+different object under the same identity is proved again rather than trusted. Only a
+successful proof enters, and only when the caller names an identity, which the adapter does
+for its closed list alone -- never for an injected provider, whatever its runtime setting.
+Published by rebinding an immutable tuple, like the implementation slot below, so no shared
+container is ever mutated in place.
+"""
+
+
+def _proved_closed_callable(
+    memo_identity: object,
+) -> Callable[[bytes, int], int] | None:
+    """Return the callable already proved under this identity, or None."""
+    for identity, function in _validated_closed_identities:
+        if identity == memo_identity:
+            return function
+    return None
+
+
+def _remember_closed_proof(
+    memo_identity: object, function: Callable[[bytes, int], int]
+) -> None:
+    """Publish one successful proof, replacing any earlier entry for the same identity."""
+    global _validated_closed_identities
+    kept = tuple(
+        pair for pair in _validated_closed_identities if pair[0] != memo_identity
+    )
+    _validated_closed_identities = kept + ((memo_identity, function),)
+
+
+def _forget_closed_proofs() -> None:
+    """Drop every memoized proof so the door replays the corpus (tests)."""
+    global _validated_closed_identities
+    _validated_closed_identities = ()
+
+
 def _install_validated_crc32c(
-    function: Callable[[bytes, int], int], *, name: str
+    function: Callable[[bytes, int], int],
+    *,
+    name: str,
+    memo_identity: object = None,
 ) -> str:
     """Install a corpus-validated callable from the native adapter's closed provider list.
 
     This private door exists so ``checksum='native'`` remains an honest acceleration. It is not
     used for injected providers: :class:`NativeCrc32c` routes those through
     :func:`install_crc32c`, whose runtime oracle makes arbitrary callables fail closed.
+
+    ``memo_identity`` is the explicit permission to memoize (D-29): when the adapter names the
+    strong identity of a closed-list provider and this exact callable already passed under it,
+    the corpus is not replayed. Without it the door proves every time, as it always did.
     """
     if not callable(function):
         observed = _builtin_type_name(function)
@@ -464,7 +513,19 @@ def _install_validated_crc32c(
             field="name",
             value="",
         )
-    _validate_candidate(function, plain_name)
+    if memo_identity is not None and type(memo_identity) is not tuple:
+        raise GrafxConfigurationError(
+            "A CRC-32C memo identity must be a tuple or None.",
+            field="memo_identity",
+            value=_builtin_type_name(memo_identity),
+        )
+    proved = (
+        _proved_closed_callable(memo_identity) if memo_identity is not None else None
+    )
+    if proved is not function:
+        _validate_candidate(function, plain_name)
+        if memo_identity is not None:
+            _remember_closed_proof(memo_identity, function)
 
     def checked(data: bytes, crc: int) -> int:
         """Contain one fast-path answer without adding the Python oracle."""
