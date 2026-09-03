@@ -1616,6 +1616,25 @@ class IndexStore:
                         "did not claim."
                     )
                     self._stale_device_seq = certificate.seq
+                elif certificate != self._cache_certificate:
+                    # Page 0 moved on the device outside any commit this handle applied: a
+                    # cold open's replay advances a proximity header without a log record
+                    # (ST-7), so no foreign-record sync ever brought it here, and nothing
+                    # before this point re-reads page 0 into the pool. A clean resident page-0
+                    # frame is still bound to the older generation; advancing the header on it
+                    # would meet the page-0 sequence fence in the flush below -- AFTER the
+                    # barrier -- and leave this handle in recovery_required over a conflict
+                    # that was never about this commit. Drop that one clean frame so the
+                    # advance reads the device generation. Only page 0, and only when clean:
+                    # this commit's dirty buckets stay, and a dirty page 0 keeps meeting the
+                    # fence, which is the refusal this must not relax.
+                    dirty = {
+                        page_index
+                        for file, page_index in self._pool.modified_pages(self.file)
+                        if file == self.file
+                    }
+                    if HEADER_PAGE_INDEX not in dirty:
+                        self._pool.discard(self.file, HEADER_PAGE_INDEX)
             if not durably_stale:
                 self._advance(stamp)
                 if moved_any:
