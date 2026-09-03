@@ -481,6 +481,7 @@ def build_receipt(
     results: Mapping[str, Any] | None = None,
     grafx_sha: str | None = None,
     pulse_sha: str | None = None,
+    pulse_core_sha: str | None = None,
     machine_idle_asserted: bool = False,
     machine: Mapping[str, Any] | None = None,
     notes: Sequence[str] = (),
@@ -500,7 +501,11 @@ def build_receipt(
             "kind": series["kind"],
         },
         "config": dict(config),
-        "commits": {"grafx": grafx_sha, "pulse": pulse_sha},
+        "commits": {
+            "grafx": grafx_sha,
+            "pulse": pulse_sha,
+            "pulse_core": pulse_core_sha,
+        },
         "environment": environment(),
         "machine": {
             "idle_asserted_by_operator": bool(machine_idle_asserted),
@@ -582,7 +587,7 @@ def validate_receipt(receipt: Mapping[str, Any]) -> None:
     for key in ("parameters", "commits", "results"):
         if type(receipt[key]) is not dict:
             raise ReceiptInvalid(f"{key} must be a JSON object")
-    for project in ("grafx", "pulse"):
+    for project in ("grafx", "pulse", "pulse_core"):
         commit = receipt["commits"].get(project)
         if commit is not None and (type(commit) is not str or not commit):
             raise ReceiptInvalid(

@@ -117,6 +117,7 @@ def copy_board(
     drained: bool,
     grafx_sha: str | None = None,
     pulse_sha: str | None = None,
+    pulse_core_sha: str | None = None,
     timestamp: str | None = None,
 ) -> dict:
     """Copy ``source`` into ``dest`` through a verified sibling temp; return the manifest written."""
@@ -174,7 +175,11 @@ def copy_board(
                 "total_bytes": copied["total_bytes"],
                 "files": copied["files"],
             },
-            "commits": {"grafx": grafx_sha, "pulse": pulse_sha},
+            "commits": {
+                "grafx": grafx_sha,
+                "pulse": pulse_sha,
+                "pulse_core": pulse_core_sha,
+            },
         }
         if not identical:
             raise CopyNotProved(manifest)
@@ -201,6 +206,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--grafx-sha", required=True)
     parser.add_argument("--pulse-sha", required=True)
     parser.add_argument(
+        "--pulse-core-sha",
+        help="exact okto-pulse-core commit, when the copy will feed a Pulse workload",
+    )
+    parser.add_argument(
         "--receipt",
         type=Path,
         help="where to write the receipt (default: <dest>/../<dest name>.copy-receipt.json)",
@@ -217,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
                 drained=args.source_is_drained_live_board,
                 grafx_sha=args.grafx_sha,
                 pulse_sha=args.pulse_sha,
+                pulse_core_sha=args.pulse_core_sha,
             )
         except CopyNotProved as unproved:
             manifest = unproved.manifest
@@ -261,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         grafx_sha=args.grafx_sha,
         pulse_sha=args.pulse_sha,
+        pulse_core_sha=args.pulse_core_sha,
         notes=[
             "file-level copy through a verified sibling temp directory; okto_grafx imported only for provenance; no database was opened"
         ],

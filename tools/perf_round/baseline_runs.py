@@ -14,8 +14,9 @@ Independence of the runs is enforced, not assumed:
   interpolated, so quoting and braces inside JSON arguments survive on Windows and POSIX;
 * every run gets its OWN data home: the child's environment has every live-data-home variable
   (``DATA_DIR``, ``OKTO_PULSE_HOME``, ``KG_BASE_DIR`` and the ``OKTO_PULSE_``-prefixed forms)
-  SET to ``<out-dir>/<mode>_runNN_home`` -- set, not merely removed, because a Pulse child with
-  no ``DATA_DIR`` falls back to ``~/.okto-pulse``, and the environment wins over a dotenv file;
+  SET to an isolated directory. A Pulse replay uses the per-run clone itself as ``DATA_DIR``;
+  a Grafx-only run defaults to ``<out-dir>/<mode>_runNN_home``. Variables are set, not merely
+  removed, because a Pulse child with no ``DATA_DIR`` falls back to ``~/.okto-pulse``;
 * when a declared copy is given, the argv MUST reference it through ``{copy}``; the copy is
   never reused mutable: ``--copy-policy clone`` (default) gives every run its own byte-identical
   clone with its own manifest and records the clone's inventory after the run (mutation of a
@@ -25,7 +26,8 @@ Independence of the runs is enforced, not assumed:
   ``-c`` payload is hashed into the receipt; ``--instrument-path`` may add supplementary files
   but cannot substitute for that binding, and ``python -m package.module`` alone is refused;
 * argv starts with the same Python whose environment is recorded, its source path is pinned to
-  this checkout, and the raw JSON must attest the effective runtime/config in ``_perf_round``;
+  this checkout, Pulse Community and Core are pinned separately when used, and the raw JSON must
+  attest the effective runtime/config and data home in ``_perf_round``;
 * an output file that already exists before its run is refused, and an output older than the
   run's start is refused as stale.
 
@@ -100,8 +102,10 @@ PLACEHOLDERS = (
     "{buffer_budget_bytes}",
     "{checksum}",
     "{kind}",
+    "{thermal}",
 )
 COPY_POLICIES = ("clone", "verify")
+DATA_HOME_POLICIES = ("isolated", "declared-copy-clone")
 _MANIFEST_FILES = (COPY_MANIFEST_NAME, COPY_MANIFEST_NAME + ".sha256")
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_IMPORT_ROOT = SOURCE_ROOT / "src"
@@ -170,7 +174,13 @@ def validate_child_provenance(document: Any, expected: dict[str, Any]) -> list[s
     errors: list[str] = []
     for field, expected_value in expected.items():
         observed_value = observed.get(field)
-        if field in ("python_executable", "okto_grafx_file"):
+        if field in (
+            "python_executable",
+            "okto_grafx_file",
+            "okto_pulse_community_file",
+            "okto_pulse_core_file",
+            "effective_data_dir",
+        ):
             try:
                 equal = Path(observed_value).resolve() == Path(expected_value).resolve()
             except (TypeError, OSError, ValueError):
@@ -238,7 +248,11 @@ def format_summary(name: str, summary: dict[str, Any]) -> str:
     )
 
 
-def child_environment(run_home: Path, pulse_root: Path | None = None) -> dict[str, str]:
+def child_environment(
+    run_home: Path,
+    pulse_root: Path | None = None,
+    pulse_core_root: Path | None = None,
+) -> dict[str, str]:
     """The child's environment with EVERY data-home variable set to this run's isolated home."""
     environment = {
         key: value
@@ -251,6 +265,8 @@ def child_environment(run_home: Path, pulse_root: Path | None = None) -> dict[st
     pinned_import_roots = [str(SOURCE_IMPORT_ROOT)]
     if pulse_root is not None:
         pinned_import_roots.append(str(pulse_root / "src"))
+    if pulse_core_root is not None:
+        pinned_import_roots.append(str(pulse_core_root / "src"))
     pinned_pythonpath = os.pathsep.join(pinned_import_roots)
     environment["PYTHONPATH"] = pinned_pythonpath + (
         os.pathsep + inherited_pythonpath if inherited_pythonpath else ""
@@ -320,6 +336,7 @@ def _guard_argv(template: Sequence[str], *, has_copy: bool) -> None:
         "{buffer_budget_bytes}",
         "{checksum}",
         "{kind}",
+        "{thermal}",
     ):
         if required not in template:
             raise RunRefused(
@@ -526,11 +543,14 @@ def _terminate_process_tree(process: subprocess.Popen, root: Any) -> None:
 
 
 def _spawn(
-    argv: Sequence[str], run_home: Path, pulse_root: Path | None = None
+    argv: Sequence[str],
+    run_home: Path,
+    pulse_root: Path | None = None,
+    pulse_core_root: Path | None = None,
 ) -> subprocess.Popen:
     """Start one isolated process group so a timeout can terminate the whole instrument tree."""
     popen_kwargs: dict[str, Any] = {
-        "env": child_environment(run_home, pulse_root),
+        "env": child_environment(run_home, pulse_root, pulse_core_root),
         "start_new_session": os.name == "posix",
     }
     if os.name == "nt":
@@ -653,7 +673,9 @@ def _clone_copy(source: Path, dest: Path) -> dict[str, Any]:
                 "total_bytes": copied["total_bytes"],
                 "files": copied["files"],
             },
-            "commits": manifest.get("commits", {"grafx": None, "pulse": None}),
+            "commits": manifest.get(
+                "commits", {"grafx": None, "pulse": None, "pulse_core": None}
+            ),
         }
         text = canonical_json(clone_manifest)
         (dest / COPY_MANIFEST_NAME).write_bytes(text.encode("utf-8"))
@@ -689,6 +711,9 @@ def run_series(
     buffer_budget_bytes: int,
     checksum: str,
     pulse_root: Path | None = None,
+    pulse_core_sha: str | None = None,
+    pulse_core_root: Path | None = None,
+    data_home_policy: str = "isolated",
     instrument_paths: Sequence[Path] = (),
     poll_seconds: float = 0.5,
     label: str = "",
@@ -742,26 +767,60 @@ def run_series(
             f"Grafx source is not clean at {grafx_sha}: {grafx_source_status[:5]}"
         )
     resolved_pulse_root: Path | None = None
+    resolved_pulse_core_root: Path | None = None
     if pulse_sha == "n/a":
         if pulse_root is not None:
             raise RunRefused("--pulse-root cannot accompany --pulse-sha n/a")
+        if pulse_core_root is not None or pulse_core_sha is not None:
+            raise RunRefused(
+                "--pulse-core-root/--pulse-core-sha cannot accompany --pulse-sha n/a"
+            )
     else:
         if pulse_root is None:
             raise RunRefused("--pulse-root is required when --pulse-sha is not n/a")
         resolved_pulse_root = guard_not_data_home(pulse_root)
-        if not (resolved_pulse_root / "src" / "okto_pulse").is_dir():
+        if not (
+            resolved_pulse_root / "src" / "okto_pulse" / "community" / "__init__.py"
+        ).is_file():
             raise RunRefused(
-                f"--pulse-root {resolved_pulse_root} has no src/okto_pulse package"
+                f"--pulse-root {resolved_pulse_root} has no Community package"
             )
         observed_pulse_sha = git_sha_of(resolved_pulse_root)
         if observed_pulse_sha != pulse_sha:
             raise RunRefused(
                 f"--pulse-sha {pulse_sha!r} does not match {resolved_pulse_root}: {observed_pulse_sha!r}"
             )
-        pulse_source_status = _source_status(resolved_pulse_root, "src/okto_pulse")
+        pulse_source_status = _source_status(
+            resolved_pulse_root, "src/okto_pulse/community"
+        )
         if pulse_source_status:
             raise RunRefused(
                 f"Pulse source is not clean at {pulse_sha}: {pulse_source_status[:5]}"
+            )
+        if pulse_core_root is None or not pulse_core_sha:
+            raise RunRefused(
+                "--pulse-core-root and --pulse-core-sha are required for a Pulse run"
+            )
+        resolved_pulse_core_root = guard_not_data_home(pulse_core_root)
+        if not (
+            resolved_pulse_core_root / "src" / "okto_pulse" / "core" / "__init__.py"
+        ).is_file():
+            raise RunRefused(
+                f"--pulse-core-root {resolved_pulse_core_root} has no Core package"
+            )
+        observed_pulse_core_sha = git_sha_of(resolved_pulse_core_root)
+        if observed_pulse_core_sha != pulse_core_sha:
+            raise RunRefused(
+                f"--pulse-core-sha {pulse_core_sha!r} does not match "
+                f"{resolved_pulse_core_root}: {observed_pulse_core_sha!r}"
+            )
+        pulse_core_source_status = _source_status(
+            resolved_pulse_core_root, "src/okto_pulse/core"
+        )
+        if pulse_core_source_status:
+            raise RunRefused(
+                f"Pulse Core source is not clean at {pulse_core_sha}: "
+                f"{pulse_core_source_status[:5]}"
             )
     if not metrics or any(
         type(name) is not str or not name or type(path) is not str or not path
@@ -770,6 +829,18 @@ def run_series(
         raise RunRefused("at least one non-empty metric name=dotted.path is required")
     if copy_policy not in COPY_POLICIES:
         raise RunRefused(f"--copy-policy must be one of {COPY_POLICIES}")
+    if data_home_policy not in DATA_HOME_POLICIES:
+        raise RunRefused(f"--data-home-policy must be one of {DATA_HOME_POLICIES}")
+    if data_home_policy == "declared-copy-clone" and (
+        declared_copy is None or copy_policy != "clone"
+    ):
+        raise RunRefused(
+            "--data-home-policy declared-copy-clone requires --declared-copy and --copy-policy clone"
+        )
+    if resolved_pulse_root is not None and data_home_policy != "declared-copy-clone":
+        raise RunRefused(
+            "Pulse runs require --data-home-policy declared-copy-clone so DATA_DIR is the disposable full-home clone"
+        )
     template = list(argv_template)
     _guard_argv(template, has_copy=declared_copy is not None)
     out_dir = guard_not_data_home(out_dir)
@@ -825,10 +896,26 @@ def run_series(
         "page_size": page_size,
         "buffer_budget_bytes": buffer_budget_bytes,
         "checksum": checksum,
+        "thermal": thermal,
     }
     if resolved_pulse_root is not None:
-        expected_child_base["okto_pulse_file"] = str(
-            (resolved_pulse_root / "src" / "okto_pulse" / "__init__.py").resolve()
+        expected_child_base["okto_pulse_community_file"] = str(
+            (
+                resolved_pulse_root
+                / "src"
+                / "okto_pulse"
+                / "community"
+                / "__init__.py"
+            ).resolve()
+        )
+        expected_child_base["okto_pulse_core_file"] = str(
+            (
+                resolved_pulse_core_root
+                / "src"
+                / "okto_pulse"
+                / "core"
+                / "__init__.py"
+            ).resolve()
         )
 
     run_reports: list[dict[str, Any]] = []
@@ -843,14 +930,13 @@ def run_series(
             raise RunRefused(
                 f"run home {run_home} already exists; refusing to reuse another run's state"
             )
-        run_home.mkdir()
         report: dict[str, Any] = {
             "run": index,
             "role": "warmup" if index < warmup else "measured",
             "discarded": index < warmup,
             "process": "fresh",
             "thermal": thermal,
-            "data_home": str(run_home),
+            "data_home_policy": data_home_policy,
             "errors": [],
         }
         copy_for_run = ""
@@ -868,6 +954,14 @@ def run_series(
                 "policy": copy_policy,
                 "sha256_before": run_copy_manifest["copy"]["sha256"],
             }
+        effective_data_home = (
+            Path(copy_for_run).resolve()
+            if data_home_policy == "declared-copy-clone"
+            else run_home.resolve()
+        )
+        if data_home_policy == "isolated":
+            effective_data_home.mkdir()
+        report["data_home"] = str(effective_data_home)
         argv = render_argv(
             template,
             out=str(out),
@@ -879,13 +973,19 @@ def run_series(
             buffer_budget_bytes=str(buffer_budget_bytes),
             checksum=checksum,
             kind=kind,
+            thermal=thermal,
         )
         report["argv"] = argv
         report["machine_before"] = machine_sample(interval_seconds=1.0)
         started_wall = time.time()
         started = time.perf_counter()
         try:
-            process = _spawn(argv, run_home, resolved_pulse_root)
+            process = _spawn(
+                argv,
+                effective_data_home,
+                resolved_pulse_root,
+                resolved_pulse_core_root,
+            )
         except OSError as failure:
             report["exit_code"] = None
             report["errors"].append(f"could not start: {failure}")
@@ -927,7 +1027,12 @@ def run_series(
             if document is not None and process.returncode == 0:
                 report["errors"].extend(
                     validate_child_provenance(
-                        document, {**expected_child_base, "run": index}
+                        document,
+                        {
+                            **expected_child_base,
+                            "run": index,
+                            "effective_data_dir": str(effective_data_home),
+                        },
                     )
                 )
                 for name, dotted in metrics.items():
@@ -998,12 +1103,29 @@ def run_series(
             "poll_seconds": poll_seconds,
             "timeout_seconds": timeout_seconds,
             "copy_policy": copy_policy,
+            "data_home_policy": data_home_policy,
             "thermal": thermal,
             "child_data_home_variables": list(DATA_HOME_ENV),
-            "child_pythonpath_prepend": str(SOURCE_IMPORT_ROOT),
+            "child_pythonpath_prepend": [
+                str(SOURCE_IMPORT_ROOT),
+                *(
+                    [str(resolved_pulse_root / "src")]
+                    if resolved_pulse_root is not None
+                    else []
+                ),
+                *(
+                    [str(resolved_pulse_core_root / "src")]
+                    if resolved_pulse_core_root is not None
+                    else []
+                ),
+            ],
             "pulse_root": str(Path(pulse_root).resolve()) if pulse_root else None,
+            "pulse_core_root": (
+                str(Path(pulse_core_root).resolve()) if pulse_core_root else None
+            ),
             "grafx_source_clean": True,
             "pulse_source_clean": True if resolved_pulse_root else None,
+            "pulse_core_source_clean": True if resolved_pulse_core_root else None,
         },
         series={"mode": mode, "thermal": thermal, "kind": kind},
         config={
@@ -1016,10 +1138,11 @@ def run_series(
         results=results,
         grafx_sha=grafx_sha,
         pulse_sha=pulse_sha,
+        pulse_core_sha=pulse_core_sha,
         machine_idle_asserted=machine_idle_asserted,
         notes=[
             "warmup runs are recorded but discarded from every aggregate",
-            "every run is a fresh process with its own data home; thermal is the operator's statement, not inferred",
+            "every run is a fresh process with its own isolated data home; a Pulse run uses its disposable full-home clone",
             "official is false by construction: this tool cannot prove the box idle",
             "thermal and raw/instrumented kind are explicit operator assertions; the concrete driver must enforce them",
         ],
@@ -1045,7 +1168,7 @@ def main(argv: list[str] | None = None) -> int:
         "--arg",
         action="append",
         default=[],
-        help="one argv token of the instrument; repeat; whole-token placeholders {out} {run} {mode} {seed} {copy}",
+        help="one argv token of the instrument; repeat; whole-token placeholders include {out} {run} {mode} {seed} {copy} {thermal}",
     )
     parser.add_argument(
         "--instrument-path",
@@ -1069,12 +1192,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--input", type=Path, action="append", default=[])
     parser.add_argument("--declared-copy", type=Path)
     parser.add_argument("--copy-policy", choices=COPY_POLICIES, default="clone")
+    parser.add_argument(
+        "--data-home-policy", choices=DATA_HOME_POLICIES, default="isolated"
+    )
     parser.add_argument("--kind", choices=("raw", "instrumented"), default="raw")
     parser.add_argument("--max-spread", type=float, default=0.08)
     parser.add_argument("--machine-idle-asserted", action="store_true")
     parser.add_argument("--grafx-sha", required=True)
     parser.add_argument("--pulse-sha", required=True)
     parser.add_argument("--pulse-root", type=Path)
+    parser.add_argument("--pulse-core-sha")
+    parser.add_argument("--pulse-core-root", type=Path)
     parser.add_argument("--label", default="")
     args = parser.parse_args(argv)
     metrics: dict[str, str] = {}
@@ -1110,6 +1238,9 @@ def main(argv: list[str] | None = None) -> int:
             buffer_budget_bytes=args.buffer_budget_bytes,
             checksum=args.checksum,
             pulse_root=args.pulse_root,
+            pulse_core_sha=args.pulse_core_sha,
+            pulse_core_root=args.pulse_core_root,
+            data_home_policy=args.data_home_policy,
             instrument_paths=args.instrument_path,
             label=args.label,
         )
