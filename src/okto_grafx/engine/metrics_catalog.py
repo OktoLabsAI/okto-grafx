@@ -162,7 +162,7 @@ _CEILING = LabelSpec(
 _DATABASE = LabelSpec(name="db", allowed_values=None, max_cardinality=64)
 _MEMORY_ESTIMATOR = LabelSpec(
     name="estimator",
-    allowed_values=frozenset({"python-v1"}),
+    allowed_values=frozenset({"python-v2"}),
     max_cardinality=1,
 )
 _SPACE = LabelSpec(name="space", allowed_values=None, max_cardinality=64)

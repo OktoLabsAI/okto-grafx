@@ -329,10 +329,11 @@ def assemble_database(
             db_label=label,
             # The pool is reached by every thread of this participant -- a commit applying pages
             # in the participant section, searches and scans pinning outside it -- and its doors
-            # must be atomic against each other. The lock is mechanism, so it is handed in here
-            # rather than imported by the pool (the pure core imports none), and it is
-            # re-entrant because a checkpoint flushes and an invalidation writes back.
-            guard=threading.RLock(),
+            # must be atomic against each other. The condition is mechanism, so it is handed in
+            # here rather than imported by the pool (the pure core imports none). It is
+            # re-entrant because checkpoint/invalidation nest pool doors, and its atomic
+            # wait/wake half lets cold reads leave this guard without duplicating one page load.
+            guard=ConditionGuard(),
             # This is the trusted composition adapter's existing deferral boundary, passed
             # explicitly rather than discovered on a host-supplied metrics implementation.
             # It drains pool and nested descriptor-cache emissions after the pool guard.
@@ -1127,7 +1128,7 @@ def _preflight_default_read_only_storage(
         NoOpMetricsSink(),
         budget_bytes=config.buffer_budget_bytes,
         db_label=database_label(config.path),
-        guard=threading.RLock(),
+        guard=ConditionGuard(),
     )
     _read_existing_identity(config, observational, MetaStore(pool))
 
@@ -1173,7 +1174,7 @@ def _observe_default_read_only_identity(
         NoOpMetricsSink(),
         budget_bytes=config.buffer_budget_bytes,
         db_label=database_label(config.path),
-        guard=threading.RLock(),
+        guard=ConditionGuard(),
     )
     meta = MetaStore(pool)
     intent = _read_first_open_intent(observational)

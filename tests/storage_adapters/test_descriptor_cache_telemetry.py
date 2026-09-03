@@ -193,5 +193,5 @@ def test_default_composition_exposes_cache_and_retained_memory_health(
         assert storage.descriptor_cache_hits is not None
         assert storage.descriptor_cache_misses is not None
         assert storage.descriptor_cache_evictions is not None
-        assert pool.retained_bytes_estimator == "python-v1"
+        assert pool.retained_bytes_estimator == "python-v2"
         assert pool.retained_bytes_estimate() >= pool.used_bytes()

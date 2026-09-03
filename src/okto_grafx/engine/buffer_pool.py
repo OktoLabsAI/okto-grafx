@@ -21,6 +21,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import wraps
 from itertools import islice
 from struct import calcsize
+from typing import Protocol, cast
 
 from okto_grafx.domain.errors import (
     GrafxBufferBudgetExceeded,
@@ -93,14 +94,16 @@ _READ_VIEW_MAX_TARGETS: int = 1024
 
 BUFFER_BUDGET_USED_BYTES: str = "oktografx_buffer_budget_used_bytes"
 BUFFER_RETAINED_ESTIMATE_BYTES: str = "oktografx_buffer_retained_estimate_bytes"
-BUFFER_RETAINED_ESTIMATOR_VERSION: str = "python-v1"
+BUFFER_RETAINED_ESTIMATOR_VERSION: str = "python-v2"
 """Version of the callback-free retained-memory estimator exposed by this pool.
 
 The estimate covers the resident and retired-pinned frame graph plus the pool-owned residency,
-dirty-page, abandoned-page, epoch and label containers. It is not process RSS: allocator arenas,
-storage/codec/metrics collaborators and arbitrary objects held by the read-view token are outside
-its authority. Versioning prevents a more accurate future formula from silently changing the
-meaning of a time series.
+dirty-page, abandoned-page, epoch, label and in-flight admission containers. It is not process RSS:
+allocator arenas, storage/codec/metrics collaborators and arbitrary objects held by the read-view
+token are outside its authority, as are temporary raw/decode values owned only by an executing
+call stack. Versioning prevents a more accurate future formula from silently changing the meaning
+of a time series. ``python-v2`` adds the bounded single-flight reservations and detached
+dirty-eviction frames introduced after the original ``python-v1`` estimator.
 """
 BUFFER_BUDGET_EXCEEDED_TOTAL: str = "oktografx_buffer_budget_exceeded_total"
 CHECKSUM_VERIFICATIONS_TOTAL: str = "oktografx_checksum_verifications_total"
@@ -275,6 +278,106 @@ class _Frame:
         )
 
 
+class BufferPoolGuard(Protocol):
+    """The injected mechanism that makes pool transitions atomic and cold misses waitable.
+
+    The protocol deliberately belongs to the engine while its implementation belongs to an
+    adapter.  C1 therefore imports no thread, task or operating-system mechanism.  One object is
+    both the pool mutex and its condition: testing a flight, releasing the mutex to wait and
+    re-testing after notification are one atomic protocol, with no second-lock ordering window.
+    """
+
+    def __enter__(self) -> object:
+        """Take the pool guard."""
+        ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> bool | None:
+        """Release the pool guard."""
+        ...
+
+    def wait_for(
+        self, predicate: Callable[[], bool], timeout: float | None = None
+    ) -> bool:
+        """Atomically release the guard, wait, reacquire it and evaluate ``predicate``."""
+        ...
+
+    def notify_all(self) -> None:
+        """Wake every waiter; the caller holds this same guard."""
+        ...
+
+    def thread_token(self) -> int:
+        """Return the stable token of the calling execution thread."""
+        ...
+
+
+class _UnguardedPoolGuard:
+    """Single-thread composition of :class:`BufferPoolGuard`, containing no mechanism."""
+
+    __slots__ = ()
+
+    def __enter__(self) -> _UnguardedPoolGuard:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> None:
+        return None
+
+    def wait_for(
+        self, predicate: Callable[[], bool], timeout: float | None = None
+    ) -> bool:
+        """Evaluate immediately: a single-thread composition has nobody to wake it."""
+        return bool(predicate())
+
+    def notify_all(self) -> None:
+        """Wake nobody."""
+        return None
+
+    def thread_token(self) -> int:
+        """Return the sole token in a single-thread composition."""
+        return 0
+
+
+class _PageLoad:
+    """One reserved frame slot and one authority to load a cold page."""
+
+    __slots__ = ("owner", "epoch", "valid")
+
+    def __init__(self, owner: int, epoch: tuple[int, int]) -> None:
+        self.owner = owner
+        self.epoch = epoch
+        self.valid = True
+
+
+class _PageEviction:
+    """One dirty frame detached while its bytes are written outside the pool guard."""
+
+    __slots__ = ("owner", "frame")
+
+    def __init__(self, owner: int, frame: _Frame) -> None:
+        self.owner = owner
+        self.frame = frame
+
+
+def _condition_capability(candidate: object) -> BufferPoolGuard | None:
+    """Return the explicitly injected wait/wake capability, when it is complete."""
+
+    if all(
+        callable(getattr(candidate, name, None))
+        for name in ("wait_for", "notify_all", "thread_token")
+    ):
+        return cast(BufferPoolGuard, candidate)
+    return None
+
+
 class _BufferWorkProbe:
     """Data-only accounting for buffer scans during one instrumented commit.
 
@@ -296,7 +399,7 @@ class _BufferWorkProbe:
 
 
 def _guarded(method: Callable[..., object]) -> Callable[..., object]:
-    """Run one pool door under the pool's guard.
+    """Run one non-cold-load pool door under the pool's guard.
 
     The pool is process-wide state that several threads of one participant reach at once -- a
     commit applying pages in the participant section, and searches and scans pinning pages
@@ -307,10 +410,11 @@ def _guarded(method: Callable[..., object]) -> Callable[..., object]:
     thread-concurrency test under suite load: ``index_entry_missing``, no error anywhere).
 
     The guard is INJECTED, not created here: the pure core imports no mechanism, so the
-    composition root hands in the re-entrant lock and the default is a no-op context. The body
-    of ``pinned()`` runs outside the guard -- only the pin and the unpin are inside -- so a
-    caller working with a page never holds the pool's lock, and no host code ever runs under it
-    (A91).
+    composition root hands in the re-entrant condition and the default contains no mechanism.
+    ``pin`` owns a more precise phase protocol: cache-table decisions run under this guard while
+    cold storage/codec work runs outside it. The body of ``pinned()`` also runs outside the guard
+    -- only the pin and the unpin are guarded -- so a caller working with a page never holds the
+    pool's lock (A91).
     """
 
     @wraps(method)
@@ -337,10 +441,15 @@ class BufferPool:
         "_storage",
         "_codec",
         "_metrics",
+        "_metrics_enabled",
         "_metrics_defer",
         "_budget_bytes",
         "_db_label",
         "_guard",
+        "_condition",
+        "_loads",
+        "_evictions",
+        "_flight_state_epoch",
         "_page_write_section",
         "_page_sequence_fence",
         "_doomed",
@@ -379,13 +488,23 @@ class BufferPool:
         self._codec: PageCodec = codec
         self._metrics: MetricsSink = metrics
         metrics_enabled = metrics.enabled
+        self._metrics_enabled: bool = metrics_enabled
         self._metrics_defer: Callable[[], AbstractContextManager[object]] | None = (
             metrics_defer if metrics_enabled else None
         )
         self._page_size: int = validate_page_size(storage.page_size)
-        self._guard: AbstractContextManager[object] = (
-            nullcontext() if guard is None else guard
+        selected_guard: AbstractContextManager[object] = (
+            _UnguardedPoolGuard() if guard is None else guard
         )
+        self._guard = selected_guard
+        # A bare context-manager guard remains supported for legacy/direct single-thread tests.
+        # Production injects one complete condition, and only that explicit capability enables
+        # releasing the mutex across a miss.  Never fabricate a second lock here: reservation and
+        # waiting must use the exact mutex that protects ``_frames``.
+        self._condition: BufferPoolGuard | None = _condition_capability(selected_guard)
+        self._loads: dict[tuple[str, PageIndex], _PageLoad] = {}
+        self._evictions: dict[tuple[str, PageIndex], _PageEviction] = {}
+        self._flight_state_epoch: int = 0
         self._page_write_section: Callable[
             [str, PageIndex], AbstractContextManager[object]
         ] = (
@@ -554,10 +673,12 @@ class BufferPool:
         return self._retained_bytes_estimate()
 
     def _retained_bytes_estimate(self) -> int:
-        """Build the callback-free ``python-v1`` retained-object estimate under the guard."""
+        """Build the callback-free ``python-v2`` retained-object estimate under the guard."""
         roots: tuple[object, ...] = (
             self._frames,
             self._doomed,
+            self._loads,
+            self._evictions,
             self._grown,
             self._abandoned,
             self._modified,
@@ -568,6 +689,7 @@ class BufferPool:
             self._page_labels,
             self._data_labels,
             self._work_probe,
+            self._flight_state_epoch,
         )
         stack = list(roots)
         seen: set[int] = set()
@@ -625,6 +747,14 @@ class BufferPool:
                     )
                 )
                 continue
+            if kind is _PageLoad:
+                retained += (2 + len(_PageLoad.__slots__)) * pointer
+                stack.extend((item.owner, item.epoch, item.valid))
+                continue
+            if kind is _PageEviction:
+                retained += (2 + len(_PageEviction.__slots__)) * pointer
+                stack.extend((item.owner, item.frame))
+                continue
             if isinstance(item, Page):
                 retained += Page._retained_bytes_estimate_v1(item)
                 continue
@@ -664,14 +794,34 @@ class BufferPool:
 
     # --- the four operations -----------------------------------------------------------------
 
-    @_guarded
     def pin(self, file: str, page_index: PageIndex) -> Page:
         """Return the page, reading it from the device when it is not resident, and pin it.
 
         A pinned page is never evicted, so the caller must unpin it. Everything that can fail
-        fails before the pin count moves.
+        fails before the pin count moves.  In a production composition, a cold miss reserves its
+        frame slot under the injected condition and performs storage read plus codec decode after
+        releasing that guard.  Exactly one loader exists for a ``(file, page)`` key; waiters wake
+        to the one published Page object.  A cache/drop or structure epoch that moves meanwhile
+        makes the detached result ineligible for publication and the load retries from the new
+        view.
         """
         _require_page_index("page_index", page_index)
+        deferred = (
+            nullcontext() if self._metrics_defer is None else self._metrics_defer()
+        )
+        with deferred:
+            if self._condition is None:
+                # Compatibility for a direct composition that supplied only a context manager.
+                # Such a composition has no injected way to release-and-wait atomically, so it
+                # retains the pre-single-flight behaviour. Public assembly always supplies the
+                # complete condition capability.
+                with self._guard:
+                    return self._pin_guarded(file, page_index)
+            return self._pin_single_flight(file, page_index)
+
+    def _pin_guarded(self, file: str, page_index: PageIndex) -> Page:
+        """Run the compatible cold path for a guard without wait/wake capability."""
+
         key = (file, page_index)
         frame = self._frames.get(key)
         if frame is not None:
@@ -686,7 +836,133 @@ class BufferPool:
         self._report_usage()
         return page
 
-    @_guarded
+    def _pin_single_flight(self, file: str, page_index: PageIndex) -> Page:
+        """Load and publish one cold frame through the injected condition protocol."""
+
+        condition = self._condition
+        assert condition is not None
+        key = (file, page_index)
+        owner = condition.thread_token()
+        while True:
+            eviction: _PageEviction | None = None
+            eviction_key: tuple[str, PageIndex] | None = None
+            load: _PageLoad | None = None
+            budget_failure: GrafxBufferBudgetExceeded | None = None
+            with self._guard:
+                frame = self._frames.get(key)
+                if frame is not None:
+                    self._frames.move_to_end(key)
+                    frame.pins += 1
+                    return frame.page
+
+                existing_load = self._loads.get(key)
+                if existing_load is not None:
+                    self._refuse_own_flight(
+                        owner, existing_load.owner, file, page_index, operation="load"
+                    )
+                    condition.wait_for(
+                        lambda: self._loads.get(key) is not existing_load
+                    )
+                    continue
+                existing_eviction = self._evictions.get(key)
+                if existing_eviction is not None:
+                    self._refuse_own_flight(
+                        owner,
+                        existing_eviction.owner,
+                        file,
+                        page_index,
+                        operation="eviction",
+                    )
+                    condition.wait_for(
+                        lambda: self._evictions.get(key) is not existing_eviction
+                    )
+                    continue
+
+                if self._occupied_slots() < self.capacity_pages:
+                    load = _PageLoad(owner, self._load_epoch(file))
+                    self._loads[key] = load
+                else:
+                    victim = self._find_victim()
+                    if victim is None:
+                        if self._loads or self._evictions:
+                            self._refuse_capacity_wait_on_self(owner, file, page_index)
+                            observed = self._flight_state_epoch
+                            condition.wait_for(
+                                lambda: self._flight_state_epoch != observed
+                            )
+                            continue
+                        budget_failure = self._budget_failure(file, page_index)
+                    else:
+                        victim_frame = self._frames.pop(victim)
+                        if victim_frame.page.dirty:
+                            eviction = _PageEviction(owner, victim_frame)
+                            eviction_key = victim
+                            self._evictions[victim] = eviction
+                            # Claim this logical admission now so a second caller of the same key
+                            # cannot evict another frame while the first victim is written. It
+                            # does not count as a second capacity slot until that victim leaves.
+                            load = _PageLoad(owner, self._load_epoch(file))
+                            self._loads[key] = load
+                        else:
+                            # Clean eviction and target reservation are one atomic replacement;
+                            # no competitor can steal the slot this caller just made.
+                            load = _PageLoad(owner, self._load_epoch(file))
+                            self._loads[key] = load
+
+            if budget_failure is not None:
+                if self._metrics_enabled:
+                    self._metrics.increment(
+                        BUFFER_BUDGET_EXCEEDED_TOTAL, 1.0, self._labels
+                    )
+                raise budget_failure
+            if eviction is not None:
+                assert eviction_key is not None
+                assert load is not None
+                self._evict_dirty_frame(eviction_key, eviction, key, load)
+            assert load is not None
+
+            try:
+                page = self._read_page(file, page_index)
+            except BaseException:
+                usage: tuple[float, float] | None = None
+                with self._guard:
+                    if self._loads.get(key) is load:
+                        del self._loads[key]
+                        self._signal_flight_state()
+                        usage = self._usage_reading()
+                if usage is not None:
+                    self._emit_usage(usage)
+                raise
+
+            usage: tuple[float, float] | None = None
+            retry = False
+            with self._guard:
+                current = self._loads.get(key)
+                if current is not load:
+                    # No sanctioned path removes a live ticket without waking its owner. Keep a
+                    # fail-closed guard here: the detached object has no publication authority.
+                    retry = True
+                else:
+                    del self._loads[key]
+                    resident = self._frames.get(key)
+                    if resident is not None:
+                        self._frames.move_to_end(key)
+                        resident.pins += 1
+                        page = resident.page
+                    elif load.valid and load.epoch == self._load_epoch(file):
+                        admitted = _Frame(page)
+                        admitted.pins = 1
+                        self._frames[key] = admitted
+                        usage = self._usage_reading()
+                    else:
+                        retry = True
+                    self._signal_flight_state()
+            if retry:
+                continue
+            if usage is not None:
+                self._emit_usage(usage)
+            return page
+
     def read_fresh_page(self, file: str, page_index: PageIndex) -> Page:
         """Read one detached page from the device, bypassing every resident frame.
 
@@ -700,8 +976,12 @@ class BufferPool:
         # A fresh cross-process certificate must also be fresh with respect to the directory
         # entry.  In generation mode this targeted invalidation keeps page-0 OCC and speculative
         # index artifact validation from certifying an inode another participant moved aside.
-        self._invalidate_descriptor_identity(file)
-        return self._read_page(file, page_index)
+        deferred = (
+            nullcontext() if self._metrics_defer is None else self._metrics_defer()
+        )
+        with deferred:
+            self._invalidate_descriptor_identity(file)
+            return self._read_page(file, page_index)
 
     @_guarded
     def unpin(
@@ -741,6 +1021,7 @@ class BufferPool:
                         if not doomed:
                             del self._doomed[key]
                         self._bump_drop_epoch(file)
+                        self._signal_flight_state()
                     return
         if frame is None:
             raise GrafxUnsupportedOperation(
@@ -757,6 +1038,8 @@ class BufferPool:
         if dirty:
             frame.page.dirty = True
         frame.pins -= 1
+        if frame.pins == 0:
+            self._signal_flight_state()
 
     def pinned(self, file: str, page_index: PageIndex) -> AbstractContextManager[Page]:
         """Return a context manager that pins the page and always unpins it again."""
@@ -768,10 +1051,11 @@ class BufferPool:
 
         A multi-page operation whose page-0 certificate covers the whole operation (an index
         rebuild, for example) uses this door instead of taking the injected section directly.
-        Every ordinary pool write already enters the local guard before its page section, so
-        this order prevents a section->guard inversion. Production injects re-entrant
-        mechanisms: nested pool doors re-enter the guard, and a nested page-0 write-back
-        re-enters the same cross-process section.
+        Ordinary guarded writes enter the local guard before their page section. A dirty
+        cold-miss eviction is the one exception: it leaves the guard, takes and releases its page
+        section, and only then reacquires the guard to settle. This door waits for all such flights
+        before taking its section, so neither route can form section->guard against
+        guard->section. Production mechanisms remain re-entrant for nested guarded writes.
 
         The default mechanisms remain no-ops, preserving the pure-core construction used by
         adapters that do not need cross-process page fencing.
@@ -782,6 +1066,11 @@ class BufferPool:
         )
         with deferred:
             with self._guard:
+                # Take no external page section while a flight may need to settle under this
+                # guard. Acquiring the section first and then waiting would invert the dirty
+                # eviction order (section -> guard against eviction's section -> guard).
+                self._wait_for_evictions()
+                self._wait_for_loads()
                 with self._page_write_section(file, page_index):
                     yield
 
@@ -869,6 +1158,7 @@ class BufferPool:
         for a fresh page and link whatever they are given. For every one of those, reuse is the
         point.
         """
+        self._wait_for_evictions(file)
         prospective = (
             self._storage.page_count(file) if self._storage.exists(file) else 0
         )
@@ -878,6 +1168,12 @@ class BufferPool:
             page_index = self._storage.allocate(file, 1)
         self._grown.add((file, page_index))
         key = (file, page_index)
+        loading = self._loads.get(key)
+        if loading is not None:
+            # Allocation installed the current meaning of this physical page while a detached
+            # read still carries its previous bytes. The reservation continues to count until
+            # the loader returns, but those bytes can no longer be published.
+            loading.valid = False
         existing = self._frames.get(key)
         if existing is not None:
             # Two ways to get here and neither leaves a holder behind. The file shrank, which no
@@ -906,6 +1202,7 @@ class BufferPool:
         deliberately does not barrier the data files (CONTRACT.md section 8.5 step 6). The path
         that does want them on the platter is checkpoint().
         """
+        self._wait_for_evictions(file)
         probe = self._work_probe
         if probe is not None:
             try:
@@ -951,6 +1248,7 @@ class BufferPool:
 
         The set is a snapshot, not a view: the frames go on changing after it is returned.
         """
+        self._wait_for_evictions(file)
         probe = self._work_probe
         if probe is not None:
             try:
@@ -965,6 +1263,7 @@ class BufferPool:
     @_guarded
     def has_dirty_pages(self, file: str | None = None) -> bool:
         """Say whether resident or doomed frames still hold unpublished local changes."""
+        self._wait_for_evictions(file)
         probe = self._work_probe
         if probe is not None:
             examined = 0
@@ -1013,6 +1312,7 @@ class BufferPool:
         forgetting the frame throws away the only corrected copy of it. A caller cannot tell those
         two apart from the dirty flag -- a written-back page is CLEAN -- so it asks here.
         """
+        self._wait_for_evictions(file)
         return frozenset(
             key for key in self._modified if file is None or key[0] == file
         )
@@ -1025,6 +1325,7 @@ class BufferPool:
         This writes exactly the page named, which is what an all-or-nothing undo needs: it decides
         page by page and must not carry anything else along with its decision.
         """
+        self._wait_for_evictions(file, page_index)
         frame = self._frames.get((file, page_index))
         if frame is None:
             return False
@@ -1040,6 +1341,7 @@ class BufferPool:
         immediately before taking its first reading -- never after work has begun, which would
         drop pages that unit had already changed.
         """
+        self._wait_for_evictions()
         self._modified.clear()
 
     @_guarded
@@ -1063,6 +1365,7 @@ class BufferPool:
         Settling ENDS the reuse of that page, and that is deliberate: the reclaim rests on the
         page never having been readable, and this makes it readable.
         """
+        self._wait_for_evictions(file)
         names = sorted(self._abandoned) if file is None else [file]
         written = 0
         for name in names:
@@ -1103,7 +1406,8 @@ class BufferPool:
         while the device performs the slow durability barrier; this method deliberately owns
         the exact same timer and failure counter as :meth:`checkpoint`.
         """
-        if self._metrics.enabled:
+        self._wait_for_evictions(file)
+        if self._metrics_enabled:
             with self._metrics.time(FSYNC_DURATION_SECONDS, self._data_labels):
                 self._barrier(file)
         else:
@@ -1114,7 +1418,7 @@ class BufferPool:
         try:
             self._storage.durable_barrier(file)
         except GrafxDurabilityBarrierFailed:
-            if self._metrics.enabled:
+            if self._metrics_enabled:
                 self._metrics.increment(BARRIER_FAILURES_TOTAL, 1.0, None)
             raise
 
@@ -1178,6 +1482,7 @@ class BufferPool:
         mismatch takes the conservative full foreign refresh rather than applying an unbound or
         stale partial interval.
         """
+        self._wait_for_evictions()
         previous = self._read_view_token
         pages: frozenset[tuple[str, PageIndex]] | None = None
         files: frozenset[str] = frozenset()
@@ -1199,6 +1504,13 @@ class BufferPool:
                 )
             )
 
+        # An own commit may retain every resident frame: those objects are the state this pool
+        # just published. A detached cold read is different -- it may have captured device bytes
+        # immediately before that commit. Revoke only those in-flight results so their loaders
+        # re-read the new view; do not move an epoch or throw away the proved resident cache.
+        for loading in self._loads.values():
+            loading.valid = False
+
         own_proved = (
             own
             and previous is not None
@@ -1209,7 +1521,7 @@ class BufferPool:
             )
         )
         if own_proved:
-            if self._metrics.enabled:
+            if self._metrics_enabled:
                 self._metrics.increment(
                     READ_VIEW_DROPS_TOTAL, 1.0, {"view_origin": "own"}
                 )
@@ -1258,7 +1570,7 @@ class BufferPool:
                 files=files,
             )
         self._read_view_token = token
-        if self._metrics.enabled:
+        if self._metrics_enabled:
             self._metrics.increment(
                 READ_VIEW_DROPS_TOTAL, 1.0, {"view_origin": "foreign"}
             )
@@ -1290,6 +1602,12 @@ class BufferPool:
         dirty target cannot leave a partially advanced read view. Clean pinned frames are doomed
         and marked discard-only; their eventual release can never overwrite the foreign commit.
         """
+
+        if every_file:
+            self._wait_for_evictions()
+        else:
+            for changed_file in files | {name for name, _page_index in pages}:
+                self._wait_for_evictions(changed_file)
 
         target_keys: set[tuple[str, PageIndex]] = set()
         if every_file:
@@ -1360,6 +1678,7 @@ class BufferPool:
             for file in sorted(changed_names):
                 self._bump_drop_epoch(file)
         if dropped:
+            self._signal_flight_state()
             self._report_usage()
         return dropped
 
@@ -1381,19 +1700,28 @@ class BufferPool:
         and the holder keeps a page whose abandoned versions the restamp has already made
         invisible. Returns True when the frame was actually dropped.
         """
-        for doomed in self._doomed.pop((file, page_index), ()):
+        _require_page_index("page_index", page_index)
+        key = (file, page_index)
+        self._wait_for_evictions(file, page_index)
+        loading = self._loads.get(key)
+        if loading is not None:
+            # The detached read is not a resident frame, so it does not change the return value;
+            # it nevertheless lost publication authority at this discard boundary.
+            loading.valid = False
+        for doomed in self._doomed.pop(key, ()):
             doomed.page.dirty = (
                 False  # an abandoned attempt's bytes, never written back
             )
-        frame = self._frames.get((file, page_index))
+        frame = self._frames.get(key)
         if frame is None:
             return False
         if frame.pins:
             frame.page.dirty = False
             return False
-        del self._frames[(file, page_index)]
+        del self._frames[key]
         self._reclaim(file, page_index)
         self._bump_drop_epoch(file)
+        self._signal_flight_state()
         self._report_usage()
         return True
 
@@ -1410,6 +1738,7 @@ class BufferPool:
         discards those stale bytes without write-back. Any dirty frame refuses before a frame,
         allocation claim, reuse claim, or epoch moves.
         """
+        self._wait_for_evictions(file)
         targets = [
             (key, frame) for key, frame in self._frames.items() if key[0] == file
         ]
@@ -1447,6 +1776,7 @@ class BufferPool:
         # device pages so close can no longer settle them. Reuse and settlement each re-read the
         # device first, retiring a claim if a foreign participant gave that page meaning.
         self._bump_drop_epoch(file)
+        self._signal_flight_state()
         self._report_usage()
         return len(targets)
 
@@ -1462,6 +1792,7 @@ class BufferPool:
         """
         _require_page_index("page_index", page_index)
         key = (file, page_index)
+        self._wait_for_evictions(file, page_index)
         frames: list[_Frame] = []
         resident = self._frames.get(key)
         if resident is not None:
@@ -1496,6 +1827,7 @@ class BufferPool:
         # Keep any allocation claim until reuse or close revalidates the device image. Dropping
         # it here would leave an abandoned all-zero page permanently unverifiable.
         self._bump_drop_epoch(file)
+        self._signal_flight_state()
         self._report_usage()
         return dropped
 
@@ -1521,6 +1853,7 @@ class BufferPool:
         holder alone: the frame leaves the table so the next pin reads the device, and the last
         release drops it. Explicit ``invalidate`` keeps refusing, because its callers mean it.
         """
+        self._wait_for_evictions(file)
         targets = [
             (key, frame)
             for key, frame in self._frames.items()
@@ -1569,6 +1902,7 @@ class BufferPool:
             self._bump_every_file_drop_epoch()
         else:
             self._bump_drop_epoch(file)
+        self._signal_flight_state()
         self._report_usage()
 
     def _invalidate_descriptor_identity(self, file: str | None) -> None:
@@ -1579,25 +1913,194 @@ class BufferPool:
 
     # --- internals ---------------------------------------------------------------------------
 
+    def _load_epoch(self, file: str) -> tuple[int, int]:
+        """Return the two monotonic authorities a detached load must still match."""
+
+        return (self.structure_epoch(file), self.cache_drop_epoch(file))
+
+    def _occupied_slots(self) -> int:
+        """Return resident plus atomically reserved frame slots under the pool guard."""
+
+        # Every dirty eviction is paired atomically with exactly one load reservation: the
+        # reservation owns the victim's still-occupied slot until write-back completes, then owns
+        # the same slot for its read. Counting both maps would double-charge that one page.
+        return len(self._frames) + len(self._loads)
+
+    def _signal_flight_state(self) -> None:
+        """Move the bounded wait generation and wake waiters while holding the pool guard."""
+
+        self._flight_state_epoch += 1
+        condition = self._condition
+        if condition is not None:
+            condition.notify_all()
+
+    @staticmethod
+    def _refuse_own_flight(
+        owner: int,
+        flight_owner: int,
+        file: str,
+        page_index: PageIndex,
+        *,
+        operation: str,
+    ) -> None:
+        """Refuse a callback that would wait for the load/eviction it is executing."""
+
+        if owner != flight_owner:
+            return
+        raise GrafxUnsupportedOperation(
+            f"A re-entrant buffer callback tried to wait for its own {operation} of page "
+            f"{page_index} in {file!r}.",
+            field="buffer_flight_reentrant",
+            operation=operation,
+            file=file,
+            page=page_index,
+            retryable=False,
+        )
+
+    def _refuse_capacity_wait_on_self(
+        self, owner: int, file: str, page_index: PageIndex
+    ) -> None:
+        """Prevent a nested callback from waiting for a slot reserved by its own stack."""
+
+        if not any(load.owner == owner for load in self._loads.values()) and not any(
+            eviction.owner == owner for eviction in self._evictions.values()
+        ):
+            return
+        raise GrafxUnsupportedOperation(
+            f"A re-entrant buffer callback cannot reserve page {page_index} of {file!r}: "
+            "its own outer load or eviction currently owns the only available capacity.",
+            field="buffer_flight_reentrant",
+            operation="capacity",
+            file=file,
+            page=page_index,
+            retryable=False,
+        )
+
+    def _wait_for_evictions(
+        self,
+        file: str | None = None,
+        page_index: PageIndex | None = None,
+    ) -> None:
+        """Wait until relevant detached dirty writes settle, without waiting on a load.
+
+        A cache invalidation is allowed to overtake a read-only load -- its epoch then rejects the
+        stale publication.  It must not overtake a dirty eviction, because that detached frame is
+        still publishing local work.  Waiting only for evictions preserves that distinction.
+        """
+
+        condition = self._condition
+        if condition is None:
+            return
+        owner = condition.thread_token()
+
+        def _relevant() -> tuple[tuple[str, PageIndex], _PageEviction] | None:
+            for key, eviction in self._evictions.items():
+                if file is not None and key[0] != file:
+                    continue
+                if page_index is not None and key[1] != page_index:
+                    continue
+                return key, eviction
+            return None
+
+        while (found := _relevant()) is not None:
+            key, eviction = found
+            self._refuse_own_flight(
+                owner,
+                eviction.owner,
+                key[0],
+                key[1],
+                operation="eviction",
+            )
+            condition.wait_for(lambda: self._evictions.get(key) is not eviction)
+
+    def _wait_for_loads(self) -> None:
+        """Wait for every detached read before entering an external page-write section."""
+
+        condition = self._condition
+        if condition is None:
+            return
+        owner = condition.thread_token()
+        while self._loads:
+            key, load = next(iter(self._loads.items()))
+            self._refuse_own_flight(
+                owner,
+                load.owner,
+                key[0],
+                key[1],
+                operation="load",
+            )
+            condition.wait_for(lambda: self._loads.get(key) is not load)
+
+    def _budget_failure(
+        self, file: str, page_index: PageIndex
+    ) -> GrafxBufferBudgetExceeded:
+        """Build the compatible typed admission refusal without invoking any collaborator."""
+
+        return GrafxBufferBudgetExceeded(
+            f"Database {self._db_label!r} holds {len(self._frames)} pinned pages of "
+            f"{self._page_size} bytes and cannot admit page {page_index} of {file!r} "
+            f"within its budget of {self._budget_bytes} bytes.",
+            db=self._db_label,
+            file=file,
+            page=page_index,
+            budget_bytes=self._budget_bytes,
+            used_bytes=self.used_bytes(),
+        )
+
+    def _evict_dirty_frame(
+        self,
+        key: tuple[str, PageIndex],
+        eviction: _PageEviction,
+        target_key: tuple[str, PageIndex],
+        load: _PageLoad,
+    ) -> None:
+        """Write one detached victim outside the guard, then atomically settle its slot."""
+
+        file, page_index = key
+        frame = eviction.frame
+        try:
+            self._publish_page(file, page_index, frame.page, frame=frame)
+        except BaseException:
+            with self._guard:
+                if self._evictions.get(key) is eviction:
+                    del self._evictions[key]
+                    if self._loads.get(target_key) is load:
+                        del self._loads[target_key]
+                    # The ticket kept every sanctioned mutation of this key away. Restore the
+                    # victim at the LRU end it occupied before the failed write-back.
+                    self._frames[key] = frame
+                    self._frames.move_to_end(key, last=False)
+                    self._signal_flight_state()
+            raise
+
+        with self._guard:
+            if self._evictions.get(key) is eviction:
+                self._remember_write_back(file, page_index)
+                del self._evictions[key]
+                if self._loads.get(target_key) is load:
+                    # No target bytes have been read yet. Rebase the certificate after the
+                    # potentially slow victim write, while preserving an explicit discard's
+                    # ``valid=False`` revocation.
+                    load.epoch = self._load_epoch(target_key[0])
+                self._signal_flight_state()
+
     def _make_room(self, file: str, page_index: PageIndex) -> None:
         """Evict until one more frame fits in the budget, or refuse the request."""
-        while (len(self._frames) + 1) * self._page_size > self._budget_bytes:
+        while (self._occupied_slots() + 1) * self._page_size > self._budget_bytes:
             victim = self._find_victim()
             if victim is None:
-                if self._metrics.enabled:
+                condition = self._condition
+                if condition is not None and (self._loads or self._evictions):
+                    owner = condition.thread_token()
+                    self._refuse_capacity_wait_on_self(owner, file, page_index)
+                    observed = self._flight_state_epoch
+                    condition.wait_for(lambda: self._flight_state_epoch != observed)
+                    continue
+                if self._metrics_enabled:
                     self._metrics.increment(
                         BUFFER_BUDGET_EXCEEDED_TOTAL, 1.0, self._labels
                     )
-                raise GrafxBufferBudgetExceeded(
-                    f"Database {self._db_label!r} holds {len(self._frames)} pinned pages of "
-                    f"{self._page_size} bytes and cannot admit page {page_index} of {file!r} "
-                    f"within its budget of {self._budget_bytes} bytes.",
-                    db=self._db_label,
-                    file=file,
-                    page=page_index,
-                    budget_bytes=self._budget_bytes,
-                    used_bytes=self.used_bytes(),
-                )
+                raise self._budget_failure(file, page_index)
             name, victim_index = victim
             frame = self._frames[victim]
             if frame.page.dirty:
@@ -1624,7 +2127,7 @@ class BufferPool:
                 return Page(
                     int(PageType.FREE), page_size=self._page_size, page_index=page_index
                 )
-            if self._metrics.enabled:
+            if self._metrics_enabled:
                 self._metrics.increment(
                     CHECKSUM_VERIFICATIONS_TOTAL, 1.0, self._page_labels
                 )
@@ -1632,7 +2135,7 @@ class BufferPool:
                 page = self._codec.decode_page(raw, verify=True)
             except GrafxCorruptionDetected as detected:
                 failure = detected
-                if self._metrics.enabled:
+                if self._metrics_enabled:
                     self._metrics.increment(
                         CHECKSUM_FAILURES_TOTAL, 1.0, self._page_labels
                     )
@@ -1701,6 +2204,9 @@ class BufferPool:
         for frame in self._doomed.get(key, ()):
             if frame.page is page:
                 return frame
+        eviction = self._evictions.get(key)
+        if eviction is not None and eviction.frame.page is page:
+            return eviction.frame
         return None
 
     def _write_back(self, file: str, page_index: PageIndex, page: Page) -> None:
@@ -1711,8 +2217,26 @@ class BufferPool:
         found, so a page that ever acquired an odd counter would stay unreadable for good, and
         amendment A21 says a durable image carries an even counter without exception.
         """
-        page.page_index = page_index
         frame = self._owning_frame(file, page_index, page)
+        self._publish_page(file, page_index, page, frame=frame)
+        self._remember_write_back(file, page_index)
+
+    def _publish_page(
+        self,
+        file: str,
+        page_index: PageIndex,
+        page: Page,
+        *,
+        frame: _Frame | None,
+    ) -> None:
+        """Perform only the page/codec/device publication half of write-back.
+
+        Normal write doors invoke this while already guarded. Dirty cold-miss eviction invokes it
+        for an unpinned, detached frame after releasing the pool guard; its ticket gives this
+        exact object exclusive ownership until the caller settles bookkeeping under the guard.
+        """
+
+        page.page_index = page_index
         fenced = page_index == HEADER_PAGE_INDEX and self._page_sequence_fence(
             file, page_index
         )
@@ -1777,6 +2301,10 @@ class BufferPool:
             if frame is not None:
                 frame.device_base_seq = page.seq
         page.dirty = False
+
+    def _remember_write_back(self, file: str, page_index: PageIndex) -> None:
+        """Settle pool-owned bookkeeping after a page publication has succeeded."""
+
         # Remembered, not forgotten. Clearing the dirty flag is what used to take an evicted
         # page out of modified_pages() and out of the log with it; see that method.
         self._modified.add((file, page_index))
@@ -1794,17 +2322,29 @@ class BufferPool:
             if not waiting:
                 del self._abandoned[file]
 
+    def _usage_reading(self) -> tuple[float, float] | None:
+        """Capture callback-free usage under the guard, or None when telemetry is disabled."""
+
+        if not self._metrics_enabled:
+            return None
+        return (float(self.used_bytes()), float(self._retained_bytes_estimate()))
+
+    def _emit_usage(self, reading: tuple[float, float]) -> None:
+        """Emit a previously captured usage pair; callers hold no pool guard."""
+
+        used, retained = reading
+        self._metrics.set_gauge(BUFFER_BUDGET_USED_BYTES, used, self._labels)
+        self._metrics.set_gauge(
+            BUFFER_RETAINED_ESTIMATE_BYTES,
+            retained,
+            self._retained_labels,
+        )
+
     def _report_usage(self) -> None:
         """Publish the resident bytes of this database under its own label."""
-        if self._metrics.enabled:
-            self._metrics.set_gauge(
-                BUFFER_BUDGET_USED_BYTES, float(self.used_bytes()), self._labels
-            )
-            self._metrics.set_gauge(
-                BUFFER_RETAINED_ESTIMATE_BYTES,
-                float(self._retained_bytes_estimate()),
-                self._retained_labels,
-            )
+        reading = self._usage_reading()
+        if reading is not None:
+            self._emit_usage(reading)
 
     def __repr__(self) -> str:
         return (

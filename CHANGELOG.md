@@ -21,11 +21,17 @@ including the on-disk format.
 
 - Bumped the development version to `0.0.2` and started the bounded performance round governed by
   `GRAFX_PERFORMANCE_ROUND_FINAL.md`.
-- Added a separate, versioned `python-v1` estimate of Python memory retained by the buffer pool
+- Added a separate, versioned `python-v2` estimate of Python memory retained by the buffer pool
   without changing its nominal page admission budget. Descriptor-cache hits, misses and
   capacity-driven evictions are now available as unlabelled metrics and immutable storage-view
   counters; composed metric callbacks run only after the local storage and enclosing buffer-pool
-  guards are released.
+  guards are released. The v2 estimator also covers bounded cold-load reservations and dirty
+  frames detached for eviction.
+- Cold buffer misses are single-flight per physical `(file, page)` and run storage read plus codec
+  decode outside the global pool guard. In-flight loads count against capacity, failures wake
+  waiters without being cached, distinct pages can load concurrently, and epoch movement prevents
+  a late stale result from being published. Dirty eviction follows the same callback-free phase
+  boundary without changing on-disk bytes, WAL, nominal LRU admission or concurrency guarantees.
 
 ## [0.0.1] — 2026-09-01
 

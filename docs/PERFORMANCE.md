@@ -426,15 +426,17 @@ are recorded only as observations.
 
 `BufferPool.used_bytes()` remains the compatible nominal admission reading: resident frame count
 times configured page size. The separate `retained_bytes_estimate()` diagnostic uses the
-pointer-width-calibrated `python-v1` formula and covers pool-owned frame/Page objects, page payload
-buffers, slot directories, retired-pinned frames, dirty/modified/abandoned sets, epoch maps and
-metric-label containers. It intentionally excludes allocator arenas, interpreter-specific header
-variations, storage/codec/metrics collaborators and arbitrary read-view tokens. It is therefore an
-honest estimate of retained Python objects, not process RSS, and it does not yet change admission
-or eviction.
+pointer-width-calibrated `python-v2` formula and covers pool-owned frame/Page objects, page payload
+buffers, slot directories, retired-pinned frames, dirty/modified/abandoned sets, epoch maps,
+metric-label containers, in-flight load reservations and dirty frames detached during eviction.
+The `python-v2` label distinguishes those transient objects from the earlier `python-v1` formula.
+It intentionally excludes allocator arenas, interpreter-specific header variations,
+storage/codec/metrics collaborators, arbitrary read-view tokens and temporary raw/decode values
+owned only by an executing call stack. It is therefore an honest estimate of the pool-owned
+retained Python object graph, not process RSS, and it does not change nominal admission or eviction.
 
 The same value is exposed as
-`oktografx_buffer_retained_estimate_bytes{db,estimator="python-v1"}` and in the immutable
+`oktografx_buffer_retained_estimate_bytes{db,estimator="python-v2"}` and in the immutable
 `Database.pool` view. The gauge is sampled when the pool reports a residency-topology change;
 reading `Database.pool` recomputes the current diagnostic, including slot-directory changes made
 since that sample. This avoids turning each ordinary page release into a whole-pool telemetry
@@ -449,6 +451,24 @@ storage door has released that guard. The existing composition-level containment
 defers a nested storage emission until the enclosing buffer-pool guard is released. A
 disabled/no-op sink receives no registration or emission callback; counters and estimator state
 reset with their owning device/pool lifecycle.
+
+### Buffer cold-miss single-flight (0.0.2 development)
+
+Production assembly now gives each pool one `ConditionGuard`. Resident hits retain the existing
+single guarded dictionary/LRU/pin-count path. A miss reserves capacity atomically, keyed by the
+bounded physical identity `(file, page_index)`, and performs device read plus page decode after
+releasing the global pool guard. A caller finding the same key in flight waits rather than issuing
+duplicate I/O; success publishes exactly one Page object, while failure removes the reservation and
+wakes every waiter without caching the exception. Loads for different keys can overlap.
+
+Resident frames, load reservations and dirty-eviction reservations share the configured page
+capacity. `used_bytes()` deliberately remains the compatible resident-frame metric; `python-v2`
+retained memory includes the transient objects. Invalidation/read-view/structure epochs captured
+before I/O are rechecked at publication, so bytes read from an older view are discarded and loaded
+again. Dirty victims are hidden behind an eviction ticket, encoded and written without the pool
+guard, and only then release their slot. State-sensitive doors wait for such a write, but never for
+a read-only load; same-thread callback re-entry that would wait on its own ticket is typed-refused
+instead of deadlocking. No metric, file path, page key or other open-cardinality label was added.
 
 ### F1, CE-3 and M-PULSE-7 gate chain
 

@@ -244,7 +244,7 @@ def test_pool_and_wal_views_do_no_io_or_telemetry_when_pages_are_cold() -> None:
 
         assert pool.used_bytes() == 0
         assert pool.retained_bytes_estimate() > 0
-        assert pool.retained_bytes_estimator == "python-v1"
+        assert pool.retained_bytes_estimator == "python-v2"
         assert wal.last_lsn >= 0
         assert storage.trail() == ()
         assert metrics.calls == []

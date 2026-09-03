@@ -733,6 +733,17 @@ class BufferPool:
 ```
 Budget is **per Database instance**. No module-level/global state anywhere (BR-8/FR-13).
 
+The public composition injects one re-entrant condition as the pool guard. On a cold `pin`, the
+pool atomically reserves one budget slot per `(file, page)`, then releases the guard before calling
+`StorageDevice.read_page` or `PageCodec.decode_page`. Concurrent callers of the same key wait and
+receive pins on the one published `Page`; a failed load is never cached and wakes all waiters. A
+load reservation occupies one budget slot; a dirty frame detached for eviction retains that same
+slot until it is transferred to the target load. Invalidation, fresh-read-view or structure/cache
+epoch movement while I/O is in flight revokes publication of the detached result, which is
+discarded and retried. This protocol changes neither `used_bytes()`
+(resident frames times page size), eviction policy, on-disk bytes, WAL nor multi-reader/multi-writer
+coordination. The pure core imports no thread, async or OS mechanism.
+
 ### 8.2 `engine/heap_store.py` (C1)
 ```python
 class HeapStore:
@@ -1295,7 +1306,7 @@ M1: `oktografx_lease_wait_seconds`{outcome=granted|timeout|takeover} ·
 `oktografx_recovery_discarded_records_total`{origin_class=reapplicable|forensic} ·
 `oktografx_ledger_depth`{origin_class} · `oktografx_ledger_oldest_entry_age_seconds`{origin_class} ·
 `oktografx_quarantine_entries` · `oktografx_buffer_budget_used_bytes`{db} ·
-`oktografx_buffer_retained_estimate_bytes`{db,estimator=python-v1} ·
+`oktografx_buffer_retained_estimate_bytes`{db,estimator=python-v2} ·
 `oktografx_buffer_budget_exceeded_total`{db} · `oktografx_database_opens_total` ·
 `oktografx_descriptor_cache_hits_total` · `oktografx_descriptor_cache_misses_total` ·
 `oktografx_descriptor_cache_evictions_total` ·
@@ -1318,10 +1329,11 @@ Query: `oktografx_query_phase_duration_seconds`{phase=parse|plan|execute} ·
 `oktografx_query_rows_returned_count` · `oktografx_query_errors_total`{code}
 
 `db` and `space` labels carry a **short hash / catalog name**, never a path or free text (TR-7).
-The `estimator` label is the closed singleton `python-v1`. Its value identifies the
+The `estimator` label is the closed singleton `python-v2`. Its value identifies the
 pointer-width-calibrated formula: engine-owned Page/frame objects, payload buffers, slot
 directories and buffer bookkeeping are included; allocator arenas, interpreter-specific header
-variations, collaborators and arbitrary read-view tokens are excluded. The gauge is an estimate
+variations, collaborators, arbitrary read-view tokens and temporary values owned only by an
+executing call stack are excluded. The gauge is an estimate
 of retained Python memory, not process RSS and not the eviction/admission budget. It is sampled
 on reported residency-topology changes; the immutable `Database.pool` health view recomputes the
 current estimate, so routine unpins do not acquire an O(resident frames) telemetry cost.

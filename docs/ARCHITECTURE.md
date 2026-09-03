@@ -321,12 +321,17 @@ the exact transition and risk contract.
 
 - **The participant section** is re-entrant and process-wide: the threads of one participant take
   turns at the acquire-commit-release window rather than ending one another's epoch.
-- **The buffer pool runs every door under an injected guard.** The pool is process-wide state that
-  several threads reach at once — a commit applying pages inside the section, and searches and scans
-  pinning pages outside any section. Its doors were sequences of dictionary steps that were
-  individually atomic and jointly not. The guard is *injected* by the composition root, because the
-  pure core imports no mechanism; the default is a no-op context, and the body of `pinned()` runs
-  outside the guard so no caller ever holds the pool's lock while working with a page.
+- **The buffer pool runs every shared-state transition under one injected condition.** The pool is
+  process-wide state that several threads reach at once — a commit applying pages inside the
+  section, and searches and scans pinning pages outside any section. Resident lookup, LRU movement,
+  pin counts, eviction and cold-load reservations are atomic under that condition. A cold miss then
+  releases it for storage read and codec decode; one loader owns each `(file, page)` and competitors
+  wait for the same complete frame. In-flight reservations count against capacity, and a cache-drop
+  or structure epoch moving during I/O prevents late stale publication. Dirty eviction is detached
+  and written before its reserved slot is reused. The condition is *injected* by the composition
+  root because the pure core imports no threading/task/OS mechanism; the default remains suitable
+  for a direct single-thread composition. The body of `pinned()` runs outside the guard so no caller
+  holds the pool's lock while working with a page.
 
 ### Isolation
 
