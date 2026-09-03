@@ -28,6 +28,7 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import NO_PAGE, PageIndex, RecordRef
+from okto_grafx.domain.model import record as record_module
 from okto_grafx.domain.model.errors import SchemaMismatchError
 from okto_grafx.domain.model.record import (
     NO_PREVIOUS_VERSION,
@@ -77,6 +78,20 @@ cannot stop a thread that is allocating -- the session dies of memory exhaustion
 report at all, which is how three mutations went unscorable. A suite that cannot report its own
 failure is worse than a red one.
 """
+
+
+class HeaderUnpackCounter:
+    """Delegate the frozen header layout while counting its struct unpack operations."""
+
+    def __init__(self, wrapped: struct.Struct) -> None:
+        self._wrapped = wrapped
+        self.calls = 0
+
+    def unpack_from(
+        self, raw: bytes | bytearray | memoryview, offset: int = 0
+    ) -> tuple[int, ...]:
+        self.calls += 1
+        return self._wrapped.unpack_from(raw, offset)
 
 
 def file_pages(pool: BufferPool, store: HeapStore) -> int:
@@ -297,25 +312,129 @@ def test_a_scan_shows_a_version_only_to_a_snapshot_that_can_see_it(
     assert len(list(heap_store.scan(person_table, at(1000)))) == 5
 
 
-def test_a_scan_decodes_each_stored_record_header_once(
+def test_predicated_reads_materialize_only_the_headers_they_accept(
     heap_store: HeapStore,
     person_table: TableDef,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for index in range(5):
         heap_store.insert(person_table, index, (index, f"n{index}"), xmin=10 * (index + 1))
-    calls = 0
-    original = RecordHeader.decode
+    constructions: list[int] = []
+    original = RecordHeader.__init__
+    unpack = HeaderUnpackCounter(record_module._HEADER_STRUCT)
 
-    def counted(raw: bytes) -> RecordHeader:
-        nonlocal calls
-        calls += 1
-        return original(raw)
+    def counted(self: RecordHeader, *args: object, **kwargs: object) -> None:
+        original(self, *args, **kwargs)
+        constructions.append(self.record_id)
 
-    monkeypatch.setattr(RecordHeader, "decode", counted)
+    monkeypatch.setattr(RecordHeader, "__init__", counted)
+    monkeypatch.setattr(record_module, "_HEADER_STRUCT", unpack)
 
-    assert len(list(heap_store.scan(person_table, at(35)))) == 3
-    assert calls == 5, "every stored header is inspected, but visible rows must not decode it twice"
+    assert list(heap_store.scan(person_table, at(0))) == []
+    assert constructions == [], "a rejected header must remain unpacked fields, not a dataclass"
+    assert unpack.calls == 5
+
+    visible = list(heap_store.scan(person_table, at(35)))
+    assert [(version.record_id, version.xmin) for _ref, version in visible] == [
+        (0, 10),
+        (1, 20),
+        (2, 30),
+    ]
+    assert constructions == [0, 1, 2], "each accepted version materializes its complete header"
+    assert unpack.calls == 10, "each inspected slot must use exactly one struct unpack"
+
+    constructions.clear()
+    assert heap_store.lookup(person_table, 99, at(1000)) is None
+    assert constructions == [], "identity rejects must not materialize headers"
+    assert unpack.calls == 15
+    found = heap_store.lookup(person_table, 3, at(1000))
+    assert found is not None and (found.record_id, found.xmin) == (3, 40)
+    assert constructions == [3], "lookup materializes only its accepted header"
+    assert unpack.calls == 20, "the page walk inspects every slot exactly once"
+
+
+def test_header_peek_follows_the_canonical_struct_layout() -> None:
+    fields = (
+        0xA5,
+        0x5A,
+        0x1234,
+        0x89ABCDEF,
+        0x0102030405060708,
+        0x1112131415161718,
+        0x2122232425262728,
+        0x3132333435363738,
+    )
+    raw = struct.pack("<BBHIQQQQ", *fields)
+
+    assert RecordHeader.peek(raw) == fields
+    assert RecordHeader.decode(raw) == RecordHeader(
+        record_id=fields[4],
+        xmin=fields[5],
+        xmax=fields[6],
+        prev_version=fields[7],
+        payload_len=fields[3],
+        schema_version=fields[2],
+        flags=fields[0],
+        reserved=fields[1],
+    )
+
+
+def test_a_bounded_scan_materializes_every_header_accepted_by_visibility(
+    heap_store: HeapStore,
+    person_table: TableDef,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for index in range(5):
+        heap_store.insert(person_table, index, (index, f"n{index}"), xmin=10 * (index + 1))
+    constructions = 0
+    original = RecordHeader.__init__
+
+    def counted(self: RecordHeader, *args: object, **kwargs: object) -> None:
+        nonlocal constructions
+        constructions += 1
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(RecordHeader, "__init__", counted)
+
+    hidden, hidden_position = heap_store.scan_page(person_table, at(0), limit=5)
+    assert hidden == () and hidden_position is None
+    assert constructions == 0
+
+    visible, position = heap_store.scan_page(person_table, at(35), limit=2)
+    assert position is not None
+    assert [(version.record_id, version.xmin) for _ref, version in visible] == [
+        (0, 10),
+        (1, 20),
+    ]
+    assert constructions == 3, "the visible continuation marker is also an accepted header"
+
+    remaining, final_position = heap_store.scan_page(
+        person_table, at(35), limit=2, position=position
+    )
+    assert final_position is None
+    assert [(version.record_id, version.xmin) for _ref, version in remaining] == [(2, 30)]
+    assert constructions == 4, "continuation reinspects and accepts its first visible header"
+
+
+def test_committed_high_water_still_reads_complete_headers(
+    heap_store: HeapStore,
+    person_table: TableDef,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = heap_store.insert(person_table, 1, (1, "first"), xmin=5)
+    heap_store.insert(person_table, 2, (2, "second"), xmin=11)
+    heap_store.delete(person_table, first, xmax=17)
+    constructions: list[int] = []
+    original = RecordHeader.__init__
+
+    def counted(self: RecordHeader, *args: object, **kwargs: object) -> None:
+        original(self, *args, **kwargs)
+        constructions.append(self.record_id)
+
+    monkeypatch.setattr(RecordHeader, "__init__", counted)
+
+    assert heap_store.committed_high_water(person_table) == 17
+    assert constructions == [1, 2]
 
 
 def test_scan_all_shows_what_a_snapshot_hides(
@@ -2100,7 +2219,10 @@ def test_the_tail_is_remembered_across_an_append_that_grew_the_chain(
 
 
 def test_a_record_slot_too_short_for_its_header_is_refused(
-    pool: BufferPool, heap_store: HeapStore, person_table: TableDef
+    pool: BufferPool,
+    heap_store: HeapStore,
+    person_table: TableDef,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Without the floor a raw struct.error leaves scan() and read(): unpack_from on a slot that
     is shorter than the header it is asked for.
@@ -2111,14 +2233,21 @@ def test_a_record_slot_too_short_for_its_header_is_refused(
     forged.insert_slot(struct.pack("<I", person_table.table_id))
     forged.insert_slot(bytes(10))
     assert heap_store.apply_page_image(reference.page, pool.codec.encode_page(forged))
+    unpack = HeaderUnpackCounter(record_module._HEADER_STRUCT)
+    monkeypatch.setattr(record_module, "_HEADER_STRUCT", unpack)
     for door in (
         lambda: heap_store.read(RecordRef(page=reference.page, slot=1)),
+        lambda: list(heap_store.scan(person_table, at(100))),
+        lambda: heap_store.scan_page(person_table, at(100), limit=1),
+        lambda: heap_store.lookup(person_table, 1, at(100)),
         lambda: list(heap_store.scan_all(person_table)),
+        lambda: heap_store.committed_high_water(person_table),
     ):
         with pytest.raises(GrafxCorruptionDetected) as raised:
             door()
-        assert raised.value.details["field"] == "record_header"
-        assert raised.value.details["value"] == 10
+        assert raised.value.message == "A record header needs 40 bytes; got 10."
+        assert raised.value.details == {"field": "record_header", "value": 10}
+        assert unpack.calls == 0, "the length guard must run before struct unpack"
 
 
 # --- D2: a refusal a caller is meant to retry must not have written anything durable ------------

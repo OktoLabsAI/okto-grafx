@@ -1055,9 +1055,9 @@ class HeapStore:
         self, table: TableDef, snapshot: SnapshotLike
     ) -> Iterator[tuple[RecordRef, HeapVersion]]:
         """Yield every version of the table the snapshot can see, in storage order."""
-        def visible(header: RecordHeader) -> bool:
+        def visible(_record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
             """Return whether this snapshot may observe the record header."""
-            return snapshot.visible(header.xmin, header.xmax)
+            return snapshot.visible(xmin, xmax)
 
         for ref, header, content in self._walk(table, accept=visible):
             yield ref, self._decode_version_with_header(table, header, content)
@@ -1144,9 +1144,20 @@ class HeapStore:
                     if slot < max(start_slot, FIRST_RECORD_SLOT):
                         continue
                     view = page.slot_view(slot)
-                    header = RecordHeader.decode(view)
-                    if not snapshot.visible(header.xmin, header.xmax):
+                    fields = RecordHeader.peek(view)
+                    (
+                        _flags,
+                        _reserved,
+                        _schema_version,
+                        _payload_len,
+                        _record_id,
+                        xmin,
+                        xmax,
+                        _previous,
+                    ) = fields
+                    if not snapshot.visible(xmin, xmax):
                         continue
+                    header = RecordHeader._from_peek(fields)
                     if len(selected) == limit:
                         next_position = _HeapScanPosition(
                             page=index,
@@ -1206,11 +1217,9 @@ class HeapStore:
         self, table: TableDef, record_id: RecordId, snapshot: SnapshotLike
     ) -> HeapVersion | None:
         """Return the version of that record the snapshot can see, or None when there is none."""
-        def wanted(header: RecordHeader) -> bool:
+        def wanted(candidate: RecordId, xmin: Csn, xmax: Csn) -> bool:
             """Return whether this version is the requested row visible to the snapshot."""
-            return header.record_id == record_id and snapshot.visible(
-                header.xmin, header.xmax
-            )
+            return candidate == record_id and snapshot.visible(xmin, xmax)
 
         for _ref, header, content in self._walk(table, accept=wanted):
             return self._decode_version_with_header(table, header, content)
@@ -1871,15 +1880,17 @@ class HeapStore:
         self,
         table: TableDef,
         *,
-        accept: Callable[[RecordHeader], bool] | None = None,
+        accept: Callable[[RecordId, Csn, Csn], bool] | None = None,
         copy_content: bool = True,
     ) -> Iterator[tuple[RecordRef, RecordHeader, bytes]]:
         """Yield every stored version of the table with its location and its raw content.
 
-        One page at a time is pinned. Every header is decoded from a read-only slot view, but only
-        accepted content is copied before the pin is released. Following an overflow chain never
-        needs a second frame while a data page is still held. Header-only callers may also suppress
-        every content copy.
+        One page at a time is pinned. A predicate sees ``record_id``, ``xmin`` and ``xmax`` from
+        one struct unpack of the read-only slot view. Rejected rows never materialize a
+        :class:`RecordHeader`; accepted rows materialize the complete header from those same
+        unpacked fields. Only accepted content is copied before the pin is released. Following an
+        overflow chain never needs a second frame while a data page is still held. Header-only
+        callers may also suppress every content copy.
         """
         extent = self._find_extent(table.table_id)
         if extent is None:
@@ -1906,9 +1917,23 @@ class HeapStore:
                     if slot < FIRST_RECORD_SLOT:
                         continue
                     view = page.slot_view(slot)
-                    header = RecordHeader.decode(view)
-                    if accept is not None and not accept(header):
-                        continue
+                    if accept is None:
+                        header = RecordHeader.decode(view)
+                    else:
+                        fields = RecordHeader.peek(view)
+                        (
+                            _flags,
+                            _reserved,
+                            _schema_version,
+                            _payload_len,
+                            record_id,
+                            xmin,
+                            xmax,
+                            _previous,
+                        ) = fields
+                        if not accept(record_id, xmin, xmax):
+                            continue
+                        header = RecordHeader._from_peek(fields)
                     items.append((slot, header, bytes(view) if copy_content else b""))
                 following = page.next_page
             for slot, header, content in items:
