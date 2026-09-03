@@ -105,7 +105,9 @@ As referências desta seção são da base `ead05a4`; linhas devem ser recalcula
 - `_write_back` altera a geração física/CRC da página: `buffer_pool.py:1490-1554`; `apply_page_image` materializa a imagem lógica: `:1885-1927`.
 - o índice hash usa 64 buckets por default e percorre a cadeia do bucket: `domain/index/keys.py:49` e `index_manager.py:2223-2230,2259-2270,2554-2598`.
 - `RecordId` cabe em `u64`, enquanto o codec público `INT64` é assinado: `heap_store.py:237-256` e `domain/model/value.py:375-383`.
-- `live_count()` e o build vetorial ainda executam walks integrais, mas a presença desse custo no backfill não foi demonstrada: `vector_engine.py:675-677,846-870,1815-1858`.
+- o build vetorial ainda executa um walk integral. D-12 agora faz `live_count()` caminhar apenas
+  quando não há contagem derivada certificada; hits quentes continuam passando pela cerca de page 0,
+  mas não decodificam novamente todas as entradas. A presença do build no backfill não foi demonstrada.
 
 ## 6. Ordem fixa de execução
 
@@ -291,7 +293,8 @@ Testes focados rodam por item. Suítes longas podem ser acumuladas após P1.2–
 | D-09 | P1.7 condicional; diferencial correto é imagem WAL antiga × nova |
 | D-10 | candidata P2-DIRTY após P1.1 e desenho formal |
 | D-11 | deferida; corrigir contagem 4→3 e autoridade do subplano antes de repropor |
-| D-12..D-17 | lane vetorial futura; D-15 cache persistida explicitamente removida |
+| D-12 | promovida sem formato: cardinalidade derivada cercada, exata após primeira leitura e incremental em `(key, ref)` |
+| D-13..D-17 | lane vetorial futura; D-15 cache persistida explicitamente removida |
 | D-18 | experimento de cota após P1, não gate nem escopo obrigatório |
 | D-19..D-22 | lane NT-1 futura; só após call counts, microbench e microprotótipo ABI real; adapter por instância |
 | D-23 | P0.3, somente pós-drain em cópia e sem `--locals` |
@@ -363,6 +366,7 @@ O consenso não autoriza mudança de formato, redução das garantias concorrent
 | 2026-09-03 | P1.2 — D-01 | promovido | origem `perf/v002-d01-header-peek@1239a0e`; integrado em `b23bcbc` + `07dfb02`; suíte focada de heap e Ruff verdes |
 | 2026-09-03 | P1.3 — D-04 | promovido e limitado por cardinalidade | origem `perf/v002-d04-index-version@e898fe7`; integrado em `2e6bbf9` + `f6e7531` + `873f419` + `bc3ede4`; somente PK automática reutiliza a versão, enquanto endpoint/índice geral preserva leitura lazy e memória limitada; gates focados verdes |
 | 2026-09-03 | P1.4 — D-02 | protótipo cauda-primeiro rejeitado; substituição estrita em implementação | o protótipo ocultou uma duplicata corrupta visível no início da cadeia. A substituição escolhida mantém cursor incremental cabeça→cauda, memo por transação/snapshot/tabela, quota e fallback ao lookup canônico, visando `O(N+E)` sem mudar a superfície fail-closed |
+| 2026-09-03 | lane vetorial — D-12 | promovido e endurecido | `df09c2e` integrou a contagem cercada; a revisão adversarial recusou deltas identificados apenas por `ref`; `6f6b410` alinhou a identidade a `(key, ref)` sem retirar o update incremental do HNSW e `16fbc0a` tornou falhas do cache derivado conservadoras, nunca falhas pós-barreira. Regressão integrada dos três arquivos afetados verde, Ruff e diff-check verdes; nenhum formato/WAL/protocolo de concorrência mudou |
 | 2026-09-03 | P0.2 — instrumentos reproduzíveis | concluído; execução pós-drain permanece em P0.3/P0.4 | primitivas integradas em `c276dec`; driver autenticado integrado em `be286fa` + `2d43d75`, com origem imutável `perf/v002-p0-card-driver@e8a6be0`. Cada run usa clone integral descartável, pins separados de Community/Core, rota Grafx autenticada, lifecycle público de exatamente um card, oráculos de ACK/audit, RAW sem hooks e instrumentação bounded/reversível. `warm` é leitura sequencial provada, `mixed` é cache não controlado, `cold` é recusado; budget diferente dos 64 MiB realmente suportados também é recusado. Regressão focada 46/46, Ruff, `py_compile`, diff-check e duas auditorias adversariais PASS; smokes sintéticos RAW/instrumentado passaram, sem acesso ao board vivo e sem comparação inválida entre os dois modos |
 | 2026-09-03 | P0.3 — perfil/censo | instrumentos concluídos; execução pós-drain pendente | `perf/v002-p0-census@222a854`: localidade dinâmica de endpoint e atividade vetorial no replay, profiler py-spy one-shot com READY/GO e contadores pré-GO, além de censo agregado read-only com inventário imutável e reconciliação independente. Regressão combinada 98/98, Ruff, `py_compile`, diff-check e smokes sintéticos/isolados verdes; nenhum acesso ao board vivo |
 | 2026-09-03 | P0.3 — hardening adversarial | promovido | `89cb893` removeu o limite de 100 mil hits por agregação exata `(table_id, page) -> peso` e adicionou preflight que recusa launchers/trampolines antes do attach py-spy; focado 28/28, Ruff, py_compile e diff-check verdes; nenhum dado Pulse acessado |

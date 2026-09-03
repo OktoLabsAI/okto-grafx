@@ -218,6 +218,20 @@ lookup on quota exhaustion. P1.5 follows that port; P1.6 remains conditional. P1
 as the already-selected, byte-equivalent single-WAL-image change rather than waiting on a release
 performance gate.
 
+## Vector lane — exact fenced live cardinality (D-12)
+
+Status: **integrated on `feature/v0.0.2`**.
+
+The vector planner still enters the existing page-0 exact-view fence, but after the first canonical
+count it no longer walks and decodes every index entry on each search. Local warm updates maintain
+the count with the durable entry identity `(key, ref)`; foreign page-0 movement, RESET, REMOVE,
+rebase and graph retirement discard it and force one exact recount. The first implementation was
+rejected adversarially because key-mismatched no-op tombstones and same-ref/different-key inserts
+proved that `ref` alone is not an index-entry identity. The promoted sequence is `df09c2e` +
+`6f6b410` + `16fbc0a`; the last hardening ensures a derived-count inconsistency is discarded and
+can never fail an already durable commit. The incremental HNSW update remains intact, so the change
+does not trade the removed count walk for an `O(N)` rebuild after each local write.
+
 ## Test cadence
 
 - Each implementation gets focused tests for its changed contract and nearby regressions.
@@ -241,3 +255,4 @@ performance gate.
 | 2026-09-03 | P0.2 authenticated Pulse card driver | integrated at `be286fa` + `2d43d75` from `perf/v002-p0-card-driver@e8a6be0`; 46 focused tests and static checks passed; synthetic RAW/instrumented lifecycle smokes passed without touching the live board; P0.3/P0.4 execution remains pending |
 | 2026-09-03 | P0.3 profiler/census tooling | published on `perf/v002-p0-census@222a854`; endpoint locality, dynamic vector activity, guarded py-spy capture and reconciled read-only census implemented; combined milestone regression 98/98 passed; real corpus execution waits for the live backfill to drain |
 | 2026-09-03 | P0.3 profiler/census hardening | `89cb893`; exact per-page endpoint weights replace the 100k-hit cap, direct-interpreter preflight prevents wrong-PID attach; focused 28/28 and Ruff passed; no Pulse data accessed |
+| 2026-09-03 | Vector D-12 integrated | `df09c2e` + `6f6b410` + `16fbc0a`; exact page-0-fenced count becomes hot `O(1)`, entry identity is `(key, ref)`, local HNSW updates stay incremental, foreign/recovery changes fall back to an exact walk; integrated focused vector/concurrency suite, Ruff and diff-check passed |
