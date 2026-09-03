@@ -165,11 +165,19 @@ __all__ = [
     "Database",
     "DatabaseIdentity",
     "MetaStore",
+    "Query",
+    "QueryCursor",
     "ScanCursorV1",
     "ScanPageV1",
     "ScanRowV1",
     "Transaction",
 ]
+
+DEFAULT_QUERY_CURSOR_BATCH_ROWS: int = 256
+"""Rows pulled per iterator refill when a caller does not select a cursor batch size."""
+
+MAX_QUERY_CURSOR_BATCH_ROWS: int = 65_536
+"""Hard guard against turning one streaming pull back into an unbounded materialisation."""
 
 META_FILE: str = "grafx.meta"
 """The identity file of a database (CONTRACT.md section 6.1).
@@ -739,6 +747,205 @@ def _scan_cursor_payload(
             value="malformed",
         )
     return observed_table_id, observed_schema_version, observed_position, value
+
+
+def _query_cursor_batch_size(value: object) -> int:
+    """Return one bounded exact cursor batch size."""
+    size = _require_positive_integer("batch_size", value)
+    if size > MAX_QUERY_CURSOR_BATCH_ROWS:
+        raise GrafxConfigurationError(
+            f"A query cursor batch may contain at most {MAX_QUERY_CURSOR_BATCH_ROWS} rows; "
+            f"got {size}.",
+            field="batch_size",
+            value=size,
+            maximum=MAX_QUERY_CURSOR_BATCH_ROWS,
+        )
+    return size
+
+
+class Query:
+    """A canonical read statement that can open independent snapshot-owning cursors."""
+
+    __slots__ = ("_database", "_parameters", "_text")
+
+    def __init__(
+        self,
+        database: Database,
+        text: str,
+        parameters: Mapping[str, object] | None,
+    ) -> None:
+        self._database = database
+        self._text = text
+        self._parameters = parameters
+
+    def cursor(
+        self, *, batch_size: int = DEFAULT_QUERY_CURSOR_BATCH_ROWS
+    ) -> QueryCursor:
+        """Open a cursor whose read transaction lives until exhaustion or explicit close."""
+        return self._database._open_query_cursor(
+            self._text,
+            self._parameters,
+            batch_size=_query_cursor_batch_size(batch_size),
+        )
+
+
+class QueryCursor:
+    """A bounded pull cursor over one fixed MVCC read snapshot.
+
+    Iteration refills at most ``batch_size`` detached rows at a time.  The cursor owns its read
+    transaction and releases the reader pin on exhaustion, :meth:`close`, or context-manager
+    exit.  It is intentionally not a write door and is not safe for concurrent consumption.
+    """
+
+    __slots__ = (
+        "_batch_size",
+        "_buffer",
+        "_buffer_position",
+        "_closed",
+        "_database",
+        "_raw",
+        "_source_done",
+        "_transaction",
+        "columns",
+        "plan",
+    )
+
+    def __init__(
+        self,
+        *,
+        database: Database,
+        transaction: Transaction,
+        raw: object,
+        columns: tuple[str, ...],
+        plan: PlanNode,
+        batch_size: int,
+    ) -> None:
+        self._database = database
+        self._transaction = transaction
+        self._raw = raw
+        self._batch_size = batch_size
+        self._buffer: tuple[tuple[Value, ...], ...] = ()
+        self._buffer_position = 0
+        self._source_done = False
+        self._closed = False
+        self.columns = columns
+        self.plan = plan
+
+    @property
+    def closed(self) -> bool:
+        """Return whether this cursor has released its snapshot and buffered rows."""
+        return self._closed
+
+    @property
+    def statistics(self) -> Mapping[str, int]:
+        """Return an immutable-shape snapshot of counters observed so far."""
+        observed = getattr(self._raw, "statistics", None)
+        if not isinstance(observed, dict):
+            raise GrafxConfigurationError(
+                "The query cursor collaborator returned malformed statistics.",
+                field="cursor.statistics",
+                value=_builtin_type_name(observed),
+            )
+        # QueryResult performs the same exact integer/name validation as execute().  Return its
+        # copied dictionary rather than exposing the engine's live counter map.
+        return QueryResult(statistics=dict(observed)).statistics
+
+    def fetchone(self) -> tuple[Value, ...] | None:
+        """Return the next detached row, or ``None`` after exhaustion."""
+        batch = self.fetchmany(1)
+        return None if not batch else batch[0]
+
+    def fetchmany(self, size: int | None = None) -> tuple[tuple[Value, ...], ...]:
+        """Return at most ``size`` detached rows without materialising the remaining result."""
+        wanted = self._batch_size if size is None else _query_cursor_batch_size(size)
+        if self._closed:
+            return ()
+        self._require_database_open()
+        selected: list[tuple[Value, ...]] = []
+        while self._buffer_position < len(self._buffer) and len(selected) < wanted:
+            selected.append(self._buffer[self._buffer_position])
+            self._buffer_position += 1
+        if self._buffer_position == len(self._buffer):
+            self._buffer = ()
+            self._buffer_position = 0
+        if len(selected) < wanted and not self._source_done:
+            rows, exhausted = self._database._fetch_query_cursor(
+                self,
+                wanted - len(selected),
+            )
+            selected.extend(rows)
+            self._source_done = exhausted
+        if self._source_done and not self._buffer:
+            self._closed = True
+        return tuple(selected)
+
+    def close(self) -> None:
+        """Discard unread rows and release the owned read snapshot idempotently."""
+        if self._closed:
+            return
+        self._buffer = ()
+        self._buffer_position = 0
+        try:
+            self._database._close_query_cursor(self)
+        finally:
+            self._source_done = True
+            self._closed = True
+
+    def __iter__(self) -> QueryCursor:
+        return self
+
+    def __next__(self) -> tuple[Value, ...]:
+        if self._closed:
+            raise StopIteration
+        self._require_database_open()
+        if self._buffer_position >= len(self._buffer):
+            rows, exhausted = self._database._fetch_query_cursor(
+                self,
+                self._batch_size,
+            )
+            self._buffer = rows
+            self._buffer_position = 0
+            self._source_done = exhausted
+            if not rows:
+                self._closed = True
+                raise StopIteration
+        row = self._buffer[self._buffer_position]
+        self._buffer_position += 1
+        if self._buffer_position == len(self._buffer):
+            self._buffer = ()
+            self._buffer_position = 0
+            if self._source_done:
+                self._closed = True
+        return row
+
+    def __enter__(self) -> QueryCursor:
+        return self
+
+    def _require_database_open(self) -> None:
+        """Make a database close terminal even when this cursor buffered detached rows."""
+        try:
+            self._database._require_open()
+        except BaseException as failure:
+            try:
+                self._database._close_query_cursor(self)
+            except BaseException as cleanup_failure:
+                _note_cleanup_failure(failure, cleanup_failure)
+            raise
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object,
+    ) -> None:
+        if exc_type is None:
+            self.close()
+            return
+        try:
+            self.close()
+        except BaseException as cleanup_failure:
+            if exc is not None:
+                _note_cleanup_failure(exc, cleanup_failure)
 
 
 class Transaction:
@@ -1697,6 +1904,188 @@ class Database:
             raise
         txn.commit()
         return result
+
+    def query(
+        self, text: str, parameters: Mapping[str, object] | None = None
+    ) -> Query:
+        """Return a reusable canonical read query whose cursors own their snapshots.
+
+        ``execute`` remains the materialised convenience and the only autocommit door for
+        statements that write.  This builder copies text and parameter values immediately, so
+        mutating the caller's containers after this call cannot change a later cursor.
+        """
+        with self._public_operation("query prepare"):
+            self._require_open()
+            statement = _query_text_snapshot(text)
+            detached_parameters = _query_parameters_snapshot(
+                parameters,
+                max_string_characters=self._max_query_value_characters,
+            )
+            return Query(self, statement, detached_parameters)
+
+    def _open_query_cursor(
+        self,
+        text: str,
+        parameters: Mapping[str, object] | None,
+        *,
+        batch_size: int,
+    ) -> QueryCursor:
+        """Open the internal stream and its owning read transaction as one public outcome."""
+        self._require_open()
+        transaction = self.begin("read")
+        raw: object | None = None
+        try:
+            with self._public_operation("query cursor open"):
+                self._require_open()
+                engine = self._require_component(
+                    "queries", self._queries, "the query engine (C10)"
+                )
+                with self._transactions.page_access_section():
+                    self._require_open()
+                    if not transaction._context.active:
+                        raise GrafxTransactionStateError(
+                            f"Transaction {transaction.txn_id} cannot open a query cursor.",
+                            txn_id=transaction.txn_id,
+                            state=transaction._context.state.value,
+                            operation="query_cursor",
+                        )
+                    self._public_contexts.setdefault(
+                        transaction.txn_id, transaction._context
+                    )
+                    opener = getattr(engine, "open_cursor", None)
+                    if not callable(opener):
+                        raise GrafxUnsupportedOperation(
+                            "The query engine of this composition has no streaming cursor door.",
+                            field="component",
+                            value="query_cursor",
+                        )
+                    raw = opener(text, transaction._context, parameters)
+                # Rebuild metadata after page access, just like the materialised result door.
+                columns = getattr(raw, "columns", None)
+                plan = getattr(raw, "plan", None)
+                fetch = getattr(raw, "fetch", None)
+                close = getattr(raw, "close", None)
+                if not callable(fetch) or not callable(close):
+                    raise GrafxConfigurationError(
+                        "The query engine returned a malformed cursor collaborator.",
+                        field="cursor",
+                        value=_builtin_type_name(raw),
+                    )
+                metadata = _query_result_view(
+                    QueryResult(columns=columns, plan=plan),  # type: ignore[arg-type]
+                    max_string_characters=self._max_query_value_characters,
+                )
+                if metadata.plan is None:
+                    raise GrafxConfigurationError(
+                        "A query cursor must expose the plan that produces it.",
+                        field="cursor.plan",
+                        value=None,
+                    )
+                return QueryCursor(
+                    database=self,
+                    transaction=transaction,
+                    raw=raw,
+                    columns=metadata.columns,
+                    plan=metadata.plan,
+                    batch_size=batch_size,
+                )
+        except BaseException as failure:
+            if raw is not None:
+                try:
+                    closer = getattr(raw, "close", None)
+                    if callable(closer):
+                        closer()
+                except BaseException as cleanup_failure:
+                    _note_cleanup_failure(failure, cleanup_failure)
+            try:
+                if transaction.active:
+                    transaction.rollback()
+            except BaseException as cleanup_failure:
+                _note_cleanup_failure(failure, cleanup_failure)
+            raise
+
+    def _fetch_query_cursor(
+        self, cursor: QueryCursor, limit: int
+    ) -> tuple[tuple[tuple[Value, ...], ...], bool]:
+        """Pull and detach one bounded cursor batch, settling its snapshot at EOF."""
+        if type(cursor) is not QueryCursor or cursor._database is not self:
+            raise GrafxConfigurationError(
+                "A query cursor can only be consumed by the database that opened it.",
+                field="cursor",
+                value=_builtin_type_name(cursor),
+            )
+        try:
+            with self._public_operation("query cursor fetch"):
+                self._require_open()
+                transaction = cursor._transaction
+                transaction._require_active()
+                with self._transactions.page_access_section():
+                    self._require_open()
+                    transaction._require_active()
+                    observed = cursor._raw.fetch(limit)
+                if type(observed) is not tuple or len(observed) != 2:
+                    raise GrafxConfigurationError(
+                        "The query cursor collaborator returned a malformed batch.",
+                        field="cursor.batch",
+                        value=_builtin_type_name(observed),
+                    )
+                raw_rows, raw_exhausted = observed
+                if type(raw_exhausted) is not bool:
+                    raise GrafxConfigurationError(
+                        "The query cursor collaborator returned a malformed EOF marker.",
+                        field="cursor.exhausted",
+                        value=_builtin_type_name(raw_exhausted),
+                    )
+                detached = _query_result_view(
+                    QueryResult(columns=cursor.columns, rows=raw_rows),  # type: ignore[arg-type]
+                    max_string_characters=self._max_query_value_characters,
+                )
+            if raw_exhausted:
+                self._settle_query_cursor(cursor)
+            return detached.rows, raw_exhausted
+        except BaseException as failure:
+            try:
+                self._close_query_cursor(cursor)
+            except BaseException as cleanup_failure:
+                _note_cleanup_failure(failure, cleanup_failure)
+            raise
+
+    def _settle_query_cursor(self, cursor: QueryCursor) -> None:
+        """Release an exhausted cursor's reader pin without re-closing its engine stream."""
+        transaction = cursor._transaction
+        if transaction.active:
+            transaction.rollback()
+
+    def _close_query_cursor(self, cursor: QueryCursor) -> None:
+        """Close a cursor stream and its read transaction, attempting both cleanup halves."""
+        failure: BaseException | None = None
+        try:
+            raw_close = getattr(cursor._raw, "close", None)
+            if callable(raw_close):
+                try:
+                    if not self._closed and cursor._transaction.active:
+                        with self._public_operation("query cursor close"):
+                            with self._transactions.page_access_section():
+                                raw_close()
+                    else:
+                        raw_close()
+                except BaseException as caught:
+                    failure = caught
+            try:
+                if cursor._transaction.active:
+                    cursor._transaction.rollback()
+            except BaseException as caught:
+                if failure is None:
+                    failure = caught
+                else:
+                    _note_cleanup_failure(failure, caught)
+        finally:
+            cursor._buffer = ()
+            cursor._buffer_position = 0
+            cursor._source_done = True
+            cursor._closed = True
+        if failure is not None:
+            raise failure
 
     def explain(self, text: str) -> PlanNode:
         """Plan one statement without exposing the mutable query engine."""

@@ -23,7 +23,13 @@ from dataclasses import fields
 
 from okto_grafx.api.assembly import assemble_database
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxError
-from okto_grafx.engine.database import Database, DatabaseIdentity, Transaction
+from okto_grafx.engine.database import (
+    Database,
+    DatabaseIdentity,
+    Query,
+    QueryCursor,
+    Transaction,
+)
 from okto_grafx.engine.query_engine import QueryResult
 from okto_grafx.runtime.bootstrap import build_default_registry, open_database
 from okto_grafx.runtime.config import DatabaseConfig
@@ -34,6 +40,8 @@ __all__ = [
     "DatabaseConfig",
     "DatabaseIdentity",
     "PortRegistry",
+    "Query",
+    "QueryCursor",
     "QueryResult",
     "Transaction",
     "assemble_database",

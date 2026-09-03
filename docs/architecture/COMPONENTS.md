@@ -736,6 +736,12 @@ is charged only as result; a terminal with no public columns is charged as inter
 Both paths raise non-retryable `GrafxQueryBudgetExceeded` and neither truncates state nor hands a
 partial write statement to its transaction.
 
+The additive public terminal stream is `Database.query(...).cursor()`. It owns an independent read
+transaction and fixed snapshot, pulls at most its configured batch, detaches values after page
+access and retains no page pin between pulls. Closing early discards only unread result rows and
+releases the reader; plans that write are refused before execution and remain materialised through
+`execute()`. Blocking operators below this terminal are unchanged.
+
 `max_traversal_expansions` and `max_traversal_paths` add two independent, opt-in cumulative budgets
 for graph-pattern work over the whole query. The first charges each relationship candidate before
 the remaining operator-local landing/repeat or pushed-predicate work; the second charges a visible,
@@ -746,8 +752,8 @@ preserve the old statistics surface; enabled fields report their admitted counte
 For a grouped endpoint fallback the candidate is what its adjacency map yields, not every physical
 relationship row read once to construct that map; the underlying auxiliary scan remains uncharged.
 
-The scope is deliberately admission, not complete query memory: there is no streaming-result,
-deadline, spill or byte/RSS budget here. Sort, aggregate, distinct and eager operators may retain up
+The scope is deliberately admission plus bounded terminal streaming, not complete query memory:
+there is no deadline, spill or byte/RSS budget here. Sort, aggregate, distinct and eager operators may retain up
 to the admitted rows or states before their first yield; payload bytes, internal structures and
 non-traversal auxiliary scans are not charged.
 

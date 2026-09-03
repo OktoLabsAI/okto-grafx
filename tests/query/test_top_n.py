@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import heapq
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import cast
@@ -254,21 +253,20 @@ def test_top_n_never_retains_more_than_skip_plus_limit(
     stack: QueryStack, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The physical heap is bounded by K even though every child row is consumed."""
-    real_push = heapq.heappush
-    real_replace = heapq.heapreplace
+    real_push = query_engine._top_heap_push
+    real_replace = query_engine._top_heap_replace
     observed_sizes: list[int] = []
 
     def recording_push(heap: list[object], item: object) -> None:
         real_push(heap, item)
         observed_sizes.append(len(heap))
 
-    def recording_replace(heap: list[object], item: object) -> object:
-        replaced = real_replace(heap, item)
+    def recording_replace(heap: list[object], item: object) -> None:
+        real_replace(heap, item)
         observed_sizes.append(len(heap))
-        return replaced
 
-    monkeypatch.setattr(query_engine, "heappush", recording_push)
-    monkeypatch.setattr(query_engine, "heapreplace", recording_replace)
+    monkeypatch.setattr(query_engine, "_top_heap_push", recording_push)
+    monkeypatch.setattr(query_engine, "_top_heap_replace", recording_replace)
 
     found = _run(
         stack,
@@ -287,7 +285,7 @@ def test_an_unbounded_sort_does_not_use_the_top_n_heap(
     def unexpected(*_args: object) -> None:
         raise AssertionError("an unbounded sort entered the top-N heap")
 
-    monkeypatch.setattr(query_engine, "heappush", unexpected)
+    monkeypatch.setattr(query_engine, "_top_heap_push", unexpected)
     assert len(_run(stack, "MATCH (p:Person) RETURN p.id ORDER BY p.id").rows) == len(
         ROWS
     )

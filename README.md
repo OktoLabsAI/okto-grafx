@@ -328,6 +328,26 @@ separately. `ScanCursorV1` is opaque, non-serializable, single-use and cannot cr
 table or database. This is a physical scan primitive for adapters, not a portable backup format
 or bulk import API.
 
+### Streaming query results
+
+`execute()` remains the convenient materialised result. For a large read result, a query cursor
+keeps one MVCC snapshot and detaches at most one bounded batch at a time:
+
+```python
+query = db.query("MATCH (c:Chunk) RETURN c.id, c.body")
+with query.cursor(batch_size=256) as rows:
+    for chunk_id, body in rows:
+        consume(chunk_id, body)
+```
+
+`Query` copies its text and parameters when it is created and may open independent cursors.
+`QueryCursor` accepts only read plans with `RETURN`; writes continue through `execute()` so early
+cursor close can never commit a prefix. The cursor owns and releases its read transaction on EOF,
+explicit `close()` or context-manager exit. It never retains a page pin or page-access section
+between pulls, is not concurrently consumable, and bounds each iterator refill to `batch_size`
+(default 256, hard maximum 65,536). The internal operators named by the plan can still be blocking;
+streaming the terminal does not by itself make an unbounded sort, distinct or group bounded.
+
 ### Safe observations
 
 Properties such as `db.catalog`, `db.indexes`, `db.wal`, `db.storage` and `db.metrics` are frozen

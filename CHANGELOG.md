@@ -7,6 +7,12 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### Added
+
+- Added snapshot-owning, read-only query cursors through `db.query(...).cursor()`. Iteration pulls
+  detached results in bounded batches without materialising the public terminal; early close can
+  never stage a write and always releases the reader transaction.
+
 ### Changed
 
 - Bumped the development version to `0.0.2` and started the bounded performance round governed by

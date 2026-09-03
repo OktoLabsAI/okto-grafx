@@ -50,7 +50,6 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
-from heapq import heappop, heappush, heapreplace
 from math import isnan
 from typing import cast
 
@@ -549,6 +548,217 @@ class _Row:
     bindings: dict[str, object]
     computed: dict[Expression, object] | None = None
     columns: dict[str, object] | None = None
+
+
+_WRITE_PLAN_NODES: tuple[type[PlanNode], ...] = (
+    CreateNodeTable,
+    CreateRelTable,
+    CreateVectorSpace,
+    CreateRelationships,
+    MergePattern,
+    SetProperties,
+    DeleteEntities,
+)
+"""Operators a snapshot-owning result cursor must never execute incrementally."""
+
+
+def _plan_writes(root: PlanNode) -> bool:
+    """Return whether ``root`` contains an operator that can stage durable work.
+
+    A result cursor may be closed before exhaustion.  Incremental execution is therefore safe
+    only for a read plan: otherwise closing after the first batch would have to choose between
+    committing a prefix and silently discarding a statement.  The planner has only unary and
+    binary operator links, so this bounded walk covers the complete executable tree without
+    inspecting expression objects that happen to be dataclasses too.
+    """
+    pending: list[PlanNode] = [root]
+    seen: set[int] = set()
+    while pending:
+        node = pending.pop()
+        identity = id(node)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(node, _WRITE_PLAN_NODES):
+            return True
+        for name in ("child", "left", "right"):
+            child = getattr(node, name, None)
+            if isinstance(child, PlanNode):
+                pending.append(child)
+    return False
+
+
+class _QueryResultCursor:
+    """One internal, pull-driven execution over a fixed transaction snapshot.
+
+    This object never crosses the public facade.  It deliberately returns detached projected
+    value tuples, not ``_Row`` instances, and retains neither a page pin nor a page-access
+    section between pulls.  The public cursor owns the transaction that owns the snapshot and
+    closes both together.
+    """
+
+    __slots__ = (
+        "_active_seconds",
+        "_closed",
+        "_context",
+        "_engine",
+        "_reported",
+        "_rows",
+        "_seen",
+        "columns",
+        "plan",
+    )
+
+    def __init__(
+        self,
+        *,
+        engine: QueryEngine,
+        root: ProduceResults,
+        context: _Context,
+        rows: Iterator[_Row],
+        initial_seconds: float = 0.0,
+    ) -> None:
+        self._engine = engine
+        self._context = context
+        self._rows = rows
+        self._closed = False
+        self._reported = False
+        self._seen = 0
+        self._active_seconds = initial_seconds
+        self.columns = root.columns
+        self.plan = root
+
+    @property
+    def closed(self) -> bool:
+        """Return whether this execution can produce another batch."""
+        return self._closed
+
+    @property
+    def statistics(self) -> dict[str, int]:
+        """Return a snapshot of counters accumulated by rows consumed so far."""
+        return dict(self._context.statistics)
+
+    def fetch(self, limit: int) -> tuple[tuple[tuple[Value, ...], ...], bool]:
+        """Return at most ``limit`` projected rows and whether exhaustion was observed.
+
+        A batch containing exactly ``limit`` rows does not pull a hidden look-ahead row merely
+        to discover EOF.  Consequently a caller must either request the next batch or close its
+        context manager.  That rule prevents an early-closing cursor from evaluating work the
+        caller never requested and keeps ``max_result_rows`` charged at the single delivery
+        boundary.
+        """
+        if self._closed:
+            return (), True
+        started = self._engine._reading()
+        produced: list[tuple[Value, ...]] = []
+        exhausted = False
+        try:
+            while len(produced) < limit:
+                try:
+                    row = next(self._rows)
+                except StopIteration:
+                    exhausted = True
+                    break
+                observed = self._seen + 1
+                configured = self._engine._max_result_rows
+                if configured is not None and observed > configured:
+                    raise GrafxQueryBudgetExceeded(
+                        f"Query would exceed max_result_rows: limit {configured}, "
+                        f"observed {observed}.",
+                        field="max_result_rows",
+                        limit=configured,
+                        observed=observed,
+                    )
+                produced.append(_projected(row, self.columns))
+                self._seen = observed
+        except GrafxError as failure:
+            self._engine._count_error(failure)
+            self._accumulate_active(started)
+            try:
+                self._finish()
+            except BaseException as cleanup_failure:
+                failure.add_note(
+                    "Query cursor cleanup also failed with "
+                    f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+                )
+            raise
+        except BaseException as failure:
+            self._accumulate_active(started)
+            try:
+                self._finish()
+            except BaseException as cleanup_failure:
+                failure.add_note(
+                    "Query cursor cleanup also failed with "
+                    f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+                )
+            raise
+        self._accumulate_active(started)
+        if exhausted:
+            self._finish()
+        return tuple(produced), exhausted
+
+    def close(self) -> None:
+        """Stop the operator tree and release all statement-local retained state."""
+        self._finish()
+
+    def _finish(self) -> None:
+        """Perform the idempotent internal half of cursor settlement."""
+        if self._closed:
+            return
+        self._closed = True
+        failure: BaseException | None = None
+        close = getattr(self._rows, "close", None)
+        if callable(close):
+            try:
+                close()
+            except BaseException as caught:
+                failure = caught
+        # Cursor plans are statically read-only, so release cannot transfer row writes.  Calling
+        # the common release door still clears any statement-local admission lists if a future
+        # read operator starts recording dependencies.
+        try:
+            moved = self._context.release()
+            if moved:
+                raise GrafxTransactionStateError(
+                    "A read-only query cursor produced staged writes.",
+                    field="cursor",
+                    value="write_plan",
+                    rows=moved,
+                )
+        except BaseException as caught:
+            if failure is None:
+                failure = caught
+            else:
+                failure.add_note(
+                    "Query context release also failed with "
+                    f"{type(caught).__name__}: {caught}"
+                )
+        if not self._reported and self._engine._metrics.enabled:
+            self._reported = True
+            try:
+                self._engine._metrics.observe(
+                    _PHASE_DURATION,
+                    self._active_seconds,
+                    {"phase": PHASE_EXECUTE},
+                )
+                self._engine._metrics.observe(_ROWS_RETURNED, float(self._seen))
+            except BaseException as caught:
+                if failure is None:
+                    failure = caught
+                else:
+                    failure.add_note(
+                        "Query cursor metrics publication also failed with "
+                        f"{type(caught).__name__}: {caught}"
+                    )
+        if failure is not None:
+            raise failure
+
+    def _accumulate_active(self, started: float) -> None:
+        """Add one pull's engine-active time without counting consumer pauses."""
+        if not self._engine._metrics.enabled:
+            return
+        elapsed = self._engine._clock.monotonic() - started
+        self._active_seconds += elapsed if elapsed > 0.0 else 0.0
 
 
 _HELD_INSERT: str = "insert"
@@ -1993,6 +2203,85 @@ class QueryEngine:
         if self._metrics.enabled:
             self._metrics.observe(_ROWS_RETURNED, float(len(result.rows)))
         return result
+
+    def open_cursor(
+        self,
+        text: str,
+        txn: object,
+        parameters: Mapping[str, object] | None = None,
+    ) -> _QueryResultCursor:
+        """Open a pull-driven cursor for one read statement under ``txn``'s snapshot.
+
+        Incremental write execution is intentionally refused.  A caller may close a cursor at
+        any batch boundary, while a statement that writes is atomic only after its whole
+        pipeline has been evaluated and handed to the transaction.  ``execute`` remains the
+        materialised door for those statements.
+        """
+        mode = getattr(txn, "mode", None)
+        mode_name = getattr(mode, "value", mode)
+        if mode_name != "read":
+            failure = GrafxTransactionStateError(
+                "A query cursor owns a read-only snapshot; open it from a read transaction.",
+                field="cursor",
+                value="write_transaction",
+                mode=mode_name,
+            )
+            self._count_error(failure)
+            raise failure
+        statement = self.parse(text)
+        working = self._working.get(getattr(txn, "txn_id", None))
+        if working is not None and not self._txn_stages_catalog(txn):
+            working = None
+        plan = self._planned_for(statement, txn, working)
+        started = self._reading()
+        try:
+            root = plan.root
+            if not isinstance(root, ProduceResults) or not root.columns:
+                raise GrafxUnsupportedOperation(
+                    "A query cursor streams a read statement with a RETURN result; use "
+                    "execute() for schema or non-returning statements.",
+                    field="cursor",
+                    value=root.label,
+                )
+            if _plan_writes(root):
+                raise GrafxUnsupportedOperation(
+                    "A query cursor cannot incrementally execute a statement that writes; "
+                    "use execute() so the statement remains atomic.",
+                    field="cursor",
+                    value="write_plan",
+                )
+            bound = self._bind_parameters(plan, parameters)
+            coalesce_types = _bound_coalesce_types(plan, bound)
+            case_types = _bound_case_types(plan, bound)
+            statistics: dict[str, int] = {}
+            context = _Context(
+                engine=self,
+                txn=txn,
+                parameters=bound,
+                analysis=plan.analysis,
+                statistics=statistics,
+                coalesce_types=coalesce_types,
+                timestamp_values={},
+                case_types=case_types,
+                catalog=working,
+                result_node=root.child,
+                union_coercions=_bound_union_columns(plan, bound),
+            )
+            _bind_timestamp_values(plan, context)
+            _validate_bound_subscript_types(plan, bound)
+            _validate_bound_label_arguments(plan, bound)
+            rows = self._rows(root.child, context)
+            elapsed = self._clock.monotonic() - started if self._metrics.enabled else 0.0
+            return _QueryResultCursor(
+                engine=self,
+                root=root,
+                context=context,
+                rows=rows,
+                initial_seconds=elapsed if elapsed > 0.0 else 0.0,
+            )
+        except GrafxError as failure:
+            self._count_error(failure)
+            raise
 
     def __repr__(self) -> str:
         """Return a short representation naming which engines this one was given."""
@@ -4256,6 +4545,54 @@ class _TopCandidate:
         return other.precedes(self)
 
 
+def _top_heap_push(heap: list[_TopCandidate], candidate: _TopCandidate) -> None:
+    """Push one candidate while preserving the local worst-first binary heap."""
+    position = len(heap)
+    heap.append(candidate)
+    while position:
+        parent = (position - 1) // 2
+        incumbent = heap[parent]
+        if not candidate < incumbent:
+            break
+        heap[position] = incumbent
+        position = parent
+    heap[position] = candidate
+
+
+def _top_heap_replace(heap: list[_TopCandidate], candidate: _TopCandidate) -> None:
+    """Replace the worst candidate and restore the binary heap in O(log K)."""
+    heap[0] = candidate
+    _top_heap_sift_down(heap, 0)
+
+
+def _top_heap_pop(heap: list[_TopCandidate]) -> _TopCandidate:
+    """Remove and return the worst candidate in O(log K)."""
+    tail = heap.pop()
+    if not heap:
+        return tail
+    result = heap[0]
+    heap[0] = tail
+    _top_heap_sift_down(heap, 0)
+    return result
+
+
+def _top_heap_sift_down(heap: list[_TopCandidate], position: int) -> None:
+    """Move one rootward candidate down to its binary-heap position."""
+    length = len(heap)
+    candidate = heap[position]
+    while True:
+        left = position * 2 + 1
+        if left >= length:
+            break
+        right = left + 1
+        child = right if right < length and heap[right] < heap[left] else left
+        if not heap[child] < candidate:
+            break
+        heap[position] = heap[child]
+        position = child
+    heap[position] = candidate
+
+
 def _top_rows(
     engine: QueryEngine,
     node: SortRows,
@@ -4287,13 +4624,13 @@ def _top_rows(
             row=row,
         )
         if len(heap) < retained:
-            heappush(heap, candidate)
+            _top_heap_push(heap, candidate)
         elif candidate.precedes(heap[0]):
-            heapreplace(heap, candidate)
+            _top_heap_replace(heap, candidate)
 
     # The heap yields worst first under its reversed comparator. Popping all K entries and
     # reversing them restores exact query order in O(K log K), within the O(N log K) bound.
-    worst_first = [heappop(heap).row for _ in range(len(heap))]
+    worst_first = [_top_heap_pop(heap).row for _ in range(len(heap))]
     yield from reversed(worst_first)
 
 

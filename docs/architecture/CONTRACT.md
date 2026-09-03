@@ -1324,6 +1324,8 @@ metrics remain available.
 ```python
 from okto_grafx import (
     Database,
+    Query,
+    QueryCursor,
     QueryResult,
     ScanCursorV1,
     ScanPageV1,
@@ -1341,6 +1343,8 @@ with db.begin("write") as txn:
     txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
     txn.execute("CREATE (:Person {id: 1, name: 'Ada'})")
 result = db.execute("MATCH (p:Person) RETURN p.name")     # autocommit read
+with db.query("MATCH (p:Person) RETURN p.name").cursor(batch_size=256) as rows:
+    for row in rows: ...                                  # bounded terminal streaming
 report  = db.verify(scope="all")
 entries = db.ledger.list(origin_class="forensic")
 db.close()
@@ -1349,6 +1353,18 @@ db.close()
 with an open transaction aborts it and never corrupts. Every public method has an en-US docstring.
 `Timestamp` and `VectorValue` are the supported parameter/result value types for temporal and
 vector columns; integrations must not import their definitions through `okto_grafx.domain`.
+
+`Database.query(text, parameters=None) -> Query` snapshots the public inputs immediately.
+`Query.cursor(*, batch_size=256) -> QueryCursor` opens an independent read transaction and owns its
+fixed snapshot until EOF, explicit `close()` or context-manager exit. It accepts only a read plan
+with a `RETURN`; any write/schema/non-returning plan is refused before an operator row runs and
+continues to use materialised `execute()`. Each pull returns detached values after leaving page
+access, keeps no page pinned between pulls and retains at most the selected batch at the public
+terminal. `batch_size` is an exact positive integer no greater than 65,536. A full batch need not
+perform hidden look-ahead, so callers must exhaust or close the cursor. The cursor is neither
+serializable nor safe for concurrent consumption. `max_result_rows` remains cumulative over the
+cursor and refuses row N+1; early close accounts only rows actually pulled. Blocking operators
+below the terminal preserve their documented semantics and may still materialise internal state.
 
 `Transaction.scan_rows_v1(table, *, limit, cursor=None) -> ScanPageV1` is the bounded physical
 transfer door. It is valid only on an active read transaction and therefore reuses that
