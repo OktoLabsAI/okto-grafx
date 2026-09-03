@@ -292,6 +292,140 @@ class _HeapScanPosition:
     chain_limit: int
 
 
+class _VisibleRecordCursor:
+    """Resume one canonical, snapshot-filtered header walk without retaining a page pin.
+
+    The cursor is deliberately narrower than :meth:`HeapStore.scan_page`: endpoint validation
+    needs only the identity and physical reference of rows the snapshot can see.  Payloads stay
+    on the heap until the one requested candidate is revalidated and fully decoded.  One page is
+    inspected into a compact tuple before its pin is released, so pausing the cursor never keeps
+    a frame resident by capability.
+
+    ``admit_page`` lets the query engine charge the growing visited-page proof before it grows.
+    Keeping that proof is not optional: it preserves the canonical walk's immediate cycle
+    refusal instead of replacing it with a later chain-length failure.
+    """
+
+    __slots__ = (
+        "_store",
+        "_table",
+        "_snapshot",
+        "_admit_page",
+        "_next_page",
+        "_pending",
+        "_pending_at",
+        "_seen",
+        "_limit",
+        "_steps",
+        "_closed",
+    )
+
+    def __init__(
+        self,
+        store: HeapStore,
+        table: TableDef,
+        snapshot: SnapshotLike,
+        admit_page: Callable[[], None],
+    ) -> None:
+        """Capture the physical end and first page of this canonical walk."""
+        extent = store._find_extent(table.table_id)
+        self._store = store
+        self._table = table
+        self._snapshot = snapshot
+        self._admit_page = admit_page
+        self._next_page = NO_PAGE if extent is None else extent.first_page
+        self._pending: tuple[tuple[RecordRef, RecordId], ...] = ()
+        self._pending_at = 0
+        self._seen: set[PageIndex] = visited_pages()
+        self._limit = store._chain_limit()
+        self._steps = 0
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        """Return whether this cursor has released all of its derived state."""
+        return self._closed
+
+    def close(self) -> None:
+        """Release every retained header/reference and make the cursor terminal."""
+        self._pending = ()
+        self._pending_at = 0
+        self._seen.clear()
+        self._next_page = NO_PAGE
+        self._closed = True
+
+    def next_visible(self) -> tuple[RecordRef, RecordId] | None:
+        """Return the next visible identity in storage order, or None at the captured end."""
+        if self._closed:
+            return None
+        while True:
+            if self._pending_at < len(self._pending):
+                item = self._pending[self._pending_at]
+                self._pending_at += 1
+                return item
+            self._pending = ()
+            self._pending_at = 0
+            index = self._next_page
+            if index == NO_PAGE:
+                self.close()
+                return None
+
+            self._steps += 1
+            self._store._refuse_endless_chain(self._table, self._steps, self._limit)
+            if index in self._seen:
+                raise GrafxCorruptionDetected(
+                    f"The page chain of table {self._table.name!r} returns to page {index}.",
+                    file=self._store._file,
+                    page=index,
+                    field="cycle",
+                )
+            # Admission precedes the set growth.  A caller that refuses it can close this cursor
+            # and fall back to an ordinary canonical lookup without one unaccounted page entry.
+            self._admit_page()
+            self._seen.add(index)
+            selected: list[tuple[RecordRef, RecordId]] = []
+            with self._store._pool.pinned(self._store._file, index) as page:
+                self._store._require_table_page(page, self._table)
+                for slot in page.live_slots():
+                    if slot < FIRST_RECORD_SLOT:
+                        continue
+                    fields = RecordHeader.peek(page.slot_view(slot))
+                    (
+                        _flags,
+                        _reserved,
+                        _schema_version,
+                        _payload_len,
+                        record_id,
+                        xmin,
+                        xmax,
+                        _previous,
+                    ) = fields
+                    if self._snapshot.visible(xmin, xmax):
+                        selected.append((RecordRef(page=index, slot=slot), record_id))
+                following = page.next_page
+            if following != NO_PAGE and following >= self._limit - 1:
+                current_page_ceiling = self._store._chain_limit() - 1
+                if following >= current_page_ceiling:
+                    raise GrafxCorruptionDetected(
+                        f"The page chain of table {self._table.name!r} in "
+                        f"{self._store._file!r} points to page {following}, outside a file "
+                        f"with {current_page_ceiling} pages.",
+                        file=self._store._file,
+                        table=self._table.name,
+                        page=following,
+                        field="next_page",
+                        page_count=current_page_ceiling,
+                    )
+                # A concurrently appended page cannot contain a version visible to this older
+                # snapshot. Validate its type/owner, then keep the physical horizon captured at
+                # cursor creation instead of drifting into an unbounded stream of new pages.
+                with self._store._pool.pinned(self._store._file, following) as appended:
+                    self._store._require_table_page(appended, self._table)
+                following = NO_PAGE
+            self._next_page = following
+            self._pending = tuple(selected)
+
+
 @dataclass(frozen=True, slots=True)
 class TableExtent:
     """Where the pages of one table are: the first, the last, and how many there are."""
@@ -1051,6 +1185,67 @@ class HeapStore:
         table = self._catalog.catalog.table_by_id(table_id)
         return self._decode_version(table, content)
 
+    def _revalidate_visible_ref(
+        self,
+        table: TableDef,
+        ref: RecordRef,
+        record_id: RecordId,
+        snapshot: SnapshotLike,
+    ) -> HeapVersion | None:
+        """Fully decode one expected physical row and reapply the caller's snapshot.
+
+        This is an internal proof door, not an identity lookup.  The caller already has a
+        :class:`RecordRef`; accepting a different table or identity at that location would turn
+        a stale/malformed proof into a different row.  Those mismatches are corruption and are
+        never candidates for fallback.  Ordinary invisibility remains ``None``, matching
+        :meth:`lookup`.
+        """
+        _require_record_id(record_id)
+        table_id, content = self._read_slot(ref)
+        if table_id != table.table_id:
+            raise GrafxCorruptionDetected(
+                f"Endpoint reference {ref.page}:{ref.slot} belongs to table {table_id}, not to "
+                f"{table.name!r} with id {table.table_id}.",
+                file=self._file,
+                page=ref.page,
+                slot=ref.slot,
+                table=table.name,
+                table_id=table_id,
+                expected_table_id=table.table_id,
+                field="table_id",
+            )
+        version = self._decode_version(table, content)
+        if version.record_id != record_id:
+            raise GrafxCorruptionDetected(
+                f"Endpoint reference {ref.page}:{ref.slot} names record {version.record_id}, "
+                f"not record {record_id} of table {table.name!r}.",
+                file=self._file,
+                page=ref.page,
+                slot=ref.slot,
+                table=table.name,
+                table_id=table.table_id,
+                field="record_id",
+                expected_record_id=record_id,
+                observed_record_id=version.record_id,
+            )
+        if not snapshot.visible(version.xmin, version.xmax):
+            return None
+        return version
+
+    def _visible_record_cursor(
+        self,
+        table: TableDef,
+        snapshot: SnapshotLike,
+        *,
+        admit_page: Callable[[], None],
+    ) -> _VisibleRecordCursor:
+        """Return a resumable canonical header cursor for one table and snapshot."""
+        return _VisibleRecordCursor(self, table, snapshot, admit_page)
+
+    def _derived_read_epoch(self) -> int:
+        """Return the conservative epoch that vouches for derived heap walks."""
+        return self._pool.derived_epoch(self._file)
+
     def scan(
         self, table: TableDef, snapshot: SnapshotLike
     ) -> Iterator[tuple[RecordRef, HeapVersion]]:
@@ -1217,12 +1412,24 @@ class HeapStore:
         self, table: TableDef, record_id: RecordId, snapshot: SnapshotLike
     ) -> HeapVersion | None:
         """Return the version of that record the snapshot can see, or None when there is none."""
+        found = self._lookup_with_ref(table, record_id, snapshot)
+        return None if found is None else found[1]
+
+    def _lookup_with_ref(
+        self, table: TableDef, record_id: RecordId, snapshot: SnapshotLike
+    ) -> tuple[RecordRef, HeapVersion] | None:
+        """Return the first canonical visible version and its physical reference.
+
+        This internal sibling deliberately shares the public lookup's head-to-tail walk.  It is
+        reusable by any executor path that already needs an identity and cannot afford to throw
+        away the reference; it neither changes scan order nor adds a second visibility rule.
+        """
         def wanted(candidate: RecordId, xmin: Csn, xmax: Csn) -> bool:
             """Return whether this version is the requested row visible to the snapshot."""
             return candidate == record_id and snapshot.visible(xmin, xmax)
 
-        for _ref, header, content in self._walk(table, accept=wanted):
-            return self._decode_version_with_header(table, header, content)
+        for ref, header, content in self._walk(table, accept=wanted):
+            return ref, self._decode_version_with_header(table, header, content)
         return None
 
     def version_chain(self, ref: RecordRef) -> tuple[RecordRef, ...]:

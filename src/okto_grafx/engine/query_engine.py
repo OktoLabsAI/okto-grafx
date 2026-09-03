@@ -54,6 +54,7 @@ from typing import cast
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
+    GrafxCorruptionDetected,
     GrafxIndexError,
     GrafxEmbeddingSpaceMismatch,
     GrafxError,
@@ -64,7 +65,7 @@ from okto_grafx.domain.errors import (
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
 )
-from okto_grafx.domain.ids import NO_CSN
+from okto_grafx.domain.ids import NO_CSN, RecordId, RecordRef
 from okto_grafx.domain.index.keys import index_key
 from okto_grafx.domain.index.definition import (
     automatic_index_definitions,
@@ -219,6 +220,18 @@ PHASE_EXECUTE: str = "execute"
 _PHASE_DURATION = metric("oktografx_query_phase_duration_seconds").name
 _ROWS_RETURNED = metric("oktografx_query_rows_returned_count").name
 _ERRORS_TOTAL = metric("oktografx_query_errors_total").name
+
+# An endpoint locator is derived, transaction-local acceleration.  These two ceilings are its
+# complete memory contract: identifiers and the exact page-chain proof share one budget, and a
+# refusal silently returns the caller to the canonical lookup rather than refusing the query.
+# The estimates deliberately overcharge Python objects.  They are not persisted or exposed as a
+# database setting because changing either value may affect cost, never answers or durability.
+_ENDPOINT_LOCATOR_MAX_BYTES: int = 64 * 1024 * 1024
+_ENDPOINT_LOCATOR_MAX_ENTRIES: int = 1_000_000
+_ENDPOINT_LOCATOR_IDENTITY_BYTES: int = 128
+_ENDPOINT_LOCATOR_PAGE_BYTES: int = 96
+_ENDPOINT_LOCATOR_CURSOR_BYTES_PER_PAGE: int = 8
+_ENDPOINT_LOCATOR_CURSOR_BASE_BYTES: int = 512
 
 QUERY_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
@@ -859,6 +872,219 @@ class _SkipEffect:
 _SchemaEffect = _IndexSchemaEffect | _IndexObservationEffect | _VectorMapEffect | _SkipEffect
 
 
+class _EndpointLocatorCapacity(Exception):
+    """Internal signal that acceleration reached its complete memory allowance."""
+
+
+class _EndpointLocatorStale(Exception):
+    """Internal signal that a derived walk no longer describes the current heap view."""
+
+
+class _EndpointLocatorBudget:
+    """One shared, explicit memory allowance for all locators of one transaction."""
+
+    __slots__ = ("_max_bytes", "_max_entries", "_used_bytes", "_used_entries")
+
+    def __init__(self, *, max_bytes: int, max_entries: int) -> None:
+        self._max_bytes = max_bytes
+        self._max_entries = max_entries
+        self._used_bytes = 0
+        self._used_entries = 0
+
+    def reserve(self, *, bytes_: int, entries: int) -> None:
+        """Reserve derived state atomically, or ask the caller to use canonical lookup."""
+        next_bytes = self._used_bytes + bytes_
+        next_entries = self._used_entries + entries
+        if next_bytes > self._max_bytes or next_entries > self._max_entries:
+            raise _EndpointLocatorCapacity
+        self._used_bytes = next_bytes
+        self._used_entries = next_entries
+
+    def release(self, *, bytes_: int, entries: int) -> None:
+        """Return an exact reservation held by a closing locator."""
+        self._used_bytes -= bytes_
+        self._used_entries -= entries
+
+
+class _EndpointIdentityLocator:
+    """Resolve identities by one resumable canonical prefix walk under one stable view.
+
+    The map stores only the first snapshot-visible physical reference for an identity.  Its
+    value is therefore a reusable ``identity -> (RecordRef, HeapVersion)`` proof door rather
+    than an edge-specific cache; P1.5 may consume the same shape later without changing it.
+    Payloads are never retained.  The requested candidate is fully decoded from its physical
+    reference immediately before it is accepted.
+    """
+
+    __slots__ = (
+        "_budget",
+        "_charged_bytes",
+        "_charged_entries",
+        "_closed",
+        "_cursor",
+        "_epoch",
+        "_first",
+        "_heap",
+        "_snapshot",
+        "_table",
+    )
+
+    def __init__(
+        self,
+        *,
+        heap: HeapStore,
+        table: TableDef,
+        snapshot: object,
+        budget: _EndpointLocatorBudget,
+        page_size: int,
+    ) -> None:
+        self._heap = heap
+        self._table = table
+        self._snapshot = snapshot
+        self._budget = budget
+        self._epoch = heap._derived_read_epoch()
+        self._first: dict[RecordId, RecordRef] = {}
+        self._cursor = None
+        self._closed = False
+        self._charged_bytes = 0
+        self._charged_entries = 0
+        # A paused cursor owns at most one page's header/ref tuple plus its fixed fields.  Eight
+        # times page_size is intentionally conservative for Python tuple/integer overhead.
+        self._reserve(
+            bytes_=(
+                _ENDPOINT_LOCATOR_CURSOR_BASE_BYTES
+                + page_size * _ENDPOINT_LOCATOR_CURSOR_BYTES_PER_PAGE
+            ),
+            entries=1,
+        )
+        try:
+            self._cursor = heap._visible_record_cursor(
+                table, snapshot, admit_page=self._admit_page
+            )
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def table(self) -> TableDef:
+        """Return the exact schema definition that vouches for this derived state."""
+        return self._table
+
+    @property
+    def epoch(self) -> int:
+        """Return the conservative heap epoch captured before the walk began."""
+        return self._epoch
+
+    def locate(self, record_id: RecordId) -> tuple[RecordRef, HeapVersion] | None:
+        """Return the first canonical visible row, decoding only the requested candidate."""
+        self._require_current()
+        ref = self._first.get(record_id)
+        while ref is None and self._cursor is not None:
+            item = self._cursor.next_visible()
+            if item is None:
+                self._cursor = None
+                break
+            candidate_ref, candidate_id = item
+            if candidate_id not in self._first:
+                self._reserve(
+                    bytes_=_ENDPOINT_LOCATOR_IDENTITY_BYTES,
+                    entries=1,
+                )
+                self._first[candidate_id] = candidate_ref
+            if candidate_id == record_id:
+                ref = self._first[candidate_id]
+        self._require_current()
+        if ref is None:
+            return None
+        version = self._heap._revalidate_visible_ref(
+            self._table, ref, record_id, self._snapshot
+        )
+        self._require_current()
+        if version is None:
+            # A fixed snapshot cannot make a previously visible header disappear without the
+            # physical view changing.  If no epoch reports that change, fail closed instead of
+            # remembering absence over a contradictory proof.
+            raise GrafxCorruptionDetected(
+                f"The canonical reference {ref.page}:{ref.slot} for record {record_id} of "
+                f"{self._table.name!r} is not visible to the snapshot that selected it.",
+                file=self._heap.file,
+                page=ref.page,
+                slot=ref.slot,
+                table=self._table.name,
+                table_id=self._table.table_id,
+                record_id=record_id,
+                field="snapshot_visibility",
+            )
+        return ref, version
+
+    def close(self) -> None:
+        """Discard all derived references and release their complete shared reservation."""
+        if self._closed:
+            return
+        cursor = self._cursor
+        if cursor is not None:
+            cursor.close()
+        self._cursor = None
+        self._first.clear()
+        self._closed = True
+        self._budget.release(
+            bytes_=self._charged_bytes, entries=self._charged_entries
+        )
+        self._charged_bytes = 0
+        self._charged_entries = 0
+
+    def _admit_page(self) -> None:
+        """Charge one exact visited-page proof before the cursor grows it."""
+        self._require_current()
+        self._reserve(bytes_=_ENDPOINT_LOCATOR_PAGE_BYTES, entries=1)
+
+    def _reserve(self, *, bytes_: int, entries: int) -> None:
+        """Reserve and remember state so close can return it exactly once."""
+        self._budget.reserve(bytes_=bytes_, entries=entries)
+        self._charged_bytes += bytes_
+        self._charged_entries += entries
+
+    def _require_current(self) -> None:
+        """Refuse a derived answer after relink, cache drop or recovery apply."""
+        if self._closed or self._heap._derived_read_epoch() != self._epoch:
+            raise _EndpointLocatorStale
+
+
+class _EndpointTxnMemo:
+    """All bounded endpoint locators owned by one exact transaction and schema picture."""
+
+    __slots__ = (
+        "budget",
+        "disabled_tables",
+        "locators",
+        "schema",
+        "snapshot",
+        "txn",
+    )
+
+    def __init__(
+        self,
+        *,
+        txn: object,
+        snapshot: object,
+        schema: Catalog,
+        budget: _EndpointLocatorBudget,
+    ) -> None:
+        self.txn = txn
+        self.snapshot = snapshot
+        self.schema = schema
+        self.budget = budget
+        self.locators: dict[int, _EndpointIdentityLocator] = {}
+        self.disabled_tables: set[int] = set()
+
+    def close(self) -> None:
+        """Close every locator before this transaction/snapshot can be forgotten."""
+        for locator in tuple(self.locators.values()):
+            locator.close()
+        self.locators.clear()
+        self.disabled_tables.clear()
+
+
 class QueryEngine:
     """The query surface of one database (CONTRACT.md section 8.9).
 
@@ -882,6 +1108,8 @@ class QueryEngine:
         "_skipped_indexes",
         "_working",
         "_owner_memo",
+        "_endpoint_memo",
+        "_endpoint_budget",
         "_txn_effects",
         "_skip_claims",
         "_durable_skips",
@@ -928,6 +1156,14 @@ class QueryEngine:
         # the working catalog is, with the same shrug about a caller that never settles: txn
         # ids are never reused, so a stale entry can never be read.
         self._owner_memo: dict[int, dict[int, tuple[object, object, dict]]] = {}
+        # Endpoint identities are resolved by one bounded canonical prefix walk per table and
+        # transaction.  Unlike the owner landing memo this state is explicitly metered, because
+        # a write that names many identities must never create an unbounded executor cache.
+        self._endpoint_memo: dict[int, _EndpointTxnMemo] = {}
+        self._endpoint_budget = _EndpointLocatorBudget(
+            max_bytes=_ENDPOINT_LOCATOR_MAX_BYTES,
+            max_entries=_ENDPOINT_LOCATOR_MAX_ENTRIES,
+        )
         # Every out-of-transaction effect each open schema transaction has made -- indexes
         # registered, spaces attached, skip-report entries, index files created -- in the order
         # it made them. The rollback undo. Pruning by table id against the live catalog was
@@ -1608,6 +1844,7 @@ class QueryEngine:
                         self._skip_claims.pop(effect.table, None)
             self._working.pop(txn_id, None)
             self._owner_memo.pop(txn_id, None)
+            self._settle_endpoint_memo(txn_id)
             self._txn_effects.pop(txn_id, None)
             return
         # The transaction's own journal, replayed in reverse -- never a prune against a catalog.
@@ -1620,7 +1857,14 @@ class QueryEngine:
             self._unwind_schema_statement(effects or [])
         self._working.pop(txn_id, None)
         self._owner_memo.pop(txn_id, None)
+        self._settle_endpoint_memo(txn_id)
         self._txn_effects.pop(txn_id, None)
+
+    def _settle_endpoint_memo(self, txn_id: int) -> None:
+        """Close one transaction's bounded derived walks on commit, rollback or retry."""
+        memo = self._endpoint_memo.pop(txn_id, None)
+        if memo is not None:
+            memo.close()
 
     @property
     def skipped_indexes(self) -> tuple[str, ...]:
@@ -3653,6 +3897,189 @@ def _write_pattern(
     return _Row(bindings=bindings, computed=row.computed, columns=row.columns)
 
 
+def _endpoint_txn_memo(
+    engine: QueryEngine, context: _Context
+) -> _EndpointTxnMemo | None:
+    """Return the memo owned by this exact transaction, snapshot and catalog picture."""
+    txn_id = getattr(context.txn, "txn_id", None)
+    if isinstance(txn_id, bool) or not isinstance(txn_id, int):
+        return None
+    snapshot = context.snapshot
+    schema = context.schema()
+    memo = engine._endpoint_memo.get(txn_id)
+    if memo is not None and (
+        memo.txn is not context.txn
+        or memo.snapshot is not snapshot
+        or memo.schema is not schema
+    ):
+        memo.close()
+        engine._endpoint_memo.pop(txn_id, None)
+        memo = None
+    if memo is None:
+        memo = _EndpointTxnMemo(
+            txn=context.txn,
+            snapshot=snapshot,
+            schema=schema,
+            budget=engine._endpoint_budget,
+        )
+        engine._endpoint_memo[txn_id] = memo
+    return memo
+
+
+def _canonical_identity_with_ref(
+    engine: QueryEngine,
+    context: _Context,
+    table: TableDef,
+    record_id: RecordId,
+) -> tuple[RecordRef, HeapVersion] | None:
+    """Use the unchanged canonical heap order for a non-accelerated identity proof."""
+    return engine.heap._lookup_with_ref(table, record_id, context.snapshot)
+
+
+def _visible_identity_with_ref(
+    engine: QueryEngine,
+    context: _Context,
+    table: TableDef,
+    record_id: RecordId,
+) -> tuple[RecordRef, HeapVersion] | None:
+    """Resolve one identity under this snapshot through a bounded, reusable prefix locator.
+
+    This is intentionally independent of CREATE relationship.  It returns the generic
+    ``RecordRef + HeapVersion`` pair P1.5 will need, while the transaction-owned lifecycle and
+    memory policy remain in the executor.  Capacity and stale derived state are the only two
+    reasons to fall back.  Stored-data mismatches and corruption propagate unchanged.
+    """
+    memo = _endpoint_txn_memo(engine, context)
+    if memo is None or table.table_id in memo.disabled_tables:
+        return _canonical_identity_with_ref(engine, context, table, record_id)
+    locator = memo.locators.get(table.table_id)
+    if locator is not None and (
+        locator.table is not table
+        or locator.epoch != engine.heap._derived_read_epoch()
+    ):
+        locator.close()
+        memo.locators.pop(table.table_id, None)
+        # The current call goes through the canonical door.  A later call may start a fresh walk
+        # if the epoch has stabilised; no result straddles two physical views.
+        return _canonical_identity_with_ref(engine, context, table, record_id)
+    if locator is None:
+        try:
+            locator = _EndpointIdentityLocator(
+                heap=engine.heap,
+                table=table,
+                snapshot=context.snapshot,
+                budget=memo.budget,
+                page_size=engine._pool.page_size,
+            )
+        except _EndpointLocatorCapacity:
+            memo.disabled_tables.add(table.table_id)
+            return _canonical_identity_with_ref(engine, context, table, record_id)
+        memo.locators[table.table_id] = locator
+    try:
+        return locator.locate(record_id)
+    except _EndpointLocatorCapacity:
+        locator.close()
+        memo.locators.pop(table.table_id, None)
+        memo.disabled_tables.add(table.table_id)
+        return _canonical_identity_with_ref(engine, context, table, record_id)
+    except _EndpointLocatorStale:
+        locator.close()
+        memo.locators.pop(table.table_id, None)
+        return _canonical_identity_with_ref(engine, context, table, record_id)
+    except GrafxError:
+        # A stored-data refusal is the answer.  Drop the partial accelerator, but never turn the
+        # same call into a fallback that could hide or reorder the failure.
+        locator.close()
+        memo.locators.pop(table.table_id, None)
+        raise
+
+
+def _raise_missing_endpoint(
+    edge_table: TableDef,
+    endpoint_table: TableDef,
+    identity: RecordId,
+    end: str,
+) -> None:
+    """Raise the public endpoint absence used by HeapStore.require_endpoints."""
+    raise GrafxConfigurationError(
+        f"An edge in {edge_table.name!r} names row {identity} of "
+        f"{endpoint_table.name!r} as its {end!r} endpoint, and this snapshot has no such row.",
+        table=edge_table.name,
+        table_id=edge_table.table_id,
+        field=end,
+        endpoint_table=endpoint_table.name,
+        value=identity,
+    )
+
+
+def _require_physical_endpoint(
+    engine: QueryEngine,
+    context: _Context,
+    edge_table: TableDef,
+    endpoint_table: TableDef,
+    identity: RecordId,
+    expected_ref: RecordRef,
+    end: str,
+) -> HeapVersion:
+    """Validate a binding's physical witness against the canonical snapshot-visible identity."""
+    canonical = _visible_identity_with_ref(engine, context, endpoint_table, identity)
+    if canonical is None:
+        # A visible row outside the table's canonical page chain is corruption, not absence.
+        disconnected = engine.heap._revalidate_visible_ref(
+            endpoint_table, expected_ref, identity, context.snapshot
+        )
+        if disconnected is not None:
+            raise GrafxCorruptionDetected(
+                f"Endpoint reference {expected_ref.page}:{expected_ref.slot} names visible "
+                f"record {identity} of {endpoint_table.name!r}, but that row is outside its "
+                "canonical heap chain.",
+                file=engine.heap.file,
+                page=expected_ref.page,
+                slot=expected_ref.slot,
+                table=endpoint_table.name,
+                table_id=endpoint_table.table_id,
+                record_id=identity,
+                field="record_ref",
+                reason="outside_canonical_chain",
+            )
+        _raise_missing_endpoint(edge_table, endpoint_table, identity, end)
+    canonical_ref, canonical_version = canonical
+    if canonical_ref == expected_ref:
+        return canonical_version
+
+    # Decode the binding's witness before classifying it.  A malformed later duplicate remains
+    # corruption in its own right and is never hidden behind a generic mismatch or a fallback.
+    observed = engine.heap._revalidate_visible_ref(
+        endpoint_table, expected_ref, identity, context.snapshot
+    )
+    if observed is not None:
+        raise GrafxCorruptionDetected(
+            f"Record {identity} of table {endpoint_table.name!r} has two snapshot-visible "
+            f"physical references: canonical {canonical_ref.page}:{canonical_ref.slot} and "
+            f"endpoint witness {expected_ref.page}:{expected_ref.slot}.",
+            file=engine.heap.file,
+            table=endpoint_table.name,
+            table_id=endpoint_table.table_id,
+            record_id=identity,
+            field="record_id",
+            canonical_ref=canonical_ref.encode(),
+            observed_ref=expected_ref.encode(),
+        )
+    raise GrafxCorruptionDetected(
+        f"Endpoint reference {expected_ref.page}:{expected_ref.slot} for record {identity} of "
+        f"{endpoint_table.name!r} is not the canonical snapshot-visible physical reference.",
+        file=engine.heap.file,
+        page=expected_ref.page,
+        slot=expected_ref.slot,
+        table=endpoint_table.name,
+        table_id=endpoint_table.table_id,
+        record_id=identity,
+        field="record_ref",
+        canonical_ref=canonical_ref.encode(),
+        observed_ref=expected_ref.encode(),
+    )
+
+
 def _materialise_edge(
     engine: QueryEngine,
     edge: CreatedRelationship,
@@ -3680,9 +4107,25 @@ def _materialise_edge(
                 field=end,
                 value=variable,
             )
+    catalog = context.schema()
+    endpoint_specs = (
+        ("source", edge.source, edge.table.from_table, ENDPOINT_COLUMNS[0]),
+        ("target", edge.target, edge.table.to_table, ENDPOINT_COLUMNS[1]),
+    )
     endpoints: list[object] = []
     guards: list[tuple[TableDef, bytes]] = []
-    for end, variable in (("source", edge.source), ("target", edge.target)):
+    physical: list[
+        tuple[str, TableDef, RecordId, RecordRef, RowBinding]
+    ] = []
+    for end, variable, table_name, endpoint_column in endpoint_specs:
+        if table_name is None:
+            raise GrafxConfigurationError(
+                f"Relationship table {edge.table.name!r} does not say which table its "
+                f"{endpoint_column!r} endpoint belongs to.",
+                table=edge.table.name,
+                field=endpoint_column,
+            )
+        endpoint_table = catalog.table(table_name)
         binding = bindings.get(variable)
         if not isinstance(binding, RowBinding):
             raise GrafxPlanError(
@@ -3691,6 +4134,17 @@ def _materialise_edge(
                 field=end,
                 value=variable,
             )
+        if binding.table != endpoint_table or binding.version.table_id != endpoint_table.table_id:
+            raise GrafxPlanError(
+                f"The {end} of a {edge.table.name!r} edge must be a row of "
+                f"{endpoint_table.name!r}, but {variable!r} is bound to "
+                f"{binding.table.name!r}.",
+                field=end,
+                value=variable,
+                table=edge.table.name,
+                endpoint_table=endpoint_table.name,
+                observed_table=binding.table.name,
+            )
         guards.append(
             (binding.table, _partition_key(binding.table, binding.version.values))
         )
@@ -3698,6 +4152,23 @@ def _materialise_edge(
             # The node was staged by an EARLIER statement, so it has a private identity this
             # transaction owns and the commit path resolves before anything is written. The
             # endpoint carries that identity rather than a number nobody has issued.
+            owns_pending = getattr(context.txn, "owns_pending_row_ref", None)
+            if (
+                binding.record_id != 0
+                or binding.ref.table_id != endpoint_table.table_id
+                or binding.ref.txn_id != getattr(context.txn, "txn_id", None)
+                or not callable(owns_pending)
+                or not owns_pending(binding.ref)
+                or context.already_ended(binding.ref)
+            ):
+                raise GrafxTransactionStateError(
+                    f"The {end} of a {edge.table.name!r} edge carries a pending row reference "
+                    "that is not owned by this transaction and endpoint table.",
+                    field="pending_row_reference",
+                    table=edge.table.name,
+                    endpoint_table=endpoint_table.name,
+                    value=variable,
+                )
             endpoints.append(binding.ref)
             continue
         if binding.record_id == 0:
@@ -3710,7 +4181,28 @@ def _materialise_edge(
                 table=edge.table.name,
                 operation="relationship_endpoint",
             )
+        if type(binding.ref) is not RecordRef:
+            raise GrafxPlanError(
+                f"The {end} of a {edge.table.name!r} edge has no physical row reference.",
+                field=end,
+                value=variable,
+                table=edge.table.name,
+                endpoint_table=endpoint_table.name,
+            )
+        if context.already_ended(binding.ref):
+            _raise_missing_endpoint(
+                edge.table, endpoint_table, binding.record_id, endpoint_column
+            )
         endpoints.append(binding.record_id)
+        physical.append(
+            (
+                endpoint_column,
+                endpoint_table,
+                binding.record_id,
+                binding.ref,
+                binding,
+            )
+        )
     properties = materialise_row(
         engine,
         edge.table,
@@ -3719,12 +4211,32 @@ def _materialise_edge(
         context,
         endpoints=(endpoints[0], endpoints[1]),
     )
-    if not any(isinstance(endpoint, PendingRowRef) for endpoint in endpoints):
-        # The heap's own door, asked BEFORE anything is staged, so an edge naming a row this
-        # snapshot cannot see leaves nothing behind. A pending endpoint has no stored row to ask
-        # about; what stands behind it is the staging proof, which the commit path re-runs over
-        # the reduced intents before it writes.
-        engine.heap.require_endpoints(edge.table, properties, context.snapshot)
+    validated: set[tuple[int, int, int]] = set()
+    for endpoint_column, endpoint_table, identity, ref, binding in physical:
+        key = (endpoint_table.table_id, ref.encode(), identity)
+        if key in validated:
+            continue  # a physical self-loop needs one identical proof, not two heap reads
+        version = _require_physical_endpoint(
+            engine,
+            context,
+            edge.table,
+            endpoint_table,
+            identity,
+            ref,
+            endpoint_column,
+        )
+        if version.record_id != binding.record_id:
+            raise GrafxCorruptionDetected(
+                f"The validated {endpoint_column!r} endpoint changed identity while "
+                f"materialising an edge in {edge.table.name!r}.",
+                file=engine.heap.file,
+                table=edge.table.name,
+                table_id=edge.table.table_id,
+                field="record_id",
+                expected_record_id=binding.record_id,
+                observed_record_id=version.record_id,
+            )
+        validated.add(key)
     # LAST, once nothing about this edge can still refuse. An edge is a statement ABOUT its two
     # endpoints: it is only correct while those rows are still there, and another transaction
     # deleting one of them makes it wrong. Without the declaration the two commits touch
