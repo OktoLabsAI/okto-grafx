@@ -46,7 +46,7 @@ from okto_grafx.domain.ledger.entry import (
     LedgerReason,
 )
 from okto_grafx.domain.ledger.payload import LedgerPayload, decode_payload
-from okto_grafx.domain.model.catalog import Catalog
+from okto_grafx.domain.model.catalog import CATALOG_LEGACY_FORMAT_VERSION, Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import (
     INT64_MAX,
@@ -1079,6 +1079,9 @@ def _index_definition(value: Any) -> IndexDefinition:
             _domain_field(value, IndexDefinition, "key_derivation"),
             field="index.key_derivation",
             empty=False,
+        ),
+        artifact_nonce=_builtin_int(
+            _domain_field(value, IndexDefinition, "artifact_nonce")
         ),
     )
 
@@ -3686,8 +3689,42 @@ def _index_view(index: Any, definition: IndexDefinition | None = None) -> IndexV
     )
 
 
-def _indexes_view(indexes: Any, tables: Sequence[TableDef]) -> IndexRegistryView:
-    """Snapshot registrations whose tables belong to the validated committed catalog."""
+def _indexes_view(
+    indexes: Any,
+    tables: Sequence[TableDef],
+    *,
+    catalog: Catalog | None = None,
+) -> IndexRegistryView:
+    """Snapshot only registrations selected by the committed catalog authority.
+
+    ``tables`` remains the independently canonicalized provenance snapshot.  Catalog v2 decides
+    which physical exact generation is active, so a merely registered building, stale or
+    process-local definition is not public inventory.  Catalog v1 retains its historical
+    registry authority: every valid index registered for a committed table remains observable.
+    Direct internal callers that omit the authority use the same catalog store owned by the
+    concrete index manager.
+    """
+
+    authority = catalog
+    if authority is None:
+        authority = indexes._heap.catalog.catalog
+    if type(authority) is not Catalog:
+        # A public observation never dispatches through a domain subclass.  The catalog store's
+        # persisted image is the independently immutable authority already used by its epoch
+        # protocol; decoding it yields an exact Catalog without retaining or executing the
+        # hostile live object.
+        authority = Catalog.deserialize(
+            _builtin_bytes(indexes._heap.catalog._persisted_image)
+        )
+    catalog_managed = authority.format_version != CATALOG_LEGACY_FORMAT_VERSION
+    expected_by_key = (
+        {
+            definition.registry_key: _index_definition(definition)
+            for definition in Catalog.active_index_definitions(authority)
+        }
+        if catalog_managed
+        else {}
+    )
     by_identity = {(table.table_id, table.name): table for table in tables}
     captured: list[IndexView] = []
     for index in indexes.indexes():
@@ -3700,7 +3737,12 @@ def _indexes_view(indexes: Any, tables: Sequence[TableDef]) -> IndexRegistryView
         table_id = definition.table_id
         table_name = definition.table_name
         table = by_identity.get((table_id, table_name))
-        if table is not None and index_definition_matches_table(definition, table):
+        expected = expected_by_key.get(definition.registry_key)
+        if (
+            (not catalog_managed or expected == definition)
+            and table is not None
+            and index_definition_matches_table(definition, table)
+        ):
             captured.append(_index_view(index, definition))
     return IndexRegistryView(
         tuple(captured),

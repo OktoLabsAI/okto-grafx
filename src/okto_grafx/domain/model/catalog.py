@@ -116,6 +116,7 @@ class Catalog:
         "_required_capabilities",
         "_indexes",
         "_indexes_by_key",
+        "_index_definitions_by_table",
     )
 
     def __init__(self) -> None:
@@ -128,6 +129,9 @@ class Catalog:
         self._required_capabilities: frozenset[str] = frozenset()
         self._indexes: dict[str, CatalogIndexDefinition] = {}
         self._indexes_by_key: dict[str, CatalogIndexDefinition] = {}
+        self._index_definitions_by_table: dict[
+            tuple[int, str], tuple[CatalogIndexDefinition, ...]
+        ] = {}
 
     # --- reading ---------------------------------------------------------------------------
 
@@ -154,6 +158,85 @@ class Catalog:
         """Return catalog-managed exact indexes in canonical registry order."""
 
         return tuple(self._indexes_by_key[key] for key in sorted(self._indexes_by_key))
+
+    def active_index_definitions(self) -> tuple[IndexDefinition, ...]:
+        """Project the complete runtime index authority for this catalog version.
+
+        A legacy v1 catalog has no persisted logical index records, so all of its automatic
+        definitions continue to come from the committed table schema.  Once v2 is active, exact
+        indexes come only from persisted logical definitions whose physical generation is
+        ``ACTIVE``; building and stale generations are deliberately invisible.  Specialized
+        proximity/vector definitions remain schema-derived in both formats because P2-ID does
+        not persist them as generic exact definitions.
+
+        The result is ordered by the registry's case-insensitive key so every runtime consumer
+        can install the same authority deterministically.
+        """
+
+        definitions = (
+            definition
+            for table in self.tables()
+            for definition in self.active_index_definitions_for(
+                table.table_id, table_name=table.name
+            )
+        )
+        return tuple(
+            sorted(
+                definitions,
+                key=lambda definition: definition.registry_key,
+            )
+        )
+
+    def active_index_definitions_for(
+        self, table_id: int, *, table_name: str | None = None
+    ) -> tuple[IndexDefinition, ...]:
+        """Project runtime authority for one complete table identity.
+
+        Catalog v2 keeps a structural secondary map of its immutable logical definitions, so a
+        row write pays only for indexes of its own table.  The map is rebuilt with every
+        authority installation; an in-place ACTIVE-generation replacement therefore cannot
+        leave a stale cached projection behind.  Legacy automatic and specialized vector
+        definitions are likewise derived only from the requested table.
+
+        A table absent from this durable catalog has no committed authority.  Returning an empty
+        tuple is intentional: a transaction may still maintain a table/index pair from its own
+        speculative schema observation without granting that pair to any other transaction.
+        """
+
+        table = self._tables_by_id.get(table_id)
+        if table is None or (table_name is not None and table.name != table_name):
+            return ()
+        if self._format_version == CATALOG_LEGACY_FORMAT_VERSION:
+            return tuple(
+                sorted(
+                    automatic_index_definitions(table),
+                    key=lambda definition: definition.registry_key,
+                )
+            )
+
+        exact_definitions: list[IndexDefinition] = []
+        for logical_definition in self._index_definitions_by_table.get(
+            (table.table_id, table.name), ()
+        ):
+            generation = logical_definition.active_generation()
+            if generation is not None:
+                exact_definitions.append(
+                    logical_definition.runtime_definition(generation)
+                )
+
+        # Do not compose the legacy PK/endpoint half here: v2 owns those paths through exact
+        # persisted generations.  P2-ID leaves only proximity/vector definitions schema-derived.
+        specialized_definitions = tuple(
+            definition
+            for definition in automatic_index_definitions(table)
+            if definition.visibility is IndexVisibility.PROXIMITY
+        )
+        return tuple(
+            sorted(
+                (*exact_definitions, *specialized_definitions),
+                key=lambda definition: definition.registry_key,
+            )
+        )
 
     def has_index_definition(self, name: str) -> bool:
         """Return whether a catalog-managed logical index has this folded name."""
@@ -652,10 +735,23 @@ class Catalog:
     def _install_indexes(self, definitions: dict[str, CatalogIndexDefinition]) -> None:
         """Adopt one already-validated logical index authority."""
 
-        self._indexes_by_key = dict(definitions)
-        self._indexes = {
-            definition.name: definition for definition in definitions.values()
+        by_key = dict(definitions)
+        by_name = {definition.name: definition for definition in definitions.values()}
+        mutable_by_table: dict[tuple[int, str], list[CatalogIndexDefinition]] = {}
+        for key in sorted(definitions):
+            definition = definitions[key]
+            identity = (definition.table_id, definition.table_name)
+            mutable_by_table.setdefault(identity, []).append(definition)
+        by_table = {
+            identity: tuple(table_definitions)
+            for identity, table_definitions in mutable_by_table.items()
         }
+
+        # Build all three projections before publishing any of them.  Catalog mutations are
+        # serialized by their owner, and readers never observe a partly constructed table map.
+        self._indexes_by_key = by_key
+        self._indexes = by_name
+        self._index_definitions_by_table = by_table
 
     def _validated_index_authority(
         self,

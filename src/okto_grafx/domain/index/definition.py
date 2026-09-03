@@ -413,54 +413,61 @@ def automatic_index_definitions(table: TableDef) -> tuple[IndexDefinition, ...]:
     Concurrent speculative catalogs may reuse both a numeric id and a table name.  Positions,
     visibility and key derivation are therefore part of provenance too; returning value objects
     here lets planning, DML staging, public inventory and verification share that complete test.
+    Each accelerator is optional independently: an inexpressible derived name may decline that
+    one path, but can never hide a valid sibling or make the committed table unusable.
     """
     if not isinstance(table, TableDef):
         return ()
     definitions: list[IndexDefinition] = []
     if table.kind == "rel":
-        definitions.extend(
-            (
-                IndexDefinition(
-                    name=f"ef_{table.name}",
-                    table_id=table.table_id,
-                    table_name=table.name,
-                    positions=(0,),
-                    visibility=IndexVisibility.EXACT,
-                ),
-                IndexDefinition(
-                    name=f"et_{table.name}",
-                    table_id=table.table_id,
-                    table_name=table.name,
-                    positions=(1,),
-                    visibility=IndexVisibility.EXACT,
-                ),
-            )
+        candidates = (
+            (f"ef_{table.name}", (0,)),
+            (f"et_{table.name}", (1,)),
         )
+        for name, positions in candidates:
+            try:
+                definitions.append(
+                    IndexDefinition(
+                        name=name,
+                        table_id=table.table_id,
+                        table_name=table.name,
+                        positions=positions,
+                        visibility=IndexVisibility.EXACT,
+                    )
+                )
+            except GrafxIndexError:
+                continue
     elif table.primary_key is not None:
-        definitions.append(
-            IndexDefinition(
-                name=f"pk_{table.name}",
-                table_id=table.table_id,
-                table_name=table.name,
-                positions=(table.column_index(table.primary_key),),
-                visibility=IndexVisibility.EXACT,
+        try:
+            definitions.append(
+                IndexDefinition(
+                    name=f"pk_{table.name}",
+                    table_id=table.table_id,
+                    table_name=table.name,
+                    positions=(table.column_index(table.primary_key),),
+                    visibility=IndexVisibility.EXACT,
+                )
             )
-        )
+        except GrafxIndexError:
+            pass
     # Local import breaks the intentional definition -> vector-definition inheritance cycle.
     from okto_grafx.domain.vector.key import VectorIndexDefinition
 
     for position, column in enumerate(table.columns):
         if column.vector_space is None:
             continue
-        definitions.append(
-            VectorIndexDefinition(
-                name=f"vector_{table.name}_{column.vector_space}",
-                table_id=table.table_id,
-                table_name=table.name,
-                positions=(position,),
-                visibility=IndexVisibility.PROXIMITY,
+        try:
+            definitions.append(
+                VectorIndexDefinition(
+                    name=f"vector_{table.name}_{column.vector_space}",
+                    table_id=table.table_id,
+                    table_name=table.name,
+                    positions=(position,),
+                    visibility=IndexVisibility.PROXIMITY,
+                )
             )
-        )
+        except GrafxIndexError:
+            continue
     return tuple(definitions)
 
 

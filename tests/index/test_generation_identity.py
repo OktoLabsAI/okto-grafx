@@ -13,6 +13,7 @@ from okto_grafx.domain.index.definition import (
     index_generation_file,
 )
 from okto_grafx.engine.index_manager import HashIndex
+from okto_grafx.engine.public_views import _index_view
 
 from .conftest import Database, exact_definition
 
@@ -27,6 +28,25 @@ def test_generation_file_is_canonical_and_independent_of_logical_name(
     assert generated.file == "index/g_0000000000000a17.idx"
     assert generated.digest() == legacy.digest()
     assert generated != legacy
+
+
+def test_public_index_view_preserves_the_selected_physical_generation(
+    database: Database,
+) -> None:
+    nonce = 0xA17
+    definition = replace(
+        exact_definition(database.table, name="generated_view"),
+        artifact_nonce=nonce,
+    )
+    index = database.manager.register(
+        HashIndex(definition, database.pool, database.metrics)
+    )
+
+    view = _index_view(index)
+
+    assert view.definition.artifact_nonce == nonce
+    assert view.file == index_generation_file(nonce)
+    assert view.file == index.file
 
 
 @pytest.mark.parametrize("nonce", [0, -1, True, 1.0, 1 << 64])

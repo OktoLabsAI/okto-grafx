@@ -129,7 +129,8 @@ class CommitRedo:
             )  # established by _preflight; not an external refusal
             index_effects += 1
             change = change_of(record)
-            index = manager.index(change.index)
+            resolve = getattr(manager, "active_index", manager.index)
+            index = resolve(change.index)
             remember(index.file)
             if not manager.apply(record):
                 raise GrafxRecoveryRefused(
@@ -270,7 +271,8 @@ class CommitRedo:
                         missing_manager_lsn = record.lsn
                     continue
                 try:
-                    index = manager.index(change.index)
+                    resolve = getattr(manager, "active_index", manager.index)
+                    index = resolve(change.index)
                 except GrafxIndexError as failure:
                     if allow_unregistered_indexes:
                         continue

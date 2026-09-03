@@ -1785,7 +1785,11 @@ class Database:
                         != epoch
                     ):
                         continue
-                    return _indexes_view(indexes, tables)
+                    return _indexes_view(
+                        indexes,
+                        tables,
+                        catalog=self._catalog._catalog,
+                    )
 
     @property
     def ledger(self) -> LedgerView:
@@ -2655,8 +2659,14 @@ class Database:
         # door's own transaction exists, because the retiring half is a checkpoint and a
         # checkpoint taken inside our own open write transaction is refused.
         claim_reason = f"Index {name!r} is being rebuilt."
+        active_index = getattr(manager, "active_index", None)
+        selected_index = (
+            active_index(name, catalog=self._catalog._catalog)
+            if callable(active_index)
+            else manager.index(name)  # type: ignore[attr-defined]
+        )
         claimed = self._transactions.checkpoint_and_claim_index_rebuild(
-            manager.index(name),  # type: ignore[attr-defined]
+            selected_index,
             claim_reason,
         )
         # Everything from here to the barrier runs under one cleanup, because the claim above
@@ -2689,7 +2699,7 @@ class Database:
             # publishes its key partition. Only this table is fenced, so unrelated commits are
             # untouched.
             table_id = _builtin_int(
-                manager.index(name).definition.table_id  # type: ignore[attr-defined]
+                selected_index.definition.table_id  # type: ignore[union-attr]
             )
             for partition in range(self._identity.partitions_per_table):
                 context.note_read(partition_key(table_id, partition))
@@ -2997,7 +3007,12 @@ class Database:
                     # participant after this handle opened. TransactionManager refreshed their
                     # freshness inside the same cross-process commit section as the checkpoint;
                     # only copy that stable local result into the public inventory here.
-                    registered = indexes.indexes()  # type: ignore[attr-defined]
+                    active_indexes = getattr(indexes, "active_indexes", None)
+                    registered = (
+                        active_indexes(catalog=self._catalog._catalog)
+                        if callable(active_indexes)
+                        else indexes.indexes()  # type: ignore[attr-defined]
+                    )
                     self._attached_indexes = tuple(
                         _builtin_text(index.name, field="attached_index", empty=False)
                         for index in registered
@@ -3136,7 +3151,12 @@ class Database:
                 "indexes", self._indexes, "the index framework (C7)"
             )
             with self._transactions.page_access_section():
-                index = indexes.index(wanted)  # type: ignore[attr-defined]
+                active_index = getattr(indexes, "active_index", None)
+                index = (
+                    active_index(wanted, catalog=self._catalog._catalog)
+                    if callable(active_index)
+                    else indexes.index(wanted)  # type: ignore[attr-defined]
+                )
                 return tuple(
                     _index_entry_view(entry)
                     for entry in index.walk()  # type: ignore[attr-defined]

@@ -57,6 +57,7 @@ from dataclasses import dataclass, field, replace
 from typing import TypeVar
 
 from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
     GrafxCorruptionDetected,
     GrafxError,
     GrafxIndexError,
@@ -105,6 +106,7 @@ from okto_grafx.domain.index.visibility import (
     is_reclaimable,
 )
 from okto_grafx.domain.model.record import HeapVersion
+from okto_grafx.domain.model.catalog import CATALOG_LEGACY_FORMAT_VERSION
 from okto_grafx.domain.page import (
     HEADER_PAGE_INDEX,
     PAGE_HEADER_SIZE,
@@ -3070,6 +3072,7 @@ class IndexManager:
         "_heap",
         "_metrics",
         "_indexes",
+        "_index_keys_by_table",
         "_published_lsn",
         "_table_watermarks",
         "_heap_cache_certificates",
@@ -3091,6 +3094,7 @@ class IndexManager:
         self._heap: HeapStore = heap
         self._metrics: MetricsSink = metrics
         self._indexes: dict[str, IndexStore] = {}
+        self._index_keys_by_table: dict[tuple[int, str], set[str]] = {}
         self._published_lsn: Lsn = NO_LSN
         self._table_watermarks: dict[int, Lsn] = {}
         # Exact answers validate index candidates against heap pages.  The index certificate is
@@ -3104,6 +3108,57 @@ class IndexManager:
         self._schema_observed: dict[int, dict[IndexStore, int]] = {}
 
     # --- registry ---------------------------------------------------------------------------
+
+    def _publish_registered_index(self, index: IndexStore) -> None:
+        """Publish one raw ownership entry and its table-local structural key."""
+
+        key = index.definition.registry_key
+        previous = self._indexes.get(key)
+        if previous is not None and previous is not index:
+            self._remove_registered_index(key, expected=previous)
+        self._indexes[key] = index
+        identity = (index.definition.table_id, index.definition.table_name)
+        self._index_keys_by_table.setdefault(identity, set()).add(key)
+
+    def _remove_registered_index(
+        self, key: str, *, expected: IndexStore | None = None
+    ) -> IndexStore | None:
+        """Remove one raw ownership entry without leaving its table bucket stale."""
+
+        current = self._indexes.get(key)
+        if current is None or (expected is not None and current is not expected):
+            return None
+        removed = self._indexes.pop(key)
+        identity = (removed.definition.table_id, removed.definition.table_name)
+        table_keys = self._index_keys_by_table.get(identity)
+        if table_keys is not None:
+            table_keys.discard(key)
+            if not table_keys:
+                self._index_keys_by_table.pop(identity, None)
+        return removed
+
+    def _registered_indexes_for(
+        self, table_id: int, *, table_name: str | None = None
+    ) -> tuple[IndexStore, ...]:
+        """Return raw registry ownership from only the requested table bucket."""
+
+        if table_name is not None:
+            keys = self._index_keys_by_table.get((table_id, table_name), ())
+        else:
+            keys = {
+                key
+                for (
+                    owned_id,
+                    _owned_name,
+                ), table_keys in self._index_keys_by_table.items()
+                if owned_id == table_id
+                for key in table_keys
+            }
+        return tuple(
+            index
+            for key in sorted(keys)
+            if (index := self._indexes.get(key)) is not None
+        )
 
     def register(
         self,
@@ -3183,7 +3238,7 @@ class IndexManager:
             )
             if header.artifact_nonce == 0 and nonce != 0:
                 header = index._ensure_artifact_nonce(nonce).header
-        self._indexes[key] = index
+        self._publish_registered_index(index)
         try:
             self._finish_registration(
                 index,
@@ -3209,7 +3264,7 @@ class IndexManager:
             # A re-entrant host callback may have installed a replacement.  This failure owns
             # neither that object nor the companion certificate it published.
             return False
-        self._indexes.pop(key, None)
+        self._remove_registered_index(key, expected=index)
         self._heap_cache_certificates.pop(index.file, None)
         return True
 
@@ -3354,7 +3409,7 @@ class IndexManager:
                     index=existing.name,
                 )
             if self._indexes.get(key) is existing:
-                self._indexes.pop(key, None)
+                self._remove_registered_index(key, expected=existing)
                 self._heap_cache_certificates.pop(existing.file, None)
         creation: list[bool] = []
         try:
@@ -3448,7 +3503,7 @@ class IndexManager:
             existing.open(proved_present=proved_present)
             return existing
         if existing is not None:
-            self._indexes.pop(key, None)
+            self._remove_registered_index(key, expected=existing)
             self._heap_cache_certificates.pop(existing.file, None)
         try:
             return self.register(
@@ -3459,9 +3514,9 @@ class IndexManager:
             )
         except BaseException:
             if self._indexes.get(key) is index:
-                self._indexes.pop(key, None)
+                self._remove_registered_index(key, expected=index)
             if existing is not None:
-                self._indexes[key] = existing
+                self._publish_registered_index(existing)
             raise
 
     def ensure_artifact_identities(self) -> None:
@@ -3472,7 +3527,7 @@ class IndexManager:
         """
         if self._artifact_nonce is None:
             return
-        for index in self.indexes():
+        for index in self.active_indexes():
             # The immediately preceding sync proved one complete directory inventory.  Reuse
             # that proof instead of doubling every per-file existence probe merely to inspect
             # the nonce.
@@ -3520,7 +3575,7 @@ class IndexManager:
         except GrafxIndexError as failure:
             if failure.details.get("field") not in {"digest", "visibility"}:
                 return False
-            self._indexes.pop(key, None)
+            self._remove_registered_index(key, expected=expected)
             self._heap_cache_certificates.pop(expected.file, None)
             return True
         except GrafxError:
@@ -3529,24 +3584,23 @@ class IndexManager:
             # Same definition, newer durable generation: another completed transaction adopted
             # the object/file.  It is no longer this rollback's state to release.
             return False
-        removed = self._indexes.pop(key, None)
+        removed = self._remove_registered_index(key)
         if (
             removed is not expected
         ):  # pragma: no cover - participant section serialises locals
             if removed is not None:
-                self._indexes[key] = removed
+                self._publish_registered_index(removed)
             return False
         self._heap_cache_certificates.pop(expected.file, None)
         return True
 
     def _definition_is_durable(self, index: IndexStore) -> bool:
-        """Prove that the refreshed committed catalog declares this automatic definition."""
+        """Prove that the refreshed committed catalog selects this physical definition."""
         try:
-            table = self._heap.catalog.catalog.table_by_id(index.definition.table_id)
-            definitions = automatic_index_definitions(table)
+            definitions = self._catalog_active_definitions()
         except GrafxError:
             return False
-        return any(definition == index.definition for definition in definitions)
+        return definitions is not None and index.definition in definitions
 
     def stage_schema_observation(
         self, index: IndexStore, txn: StagingTransaction
@@ -3605,14 +3659,17 @@ class IndexManager:
                 value=repr(txn_id),
             )
         schema_indexes = tuple(self._schema_observed.get(txn_id, ()))
-        staged_indexes = tuple(index for index in self.indexes() if index.observed(txn))
+        staged_indexes = tuple(
+            index for index in self._transaction_indexes(txn) if index.observed(txn)
+        )
         row_indexes = tuple(
             index
             for table in row_tables
-            for index in self.indexes_for(
+            for index in self.active_indexes_for(
                 getattr(table, "table_id", -1),
                 table_name=getattr(table, "name", None),
                 table=table,
+                txn=txn,
             )
         )
         for index in dict.fromkeys((*schema_indexes, *staged_indexes, *row_indexes)):
@@ -3681,31 +3738,24 @@ class IndexManager:
         return True
 
     def _canonical_file_is_declared(self, file: str) -> bool:
-        """Say whether the committed catalog assigns this case-folded name to an index."""
+        """Say whether any committed catalog generation owns this physical file.
+
+        Runtime eligibility and physical ownership are deliberately different questions.  Only
+        the ACTIVE generation may answer queries or receive DML, but BUILDING and STALE files
+        are still catalog-owned bytes and may never be displaced as speculative orphans.
+        """
         wanted = file.casefold()
         try:
-            tables = self._heap.catalog.catalog.tables()
+            catalog = self._heap.catalog.catalog
+            definitions = list(self._catalog_active_definitions(catalog) or ())
+            logical_definitions = getattr(catalog, "index_definitions", None)
+            if callable(logical_definitions):
+                for logical in logical_definitions():
+                    for generation in logical.generations:
+                        definitions.append(logical.runtime_definition(generation))
         except GrafxError:
             return True
-        for table in tables:
-            names: list[str] = []
-            if getattr(table, "kind", None) == "rel":
-                names.extend(
-                    (edge_from_index_name(table.name), edge_to_index_name(table.name))
-                )
-            elif getattr(table, "primary_key", None) is not None:
-                names.append(primary_key_index_name(table.name))
-            for column in getattr(table, "columns", ()):
-                space = getattr(column, "vector_space", None)
-                if isinstance(space, str) and space:
-                    names.append(f"vector_{table.name}_{space}")
-            for name in names:
-                try:
-                    if index_file(name).casefold() == wanted:
-                        return True
-                except GrafxIndexError:
-                    continue
-        return False
+        return any(definition.file.casefold() == wanted for definition in definitions)
 
     def unregister(self, name: str) -> bool:
         """Forget one registered index, leaving its file alone, and say whether one was held.
@@ -3721,7 +3771,7 @@ class IndexManager:
         """
         if not isinstance(name, str):
             return False
-        removed = self._indexes.pop(name.lower(), None)
+        removed = self._remove_registered_index(name.lower())
         if removed is None:
             return False
         self._heap_cache_certificates.pop(removed.file, None)
@@ -3749,6 +3799,267 @@ class IndexManager:
             )
         return found
 
+    def _catalog_active_definitions(
+        self, catalog: object | None = None
+    ) -> tuple[IndexDefinition, ...] | None:
+        """Return the catalog's runtime projection, or ``None`` for a legacy test double.
+
+        Production heaps always expose a concrete :class:`Catalog`, whose projection is the
+        authority.  A few component collaborators intentionally implement only the old heap
+        surface; retaining the raw-registry fallback for those doubles does not weaken a real
+        database because the fallback is unreachable once a catalog object is present.
+        """
+        authority = catalog
+        if authority is None:
+            try:
+                authority = self._heap.catalog.catalog
+            except AttributeError:
+                return None
+        projection = getattr(authority, "active_index_definitions", None)
+        if callable(projection):
+            return tuple(projection())
+        tables = getattr(authority, "tables", None)
+        if not callable(tables):
+            return None
+        return tuple(
+            definition
+            for table in tables()
+            for definition in automatic_index_definitions(table)
+        )
+
+    def _catalog_authority(self, catalog: object | None = None) -> object | None:
+        """Return the selected catalog object without inventing one for narrow doubles."""
+        if catalog is not None:
+            return catalog
+        try:
+            return self._heap.catalog.catalog
+        except AttributeError:
+            return None
+
+    def _definition_matches_table_tolerantly(
+        self,
+        definition: IndexDefinition,
+        table: object,
+        *,
+        catalog: object | None = None,
+    ) -> bool:
+        """Validate one access path without deriving an invalid sibling accelerator."""
+
+        if definition.table_id != getattr(
+            table, "table_id", None
+        ) or definition.table_name != getattr(table, "name", None):
+            return False
+        try:
+            return index_definition_matches_table(  # type: ignore[arg-type]
+                definition, table
+            )
+        except GrafxIndexError:
+            # The legacy compositor constructs scalar and vector siblings together.  A legal
+            # scalar access path must remain usable when only a derived vector name is too long,
+            # so ask Catalog's per-path tolerant projection for the one expected name.
+            authority = self._catalog_authority(catalog)
+            projection = getattr(authority, "active_index_definitions_for", None)
+            if callable(projection):
+                expected = next(
+                    (
+                        candidate
+                        for candidate in projection(
+                            definition.table_id,
+                            table_name=definition.table_name,
+                        )
+                        if candidate.registry_key == definition.registry_key
+                    ),
+                    None,
+                )
+                if expected is not None:
+                    return (
+                        type(definition) is type(expected)
+                        and definition.name == expected.name
+                        and definition.table_id == expected.table_id
+                        and definition.table_name == expected.table_name
+                        and definition.positions == expected.positions
+                        and definition.visibility is expected.visibility
+                        and definition.key_derivation == expected.key_derivation
+                    )
+            columns = getattr(table, "columns", None)
+            if columns is None:
+                return False
+            stored_arity = len(columns) + (
+                2 if getattr(table, "kind", None) == "rel" else 0
+            )
+            return all(position < stored_arity for position in definition.positions)
+
+    def _legacy_active_indexes(self, catalog: object) -> tuple[IndexStore, ...]:
+        """Preserve v1's valid process-local registry semantics.
+
+        Catalog v1 predates persisted logical definitions.  Its schema can prove provenance but
+        cannot distinguish an automatic index from a legitimate low-level custom registration.
+        Consequently every registered definition that still matches a committed table remains
+        eligible in v1; catalog v2 replaces this compatibility rule with exact generation
+        authority.
+        """
+        try:
+            tables = {(table.table_id, table.name): table for table in catalog.tables()}
+        except (AttributeError, GrafxError):
+            return ()
+        return tuple(
+            index
+            for index in self.indexes()
+            if (
+                table := tables.get(
+                    (index.definition.table_id, index.definition.table_name)
+                )
+            )
+            is not None
+            and self._definition_matches_table_tolerantly(
+                index.definition, table, catalog=catalog
+            )
+        )
+
+    def active_indexes(
+        self, *, catalog: object | None = None
+    ) -> tuple[IndexStore, ...]:
+        """Return registered stores selected by the catalog's complete ACTIVE definitions.
+
+        :meth:`indexes` remains the raw ownership registry used by DDL compensation.  This
+        sibling is the committed-data facade: a same-name process-local object, an old physical
+        nonce and BUILDING/STALE generations all fail the exact value comparison and therefore
+        cannot become query, redo, verification or DML authority.  Passing an explicit catalog
+        requests that exact snapshot.  Catalog v1 preserves its historical valid process-local
+        registrations because it has no logical-definition records; strict generation authority
+        begins only with v2.
+        """
+        authority = self._catalog_authority(catalog)
+        if authority is not None and (
+            getattr(authority, "format_version", None) == CATALOG_LEGACY_FORMAT_VERSION
+        ):
+            return self._legacy_active_indexes(authority)
+        definitions = self._catalog_active_definitions(authority)
+        if definitions is None:
+            return self.indexes()
+        selected: list[IndexStore] = []
+        for definition in definitions:
+            current = self._indexes.get(definition.registry_key)
+            if current is not None and current.definition == definition:
+                selected.append(current)
+        return tuple(selected)
+
+    def active_index(self, name: str, *, catalog: object | None = None) -> IndexStore:
+        """Resolve one name only when its registered store is the catalog-selected generation."""
+        if not isinstance(name, str):
+            raise GrafxIndexError(
+                f"An index is named by a string; got {type(name).__name__}.",
+                field="name",
+                value=type(name).__name__,
+            )
+        authority = self._catalog_authority(catalog)
+        if authority is not None and (
+            getattr(authority, "format_version", None) == CATALOG_LEGACY_FORMAT_VERSION
+        ):
+            current = self._indexes.get(name.lower())
+            if current is not None:
+                try:
+                    table = authority.table_by_id(current.definition.table_id)
+                    matches = self._definition_matches_table_tolerantly(
+                        current.definition, table, catalog=authority
+                    )
+                except (AttributeError, GrafxError):
+                    matches = False
+                if matches:
+                    return current
+            raise GrafxIndexError(
+                f"No committed-table index named {name!r} is registered in this v1 catalog.",
+                field="index_authority",
+                value=name,
+                index=name,
+                registered=current is not None,
+            )
+        key = name.lower()
+        if authority is not None and (
+            getattr(authority, "format_version", None) != CATALOG_LEGACY_FORMAT_VERSION
+        ):
+            logical_lookup = getattr(authority, "index_definition", None)
+            table_projection = getattr(authority, "active_index_definitions_for", None)
+            if callable(logical_lookup) and callable(table_projection):
+                current = self._indexes.get(key)
+                expected: IndexDefinition | None = None
+                try:
+                    logical = logical_lookup(name)
+                except GrafxConfigurationError:
+                    # Specialized proximity indexes are deliberately schema-derived in v2.
+                    # The registered definition identifies the sole table bucket worth asking;
+                    # exact process-local impostors still fail complete value equality below.
+                    if current is not None:
+                        definitions = tuple(
+                            table_projection(
+                                current.definition.table_id,
+                                table_name=current.definition.table_name,
+                            )
+                        )
+                        expected = next(
+                            (
+                                definition
+                                for definition in definitions
+                                if definition.registry_key == key
+                            ),
+                            None,
+                        )
+                else:
+                    generation = logical.active_generation()
+                    if generation is not None:
+                        expected = logical.runtime_definition(generation)
+                if (
+                    expected is None
+                    or current is None
+                    or current.definition != expected
+                ):
+                    raise GrafxIndexError(
+                        f"No catalog-selected ACTIVE index named {name!r} is registered with "
+                        "its exact physical definition.",
+                        field="index_authority",
+                        value=name,
+                        index=name,
+                        registered=current is not None,
+                    )
+                return current
+        definitions = self._catalog_active_definitions(authority)
+        if definitions is None:
+            return self.index(name)
+        expected = next(
+            (
+                definition
+                for definition in definitions
+                if definition.registry_key == key
+            ),
+            None,
+        )
+        current = self._indexes.get(key)
+        if expected is None or current is None or current.definition != expected:
+            raise GrafxIndexError(
+                f"No catalog-selected ACTIVE index named {name!r} is registered with its "
+                "exact physical definition.",
+                field="index_authority",
+                value=name,
+                index=name,
+                registered=current is not None,
+            )
+        return current
+
+    def _transaction_indexes(
+        self, txn: StagingTransaction, *, catalog: object | None = None
+    ) -> tuple[IndexStore, ...]:
+        """Return ACTIVE stores plus speculative stores explicitly observed by ``txn``."""
+        txn_id = getattr(txn, "txn_id", None)
+        if isinstance(txn_id, bool) or not isinstance(txn_id, int) or txn_id < 0:
+            raise GrafxIndexError(
+                "Transaction-scoped index authority needs a non-negative integer txn_id.",
+                field="txn_id",
+                value=repr(txn_id),
+            )
+        active = self.active_indexes(catalog=catalog)
+        observed = tuple(self._schema_observed.get(txn_id, ()))
+        return tuple(dict.fromkeys((*active, *observed)))
+
     def indexes_for(
         self,
         table_id: int,
@@ -3764,20 +4075,115 @@ class IndexManager:
         """
         return tuple(
             index
-            for index in self.indexes()
-            if index.definition.table_id == table_id
-            and (table_name is None or index.definition.table_name == table_name)
-            and (
+            for index in self._registered_indexes_for(table_id, table_name=table_name)
+            if (
                 table is None
                 or not hasattr(table, "columns")
-                or index_definition_matches_table(index.definition, table)
+                or self._definition_matches_table_tolerantly(index.definition, table)
             )
         )
 
+    def active_indexes_for(
+        self,
+        table_id: int,
+        *,
+        table_name: str | None = None,
+        table: object | None = None,
+        txn: StagingTransaction | None = None,
+        catalog: object | None = None,
+    ) -> tuple[IndexStore, ...]:
+        """Return authoritative indexes owned by one complete table identity.
+
+        Supplying ``txn`` adds only stores that transaction previously observed through the DDL
+        journal.  This narrow exception preserves CREATE-TABLE-plus-DML in one transaction
+        without granting another process-local registration committed authority.
+        """
+
+        def belongs_to_requested_table(index: IndexStore) -> bool:
+            definition = index.definition
+            if definition.table_id != table_id or (
+                table_name is not None and definition.table_name != table_name
+            ):
+                return False
+            return (
+                table is None
+                or not hasattr(table, "columns")
+                or self._definition_matches_table_tolerantly(
+                    definition, table, catalog=authority
+                )
+            )
+
+        authority = self._catalog_authority(catalog)
+        is_v1 = authority is not None and (
+            getattr(authority, "format_version", None) == CATALOG_LEGACY_FORMAT_VERSION
+        )
+        table_projection = getattr(authority, "active_index_definitions_for", None)
+        if not is_v1 and callable(table_projection):
+            definitions = tuple(table_projection(table_id, table_name=table_name))
+            committed = tuple(
+                current
+                for definition in definitions
+                if (current := self._indexes.get(definition.registry_key)) is not None
+                and current.definition == definition
+                and belongs_to_requested_table(current)
+            )
+        elif is_v1:
+            # v1 has no persisted logical authority: every valid process-local access path for
+            # the committed table remains eligible, including with an explicit catalog photo.
+            # Resolve only that table's raw ownership bucket; calling active_indexes() here
+            # would reintroduce an O(total_indexes) projection for every row.
+            try:
+                catalog_table = authority.table_by_id(table_id)
+            except (AttributeError, GrafxError):
+                committed = ()
+            else:
+                if table_name is not None and catalog_table.name != table_name:
+                    committed = ()
+                else:
+                    committed = tuple(
+                        index
+                        for index in self._registered_indexes_for(
+                            table_id, table_name=catalog_table.name
+                        )
+                        if belongs_to_requested_table(index)
+                        and self._definition_matches_table_tolerantly(
+                            index.definition, catalog_table, catalog=authority
+                        )
+                    )
+        else:
+            # Narrow component doubles have no persisted authority surface.  Their historical
+            # contract is the raw registry, now reached through the same table-local structure.
+            committed = tuple(
+                index
+                for index in self._registered_indexes_for(
+                    table_id, table_name=table_name
+                )
+                if belongs_to_requested_table(index)
+            )
+
+        if txn is None:
+            return committed
+        txn_id = getattr(txn, "txn_id", None)
+        if isinstance(txn_id, bool) or not isinstance(txn_id, int) or txn_id < 0:
+            raise GrafxIndexError(
+                "Transaction-scoped index authority needs a non-negative integer txn_id.",
+                field="txn_id",
+                value=repr(txn_id),
+            )
+        observed = tuple(
+            index
+            for index in self._schema_observed.get(txn_id, ())
+            if belongs_to_requested_table(index)
+        )
+        return tuple(dict.fromkeys((*committed, *observed)))
+
     def unregistered_persistent_indexes_for(
-        self, tables: Sequence[object]
+        self,
+        tables: Sequence[object],
+        *,
+        catalog: object | None = None,
     ) -> tuple[str, ...]:
-        """Name durable automatic indexes of ``tables`` absent from this registry.
+        """Name catalog-selected indexes of ``tables`` absent or physically mismatched.
 
         A long-lived participant can adopt a table committed by another process while its
         process-local index registry still predates that DDL.  In that state row materialisation
@@ -3786,43 +4192,67 @@ class IndexManager:
         silence for a complete replay and certify a short index.
 
         This is the pre-WAL proof used by the transaction manager after its existing-only
-        registry synchronisation.  Only files that actually exist are obligations: an automatic
-        accelerator that was deliberately skipped because its name is illegal or collides keeps
-        the established scan fallback.  A path alone is not proof: the registry definition and
-        the durable header must both match the complete automatic definition, so a speculative
-        artifact that reused the same folded name cannot satisfy another table's obligation.
+        registry synchronisation.  In v1 only legacy automatic files that actually exist are
+        obligations, preserving the established scan fallback.  In v2 every ACTIVE generation
+        is an explicit catalog promise, so absence, unreadable bytes or any header/nonce mismatch
+        is an obligation and blocks the write before WAL publication.
         """
 
+        authority = catalog
+        if authority is None:
+            try:
+                authority = self._heap.catalog.catalog
+            except AttributeError:
+                authority = None
+        definitions = self._catalog_active_definitions(authority)
+        if definitions is None:
+            definitions = tuple(index.definition for index in self.indexes())
+        identities = {
+            (getattr(table, "table_id", None), getattr(table, "name", None))
+            for table in tables
+        }
+        is_v2 = (
+            getattr(authority, "format_version", CATALOG_LEGACY_FORMAT_VERSION)
+            != CATALOG_LEGACY_FORMAT_VERSION
+        )
         persisted = frozenset(self._pool.storage.list_files(f"{INDEX_DIRECTORY}/"))
         missing: list[str] = []
         seen: set[str] = set()
-        for table in tables:
-            try:
-                definitions = automatic_index_definitions(table)  # type: ignore[arg-type]
-            except GrafxError:
+        for definition in definitions:
+            if (definition.table_id, definition.table_name) not in identities:
                 continue
-            for definition in definitions:
-                file = definition.file
-                if file in seen or file not in persisted:
-                    continue
-                seen.add(file)
-                current = self._indexes.get(definition.registry_key)
-                if current is not None and current.definition == definition:
-                    continue
-                try:
-                    page = self._pool.read_fresh_page(file, HEADER_PAGE_INDEX)
-                    header = IndexHeader.decode(page.read_slot(INDEX_HEADER_SLOT))
-                except GrafxError:
-                    # An unreadable/torn file was not proved to be this automatic accelerator;
-                    # the normal sync/open refusal retains its own classification.
-                    continue
-                if (
-                    header.digest == definition.digest()
-                    and header.visibility is definition.visibility
-                    and header.table_id == definition.table_id
-                    and header.bucket_count == definition.bucket_count
-                ):
+            file = definition.file
+            if file in seen:
+                continue
+            seen.add(file)
+            strict_generation = is_v2 and definition.artifact_nonce != 0
+            exists = file in persisted
+            if not exists:
+                if strict_generation:
                     missing.append(definition.name)
+                continue
+            current = self._indexes.get(definition.registry_key)
+            if current is not None and current.definition == definition:
+                continue
+            try:
+                page = self._pool.read_fresh_page(file, HEADER_PAGE_INDEX)
+                header = IndexHeader.decode(page.read_slot(INDEX_HEADER_SLOT))
+            except GrafxError:
+                if strict_generation:
+                    missing.append(definition.name)
+                continue
+            matches = (
+                header.digest == definition.digest()
+                and header.visibility is definition.visibility
+                and header.table_id == definition.table_id
+                and header.bucket_count == definition.bucket_count
+                and (
+                    not strict_generation
+                    or header.artifact_nonce == definition.artifact_nonce
+                )
+            )
+            if matches or strict_generation:
+                missing.append(definition.name)
         return tuple(missing)
 
     # --- freshness --------------------------------------------------------------------------
@@ -3846,12 +4276,12 @@ class IndexManager:
         :meth:`open`, which runs after the section is released into the regime where foreign
         commits move the heap, always takes its own (ST-7).
         """
-        return self._table_high_waters(self.indexes())
+        return self._table_high_waters(self.active_indexes())
 
     def _replace_table_watermarks(self, high_waters: Mapping[int, Lsn]) -> None:
         """Bind every index to one open-time physical table-watermark picture."""
         self._table_watermarks = dict(high_waters)
-        for index in self.indexes():
+        for index in self.active_indexes():
             index._table_high_water = high_waters.get(index.definition.table_id)
 
     def _record_table_watermark(
@@ -3860,7 +4290,7 @@ class IndexManager:
         """Advance one locally observed table floor and bind all of its indexes to it."""
         position = max(self._table_watermarks.get(table_id, NO_LSN), lsn)
         self._table_watermarks[table_id] = position
-        for index in self.indexes_for(table_id, table_name=table_name):
+        for index in self.active_indexes_for(table_id, table_name=table_name):
             index._table_high_water = position
 
     @property
@@ -3895,6 +4325,7 @@ class IndexManager:
         *,
         persist_stale: bool = True,
         allow_ahead: bool = False,
+        catalog: object | None = None,
     ) -> tuple[IndexStore, ...]:
         """Check every registered index against the position the database has published.
 
@@ -3903,7 +4334,7 @@ class IndexManager:
         writes to the log and therefore belongs inside a transaction the caller owns.
         """
         published = _require_position("published_lsn", published_lsn)
-        indexes = self.indexes()
+        indexes = self.active_indexes(catalog=catalog)
         high_waters = self._table_high_waters(indexes)
         for index in indexes:
             required = high_waters[index.definition.table_id]
@@ -3957,7 +4388,7 @@ class IndexManager:
         pass -- is read fresh here, never guessed at (ST-7).
         """
         floor = _require_position("checkpoint_lsn", checkpoint_lsn)
-        indexes = self.indexes()
+        indexes = self.active_indexes()
         if watermarks is None:
             high_waters = self._table_high_waters(indexes)
         else:
@@ -4006,7 +4437,7 @@ class IndexManager:
         out of the stale state.
         """
         position = _require_position("lsn", lsn)
-        indexes = self.indexes()
+        indexes = self.active_indexes()
         photo = (
             dict(watermarks)
             if watermarks is not None
@@ -4032,7 +4463,7 @@ class IndexManager:
         default is in-memory only: the WAL is retained and the failed pass may have refused
         before its first mutation, so poisoning this handle must not invent another disk write.
         """
-        for index in self.indexes():
+        for index in self.active_indexes():
             index.mark_stale(reason, persist=persist)
 
     def validate_staged_records(
@@ -4046,6 +4477,10 @@ class IndexManager:
         commit path. The decoded multiset must exactly match the changes held by the registered
         indexes for this transaction.
         """
+        authorised = {
+            index.definition.registry_key: index
+            for index in self._transaction_indexes(txn)
+        }
         actual: list[IndexChange] = []
         for position, record in enumerate(records):
             if not isinstance(record, WalRecord):
@@ -4072,16 +4507,21 @@ class IndexManager:
                     field="pending_records",
                     position=position,
                 ) from failure
-            if change.index.lower() not in self._indexes:
+            if change.index.lower() not in authorised:
                 raise GrafxIndexError(
-                    f"A staged effect names unregistered index {change.index!r}.",
+                    f"A staged effect names index {change.index!r} without ACTIVE catalog "
+                    "authority for this transaction.",
                     field="index",
                     index=change.index,
                     position=position,
                 )
             actual.append(change)
 
-        expected = [change for index in self.indexes() for change in index.pending(txn)]
+        expected = [
+            change
+            for index in self._transaction_indexes(txn)
+            for change in index.pending(txn)
+        ]
         remaining = list(expected)
         for change in actual:
             try:
@@ -4132,7 +4572,7 @@ class IndexManager:
         staged_replacements: list[tuple[_Staged, list[IndexChange]]] = []
         expected: list[IndexChange] = []
         txn_id = int(txn.txn_id)
-        for index in self.indexes():
+        for index in self._transaction_indexes(txn):
             staged = index._staged.get(txn_id)
             if staged is None:
                 continue
@@ -4205,12 +4645,18 @@ class IndexManager:
         *,
         table_name: str | None = None,
         table: object | None = None,
+        txn: StagingTransaction | None = None,
     ) -> int:
         """Count entries this row owes without deriving or hashing their keys."""
 
         return sum(
             1
-            for index in self.indexes_for(table_id, table_name=table_name, table=table)
+            for index in self.active_indexes_for(
+                table_id,
+                table_name=table_name,
+                table=table,
+                txn=txn,
+            )
             if index.definition.owes_entry(values)
         )
 
@@ -4227,7 +4673,9 @@ class IndexManager:
     ) -> tuple[WalRecord, ...]:
         """Stage, on every index of the table, the entry this new row version owes it."""
         records: list[WalRecord] = []
-        for index in self.indexes_for(table_id, table_name=table_name, table=table):
+        for index in self.active_indexes_for(
+            table_id, table_name=table_name, table=table, txn=txn
+        ):
             definition = index.definition
             if not definition.owes_entry(values):
                 index.stage_empty_observation(txn)
@@ -4250,7 +4698,9 @@ class IndexManager:
     ) -> tuple[WalRecord, ...]:
         """Stage, on every index of the table, the end of the entry this row version had."""
         records: list[WalRecord] = []
-        for index in self.indexes_for(table_id, table_name=table_name, table=table):
+        for index in self.active_indexes_for(
+            table_id, table_name=table_name, table=table, txn=txn
+        ):
             definition = index.definition
             if not definition.owes_entry(values):
                 index.stage_empty_observation(txn)
@@ -4281,7 +4731,9 @@ class IndexManager:
         key looks the same would leave the index pointing at a version the row no longer has.
         """
         records: list[WalRecord] = []
-        for index in self.indexes_for(table_id, table_name=table_name, table=table):
+        for index in self.active_indexes_for(
+            table_id, table_name=table_name, table=table, txn=txn
+        ):
             definition = index.definition
             owes_old = definition.owes_entry(old_values)
             owes_new = definition.owes_entry(new_values)
@@ -4313,7 +4765,7 @@ class IndexManager:
         touched: list[str] = []
         written_tables = _tables_written_by(txn)
         observed_tables: set[_TableIdentity] = set(written_tables or ())
-        indexes = self.indexes()
+        indexes = self._transaction_indexes(txn)
         observations = {index.name: index.observed(txn) for index in indexes}
         staged_tables = {
             index.definition.table_id for index in indexes if observations[index.name]
@@ -4377,8 +4829,9 @@ class IndexManager:
         answer says so rather than raising, and the caller decides.
         """
         change = change_of(record)
-        found = self._indexes.get(change.index.lower())
-        if found is None:
+        try:
+            found = self.active_index(change.index)
+        except GrafxIndexError:
             return False
         found.apply(record)
         return True
@@ -4395,7 +4848,7 @@ class IndexManager:
         every call site with a chance of being forgotten. For a PROXIMITY index the entries are
         already the answer and the heap is deliberately not consulted.
         """
-        index = self.index(name)
+        index = self.active_index(name)
         if index.visibility is IndexVisibility.PROXIMITY:
             # Every registered index satisfies the protocol -- register() checks it -- so the
             # index decides its own answer here and the heap is deliberately not consulted.
@@ -4415,7 +4868,7 @@ class IndexManager:
         deliberately does not consult the heap, so it keeps using :meth:`lookup` and this door
         refuses that contract rather than silently changing it.
         """
-        index = self.index(name)
+        index = self.active_index(name)
         if index.visibility is IndexVisibility.PROXIMITY:
             raise GrafxIndexError(
                 f"Index {index.name!r} has proximity visibility and does not validate heap "
@@ -4544,11 +4997,11 @@ class IndexManager:
         With a transaction the pass removes and logs; without one it measures. The argument order
         follows the index method it delegates to, which follows CONTRACT.md section 8.7.
         """
-        return tuple(index.reconcile(horizon, txn) for index in self.indexes())
+        return tuple(index.reconcile(horizon, txn) for index in self.active_indexes())
 
     def note_reconciled(self, horizon: Lsn) -> None:
         """Record on every index the horizon a completed reconciliation pass applied."""
-        for index in self.indexes():
+        for index in self.active_indexes():
             index.note_reconciled(horizon)
 
     def rebuild(
@@ -4575,7 +5028,7 @@ class IndexManager:
         publish a partially-built index in between, and that is the state this method exists to
         get out of.
         """
-        index = self.index(name)
+        index = self.active_index(name)
         definition = index.definition
         table = self._heap.catalog.catalog.table_by_id(definition.table_id)
         position = _require_position("through_lsn", through_lsn)
@@ -4651,7 +5104,7 @@ class IndexManager:
         that was staged and never committed changed nothing, and an index that started answering
         at staging time would answer from a structure the log had not yet accepted.
         """
-        index = self.index(name)
+        index = self.active_index(name)
         index.clear_stale(
             through_lsn, advance_to=advance_to, rebuild_token=rebuild_token
         )
@@ -4681,7 +5134,9 @@ class IndexManager:
         whichever kind of index left it out.
         """
         findings: list[IndexFinding] = []
-        for index in self.indexes() if name is None else (self.index(name),):
+        for index in (
+            self.active_indexes() if name is None else (self.active_index(name),)
+        ):
             findings.extend(self._verify_entries(index))
             findings.extend(self._verify_coverage(index))
         return tuple(findings)

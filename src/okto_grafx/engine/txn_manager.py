@@ -1129,7 +1129,8 @@ class TransactionManager:
                 if manager is None:
                     return None
                 change = change_of(record)
-                index_file = getattr(manager.index(change.index), "file", None)
+                active_index = getattr(manager, "active_index", manager.index)
+                index_file = getattr(active_index(change.index), "file", None)
                 if (
                     not isinstance(index_file, str)
                     or not index_file
@@ -1150,7 +1151,9 @@ class TransactionManager:
                 # dominate it by targeting their whole file.
                 manager = self._index_manager
                 if manager is not None:
-                    indexes_of = getattr(manager, "indexes", None)
+                    indexes_of = getattr(
+                        manager, "active_indexes", getattr(manager, "indexes", None)
+                    )
                     if not callable(indexes_of):
                         return None
                     indexes = indexes_of()
@@ -1278,7 +1281,11 @@ class TransactionManager:
         missing_for = getattr(manager, "unregistered_persistent_indexes_for", None)
         if not written_tables or not callable(missing_for):
             return
-        missing = tuple(missing_for(written_tables))
+        try:
+            missing = tuple(missing_for(written_tables, catalog=committed_catalog))
+        except TypeError:
+            # Compatibility collaborators may still expose the pre-authority signature.
+            missing = tuple(missing_for(written_tables))
         if not missing:
             return
         raise GrafxTransactionStateError(
@@ -1956,8 +1963,25 @@ class TransactionManager:
                 COMMIT_SECTION, timeout=self._commit_lock_timeout
             ):
                 published = self._published_state_in_section().last_committed_lsn
-                registered = tuple(manager.indexes())
-                stale = tuple(manager.open(published, persist_stale=persist_stale))
+                committed_catalog = getattr(self._catalog, "catalog", None)
+                active_indexes = getattr(manager, "active_indexes", None)
+                registered = tuple(
+                    active_indexes(catalog=committed_catalog)
+                    if callable(active_indexes)
+                    else manager.indexes()
+                )
+                try:
+                    stale = tuple(
+                        manager.open(
+                            published,
+                            persist_stale=persist_stale,
+                            catalog=committed_catalog,
+                        )
+                    )
+                except TypeError:
+                    stale = tuple(
+                        manager.open(published, persist_stale=persist_stale)
+                    )
         return registered, stale
 
     def checkpoint_and_claim_index_rebuild(self, index: Any, reason: str) -> int:
@@ -3511,7 +3535,7 @@ class TransactionManager:
             base
             + len(staged)
             + len(txn.pending_records)
-            + self._index_record_count(rows)
+            + self._index_record_count(txn, rows)
             + 1
         )
         if predicted >= PROVISIONAL_CSN:
@@ -3714,7 +3738,9 @@ class TransactionManager:
         except GrafxError:
             return ()
 
-    def _index_record_count(self, rows: Sequence[_RowWrite]) -> int:
+    def _index_record_count(
+        self, txn: TransactionContext, rows: Sequence[_RowWrite]
+    ) -> int:
         """Return how many log records the index staging of these rows will produce.
 
         The number is needed BEFORE the staging happens, because the commit number every index
@@ -3743,6 +3769,7 @@ class TransactionManager:
                     row.ended_values,
                     table_name=table_name,
                     table=row.table,
+                    txn=txn,
                 )
             if row.born is not None:
                 total += manager.row_entry_count(
@@ -3750,6 +3777,7 @@ class TransactionManager:
                     row.born_values,
                     table_name=table_name,
                     table=row.table,
+                    txn=txn,
                 )
         return total
 
@@ -3774,7 +3802,7 @@ class TransactionManager:
         if manager is None:
             return
         before = len(txn.pending_records)
-        expected = self._index_record_count(rows)
+        expected = self._index_record_count(txn, rows)
         for row in rows:
             table_id = getattr(row.table, "table_id", None)
             if table_id is None:
@@ -3859,7 +3887,8 @@ class TransactionManager:
         for table_id, table_name in tables:
             if table_id is None or not isinstance(table_name, str):
                 continue
-            for index in manager.indexes_for(table_id, table_name=table_name):
+            active_for = getattr(manager, "active_indexes_for", manager.indexes_for)
+            for index in active_for(table_id, table_name=table_name):
                 try:
                     index.mark_stale(
                         f"commit {committed} was durable but could not be applied to this index "

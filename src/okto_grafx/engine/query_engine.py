@@ -205,7 +205,7 @@ from okto_grafx.domain.query.tokens import (
 )
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.engine.buffer_pool import BufferPool
-from okto_grafx.domain.model.catalog import Catalog
+from okto_grafx.domain.model.catalog import CATALOG_LEGACY_FORMAT_VERSION, Catalog
 from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.metrics_catalog import MetricEmitter, metric
@@ -2006,6 +2006,33 @@ class _OwnerLandingTxnMemo:
             self._base_charged = False
 
 
+def _catalog_active_indexes(manager: object, catalog: Catalog) -> tuple[object, ...]:
+    """Return the registry objects authorized by this exact catalog picture.
+
+    Production's ``IndexManager`` owns the mapping from catalog definitions to resident stores.
+    The legacy ``indexes`` fallback exists only for narrow query-engine doubles which implement
+    the pre-v2 collaborator surface; it must not become a second production authority.
+    """
+
+    active = getattr(manager, "active_indexes", None)
+    if callable(active):
+        return tuple(active(catalog=catalog))
+    listing = getattr(manager, "indexes", None)
+    return tuple(listing()) if callable(listing) else ()
+
+
+def _catalog_active_index(
+    manager: object, name: str, catalog: Catalog
+) -> object | None:
+    """Return one catalog-authorized registered index, with a legacy-double fallback."""
+
+    active = getattr(manager, "active_index", None)
+    if callable(active):
+        return active(name, catalog=catalog)
+    lookup = getattr(manager, "index", None)
+    return lookup(name) if callable(lookup) else None
+
+
 class QueryEngine:
     """The query surface of one database (CONTRACT.md section 8.9).
 
@@ -2371,9 +2398,6 @@ class QueryEngine:
         """Return usable index definitions, withholding tables that need an owner overlay."""
         if self._indexes is None:
             return ()
-        listing = getattr(self._indexes, "indexes", None)
-        if listing is None:
-            return ()
         # A STALE index is withheld from the planner, and that is a correctness rule rather than
         # a policy. A stale index is a SUBSET of what the heap holds -- entries it never received
         # -- and being a subset is exactly what the EXACT contract cannot repair: validating a
@@ -2385,7 +2409,7 @@ class QueryEngine:
         tables = {(table.table_id, table.name): table for table in catalog.tables()}
         return tuple(
             index.definition
-            for index in listing()
+            for index in _catalog_active_indexes(self._indexes, catalog)
             if not getattr(index, "stale", False)
             and index.definition.table_id not in without_indexes_for
             and (
@@ -2790,13 +2814,14 @@ class QueryEngine:
         if self._indexes is None:
             return False
         try:
-            tables = tuple(self._catalog.catalog.tables())
+            catalog = self._catalog.catalog
+            tables = tuple(catalog.tables())
         except (AttributeError, GrafxError):
             return False
         missing_for = getattr(
             self._indexes, "unregistered_persistent_indexes_for", None
         )
-        if callable(missing_for) and missing_for(tables):
+        if callable(missing_for) and missing_for(tables, catalog=catalog):
             return True
         vectors = self._vectors
         if vectors is None:
@@ -2828,27 +2853,47 @@ class QueryEngine:
         if self._indexes is None:
             return
         try:
-            registered = tuple(self._indexes.indexes())
-            tables = tuple(self._catalog.catalog.tables())
+            catalog = self._catalog.catalog
+            registered = _catalog_active_indexes(self._indexes, catalog)
+            tables = tuple(catalog.tables())
         except (AttributeError, GrafxError):
             return
+        project = getattr(catalog, "active_index_definitions", None)
+        projected = (
+            tuple(project())
+            if callable(project)
+            else tuple(
+                definition
+                for table in tables
+                for definition in automatic_index_definitions(table)
+            )
+        )
         durable: set[str] = set()
         for table in tables:
             try:
-                definitions = automatic_index_definitions(table)
+                definitions = (
+                    tuple(
+                        definition
+                        for definition in automatic_index_definitions(table)
+                        if definition.visibility is IndexVisibility.EXACT
+                    )
+                    if catalog.format_version == CATALOG_LEGACY_FORMAT_VERSION
+                    else tuple(
+                        definition
+                        for definition in projected
+                        if definition.visibility is IndexVisibility.EXACT
+                        and definition.table_id == table.table_id
+                        and definition.table_name == table.name
+                    )
+                )
             except GrafxError:
                 # An automatic scalar index name outside the identifier budget is precisely the
                 # supported decline this diagnostic describes.
                 durable.add(table.name)
                 continue
-            scalar = tuple(
-                definition
-                for definition in definitions
-                if definition.visibility.value == "exact"
-            )
-            if scalar and any(
+            if definitions and any(
                 not any(index.definition == expected for index in registered)
-                for expected in scalar
+                for expected in definitions
             ):
                 durable.add(table.name)
         self._durable_skips.clear()
@@ -3455,6 +3500,7 @@ def _index_lookup_versions(
     *,
     reuse_validated_version: bool,
     ended: Collection[object],
+    selected_index: object | None = None,
 ) -> Iterator[tuple[object, HeapVersion]]:
     """Yield index hits with their versions, reusing exact validation when available.
 
@@ -3467,11 +3513,35 @@ def _index_lookup_versions(
     exactly as before this optimisation.
     """
     lookup_versions = getattr(manager, "lookup_versions", None)
-    if reuse_validated_version and callable(lookup_versions):
+    if selected_index is not None:
+        visibility = getattr(selected_index, "visibility", None)
+        validated_versions = getattr(manager, "validated_versions", None)
+        if (
+            reuse_validated_version
+            and visibility is IndexVisibility.EXACT
+            and callable(validated_versions)
+        ):
+            yield from validated_versions(selected_index, key, snapshot)
+            return
+        validated = getattr(manager, "validated", None)
+        if visibility is IndexVisibility.EXACT:
+            refs = (
+                validated(selected_index, key, snapshot)
+                if callable(validated)
+                else getattr(manager, "lookup")(name, key, snapshot)
+            )
+        else:
+            index_lookup = getattr(selected_index, "lookup", None)
+            if not callable(index_lookup):
+                refs = getattr(manager, "lookup")(name, key, snapshot)
+            else:
+                refs = index_lookup(key, snapshot)
+    elif reuse_validated_version and callable(lookup_versions):
         yield from lookup_versions(name, key, snapshot)
         return
-    lookup = getattr(manager, "lookup")
-    for ref in lookup(name, key, snapshot):
+    else:
+        refs = getattr(manager, "lookup")(name, key, snapshot)
+    for ref in refs:
         # The old fallback filtered this owner overlay before its second heap read. Preserve that
         # ordering: a row ended by this transaction is absent even if its stored bytes are now
         # corrupt, and observing that corruption here would expand the query's read surface.
@@ -3491,6 +3561,7 @@ def _index_seek(
     be a second implementation of a rule that already has one, and the two would drift.
     """
     manager = engine.require_indexes()
+    selected_index = _catalog_active_index(manager, node.index, context.schema())
     snapshot = context.snapshot
     arity = len(node.table.columns)
     positions = tuple(node.table.column_index(name) for name in node.key_columns)
@@ -3520,6 +3591,7 @@ def _index_seek(
             snapshot,
             reuse_validated_version=reuse_validated_version,
             ended=ended,
+            selected_index=selected_index,
         ):
             if ref in ended:
                 continue  # ended by this transaction: the same rule the scan applies
@@ -3575,12 +3647,15 @@ def _edge_steps(
     """
     manager = engine._indexes
     lookup = getattr(manager, "lookup", None) if manager is not None else None
+    catalog = context.schema()
 
-    def usable(name: str) -> str | None:
-        """Return the name when that index is present, this table's own, and fresh."""
+    def usable(name: str) -> object | None:
+        """Return the store when that index is present, this table's own, and fresh."""
         try:
-            index = manager.index(name)  # type: ignore[union-attr]
+            index = _catalog_active_index(manager, name, catalog)  # type: ignore[arg-type]
         except GrafxError:
+            return None
+        if index is None:
             return None
         if (
             index.definition.table_id != relationship.table_id
@@ -3589,19 +3664,19 @@ def _edge_steps(
             return None  # a name collision, not this table's index
         if getattr(index, "stale", False):
             return None
-        return name
+        return index
 
-    from_name = (
+    from_index = (
         usable(edge_from_index_name(relationship.name))
         if callable(lookup) and outgoing
         else None
     )
-    to_name = (
+    to_index = (
         usable(edge_to_index_name(relationship.name))
         if callable(lookup) and incoming
         else None
     )
-    indexed = ((not outgoing) or from_name) and ((not incoming) or to_name)
+    indexed = ((not outgoing) or from_index) and ((not incoming) or to_index)
     if pending:
         # An endpoint index describes COMMITTED edges. An edge this transaction created is not in
         # it and cannot be put in it before the commit, so a lookup would answer a question about
@@ -3643,11 +3718,12 @@ def _edge_steps(
             for ref, version in _index_lookup_versions(
                 engine,
                 manager,
-                cast(str, from_name),
+                cast(str, getattr(from_index, "name", None)),
                 index_key((cast(Value, record_id), None), (0,)),
                 snapshot,
                 reuse_validated_version=False,
                 ended=ended,
+                selected_index=from_index,
             ):
                 if ref in ended:
                     continue
@@ -3660,11 +3736,12 @@ def _edge_steps(
             for ref, version in _index_lookup_versions(
                 engine,
                 manager,
-                cast(str, to_name),
+                cast(str, getattr(to_index, "name", None)),
                 index_key((None, cast(Value, record_id)), (1,)),
                 snapshot,
                 reuse_validated_version=False,
                 ended=ended,
+                selected_index=to_index,
             ):
                 if ref in ended:
                     continue
@@ -7637,14 +7714,19 @@ def _rows_carrying_key(
     if manager is None:
         return None
     lookup = getattr(manager, "lookup", None)
-    index_of = getattr(manager, "index", None)
-    if not callable(lookup) or not callable(index_of):
+    active_index = getattr(manager, "active_index", None)
+    legacy_index = getattr(manager, "index", None)
+    if not callable(lookup) or not (
+        callable(active_index) or callable(legacy_index)
+    ):
         return None
     name = primary_key_index_name(table.name)
     try:
-        index = index_of(name)
+        index = _catalog_active_index(manager, name, context.schema())
     except GrafxError:
         return None  # no index covers this table's key
+    if index is None:
+        return None
     if (
         index.definition.table_id != table.table_id
         or index.definition.table_name != table.name
@@ -7664,7 +7746,15 @@ def _rows_carrying_key(
     template[position] = key
     return tuple(
         (ref, engine.heap.read(ref))
-        for ref in lookup(name, index_key(template, (position,)), context.snapshot)
+        for ref in (
+            getattr(manager, "validated")(
+                index,
+                index_key(template, (position,)),
+                context.snapshot,
+            )
+            if callable(getattr(manager, "validated", None))
+            else lookup(name, index_key(template, (position,)), context.snapshot)
+        )
     )
 
 

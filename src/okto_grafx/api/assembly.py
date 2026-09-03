@@ -62,7 +62,9 @@ from okto_grafx.domain.errors import (
     GrafxSchemaVersionMismatch,
     GrafxUnsupportedOperation,
 )
-from okto_grafx.domain.index.definition import index_definition_matches_table
+from okto_grafx.domain.index.definition import IndexDefinition
+from okto_grafx.domain.index.visibility import IndexVisibility
+from okto_grafx.domain.model.catalog import CATALOG_FORMAT_VERSION
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.codec import PageCodec
@@ -78,13 +80,12 @@ from okto_grafx.engine.database import META_FILE, Database, DatabaseIdentity, Me
 from okto_grafx.engine.heap_store import HEAP_FILE, HeapStore
 from okto_grafx.engine.index_manager import (
     INDEX_DIRECTORY,
+    HashIndex,
     IndexManager,
     edge_from_index_name,
     edge_to_index_name,
     index_file,
-    primary_key_index,
     primary_key_index_name,
-    relationship_endpoint_indexes,
 )
 from okto_grafx.engine.ledger_store import LedgerStore
 from okto_grafx.engine.metrics_catalog import register_catalog
@@ -406,17 +407,20 @@ def assemble_database(
         def sync_indexes(*, existing_only: bool) -> tuple[str, ...]:
             """Adopt every declared index from one proved directory inventory."""
             existing_files = frozenset(storage.list_files("index/"))
+            active_definitions = catalog.catalog.active_index_definitions()
             newly_attached = _attach_primary_key_indexes(
                 catalog,
                 indexes,
                 pool,
                 metrics,
+                definitions=active_definitions,
                 existing_only=existing_only,
                 existing_files=existing_files,
             )
             newly_attached += _attach_declared_vector_indexes(
                 catalog,
                 vectors,
+                definitions=active_definitions,
                 storage=storage,
                 existing_only=existing_only,
                 existing_files=existing_files,
@@ -643,26 +647,28 @@ def _verifier_factory(
 
     def build() -> Verifier:
         """Return a verifier over the index set registered at this moment."""
-        committed_tables = {
-            (table.table_id, table.name): table for table in catalog.catalog.tables()
-        }
-
-        def is_committed(index: object) -> bool:
-            """Return whether ``index`` exactly belongs to the durable catalog."""
-            definition = getattr(index, "definition", None)
-            table = committed_tables.get(
-                (
-                    getattr(definition, "table_id", None),
-                    getattr(definition, "table_name", None),
-                )
-            )
-            return table is not None and index_definition_matches_table(
-                definition, table
-            )
-
-        committed_indexes = tuple(
-            index for index in indexes.indexes() if is_committed(index)
+        authority = catalog.catalog
+        committed_indexes = indexes.active_indexes(
+            catalog=authority,
         )
+        if authority.format_version == CATALOG_FORMAT_VERSION:
+            covered = {
+                index.definition.registry_key: index.definition
+                for index in committed_indexes
+            }
+            missing = tuple(
+                definition.name
+                for definition in authority.active_index_definitions()
+                if definition.visibility is IndexVisibility.EXACT
+                and covered.get(definition.registry_key) != definition
+            )
+            if missing:
+                raise GrafxIndexError(
+                    "Verification cannot cover every exact ACTIVE generation selected by "
+                    f"catalog v2; missing or mismatched registrations: {', '.join(missing)}.",
+                    field="index_authority",
+                    missing=missing,
+                )
         return Verifier(
             pool,
             metrics,
@@ -680,96 +686,83 @@ def _attach_primary_key_indexes(
     pool: BufferPool,
     metrics: MetricsSink,
     *,
+    definitions: tuple[IndexDefinition, ...] | None = None,
     existing_only: bool = False,
     existing_files: frozenset[str] | None = None,
 ) -> tuple[str, ...]:
-    """Register the primary-key index of every table the catalog holds, and name them.
+    """Register every exact index selected by the catalog's runtime authority.
 
-    The DDL that creates a table creates its index, so this is the RE-ADOPTION path: the next
-    process to open the database has an index file on disk and no object for it. It mirrors
-    `_attach_declared_vector_indexes` exactly, and for the same reason -- an index that exists on
-    the device and is registered by nobody is an index the planner cannot see, which is a silent
-    fall back to a full scan rather than an error.
+    In catalog v1 these are the schema-derived primary-key and relationship endpoint definitions.
+    In v2 they are only persisted logical definitions with an ``ACTIVE`` physical generation.
+    The latter names an immutable generation file by nonce; its absence or any header mismatch is
+    an authority failure, never permission for startup to manufacture a new empty file.
 
-    Registering OPENS an existing file rather than replacing it (G6), so this adopts what is there
-    instead of rebuilding it, and `IndexManager.open` decides freshness afterwards. A database
-    written before primary keys were indexed has no such file: one is created, it is empty while
-    the heap is not, and it is therefore STALE -- which is the honest answer and the safe one,
-    because a stale index is excluded from planning and the query falls back to the scan it used
-    to do.
+    Legacy writable composition retains its established compatibility behaviour: a missing
+    derived accelerator may be created and then marked stale against a populated heap. Existing-
+    only sync never creates an artifact in either format.
     """
+    catalog_value = catalog.catalog
+    selected = (
+        catalog_value.active_index_definitions()
+        if definitions is None
+        else definitions
+    )
+    catalog_managed = catalog_value.format_version == CATALOG_FORMAT_VERSION
     attached: list[str] = []
-    for table in catalog.catalog.tables():
+    for definition in selected:
+        if definition.visibility is not IndexVisibility.EXACT:
+            continue
         try:
-            for endpoint in relationship_endpoint_indexes(table, pool, metrics):
-                try:
-                    current = indexes.index(endpoint.name)
-                except GrafxIndexError as failure:
-                    if failure.details.get("field") != "name":
-                        raise
-                    current = None
-                if current is not None and current.definition == endpoint.definition:
-                    continue
-                proved_present = (
-                    existing_files is not None and endpoint.file in existing_files
-                )
-                if existing_only and (
-                    not proved_present
-                    if existing_files is not None
-                    else not pool.storage.exists(endpoint.file)
-                ):
-                    continue
-                attached.append(
-                    (
-                        indexes.adopt_committed(
-                            endpoint,
-                            persist_stale=False,
-                            proved_present=proved_present,
-                        )
-                        if existing_only
-                        else indexes.register(
-                            endpoint,
-                            existing_only=existing_only,
-                            persist_stale=not existing_only,
-                            proved_present=proved_present,
-                        )
-                    ).name
-                )
-            index = primary_key_index(table, pool, metrics)
-            if index is None:
-                continue
+            index = HashIndex(definition, pool, metrics)
             try:
                 current = indexes.index(index.name)
             except GrafxIndexError as failure:
                 if failure.details.get("field") != "name":
                     raise
                 current = None
-            if current is not None and current.definition == index.definition:
-                continue
-            proved_present = existing_files is not None and index.file in existing_files
-            if existing_only and (
-                not proved_present
-                if existing_files is not None
-                else not pool.storage.exists(index.file)
+            if (
+                not catalog_managed
+                and current is not None
+                and current.definition == index.definition
             ):
                 continue
+            proved_present = existing_files is not None and index.file in existing_files
+            present = (
+                proved_present
+                if existing_files is not None
+                else pool.storage.exists(index.file)
+            )
+            if not present:
+                if catalog_managed:
+                    raise GrafxIndexError(
+                        f"Catalog v2 selects active index {index.name!r}, but its physical "
+                        f"generation {index.file!r} is absent.",
+                        field="file",
+                        file=index.file,
+                        index=index.name,
+                        artifact_nonce=definition.artifact_nonce,
+                    )
+                if existing_only:
+                    continue
             attached.append(
                 (
                     indexes.adopt_committed(
                         index,
                         persist_stale=False,
-                        proved_present=proved_present,
+                        proved_present=present,
                     )
-                    if existing_only
+                    if existing_only or catalog_managed
                     else indexes.register(
                         index,
                         existing_only=existing_only,
                         persist_stale=not existing_only,
-                        proved_present=proved_present,
+                        proved_present=present,
                     )
                 ).name
             )
         except (GrafxIndexError, GrafxUnsupportedOperation):
+            if catalog_managed:
+                raise
             # AN INDEX MAY NEVER MAKE A DATABASE UNOPENABLE. A catalog can hold a table whose
             # index name is illegal or collides -- two names differing only by case fold to one
             # file -- and raising here meant every later `connect()` on that database refused,
@@ -784,6 +777,7 @@ def _attach_declared_vector_indexes(
     catalog: CatalogStore,
     vectors: VectorEngine,
     *,
+    definitions: tuple[IndexDefinition, ...] | None = None,
     storage: StorageDevice | None = None,
     existing_only: bool = False,
     existing_files: frozenset[str] | None = None,
@@ -802,6 +796,16 @@ def _attach_declared_vector_indexes(
     transaction the caller owns -- so an index that opens stale is reported through
     :attr:`okto_grafx.engine.database.Database.stale_indexes` rather than silently rebuilt.
     """
+    selected = (
+        catalog.catalog.active_index_definitions()
+        if definitions is None
+        else definitions
+    )
+    active_names = {
+        definition.registry_key
+        for definition in selected
+        if definition.visibility is IndexVisibility.PROXIMITY
+    }
     attached: list[str] = []
     for table in catalog.catalog.tables():
         for column in table.columns:
@@ -809,6 +813,8 @@ def _attach_declared_vector_indexes(
             if space is None:
                 continue
             name = f"vector_{table.name}_{space}"
+            if name.lower() not in active_names:
+                continue
             file = index_file(name)
             proved_present = existing_files is not None and file in existing_files
             if existing_only and (

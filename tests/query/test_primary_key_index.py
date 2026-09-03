@@ -30,6 +30,7 @@ import okto_grafx
 import okto_grafx.engine.index_manager as index_manager_module
 import okto_grafx.engine.query_engine as query_engine_module
 from okto_grafx.domain.errors import GrafxQueryError
+from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.query.plan import IndexSeek, NodeScan
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import IndexManager, primary_key_index_name
@@ -237,6 +238,45 @@ def test_index_version_fallback_reads_hits_lazily(
     )
     assert next(owner_filtered) == ("second", "version-second")
     assert reads == ["second"], "ended hits must be filtered before fallback heap reads"
+
+
+def test_selected_exact_index_keeps_manager_validation_for_legacy_double() -> None:
+    """Selecting a store must not bypass an older manager's exact heap validation."""
+
+    class SelectedExact:
+        visibility = IndexVisibility.EXACT
+
+        def lookup(self, key: bytes, snapshot: object) -> tuple[str, ...]:
+            del key, snapshot
+            raise AssertionError("raw exact-index lookup bypassed manager validation")
+
+    calls: list[tuple[str, bytes, object]] = []
+
+    class LegacyManager:
+        def lookup(
+            self, name: str, key: bytes, snapshot: object
+        ) -> tuple[str, ...]:
+            calls.append((name, key, snapshot))
+            return ("confirmed",)
+
+    snapshot = object()
+    engine = SimpleNamespace(
+        heap=SimpleNamespace(read=lambda ref: f"version-{ref}")
+    )
+
+    assert tuple(
+        query_engine_module._index_lookup_versions(
+            engine,
+            LegacyManager(),
+            "idx",
+            b"key",
+            snapshot,
+            reuse_validated_version=False,
+            ended=(),
+            selected_index=SelectedExact(),
+        )
+    ) == (("confirmed", "version-confirmed"),)
+    assert calls == [("idx", b"key", snapshot)]
 
 
 def test_a_deleted_row_is_not_returned_by_a_seek(database) -> None:
