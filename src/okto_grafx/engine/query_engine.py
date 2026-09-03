@@ -47,7 +47,7 @@ its chain, which is exactly what section 8.5 step 4 needs in order to log the wr
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import cast
@@ -2110,6 +2110,7 @@ def _index_lookup_versions(
     snapshot: object,
     *,
     exact: bool,
+    ended: Collection[object],
 ) -> Iterator[tuple[object, HeapVersion]]:
     """Yield index hits with their versions, reusing exact validation when available.
 
@@ -2126,6 +2127,11 @@ def _index_lookup_versions(
         return
     lookup = getattr(manager, "lookup")
     for ref in lookup(name, key, snapshot):
+        # The old fallback filtered this owner overlay before its second heap read. Preserve that
+        # ordering: a row ended by this transaction is absent even if its stored bytes are now
+        # corrupt, and observing that corruption here would expand the query's read surface.
+        if ref in ended:
+            continue
         yield ref, engine.heap.read(ref)
 
 
@@ -2157,6 +2163,7 @@ def _index_seek(
             key,
             snapshot,
             exact=node.visibility is IndexVisibility.EXACT,
+            ended=ended,
         ):
             if ref in ended:
                 continue  # ended by this transaction: the same rule the scan applies
@@ -2284,6 +2291,7 @@ def _edge_steps(
                 index_key((cast(Value, record_id), None), (0,)),
                 snapshot,
                 exact=True,
+                ended=ended,
             ):
                 if ref in ended:
                     continue
@@ -2300,6 +2308,7 @@ def _edge_steps(
                 index_key((None, cast(Value, record_id)), (1,)),
                 snapshot,
                 exact=True,
+                ended=ended,
             ):
                 if ref in ended:
                     continue
