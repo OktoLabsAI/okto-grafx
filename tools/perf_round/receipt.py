@@ -230,9 +230,41 @@ def _refuse(reason: str) -> LiveBoardRefused:
     return LiveBoardRefused(reason)
 
 
-def require_declared_copy(path: Path | str) -> dict[str, Any]:
-    """Accept a board directory only as the declared copy its manifest describes, re-hashed now."""
-    root = guard_not_data_home(path)
+def require_declared_copy(
+    path: Path | str, *, allow_effective_data_home: bool = False
+) -> dict[str, Any]:
+    """Accept only the declared copy its manifest describes, re-hashed now.
+
+    ``allow_effective_data_home`` exists solely for the child of
+    :mod:`tools.perf_round.baseline_runs`: that runner intentionally makes its disposable,
+    per-run clone the Pulse data home.  The exception is fail-closed: every data-home variable
+    must be present and resolve to this exact directory, and the implicit real Pulse home remains
+    forbidden.  Consumers must additionally require the clone-provenance marker before mutation.
+    """
+    candidate = Path(path).resolve()
+    if allow_effective_data_home:
+        default_home = (Path.home() / DEFAULT_DATA_HOME_NAME).resolve()
+        if (
+            candidate == default_home
+            or default_home in candidate.parents
+            or candidate in default_home.parents
+        ):
+            raise _refuse(
+                f"runtime copy {candidate} overlaps the implicit live data home {default_home}"
+            )
+        missing_or_different = []
+        for name in DATA_HOME_ENV:
+            value = os.environ.get(name)
+            if not value or Path(value).expanduser().resolve() != candidate:
+                missing_or_different.append(name)
+        if missing_or_different:
+            raise _refuse(
+                "a runtime copy exception requires every data-home variable to name the "
+                f"same disposable directory; mismatches: {missing_or_different}"
+            )
+        root = candidate
+    else:
+        root = guard_not_data_home(candidate)
     manifest_path = root / COPY_MANIFEST_NAME
     sidecar_path = root / (COPY_MANIFEST_NAME + ".sha256")
     if _is_reparse_point(manifest_path) or not manifest_path.is_file():

@@ -272,6 +272,11 @@ def child_environment(
         os.pathsep + inherited_pythonpath if inherited_pythonpath else ""
     )
     environment["OKTO_GRAFX_EXPECTED_ROOT"] = str(SOURCE_ROOT)
+    environment["OKTO_GRAFX_PERF_RUNNER_PID"] = str(os.getpid())
+    if pulse_root is not None:
+        environment["OKTO_PULSE_EXPECTED_ROOT"] = str(pulse_root.resolve())
+    if pulse_core_root is not None:
+        environment["OKTO_PULSE_CORE_EXPECTED_ROOT"] = str(pulse_core_root.resolve())
     return environment
 
 
