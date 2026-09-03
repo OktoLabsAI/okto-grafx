@@ -2684,8 +2684,6 @@ class TransactionManager:
                     ),
                     self._hold_wal_tail(),
                 ):
-                    if commit_trace is not None:
-                        commit_trace.phase("occ")
                     self._validate_lease(lease)  # step 3.1
                     durable = self._complete_committed_gap()
                     current = durable.last_committed_lsn
@@ -2715,6 +2713,12 @@ class TransactionManager:
                     )
                     pre_staged_pages = frozenset(txn.staged_pages())
                     if conflict is None:
+                        if commit_trace is not None:
+                            # Completing a durable commit left behind by another participant is
+                            # recovery/application work, not optimistic validation. Keep it in
+                            # ``other`` and begin OCC only at the first conflict predicate; an
+                            # expensive foreign gap must not make the OCC phase look expensive.
+                            commit_trace.phase("occ")
                         with self._close_wait_hazard():
                             conflict = self._find_conflict(
                                 txn, interested_partitions=snapshot_interest

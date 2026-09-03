@@ -775,9 +775,22 @@ def test_hostile_commit_sink_cannot_change_a_durable_outcome(tmp_path: Path) -> 
     assert COMMIT_RETARGETS_TOTAL in metrics.attempts
 
 
-def test_foreign_commit_completion_is_counted_once(tmp_path: Path) -> None:
+def test_foreign_commit_completion_is_counted_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     metrics = RecordingMetricsSink()
     stack = build_stack(tmp_path, metrics=metrics, clock=StepClock())
+    observed_phases: list[str | None] = []
+    original = TransactionManager._complete_committed_gap
+
+    def observe_gap_phase(manager: TransactionManager):
+        trace = manager._active_commit_trace
+        observed_phases.append(None if trace is None else trace._phase)
+        return original(manager)
+
+    monkeypatch.setattr(
+        TransactionManager, "_complete_committed_gap", observe_gap_phase
+    )
     stack.wal.append(
         WalRecord(
             record_type=int(WalRecordType.COMMIT),
@@ -792,6 +805,7 @@ def test_foreign_commit_completion_is_counted_once(tmp_path: Path) -> None:
 
     assert report.durable is True
     assert metrics.total(COMMIT_FOREIGN_COMMITS_TOTAL) == 1.0
+    assert observed_phases[0] == "other"
 
 
 def test_real_index_commit_reports_the_actual_buffer_scans(

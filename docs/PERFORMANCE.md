@@ -446,6 +446,12 @@ complete timing sample. A typed coordination timeout closes its wait sample at t
 boundary, not after participant unwind. An untyped acquisition failure cannot prove that no grant
 occurred and therefore suppresses the whole trace.
 
+`other` deliberately includes completion/application of a durable commit left behind by another
+participant before this attempt starts its first OCC predicate. The separate foreign-commit
+counter reports how many such commits were completed. Classifying that recovery work as `occ`
+would make a foreign gap look like local conflict-validation cost and could select the wrong
+optimization.
+
 The counters report page images logged, physical live-WAL bytes successfully appended (including a
 segment header on rollover), actual buffer-pool flush calls, resident and retired-pinned frames
 traversed by commit-time flush/modified/dirty checks, foreign durable commits completed, and batches
