@@ -977,8 +977,8 @@ class _EndpointIdentityLocator:
         self._closed = False
         self._charged_bytes = 0
         self._charged_entries = 0
-        # A paused cursor owns at most one page's header/ref tuple plus its fixed fields.  Eight
-        # times page_size is intentionally conservative for Python tuple/integer overhead.
+        # A paused cursor owns at most one page's header/ref tuple plus its fixed fields.  Thirty-
+        # two times page_size is intentionally conservative for Python tuple/integer overhead.
         self._reserve(
             bytes_=(
                 _ENDPOINT_LOCATOR_CURSOR_BASE_BYTES
