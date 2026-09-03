@@ -47,6 +47,7 @@ from tools.perf_round.receipt import (  # noqa: E402
 SCHEMA = "okto-grafx.perf-round-0.0.2.pulse-graph-census.v1"
 WORKLOAD_SEMANTICS = "untimed_read_only_post_drain_heap_census"
 _MANIFEST_FILES = (COPY_MANIFEST_NAME, COPY_MANIFEST_NAME + ".sha256")
+_SERVE_LOCK_FILES = (".okto-pulse-serve.lock", ".okto-pulse-serve.lock.acquire")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -89,7 +90,10 @@ def _module_file(module: Any, *, root_env: str, package: str) -> str:
     root = Path(root_value).resolve()
     expected = root / "src" / Path(*package.split(".")) / "__init__.py"
     actual_value = getattr(module, "__file__", None)
-    if type(actual_value) is not str or Path(actual_value).resolve() != expected.resolve():
+    if (
+        type(actual_value) is not str
+        or Path(actual_value).resolve() != expected.resolve()
+    ):
         raise GraphCensusRefused(f"{package} did not import from its pinned checkout")
     return str(expected.resolve())
 
@@ -176,7 +180,9 @@ def _require_authenticated_grafx_binding(
 
 def _require_clean_verification(report: Any, *, scope: str) -> int:
     if getattr(report, "scope", None) != scope:
-        raise GraphCensusRefused("Grafx returned a verification report for another scope")
+        raise GraphCensusRefused(
+            "Grafx returned a verification report for another scope"
+        )
     findings = getattr(report, "findings", None)
     if findings != () or getattr(report, "clean", None) is not True:
         raise GraphCensusRefused(f"the read-only {scope} verification is not clean")
@@ -196,7 +202,9 @@ def _header_observations(heap: Any, table: Any) -> Iterator[tuple[int, RecordHea
                 "the header-only heap walk unexpectedly copied record content"
             )
         if not isinstance(header, RecordHeader):
-            raise GraphCensusRefused("the header-only heap walk returned an invalid header")
+            raise GraphCensusRefused(
+                "the header-only heap walk returned an invalid header"
+            )
         page = getattr(ref, "page", None)
         if isinstance(page, bool) or not isinstance(page, int):
             raise GraphCensusRefused(
@@ -215,7 +223,9 @@ def collect_heap_census(database: Any) -> dict[str, Any]:
     tables = tuple(database.catalog.catalog.tables())
     heap = getattr(database, "_heap", None)
     if heap is None:
-        raise GraphCensusRefused("the pinned Grafx handle exposes no heap for the census")
+        raise GraphCensusRefused(
+            "the pinned Grafx handle exposes no heap for the census"
+        )
 
     heap_pages_total = 0
 
@@ -287,9 +297,7 @@ def _admit_database(database: Any, graph_path: Path, args: argparse.Namespace) -
     )
 
 
-def _open_and_collect(
-    graph_path: Path, args: argparse.Namespace
-) -> dict[str, Any]:
+def _open_and_collect(graph_path: Path, args: argparse.Namespace) -> dict[str, Any]:
     database = _connect_read_only(graph_path, args)
     result: dict[str, Any] | None = None
     try:
@@ -324,14 +332,72 @@ def _open_and_collect(
     return result
 
 
-def _inventory_matches(expected: Mapping[str, Any], observed: Mapping[str, Any]) -> bool:
+def _inventory_matches(
+    expected: Mapping[str, Any], observed: Mapping[str, Any]
+) -> bool:
     return all(
         expected.get(field) == observed.get(field)
         for field in ("sha256", "file_count", "total_bytes", "files")
     )
 
 
+def _require_lock_artifacts_absent(copy_root: Path) -> None:
+    if any(os.path.lexists(copy_root / name) for name in _SERVE_LOCK_FILES):
+        raise GraphCensusRefused(
+            "the exclusive Pulse serve-lock artifacts remained after lock release"
+        )
+
+
+def _require_per_run_clone_manifest(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
+    source = manifest.get("source")
+    marker = (
+        source.get("cloned_from_declared_copy") if isinstance(source, dict) else None
+    )
+    if type(marker) is not str or _SHA256.fullmatch(marker) is None:
+        raise GraphCensusRefused(
+            "the declared data home is not a proved full per-run clone"
+        )
+    expected_inventory = manifest.get("copy")
+    if not isinstance(expected_inventory, dict):
+        raise GraphCensusRefused(
+            "the per-run clone manifest has no inventory authority"
+        )
+    return expected_inventory
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    args.board_id = _uuid(args.board_id, field="board_id")
+    if isinstance(args.run, bool) or not isinstance(args.run, int) or args.run < 0:
+        raise GraphCensusRefused("--run must be a non-negative integer")
+    if args.mode not in ("strict", "generation"):
+        raise GraphCensusRefused("--mode must be strict or generation")
+    if isinstance(args.seed, bool) or not isinstance(args.seed, int):
+        raise GraphCensusRefused("--seed must be an integer")
+    if (
+        isinstance(args.page_size, bool)
+        or not isinstance(args.page_size, int)
+        or args.page_size <= 0
+        or isinstance(args.buffer_budget_bytes, bool)
+        or not isinstance(args.buffer_budget_bytes, int)
+        or args.buffer_budget_bytes <= 0
+    ):
+        raise GraphCensusRefused(
+            "page size and buffer budget must be positive integers"
+        )
+    if args.checksum != "auto":
+        raise GraphCensusRefused("this census supports only --checksum auto")
+    if args.kind != "instrumented":
+        raise GraphCensusRefused(
+            "the private header-only census requires --kind instrumented"
+        )
+    if args.thermal != "mixed":
+        raise GraphCensusRefused(
+            "the untimed census requires --thermal mixed because it does not control the OS cache"
+        )
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    _validate_args(args)
     args.copy = Path(args.copy).resolve()
     args.out = guard_not_data_home(args.out)
     if args.out.exists():
@@ -348,22 +414,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _validate_runner_parent()
     _validate_effective_data_home(args.copy)
     manifest = require_declared_copy(args.copy, allow_effective_data_home=True)
-    source = manifest.get("source")
-    marker = source.get("cloned_from_declared_copy") if isinstance(source, dict) else None
-    if type(marker) is not str or _SHA256.fullmatch(marker) is None:
-        raise GraphCensusRefused(
-            "the declared data home is not a proved full per-run clone"
-        )
-    expected_inventory = manifest.get("copy")
-    if not isinstance(expected_inventory, dict):
-        raise GraphCensusRefused("the per-run clone manifest has no inventory authority")
+    expected_inventory = _require_per_run_clone_manifest(manifest)
     if not (args.copy / "boards" / args.board_id).is_dir():
         raise GraphCensusRefused("the requested board is absent from the per-run clone")
 
     runtime_files = _validate_runtime_imports()
     with _exclusive_clone_lock(args.copy) as owned_lock:
         if owned_lock is None:
-            raise GraphCensusRefused("the per-run clone lock was not acquired exclusively")
+            raise GraphCensusRefused(
+                "the per-run clone lock was not acquired exclusively"
+            )
         binding = _acquire_board_binding(args.copy, args.board_id)
         graph_path = _require_authenticated_grafx_binding(
             binding,
@@ -373,6 +433,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         aggregate = _open_and_collect(graph_path, args)
 
+    _require_lock_artifacts_absent(args.copy)
     observed_inventory = inventory(args.copy, exclude=_MANIFEST_FILES)
     if not _inventory_matches(expected_inventory, observed_inventory):
         raise GraphCensusRefused(
@@ -382,6 +443,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "schema": SCHEMA,
         "workload_semantics": WORKLOAD_SEMANTICS,
+        "measurement_semantics": {
+            "timed": False,
+            "filesystem_cache_controlled": False,
+            "thermal_label": "mixed",
+            "thermal_meaning": "uncontrolled_and_not_applicable_to_an_untimed_census",
+            "kind": "instrumented",
+            "kind_meaning": "private_header_only_static_census_not_replay_hooks",
+            "mvcc_classification": "heap_version_live_predicate",
+            "dead_meaning": "not_heap_version_live_not_vacuum_safe",
+            "vacuum_safety_established": False,
+            "vector_inventory_meaning": "static_catalog_presence_only",
+            "vector_activity_established": False,
+        },
         "route": {
             "binding_authenticated": True,
             "backend": "grafx",
@@ -398,6 +472,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         **aggregate,
         "clone_inventory": {
             "unchanged": True,
+            "serve_lock_artifacts_absent": True,
             "sha256_before": expected_inventory["sha256"],
             "sha256_after": observed_inventory["sha256"],
             "file_count": observed_inventory["file_count"],
@@ -441,15 +516,6 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        args.board_id = _uuid(args.board_id, field="board_id")
-        if args.run < 0:
-            raise GraphCensusRefused("--run must be non-negative")
-        if args.page_size <= 0 or args.buffer_budget_bytes <= 0:
-            raise GraphCensusRefused("page size and buffer budget must be positive")
-        if args.checksum != "auto":
-            raise GraphCensusRefused("this census supports only --checksum auto")
-        if args.kind != "instrumented":
-            raise GraphCensusRefused("the heap census requires --kind instrumented")
         document = run(args)
         with args.out.open("x", encoding="utf-8", newline="\n") as handle:
             handle.write(canonical_json(document))

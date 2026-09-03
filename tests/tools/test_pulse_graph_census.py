@@ -19,8 +19,12 @@ from tools.perf_round import pulse_graph_census
 from tools.perf_round.pulse_graph_census import (
     GraphCensusRefused,
     _inventory_matches,
+    _module_file,
     _open_and_collect,
     _require_authenticated_grafx_binding,
+    _require_lock_artifacts_absent,
+    _require_per_run_clone_manifest,
+    _validate_effective_data_home,
     _validate_runner_parent,
     collect_heap_census,
 )
@@ -36,7 +40,9 @@ class _Table:
 class _Heap:
     def __init__(
         self,
-        populations: dict[_Table, tuple[tuple[int, ...], tuple[tuple[int, RecordHeader], ...]]],
+        populations: dict[
+            _Table, tuple[tuple[int, ...], tuple[tuple[int, RecordHeader], ...]]
+        ],
         *,
         copied_content: bytes = b"",
     ) -> None:
@@ -46,12 +52,14 @@ class _Heap:
     def pages_of(self, table: _Table) -> tuple[int, ...]:
         return self._populations[table][0]
 
-    def _walk(
-        self, table: _Table, *, copy_content: bool
-    ) -> Any:
+    def _walk(self, table: _Table, *, copy_content: bool) -> Any:
         assert copy_content is False
         for page, header in self._populations[table][1]:
-            yield SimpleNamespace(page=page, slot=987_654_321), header, self._copied_content
+            yield (
+                SimpleNamespace(page=page, slot=987_654_321),
+                header,
+                self._copied_content,
+            )
 
 
 class _Database:
@@ -147,7 +155,9 @@ def _args(copy: Path, out: Path) -> argparse.Namespace:
     )
 
 
-def test_census_emits_only_aggregate_counts_and_reconciles_verifier(tmp_path: Path) -> None:
+def test_census_emits_only_aggregate_counts_and_reconciles_verifier(
+    tmp_path: Path,
+) -> None:
     result = collect_heap_census(_Database(tmp_path / "graph"))
 
     assert result["verification"] == {
@@ -234,6 +244,18 @@ def test_binding_must_be_authenticated_grafx_inside_clone(tmp_path: Path) -> Non
             board_id=BOARD_ID,
             page_size=8192,
         )
+    for field, value in (
+        ("scope", "global"),
+        ("scope_id", "00000000-0000-0000-0000-000000000002"),
+        ("page_size", 4096),
+    ):
+        with pytest.raises(GraphCensusRefused, match="Grafx geometry"):
+            _require_authenticated_grafx_binding(
+                SimpleNamespace(**{**vars(valid), field: value}),
+                clone_root=clone,
+                board_id=BOARD_ID,
+                page_size=8192,
+            )
     outside = tmp_path / "outside"
     outside.mkdir()
     with pytest.raises(GraphCensusRefused, match="descendant"):
@@ -298,7 +320,103 @@ def test_open_refuses_any_recovery_report_and_still_closes(
     assert database.closed is True and database.close_complete is True
 
 
-def test_child_requires_its_direct_runner_parent(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("read_only", False, "not a recovery-free consistent read-only view"),
+        ("descriptor_revalidation", "generation", "does not match"),
+        ("identity", SimpleNamespace(page_size=4096), "does not match"),
+        (
+            "pool",
+            SimpleNamespace(budget_bytes=32 * 1024 * 1024),
+            "does not match",
+        ),
+    ),
+)
+def test_open_refuses_an_effective_handle_configuration_mismatch_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    graph = tmp_path / "graph"
+    graph.mkdir()
+    database = _Database(graph)
+    setattr(database, field, value)
+    monkeypatch.setattr(
+        pulse_graph_census, "_connect_read_only", lambda _path, _args: database
+    )
+    monkeypatch.setattr(
+        pulse_graph_census, "_admit_database", lambda _database, _path, _args: None
+    )
+
+    with pytest.raises(GraphCensusRefused, match=message):
+        _open_and_collect(graph, _args(tmp_path / "clone", tmp_path / "out"))
+
+    assert database.closed is True and database.close_complete is True
+
+
+def test_open_refuses_an_incomplete_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph = tmp_path / "graph"
+    graph.mkdir()
+    database = _Database(graph)
+
+    def incomplete_close() -> None:
+        database.closed = True
+
+    database.close = incomplete_close
+    monkeypatch.setattr(
+        pulse_graph_census, "_connect_read_only", lambda _path, _args: database
+    )
+    monkeypatch.setattr(
+        pulse_graph_census, "_admit_database", lambda _database, _path, _args: None
+    )
+
+    with pytest.raises(GraphCensusRefused, match="did not close completely"):
+        _open_and_collect(graph, _args(tmp_path / "clone", tmp_path / "out"))
+
+
+def test_checkpointed_real_grafx_supports_the_header_only_census(
+    tmp_path: Path,
+) -> None:
+    graph = tmp_path / "graph"
+    writer = okto_grafx.connect(graph, page_size=512)
+    try:
+        with writer.begin("write") as transaction:
+            transaction.execute(
+                "CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))"
+            )
+        with writer.begin("write") as transaction:
+            transaction.execute(
+                "CREATE (:Person {id: $id, name: $name})",
+                {"id": 1, "name": "private-value-must-not-be-decoded"},
+            )
+        writer.checkpoint()
+    finally:
+        writer.close()
+
+    reader = okto_grafx.connect(
+        graph,
+        page_size=512,
+        read_only=True,
+        recovery_policy="refuse",
+    )
+    try:
+        census = collect_heap_census(reader)
+    finally:
+        reader.close()
+
+    assert census["verification"]["records"]["clean"] is True
+    assert census["counts"]["heap_record_slots_total"] == 1
+    assert census["heap"]["mvcc_headers"]["live_committed_open"] == 1
+
+
+def test_child_requires_its_direct_runner_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("OKTO_GRAFX_PERF_RUNNER_PID", str(os.getppid()))
     _validate_runner_parent()
     monkeypatch.setenv("OKTO_GRAFX_PERF_RUNNER_PID", str(os.getppid() + 1))
@@ -317,6 +435,148 @@ class _Lock(AbstractContextManager[object]):
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self._events.append("lock_exit")
         return None
+
+
+class _NullLock(AbstractContextManager[object]):
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
+
+
+def _stub_run_dependencies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    lock: AbstractContextManager[object],
+    inventory_after: dict[str, Any] | None = None,
+) -> tuple[argparse.Namespace, dict[str, Any]]:
+    clone = tmp_path / "clone"
+    graph = clone / "boards" / BOARD_ID / "grafx" / "generation"
+    graph.mkdir(parents=True)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    args = _args(clone, out_dir / "census.json")
+    for name in pulse_graph_census.DATA_HOME_ENV:
+        monkeypatch.setenv(name, str(clone))
+    monkeypatch.setenv("OKTO_GRAFX_PERF_RUNNER_PID", str(os.getppid()))
+    files = [{"path": "opaque", "size": 1, "sha256": "a" * 64}]
+    manifest = {
+        "source": {"cloned_from_declared_copy": "b" * 64},
+        "copy": {
+            "sha256": "c" * 64,
+            "file_count": 1,
+            "total_bytes": 1,
+            "files": files,
+        },
+    }
+    binding = SimpleNamespace(
+        scope="board",
+        scope_id=BOARD_ID,
+        backend="grafx",
+        page_size=8192,
+        physical_path=graph,
+    )
+    monkeypatch.setattr(
+        pulse_graph_census,
+        "require_declared_copy",
+        lambda _path, *, allow_effective_data_home: manifest,
+    )
+    monkeypatch.setattr(
+        pulse_graph_census,
+        "_validate_runtime_imports",
+        lambda: {
+            "okto_grafx_file": "grafx",
+            "okto_pulse_community_file": "community",
+            "okto_pulse_core_file": "core",
+        },
+    )
+    monkeypatch.setattr(pulse_graph_census, "_exclusive_clone_lock", lambda _root: lock)
+    monkeypatch.setattr(
+        pulse_graph_census,
+        "_acquire_board_binding",
+        lambda _root, _board: binding,
+    )
+    monkeypatch.setattr(
+        pulse_graph_census,
+        "_open_and_collect",
+        lambda _path, _args: {"verification": {}, "counts": {}, "heap": {}},
+    )
+    monkeypatch.setattr(
+        pulse_graph_census,
+        "inventory",
+        lambda _root, *, exclude: (
+            inventory_after if inventory_after is not None else dict(manifest["copy"])
+        ),
+    )
+    return args, manifest
+
+
+def test_manifest_requires_a_well_formed_per_run_clone_marker() -> None:
+    for marker in (None, "", "not-a-sha", "A" * 64):
+        with pytest.raises(GraphCensusRefused, match="proved full per-run clone"):
+            _require_per_run_clone_manifest(
+                {"source": {"cloned_from_declared_copy": marker}, "copy": {}}
+            )
+
+
+def test_every_effective_data_home_variable_must_name_the_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clone = tmp_path / "clone"
+    for name in pulse_graph_census.DATA_HOME_ENV:
+        monkeypatch.setenv(name, str(clone))
+    monkeypatch.setenv(pulse_graph_census.DATA_HOME_ENV[-1], str(tmp_path / "other"))
+
+    with pytest.raises(GraphCensusRefused, match="every data-home"):
+        _validate_effective_data_home(clone.resolve())
+
+
+def test_runtime_module_must_come_from_the_pinned_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "checkout"
+    expected = root / "src" / "private_package" / "__init__.py"
+    expected.parent.mkdir(parents=True)
+    expected.write_text("", encoding="utf-8")
+    wrong = tmp_path / "installed" / "private_package" / "__init__.py"
+    wrong.parent.mkdir(parents=True)
+    wrong.write_text("", encoding="utf-8")
+    monkeypatch.setenv("EXPECTED_PRIVATE_ROOT", str(root))
+
+    with pytest.raises(GraphCensusRefused, match="did not import from its pinned"):
+        _module_file(
+            SimpleNamespace(__file__=str(wrong)),
+            root_env="EXPECTED_PRIVATE_ROOT",
+            package="private_package",
+        )
+
+
+def test_run_refuses_a_lock_context_that_did_not_acquire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, _manifest = _stub_run_dependencies(tmp_path, monkeypatch, lock=_NullLock())
+
+    with pytest.raises(GraphCensusRefused, match="not acquired exclusively"):
+        pulse_graph_census.run(args)
+
+
+def test_run_refuses_a_changed_post_close_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    changed = {
+        "sha256": "d" * 64,
+        "file_count": 1,
+        "total_bytes": 1,
+        "files": [{"path": "opaque", "size": 1, "sha256": "a" * 64}],
+    }
+    args, _manifest = _stub_run_dependencies(
+        tmp_path, monkeypatch, lock=_Lock([]), inventory_after=changed
+    )
+
+    with pytest.raises(GraphCensusRefused, match="clone changed"):
+        pulse_graph_census.run(args)
 
 
 def test_run_requires_full_clone_and_proves_post_close_inventory(
@@ -405,6 +665,7 @@ def test_run_requires_full_clone_and_proves_post_close_inventory(
     ]
     assert document["clone_inventory"] == {
         "unchanged": True,
+        "serve_lock_artifacts_absent": True,
         "sha256_before": "c" * 64,
         "sha256_after": "c" * 64,
         "file_count": 1,
@@ -414,6 +675,98 @@ def test_run_requires_full_clone_and_proves_post_close_inventory(
     assert BOARD_ID not in encoded
     assert str(graph) not in encoded
     assert not args.out.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("thermal", "warm", "does not control the OS cache"),
+        ("thermal", "cold", "does not control the OS cache"),
+        ("kind", "raw", "requires --kind instrumented"),
+    ),
+)
+def test_run_refuses_misleading_measurement_labels(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    args = _args(tmp_path / "clone", tmp_path / "out.json")
+    setattr(args, field, value)
+
+    with pytest.raises(GraphCensusRefused, match=message):
+        pulse_graph_census.run(args)
+
+
+def test_report_names_static_mvcc_and_vector_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clone = tmp_path / "clone"
+    graph = clone / "boards" / BOARD_ID / "grafx" / "generation"
+    graph.mkdir(parents=True)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    args = _args(clone, out_dir / "census.json")
+    for name in pulse_graph_census.DATA_HOME_ENV:
+        monkeypatch.setenv(name, str(clone))
+    monkeypatch.setenv("OKTO_GRAFX_PERF_RUNNER_PID", str(os.getppid()))
+    files = [{"path": "opaque", "size": 1, "sha256": "a" * 64}]
+    manifest = {
+        "source": {"cloned_from_declared_copy": "b" * 64},
+        "copy": {
+            "sha256": "c" * 64,
+            "file_count": 1,
+            "total_bytes": 1,
+            "files": files,
+        },
+    }
+    binding = SimpleNamespace(
+        scope="board",
+        scope_id=BOARD_ID,
+        backend="grafx",
+        page_size=8192,
+        physical_path=graph,
+    )
+    monkeypatch.setattr(
+        pulse_graph_census,
+        "require_declared_copy",
+        lambda _path, *, allow_effective_data_home: manifest,
+    )
+    monkeypatch.setattr(
+        pulse_graph_census,
+        "_validate_runtime_imports",
+        lambda: {
+            "okto_grafx_file": "grafx",
+            "okto_pulse_community_file": "community",
+            "okto_pulse_core_file": "core",
+        },
+    )
+    monkeypatch.setattr(
+        pulse_graph_census, "_exclusive_clone_lock", lambda _root: _Lock([])
+    )
+    monkeypatch.setattr(
+        pulse_graph_census,
+        "_acquire_board_binding",
+        lambda _root, _board: binding,
+    )
+    monkeypatch.setattr(
+        pulse_graph_census,
+        "_open_and_collect",
+        lambda _path, _args: {"verification": {}, "counts": {}, "heap": {}},
+    )
+    monkeypatch.setattr(
+        pulse_graph_census,
+        "inventory",
+        lambda _root, *, exclude: dict(manifest["copy"]),
+    )
+
+    semantics = pulse_graph_census.run(args)["measurement_semantics"]
+
+    assert semantics["timed"] is False
+    assert semantics["filesystem_cache_controlled"] is False
+    assert semantics["dead_meaning"] == "not_heap_version_live_not_vacuum_safe"
+    assert semantics["vacuum_safety_established"] is False
+    assert semantics["vector_activity_established"] is False
 
 
 def test_inventory_proof_compares_file_population_not_only_tree_digest() -> None:
@@ -433,6 +786,18 @@ def test_inventory_proof_compares_file_population_not_only_tree_digest() -> None
         observed = dict(expected)
         observed[field] = changed
         assert _inventory_matches(expected, observed) is False
+
+
+@pytest.mark.parametrize(
+    "name", (".okto-pulse-serve.lock", ".okto-pulse-serve.lock.acquire")
+)
+def test_post_close_proof_refuses_a_remaining_lock_artifact(
+    tmp_path: Path, name: str
+) -> None:
+    (tmp_path / name).write_text("left behind", encoding="utf-8")
+
+    with pytest.raises(GraphCensusRefused, match="remained after lock release"):
+        _require_lock_artifacts_absent(tmp_path)
 
 
 def test_main_creates_json_exclusively_only_after_run_returns(
