@@ -187,8 +187,20 @@
   pelo tipo especializado do schema. O mesmo milestone fixa o payload `commit.state` v2 de 36
   bytes e preserva monotonicamente uma versão já publicada. Gates agrupados: `132 passed` no codec
   e contratos adjacentes, mais `207 passed` no `CatalogStore`, publicação e visões públicas. A
-  próxima entrega é a porta transacional de promoção/coativação e sua matriz de recovery; até ela,
-  nenhum fluxo comum promove automaticamente um banco v1.
+  porta transacional de promoção/coativação foi concluída no milestone `12414d0`: somente um
+  commit que efetivamente materializou `catalog.dat` decodifica a autoridade durável após
+  `WAL barrier -> apply/flush`, e então publica `commit.state` v2 como último ato; commits comuns,
+  checkpoints e gap completion preservam monotonicamente o fence sem confundir catálogo LIVE não
+  salvo com estado durável. A primeira promoção substitui os dois slots com preflight do budget de
+  gerações; crash entre as escritas é convergido pelo recovery. Todos os payloads outer-valid são
+  inspecionados antes de replay/publicação: fallback v2, payload futuro, geração ambígua, binding
+  estrangeiro e dano de header que esconda um fence mais forte recusam sem mutação. Dano local
+  reconstruível só usa WAL completo e, após validar checksums independentes e bindings, restaura
+  duas cópias v2. O gate agrupado passou **309/309 testes** (`281` em transação/recovery/API e `28`
+  no formato de controle), com auditoria adversarial adicional em **77/77**, Ruff, format check
+  escopado, `compileall` e `git diff --check` verdes. A próxima entrega finita do item 10 é projetar
+  a autoridade ACTIVE do catálogo v2 sobre registry/planner/redo/staging/verifier/inventory; nenhum
+  índice novo está elegível no runtime antes dessa projeção.
 
 - **Run real do Pulse 0.3.3 na pasta padrão — reconstrução Grafx em andamento, SQLite preservado.**
   Antes da troca foi criado backup consistente do SQLite (`quick_check=ok`, zero violações de FK)

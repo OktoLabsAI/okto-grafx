@@ -92,6 +92,22 @@ The two authorities are coactivated under `COMMIT_SECTION`: catalog v2 becomes d
 normal WAL transaction, and commit-state v2 is its final publication act. Every later commit and
 checkpoint preserves version 2. No path may publish version 1 once catalog v2 has committed.
 
+The concrete publication order is `WAL barrier -> catalog/page apply -> catalog flush -> durable
+catalog decode -> commit-state publication`. Only a transaction whose durable page set contains
+`catalog.dat` pays for that decode; an unrelated commit preserves the previously published
+commit-state version and cannot promote from an unsaved process-local catalog. Foreign-gap
+completion and recovery inspect the durable catalog after replay before publishing.
+
+The first format-1-to-format-2 publication replaces both physical commit-state slots. A crash
+after its first page write leaves format 2 newest and format 1 only as fallback; recovery heals the
+second copy before returning. Readers and publishers inspect every outer-valid slot, not just the
+highest generation: a future logical payload or an older physical slot carrying a stronger
+supported fence is a pre-mutation refusal. WAL-authorized reconstruction of torn commit-state
+bytes preserves the strongest decodable fallback fence. Header-checksum repair may inspect the
+slots only when the independent remaining checksum, canonical page header, database/kind/nonce
+binding and each slot checksum still validate; it never treats a foreign binding as torn local
+state. Generation capacity for both promotion writes is checked before either write.
+
 The v2 catalog checksum covers the complete body, including capabilities, logical definitions and
 physical generation records. Required capabilities use a bounded `u64` bitset; bit zero names
 `identity_secondary_indexes_v1`, and an unknown required bit is a typed capability/version refusal.
