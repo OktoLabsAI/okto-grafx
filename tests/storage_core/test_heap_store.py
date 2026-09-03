@@ -379,6 +379,32 @@ def test_header_peek_follows_the_canonical_struct_layout() -> None:
     )
 
 
+def test_record_header_decode_unpacks_once_without_delegating_to_peek(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = struct.pack("<BBHIQQQQ", 3, 4, 5, 6, 7, 8, 9, 10)
+    unpack = HeaderUnpackCounter(record_module._HEADER_STRUCT)
+
+    def forbidden_peek_helper(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("RecordHeader.decode must not delegate to predicated-read peek helpers")
+
+    monkeypatch.setattr(record_module, "_HEADER_STRUCT", unpack)
+    monkeypatch.setattr(RecordHeader, "peek", forbidden_peek_helper)
+    monkeypatch.setattr(RecordHeader, "_from_peek", forbidden_peek_helper)
+
+    assert RecordHeader.decode(raw) == RecordHeader(
+        record_id=7,
+        xmin=8,
+        xmax=9,
+        prev_version=10,
+        payload_len=6,
+        schema_version=5,
+        flags=3,
+        reserved=4,
+    )
+    assert unpack.calls == 1
+
+
 def test_a_bounded_scan_materializes_every_header_accepted_by_visibility(
     heap_store: HeapStore,
     person_table: TableDef,
