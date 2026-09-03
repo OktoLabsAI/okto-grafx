@@ -433,6 +433,7 @@ O consenso não autoriza mudança de formato, redução das garantias concorrent
 | 2026-09-03 | seleção finita de P2 | nenhuma | nenhuma das três opções atingiu seu gatilho congelado; a rodada encerra sem mudança estrutural por hipótese |
 | 2026-09-03 | item 10 / P2-ID — projeção ACTIVE | concluído | `99622af` aplica a autoridade exata da geração ACTIVE a registry/planner/DML/redo/freshness/verifier/inventário, preserva os access paths custom v1 e limita count/staging por linha aos índices da própria tabela; gate agrupado 242/242, Ruff, compile e diff-check verdes, com duas revisões adversariais sem blocker |
 | 2026-09-03 | item 10 / P2-ID — lifecycle de identidade | concluído | `0d353ae` leva o `record_id` durável por quota, INSERT/UPDATE/DELETE, lookup, rebuild e verifier, inclusive domínio u64 e DELETE sem reencode do intent vazio; gate agrupado 435/435, Ruff, compile e diff-check verdes, revisão adversarial sem blocker; WAL continua lógico por nome conforme o ADR |
+| 2026-09-03 | item 10 / P2-ID — roteamento de endpoint | concluído | `01c496d` fixa por statement a escolha índice-versus-fallback, seleciona por projeção `O(K_t)`, usa `RecordId` u64 e heap validation, trata miss como definitivo e propaga falha após seleção; 26/26 testes de rota/locator, regressão relacional focada, Ruff, compile e diff-check verdes, revisão adversarial sem blocker |
 
 Esta seção registra fatos concluídos e trabalho explicitamente em andamento. H5 foi fechado. Por
 decisão explícita posterior do usuário, P0.3/P0.4 continuam evidência de engenharia, mas não são

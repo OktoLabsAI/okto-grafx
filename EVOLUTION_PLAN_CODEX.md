@@ -230,10 +230,20 @@
   integralmente o horizonte cercado e redo anterior é idempotente sobre a nova geração. A matriz
   de rehash/recovery deverá provar essas premissas, sem adicionar nonce ou novo formato WAL.
 
-  O próximo submilestone permanece finito: ativação/DDL persistente e escopo automático de
-  endpoints, com a escolha índice-versus-fallback fixada uma única vez por statement. Depois vêm
-  sizing/criação de índices secundários e rehash growth-only. Itens 11--13 e sharding não entram
-  nesses passos.
+  O roteamento de identidade de endpoint foi concluído em `01c496d`. Cada statement fixa uma
+  única decisão por identidade completa `(table_id, table_name)`: catálogo v1, ausência de geração
+  ACTIVE ou store já stale escolhem o caminho canônico; uma geração ACTIVE íntegra escolhe o
+  índice e não pode depois cair silenciosamente para scan. A consulta usa a projeção estrutural
+  `O(K_t)`, a chave u64 do `RecordId` e versões já validadas contra heap/snapshot; miss é definitivo,
+  duplicidade visível é corrupção e falha posterior propaga fail-closed. Os testes discriminam
+  store ausente, definição física divergente e framework sem validação, além de identidade acima
+  de `2**63`; rota + locator passaram 26/26, a regressão relacional focada permaneceu verde e a
+  revisão adversarial não encontrou blocker. Cold reopen com `IndexManager` real permanece
+  corretamente vinculado ao próximo milestone de ativação física, que cria o artefato necessário.
+
+  O próximo submilestone permanece finito: ativação física persistente e escopo automático de
+  endpoints por `ensure_identity_indexes()`, seguido pela porta DDL/Python de índices secundários.
+  Depois vêm sizing/criação e rehash growth-only. Itens 11--13 e sharding não entram nesses passos.
 
 - **Run real do Pulse 0.3.3 na pasta padrão — reconstrução Grafx em andamento, SQLite preservado.**
   Antes da troca foi criado backup consistente do SQLite (`quick_check=ok`, zero violações de FK)

@@ -541,7 +541,8 @@ The implementation is intentionally split at reviewable durability boundaries:
 | Catalog/commit-state coactivation | complete | `12414d0` + documentation `1e68ae7`; catalog v2 becomes authoritative before commit-state v2 is the final publication act |
 | ACTIVE runtime projection | complete | `99622af`; v2 exact-generation equality is enforced across composition, planner, row maintenance, redo, freshness, verifier and public inventory; v1 custom access paths remain compatible |
 | Record-aware identity lifecycle | complete | `0d353ae`; quota, INSERT/UPDATE/DELETE, validated lookup, rebuild and bidirectional verification consume the durable `record_id`; logical WAL continues to name the immutable index definition |
-| Activation/DDL and endpoint scope | next | explicit `ensure_identity_indexes`, persistent `CREATE INDEX`/Python door and one index-versus-fallback decision per statement |
+| Statement-stable endpoint routing | complete | `01c496d`; ACTIVE identity lookup is `O(K_t)` to select and hash-directed thereafter; miss is definitive and post-selection failures never fall back |
+| Activation/DDL and endpoint scope | next | explicit `ensure_identity_indexes`, persistent physical activation and `CREATE INDEX`/Python door |
 | Sizing and growth-only rehash | pending | deterministic sizing, secondary-index creation and foreground ACTIVE-to-STALE rotation with the recovery matrix in section 12 |
 
 The ACTIVE projection uses a structural catalog map and a structural raw-registry map keyed by
@@ -562,6 +563,13 @@ quota/staging equality, validated lookup, rebuild and both verifier directions. 
 `compileall` and diff checks passed, and the adversarial review found no blocker. Catalog v1's raw
 registry remains visible only to its historical component diagnostic; catalog v2 verification
 still refuses BUILDING, STALE and rogue registrations.
+
+Quality evidence for `01c496d`: 26 focused routing/locator tests passed, including unsigned
+identities above `2**63`, fixed fallback, definitive miss, duplicate-visible corruption, missing
+store, physical-definition mismatch and missing heap-validation capability. The broader focused
+relationship regression, Ruff, `compileall` and diff checks were green, and an independent
+adversarial review found no blocker. The real-store cold-reopen proof belongs to activation because
+catalog v1 deliberately has no persistent identity generation to reopen.
 
 The WAL is intentionally **not** qualified by physical generation. A logical name cannot be
 rebound to different table/positions/visibility/derivation, a rehash shadow is complete through
