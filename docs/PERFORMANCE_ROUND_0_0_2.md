@@ -361,3 +361,33 @@ commit/WAL integration batch, Ruff and diff-check passed; no Pulse data was acce
 | 2026-09-03 | Multiprocess quality gate | 500/500 operations acknowledged in 46.6 s, 510 stored rows including ten contention seeds, 44 retryable conflicts absorbed, zero loss/duplicate/phantom/torn read, and clean live/reopen `verify("all")` |
 | 2026-09-03 | Finite P2 selection | `none`; P2-ID, P2-DIRTY and P2-VAC did not meet their frozen post-P1 evidence triggers, so no structural change was implemented by hypothesis |
 | 2026-09-03 | Post-round D-29(c/d): closed-provider corpus proof memoized | `NativeCrc32c` proved the corpus (108 inputs, 169,529 bytes, 8 published vectors) against the pure reference on every construction, ~34 ms per `connect()` on the 3.13.1 box `[MEDIDO-micro]`; and `install()` replayed it again in the domain door (another ~30 ms); the successful proof of a `load_provider` result is now memoized per process under the provider's strong identity in BOTH doors, so a repeat `connect()` cycle costs ~0.05 ms for both. Each closed module/attribute slot retains only its current wrapper/proofs, raw functions match strictly by `is`, and one adapter lock makes concurrent first opens run each independent corpus once. Refusals are never memoized, a replaced function proves again, and injected providers and `verify_runtime=True` keep their per-construction/per-call semantics |
+
+## Post-P1 bounded queue — items 1–9 checkpoint
+
+Status: **approved on `feature/v0.0.2` on 2026-09-03**.
+
+The finite queue recorded in `EVOLUTION_PLAN_CODEX.md` is integrated: constant-state scalar
+aggregates; bounded checksum-provider proof memoization; stable top-N; traversal budgets; retained
+memory and descriptor telemetry; hit-driven ANN top-k; exception-safe single-flight cold page
+loads; cursor plus bounded blocking-query spill; and atomic streaming `executemany`. The promoted
+commits and the semantic boundaries of every item are recorded in that central plan.
+
+The final composed quality gate covered query, bulk/public boundaries, buffer/single-flight,
+checksum, descriptor telemetry, the metrics catalog, configuration, packaging and import
+boundaries and passed **2,916/2,916 tests**. The preceding composed run found one real integration
+regression: a buffer assembled with an enabled metrics sink kept emitting after that sink was
+disabled. `60fc96b` makes emission honor the current disabled state while retaining the existing
+fail-closed rule against unsafe late enablement; its focused regression passed before the final
+gate. Ruff lint, `compileall` and `git diff --check` also passed.
+
+The repository-wide Ruff formatting baseline still contains 256 historical files that would be
+reformatted. It was not mechanically rewritten in this performance milestone. New item-8 files
+and the directly changed hot paths passed scoped format checks; this distinction is intentional
+and no repository-wide formatting success is claimed.
+
+The earlier `Finite P2 selection = none` row remains the outcome of its frozen evidence gate. A
+later explicit product decision authorized items 10–13 only after this checkpoint: P2-ID with
+sizing/rehash and identity/secondary indexes, MVCC vacuum/compaction, delta/chunked/physiological
+WAL, and a native codec beyond CRC. That authorization does not waive each item's ADR,
+migration/compatibility contract or recovery and concurrency quality gates; it only removes the
+need to repeat the prior performance-selection gate.

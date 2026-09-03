@@ -94,41 +94,72 @@
   sem ordem total; a nova regra deve ser determinística, compartilhada por `ORDER BY` e `MIN/MAX` e
   coberta por diferencial.
 
-  Estado incremental desta fila: o item 1 está integrado em `da48d6a`; `COUNT`, `SUM`, `AVG`,
-  `MIN` e `MAX` mantêm estado O(1) por grupo, `COLLECT` continua materializado e `DISTINCT` retém
-  apenas seu conjunto de unicidade. A exceção `NaN` foi fechada com ordem total compartilhada
-  (depois dos demais números em ASC, antes em DESC), preservando estabilidade; 435 testes
-  relacionados passaram no candidato e a revisão integrada acrescentou diferencial com top-N. O
-  item 3 está integrado em `b71846d` + `841127a`: `ORDER BY ... SKIP ... LIMIT` consome o child
-  integral, mas retém no máximo `K = SKIP + LIMIT` em heap estável, com memória O(K) e tempo
-  O(N log K); planos com bound físico sem a janela semântica exata são recusados. O item 4 está
-  integrado em `8447ded`: `max_traversal_expansions` e `max_traversal_paths` são limites positivos
-  opt-in, cumulativos por query e aplicados a traversal tipado, sem tipo e scan de relações; N+1 é
-  recusado antes de retenção/retorno e os campos desabilitados preservam a superfície anterior de
-  estatísticas. O contrato explicita que a construção do fallback agrupado e o HNSW interno não
-  são cobrados por esses dois contadores. Os gates combinados focados de top-N/budgets passaram;
-  nenhuma suíte longa foi executada neste subcheckpoint. O item 5 está integrado em `283cffa`:
-  `used_bytes` preserva o budget nominal compatível e uma métrica/health view separada, versionada
-  como `python-v1`, estima o grafo de objetos Python retido, inclusive frames aposentados ainda
-  pinados, sem alegar RSS nem governar eviction. Hits, misses e evictions do cache LRU de
-  descriptors são cumulativos por device, sem labels de arquivo/path, e seus callbacks são
-  entregues somente fora dos guards de storage e buffer; 668 testes focados conjuntos passaram na
-  revisão isolada. A parte cursor/streaming do item 8 está integrada em `c4cba57`: `QueryCursor`
-  possui uma transação read-only e seu snapshot até EOF/close, destaca lotes limitados e preserva
-  cumulativamente `max_result_rows`; budget em bytes e spill continuam em implementação. O item 9
-  está integrado em `ae5c89f`: `Transaction.executemany` faz parse único, consome/canonicaliza um
-  mapping por vez fora do page access, replana cada DML sem `RETURN` e reverte todo o lote ao mark
-  externo em qualquer falha, sem mudar commit/WAL/OCC. O conflito de composição entre o AST
-  `Query` e o novo tipo público homônimo, além do pin incompleto de `__all__`, foi corrigido em
-  `f1ab724`; a regressão combinada cursor + bulk + packaging + import boundary passou. O
-  microbenchmark indicativo de 200 inserts observou `2,77x` sem PK e `1,74x` com PK, sem caráter de
-  SLO; a validação de unicidade sobre muitos intents com PK e a reconciliação repetida do budget em
-  bytes permanecem débitos superlineares explícitos, não escondidos como ganhos de `executemany`.
-  O item 2 está em correção após revisão adversarial; itens 6 e 7 e o restante do item 8 seguem em
-  branches isolados.
+  Estado final desta fila: o item 1 está integrado em `da48d6a`; `COUNT`, `SUM`, `AVG`, `MIN` e
+  `MAX` mantêm estado O(1) por grupo, `COLLECT` continua materializado e `DISTINCT` retém apenas
+  seu conjunto de unicidade. A exceção `NaN` foi fechada com ordem total compartilhada (depois dos
+  demais números em ASC, antes em DESC), preservando estabilidade. O item 2 está integrado em
+  `658760b` + `401e838`: as duas portas de instalação de checksum memoizam a prova fechada do
+  corpus CRC-32C por processo sem confiar em igualdade nem em um `id` reutilizável; a identidade do
+  provider é autenticada por `is`, as entradas são limitadas, validações concorrentes são
+  serializadas e falhas nunca são memorizadas como sucesso. O item 3 está integrado em `b71846d` +
+  `841127a`: `ORDER BY ... SKIP ... LIMIT` consome o child integral, mas retém no máximo
+  `K = SKIP + LIMIT` em heap estável, com memória O(K) e tempo O(N log K); planos com bound físico
+  sem a janela semântica exata são recusados. O item 4 está integrado em `8447ded`:
+  `max_traversal_expansions` e `max_traversal_paths` são limites positivos opt-in, cumulativos por
+  query e aplicados a traversal tipado, sem tipo e scan de relações; N+1 é recusado antes de
+  retenção/retorno. O contrato explicita que a construção do fallback agrupado e o HNSW interno
+  não são cobrados por esses dois contadores.
 
-  Somente quando 1--9 estiverem implementados, documentados, auditados e aprovados numa regressão
-  agrupada haverá o checkpoint que libera o segundo grupo já autorizado: (10) P2-ID com sizing,
+  O item 5 está integrado em `283cffa`: `used_bytes` preserva o budget nominal compatível e uma
+  métrica/health view separada estima os objetos Python retidos sem alegar RSS nem governar
+  eviction. Hits, misses e evictions do LRU de descriptors são cumulativos por device, sem labels
+  de arquivo/path, e callbacks compostos deixam os guards de storage/buffer antes de alcançar o
+  host. O item 7, integrado em `59af285` + `6e8d261` + `b49f297`, avança esse estimador para
+  `python-v2` e executa um único cold load por `(file, page)`: callers da mesma chave compartilham
+  o resultado; leituras/decode distintos e a publicação da vítima dirty ficam fora do guard global;
+  tickets limitados e epochs de estrutura/drop recusam publicação stale. Testes determinísticos de
+  alocação fecharam três janelas: a vítima dirty mantém autoridade enquanto tickets são criados,
+  toda falha de publicação de frame acorda waiters, e um write físico bem-sucedido cuja
+  pós-publicação falha preserva a evidência da página modificada e libera ambos os flights. A
+  revisão focada de buffer, concorrência pública, telemetria e import boundary passou 396 testes.
+
+  O item 6 está integrado em `2642750` + `1299ad8` + `980ac52`: planos HNSW top-k elegíveis
+  consomem hits já ordenados em vez de revarrer a label inteira, capturam `ref`, `record_id` e
+  score uma vez, revalidam identidade/visibilidade no snapshot exato e retornam ao caminho canônico
+  em formas stale, ambíguas, nullable ou não suportadas. O planner nunca funde a janela de retorno
+  quando há `DELETE`/`SET`; seis combinações adversariais com LIMIT/SKIP provaram que todos os
+  matches são mutados e apenas o retorno é limitado. A auditoria independente final deu PASS.
+
+  O cursor do item 8 está integrado em `c4cba57`: `QueryCursor` mantém uma transação read-only e o
+  snapshot até EOF/close, destaca lotes limitados e preserva `max_result_rows` cumulativo. O budget
+  em bytes e spill estão integrados em `192a497`: `query_memory_budget_bytes` opt-in dá a cada sort,
+  result-DISTINCT ou aggregate bloqueante um contador lógico determinístico e um external merge
+  workspace isolado fora do namespace do banco. Ordem estável/primeira ocorrência, aggregate
+  DISTINCT, mixed values, identidade de NaN, equivalência de zero com sinal inclusive em vetores,
+  cancelamento por cursor e preservação da exceção primária têm diferenciais. Níveis binários de
+  runs e remoção imediata de sorters fechados por grupo evitam metadados O(N). Não há pickle nem
+  mudança de formato; um `COLLECT` cujo próprio resultado excede o limite falha fechado, e `None`
+  preserva os caminhos in-memory/top-N anteriores.
+
+  O item 9 está integrado em `ae5c89f`: `Transaction.executemany` faz parse único,
+  consome/canonicaliza um mapping por vez fora do page access, replana cada DML sem `RETURN` e
+  reverte todo o lote ao mark externo em qualquer falha, sem mudar commit/WAL/OCC. A composição
+  entre o AST `Query` e o novo tipo público homônimo foi corrigida em `f1ab724`. O microbenchmark
+  indicativo de 200 inserts observou `2,77x` sem PK e `1,74x` com PK, sem caráter de SLO; validação
+  de unicidade sobre muitos intents com PK e reconciliação repetida do budget em bytes permanecem
+  débitos superlineares explícitos, não escondidos como ganhos de `executemany`.
+
+  **Checkpoint dos itens 1--9 aprovado em 2026-09-03.** Após integração serial, um gate agrupado
+  sobre todo o subsistema de query, bulk/public boundaries, buffer/single-flight, checksum,
+  descriptor telemetry, metric catalog, configuração, packaging e import boundaries passou
+  **2.916/2.916 testes**. A única falha no run composto anterior revelou que a telemetria de buffer
+  congelava um sink habilitado no assembly; `60fc96b` agora respeita sua desativação posterior sem
+  permitir opt-in tardio inseguro, e o caso falho mais a suíte focada passaram antes do gate final.
+  Ruff lint, `compileall` e `git diff --check` estão verdes. O baseline histórico de Ruff format do
+  repo inteiro não é verde e não foi reformatado mecanicamente; todos os arquivos novos do item 8
+  e cada hot path editado diretamente nesta etapa passaram seu format check escopado.
+
+  O checkpoint aprovado acima libera o segundo grupo já autorizado: (10) P2-ID com sizing,
   rehash e índices de identidade/secundários; (11) vacuum/compaction MVCC; (12) WAL
   delta/chunked/fisiológico; e (13) codec nativo além do CRC. Cada item 10--13 ainda exige seu ADR,
   migração/compatibilidade quando aplicável e gates próprios de recovery, mas não nova decisão de
