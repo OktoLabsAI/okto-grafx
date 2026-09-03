@@ -133,6 +133,17 @@ transactions like any other.
   `achieved_k`, so a caller can tell an exhaustive answer from an approximate one. The database
   validates that the transaction is active and belongs to it; no raw transaction context or
   mutable vector engine is exposed.
+- A bounded query-language search over one unfiltered node table can use the vector index as a
+  complete access path: after a durable frontier proof over the engine-owned immutable snapshot,
+  and the exact planned table/column pair, the query layer decodes only the returned
+  `VectorHit.ref` rows from the heap (at most `K`, not the table's `N`). The approximate hot path
+  therefore avoids the former heap scan; the exact oracle still performs its intentional
+  exhaustive heap validation once, but no longer pays for an additional `NodeScan`. Filters,
+  joins/traversals, historical/custom snapshots, stale indexes, unbounded searches and uncertain
+  sparse cardinality retain the canonical materialised path; staged owner rows keep the existing
+  fail-closed RYOW refusal.
+  `QueryResult.statistics` reports `vector_direct_accesses` and
+  `vector_rows_materialized` when the direct path is selected.
 
 ### Observability
 

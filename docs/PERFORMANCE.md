@@ -176,6 +176,25 @@ the landing table per traversal (edges store record identities; identities carry
 that is most of the 192.9 ms above, and the next structural lever. See PUNCHLIST, *"Traversal after
 CF-17: the two levers left"*.
 
+### Vector top-k as an end-to-end access path (0.0.2)
+
+A bounded similarity query whose candidate child is exactly one unfiltered node-table scan no
+longer has to materialise every heap row before HNSW can run. At the current certified snapshot
+frontier, and only when the registered index names the exact planned table/column pair,
+`VectorSearch` lets the vector index produce hits and revalidates only their physical
+`VectorHit.ref` witnesses. The focused discriminant uses 8 heap rows and `LIMIT 3`: both exact and
+approximate plans report `vector_rows_materialized=3`, while the equivalent forced-canonical plan
+reports `rows_scanned=8` and returns byte/value-identical rows and score order.
+
+This is a complexity claim, not a wall-time benchmark: after the derived HNSW picture and D-12
+cardinality are warm, the query-layer heap materialisation changes from **O(N) payloads to O(K)**.
+An exact vector regime still performs its intentional exhaustive vector scoring, and a cold HNSW
+still performs its intentional rebuild; this change removes the redundant query child scan, not
+those costs. Filters, historical/custom snapshots, stale state, an unbounded search, configured
+intermediate-row admission and uncertain sparse-vector cardinality decline the shortcut; dirty
+owner state keeps its existing fail-closed RYOW refusal. No beam, recall floor, index format, WAL
+or locking protocol changed.
+
 ---
 
 ## 4. Point reads, inserts and edge creation as the graph grows

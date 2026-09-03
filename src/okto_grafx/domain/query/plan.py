@@ -433,13 +433,21 @@ class FilterRows(PlanNode):
 
 @dataclass(frozen=True, slots=True)
 class VectorSearch(PlanNode):
-    """The similarity operator: one pass over the rows the child produced (SPEC-VEC FR-4).
+    """The similarity operator over the candidate set denoted by its child (SPEC-VEC FR-4).
 
     The child is the candidate set -- everything the node predicates, the relationship predicates
     and the traversal left standing -- and it is a CHILD rather than a separate query because
     BR-6 says the combination belongs to the plan. The record identifiers of those rows become
     the candidate filter the two-regime planner of the vector subsystem reads, so the regime is
     chosen from the real filtered cardinality rather than from a guess.
+
+    A runtime may recognise the exact ``NodeScan(SingleRow)`` whole-table shape as an access-path
+    opportunity.  It may bypass physical child materialisation only after proving that the vector
+    index's count belongs to the transaction snapshot's durable frontier and to the exact planned
+    table/column pair, and must fall back to this child for every filtered, correlated, historical,
+    custom-snapshot or otherwise uncertain case.  An owner-dirty table retains the executor's
+    separate fail-closed RYOW refusal.  The child therefore remains both the semantic authority and
+    the inspectable fallback in the one plan.
 
     ``k`` is present only when the query asked for a top-k and nothing above this operator can
     discard a row. When it is None the operator scores every candidate and returns them all,

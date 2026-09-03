@@ -475,6 +475,8 @@ def build_query_stack(
     *,
     budget_pages: int = 64,
     with_indexes: bool = True,
+    vector_nullable: bool = True,
+    vector_exact_scan_threshold: int = 4096,
     max_result_rows: int | None = None,
     max_intermediate_rows: int | None = None,
     max_traversal_expansions: int | None = None,
@@ -529,7 +531,10 @@ def build_query_stack(
                 ColumnDef(name="id", type=ValueType.INT64, nullable=False),
                 ColumnDef(name="layer", type=ValueType.INT64),
                 ColumnDef(
-                    name="embedding", type=ValueType.VECTOR_F32, vector_space=SPACE_NAME
+                    name="embedding",
+                    type=ValueType.VECTOR_F32,
+                    nullable=vector_nullable,
+                    vector_space=SPACE_NAME,
                 ),
             ),
             primary_key="id",
@@ -584,7 +589,7 @@ def build_query_stack(
         clock=clock,
         pool=pool,
         indexes=indexes,
-        exact_scan_threshold=4096,
+        exact_scan_threshold=vector_exact_scan_threshold,
     )
     # An index covers a (table, space) pair, so it is created when the table declares the
     # column rather than when the space is declared. The fixture builds its tables directly on

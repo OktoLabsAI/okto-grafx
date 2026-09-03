@@ -1008,6 +1008,26 @@ class VectorEngine:
   **before any distance computation** (BR-1).
 * Writes to a retired space raise `GrafxSpaceRetired`; reads succeed with `retired=True` (FR-3).
 
+For query-language top-k, `VectorSearch` MAY make the vector index the physical row source only
+for an unfiltered, uncorrelated `NodeScan(SingleRow)` with a fused bound, row-independent arguments
+and the exact engine-owned immutable `Snapshot` (a structural/custom `SnapshotLike` keeps the
+canonical path). The index MUST first return its live cardinality under the ordinary pre/post
+page-0 certificate, only when `built_through_lsn == snapshot.read_lsn`, and only when the
+registered index names the exact table id and vector-column position planned by the scan. Each
+returned `VectorHit.ref` MUST then be fully decoded and revalidated for table, record identity
+and snapshot visibility before a row can be returned. A missing, foreign, malformed or invisible
+witness is a typed fail-closed error. Historical/frontier mismatch, filters, traversal, stale
+indexes, unbounded searches and ambiguous nullable cardinality use the canonical materialised
+child; owner-dirty tables keep the existing fail-closed RYOW refusal. For a nullable column,
+direct execution is admitted only when its certified vector count is
+above the exact threshold and the fused `k` does not exceed that count; this makes the regime and
+HNSW work independent of the unknown number of NULL heap rows. With the direct path,
+`vector_direct_accesses=1` and `vector_rows_materialized=<query-layer returned-hit decodes>` (at
+most the fused K) are reported in `QueryResult.statistics`. The exact regime still performs its
+owned exhaustive heap validation; the counter records the redundant query-child materialisation
+that was removed, not that oracle's work. No WAL, format, HNSW beam, recall rule or concurrency
+premise changes.
+
 ### 8.9 `engine/query_engine.py` (C10)
 ```python
 class QueryEngine:

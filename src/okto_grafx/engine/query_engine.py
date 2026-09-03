@@ -19,11 +19,16 @@ the immutable version that discharged that proof, avoiding a second heap read. T
 not reimplement either visibility rule; it records the contract in the plan and dispatches to the
 component that owns it.
 
-**How the similarity operator stays one pass.** The candidate set is the rows the operator's CHILD
-produced, handed to the vector subsystem as a
-:class:`~okto_grafx.domain.vector.filter.RecordIdFilter`, so the two-regime planner chooses its
-regime from the real filtered cardinality rather than from a guess, and no vector is fetched for a
-row the query had already excluded (SPEC-VEC FR-4, BR-6, AC-7).
+**How the similarity operator obtains candidates.** A filtered, traversed or correlated CHILD is
+materialised and handed to the vector subsystem as a
+:class:`~okto_grafx.domain.vector.filter.RecordIdFilter`, so its real membership and cardinality
+remain authoritative (SPEC-VEC FR-4, BR-6, AC-7).  A bounded whole-table node scan may instead use
+the vector index as an end-to-end access path, but only at a page-0-certified snapshot frontier;
+then each returned ``VectorHit.ref`` is revalidated against the heap and only K row payloads are
+materialised by the query layer.  The exact vector oracle retains its own exhaustive validation;
+this path removes the redundant child scan around it.  Historical, filtered, stale or otherwise
+ambiguous cases retain the canonical CHILD path; an owner-dirty table keeps its pre-existing
+fail-closed RYOW refusal.
 
 **What this engine refuses rather than guesses.** Writing rows needs three clauses that do not
 exist yet, and each refusal names the one it waits on rather than answering with a row that would
@@ -108,6 +113,7 @@ from okto_grafx.domain.txn.context import (
     RowOperation,
 )
 from okto_grafx.domain.txn.intents import reduce_row_intents
+from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.domain.query.analysis import Aggregation, QueryAnalysis, analyze
 from okto_grafx.domain.query.ast import (
     Direction,
@@ -126,6 +132,7 @@ from okto_grafx.domain.query.ast import (
     Subscript,
     UnaryOperation,
     Variable,
+    free_variables,
     walk,
 )
 from okto_grafx.domain.query.limits import (
@@ -278,6 +285,25 @@ MISSING_COMMIT_HOOK: str = (
     "written before that number exists carries a birth stamp no snapshot rule can make correct."
 )
 """Why a write refuses on visibility."""
+
+
+@dataclass(frozen=True, slots=True)
+class _WholeVectorTableFilter:
+    """An all-record predicate carrying a certified regime-safe cardinality.
+
+    A direct whole-table vector access path has no semantic membership filter: the versioned
+    vector index and the snapshot decide visibility.  For a non-null vector column this is the
+    cardinality the materialised ``NodeScan`` would have supplied.  For a nullable column it is
+    used only above the exact threshold, where every possible count of additional NULL heap rows
+    chooses the same approximate regime.
+    """
+
+    cardinality: int
+
+    @staticmethod
+    def admits(_record_id: RecordId) -> bool:
+        """Admit every index record; table and visibility were certified separately."""
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -4126,12 +4152,15 @@ def _filter_rows(
 def _vector_search(
     engine: QueryEngine, node: VectorSearch, context: _Context
 ) -> Iterator[_Row]:
-    """Score the candidate set the child produced, in one pass (SPEC-VEC FR-4, BR-6).
+    """Score one candidate set, using hit-driven heap reads only when the shape proves safe.
 
-    The candidates are materialised because a filter must know its own cardinality: that number
-    is what the two-regime planner of the vector subsystem chooses its regime from, and a filter
-    that could not count itself would be treated as the whole space and would push every query
-    into the approximate regime.
+    A filtered/traversed/correlated child remains the authority and is materialised exactly as
+    before: its record identifiers are both the membership predicate and the regime estimate.
+    A bounded, unfiltered ``NodeScan(SingleRow)`` has a narrower option.  When the vector index
+    certifies that its live count belongs to this snapshot's exact durable frontier, the index
+    already represents the complete candidate vector set, so its ``VectorHit.ref`` may drive K
+    point reads instead of first decoding N heap rows.  Every uncertain case returns to the
+    canonical child path; none guesses eligibility.
     """
     table = _planned_table_for_variable(node.child, node.variable)
     if table is not None and table.table_id in _intent_table_ids(context.txn):
@@ -4145,6 +4174,160 @@ def _vector_search(
             operation="similarity",
         )
     vectors = engine.require_vectors()
+    direct = _direct_vector_search(engine, vectors, node, context)
+    if direct is not None:
+        yield from direct
+        return
+    yield from _materialised_vector_search(engine, vectors, node, context)
+
+
+def _direct_vector_search(
+    engine: QueryEngine, vectors: object, node: VectorSearch, context: _Context
+) -> tuple[_Row, ...] | None:
+    """Return hit-driven rows, or ``None`` when the canonical child must remain authoritative.
+
+    The gate is deliberately closed rather than cost-model driven.  Filters, traversal,
+    correlation, a structural/custom snapshot, an unbounded search, row-dependent arguments and
+    an enabled intermediate-row budget all preserve the old physical path.  Requiring the exact
+    engine-owned immutable ``Snapshot`` makes the cardinality proof imply its standard visibility
+    rule; the latter gate keeps an existing admission contract from changing merely because this
+    acceleration was installed.
+    """
+    scan = node.child
+    if (
+        type(scan) is not NodeScan
+        or type(scan.child) is not SingleRow
+        or scan.variable != node.variable
+        or node.k is None
+        or type(context.snapshot) is not Snapshot
+        or engine._max_intermediate_rows is not None
+    ):
+        return None
+    expressions = (node.space, node.query_vector, node.k)
+    if node.threshold is not None:
+        expressions += (node.threshold,)
+    if any(free_variables(expression) for expression in expressions):
+        return None
+    position = scan.table.column_positions.get(node.property_key)
+    if position is None:
+        return None
+    column = scan.table.columns[position]
+    if (
+        not column.is_vector
+        or column.vector_space != node.column_space
+        or scan.table.kind != "node"
+    ):
+        return None
+    count_at_frontier = getattr(vectors, "snapshot_frontier_live_count", None)
+    threshold = getattr(vectors, "exact_scan_threshold", None)
+    if not callable(count_at_frontier) or type(threshold) is not int:
+        return None
+
+    if not node.column_space:
+        return None
+    # Ask through the column's already-planned space, not the runtime space expression.  An
+    # empty child historically returns before evaluating query arguments or touching the vector
+    # index.  A zero count or a failed optional proof therefore falls back and preserves that
+    # short circuit; only a proven non-empty vector set evaluates the user's arguments early.
+    try:
+        candidate_count = count_at_frontier(
+            node.column_space,
+            context.snapshot,
+            table_id=scan.table.table_id,
+            position=position,
+        )
+    except Exception:  # noqa: BLE001 - an optional cost proof never replaces canonical errors
+        # A custom vector subsystem may expose an incompatible method or any implementation may
+        # be unable to prove this optional shortcut.  Running the child is the pre-optimisation
+        # semantics; its ordinary vector search remains responsible for the operation's error.
+        return None
+    if type(candidate_count) is not int or candidate_count <= 0:
+        # Zero vector entries does not prove an empty nullable heap table.  The canonical path
+        # preserves its empty-candidate short circuit and its missing-index diagnostic.
+        return None
+
+    requested = _requested_neighbour_count(node, (), context)
+    if column.nullable and (
+        candidate_count <= threshold or requested > candidate_count
+    ):
+        # With a sparse column, a small vector count does not reveal whether NULL heap rows push
+        # the materialised filter across the exact/approximate boundary.  Likewise k greater
+        # than the vector count can widen HNSW work when NULL rows made the old heap cardinality
+        # larger.  Both retain the canonical path.  Above the threshold with k <= vectors, both
+        # possible heap cardinalities select the same approximate regime.
+        return None
+
+    space = _space_name(node, (), context)
+    query_vector = _query_vector(node, (), context)
+    wanted = max(min(requested, candidate_count), 1)
+    result = vectors.search(  # type: ignore[attr-defined]
+        space=space,
+        query=query_vector,
+        k=wanted,
+        snapshot=context.snapshot,
+        candidate_filter=_WholeVectorTableFilter(candidate_count),
+    )
+    _record_vector_search_statistics(context, result, candidate_count)
+    threshold_value = _threshold_value(node, (), context)
+
+    materialised: list[tuple[object, HeapVersion]] = []
+    for hit in result.hits:
+        ref = getattr(hit, "ref", None)
+        record_id = getattr(hit, "record_id", None)
+        if type(ref) is not RecordRef or type(record_id) is not int or record_id < 1:
+            raise GrafxIndexError(
+                "A vector hit must name one positive record id and one exact heap reference.",
+                field="vector_hit_ref",
+                space=space,
+                value=repr(ref),
+                record_id=repr(record_id),
+            )
+        version = engine.heap._revalidate_visible_ref(
+            scan.table, ref, record_id, context.snapshot
+        )
+        if version is None:
+            raise GrafxIndexError(
+                f"Vector hit {record_id} at page {ref.page} slot {ref.slot} is not visible to "
+                "the snapshot its index search certified.",
+                field="vector_hit_visibility",
+                space=space,
+                table=scan.table.name,
+                table_id=scan.table.table_id,
+                record_id=record_id,
+                page=ref.page,
+                slot=ref.slot,
+            )
+        materialised.append((hit, version))
+
+    context.count("vector_direct_accesses")
+    context.count("vector_rows_materialized", len(materialised))
+    rows: list[_Row] = []
+    for hit, version in materialised:
+        score = getattr(hit, "score")
+        if threshold_value is not None and not _passes(
+            node.threshold_operator, score, threshold_value
+        ):
+            continue
+        rows.append(
+            _Row(
+                bindings={
+                    node.variable: RowBinding(
+                        variable=node.variable,
+                        table=scan.table,
+                        ref=getattr(hit, "ref"),
+                        version=version,
+                    ),
+                    node.score_column: score,
+                }
+            )
+        )
+    return tuple(rows)
+
+
+def _materialised_vector_search(
+    engine: QueryEngine, vectors: object, node: VectorSearch, context: _Context
+) -> Iterator[_Row]:
+    """Execute the canonical child-materialising vector path without semantic shortcuts."""
     candidates = tuple(engine._rows(node.child, context))
     by_record: dict[int, list[_Row]] = {}
     for row in candidates:
@@ -4169,18 +4352,7 @@ def _vector_search(
         snapshot=context.snapshot,
         candidate_filter=RecordIdFilter(frozenset(by_record)),
     )
-    context.statistics["vector_regime_exact"] = context.statistics.get(
-        "vector_regime_exact", 0
-    ) + (1 if result.regime == "exact" else 0)
-    context.count("vector_hits", len(result.hits))
-    if by_record and not result.hits:
-        # Silence here is the wrong answer to give a caller: the filter admitted rows and the
-        # search came back with nothing, which is either a genuinely empty neighbourhood or an
-        # index that does not hold the vectors the heap does. The statement still returns no
-        # rows -- inventing some would be far worse -- but it says so, so the difference is
-        # visible from outside instead of having to be isolated by bisection.
-        context.count("vector_empty_over_candidates")
-        context.statistics["vector_candidates_offered"] = len(by_record)
+    _record_vector_search_statistics(context, result, len(by_record))
     threshold = _threshold_value(node, candidates, context)
     for hit in result.hits:
         if threshold is not None and not _passes(
@@ -4191,6 +4363,24 @@ def _vector_search(
             bindings = dict(row.bindings)
             bindings[node.score_column] = hit.score
             yield _Row(bindings=bindings)
+
+
+def _record_vector_search_statistics(
+    context: _Context, result: object, candidate_count: int
+) -> None:
+    """Record the common vector outcome for both physical candidate paths."""
+    regime = getattr(result, "regime")
+    hits = getattr(result, "hits")
+    context.statistics["vector_regime_exact"] = context.statistics.get(
+        "vector_regime_exact", 0
+    ) + (1 if regime == "exact" else 0)
+    context.count("vector_hits", len(hits))
+    if candidate_count and not hits:
+        # Silence here is the wrong answer to give a caller: the candidate source admitted rows
+        # and the search came back with nothing.  Inventing rows would be worse, so keep the
+        # empty answer observable whichever physical path supplied the cardinality.
+        context.count("vector_empty_over_candidates")
+        context.statistics["vector_candidates_offered"] = candidate_count
 
 
 def _space_name(node: VectorSearch, rows: Sequence[_Row], context: _Context) -> str:
@@ -4255,6 +4445,19 @@ def _neighbour_count(
     """Return how many neighbours to ask for: the fused bound, or every candidate."""
     if node.k is None:
         return max(candidates, 1)
+    return max(min(_requested_neighbour_count(node, rows, context), candidates), 1)
+
+
+def _requested_neighbour_count(
+    node: VectorSearch, rows: Sequence[_Row], context: _Context
+) -> int:
+    """Evaluate and validate one fused neighbour bound without a candidate-set clamp."""
+    if node.k is None:
+        raise GrafxPlanError(
+            "An unbounded similarity search has no requested neighbour count.",
+            field="k",
+            value=None,
+        )
     probe = rows[0] if rows else _Row(bindings={})
     wanted = _evaluate(node.k, probe, context)
     if isinstance(wanted, bool) or not isinstance(wanted, int):
@@ -4267,7 +4470,7 @@ def _neighbour_count(
         raise GrafxPlanError(
             f"A neighbour count is zero or more; got {wanted}.", field="k", value=wanted
         )
-    return max(min(wanted, candidates), 1)
+    return max(wanted, 1)
 
 
 def _threshold_value(

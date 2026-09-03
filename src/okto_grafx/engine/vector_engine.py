@@ -729,6 +729,56 @@ class VectorHnswIndex(ProximityIndex):
                 self._live_count_generation = generation
         return live
 
+    def snapshot_frontier_live_count(self, snapshot: SnapshotLike) -> int | None:
+        """Return the live count only when this snapshot is the index's exact frontier.
+
+        This is the narrow proof used by the query engine's whole-table vector access path.  A
+        cached count by itself is not enough: an older snapshot may see tombstoned entries and
+        must keep the materialised candidate filter that describes that historical view.  The
+        count is therefore read inside the ordinary pre/post page-0 certificate, and is returned
+        only when that certificate's durable frontier is exactly ``snapshot.read_lsn``.
+
+        ``None`` is a cost-only verdict.  It asks the caller to use its canonical materialised
+        candidate path; it never weakens freshness, visibility or the stale-index refusal.
+        """
+        read_lsn = self._require_exact_read_lsn(snapshot)
+
+        def count(
+            certificate: object,
+        ) -> tuple[int, Lsn, object] | None:
+            """Count one certified frontier, or decline a historical/ahead view."""
+            header = getattr(certificate, "header", None)
+            mark = getattr(header, "built_through_lsn", None)
+            if mark != read_lsn:
+                return None
+            with self._guard:
+                if (
+                    self._live_count is not None
+                    and self._live_count_mark == mark
+                    and self._live_count_generation is self._graph_generation
+                ):
+                    return self._live_count, mark, self._graph_generation
+                generation = self._graph_generation
+            # No pool operation occurs while the graph guard is held.  ``walk`` materialises
+            # the first cold count exactly as ``live_count`` does; D-12 makes every later query
+            # at this generation O(1).
+            return (
+                sum(1 for entry in self.walk() if entry.live),
+                mark,
+                generation,
+            )
+
+        measured = self._stable_view(read_lsn, count)
+        if measured is None:
+            return None
+        live, mark, generation = measured
+        with self._guard:
+            if generation is self._graph_generation:
+                self._live_count = live
+                self._live_count_mark = mark
+                self._live_count_generation = generation
+        return live
+
     def visible_count(self, snapshot: SnapshotLike) -> int:
         """Return how many entries one snapshot may see."""
         return len(self.visible_entries(_require_snapshot(snapshot)))
@@ -1914,6 +1964,35 @@ class VectorEngine:
     def _refresh_heap_view(self, index_file: str, certificate: object) -> None:
         """Attach resolver/scan heap frames to the vector index's durable generation."""
         self._require_registry()._prepare_heap_view(index_file, certificate)
+
+    def snapshot_frontier_live_count(
+        self,
+        space: str,
+        snapshot: SnapshotLike,
+        *,
+        table_id: int,
+        position: int,
+    ) -> int | None:
+        """Return a certified whole-space count only at the snapshot's exact frontier.
+
+        The query engine uses this optional acceleration before letting a ``VectorSearch`` over
+        an unfiltered table drive heap reads from ``VectorHit.ref``.  The caller also names its
+        planned table/column pair: a space can be rebound process-locally while DDL settles, and
+        a count from any other pair cannot prove that this scan's rows and the index are the same
+        candidate set.  Mapping provenance and stale/freshness checks are identical to
+        :meth:`search`; ``None`` means only that the cheap proof is unavailable and the caller
+        must execute its child normally.
+        """
+        definition = self._catalog.catalog.space(space)
+        _require_snapshot(snapshot)
+        index = self.index(space)
+        self._require_committed_search_index(index, definition)
+        if (
+            index.definition.table_id != table_id
+            or index.definition.positions != (position,)
+        ):
+            return None
+        return index.snapshot_frontier_live_count(snapshot)
 
     def search(
         self,
