@@ -7,7 +7,10 @@ including the on-disk format.
 
 ## [Unreleased]
 
-No changes yet.
+### Changed
+
+- Bumped the development version to `0.0.2` and started the bounded performance round governed by
+  `GRAFX_PERFORMANCE_ROUND_FINAL.md`.
 
 ## [0.0.1] — 2026-09-01
 

@@ -8,7 +8,7 @@ processes and several threads read and write it at the same time**. There is no 
 no daemon to keep alive. The core is pure Python and the standard library is its only runtime
 requirement.
 
-**Version 0.0.1 — pre-alpha.** The on-disk format, the public API and the query surface may all
+**Version 0.0.2 — pre-alpha.** The on-disk format, the public API and the query surface may all
 change. Read [Status and limitations](#status-and-limitations) before you rely on it.
 
 ---
@@ -663,11 +663,11 @@ translate exceptions it raises later. Such an exception can therefore propagate 
 
 ## Status and limitations
 
-**0.0.1 is pre-alpha.** It is tested hard — 7900+ tests, multi-process smoke tests, crash-and-recover
+**0.0.2 is pre-alpha.** It is tested hard — multi-process smoke tests, crash-and-recover
 tests, a mutation battery with per-mutant verdicts — and it is still young. What that means in
 practice:
 
-- **The on-disk format is not stable.** A database written by 0.0.1 may not open in the next version.
+- **The on-disk format is not stable.** A database written by one pre-alpha version may not open in another.
   There is no migration path yet.
 - **Write throughput is currently platform-bound and serialized** — ~300 ms per durable commit on
   Windows, and all writers intersect on the table directory page, so disjoint writers queue. Reads
