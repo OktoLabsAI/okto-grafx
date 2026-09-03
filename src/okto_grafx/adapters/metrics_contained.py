@@ -119,7 +119,7 @@ class ContainedMetricsSink:
     @property
     def enabled(self) -> bool:
         """Return the inner sink's answer, and False when even asking raises."""
-        if self._state.depth > 0:
+        if self._state.depth > 0 or self._state.transition_depth > 0:
             # Asking the host is itself a callback. During an engine transition use the last
             # answer observed outside it; recording calls are queued behind the same boundary.
             return self._enabled_hint

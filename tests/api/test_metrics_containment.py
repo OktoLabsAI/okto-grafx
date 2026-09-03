@@ -192,6 +192,45 @@ class _CloseOnDeferredFsync:
         return {}
 
 
+class _CloseOnEnabled:
+    """Request close only if the engine consults the host's enabled getter mid-transition."""
+
+    def __init__(self) -> None:
+        self.database = None
+        self.armed = False
+        self.boundaries: list[tuple[int, int]] = []
+
+    @property
+    def enabled(self) -> bool:
+        if self.armed:
+            self.armed = False
+            assert self.database is not None
+            state = self.database._metrics._state
+            self.boundaries.append((state.transition_depth, state.depth))
+            self.database.close()
+        return True
+
+    def register(self, descriptor) -> None:
+        return None
+
+    def increment(self, name, value=1.0, labels=None) -> None:
+        return None
+
+    def set_gauge(self, name, value, labels=None) -> None:
+        return None
+
+    def observe(self, name, value, labels=None) -> None:
+        return None
+
+    def time(self, name, labels=None):
+        from contextlib import nullcontext
+
+        return nullcontext()
+
+    def snapshot(self):
+        return {}
+
+
 def _database_with(tmp_path: Path, sink):
     root = str(tmp_path / "db")
     registry = build_default_registry(DatabaseConfig(path=root))
@@ -324,3 +363,29 @@ def test_wal_timer_reentrant_close_waits_for_commit_outcome_then_releases_storag
     assert database._transactions.close_complete
     with pytest.raises(GrafxUnsupportedOperation):
         database.storage.exists("grafx.meta")
+
+
+def test_enabled_probe_does_not_reenter_host_before_participant_deferral(
+    tmp_path: Path,
+) -> None:
+    """D-26 decides from the transition's cached hint, never from a host getter."""
+    database = okto_grafx.connect(tmp_path / "enabled-close", page_size=512)
+    contained = database._metrics
+    assert isinstance(contained, ContainedMetricsSink)
+    hostile = _CloseOnEnabled()
+    hostile.database = database
+    contained._inner = hostile
+    contained._enabled_hint = True
+    with database.begin("write") as schema:
+        schema.execute("CREATE NODE TABLE T(id INT64, PRIMARY KEY(id))")
+    writer = database.begin("write")
+    writer.execute("CREATE (:T {id: 1})")
+    hostile.armed = True
+
+    report = writer.commit()
+
+    assert report.durable and report.wrote
+    assert writer._context.state is TransactionState.COMMITTED
+    assert hostile.boundaries == []
+    assert not database.closed
+    database.close()

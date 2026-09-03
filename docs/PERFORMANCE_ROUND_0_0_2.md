@@ -61,4 +61,5 @@ promoted or integrated until P0.1–P0.4 are closed as specified by the governin
 | Date | Milestone | Result |
 |---|---|---|
 | 2026-09-02 | Version bump and branch bootstrap | packaging and CLI version tests passed |
+| 2026-09-03 | P1.1 / D-26 implementation | lease, commit-section, phase, WAL, page, flush, foreign-commit and retarget metrics implemented; focused commit/concurrency/catalog/import suite and Ruff passed; measurement and promotion remain deferred until P0 closes |
 

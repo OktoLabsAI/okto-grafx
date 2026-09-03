@@ -435,6 +435,39 @@ an official CE-3 performance matrix and a `7.5/s` entry floor was retired on 202
 now proceeds directly under the quality gates stated at the top of this document; a future CE-3
 matrix is optional performance evidence and cannot block it.
 
+### D-26 exclusive-window instrumentation (0.0.2 development)
+
+The 0.0.2 performance round adds bounded-cardinality measurements that locate write-commit cost
+before selecting later optimizations. `oktografx_commit_window_duration_seconds` separates wait and
+hold for the writer lease and `COMMIT_SECTION`; `oktografx_commit_phase_duration_seconds` partitions
+the commit-section hold across `other`, `occ`, `materialize`, `build_records`, `append`, `barrier`,
+`apply`, `flush`, `index` and `publish`. The phase durations reconcile to the section hold for a
+complete timing sample. A typed coordination timeout closes its wait sample at the failure
+boundary, not after participant unwind. An untyped acquisition failure cannot prove that no grant
+occurred and therefore suppresses the whole trace.
+
+The counters report page images logged, physical live-WAL bytes successfully appended (including a
+segment header on rollover), actual buffer-pool flush calls, resident and retired-pinned frames
+traversed by commit-time flush/modified/dirty checks, foreign durable commits completed, and batches
+successfully retargeted. Buffer accounting is a data-only probe: it is attached after participant
+serialization and detached before that section is released, so consecutive local commits cannot
+steal or mix one another's accounting.
+
+Collection is outcome-neutral. The no-op sink constructs no trace object; an enabled trace invokes
+neither the sink nor the host-provided `Clock` while an exclusive window is held. It emits after all
+three coordination layers are proven settled, and a hostile sink cannot alter the commit result.
+Any uncertain acquisition or release suppresses the whole trace rather than invoking host code
+while a boundary may remain held. The exact
+`time.perf_counter_ns` observation used for diagnostics is the sole narrow G2 exception and is never
+an input to liveness, WAL, visibility or durability. If that timer fails, duration samples for the
+attempt are discarded while counters and the transaction continue normally.
+
+The internal `retain_lease=True` policy emits no D-26 per-commit trace. Because its writer lease
+remains live after the operation, there is no safe complete-trace callback boundary; emitting would
+contradict A91. The public/default lease-per-commit policy is fully instrumented. Official probe
+effect and disabled-overhead numbers remain pending P0.4 on an isolated machine; no temporal claim
+is made from development runs while the live Pulse backfill is active.
+
 ---
 
 ## 6. Reproducing

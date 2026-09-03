@@ -301,9 +301,9 @@ Cadeia de derivação: ideação d6d69798 (DONE ed.4, decisões D1–D9) → ref
 
 ## Observability Requirements
 
-### `or_e32ab34d` OR-1 Métricas de concorrência
-- **Signal**: metric · metric: `oktografx_lease_wait_seconds, oktografx_write_conflicts_total, oktografx_commit_retries_total, oktografx_active_transactions` · threshold: None
-- Histograma de espera por lease (labels: outcome=granted|timeout|takeover), contador de conflitos de escrita, retentativas e gauge de transações ativas por modo (read|write). Toda espera de coordenação é medida — contenção invisível é proibida por desenho.
+### `or_e32ab34d` OR-1 Métricas de concorrência e custo do commit
+- **Signal**: metric · metric: `oktografx_lease_wait_seconds, oktografx_write_conflicts_total, oktografx_commit_retries_total, oktografx_active_transactions, oktografx_commit_window_duration_seconds, oktografx_commit_phase_duration_seconds, oktografx_commit_pages_logged_total, oktografx_commit_wal_bytes_total, oktografx_commit_frames_examined_total, oktografx_commit_flushes_total, oktografx_commit_foreign_commits_total, oktografx_commit_retargets_total` · threshold: None
+- Histograma de espera por lease (labels: outcome=granted|timeout|takeover), contador de conflitos de escrita, retentativas e gauge de transações ativas por modo (read|write). Cada commit de escrita com trabalho/WAL no modo público/default de lease por commit mede wait/hold da writer lease e de `COMMIT_SECTION`, as fases internas de OCC, materialização, records, append, barrier, apply, flush, índice e publish, além de páginas, crescimento físico do WAL, frames percorridos, flushes, commits estrangeiros e retargets concluídos. Labels têm domínio fechado e o sink recebe o lote apenas depois de a liberação de todas as seções exclusivas ser comprovada; incerteza de aquisição/liberação suprime o lote inteiro. O modo interno `retain_lease=True` não emite esta família por commit: não há fronteira segura para invocar um sink enquanto a lease permanece viva; métricas de lease já existentes continuam independentes.
 
 ### `or_c7a4cece` OR-2 Métricas de durabilidade e WAL
 - **Signal**: metric · metric: `oktografx_fsync_duration_seconds, oktografx_barrier_failures_total, oktografx_wal_size_bytes, oktografx_wal_segments, oktografx_wal_truncation_lag_segments` · threshold: None

@@ -61,10 +61,12 @@ participants cannot hold one section each and wait for the other. Proved by
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, is_dataclass, replace
-from typing import Any
+from time import perf_counter_ns
+from types import TracebackType
+from typing import Any, Literal
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -129,13 +131,14 @@ from okto_grafx.domain.txn.records import (
 )
 from okto_grafx.domain.wal.replay import RecycleReport
 from okto_grafx.domain.txn.snapshot import Snapshot
-from okto_grafx.engine.buffer_pool import BufferPool, apply_page_image
+from okto_grafx.engine.buffer_pool import BufferPool, _BufferWorkProbe, apply_page_image
 from okto_grafx.engine.commit_state_store import (
     COMMIT_STATE_READ_ATTEMPTS,
     CommitStateStore,
 )
 from okto_grafx.engine.commit_redo import CommitRedo
 from okto_grafx.engine.heap_store import FIRST_RECORD_ID
+from okto_grafx.engine.wal_manager import WalManager
 from okto_grafx.engine.coordination import (
     COMMIT_SECTION,
     DEFAULT_RENEWAL_FRACTION,
@@ -147,8 +150,16 @@ from okto_grafx.engine.metrics_catalog import metric
 
 __all__ = [
     "ACTIVE_TRANSACTIONS",
+    "COMMIT_FLUSHES_TOTAL",
+    "COMMIT_FOREIGN_COMMITS_TOTAL",
+    "COMMIT_FRAMES_EXAMINED_TOTAL",
+    "COMMIT_PAGES_LOGGED_TOTAL",
+    "COMMIT_PHASE_DURATION_SECONDS",
     "COMMIT_RETRIES_TOTAL",
+    "COMMIT_RETARGETS_TOTAL",
     "COMMIT_SECTION",
+    "COMMIT_WAL_BYTES_TOTAL",
+    "COMMIT_WINDOW_DURATION_SECONDS",
     "PARTICIPANT_SECTION_PREFIX",
     "COMMIT_STATE_READ_ATTEMPTS",
     "TRANSACTION_MANAGER_METRICS",
@@ -159,10 +170,30 @@ __all__ = [
 WRITE_CONFLICTS_TOTAL: str = "oktografx_write_conflicts_total"
 COMMIT_RETRIES_TOTAL: str = "oktografx_commit_retries_total"
 ACTIVE_TRANSACTIONS: str = "oktografx_active_transactions"
+COMMIT_WINDOW_DURATION_SECONDS: str = "oktografx_commit_window_duration_seconds"
+COMMIT_PHASE_DURATION_SECONDS: str = "oktografx_commit_phase_duration_seconds"
+COMMIT_PAGES_LOGGED_TOTAL: str = "oktografx_commit_pages_logged_total"
+COMMIT_WAL_BYTES_TOTAL: str = "oktografx_commit_wal_bytes_total"
+COMMIT_FRAMES_EXAMINED_TOTAL: str = "oktografx_commit_frames_examined_total"
+COMMIT_FLUSHES_TOTAL: str = "oktografx_commit_flushes_total"
+COMMIT_FOREIGN_COMMITS_TOTAL: str = "oktografx_commit_foreign_commits_total"
+COMMIT_RETARGETS_TOTAL: str = "oktografx_commit_retargets_total"
 
 TRANSACTION_MANAGER_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
-    for name in (WRITE_CONFLICTS_TOTAL, COMMIT_RETRIES_TOTAL, ACTIVE_TRANSACTIONS)
+    for name in (
+        WRITE_CONFLICTS_TOTAL,
+        COMMIT_RETRIES_TOTAL,
+        ACTIVE_TRANSACTIONS,
+        COMMIT_WINDOW_DURATION_SECONDS,
+        COMMIT_PHASE_DURATION_SECONDS,
+        COMMIT_PAGES_LOGGED_TOTAL,
+        COMMIT_WAL_BYTES_TOTAL,
+        COMMIT_FRAMES_EXAMINED_TOTAL,
+        COMMIT_FLUSHES_TOTAL,
+        COMMIT_FOREIGN_COMMITS_TOTAL,
+        COMMIT_RETARGETS_TOTAL,
+    )
 )
 """The descriptors this component registers and emits, taken from the frozen catalog (G7).
 
@@ -264,6 +295,293 @@ class _CheckpointTarget:
     barrier_files: tuple[str, ...]
 
 
+class _DisabledCommitTrace:
+    """Reusable context for the default no-op metrics path.
+
+    It is deliberately one stateless singleton: a write commit with metrics disabled allocates
+    no timer, mapping, label set or context-manager object.
+    """
+
+    __slots__ = ()
+
+    def __enter__(self) -> None:
+        """Return the disabled trace marker."""
+        return None
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        """Never suppress the commit outcome."""
+        del exc_type, exc_value, traceback
+        return False
+
+
+_DISABLED_COMMIT_TRACE = _DisabledCommitTrace()
+
+
+class _CommitBufferScope:
+    """Keep a buffer-work probe inside the participant section that owns the commit."""
+
+    __slots__ = ("_manager", "_previous", "_trace")
+
+    def __init__(self, manager: TransactionManager, trace: _CommitTrace) -> None:
+        self._manager = manager
+        self._previous: _CommitTrace | None = None
+        self._trace = trace
+
+    def __enter__(self) -> None:
+        """Attach only after the participant section has serialized local commits."""
+        self._previous = self._manager._active_commit_trace
+        self._manager._active_commit_trace = self._trace
+        self._trace.attach_buffer()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        """Detach before that participant section can admit the next local commit."""
+        del exc_type, exc_value, traceback
+        self._manager._active_commit_trace = None
+        self._trace.detach_buffer()
+        self._manager._active_commit_trace = self._previous
+        return False
+
+
+def _commit_buffer_scope(
+    manager: TransactionManager,
+    trace: _CommitTrace | None,
+) -> _CommitBufferScope | _DisabledCommitTrace:
+    """Return an enabled scope or the allocation-free disabled singleton."""
+    return (
+        _CommitBufferScope(manager, trace)
+        if trace is not None
+        else _DISABLED_COMMIT_TRACE
+    )
+
+
+class _CommitTrace:
+    """Collect one write-commit trace locally and emit it after every lock is released.
+
+    Timing uses Python's captured process-local performance counter rather than the host-supplied
+    ``Clock`` port, and counter arithmetic is data-only. The metrics sink is not called until
+    :meth:`__exit__`, which is deliberately the outer context around the participant section.
+    Consequently no host callback runs under the writer lease, ``COMMIT_SECTION`` or the
+    process-local participant section, and telemetry can never change the commit outcome.
+    """
+
+    __slots__ = (
+        "_metrics",
+        "_pool",
+        "_buffer_work",
+        "_buffer_attached",
+        "_delivery_safe",
+        "_timing_enabled",
+        "_wait_started",
+        "_hold_started",
+        "_windows",
+        "_phase",
+        "_phase_started",
+        "_phases",
+        "_counters",
+    )
+
+    def __init__(self, metrics: MetricsSink, pool: BufferPool) -> None:
+        self._metrics = metrics
+        self._pool = pool
+        self._buffer_work = _BufferWorkProbe()
+        self._buffer_attached = False
+        self._delivery_safe = True
+        self._timing_enabled = True
+        self._wait_started: dict[str, float] = {}
+        self._hold_started: dict[str, float] = {}
+        self._windows: list[tuple[str, str, float]] = []
+        self._phase: str | None = None
+        self._phase_started: float | None = None
+        self._phases: dict[str, float] = {}
+        self._counters: dict[str, int] = {}
+
+    def __enter__(self) -> _CommitTrace:
+        """Return this collector; buffer accounting waits for participant serialization."""
+        return self
+
+    def attach_buffer(self) -> None:
+        """Attach data-only accounting after the participant section is acquired."""
+        try:
+            self._buffer_attached = self._pool._attach_work_probe(self._buffer_work)
+        except BaseException:  # noqa: BLE001 - instrumentation is outcome-neutral
+            self._buffer_attached = False
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        """Finish open intervals and publish without masking any transaction outcome."""
+        del exc_type, exc_value, traceback
+        if not self._delivery_safe:
+            return False
+        self._finish_open_intervals()
+        for window, interval, seconds in tuple(self._windows):
+            try:
+                self._metrics.observe(
+                    COMMIT_WINDOW_DURATION_SECONDS,
+                    seconds,
+                    {"window": window, "interval": interval},
+                )
+            except BaseException:  # noqa: BLE001 - telemetry is outcome-neutral
+                continue
+        for phase, seconds in tuple(self._phases.items()):
+            try:
+                self._metrics.observe(
+                    COMMIT_PHASE_DURATION_SECONDS,
+                    seconds,
+                    {"phase": phase},
+                )
+            except BaseException:  # noqa: BLE001 - telemetry is outcome-neutral
+                continue
+        for name, value in tuple(self._counters.items()):
+            if value <= 0:
+                continue
+            try:
+                self._metrics.increment(name, float(value))
+            except BaseException:  # noqa: BLE001 - telemetry is outcome-neutral
+                continue
+        return False
+
+    def suppress_delivery(self) -> None:
+        """Drop this trace when releasing an exclusive boundary could not be proved."""
+        self._delivery_safe = False
+
+    def detach_buffer(self) -> None:
+        """Finish buffer accounting before the serialized participant window opens again."""
+        attached = self._buffer_attached
+        self._buffer_attached = False
+        if not attached:
+            return
+        try:
+            self._pool._detach_work_probe(self._buffer_work)
+        except BaseException:  # noqa: BLE001 - instrumentation is outcome-neutral
+            pass
+        try:
+            self.increment(COMMIT_FLUSHES_TOTAL, self._buffer_work.flushes)
+            self.increment(
+                COMMIT_FRAMES_EXAMINED_TOTAL,
+                self._buffer_work.frames_examined,
+            )
+        except BaseException:  # noqa: BLE001 - instrumentation is outcome-neutral
+            pass
+
+    def start_window(self, window: str) -> None:
+        """Start measuring acquisition of one bounded coordination window."""
+        reading = self._reading()
+        if reading is not None:
+            self._wait_started[window] = reading
+
+    def acquire_window(self, window: str) -> None:
+        """Close a wait interval and start its matching hold interval."""
+        started = self._wait_started.pop(window, None)
+        reading = self._reading()
+        if reading is None:
+            return
+        if started is not None:
+            self._windows.append((window, "wait", max(reading - started, 0.0)))
+        self._hold_started[window] = reading
+        if window == "commit_section":
+            self._phase = "other"
+            self._phase_started = reading
+
+    def release_window(self, window: str) -> None:
+        """Close one held interval; commit-section phases reconcile to this reading."""
+        started = self._hold_started.pop(window, None)
+        reading = self._reading()
+        if reading is None:
+            return
+        if window == "commit_section":
+            self._finish_phase(reading)
+        if started is not None:
+            self._windows.append((window, "hold", max(reading - started, 0.0)))
+
+    def fail_window(self, window: str) -> None:
+        """Close a failed acquisition at its exception boundary, before unwind adds noise."""
+        started = self._wait_started.pop(window, None)
+        reading = self._reading()
+        if started is not None and reading is not None:
+            self._windows.append((window, "wait", max(reading - started, 0.0)))
+
+    def phase(self, phase: str) -> None:
+        """Move the commit-section clock to a closed-cardinality phase."""
+        if "commit_section" not in self._hold_started or phase == self._phase:
+            return
+        reading = self._reading()
+        if reading is None:
+            return
+        self._finish_phase(reading)
+        self._phase = phase
+        self._phase_started = reading
+
+    def increment(self, name: str, value: int = 1) -> None:
+        """Accumulate a non-negative per-attempt count without touching the sink."""
+        if value > 0:
+            self._counters[name] = self._counters.get(name, 0) + value
+
+    def capture_batch(
+        self,
+        images: Sequence[tuple[str, PageIndex, bytes]],
+        wal_bytes: int | None,
+    ) -> None:
+        """Record a successful append's page count and trusted physical WAL growth."""
+        self.increment(COMMIT_PAGES_LOGGED_TOTAL, len(images))
+        if wal_bytes is not None:
+            self.increment(COMMIT_WAL_BYTES_TOTAL, wal_bytes)
+
+    def _reading(self) -> float | None:
+        """Read the trusted process timer, never a host callback, for diagnostics only."""
+        if not self._timing_enabled:
+            return None
+        try:
+            return perf_counter_ns() / 1_000_000_000
+        except BaseException:  # noqa: BLE001 - instrumentation is strictly outcome-neutral
+            self._timing_enabled = False
+            self._wait_started.clear()
+            self._hold_started.clear()
+            self._windows.clear()
+            self._phase = None
+            self._phase_started = None
+            self._phases.clear()
+            return None
+
+    def _finish_phase(self, reading: float) -> None:
+        """Accumulate the current phase through ``reading`` when one is active."""
+        phase = self._phase
+        started = self._phase_started
+        if phase is None or started is None:
+            return
+        self._phases[phase] = self._phases.get(phase, 0.0) + max(reading - started, 0.0)
+        self._phase_started = reading
+
+    def _finish_open_intervals(self) -> None:
+        """Close failed acquisitions and defensive leaked holds at the last safe boundary."""
+        reading = self._reading()
+        if reading is None:
+            return
+        for window, started in tuple(self._wait_started.items()):
+            self._windows.append((window, "wait", max(reading - started, 0.0)))
+        self._wait_started.clear()
+        if "commit_section" in self._hold_started:
+            self._finish_phase(reading)
+        for window, started in tuple(self._hold_started.items()):
+            self._windows.append((window, "hold", max(reading - started, 0.0)))
+        self._hold_started.clear()
+        self._phase = None
+        self._phase_started = None
+
+
 class _ReaderPin:
     """One live reader registration together with the reading at which it was last refreshed."""
 
@@ -287,6 +605,7 @@ class TransactionManager:
         "_commit_redo",
         "_clock",
         "_metrics",
+        "_active_commit_trace",
         "_index_manager",
         "_index_sync",
         "_partitions_per_table",
@@ -394,6 +713,7 @@ class TransactionManager:
         self._commit_redo = CommitRedo(pool, index_manager)
         self._clock: Clock = clock
         self._metrics: MetricsSink = metrics
+        self._active_commit_trace: _CommitTrace | None = None
         self._index_manager: Any = index_manager
         self._index_sync: Callable[[], object] | None = index_sync
         self._partitions_per_table: int = validate_partitions_per_table(
@@ -964,15 +1284,16 @@ class TransactionManager:
         row_tables: dict[tuple[object, object], object] = {}
         for intent in reduce_row_intents(txn.row_intents):
             table = intent.table
-            row_tables[(getattr(table, "table_id", None), getattr(table, "name", None))] = table
+            row_tables[
+                (getattr(table, "table_id", None), getattr(table, "name", None))
+            ] = table
         try:
             validate(txn, row_tables=tuple(row_tables.values()))
         except GrafxIndexError as failure:
-            if (
-                failure.retryable is not True
-                or failure.details.get("field")
-                not in {"index_registry", "artifact_nonce"}
-            ):
+            if failure.retryable is not True or failure.details.get("field") not in {
+                "index_registry",
+                "artifact_nonce",
+            }:
                 raise
             file = failure.details.get("file")
             if not isinstance(file, str) or not file:
@@ -1085,11 +1406,7 @@ class TransactionManager:
             observe = getattr(self._index_manager, "observe_published_lsn", None)
             if callable(observe):
                 observe(durable.last_committed_lsn)
-            if (
-                self._index_sync is not None
-                and sync_if is not None
-                and sync_if()
-            ):
+            if self._index_sync is not None and sync_if is not None and sync_if():
                 with self._close_wait_hazard():
                     self._index_sync()
             yield
@@ -1918,20 +2235,14 @@ class TransactionManager:
                 # newest published checkpoint. A concurrent checkpoint may already have recycled
                 # the older prefix, which is why replay starts at the larger physical proof.
                 self._establish_read_view(current, own=False)
-                replay_from = _larger(
-                    target.target_lsn, current.checkpoint_lsn
-                )
+                replay_from = _larger(target.target_lsn, current.checkpoint_lsn)
                 # Even an empty suffix performs the registry synchronisation owned by the redo
                 # door. A newer checkpoint may have installed foreign DDL and recycled its WAL
                 # while B was running; skipping the empty range would leave this long-lived
                 # handle without the newly durable indexes.
-                self._redo_onto_device(
-                    replay_from, current.last_committed_lsn
-                )
+                self._redo_onto_device(replay_from, current.last_committed_lsn)
 
-                checkpoint_lsn = _larger(
-                    current.checkpoint_lsn, target.target_lsn
-                )
+                checkpoint_lsn = _larger(current.checkpoint_lsn, target.target_lsn)
                 self._publish(
                     CommitState(
                         last_committed_lsn=current.last_committed_lsn,
@@ -1970,11 +2281,20 @@ class TransactionManager:
         otherwise the later page image can overwrite a page that never received the earlier
         commit, and replaying in WAL order preserves the overwrite permanently.
         """
+        trace = self._active_commit_trace
         try:
             durable = self._read_commit_state()
             with self._close_wait_hazard():
+                records = self._wal.read_from(durable.last_committed_lsn + 1)
+                foreign_commit_count = [0] if trace is not None else None
                 tail = committed_replay(
-                    self._wal.read_from(durable.last_committed_lsn + 1)
+                    _count_foreign_commits(
+                        records,
+                        durable.last_committed_lsn,
+                        foreign_commit_count,
+                    )
+                    if foreign_commit_count is not None
+                    else records
                 )
             if tail.incomplete_effects:
                 pending = tail.incomplete_effects
@@ -2008,6 +2328,8 @@ class TransactionManager:
             )
             self._publish(completed)
             self._published_high_water = _larger(self._published_high_water, target)
+            if trace is not None and foreign_commit_count is not None:
+                trace.increment(COMMIT_FOREIGN_COMMITS_TOTAL, foreign_commit_count[0])
             return completed
         except BaseException:
             # Redo can already have installed a prefix of the durable transaction when an
@@ -2139,8 +2461,8 @@ class TransactionManager:
             watermarks = manager.table_watermark_photo()
             manager.check_replay_floor(checkpoint, watermarks=watermarks)
         index_result = self._commit_redo.apply(index_replay)
-        self._commit_redo.flush(page_result)
-        self._commit_redo.flush(index_result)
+        for result in (page_result, index_result):
+            self._commit_redo.flush(result)
         if manager is not None and replay.last_committed_lsn > NO_LSN:
             manager.mark_built_through(replay.last_committed_lsn, watermarks=watermarks)
         return page_result.effects_replayed + index_result.effects_replayed
@@ -2310,7 +2632,24 @@ class TransactionManager:
         post_barrier_failure: BaseException | None = None
         cleanup_failure: BaseException | None = None
         identities: _IdentityPlan | None = None
-        with self._participant_section():
+        instrumentation = (
+            _CommitTrace(self._metrics, self._pool)
+            if not self._retain_lease and _metrics_are_enabled(self._metrics)
+            else _DISABLED_COMMIT_TRACE
+        )
+        participant = (
+            self._participant_section()
+            if instrumentation is _DISABLED_COMMIT_TRACE
+            else self._measured_participant_section(instrumentation)
+        )
+        # Contexts leave in reverse order: telemetry emits only after the participant section,
+        # writer lease and COMMIT_SECTION have all been settled. The innermost probe detaches
+        # before the participant section can admit another local commit.
+        with (
+            instrumentation as commit_trace,
+            participant,
+            _commit_buffer_scope(self, commit_trace),
+        ):
             self._require_not_closed("commit a transaction")
             self._require_current_active(txn)
             self._require_writable("commit a write transaction")
@@ -2322,17 +2661,31 @@ class TransactionManager:
             # global commit lock before any such id is accepted.
             self._validate_explicit_identity_floors(txn)
             self._refresh_finished_door()
-            lease = self._hold_lease()
+            if commit_trace is not None:
+                commit_trace.start_window("writer_lease")
+            try:
+                lease = self._hold_lease()
+            except BaseException as failure:
+                if commit_trace is not None:
+                    commit_trace.fail_window("writer_lease")
+                    if not isinstance(failure, GrafxLeaseTimeout):
+                        commit_trace.suppress_delivery()
+                raise
+            if commit_trace is not None:
+                commit_trace.acquire_window("writer_lease")
             try:
                 # Step 2: the epoch is confirmed before any byte can reach the device (BR-7,
                 # AC-6), through the coordinator that granted this very lease (A74).
                 self._validate_lease(lease)
                 with (
                     self._coordinator_section(
-                        COMMIT_SECTION, timeout=self._commit_lock_timeout
+                        COMMIT_SECTION,
+                        timeout=self._commit_lock_timeout,
                     ),
                     self._hold_wal_tail(),
                 ):
+                    if commit_trace is not None:
+                        commit_trace.phase("occ")
                     self._validate_lease(lease)  # step 3.1
                     durable = self._complete_committed_gap()
                     current = durable.last_committed_lsn
@@ -2380,6 +2733,8 @@ class TransactionManager:
                         # before nonce/registry provenance is consulted.
                         conflict = self._staged_artifact_conflict(txn)
                     if conflict is None:
+                        if commit_trace is not None:
+                            commit_trace.phase("materialize")
                         identities, pending_identity_ranges = (
                             self._prepare_identity_plan(txn)
                         )
@@ -2426,6 +2781,8 @@ class TransactionManager:
                             # pre-staged pages may not.  Revalidate only that already-proved set
                             # over the incremental interval and do not forgive the refill: a
                             # pre-staged heap page 0 is stale relative to the new durable floor.
+                            if commit_trace is not None:
+                                commit_trace.phase("occ")
                             with self._close_wait_hazard():
                                 conflict = self._find_conflict(
                                     txn,
@@ -2459,6 +2816,8 @@ class TransactionManager:
                             # of a batch used to leave the first one written and never
                             # abandoned -- a phantom row the next commit of anyone flushed and
                             # published (C5 round-2 B1).
+                            if commit_trace is not None:
+                                commit_trace.phase("materialize")
                             with self._close_wait_hazard():
                                 rows = self._write_rows(txn, identities)
                             materialized_pages = self._declare_page_interest(txn, rows)
@@ -2468,6 +2827,8 @@ class TransactionManager:
                                 pre_staged_pages=pre_staged_pages,
                                 materialized_pages=materialized_pages,
                             )
+                            if commit_trace is not None:
+                                commit_trace.phase("occ")
                             with self._close_wait_hazard():
                                 conflict = self._find_conflict(
                                     txn,
@@ -2487,6 +2848,8 @@ class TransactionManager:
                             )
                             if callable(validate_generations):
                                 validate_generations(txn)
+                            if commit_trace is not None:
+                                commit_trace.phase("build_records")
                             with self._close_wait_hazard():
                                 records, images, materialized_csn = self._build_records(
                                     txn, lease.epoch, rows
@@ -2506,14 +2869,34 @@ class TransactionManager:
                                         new_csn=planned_csn,
                                         epoch=lease.epoch,
                                     )
-                                self._validate_wal_batch_budget(txn, records)
+                                if commit_trace is not None:
+                                    commit_trace.increment(COMMIT_RETARGETS_TOTAL)
+                            self._validate_wal_batch_budget(txn, records)
                             self._validate_lease(lease)
+                            if commit_trace is not None:
+                                commit_trace.phase("append")
+                            wal_bytes_before = (
+                                _trusted_wal_bytes(self._wal)
+                                if commit_trace is not None
+                                else None
+                            )
                             with self._close_wait_hazard():
                                 committed = self._wal.append_many(
                                     records,
                                     expected_terminal_lsn=planned_csn,
                                 )  # step 3.4
+                            if commit_trace is not None:
+                                wal_bytes_after = _trusted_wal_bytes(self._wal)
+                                commit_trace.capture_batch(
+                                    images,
+                                    None
+                                    if wal_bytes_before is None
+                                    or wal_bytes_after is None
+                                    else wal_bytes_after - wal_bytes_before,
+                                )
                             _require_forward_commit(committed, current)
+                            if commit_trace is not None:
+                                commit_trace.phase("barrier")
                             with self._close_wait_hazard():
                                 self._wal.barrier()  # step 3.5 -- durable here
                             # The WAL outcome is irrevocable at this instant. Settle it before
@@ -2523,6 +2906,8 @@ class TransactionManager:
                             txn.bind_epoch(lease.epoch)
                             txn.mark_committed(committed)
                     except BaseException as failure:
+                        if commit_trace is not None:
+                            commit_trace.phase("other")
                         with self._close_wait_hazard():
                             wal_is_damaged = _wal_is_damaged(self._wal)
                         if committed > NO_CSN or wal_is_damaged:
@@ -2542,6 +2927,8 @@ class TransactionManager:
                             _note_cleanup_failure(failure, failed_cleanup)
                         raise
                     if conflict is not None:
+                        if commit_trace is not None:
+                            commit_trace.phase("other")
                         with self._close_wait_hazard():
                             abandoned = self._abandon_rows(rows)
                         with self._close_wait_hazard():
@@ -2554,15 +2941,23 @@ class TransactionManager:
                             self._published_high_water, committed
                         )
                         try:
+                            if commit_trace is not None:
+                                commit_trace.phase("apply")
                             with self._close_wait_hazard():
                                 self._apply_images(images)  # step 3.6
+                            if commit_trace is not None:
+                                commit_trace.phase("index")
                             with self._close_wait_hazard():
                                 self._apply_index_changes(txn, committed)  # step 3.6
+                            if commit_trace is not None:
+                                commit_trace.phase("publish")
                             with self._close_wait_hazard():
                                 self._publish_commit_state(
                                     durable, committed
                                 )  # step 3.7
                         except BaseException as failure:
+                            if commit_trace is not None:
+                                commit_trace.phase("other")
                             post_barrier_failure = failure
                             if isinstance(failure, GrafxError):
                                 try:
@@ -2654,7 +3049,9 @@ class TransactionManager:
         return CommitReport(csn=committed, durable=True, wrote=True)
 
     def _declare_page_interest(
-        self, txn: TransactionContext, rows: Sequence[_RowWrite]
+        self,
+        txn: TransactionContext,
+        rows: Sequence[_RowWrite],
     ) -> frozenset[tuple[str, PageIndex]]:
         """Declare interest in every page this commit is about to overwrite, then refuse silence.
 
@@ -3408,7 +3805,8 @@ class TransactionManager:
         manager = self._index_manager
         if manager is None:
             return 0
-        return int(manager.commit(txn, csn))
+        applied = int(manager.commit(txn, csn))
+        return applied
 
     def _drop_index_changes(self, txn: TransactionContext) -> int:
         """Drop what this transaction staged into the indexes, and return how many were dropped.
@@ -3931,6 +4329,7 @@ class TransactionManager:
         user_txn_id: TxnId,
     ) -> tuple[CommitState, Lsn]:
         """Commit one detached floor image through WAL before its identities can be used."""
+        trace = self._active_commit_trace
         reservation = TransactionContext(
             txn_id=self._next_txn_id,
             mode=TransactionMode.WRITE,
@@ -3957,6 +4356,8 @@ class TransactionManager:
         committed: Csn = NO_CSN
         epoch = lease.epoch
         try:
+            if trace is not None:
+                trace.phase("build_records")
             with self._close_wait_hazard():
                 records, images, materialized_csn = self._build_records(
                     reservation, epoch
@@ -3975,14 +4376,31 @@ class TransactionManager:
                         new_csn=planned_csn,
                         epoch=epoch,
                     )
-                self._validate_wal_batch_budget(reservation, records)
+                if trace is not None:
+                    trace.increment(COMMIT_RETARGETS_TOTAL)
+            self._validate_wal_batch_budget(reservation, records)
             self._validate_lease(lease)
+            if trace is not None:
+                trace.phase("append")
+            wal_bytes_before = (
+                _trusted_wal_bytes(self._wal) if trace is not None else None
+            )
             with self._close_wait_hazard():
                 committed = self._wal.append_many(
                     records,
                     expected_terminal_lsn=planned_csn,
                 )
+            if trace is not None:
+                wal_bytes_after = _trusted_wal_bytes(self._wal)
+                trace.capture_batch(
+                    images,
+                    None
+                    if wal_bytes_before is None or wal_bytes_after is None
+                    else wal_bytes_after - wal_bytes_before,
+                )
             _require_forward_commit(committed, previous.last_committed_lsn)
+            if trace is not None:
+                trace.phase("barrier")
             with self._close_wait_hazard():
                 self._wal.barrier()
             reservation.bind_epoch(epoch)
@@ -3994,11 +4412,17 @@ class TransactionManager:
 
         self._published_high_water = _larger(self._published_high_water, committed)
         try:
+            if trace is not None:
+                trace.phase("apply")
             with self._close_wait_hazard():
                 self._apply_images(images)
+            if trace is not None:
+                trace.phase("publish")
             with self._close_wait_hazard():
                 self._publish_commit_state(previous, committed)
         except BaseException as failure:
+            if trace is not None:
+                trace.phase("other")
             if isinstance(failure, GrafxError):
                 try:
                     self._redo_onto_device(previous.last_committed_lsn, committed)
@@ -4277,7 +4701,10 @@ class TransactionManager:
             failure = _first_failure(failure, index_failure)
         return failure
 
-    def _abandon_rows(self, rows: Sequence[_RowWrite]) -> BaseException | None:
+    def _abandon_rows(
+        self,
+        rows: Sequence[_RowWrite],
+    ) -> BaseException | None:
         """Make rows written by a commit that then failed unreachable to every snapshot.
 
         The rows are in the buffer pool by the time the log is asked for anything, and the pool
@@ -4507,7 +4934,10 @@ class TransactionManager:
         with self._pool.pinned(file, page_index) as page:
             return self._pool.codec.encode_page(page)
 
-    def _apply_images(self, images: Sequence[tuple[str, PageIndex, bytes]]) -> None:
+    def _apply_images(
+        self,
+        images: Sequence[tuple[str, PageIndex, bytes]],
+    ) -> None:
         """Apply the staged pages under the redo rule of step 6, then put them on the device.
 
         The apply door is C1's, and deliberately: the rule -- grow the file if the page is
@@ -4528,10 +4958,13 @@ class TransactionManager:
         actually returned would leave the page and the record disagreeing about the page, and a
         later replay would then produce a page that is not the one this commit wrote.
         """
+        trace = self._active_commit_trace
         touched: set[str] = set()
         for file, page_index, image in images:
             apply_page_image(self._pool, file, page_index, image)
             touched.add(file)
+        if trace is not None:
+            trace.phase("flush")
         for file in sorted(touched):
             self._pool.flush(file)
 
@@ -4632,7 +5065,10 @@ class TransactionManager:
         return guard
 
     def _drop_lease(
-        self, lease: LeaseGuard, *, force: bool = False
+        self,
+        lease: LeaseGuard,
+        *,
+        force: bool = False,
     ) -> BaseException | None:
         """Give the lease up and return, rather than raise, a foreign cleanup failure.
 
@@ -4640,17 +5076,34 @@ class TransactionManager:
         keep every other process out for the whole data barrier and defeat the concurrency the
         split exists to provide, so the cached guard is detached before release is attempted.
         """
+        trace = self._active_commit_trace
         if (
             not force
             and self._retain_lease
             and lease is self._lease_guard
             and not lease.released
         ):
+            if trace is not None:
+                # This is the commit's occupancy of a retained lease. The intentional idle
+                # retention between operations is outside a write-commit attempt and therefore
+                # outside D-26's per-commit denominator.
+                trace.release_window("writer_lease")
             return None
         if force and lease is self._lease_guard:
             self._lease_guard = None
-        with self._close_wait_hazard():
-            return _release_quietly(lease)
+        try:
+            with self._close_wait_hazard():
+                failure = _release_quietly(lease)
+            if failure is not None and trace is not None:
+                trace.suppress_delivery()
+            return failure
+        except BaseException:
+            if trace is not None:
+                trace.suppress_delivery()
+            raise
+        finally:
+            if trace is not None:
+                trace.release_window("writer_lease")
 
     def _validate_lease(self, lease: LeaseGuard) -> None:
         """Validate one coordinator-owned lease under the narrow close-wait hazard."""
@@ -4683,7 +5136,12 @@ class TransactionManager:
             yield
 
     @contextmanager
-    def _coordinator_section(self, name: str, *, timeout: float) -> Iterator[object]:
+    def _coordinator_section(
+        self,
+        name: str,
+        *,
+        timeout: float,
+    ) -> Iterator[object]:
         """Enter each foreign context phase under a hazard, but never mark its body.
 
         A coordinator owns the factory and both context-protocol callbacks. Any of those may
@@ -4692,22 +5150,55 @@ class TransactionManager:
         normal close/quiescence during commit and schema settlement, so the phases are expanded
         explicitly here.
         """
-        with self._close_wait_hazard():
-            section = self._coordinator.exclusive(name, timeout=timeout)
-        with self._close_wait_hazard():
-            entered = section.__enter__()
+        trace = self._active_commit_trace
+        measured = trace is not None and name == COMMIT_SECTION
+        if measured:
+            trace.start_window("commit_section")
+        try:
+            with self._close_wait_hazard():
+                section = self._coordinator.exclusive(name, timeout=timeout)
+            with self._close_wait_hazard():
+                entered = section.__enter__()
+        except BaseException as failure:
+            if measured:
+                trace.fail_window("commit_section")
+                if not isinstance(failure, GrafxLeaseTimeout):
+                    trace.suppress_delivery()
+            raise
+        if measured:
+            trace.acquire_window("commit_section")
         try:
             yield entered
         except BaseException as failure:
-            with self._close_wait_hazard():
-                suppressed = bool(
-                    section.__exit__(type(failure), failure, failure.__traceback__)
-                )
+            if measured:
+                trace.phase("other")
+            try:
+                with self._close_wait_hazard():
+                    suppressed = bool(
+                        section.__exit__(type(failure), failure, failure.__traceback__)
+                    )
+            except BaseException:
+                if measured:
+                    trace.suppress_delivery()
+                raise
+            finally:
+                if measured:
+                    trace.release_window("commit_section")
             if not suppressed:
                 raise
         else:
-            with self._close_wait_hazard():
-                section.__exit__(None, None, None)
+            if measured:
+                trace.phase("other")
+            try:
+                with self._close_wait_hazard():
+                    section.__exit__(None, None, None)
+            except BaseException:
+                if measured:
+                    trace.suppress_delivery()
+                raise
+            finally:
+                if measured:
+                    trace.release_window("commit_section")
 
     @contextmanager
     def _hold_wal_tail(self) -> Iterator[None]:
@@ -4761,6 +5252,34 @@ class TransactionManager:
                 timeout=self._commit_lock_timeout,
             ):
                 yield
+
+    @contextmanager
+    def _measured_participant_section(self, trace: _CommitTrace) -> Iterator[None]:
+        """Enter the existing section and suppress delivery if its release is uncertain."""
+        try:
+            section = self._participant_section()
+            entered = section.__enter__()
+        except BaseException:
+            trace.suppress_delivery()
+            raise
+        try:
+            yield entered
+        except BaseException as failure:
+            try:
+                suppressed = bool(
+                    section.__exit__(type(failure), failure, failure.__traceback__)
+                )
+            except BaseException:
+                trace.suppress_delivery()
+                raise
+            if not suppressed:
+                raise
+        else:
+            try:
+                section.__exit__(None, None, None)
+            except BaseException:
+                trace.suppress_delivery()
+                raise
 
     def _require_owned(self, txn: TransactionContext) -> None:
         """Refuse a transaction this manager did not open (amendment A74).
@@ -4881,6 +5400,31 @@ class TransactionManager:
             f"TransactionManager(partitions_per_table={self._partitions_per_table}, "
             f"open_transactions={len(self._open)})"
         )
+
+
+def _metrics_are_enabled(metrics: MetricsSink) -> bool:
+    """Read the optional telemetry capability without changing a transaction outcome."""
+    try:
+        return metrics.enabled is True
+    except BaseException:  # noqa: BLE001 - a metrics adapter is never transaction authority
+        return False
+
+
+def _trusted_wal_bytes(wal: object) -> int | None:
+    """Return cached live bytes only for the engine's exact, callback-free WAL implementation."""
+    if type(wal) is not WalManager:
+        return None
+    return wal._total_bytes  # noqa: SLF001 - exact trusted type; diagnostics must not refresh I/O
+
+
+def _count_foreign_commits(
+    records: Iterable[WalRecord], floor: Lsn, count: list[int]
+) -> Iterator[WalRecord]:
+    """Yield a WAL stream unchanged while counting complete outcomes above ``floor``."""
+    for record in records:
+        if record.lsn > floor and record.record_type == int(WalRecordType.COMMIT):
+            count[0] += 1
+        yield record
 
 
 def _require_positive_int(field: str, value: object) -> int:
