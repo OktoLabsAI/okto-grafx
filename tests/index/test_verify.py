@@ -196,8 +196,11 @@ def test_an_index_over_a_table_the_catalog_does_not_know_is_reported(
     )
     database.manager.register(HashIndex(ghost, database.pool, database.metrics))
 
+    all_findings = database.manager.verify()
     findings = database.manager.verify("ghost_index")
 
+    assert _kinds(all_findings) == ["unknown_table"]
+    assert all_findings[0].index == "ghost_index"
     assert _kinds(findings) == ["unknown_table"]
     assert findings[0].index == "ghost_index"
 

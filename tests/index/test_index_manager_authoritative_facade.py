@@ -120,6 +120,8 @@ def test_authoritative_facade_intersects_registry_with_only_catalog_active_gener
     for forbidden in ("catalog_building", "catalog_stale", "process_local_rogue"):
         with pytest.raises(GrafxIndexError):
             manager.active_index(forbidden, catalog=catalog_store.catalog)
+        with pytest.raises(GrafxIndexError):
+            manager.verify(forbidden)
 
 
 def test_authoritative_facade_requires_complete_definition_equality_including_nonce(

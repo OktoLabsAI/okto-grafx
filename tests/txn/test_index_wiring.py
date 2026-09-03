@@ -21,6 +21,8 @@ from okto_grafx.domain.errors import GrafxWriteConflict
 from okto_grafx.domain.ids import RecordRef
 from okto_grafx.domain.index.definition import IndexDefinition
 from okto_grafx.domain.index.visibility import IndexVisibility
+from okto_grafx.domain.model.schema import ColumnDef, TableDef
+from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.txn import TransactionState, WalRecord, WalRecordType
 from okto_grafx.engine.index_manager import HashIndex, IndexManager
 from okto_grafx.engine.txn_manager import TransactionManager
@@ -205,6 +207,19 @@ def test_an_entry_staged_through_the_real_index_is_there_after_the_commit(
 ) -> None:
     """The double proves the call; this proves the change."""
     stack = build_stack(database_root)
+    stack.catalog.catalog.add_table(
+        TableDef(
+            table_id=1,
+            name="person",
+            kind="node",
+            columns=(
+                ColumnDef(name="name", type=ValueType.STRING, nullable=False),
+            ),
+            primary_key="name",
+        )
+    )
+    stack.catalog.save()
+    stack.pool.flush(stack.catalog.file)
     indexes = IndexManager(stack.pool, stack.heap, stack.metrics)
     index = indexes.register(
         HashIndex(

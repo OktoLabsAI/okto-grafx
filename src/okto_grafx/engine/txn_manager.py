@@ -251,11 +251,10 @@ class _RowWrite:
     they travel together. Both halves carry the same commit number, so a snapshot below it finds
     exactly one live version and a snapshot at or above it finds exactly one.
 
-    The table and the two value tuples travel with the refs because the secondary indexes are
-    keyed on the VALUES, not on the reference: ending the entry a version had needs the values
-    that version carried, and they are gone from the caller's hands by the time the commit runs.
-    ``ended_values`` is read from the heap rather than taken from the caller, because the heap is
-    the authority inside the commit section and a caller's copy can be one version stale.
+    The table, durable RecordId and two value tuples travel with the refs because an index may be
+    keyed on either the row values or its logical identity. Ending the entry a version had needs
+    the authoritative version the heap held inside the commit section; a caller's copy can be one
+    version stale. An update keeps one RecordId while moving to a new physical reference.
     """
 
     born: RecordRef | None
@@ -263,6 +262,7 @@ class _RowWrite:
     table: object = None
     born_values: tuple[object, ...] = ()
     ended_values: tuple[object, ...] = ()
+    record_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -3723,20 +3723,24 @@ class TransactionManager:
             return replace(record, epoch=epoch)  # type: ignore[type-var]
         return record
 
-    def _values_at(self, reference: RecordRef) -> tuple[object, ...]:
-        """Return the values the version at this reference carries, for the index to key on.
+    def _index_row_at(
+        self, reference: RecordRef
+    ) -> tuple[int | None, tuple[object, ...]]:
+        """Return the durable identity and values an ended index entry must derive from.
 
         Read from the heap rather than taken from the caller: inside the commit section the heap
         is the authority, and a caller's copy of a row can be one version behind. A reference the
-        heap cannot read yields nothing, and the index staging then has no key to end -- which is
-        the same outcome as a table with no index, and strictly better than ending the wrong one.
+        heap cannot read yields no identity and no values. The heap mutation that follows retains
+        its own refusal, while an active identity index also fails closed rather than deriving a
+        key for the wrong logical row.
         """
         if self._index_manager is None:
-            return ()
+            return None, ()
         try:
-            return tuple(self._heap.read(reference).values)
+            version = self._heap.read(reference)
+            return int(version.record_id), tuple(version.values)
         except GrafxError:
-            return ()
+            return None, ()
 
     def _index_record_count(
         self, txn: TransactionContext, rows: Sequence[_RowWrite]
@@ -3767,6 +3771,7 @@ class TransactionManager:
                 total += manager.row_entry_count(
                     table_id,
                     row.ended_values,
+                    record_id=row.record_id,
                     table_name=table_name,
                     table=row.table,
                     txn=txn,
@@ -3775,6 +3780,7 @@ class TransactionManager:
                 total += manager.row_entry_count(
                     table_id,
                     row.born_values,
+                    record_id=row.record_id,
                     table_name=table_name,
                     table=row.table,
                     txn=txn,
@@ -3817,6 +3823,7 @@ class TransactionManager:
                     row.ended,
                     row.ended_values,
                     csn,
+                    record_id=row.record_id,
                     table_name=table_name,
                     table=row.table,
                 )
@@ -3827,6 +3834,7 @@ class TransactionManager:
                     row.born,
                     row.born_values,
                     csn,
+                    record_id=row.record_id,
                     table_name=table_name,
                     table=row.table,
                 )
@@ -4019,7 +4027,7 @@ class TransactionManager:
         for position, intent in enumerate(self._resolved_intents(txn, identities)):
             effective_row_tables.add((intent.table.table_id, intent.table.name))
             if intent.operation is RowOperation.DELETE:
-                ending = self._values_at(intent.reference)
+                record_id, ending = self._index_row_at(intent.reference)
                 heap.delete(intent.table, intent.reference, provisional)
                 written.append(
                     _RowWrite(
@@ -4027,11 +4035,12 @@ class TransactionManager:
                         ended=intent.reference,
                         table=intent.table,
                         ended_values=ending,
+                        record_id=record_id,
                     )
                 )
                 continue
             if intent.operation is RowOperation.UPDATE:
-                ending = self._values_at(intent.reference)
+                record_id, ending = self._index_row_at(intent.reference)
                 reference = heap.update(
                     intent.table, intent.reference, intent.values, provisional
                 )
@@ -4042,6 +4051,7 @@ class TransactionManager:
                         table=intent.table,
                         born_values=tuple(intent.values),
                         ended_values=ending,
+                        record_id=record_id,
                     )
                 )
                 continue
@@ -4065,6 +4075,7 @@ class TransactionManager:
                     ended=None,
                     table=intent.table,
                     born_values=tuple(intent.values),
+                    record_id=record_id,
                 )
             )
         return frozenset(effective_row_tables)

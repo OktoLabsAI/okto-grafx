@@ -4643,11 +4643,18 @@ class IndexManager:
         table_id: int,
         values: Sequence[object],
         *,
+        record_id: object | None = None,
         table_name: str | None = None,
         table: object | None = None,
         txn: StagingTransaction | None = None,
     ) -> int:
-        """Count entries this row owes without deriving or hashing their keys."""
+        """Count entries this row owes without deriving or hashing value keys.
+
+        ``record_id`` is optional only for compatibility with column-derived indexes, whose
+        inclusion predicate ignores it.  A RecordId-derived index validates that the durable
+        logical identity is present here, keeping WAL quota pre-counting on exactly the same
+        domain as staging without trying to encode an empty DELETE value tuple.
+        """
 
         return sum(
             1
@@ -4657,7 +4664,7 @@ class IndexManager:
                 table=table,
                 txn=txn,
             )
-            if index.definition.owes_entry(values)
+            if index.definition.owes_entry_for_record(record_id, values)
         )
 
     def stage_row_insert(
@@ -4668,6 +4675,7 @@ class IndexManager:
         values: Sequence[object],
         csn: Csn,
         *,
+        record_id: object | None = None,
         table_name: str | None = None,
         table: object | None = None,
     ) -> tuple[WalRecord, ...]:
@@ -4677,11 +4685,16 @@ class IndexManager:
             table_id, table_name=table_name, table=table, txn=txn
         ):
             definition = index.definition
-            if not definition.owes_entry(values):
+            if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
             else:
                 records.append(
-                    index.stage_insert(txn, definition.key_for(values), ref, csn)
+                    index.stage_insert(
+                        txn,
+                        definition.key_for_record(record_id, values),
+                        ref,
+                        csn,
+                    )
                 )
         return tuple(records)
 
@@ -4693,6 +4706,7 @@ class IndexManager:
         values: Sequence[object],
         csn: Csn,
         *,
+        record_id: object | None = None,
         table_name: str | None = None,
         table: object | None = None,
     ) -> tuple[WalRecord, ...]:
@@ -4702,11 +4716,16 @@ class IndexManager:
             table_id, table_name=table_name, table=table, txn=txn
         ):
             definition = index.definition
-            if not definition.owes_entry(values):
+            if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
             else:
                 records.append(
-                    index.stage_delete(txn, definition.key_for(values), ref, csn)
+                    index.stage_delete(
+                        txn,
+                        definition.key_for_record(record_id, values),
+                        ref,
+                        csn,
+                    )
                 )
         return tuple(records)
 
@@ -4720,6 +4739,7 @@ class IndexManager:
         new_values: Sequence[object],
         csn: Csn,
         *,
+        record_id: object | None = None,
         table_name: str | None = None,
         table: object | None = None,
     ) -> tuple[WalRecord, ...]:
@@ -4735,20 +4755,26 @@ class IndexManager:
             table_id, table_name=table_name, table=table, txn=txn
         ):
             definition = index.definition
-            owes_old = definition.owes_entry(old_values)
-            owes_new = definition.owes_entry(new_values)
+            owes_old = definition.owes_entry_for_record(record_id, old_values)
+            owes_new = definition.owes_entry_for_record(record_id, new_values)
             if not owes_old and not owes_new:
                 index.stage_empty_observation(txn)
             elif owes_old:
                 records.append(
                     index.stage_delete(
-                        txn, definition.key_for(old_values), old_ref, csn
+                        txn,
+                        definition.key_for_record(record_id, old_values),
+                        old_ref,
+                        csn,
                     )
                 )
             if owes_new:
                 records.append(
                     index.stage_insert(
-                        txn, definition.key_for(new_values), new_ref, csn
+                        txn,
+                        definition.key_for_record(record_id, new_values),
+                        new_ref,
+                        csn,
                     )
                 )
         return tuple(records)
@@ -4948,7 +4974,12 @@ class IndexManager:
                     )
                 if not snapshot.visible(version.xmin, version.xmax):
                     continue
-                if definition.entry_key_for(version.values) != entry.key:
+                if (
+                    definition.entry_key_for_record(
+                        version.record_id, version.values
+                    )
+                    != entry.key
+                ):
                     continue
                 confirmed.append(project(entry.ref, version))
             return tuple(confirmed)
@@ -5049,7 +5080,7 @@ class IndexManager:
         for ref, version in self._heap.scan_all(table):
             if is_provisional_csn(version.xmin):
                 continue
-            key = definition.entry_key_for(version.values)
+            key = definition.entry_key_for_record(version.record_id, version.values)
             if key is None:
                 continue
             index.stage_insert(txn, key, ref, version.xmin)
@@ -5133,10 +5164,25 @@ class IndexManager:
         an OMISSION, which is a wrong answer under either contract, and it is reported as such
         whichever kind of index left it out.
         """
+        authority = self._catalog_authority()
+        legacy = authority is not None and (
+            getattr(authority, "format_version", None)
+            == CATALOG_LEGACY_FORMAT_VERSION
+        )
+        # Catalog v1 had no persistent access-path authority.  Its verifier historically
+        # inspected the raw registry so that it could diagnose, among other things, an index
+        # bound to a table the catalog no longer knows.  Catalog v2 is different: only its exact
+        # ACTIVE generations may be interpreted as database state, including by diagnostics.
+        if legacy:
+            indexes = self.indexes() if name is None else (self.index(name),)
+        else:
+            indexes = (
+                self.active_indexes()
+                if name is None
+                else (self.active_index(name),)
+            )
         findings: list[IndexFinding] = []
-        for index in (
-            self.active_indexes() if name is None else (self.active_index(name),)
-        ):
+        for index in indexes:
             findings.extend(self._verify_entries(index))
             findings.extend(self._verify_coverage(index))
         return tuple(findings)
@@ -5206,7 +5252,10 @@ class IndexManager:
             # Exact indexes may legally retain a candidate for it, and proximity indexes must
             # never have persisted its reserved birth stamp.
             return ()
-        if definition.entry_key_for(version.values) != entry.key:
+        if (
+            definition.entry_key_for_record(version.record_id, version.values)
+            != entry.key
+        ):
             findings.append(
                 IndexFinding(
                     kind="stale_entry"
@@ -5290,7 +5339,7 @@ class IndexManager:
         for ref, version in self._heap.scan_all(table):
             if is_provisional_csn(version.xmin):
                 continue
-            key = definition.entry_key_for(version.values)
+            key = definition.entry_key_for_record(version.record_id, version.values)
             if key is None:
                 continue
             if (key, ref) in stored:
