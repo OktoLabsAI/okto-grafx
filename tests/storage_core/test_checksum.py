@@ -863,7 +863,9 @@ def test_the_memo_is_keyed_on_the_strong_identity_not_on_the_module_name(
         replayed = counter.calls - proved
 
     assert replayed >= len(CRC32C_ACCEPTANCE_CORPUS), difference
-    assert len(checksum_native._validated_closed_providers) == 2
+    assert len(checksum_native._validated_closed_providers) == 1, (
+        "a replacement occupies the same bounded provider slot"
+    )
 
 
 def test_a_refused_provider_never_enters_the_memo(
@@ -1083,12 +1085,90 @@ def test_replacing_the_provider_function_replays_both_doors_and_a_wrong_one_is_r
         module.extend = wrong
         with pytest.raises(GrafxConfigurationError):
             NativeCrc32c()
-        assert len(checksum_native._validated_closed_providers) == 2
-        assert len(checksum_module._validated_closed_identities) == 2
-        assert all(
-            proved is not wrong
-            for _identity, proved in checksum_module._validated_closed_identities
-        )
+        assert checksum_native._validated_closed_providers == {}
+        assert checksum_module._validated_closed_identities == ()
+
+
+class _EqualitySpoofingProvider:
+    """A correct callable whose equality/hash claim it is every other provider."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, crc: int, data: bytes) -> int:
+        self.calls += 1
+        return crc32c_reference(data, crc)
+
+    def __eq__(self, _other: object) -> bool:
+        return True
+
+    def __hash__(self) -> int:
+        return 1
+
+
+def test_callable_equality_cannot_spoof_either_closed_provider_memo(
+    monkeypatch: pytest.MonkeyPatch, forget_the_memo: None, restore_the_reference: None
+) -> None:
+    """Only ``is`` authenticates the raw callable in both independent proof doors."""
+    from okto_grafx.domain.page import checksum as checksum_module
+
+    first = _EqualitySpoofingProvider()
+    second = _EqualitySpoofingProvider()
+    assert first == second and hash(first) == hash(
+        second
+    )  # prove the adversarial premise
+    module = _fake_google_module(first)
+    adapter_validations = 0
+    domain_validations = 0
+    original_adapter_validation = NativeCrc32c._require_agreement
+    original_domain_validation = checksum_module._validate_candidate
+
+    def count_adapter_validation(adapter: NativeCrc32c) -> None:
+        nonlocal adapter_validations
+        adapter_validations += 1
+        original_adapter_validation(adapter)
+
+    def count_domain_validation(function, name: str) -> None:
+        nonlocal domain_validations
+        domain_validations += 1
+        original_domain_validation(function, name)
+
+    with monkeypatch.context() as patch:
+        _install_fake_google(patch, module)
+        patch.setattr(NativeCrc32c, "_require_agreement", count_adapter_validation)
+        patch.setattr(checksum_module, "_validate_candidate", count_domain_validation)
+        NativeCrc32c().install()
+        module.extend = second
+        NativeCrc32c().install()
+
+    assert adapter_validations == 2
+    assert domain_validations == 2
+    assert len(checksum_native._closed_providers) == 1
+    assert len(checksum_native._validated_closed_providers) == 1
+    assert len(checksum_module._validated_closed_identities) == 1
+    identity, _wrapper = checksum_module._validated_closed_identities[0]
+    assert identity[4] is second
+
+
+def test_repeated_provider_replacement_keeps_both_memos_strictly_bounded(
+    monkeypatch: pytest.MonkeyPatch, forget_the_memo: None, restore_the_reference: None
+) -> None:
+    """Reload churn replaces one slot instead of retaining every historical function."""
+    from okto_grafx.domain.page import checksum as checksum_module
+
+    providers = [_EqualitySpoofingProvider() for _ in range(12)]
+    module = _fake_google_module(providers[0])
+    with monkeypatch.context() as patch:
+        _install_fake_google(patch, module)
+        for provider in providers:
+            module.extend = provider
+            NativeCrc32c().install()
+            assert len(checksum_native._closed_providers) == 1
+            assert len(checksum_native._validated_closed_providers) == 1
+            assert len(checksum_module._validated_closed_identities) == 1
+
+    identity, _wrapper = checksum_module._validated_closed_identities[0]
+    assert identity[4] is providers[-1]
 
 
 def test_an_injected_provider_never_inherits_the_installer_memo(
@@ -1122,24 +1202,46 @@ def test_a_memo_identity_that_is_not_a_tuple_is_refused_by_the_door() -> None:
 
 
 def test_concurrent_constructions_share_one_proof_and_one_wrapper(
-    monkeypatch: pytest.MonkeyPatch, forget_the_memo: None
+    monkeypatch: pytest.MonkeyPatch,
+    forget_the_memo: None,
+    restore_the_reference: None,
 ) -> None:
     import threading
+
+    from okto_grafx.domain.page import checksum as checksum_module
 
     module = _fake_google_module(_ProviderCounter().extend)
     adapters: list[NativeCrc32c] = []
     failures: list[BaseException] = []
     gate = threading.Barrier(4)
+    adapter_validations = 0
+    domain_validations = 0
+    original_adapter_validation = NativeCrc32c._require_agreement
+    original_domain_validation = checksum_module._validate_candidate
+
+    def count_adapter_validation(adapter: NativeCrc32c) -> None:
+        nonlocal adapter_validations
+        adapter_validations += 1
+        original_adapter_validation(adapter)
+
+    def count_domain_validation(function, name: str) -> None:
+        nonlocal domain_validations
+        domain_validations += 1
+        original_domain_validation(function, name)
 
     def construct() -> None:
         try:
             gate.wait(timeout=10)
-            adapters.append(NativeCrc32c())
+            adapter = NativeCrc32c()
+            adapter.install()
+            adapters.append(adapter)
         except BaseException as failure:  # pragma: no cover - reported below
             failures.append(failure)
 
     with monkeypatch.context() as patch:
         _install_fake_google(patch, module)
+        patch.setattr(NativeCrc32c, "_require_agreement", count_adapter_validation)
+        patch.setattr(checksum_module, "_validate_candidate", count_domain_validation)
         threads = [threading.Thread(target=construct) for _ in range(4)]
         for thread in threads:
             thread.start()
@@ -1150,6 +1252,10 @@ def test_concurrent_constructions_share_one_proof_and_one_wrapper(
     assert len(adapters) == 4
     assert len({id(adapter._provider) for adapter in adapters}) == 1
     assert checksum_native.validated_closed_providers() == ("google_crc32c",)
+    assert adapter_validations == 1, "the adapter corpus runs once under contention"
+    assert domain_validations == 1, (
+        "the independent domain corpus runs once under contention"
+    )
     assert all(adapter.checksum(b"123456789") == 0xE3069283 for adapter in adapters)
 
 

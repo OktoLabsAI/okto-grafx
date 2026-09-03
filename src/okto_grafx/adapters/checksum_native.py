@@ -40,19 +40,23 @@ and an explicit ``verify_runtime=True`` keep their per-construction and per-call
 untouched. The domain's installer door keeps its own, independent proof: the adapter hands it
 the same strong identity explicitly, and it too skips the replay only for the exact wrapper
 it already proved -- so a second ``connect()`` over the same provider costs no corpus in
-either door, while a replaced function, an injected callable or a refusal proves again.
+either door, while a replaced function, an injected callable or a refusal proves again. Both
+memos hold at most one current identity per closed module/attribute slot. A process-local
+adapter guard serializes lookup, proof and publication; the pure domain imports no mechanism.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from importlib import import_module
+from threading import RLock
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxError
 from okto_grafx.domain.page.checksum import (
     CRC32C_ACCEPTANCE_CORPUS,
     CRC32C_INITIAL,
     CRC32C_KNOWN_ANSWERS,
+    _forget_closed_proof,
     _install_validated_crc32c,
     _require_crc32c_agreement,
     _require_crc32c_answer,
@@ -137,6 +141,22 @@ def _closed_provider_identity(
     )
 
 
+_ClosedProviderIdentity = tuple[str, str, str | None, str | None, object]
+_ClosedProviderSlot = tuple[str, str]
+
+
+def _closed_slot(identity: _ClosedProviderIdentity) -> _ClosedProviderSlot:
+    """Return the fixed module/attribute slot occupied by a closed provider."""
+    return identity[0], identity[1]
+
+
+def _same_closed_identity(
+    left: _ClosedProviderIdentity, right: _ClosedProviderIdentity
+) -> bool:
+    """Compare metadata by value and the raw provider strictly by object identity."""
+    return left[:4] == right[:4] and left[4] is right[4]
+
+
 class _ClosedProvider:
     """A closed-list provider adapted to ``(data, crc) -> int`` that knows its identity.
 
@@ -171,41 +191,52 @@ class _ClosedProvider:
         return f"_ClosedProvider(module_name={self.module_name!r})"
 
 
-_closed_providers: dict[
-    tuple[str, str, str | None, str | None, object], _ClosedProvider
-] = {}
-"""One adapted wrapper per strong identity, so the same provider is the same object.
+_closed_provider_lock = RLock()
+"""Serializes closed-provider lookup, both corpus proofs and their bounded publication.
 
-``load_provider`` hands the cached wrapper back while module, attribute, origin, version and
-the raw function object are all unchanged; any of them changing yields a new wrapper. The
-domain door memoizes by identity AND by the exact callable it proved, so this cache is what
-lets a second ``connect()`` skip the corpus there as well. Bounded like the memo below.
+The mechanism lives in the adapter, not the pure domain (G2). The private domain memo door is
+entered only while this guard is held, so a concurrent first construction/installation has one
+loader and one successful proof in each layer.
 """
 
-_validated_closed_providers: dict[
-    tuple[str, str, str | None, str | None, object], str
-] = {}
-"""Closed-list provider identities this process has already proved against the corpus.
+_closed_providers: dict[_ClosedProviderSlot, _ClosedProvider] = {}
+"""The current adapted wrapper for each closed-list module/attribute slot.
+
+``load_provider`` hands the cached wrapper back while module, attribute, origin, version and
+the raw function object are all unchanged; any of them changing REPLACES the slot and evicts
+both obsolete proofs. Its size is therefore bounded by ``len(CRC32C_PROVIDERS)`` even across
+arbitrarily many module reloads.
+"""
+
+_validated_closed_providers: dict[_ClosedProviderSlot, _ClosedProvider] = {}
+"""Current closed-list wrappers this adapter has already proved against the corpus.
 
 Only a SUCCESSFUL proof is recorded, only for a provider ``load_provider`` resolved (never an
 injected callable) and only when runtime verification resolved off. A refusal records
-nothing, so the next construction proves again. The dictionary is bounded by the closed
-provider list times the distinct builds one process can load, which is a handful.
+nothing, so the next construction proves again. One entry per fixed provider slot is a hard
+bound; raw callable identity is tested with ``is`` and never delegated to its equality/hash.
 """
 
 
 def validated_closed_providers() -> tuple[str, ...]:
     """Return the closed-list providers this process has memoized, in first-proved order."""
-    return tuple(dict.fromkeys(_validated_closed_providers.values()))
+    with _closed_provider_lock:
+        return tuple(
+            dict.fromkeys(
+                provider.module_name
+                for provider in _validated_closed_providers.values()
+            )
+        )
 
 
 def _forget_validated_closed_providers() -> None:
     """Drop every memoized proof and cached wrapper so the corpus is replayed (tests)."""
     from okto_grafx.domain.page.checksum import _forget_closed_proofs
 
-    _validated_closed_providers.clear()
-    _closed_providers.clear()
-    _forget_closed_proofs()
+    with _closed_provider_lock:
+        _validated_closed_providers.clear()
+        _closed_providers.clear()
+        _forget_closed_proofs()
 
 
 def load_provider() -> tuple[str, Callable[[bytes, int], int]]:
@@ -223,11 +254,16 @@ def load_provider() -> tuple[str, Callable[[bytes, int], int]]:
         if function is None:
             continue
         identity = _closed_provider_identity(module_name, attribute, module, function)
-        cached = _closed_providers.get(identity)
-        if cached is None:
-            cached = _ClosedProvider(module_name, attribute, module, function)
-            _closed_providers[identity] = cached
-        return module_name, cached
+        slot = _closed_slot(identity)
+        with _closed_provider_lock:
+            cached = _closed_providers.get(slot)
+            if cached is None or not _same_closed_identity(cached.identity, identity):
+                if cached is not None:
+                    _validated_closed_providers.pop(slot, None)
+                    _forget_closed_proof(slot)
+                cached = _ClosedProvider(module_name, attribute, module, function)
+                _closed_providers[slot] = cached
+            return module_name, cached
     wanted = ", ".join(name for name, _attribute in CRC32C_PROVIDERS)
     raise ImportError(
         f"No native CRC-32C provider is installed. Install the [accel] extra, which brings one "
@@ -282,11 +318,28 @@ class NativeCrc32c:
         verify_answers = (
             provider is not None if verify_runtime is None else verify_runtime
         )
-        identity: tuple[str, str, str | None, str | None, object] | None = None
-        if provider is None:
+        identity: _ClosedProviderIdentity | None = None
+        if provider is None and not verify_answers:
+            # Keep lookup, proof decision, full proof and publication in one critical section.
+            # ``load_provider`` re-enters this RLock. Without the outer guard, a concurrent
+            # reload could replace the slot between lookup and proof publication, letting an
+            # obsolete identity displace the current one.
+            with _closed_provider_lock:
+                resolved_name, resolved = load_provider()
+                if isinstance(resolved, _ClosedProvider):
+                    identity = resolved.identity
+                    self._provider = resolved
+                    self._provider_name = resolved_name
+                    self._verify_runtime = False
+                    self._memo_identity = identity
+                    slot = _closed_slot(identity)
+                    if _validated_closed_providers.get(slot) is resolved:
+                        return
+                    self._require_agreement()
+                    _validated_closed_providers[slot] = resolved
+                    return
+        elif provider is None:
             resolved_name, resolved = load_provider()
-            if isinstance(resolved, _ClosedProvider):
-                identity = resolved.identity
         else:
             if not callable(provider):
                 observed = _builtin_type_name(provider)
@@ -315,15 +368,8 @@ class NativeCrc32c:
         self._provider: Callable[[bytes, int], int] = resolved
         self._provider_name: str = resolved_name
         self._verify_runtime: bool = verify_answers
-        memo_key = identity if not verify_answers else None
-        self._memo_identity = memo_key
-        if memo_key is not None and memo_key in _validated_closed_providers:
-            # Proved earlier in this process over this exact function object; the corpus
-            # answer cannot have changed underneath the same identity.
-            return
+        self._memo_identity = identity if not verify_answers else None
         self._require_agreement()
-        if memo_key is not None:
-            _validated_closed_providers[memo_key] = resolved_name
 
     def _raw_answer(self, data: bytes, crc: int) -> int:
         """Call the provider and return an exact bounded checksum or a typed refusal."""
@@ -430,10 +476,25 @@ class NativeCrc32c:
         exact wrapper already passed under it (D-29); an injected provider never carries one.
         """
         if not self._verify_runtime:
+            if self._memo_identity is not None:
+                with _closed_provider_lock:
+                    slot = _closed_slot(self._memo_identity)
+                    current = _closed_providers.get(slot)
+                    # A previously constructed adapter remains safe to install after a module
+                    # reload, but it must prove again without displacing the proof for the new
+                    # current identity in this slot.
+                    memo_identity = (
+                        self._memo_identity if current is self._provider else None
+                    )
+                    return _install_validated_crc32c(
+                        self._provider,
+                        name=NATIVE_ADAPTER_NAME,
+                        memo_identity=memo_identity,
+                    )
             return _install_validated_crc32c(
                 self._provider,
                 name=NATIVE_ADAPTER_NAME,
-                memo_identity=self._memo_identity,
+                memo_identity=None,
             )
         return install_crc32c(self._provider, name=NATIVE_ADAPTER_NAME)
 

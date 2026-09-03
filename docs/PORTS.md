@@ -284,7 +284,13 @@ provider and an explicit `verify_runtime=True` are never memoized: they keep the
 proof and the per-call oracle. The domain's installer door keeps an independent memo of its own:
 the adapter names the same strong identity explicitly, and the door skips its replay only for the
 exact wrapper it already proved -- an injected callable never names an identity, so `install_crc32c`
-and the closed-list door prove it every time, as before.
+and the closed-list door prove it every time, as before. Both proof stores are strictly bounded to
+one current identity per closed module/attribute slot; a replacement evicts the old wrapper and
+both old proofs. Raw function identity is compared with `is`, never its equality or hash hooks.
+A process-local lock in the adapter serializes closed-provider lookup, validation and publication,
+including the private domain door; the pure domain remains free of threading mechanisms. Thus
+concurrent first opens run the corpus exactly once in each independent door, while a failure is
+never published or inherited by another opener.
 
 **One consequence a caller should know:** two databases in one process do not get independent
 checksum implementations. `connect(a, checksum="pure")` followed by `connect(b)` leaves both on
