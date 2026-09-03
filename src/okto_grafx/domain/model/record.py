@@ -184,7 +184,25 @@ class RecordHeader:
     @classmethod
     def decode(cls, raw: bytes) -> RecordHeader:
         """Parse the first 40 bytes of a slot payload into a record header."""
-        return cls._from_peek(cls.peek(raw))
+        if len(raw) < RECORD_HEADER_SIZE:
+            raise GrafxCorruptionDetected(
+                f"A record header needs {RECORD_HEADER_SIZE} bytes; got {len(raw)}.",
+                field="record_header",
+                value=len(raw),
+            )
+        flags, reserved, schema_version, payload_len, record_id, xmin, xmax, prev = (
+            _HEADER_STRUCT.unpack_from(raw, 0)
+        )
+        return cls(
+            record_id=record_id,
+            xmin=xmin,
+            xmax=xmax,
+            prev_version=prev,
+            payload_len=payload_len,
+            schema_version=schema_version,
+            flags=flags,
+            reserved=reserved,
+        )
 
 
 @dataclass(frozen=True, slots=True)
