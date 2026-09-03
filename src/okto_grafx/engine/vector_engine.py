@@ -461,25 +461,24 @@ class _GraphSnapshot:
     walk (then the picture is ahead of its mark, which costs one rebuild) or not (then the mark
     says so). The maps are mutated in place by the warm path, under the same
     discipline as the graph -- an entry is registered before its node becomes reachable -- and a
-    search that captured this picture keeps every part of it for as long as it runs.
+    search that captured this picture keeps every part of it for as long as it runs.  The derived
+    planner count is deliberately separate: only the graph guard reads or writes it.
     """
 
     graph: HnswGraph
-    node_of_ref: dict[int, int]
+    node_of_entry: dict[tuple[bytes, int], int]
     entry_of_node: dict[int, IndexEntry]
     record_of_node: dict[int, RecordId]
     mark: Lsn
-    live_count: int
 
     def certified(self, mark: Lsn) -> _GraphSnapshot:
         """Return this same picture -- same graph, same maps -- carrying a newer mark."""
         return _GraphSnapshot(
             graph=self.graph,
-            node_of_ref=self.node_of_ref,
+            node_of_entry=self.node_of_entry,
             entry_of_node=self.entry_of_node,
             record_of_node=self.record_of_node,
             mark=mark,
-            live_count=self.live_count,
         )
 
 
@@ -710,9 +709,6 @@ class VectorHnswIndex(ProximityIndex):
                     and self._live_count_generation is self._graph_generation
                 ):
                     return self._live_count, mark, self._graph_generation
-                picture = self._snapshot
-                if picture is not None and picture.mark == mark:
-                    return picture.live_count, mark, self._graph_generation
                 generation = self._graph_generation
             # No pool or store operation occurs while the graph guard is held.
             return (
@@ -927,18 +923,15 @@ class VectorHnswIndex(ProximityIndex):
                 neighbours=self._neighbours,
                 ef_construction=self._ef_construction,
             ),
-            node_of_ref={},
+            node_of_entry={},
             entry_of_node={},
             record_of_node={},
             mark=mark,
-            live_count=0,
         )
         for entry in sorted(
             self.walk(), key=lambda item: (item.born_csn, item.ref.encode())
         ):
             self._install(picture, entry)
-            if entry.live:
-                object.__setattr__(picture, "live_count", picture.live_count + 1)
         return picture
 
     def _retire(self, picture: _GraphSnapshot) -> None:
@@ -978,15 +971,15 @@ class VectorHnswIndex(ProximityIndex):
         refusal inside ``graph.insert`` can leave the graph half-linked and a half-linked graph
         is discarded, never repaired.
         """
-        encoded = entry.ref.encode()
-        node = picture.node_of_ref.get(encoded)
+        identity = (entry.key, entry.ref.encode())
+        node = picture.node_of_entry.get(identity)
         if node is not None:
             picture.entry_of_node[node] = entry
             return
-        self._install_fresh(picture, entry, encoded)
+        self._install_fresh(picture, entry, identity)
 
     def _install_fresh(
-        self, picture: _GraphSnapshot, entry: IndexEntry, encoded: int
+        self, picture: _GraphSnapshot, entry: IndexEntry, identity: tuple[bytes, int]
     ) -> None:
         """Resolve, check and insert one entry that the picture does not hold yet."""
         try:
@@ -1029,19 +1022,16 @@ class VectorHnswIndex(ProximityIndex):
         entries[node] = entry
         picture.record_of_node[node] = record_id
         picture.graph.insert(node, components)
-        picture.node_of_ref[encoded] = node
+        picture.node_of_entry[identity] = node
 
     def _adjust_live_count(self, picture: _GraphSnapshot, delta: int) -> None:
-        """Apply one already-proved warm change to its picture and count cache."""
-        next_count = picture.live_count + delta
-        if next_count < 0:
-            raise GrafxIndexError(
-                f"Index {self.name!r} derived a negative live count.",
-                field="live_count",
-                index=self.name,
-                file=self.file,
-            )
-        object.__setattr__(picture, "live_count", next_count)
+        """Apply one exact warm entry delta to the separately guarded count cache.
+
+        ``_note`` calls this only after locating the exact durable entry
+        identity, ``(key, ref)``.  The graph/maps retain their established
+        warm-path publication discipline; this scalar is never stored in that
+        mutable picture and never read or written outside the graph guard.
+        """
         with self._guard:
             if (
                 self._snapshot is picture
@@ -1049,20 +1039,31 @@ class VectorHnswIndex(ProximityIndex):
                 and self._live_count_mark == picture.mark
                 and self._live_count_generation is self._graph_generation
             ):
+                next_count = self._live_count + delta
+                if next_count < 0:
+                    raise GrafxIndexError(
+                        f"Index {self.name!r} derived a negative live count.",
+                        field="live_count",
+                        index=self.name,
+                        file=self.file,
+                    )
                 self._live_count = next_count
 
     def _note(self, picture: _GraphSnapshot, change: IndexChange) -> bool:
-        """Bring one published picture in line with one applied change; say whether it survived.
+        """Bring a warm picture in line with one proven durable entry change.
 
-        Returns False when the change retired the picture -- a RESET, a removal, or a refusal on
-        the way in -- so the caller stops noting into a picture nobody can reach any more and,
-        above all, does not certify it.
+        The index manager is intentionally idempotent: a duplicate INSERT or
+        a TOMBSTONE whose target is absent reports no failure at its durable
+        door.  A ref alone is not an entry identity, so every warm lookup uses
+        the pair the paged store uses, ``(key, ref)``.  Consequently a key
+        mismatch is a no-op here too, while the same ref under a second key
+        becomes a distinct graph node and increments the guarded count.
         """
         if change.operation is IndexOperation.RESET:
             self._retire(picture)
             return False
-        encoded = change.ref.encode()
-        node = picture.node_of_ref.get(encoded)
+        identity = (change.key, change.ref.encode())
+        node = picture.node_of_entry.get(identity)
         if change.operation is IndexOperation.INSERT:
             if node is None:
                 try:
@@ -1076,10 +1077,6 @@ class VectorHnswIndex(ProximityIndex):
                         ),
                     )
                 except BaseException:
-                    # EVERY refusal on the way into the graph discards the picture, not only
-                    # the late one inside graph.insert: the two early refusals used to re-raise
-                    # with the graph intact, and a search then answered out of a graph missing
-                    # the row (C9 round-2 B4: five nodes, live_count six, stale False).
                     self._retire(picture)
                     raise
                 self._adjust_live_count(picture, 1)
@@ -1092,10 +1089,8 @@ class VectorHnswIndex(ProximityIndex):
             if previous.live:
                 self._adjust_live_count(picture, -1)
             return True
-        # A removal mutates the graph's neighbour lists and unlinks a node; done in place under
-        # a traversal on another thread, that traversal can step onto a node that is no longer
-        # there. Derived state is discarded rather than edited, and rebuilt on the next search
-        # (a reconcile pass removes many entries in one go and pays one rebuild for all of them).
+        # A physical removal mutates graph links, so it remains a whole-picture
+        # retirement and the next planner recounts from the durable entries.
         self._retire(picture)
         return False
 

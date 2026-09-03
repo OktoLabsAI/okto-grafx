@@ -175,6 +175,8 @@ def test_a_warm_planner_uses_the_exact_live_count_without_an_entry_walk(
     decoded = [0]
     original_plan = vector_engine_module.plan_regime
     original_decode = IndexEntry.decode.__func__
+    original_build = type(index)._build
+    builds = [0]
 
     def record_plan(*, space_size: int, filter_cardinality: int | None, threshold: int):
         planned_sizes.append(space_size)
@@ -188,8 +190,13 @@ def test_a_warm_planner_uses_the_exact_live_count_without_an_entry_walk(
         decoded[0] += 1
         return original_decode(cls, raw)
 
+    def count_build(self, mark: int):
+        builds[0] += 1
+        return original_build(self, mark)
+
     monkeypatch.setattr(vector_engine_module, "plan_regime", record_plan)
     monkeypatch.setattr(IndexEntry, "decode", classmethod(count_decode))
+    monkeypatch.setattr(type(index), "_build", count_build)
     result = database.engine.search(
         space="space", query=corpus[1], k=5, snapshot=SnapshotDouble(1000)
     )
@@ -198,9 +205,10 @@ def test_a_warm_planner_uses_the_exact_live_count_without_an_entry_walk(
     assert planned_sizes == [oracle]
     assert decoded == [0]
 
-    # A local INSERT and TOMBSTONE may update the warm picture, but they must
-    # update its exact count in the same step.  The oracle remains the durable
-    # walk; the patched decoder proves planning did not perform that walk.
+    # A local INSERT and TOMBSTONE update the warm picture and the separately
+    # guarded exact count only after matching the durable ``(key, ref)``.
+    # The durable walk remains the oracle; the patched decoder proves planning
+    # did not perform that walk.
     table = database.table
     assert table is not None
     space = database.catalog_store.catalog.space("space")
@@ -212,6 +220,7 @@ def test_a_warm_planner_uses_the_exact_live_count_without_an_entry_walk(
     )
     assert planned_sizes[-1] == after_insert
     assert decoded == [0]
+    assert builds == [0]
 
     database.delete_row(table, added, 999, space, corpus[2], csn=1000)
     after_tombstone = sum(1 for entry in index.walk() if entry.live)
@@ -221,6 +230,7 @@ def test_a_warm_planner_uses_the_exact_live_count_without_an_entry_walk(
     )
     assert planned_sizes[-1] == after_tombstone
     assert decoded == [0]
+    assert builds == [0]
 
 
 def test_the_two_regime_labels_are_the_bounded_domain_of_the_metric_label() -> None:
