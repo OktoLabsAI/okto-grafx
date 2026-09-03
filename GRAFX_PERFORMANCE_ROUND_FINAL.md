@@ -351,5 +351,8 @@ O consenso não autoriza mudança de formato, redução das garantias concorrent
 | 2026-09-02 | versão de desenvolvimento | concluído | `pyproject.toml`, pacote e README em `0.0.2`; testes pontuais de packaging/CLI verdes |
 | 2026-09-03 | P0.1 — H5 e relevância para o Pulse | concluído | reprodução multiprocesso e correção de page 0 promovidas em `7a9414c`, `e8c3583`, `cef70db`; auditoria estática independente do Pulse `d50c034` confirmou que o backfill não chama `rebuild_vector_index` e não alcança a cerca process-local remanescente (`hof_5278e93d6f09409cbce04bbbcbe787f1`, verificada pelo Codex) |
 | 2026-09-03 | P1.1 — D-26 | desenvolvido, não promovido | instrumentação e testes focados publicados em `perf/v002-d26-commit-metrics` / `5abfd396ea352eb4eac9e20902d4ab55f0bc8898`; medição P0.4 e decisão de promoção permanecem pendentes |
+| 2026-09-03 | P1.2 — D-01 | desenvolvido, não promovido | header peek sem dataclass para versões rejeitadas em `perf/v002-d01-header-peek` / `1239a0e519295b9f2b127d88d3155c7fdd352daf`; suíte focada de heap e Ruff verdes |
+| 2026-09-03 | P1.3 — D-04 | desenvolvido, não promovido | versão já validada reutilizada no caminho de índice em `perf/v002-d04-index-version` / `e898fe766b29e61c867b44679a5f0f1e77b724d9`; suíte focada de primary-key index e Ruff verdes |
+| 2026-09-03 | P1.4 — D-02 | diferido para P2-ID | o protótipo cauda-primeiro ocultou uma duplicata corrupta visível no início da cadeia; sem prova de unicidade/min-max, promovê-lo enfraqueceria a recusa de corrupção exigida pelo plano |
 
 Esta seção registra somente fatos concluídos. Resultados P1 não serão promovidos antes do restante de P0 e do fechamento de H5, conforme a seção 6.
