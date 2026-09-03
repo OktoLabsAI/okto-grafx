@@ -736,6 +736,48 @@ def test_frame_memory_error_removes_the_load_and_wakes_a_same_key_waiter(
     pool.unpin(FILE, 0, page=pages[0])
 
 
+def test_post_write_epoch_failure_releases_both_flights_and_keeps_change_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful dirty write cannot strand tickets if its target rebase fails."""
+    device = MemoryDevice()
+    codec = stored_pages(device, 2)
+    pool, _guard = concurrent_pool(
+        device, budget_pages=1, metrics=RecordingMetrics(enabled=False)
+    )
+    dirty = pool.pin(FILE, 0)
+    dirty.insert_slot(b"published-before-rebase-failure")
+    pool.unpin(FILE, 0, dirty=True, page=dirty)
+    real_load_epoch = BufferPool._load_epoch
+    expected = MemoryError("injected post-write epoch allocation failure")
+    calls = 0
+
+    def fail_the_rebase(self: BufferPool, file: str) -> tuple[int, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise expected
+        return real_load_epoch(self, file)
+
+    monkeypatch.setattr(BufferPool, "_load_epoch", fail_the_rebase)
+
+    with pytest.raises(MemoryError) as raised:
+        pool.pin(FILE, 1)
+
+    assert raised.value is expected
+    assert pool._loads == {}
+    assert pool._evictions == {}
+    assert not pool.is_resident(FILE, 0)
+    assert (FILE, 0) in pool.modified_pages()
+    written = codec.decode_page(device.raw_page(FILE, 0), verify=True)
+    assert written.read_slot(1) == b"published-before-rebase-failure"
+
+    # The failed target reservation owns no capacity and a subsequent cold pin progresses.
+    target = pool.pin(FILE, 1)
+    assert target.read_slot(0) == b"page-1"
+    pool.unpin(FILE, 1, page=target)
+
+
 def test_page_fence_waits_for_detached_eviction_before_taking_its_section() -> None:
     device = BlockingWriteDevice()
     stored_pages(device, 2)

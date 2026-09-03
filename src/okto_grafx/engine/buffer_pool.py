@@ -894,6 +894,13 @@ class BufferPool:
                         budget_failure = self._budget_failure(file, page_index)
                     else:
                         victim_frame = self._frames[victim]
+                        if victim_frame.page.dirty:
+                            # Reserve the durable-change evidence before the frame leaves the
+                            # authoritative table.  ``set.add`` may allocate; failing here keeps
+                            # the dirty frame resident.  Once publication succeeds, settlement
+                            # can be exception-safe without risking that a successfully written
+                            # page disappears from ``modified_pages()``.
+                            self._modified.add(victim)
                         prepared_load = _PageLoad(owner, self._load_epoch(file))
                         prepared_eviction = (
                             _PageEviction(owner, victim_frame)
@@ -2123,13 +2130,36 @@ class BufferPool:
 
         with self._guard:
             if self._evictions.get(key) is eviction:
-                self._remember_write_back(file, page_index)
+                try:
+                    self._remember_write_back(file, page_index, key=key)
+                    target_epoch = (
+                        self._load_epoch(target_key[0])
+                        if self._loads.get(target_key) is load
+                        else None
+                    )
+                except BaseException as failure:
+                    # The page publication already succeeded.  Its modified marker was reserved
+                    # before detachment, so abandon only the target admission and release every
+                    # waiter.  A retry may read the target afresh; no dirty work or flight remains
+                    # stranded behind this bookkeeping failure.
+                    del self._evictions[key]
+                    if self._loads.get(target_key) is load:
+                        del self._loads[target_key]
+                    try:
+                        self._signal_flight_state()
+                    except BaseException as signal_failure:
+                        failure.add_note(
+                            "Buffer-flight notification also failed after publication with "
+                            f"{type(signal_failure).__name__}: {signal_failure}"
+                        )
+                    raise
                 del self._evictions[key]
                 if self._loads.get(target_key) is load:
                     # No target bytes have been read yet. Rebase the certificate after the
                     # potentially slow victim write, while preserving an explicit discard's
                     # ``valid=False`` revocation.
-                    load.epoch = self._load_epoch(target_key[0])
+                    assert target_epoch is not None
+                    load.epoch = target_epoch
                 self._signal_flight_state()
 
     def _make_room(self, file: str, page_index: PageIndex) -> None:
@@ -2350,7 +2380,13 @@ class BufferPool:
                 frame.device_base_seq = page.seq
         page.dirty = False
 
-    def _remember_write_back(self, file: str, page_index: PageIndex) -> None:
+    def _remember_write_back(
+        self,
+        file: str,
+        page_index: PageIndex,
+        *,
+        key: tuple[str, PageIndex] | None = None,
+    ) -> None:
         """Settle pool-owned bookkeeping after a page publication has succeeded."""
 
         # Remembered, not forgotten. Clearing the dirty flag is what used to take an evicted
@@ -2362,7 +2398,10 @@ class BufferPool:
         # that had already been reclaimed still standing on the reuse list, where the safety
         # check that put it there is never re-taken, so allocate() would hand out an index whose
         # image was by then real and write a blank page over it.
-        key = (file, page_index)
+        # A detached dirty eviction already owns this tuple. Reusing it avoids making the
+        # successful-publication settlement depend on one more allocation after the device write.
+        if key is None:
+            key = (file, page_index)
         self._grown.discard(key)
         waiting = self._abandoned.get(file)
         if waiting is not None and page_index in waiting:
