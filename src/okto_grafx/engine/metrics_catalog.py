@@ -167,6 +167,32 @@ _QUERY_PHASE = LabelSpec(
 _VIEW_ORIGIN = LabelSpec(
     name="view_origin", allowed_values=frozenset({"own", "foreign"}), max_cardinality=2
 )
+_COMMIT_WINDOW = LabelSpec(
+    name="window",
+    allowed_values=frozenset({"writer_lease", "commit_section"}),
+    max_cardinality=2,
+)
+_COMMIT_INTERVAL = LabelSpec(
+    name="interval", allowed_values=frozenset({"wait", "hold"}), max_cardinality=2
+)
+_COMMIT_PHASE = LabelSpec(
+    name="phase",
+    allowed_values=frozenset(
+        {
+            "other",
+            "occ",
+            "materialize",
+            "build_records",
+            "append",
+            "barrier",
+            "apply",
+            "flush",
+            "index",
+            "publish",
+        }
+    ),
+    max_cardinality=10,
+)
 _ERROR_CODE = LabelSpec(
     name="code",
     allowed_values=frozenset(
@@ -240,6 +266,55 @@ METRIC_CATALOG: tuple[MetricDescriptor, ...] = (
         description="Transactions currently open, by mode.",
         unit="transactions",
         labels=(_MODE,),
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_window_duration_seconds",
+        kind=MetricKind.HISTOGRAM,
+        description="Duration of one write-commit coordination interval, by window and interval.",
+        unit="seconds",
+        labels=(_COMMIT_WINDOW, _COMMIT_INTERVAL),
+        buckets=LATENCY_BUCKETS_SECONDS,
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_phase_duration_seconds",
+        kind=MetricKind.HISTOGRAM,
+        description="Duration of one write-commit phase while the commit section is held.",
+        unit="seconds",
+        labels=(_COMMIT_PHASE,),
+        buckets=LATENCY_BUCKETS_SECONDS,
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_pages_logged_total",
+        kind=MetricKind.COUNTER,
+        description="Page images included in write-commit log batches.",
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_wal_bytes_total",
+        kind=MetricKind.COUNTER,
+        description="Physical bytes added to the live WAL by successful write-commit appends.",
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_frames_examined_total",
+        kind=MetricKind.COUNTER,
+        description=(
+            "Resident and retired-pinned frames traversed by write-commit flush, modified-page, "
+            "and dirty-page scans."
+        ),
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_flushes_total",
+        kind=MetricKind.COUNTER,
+        description="Buffer-pool flush calls executed by write commits.",
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_foreign_commits_total",
+        kind=MetricKind.COUNTER,
+        description="Foreign durable commits completed before a local write commit.",
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_retargets_total",
+        kind=MetricKind.COUNTER,
+        description="Write-commit log batches retargeted after segment planning.",
     ),
     # SPEC-M1 OR-2: durability and write-ahead log
     MetricDescriptor(

@@ -49,6 +49,14 @@ EXPECTED_METRIC_NAMES: frozenset[str] = frozenset(
         "oktografx_write_conflicts_total",
         "oktografx_commit_retries_total",
         "oktografx_active_transactions",
+        "oktografx_commit_window_duration_seconds",
+        "oktografx_commit_phase_duration_seconds",
+        "oktografx_commit_pages_logged_total",
+        "oktografx_commit_wal_bytes_total",
+        "oktografx_commit_frames_examined_total",
+        "oktografx_commit_flushes_total",
+        "oktografx_commit_foreign_commits_total",
+        "oktografx_commit_retargets_total",
         # SPEC-M1 OR-2
         "oktografx_fsync_duration_seconds",
         "oktografx_barrier_failures_total",
@@ -106,6 +114,39 @@ EXPECTED_METRICS: dict[str, tuple[str, str]] = {
     'oktografx_active_transactions': (
         'gauge',
         'Transactions currently open, by mode.',
+    ),
+    'oktografx_commit_window_duration_seconds': (
+        'histogram',
+        'Duration of one write-commit coordination interval, by window and interval.',
+    ),
+    'oktografx_commit_phase_duration_seconds': (
+        'histogram',
+        'Duration of one write-commit phase while the commit section is held.',
+    ),
+    'oktografx_commit_pages_logged_total': (
+        'counter',
+        'Page images included in write-commit log batches.',
+    ),
+    'oktografx_commit_wal_bytes_total': (
+        'counter',
+        'Physical bytes added to the live WAL by successful write-commit appends.',
+    ),
+    'oktografx_commit_frames_examined_total': (
+        'counter',
+        'Resident and retired-pinned frames traversed by write-commit flush, modified-page, and '
+        'dirty-page scans.',
+    ),
+    'oktografx_commit_flushes_total': (
+        'counter',
+        'Buffer-pool flush calls executed by write commits.',
+    ),
+    'oktografx_commit_foreign_commits_total': (
+        'counter',
+        'Foreign durable commits completed before a local write commit.',
+    ),
+    'oktografx_commit_retargets_total': (
+        'counter',
+        'Write-commit log batches retargeted after segment planning.',
     ),
     'oktografx_fsync_duration_seconds': (
         'histogram',
@@ -248,6 +289,8 @@ because only the handful of metrics some test happens to emit were protected inc
 EXPECTED_LABELS: dict[str, tuple[str, ...]] = {
     "oktografx_lease_wait_seconds": ("outcome",),
     "oktografx_active_transactions": ("mode",),
+    "oktografx_commit_window_duration_seconds": ("window", "interval"),
+    "oktografx_commit_phase_duration_seconds": ("phase",),
     "oktografx_fsync_duration_seconds": ("target",),
     "oktografx_wal_truncation_lag_segments": ("reader_present",),
     "oktografx_checksum_verifications_total": ("kind",),
@@ -312,7 +355,7 @@ def test_the_catalog_holds_exactly_the_metrics_the_contract_freezes() -> None:
         "missing": sorted(EXPECTED_METRIC_NAMES - names),
         "unexpected": sorted(names - EXPECTED_METRIC_NAMES),
     }
-    assert len(METRIC_CATALOG) == len(EXPECTED_METRIC_NAMES) == 36
+    assert len(METRIC_CATALOG) == len(EXPECTED_METRIC_NAMES) == 44
 
 
 def test_the_catalog_matches_section_nine_of_the_contract_itself() -> None:

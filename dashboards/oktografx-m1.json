@@ -1358,6 +1358,84 @@
           "range": true
         }
       ]
+    },
+    {
+      "id": 25,
+      "type": "row",
+      "title": "Commit cost (SPEC-M1 OR-1)",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 85},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Commit coordination wait and hold, 95th percentile",
+      "description": "Writer-lease and commit-section wait/hold latency. This distinguishes contention from work performed while exclusive coordination is held.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 86},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, window, interval) (rate(oktografx_commit_window_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{window}} {{interval}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Commit phase duration, 95th percentile",
+      "description": "Per-phase p95 while the commit section is held. The phase samples of each individual commit reconcile with that commit's hold interval; marginal p95 values are not additive.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 86},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, phase) (rate(oktografx_commit_phase_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{phase}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Commit WAL workload",
+      "description": "Rates of page images logged and physical bytes added to the live WAL by commits, including implicit segment headers; use the separate legends because the series have different units.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 94},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": [{"matcher": {"id": "byName", "options": "WAL bytes/s"}, "properties": [{"id": "unit", "value": "Bps"}, {"id": "custom.axisPlacement", "value": "right"}]}]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(oktografx_commit_pages_logged_total[5m]))", "legendFormat": "pages/s", "range": true},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(oktografx_commit_wal_bytes_total[5m]))", "legendFormat": "WAL bytes/s", "range": true}
+      ]
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Commit amplification and coordination work",
+      "description": "Rates of resident and retired-pinned frames examined, flush calls executed, foreign commits completed and WAL batches retargeted by local commits.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 94},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(oktografx_commit_frames_examined_total[5m]))", "legendFormat": "frames/s", "range": true},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(oktografx_commit_flushes_total[5m]))", "legendFormat": "flushes/s", "range": true},
+        {"refId": "C", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(oktografx_commit_foreign_commits_total[5m]))", "legendFormat": "foreign commits/s", "range": true},
+        {"refId": "D", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(oktografx_commit_retargets_total[5m]))", "legendFormat": "retargets/s", "range": true}
+      ]
     }
   ],
   "refresh": "30s",

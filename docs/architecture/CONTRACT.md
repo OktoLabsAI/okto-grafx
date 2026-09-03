@@ -14,7 +14,7 @@ this contract is the single agreed realization of them.
 | ID | Rule | Enforcement |
 |----|------|-------------|
 | G1 | **All product surfaces are en-US**: class names, function names, exception messages, metric names & descriptions, CLI help, docstrings. | Code review + `tests/test_language_surface.py` |
-| G2 | **Hexagonal**: `okto_grafx/domain/**` and `okto_grafx/engine/**` contain NO mechanism. Forbidden: `open()`, `os`, `pathlib` I/O, `mmap`, `socket`, `sys.platform`, `os.name`, `threading`, `time.time`, `time.monotonic`, `random` (unseeded), any third-party import. | `tests/test_import_boundary.py`, budget **ZERO**, fails closed |
+| G2 | **Hexagonal**: `okto_grafx/domain/**` and `okto_grafx/engine/**` contain NO mechanism. Forbidden: `open()`, `os`, `pathlib` I/O, `mmap`, `socket`, `sys.platform`, `os.name`, `threading`, `time.time`, `time.monotonic`, `random` (unseeded), any third-party import. **D-26 diagnostic exception:** only the exact, unaliased import `okto_grafx.engine.txn_manager <- time.perf_counter_ns` is allowed, solely for outcome-neutral commit timings; it never supplies lease/liveness, storage, WAL or visibility decisions. This avoids invoking the host `Clock` under an exclusive window. | `tests/test_import_boundary.py`, budget **ZERO**, fails closed |
 | G2b | **No `random` in the domain.** Anything needing randomness (HNSW level assignment, sampling) uses `okto_grafx.domain.rand.SplitMix64` — an explicitly seeded, deterministic, reproducible PRNG owned by C1. Reproducibility is a spec requirement (seeded interleavings, seeded corpora), not a preference. | `tests/test_import_boundary.py` |
 | G3 | **Pure-Python core, single universal wheel.** Runtime deps: stdlib only. `numpy` only under extra `[accel]`, imported only in `adapters/vectormath_numpy.py`. `ladybug` only under extra `[bench]`. | `pyproject.toml` + import-boundary test |
 | G4 | **Windows and POSIX are equal citizens.** No test may be silently skipped on a family; a family-specific test must be explicitly marked `@pytest.mark.platform_specific` and have a counterpart. **Extended by A32 (runtime observation, not static prediction) and REPLACED in its attribution rule by A54 (three registered markers: `platform_specific` with a family condition + counterpart, `optional_dependency("<module>")`, `pending`/`xfail`).** | `tests/test_platform_parity.py` |
@@ -1237,7 +1237,13 @@ refusal leaves the transaction exactly as it entered the statement.
 
 M1: `oktografx_lease_wait_seconds`{outcome=granted|timeout|takeover} ·
 `oktografx_write_conflicts_total` · `oktografx_commit_retries_total` ·
-`oktografx_active_transactions`{mode=read|write} · `oktografx_fsync_duration_seconds`{target=wal|data} ·
+`oktografx_active_transactions`{mode=read|write} ·
+`oktografx_commit_window_duration_seconds`{window=writer_lease|commit_section,interval=wait|hold} ·
+`oktografx_commit_phase_duration_seconds`{phase=other|occ|materialize|build_records|append|barrier|apply|flush|index|publish} ·
+`oktografx_commit_pages_logged_total` · `oktografx_commit_wal_bytes_total` ·
+`oktografx_commit_frames_examined_total` · `oktografx_commit_flushes_total` ·
+`oktografx_commit_foreign_commits_total` · `oktografx_commit_retargets_total` ·
+`oktografx_fsync_duration_seconds`{target=wal|data} ·
 `oktografx_barrier_failures_total` · `oktografx_read_view_drops_total`{view_origin=own|foreign} ·
 `oktografx_wal_size_bytes` · `oktografx_wal_segments` ·
 `oktografx_wal_truncation_lag_segments`{reader_present=true|false} ·
@@ -1267,6 +1273,26 @@ Query: `oktografx_query_phase_duration_seconds`{phase=parse|plan|execute} ·
 
 `db` and `space` labels carry a **short hash / catalog name**, never a path or free text (TR-7).
 Every metric here MUST appear in a `dashboards/*.json` panel (OR-5/OR-3) — the CI test asserts it.
+
+**D-26 commit-measurement boundary.** The default/public per-commit lease policy emits one local
+trace only after the participant section, writer lease and `COMMIT_SECTION` are all proven
+released. The D-26 trace adds no metrics-sink or host-`Clock` callback inside those windows:
+phase timestamps use the sole G2 diagnostic exception, the exact `time.perf_counter_ns` symbol,
+and never affect a decision or stored byte. A data-only probe is attached to the buffer pool only
+while the participant section is held
+and is detached before the next local commit can enter. It counts executed flush calls and the
+resident/retired-pinned frames traversed by `flush`, `modified_pages` and `has_dirty_pages`.
+`oktografx_commit_wal_bytes_total` is physical live-WAL growth from successful appends, including an
+implicit segment header; `retargets_total` advances only after retargeting completes. A failed timer
+sample discards that trace's duration series rather than stretching a partial interval across
+unwind. If acquiring or releasing an exclusive boundary fails without proving the boundary is
+free, the whole trace is suppressed before any host callback. Counters remain outcome-neutral.
+
+The private `retain_lease=True` policy intentionally emits none of the D-26 per-commit family. Its
+lease survives the operation, so there is no post-lease sink boundary from which a complete trace
+can be delivered without violating A91. This is an observability limitation of that explicitly
+unsafe/internal performance mode, not a change to its lease semantics; existing coordinator lease
+metrics remain available.
 
 ---
 

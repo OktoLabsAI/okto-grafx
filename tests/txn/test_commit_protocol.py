@@ -915,6 +915,14 @@ def test_the_manager_registers_only_names_from_the_frozen_catalog(stack: Stack) 
         "oktografx_write_conflicts_total",
         "oktografx_commit_retries_total",
         "oktografx_active_transactions",
+        "oktografx_commit_window_duration_seconds",
+        "oktografx_commit_phase_duration_seconds",
+        "oktografx_commit_pages_logged_total",
+        "oktografx_commit_wal_bytes_total",
+        "oktografx_commit_frames_examined_total",
+        "oktografx_commit_flushes_total",
+        "oktografx_commit_foreign_commits_total",
+        "oktografx_commit_retargets_total",
     }
     assert names <= {descriptor.name for descriptor in stack.metrics.registered}
 

@@ -261,6 +261,26 @@ class _Frame:
         )
 
 
+class _BufferWorkProbe:
+    """Data-only accounting for buffer scans during one instrumented commit.
+
+    The probe contains no sink and invokes no callback. A pool only holds it while an enabled
+    commit trace is active, so the default no-op path allocates nothing.
+    """
+
+    __slots__ = ("flushes", "frames_examined")
+
+    def __init__(self) -> None:
+        self.flushes: int = 0
+        self.frames_examined: int = 0
+
+    def record_scan(self, frames: int, *, flush: bool = False) -> None:
+        """Account for one complete resident-frame scan."""
+        self.frames_examined += frames
+        if flush:
+            self.flushes += 1
+
+
 def _guarded(method: Callable[..., object]) -> Callable[..., object]:
     """Run one pool door under the pool's guard.
 
@@ -313,6 +333,7 @@ class BufferPool:
         "_grown",
         "_abandoned",
         "_modified",
+        "_work_probe",
     )
 
     def __init__(
@@ -356,6 +377,7 @@ class BufferPool:
         # Pages written back since the last forget_modified(), so an eviction cannot take a page
         # out of the answer modified_pages() gives. See that method.
         self._modified: set[tuple[str, PageIndex]] = set()
+        self._work_probe: _BufferWorkProbe | None = None
         self._budget_bytes: int = _validate_budget(budget_bytes, self._page_size)
         self._db_label: str = _validate_db_label(db_label)
         self._frames: OrderedDict[tuple[str, PageIndex], _Frame] = OrderedDict()
@@ -475,6 +497,20 @@ class BufferPool:
     def used_bytes(self) -> int:
         """Return the bytes currently resident in this pool."""
         return len(self._frames) * self._page_size
+
+    @_guarded
+    def _attach_work_probe(self, probe: _BufferWorkProbe) -> bool:
+        """Attach one trusted commit-work probe, or decline a nested measurement."""
+        if self._work_probe is not None:
+            return False
+        self._work_probe = probe
+        return True
+
+    @_guarded
+    def _detach_work_probe(self, probe: _BufferWorkProbe) -> None:
+        """Detach ``probe`` if it is still the pool's current measurement."""
+        if self._work_probe is probe:
+            self._work_probe = None
 
     @_guarded
     def is_resident(self, file: str, page_index: PageIndex) -> bool:
@@ -727,6 +763,12 @@ class BufferPool:
         deliberately does not barrier the data files (CONTRACT.md section 8.5 step 6). The path
         that does want them on the platter is checkpoint().
         """
+        probe = self._work_probe
+        if probe is not None:
+            try:
+                probe.record_scan(len(self._frames), flush=True)
+            except BaseException:  # noqa: BLE001 - diagnostics never own buffer progress
+                self._work_probe = None
         written = 0
         for (name, page_index), frame in list(self._frames.items()):
             if file is not None and name != file:
@@ -766,6 +808,12 @@ class BufferPool:
 
         The set is a snapshot, not a view: the frames go on changing after it is returned.
         """
+        probe = self._work_probe
+        if probe is not None:
+            try:
+                probe.record_scan(len(self._frames))
+            except BaseException:  # noqa: BLE001 - diagnostics never own buffer progress
+                self._work_probe = None
         live = {key for key, frame in self._frames.items() if frame.page.dirty}
         return frozenset(
             key for key in (live | self._modified) if file is None or key[0] == file
@@ -774,6 +822,31 @@ class BufferPool:
     @_guarded
     def has_dirty_pages(self, file: str | None = None) -> bool:
         """Say whether resident or doomed frames still hold unpublished local changes."""
+        probe = self._work_probe
+        if probe is not None:
+            examined = 0
+            for (name, _page_index), frame in self._frames.items():
+                examined += 1
+                if frame.page.dirty and (file is None or name == file):
+                    try:
+                        probe.record_scan(examined)
+                    except BaseException:  # noqa: BLE001 - diagnostics never own progress
+                        self._work_probe = None
+                    return True
+            for (name, _page_index), frames in self._doomed.items():
+                for frame in frames:
+                    examined += 1
+                    if frame.page.dirty and (file is None or name == file):
+                        try:
+                            probe.record_scan(examined)
+                        except BaseException:  # noqa: BLE001 - diagnostics never own progress
+                            self._work_probe = None
+                        return True
+            try:
+                probe.record_scan(examined)
+            except BaseException:  # noqa: BLE001 - diagnostics never own buffer progress
+                self._work_probe = None
+            return False
         if any(
             frame.page.dirty and (file is None or name == file)
             for (name, _page_index), frame in self._frames.items()
