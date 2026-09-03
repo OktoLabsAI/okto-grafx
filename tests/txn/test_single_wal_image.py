@@ -115,6 +115,7 @@ def test_a_page_copy_carries_every_field_and_shares_nothing(page_size: int) -> N
         assert clone._reserved == page._reserved, label
         assert clone.free_start == page.free_start, label
         assert clone.to_bytes() == before, label
+        assert clone.dirty == page.dirty, label  # a copy, not a clean re-read
         assert clone._data is not page._data and clone._slots is not page._slots, label
         # Mutate the copy in every way the commit path or a later caller could.
         clone.page_lsn = 999_999
@@ -241,8 +242,13 @@ class _DecodeCounter:
                     counter.local_decodes += 1
                 elif region == "committed":
                     counter.committed_decodes += 1
-                elif region == "retarget" and bytes(raw) in counter._retarget_images:
-                    counter.retarget_image_decodes += 1
+                if (
+                    "retarget" in counter._region
+                    and bytes(raw) in counter._retarget_images
+                ):
+                    counter.retarget_image_decodes += (
+                        1  # wherever in the retarget it happens
+                    )
             return decode(codec_self, raw, *args, **kwargs)
 
         def in_local(manager_self: object, *args: object, **kwargs: object) -> object:
@@ -354,6 +360,62 @@ def test_a_locally_materialised_page_is_decoded_only_by_the_apply_after_the_barr
             database.execute("MATCH (p:Person) RETURN p.name").rows
             and not database.verify("all").findings
         )
+
+
+def test_the_materialised_page_cache_is_attempt_local(stack: Stack) -> None:
+    """No page value survives the attempt that produced it, and no other attempt may use one.
+
+    The cache is bound to (txn id, materialised CSN). A retarget with a different txn or a
+    different old_csn -- or with no attempt at all -- verifies the bytes instead of reusing
+    a value, and every path ends with the cache cleared.
+    """
+    from okto_grafx.domain.wal.record import WalRecordType as _Type
+    from okto_grafx.engine.txn_manager import _MaterializedAttempt
+
+    txn = stack.manager.begin("write")
+    txn.owner._stage_page_image(
+        txn, HEAP, 4, make_page_image(stack.codec, [b"attempt"], page_index=4)
+    )
+    txn.note_write(stack.manager.partition_of(1, b"attempt"))
+    with _DecodeCounter(stack.codec, stack.manager):
+        report = stack.manager.commit(txn)
+    assert report.durable is True
+    assert stack.manager._materialized is None  # cleared once the batch was final
+
+    # A stale value planted for another txn / CSN is never reused by a retarget.
+    image = make_page_image(stack.codec, [b"foreign"], page_index=6)
+    planted = stack.codec.decode_page(image, verify=True)
+    planted.page_lsn = 999  # would be visible in the logged bytes if it were reused
+    other = stack.manager.begin("write")
+
+    class _Commit:
+        record_type = int(_Type.COMMIT)
+        epoch = 1
+
+    for txn_id, csn, expect_decodes in (
+        (int(other.txn_id) + 1, 10, 1),  # another transaction
+        (int(other.txn_id), 11, 1),  # this transaction, another materialisation
+        (int(other.txn_id), 10, 0),  # exactly this attempt: reused, no decode
+    ):
+        stack.manager._materialized = _MaterializedAttempt(
+            txn_id=txn_id, csn=csn, pages={(HEAP, 6): planted.copy()}
+        )
+        with _DecodeCounter(stack.codec, stack.manager) as counter:
+            _records, corrected = stack.manager._retarget_commit_batch(
+                other,
+                [object(), _Commit()],  # one WRITE_PAGE placeholder + the COMMIT
+                [(HEAP, 6, image)],
+                (),
+                old_csn=10,
+                new_csn=12,
+                epoch=1,
+            )
+        assert counter.retarget_image_decodes == expect_decodes, (txn_id, csn)
+        assert counter.committed_calls == expect_decodes, (txn_id, csn)
+        assert stack.manager._materialized is None
+        stamped = stack.codec.decode_page(corrected[0][2], verify=True)
+        assert stamped.page_lsn == (999 if expect_decodes == 0 else 12)
+    stack.manager.rollback(other)
 
 
 def test_a_pre_staged_image_is_verified_once_and_applied_once(stack: Stack) -> None:

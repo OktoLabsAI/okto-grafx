@@ -441,8 +441,9 @@ class Page:
         The commit path stamps the predicted commit number into a copy of the resident frame
         and encodes that copy once; the frame itself must stay provisional until the WAL
         barrier returns, so nothing may be shared: the slot directory and the payload buffer
-        are duplicated, and the identity, header fields and reserved word are carried whole.
-        ``to_bytes`` of the copy is byte-identical to ``to_bytes`` of the original.
+        are duplicated, and the identity, header fields, reserved word and dirty flag are
+        carried whole -- it is a copy, not a clean re-read. ``to_bytes`` of the copy is
+        byte-identical to ``to_bytes`` of the original.
         """
         clone = Page.__new__(Page)
         clone._page_size = self._page_size
@@ -456,7 +457,7 @@ class Page:
         clone._slots = list(self._slots)
         clone._data = bytearray(self._data)
         clone._free_start = self._free_start
-        clone._dirty = False
+        clone._dirty = self._dirty
         return clone
 
     # --- serialisation --------------------------------------------------------------------
