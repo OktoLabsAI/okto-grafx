@@ -33,7 +33,13 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.index.definition import (
     IndexDefinition,
+    automatic_index_definitions,
     index_definition_matches_table,
+)
+from okto_grafx.domain.index.catalog import (
+    CatalogIndexDefinition,
+    IndexGenerationDescriptor,
+    IndexGenerationState,
 )
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.header import INDEX_HEADER_SLOT, IndexHeader
@@ -99,6 +105,7 @@ from okto_grafx.domain.query.plan import (
     AllNodesScan,
     MAX_PLAN_DEPTH,
     AggregateRows,
+    CreateIndex,
     CreateNodeTable,
     CreatedNode,
     CreatedRelationship,
@@ -549,6 +556,36 @@ class IndexView:
     built_through_lsn: int | None
     reconciled_through_lsn: int | None
     missing_targets: int
+    columns: tuple[str, ...] = ()
+    automatic: bool | None = None
+    generation_state: str | None = None
+    active_nonce: int | None = None
+    expected_cardinality: int | None = None
+
+    @property
+    def table_id(self) -> int:
+        """Return the committed table id covered by this index."""
+        return self.definition.table_id
+
+    @property
+    def table_name(self) -> str:
+        """Return the committed table name covered by this index."""
+        return self.definition.table_name
+
+    @property
+    def positions(self) -> tuple[int, ...]:
+        """Return key positions in their declared compound-key order."""
+        return self.definition.positions
+
+    @property
+    def key_derivation(self) -> str:
+        """Return the stable key-derivation contract."""
+        return self.definition.key_derivation
+
+    @property
+    def bucket_count(self) -> int:
+        """Return the active physical generation's bucket count."""
+        return self.definition.bucket_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -2197,6 +2234,7 @@ _QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
     {
         AggregateRows,
         AllNodesScan,
+        CreateIndex,
         CreateNodeTable,
         CreateRelationships,
         CreateRelTable,
@@ -3669,13 +3707,35 @@ def _transactions_view(
     )
 
 
-def _index_view(index: Any, definition: IndexDefinition | None = None) -> IndexView:
-    """Snapshot one registered index without retaining its store or faulting a page in."""
+def _index_view(
+    index: Any,
+    definition: IndexDefinition | None = None,
+    *,
+    table: TableDef | None = None,
+    automatic: bool | None = None,
+    generation_state: str | None = None,
+    expected_cardinality: int | None = None,
+    certified_header: IndexHeader | None = None,
+) -> IndexView:
+    """Snapshot one index, using an optional already-certified header without retaining it."""
     definition = (
         _index_definition(index.definition) if definition is None else definition
     )
     file = _builtin_text(definition.file, field="index.file", empty=False)
-    built_through, reconciled_through = _resident_index_positions(index, file)
+    if certified_header is None:
+        built_through, reconciled_through = _resident_index_positions(index, file)
+    else:
+        header = _domain_value(
+            certified_header, IndexHeader, field="index.certified_header"
+        )
+        built_through = _builtin_int(
+            _domain_field(header, IndexHeader, "built_through_lsn"),
+            field="index.built_through_lsn",
+        )
+        reconciled_through = _builtin_int(
+            _domain_field(header, IndexHeader, "reconciled_through_lsn"),
+            field="index.reconciled_through_lsn",
+        )
     return IndexView(
         _builtin_text(definition.name, field="index.name", empty=False),
         file,
@@ -3686,6 +3746,115 @@ def _index_view(index: Any, definition: IndexDefinition | None = None) -> IndexV
         built_through,
         reconciled_through,
         _builtin_int(index.missing_targets),
+        (
+            ()
+            if table is None
+            else tuple(
+                _builtin_text(
+                    table.columns[position].name,
+                    field="index.columns",
+                    empty=False,
+                )
+                for position in definition.positions
+            )
+        ),
+        None if automatic is None else _builtin_bool(automatic),
+        (
+            None
+            if generation_state is None
+            else _builtin_text(
+                generation_state,
+                field="index.generation_state",
+                empty=False,
+            )
+        ),
+        (
+            None
+            if definition.artifact_nonce == 0
+            else _builtin_int(definition.artifact_nonce)
+        ),
+        (
+            None
+            if expected_cardinality is None
+            else _builtin_int(expected_cardinality)
+        ),
+    )
+
+
+def _index_generation_descriptor(value: Any) -> IndexGenerationDescriptor:
+    """Rebuild one catalog generation without dispatching through a subclass."""
+    value = _domain_value(
+        value, IndexGenerationDescriptor, field="index.generation"
+    )
+    return IndexGenerationDescriptor(
+        artifact_nonce=_builtin_int(
+            _domain_field(value, IndexGenerationDescriptor, "artifact_nonce")
+        ),
+        bucket_count=_builtin_int(
+            _domain_field(value, IndexGenerationDescriptor, "bucket_count")
+        ),
+        state=_string_enum(
+            _domain_field(value, IndexGenerationDescriptor, "state"),
+            IndexGenerationState,
+            field="index.generation.state",
+        ),
+    )
+
+
+def _catalog_index_definition(value: Any) -> CatalogIndexDefinition:
+    """Detach one logical catalog index and all of its physical generations."""
+    value = _domain_value(
+        value, CatalogIndexDefinition, field="catalog.index_definition"
+    )
+    raw_expected = _domain_field(
+        value, CatalogIndexDefinition, "expected_cardinality"
+    )
+    return CatalogIndexDefinition(
+        name=_builtin_text(
+            _domain_field(value, CatalogIndexDefinition, "name"),
+            field="index.name",
+            empty=False,
+        ),
+        table_id=_builtin_int(
+            _domain_field(value, CatalogIndexDefinition, "table_id")
+        ),
+        table_name=_builtin_text(
+            _domain_field(value, CatalogIndexDefinition, "table_name"),
+            field="index.table_name",
+            empty=False,
+        ),
+        positions=tuple(
+            _builtin_int(position)
+            for position in _tuple_items(
+                _domain_field(value, CatalogIndexDefinition, "positions"),
+                field="index.positions",
+            )
+        ),
+        visibility=_string_enum(
+            _domain_field(value, CatalogIndexDefinition, "visibility"),
+            IndexVisibility,
+            field="index.visibility",
+        ),
+        key_derivation=_builtin_text(
+            _domain_field(value, CatalogIndexDefinition, "key_derivation"),
+            field="index.key_derivation",
+            empty=False,
+        ),
+        automatic=_builtin_bool(
+            _domain_field(value, CatalogIndexDefinition, "automatic")
+        ),
+        expected_cardinality=(
+            None
+            if raw_expected is None
+            else _builtin_int(raw_expected, field="index.expected_cardinality")
+        ),
+        generations=tuple(
+            _index_generation_descriptor(generation)
+            for generation in _tuple_items(
+                _domain_field(value, CatalogIndexDefinition, "generations"),
+                field="index.generations",
+            )
+        ),
     )
 
 
@@ -3694,6 +3863,7 @@ def _indexes_view(
     tables: Sequence[TableDef],
     *,
     catalog: Catalog | None = None,
+    certified_headers: dict[str, IndexHeader] | None = None,
 ) -> IndexRegistryView:
     """Snapshot only registrations selected by the committed catalog authority.
 
@@ -3717,14 +3887,38 @@ def _indexes_view(
             _builtin_bytes(indexes._heap.catalog._persisted_image)
         )
     catalog_managed = authority.format_version != CATALOG_LEGACY_FORMAT_VERSION
-    expected_by_key = (
-        {
-            definition.registry_key: _index_definition(definition)
-            for definition in Catalog.active_index_definitions(authority)
-        }
+    # Detach logical definitions before deriving either registry keys or runtime generations.
+    # A CatalogIndexDefinition subclass can override ``registry_key`` or
+    # ``active_generation``; a public observation must never execute those callbacks.  Calling
+    # the base Catalog method alone is insufficient because it delegates back into each stored
+    # definition.  Exact reconstructed values make every derivation below ordinary domain code.
+    logical_definitions = (
+        tuple(
+            _catalog_index_definition(definition)
+            for definition in Catalog.index_definitions(authority)
+        )
         if catalog_managed
-        else {}
+        else ()
     )
+    logical_by_key = {
+        definition.name.lower(): definition for definition in logical_definitions
+    }
+    expected_by_key: dict[str, IndexDefinition] = {}
+    for logical in logical_definitions:
+        generation = CatalogIndexDefinition.active_generation(logical)
+        if generation is not None:
+            expected_by_key[logical.name.lower()] = (
+                CatalogIndexDefinition.runtime_definition(logical, generation)
+            )
+    # Catalog v2 persists exact indexes but deliberately leaves proximity/vector definitions
+    # schema-derived.  Preserve that second authority without asking a raw logical definition
+    # to execute anything.
+    for table in tables:
+        for specialized in automatic_index_definitions(table):
+            if specialized.visibility is IndexVisibility.PROXIMITY:
+                expected_by_key[specialized.registry_key] = _index_definition(
+                    specialized
+                )
     by_identity = {(table.table_id, table.name): table for table in tables}
     captured: list[IndexView] = []
     for index in indexes.indexes():
@@ -3743,7 +3937,31 @@ def _indexes_view(
             and table is not None
             and index_definition_matches_table(definition, table)
         ):
-            captured.append(_index_view(index, definition))
+            logical = logical_by_key.get(definition.registry_key)
+            generation = (
+                None
+                if logical is None
+                else CatalogIndexDefinition.active_generation(logical)
+            )
+            captured.append(
+                _index_view(
+                    index,
+                    definition,
+                    table=table,
+                    automatic=None if logical is None else logical.automatic,
+                    generation_state=(
+                        None if generation is None else generation.state.value
+                    ),
+                    expected_cardinality=(
+                        None if logical is None else logical.expected_cardinality
+                    ),
+                    certified_header=(
+                        None
+                        if certified_headers is None
+                        else dict.get(certified_headers, definition.registry_key)
+                    ),
+                )
+            )
     return IndexRegistryView(
         tuple(captured),
         _builtin_int(indexes.published_lsn),

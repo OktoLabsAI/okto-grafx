@@ -67,6 +67,7 @@ from okto_grafx.domain.ports.vectormath import VectorMath
 from okto_grafx.domain.query.ast import Query as QueryStatement
 from okto_grafx.domain.query.limits import (
     DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+    MAX_COLUMN_DEFINITIONS,
     MAX_MAP_ENTRIES,
     MAX_QUERY_VALUE_CHARACTERS,
 )
@@ -95,6 +96,7 @@ from okto_grafx.engine.public_views import (
     ComponentView,
     CoordinatorView,
     HeapStoreView,
+    IndexView,
     IndexRegistryView,
     LedgerView,
     MaintenanceStatus,
@@ -239,6 +241,54 @@ _UUID_BYTES: int = 16
 def _require_text(field: str, value: object) -> str:
     """Return the value as a non-empty string, or refuse with the field named."""
     return _builtin_text(value, field=field, empty=False)
+
+
+def _index_columns_snapshot(columns: object) -> tuple[str, ...]:
+    """Detach one bounded ordered column sequence before entering engine coordination."""
+    if issubclass(type(columns), (str, bytes, bytearray, memoryview)):
+        raise GrafxConfigurationError(
+            "Index columns must be a sequence of column names, not a scalar string or buffer.",
+            field="columns",
+            value=_builtin_type_name(columns),
+        )
+    if not isinstance(columns, Sequence):
+        raise GrafxConfigurationError(
+            "Index columns must be an ordered sequence of column names.",
+            field="columns",
+            value=_builtin_type_name(columns),
+        )
+    try:
+        if issubclass(type(columns), tuple):
+            iterator = tuple.__iter__(columns)
+        elif issubclass(type(columns), list):
+            iterator = list.__iter__(columns)
+        else:
+            iterator = iter(columns)  # type: ignore[arg-type]
+        detached: list[str] = []
+        for column in iterator:
+            detached.append(_builtin_text(column, field="columns", empty=False))
+            if len(detached) > MAX_COLUMN_DEFINITIONS:
+                raise GrafxConfigurationError(
+                    f"An index may name at most {MAX_COLUMN_DEFINITIONS} columns.",
+                    field="columns",
+                    value=len(detached),
+                    maximum=MAX_COLUMN_DEFINITIONS,
+                )
+    except GrafxError:
+        raise
+    except (TypeError, ValueError, OverflowError) as failure:
+        raise GrafxConfigurationError(
+            "Index columns must be an iterable of column names.",
+            field="columns",
+            value=_builtin_type_name(columns),
+        ) from failure
+    if not detached:
+        raise GrafxConfigurationError(
+            "An exact index must name at least one column.",
+            field="columns",
+            value=0,
+        )
+    return tuple(detached)
 
 
 def _note_cleanup_failure(primary: BaseException, cleanup: BaseException) -> None:
@@ -1312,6 +1362,24 @@ class Maintenance:
     def ensure_identity_indexes(self) -> None:
         """Delegate explicit persistent identity-index activation to the database."""
         self._database.ensure_identity_indexes()
+
+    def create_index(
+        self,
+        name: str,
+        table: str,
+        columns: Sequence[str],
+        *,
+        bucket_count: int | None = None,
+        expected_cardinality: int | None = None,
+    ) -> IndexView:
+        """Delegate custom exact-index creation to the database."""
+        return self._database.create_index(
+            name,
+            table,
+            columns,
+            bucket_count=bucket_count,
+            expected_cardinality=expected_cardinality,
+        )
 
     def publish_metrics(self) -> None:
         """Delegate explicit metric publication to :meth:`Database.publish_metrics`."""
@@ -2594,6 +2662,82 @@ class Database:
 
     # --- operator surface ---------------------------------------------------------------------
 
+    def create_index(
+        self,
+        name: str,
+        table: str,
+        columns: Sequence[str],
+        *,
+        bucket_count: int | None = None,
+        expected_cardinality: int | None = None,
+    ) -> IndexView:
+        """Create and atomically publish one custom exact index.
+
+        The operation owns a fresh, dedicated write transaction. ``bucket_count`` selects the
+        physical directory directly; ``expected_cardinality`` lets Grafx derive it. Supplying
+        both is refused by the same planner used by textual ``CREATE INDEX``.
+        """
+        with self._public_operation("create_index"):
+            self._require_open()
+            self._require_writable("create an exact index")
+            self._require_component(
+                "indexes", self._indexes, "the index framework (C7)"
+            )
+            engine = self._require_component(
+                "queries", self._queries, "the query engine (C10)"
+            )
+            creator = getattr(engine, "create_index", None)
+            if not callable(creator):
+                raise GrafxUnsupportedOperation(
+                    "The query engine of this composition has no custom exact-index door.",
+                    field="component",
+                    value="create_index",
+                )
+
+            wanted_name = _require_text("name", name)
+            wanted_table = _require_text("table", table)
+            wanted_columns = _index_columns_snapshot(columns)
+            wanted_bucket_count = (
+                None
+                if bucket_count is None
+                else _require_positive_integer("bucket_count", bucket_count)
+            )
+            wanted_expected_cardinality = (
+                None
+                if expected_cardinality is None
+                else _require_positive_integer(
+                    "expected_cardinality", expected_cardinality
+                )
+            )
+
+            transaction = self.begin("write")
+            try:
+                with self._transactions.page_access_section():
+                    self._require_open()
+                    transaction._require_active()
+                    self._public_contexts.setdefault(
+                        transaction.txn_id, transaction._context
+                    )
+                    creator(
+                        name=wanted_name,
+                        table=wanted_table,
+                        columns=wanted_columns,
+                        bucket_count=wanted_bucket_count,
+                        expected_cardinality=wanted_expected_cardinality,
+                        txn=transaction._context,
+                    )
+                transaction.commit()
+            except BaseException as failure:
+                if transaction.active:
+                    try:
+                        transaction.rollback()
+                    except BaseException as cleanup_failure:
+                        _note_cleanup_failure(failure, cleanup_failure)
+                raise
+
+            self._refresh_index_inventory()
+            return self._committed_index_receipt(wanted_name)
+
     def verify(self, scope: str = "all") -> VerificationReport:
         """Walk the database and report every finding, precisely located (SPEC-M1 FR-11).
 
@@ -2642,20 +2786,68 @@ class Database:
                         _note_cleanup_failure(failure, cleanup_failure)
                 raise
 
-            manager = self._indexes
-            active_indexes = getattr(manager, "active_indexes", None)
-            if callable(active_indexes):
-                active = tuple(active_indexes(catalog=self._catalog.catalog))
-                self._attached_indexes = tuple(
-                    _builtin_text(index.name, field="attached_index", empty=False)
-                    for index in active
-                )
-                self._stale_indexes = tuple(
-                    _builtin_text(index.name, field="stale_index", empty=False)
-                    for index in active
-                    if index.stale
-                )
+            self._refresh_index_inventory()
             return None
+
+    def _refresh_index_inventory(self) -> None:
+        """Refresh cached operational names from the committed catalog authority."""
+        manager = self._indexes
+        active_indexes = getattr(manager, "active_indexes", None)
+        if callable(active_indexes):
+            active = tuple(active_indexes(catalog=self._catalog.catalog))
+            self._attached_indexes = tuple(
+                _builtin_text(index.name, field="attached_index", empty=False)
+                for index in active
+            )
+            self._stale_indexes = tuple(
+                _builtin_text(index.name, field="stale_index", empty=False)
+                for index in active
+                if index.stale
+            )
+
+    def _committed_index_receipt(self, name: str) -> IndexView:
+        """Return one ACTIVE view with page-zero horizons certified after its commit."""
+        manager = self._require_component(
+            "indexes", self._indexes, "the index framework (C7)"
+        )
+        active_index = getattr(manager, "active_index", None)
+        if not callable(active_index):
+            raise GrafxUnsupportedOperation(
+                "The index framework cannot resolve committed catalog authority.",
+                field="component",
+                value="active_index",
+            )
+        # Establish freshness before capturing the catalog epoch. Doing it inside the loop's
+        # validation section can itself advance that epoch and turn a successful local commit
+        # into an endless optimistic retry.
+        with self._transactions.page_access_section(fresh_read_view=True):
+            pass
+        while True:
+            catalog, epoch = self._catalog_snapshot()
+            authority = self._catalog._catalog
+            tables = catalog.catalog.table_definitions
+            with self._transactions.page_access_section():
+                if (
+                    _builtin_int(self._catalog._view_epoch(), field="catalog.epoch")
+                    != epoch
+                ):
+                    continue
+                selected = active_index(name, catalog=authority)
+                # The freshness boundary above rebased clean frames to current publication;
+                # open now validates digest, visibility and physical generation nonce.
+                header = selected.open()
+                if (
+                    _builtin_int(self._catalog._view_epoch(), field="catalog.epoch")
+                    != epoch
+                ):
+                    continue
+                receipt = _indexes_view(
+                    manager,
+                    tables,
+                    catalog=authority,
+                    certified_headers={name.lower(): header},
+                )
+            return receipt.index(name)
 
     def rebuild_vector_index(self, space: str) -> VectorIndexView:
         """Re-derive one vector index from the heap, and report it only once it is healthy.

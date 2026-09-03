@@ -46,6 +46,7 @@ __all__ = [
     "MAX_PLAN_DEPTH",
     "AggregateRows",
     "AllNodesScan",
+    "CreateIndex",
     "CreateNodeTable",
     "CreateRelTable",
     "CreateRelationships",
@@ -855,6 +856,27 @@ class DeleteEntities(PlanNode):
 
 
 # --- schema ---------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CreateIndex(PlanNode):
+    """Build and publish one custom exact index over a committed node table."""
+
+    name: str
+    table: TableDef
+    positions: tuple[int, ...]
+    bucket_count: int
+    expected_cardinality: int | None
+
+    def details(self) -> Mapping[str, object]:
+        """Return the fully resolved logical definition and sizing intent."""
+        return {
+            "index": self.name,
+            "table": self.table.name,
+            "positions": ", ".join(str(position) for position in self.positions),
+            "bucket_count": self.bucket_count,
+            "expected_cardinality": self.expected_cardinality or "none",
+        }
 
 
 @dataclass(frozen=True, slots=True)

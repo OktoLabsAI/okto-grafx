@@ -43,6 +43,19 @@ _STALE = "stale_by_name"
 _ROGUE = "process_local_rogue"
 
 
+class _HostileLogicalDefinition(CatalogIndexDefinition):
+    """Layout-compatible value whose virtual metadata doors must never be dispatched."""
+
+    __slots__ = ()
+
+    @property
+    def registry_key(self) -> str:
+        raise RuntimeError("hostile registry_key executed")
+
+    def active_generation(self) -> IndexGenerationDescriptor | None:
+        raise RuntimeError("hostile active_generation executed")
+
+
 @dataclass(frozen=True, slots=True)
 class _AuthorityScenario:
     """One persisted authority plus deliberately broader process-local state."""
@@ -235,6 +248,66 @@ def test_public_inventory_exposes_only_active_and_preserves_its_physical_nonce(
     assert inventory.registered[0].file == "index/g_00000000000a11ce.idx"
 
 
+def test_public_inventory_reports_detached_logical_and_generation_metadata(
+    authority_scenario: _AuthorityScenario,
+) -> None:
+    scenario = authority_scenario
+
+    view = _indexes_view(
+        scenario.manager,
+        scenario.catalog.catalog.tables(),
+    ).index(_ACTIVE)
+
+    assert view.table_id == scenario.table.table_id
+    assert view.table_name == "Person"
+    assert view.columns == ("name",)
+    assert view.positions == (1,)
+    assert view.key_derivation == "columns"
+    assert view.automatic is False
+    assert view.generation_state == "active"
+    assert view.active_nonce == scenario.active_nonce
+    assert view.bucket_count == 4
+    assert view.expected_cardinality is None
+
+
+def test_public_inventory_never_dispatches_through_a_hostile_logical_definition(
+    authority_scenario: _AuthorityScenario,
+) -> None:
+    scenario = authority_scenario
+    logical = scenario.catalog.catalog.index_definition(_ACTIVE)
+    object.__setattr__(logical, "__class__", _HostileLogicalDefinition)
+
+    view = _indexes_view(
+        scenario.manager,
+        scenario.catalog.catalog.tables(),
+    ).index(_ACTIVE)
+
+    assert type(view.definition) is not _HostileLogicalDefinition
+    assert view.name == _ACTIVE
+    assert view.generation_state == "active"
+
+
+def test_catalog_v2_inventory_preserves_schema_derived_vector_indexes(
+    tmp_path: Path,
+) -> None:
+    with okto_grafx.connect(tmp_path / "vector-v2", page_size=512) as database:
+        with database.begin("write") as schema:
+            schema.execute("CREATE VECTOR SPACE s {dimension: 2, metric: 'cosine'}")
+            schema.execute(
+                "CREATE NODE TABLE V(id INT64, embedding VECTOR(s), PRIMARY KEY(id))"
+            )
+
+        assert "vector_V_s" in {
+            index.name for index in database.indexes.registered
+        }
+        database.ensure_identity_indexes()
+        vector = database.indexes.index("vector_V_s")
+
+        assert vector.visibility is IndexVisibility.PROXIMITY
+        assert vector.automatic is None
+        assert vector.generation_state is None
+
+
 def test_own_schema_transaction_resolves_primary_key_through_its_working_catalog(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -244,7 +317,13 @@ def test_own_schema_transaction_resolves_primary_key_through_its_working_catalog
     observations: list[tuple[str, bool, bool]] = []
     original = query_engine_module._catalog_active_index
 
-    def recording(manager: object, name: str, catalog: Catalog) -> object | None:
+    def recording(
+        manager: object,
+        name: str,
+        catalog: Catalog,
+        *,
+        txn: object | None = None,
+    ) -> object | None:
         live = manager._heap.catalog.catalog  # type: ignore[attr-defined]
         observations.append(
             (
@@ -253,7 +332,7 @@ def test_own_schema_transaction_resolves_primary_key_through_its_working_catalog
                 live.has_table("Fresh"),
             )
         )
-        return original(manager, name, catalog)
+        return original(manager, name, catalog, txn=txn)
 
     monkeypatch.setattr(query_engine_module, "_catalog_active_index", recording)
     with okto_grafx.connect(tmp_path / "db", page_size=512) as database:
@@ -296,9 +375,15 @@ def test_endpoint_bypass_resolves_its_store_through_catalog_authority(
         selected: list[str] = []
         original = query_engine_module._catalog_active_index
 
-        def recording(manager: object, name: str, catalog: Catalog) -> object | None:
+        def recording(
+            manager: object,
+            name: str,
+            catalog: Catalog,
+            *,
+            txn: object | None = None,
+        ) -> object | None:
             selected.append(name)
-            return original(manager, name, catalog)
+            return original(manager, name, catalog, txn=txn)
 
         monkeypatch.setattr(query_engine_module, "_catalog_active_index", recording)
 

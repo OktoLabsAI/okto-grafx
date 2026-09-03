@@ -29,6 +29,7 @@ from okto_grafx.domain.errors import GrafxParseError, GrafxPlanError
 from okto_grafx.domain.query.ast import (
     CaseExpression,
     CreateClause,
+    CreateIndexStatement,
     CreateNodeTableStatement,
     CreateRelTableStatement,
     CreateVectorSpaceStatement,
@@ -934,7 +935,12 @@ def analyze(statement: Statement) -> QueryAnalysis:
     """Return what a statement means, refusing one that parses but cannot be answered."""
     if isinstance(
         statement,
-        (CreateNodeTableStatement, CreateRelTableStatement, CreateVectorSpaceStatement),
+        (
+            CreateIndexStatement,
+            CreateNodeTableStatement,
+            CreateRelTableStatement,
+            CreateVectorSpaceStatement,
+        ),
     ):
         return QueryAnalysis(
             statement=statement, parameters=_parameters_of_schema(statement)

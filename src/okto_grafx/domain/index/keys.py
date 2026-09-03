@@ -33,6 +33,7 @@ __all__ = [
     "MIN_BUCKET_COUNT",
     "RECORD_ID_KEY_FORMAT_VERSION",
     "bucket_of",
+    "custom_index_sizing",
     "identity_index_sizing",
     "index_key",
     "record_id_key",
@@ -71,6 +72,14 @@ _FIRST_RECORD_ID: int = 1
 _EXHAUSTED_RECORD_ID: int = 0xFFFFFFFFFFFFFFFF
 
 
+def _bucket_count_for_expected(expected_cardinality: int) -> int:
+    """Resolve one already-validated expected count by the single P2-ID formula."""
+    required = (
+        expected_cardinality + _TARGET_ENTRIES_PER_BUCKET - 1
+    ) // _TARGET_ENTRIES_PER_BUCKET
+    return validate_bucket_count(1 << (required - 1).bit_length())
+
+
 def validate_bucket_count(bucket_count: object) -> int:
     """Return the bucket count when it is a usable one, else refuse it."""
     if isinstance(bucket_count, bool) or not isinstance(bucket_count, int):
@@ -87,6 +96,50 @@ def validate_bucket_count(bucket_count: object) -> int:
             value=bucket_count,
         )
     return bucket_count
+
+
+def custom_index_sizing(
+    *,
+    bucket_count: object | None = None,
+    expected_cardinality: object | None = None,
+) -> tuple[int, int | None]:
+    """Return ``(bucket_count, expected_cardinality)`` for a custom exact index.
+
+    The two hints are alternatives: a bucket count chooses the physical directory exactly,
+    while an expected cardinality records the caller's sizing intent and deterministically
+    derives the next power-of-two directory at sixty-four expected entries per bucket.  The
+    eager directory has a finite bound, so no value is silently capped.
+    """
+
+    if bucket_count is not None and expected_cardinality is not None:
+        raise GrafxIndexError(
+            "Index sizing accepts either bucket_count or expected_cardinality, not both.",
+            field="sizing",
+            bucket_count=repr(bucket_count),
+            expected_cardinality=repr(expected_cardinality),
+        )
+    if bucket_count is not None:
+        return validate_bucket_count(bucket_count), None
+    if expected_cardinality is None:
+        return DEFAULT_BUCKET_COUNT, None
+    if isinstance(expected_cardinality, bool) or not isinstance(
+        expected_cardinality, int
+    ):
+        raise GrafxIndexError(
+            "An expected cardinality must be a positive integer; "
+            f"got {type(expected_cardinality).__name__}.",
+            field="expected_cardinality",
+            value=repr(expected_cardinality),
+        )
+    if not 1 <= expected_cardinality <= MAX_EXPECTED_CARDINALITY:
+        raise GrafxIndexError(
+            "An expected cardinality must fit the eager hash-directory limit "
+            f"1..{MAX_EXPECTED_CARDINALITY}; got {expected_cardinality}.",
+            field="expected_cardinality",
+            value=expected_cardinality,
+            max_expected_cardinality=MAX_EXPECTED_CARDINALITY,
+        )
+    return _bucket_count_for_expected(expected_cardinality), expected_cardinality
 
 
 def identity_index_sizing(visible_rows: object) -> tuple[int, int]:
@@ -125,13 +178,7 @@ def identity_index_sizing(visible_rows: object) -> tuple[int, int]:
             max_expected_cardinality=MAX_EXPECTED_CARDINALITY,
         )
 
-    required = max(
-        MIN_BUCKET_COUNT,
-        (expected + _TARGET_ENTRIES_PER_BUCKET - 1)
-        // _TARGET_ENTRIES_PER_BUCKET,
-    )
-    bucket_count = 1 << (required - 1).bit_length()
-    return expected, validate_bucket_count(bucket_count)
+    return expected, _bucket_count_for_expected(expected)
 
 
 def index_key(values: Sequence[Value], positions: Sequence[int]) -> bytes:

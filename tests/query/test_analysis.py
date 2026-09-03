@@ -555,3 +555,13 @@ def test_a_schema_statement_analyses_to_an_empty_analysis() -> None:
     assert found.bindings == ()
     assert found.parameters == ()
     assert found.aggregated is False
+
+
+def test_a_custom_index_statement_is_parameter_free_schema_work() -> None:
+    found = analysis_of(
+        "CREATE INDEX by_name FOR (p:Person) ON (p.name) "
+        "OPTIONS expected_cardinality = 4096"
+    )
+    assert found.bindings == ()
+    assert found.parameters == ()
+    assert found.aggregated is False

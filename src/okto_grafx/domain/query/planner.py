@@ -36,11 +36,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 
 from okto_grafx.domain.errors import GrafxEmbeddingSpaceMismatch, GrafxPlanError
+from okto_grafx.domain.index.catalog import CatalogIndexDefinition
 from okto_grafx.domain.index.definition import (
     COLUMN_KEY_DERIVATION,
     IndexDefinition,
+    automatic_index_definitions,
     index_definition_matches_table,
 )
+from okto_grafx.domain.index.keys import custom_index_sizing
+from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import VECTOR_DTYPES, ValueType, value_type_of
@@ -63,6 +67,7 @@ from okto_grafx.domain.query.ast import (
     CaseExpression,
     ColumnSpec,
     CreateClause,
+    CreateIndexStatement,
     CreateNodeTableStatement,
     CreateRelTableStatement,
     CreateVectorSpaceStatement,
@@ -101,6 +106,7 @@ from okto_grafx.domain.query.plan import (
     AllNodesScan,
     CreatedNode,
     CreatedRelationship,
+    CreateIndex,
     CreateNodeTable,
     CreateRelationships,
     CreateRelTable,
@@ -511,6 +517,8 @@ class _Planner:
 
     def run(self, statement: Statement) -> PlannedQuery:
         """Plan whichever kind of statement this is."""
+        if isinstance(statement, CreateIndexStatement):
+            return self._planned(self._index(statement), writes=True)
         if isinstance(statement, CreateNodeTableStatement):
             return self._planned(self._node_table(statement), writes=True)
         if isinstance(statement, CreateRelTableStatement):
@@ -996,6 +1004,63 @@ class _Planner:
         )
 
     # --- schema ------------------------------------------------------------------------------
+
+    def _index(self, statement: CreateIndexStatement) -> PlanNode:
+        """Resolve a custom exact index against one committed node table."""
+        table = self._table_named(statement.table, "table")
+        if table.kind != "node":
+            raise GrafxPlanError(
+                f"A custom index is declared on a node table; {table.name!r} is a "
+                f"{table.kind} table.",
+                field="table",
+                value=table.name,
+            )
+        bucket_count, expected_cardinality = custom_index_sizing(
+            bucket_count=statement.bucket_count,
+            expected_cardinality=statement.expected_cardinality,
+        )
+        definition = IndexDefinition.on(
+            table,
+            name=statement.name,
+            columns=statement.columns,
+            visibility=IndexVisibility.EXACT,
+            bucket_count=bucket_count,
+        )
+        logical = CatalogIndexDefinition(
+            name=definition.name,
+            table_id=definition.table_id,
+            table_name=definition.table_name,
+            positions=definition.positions,
+            visibility=definition.visibility,
+            expected_cardinality=expected_cardinality,
+        )
+        self._require_new_index_name(logical.name)
+        return CreateIndex(
+            name=logical.name,
+            table=table,
+            positions=logical.positions,
+            bucket_count=definition.bucket_count,
+            expected_cardinality=logical.expected_cardinality,
+        )
+
+    def _require_new_index_name(self, name: str) -> None:
+        """Refuse a logical name already owned by persisted or schema-derived authority."""
+        key = name.lower()
+        collision = self.catalog.has_index_definition(name) or any(
+            definition.registry_key == key for definition in self.indexes
+        )
+        if not collision:
+            collision = any(
+                definition.registry_key == key
+                for table in self.catalog.tables()
+                for definition in automatic_index_definitions(table)
+            )
+        if collision:
+            raise GrafxPlanError(
+                f"An index named {name!r} already exists without regard to case.",
+                field="name",
+                value=name,
+            )
 
     def _node_table(self, statement: CreateNodeTableStatement) -> PlanNode:
         """Plan a CREATE NODE TABLE statement."""

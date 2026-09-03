@@ -6,6 +6,7 @@ import pytest
 
 from okto_grafx.domain.errors import (
     GrafxEmbeddingSpaceMismatch,
+    GrafxIndexError,
     GrafxPlanError,
 )
 from okto_grafx.domain.index.definition import IndexDefinition
@@ -14,6 +15,7 @@ from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.query.ast import BinaryOperation, Direction, Literal, Parameter
 from okto_grafx.domain.query.plan import (
+    CreateIndex,
     CreateNodeTable,
     CreateRelTable,
     CreateRelationships,
@@ -490,6 +492,91 @@ def test_a_merge_of_a_longer_path_is_refused() -> None:
 
 
 # --- schema ---------------------------------------------------------------------------------
+
+
+def test_a_custom_index_plan_resolves_ordered_positions_and_default_sizing() -> None:
+    planned = plan_text(
+        "CREATE INDEX by_city_age FOR (p:Person) ON (p.city, p.age)"
+    )
+    assert isinstance(planned.root, CreateIndex)
+    assert planned.root.table.name == "Person"
+    assert planned.root.positions == (3, 2)
+    assert planned.root.bucket_count == 64
+    assert planned.root.expected_cardinality is None
+    assert planned.writes is True
+
+
+def test_a_custom_index_plan_resolves_expected_cardinality_sizing() -> None:
+    planned = plan_text(
+        "CREATE INDEX by_name FOR (p:Person) ON (p.name) "
+        "OPTIONS expected_cardinality = 4097"
+    )
+    assert isinstance(planned.root, CreateIndex)
+    assert planned.root.bucket_count == 128
+    assert planned.root.expected_cardinality == 4097
+
+
+def test_a_custom_index_plan_preserves_an_explicit_legal_bucket_count() -> None:
+    planned = plan_text(
+        "CREATE INDEX by_name FOR (p:Person) ON (p.name) OPTIONS bucket_count = 17"
+    )
+    assert isinstance(planned.root, CreateIndex)
+    assert planned.root.bucket_count == 17
+    assert planned.root.expected_cardinality is None
+
+
+@pytest.mark.parametrize(
+    ("text", "error", "field"),
+    [
+        ("CREATE INDEX i FOR (p:Nope) ON (p.name)", GrafxPlanError, "table"),
+        (
+            "CREATE INDEX i FOR (p:Person) ON (p.nope)",
+            GrafxIndexError,
+            "columns",
+        ),
+        (
+            "CREATE INDEX i FOR (p:Person) ON (p.name, p.name)",
+            GrafxIndexError,
+            "positions",
+        ),
+        ("CREATE INDEX i FOR (r:Knows) ON (r.since)", GrafxPlanError, "table"),
+        (
+            "CREATE INDEX i FOR (p:Person) ON (p.name) OPTIONS bucket_count = 4097",
+            GrafxIndexError,
+            "bucket_count",
+        ),
+        (
+            "CREATE INDEX i FOR (p:Person) ON (p.name) "
+            "OPTIONS expected_cardinality = 262145",
+            GrafxIndexError,
+            "expected_cardinality",
+        ),
+        (
+            "CREATE INDEX rid_t_custom FOR (p:Person) ON (p.name)",
+            GrafxIndexError,
+            "name",
+        ),
+        (
+            "CREATE INDEX g_0000000000000001 FOR (p:Person) ON (p.name)",
+            GrafxIndexError,
+            "name",
+        ),
+        (
+            "CREATE INDEX PERSON_ID FOR (p:Person) ON (p.name)",
+            GrafxPlanError,
+            "name",
+        ),
+    ],
+)
+def test_a_custom_index_plan_refuses_unresolved_or_out_of_domain_definitions(
+    text: str,
+    error: type[Exception],
+    field: str,
+) -> None:
+    with pytest.raises(error) as failure:
+        plan_text(text)
+
+    assert failure.value.details["field"] == field
 
 
 def test_a_node_table_plan_resolves_its_column_types() -> None:

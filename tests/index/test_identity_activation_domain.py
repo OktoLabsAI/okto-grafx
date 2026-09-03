@@ -4,7 +4,9 @@ import pytest
 
 from okto_grafx.domain.errors import GrafxIndexError
 from okto_grafx.domain.index import (
+    DEFAULT_BUCKET_COUNT,
     MAX_EXPECTED_CARDINALITY,
+    custom_index_sizing,
     identity_index_name,
     identity_index_sizing,
 )
@@ -50,6 +52,55 @@ def test_automatic_identity_sizing_refuses_invalid_counts(
         identity_index_sizing(visible_rows)
 
     assert raised.value.details["field"] == "visible_rows"
+
+
+@pytest.mark.parametrize(
+    ("expected_cardinality", "bucket_count"),
+    [
+        (1, 1),
+        (64, 1),
+        (65, 2),
+        (4096, DEFAULT_BUCKET_COUNT),
+        (4097, 128),
+        (MAX_EXPECTED_CARDINALITY, 4096),
+    ],
+)
+def test_custom_sizing_derives_the_next_power_of_two_directory(
+    expected_cardinality: int,
+    bucket_count: int,
+) -> None:
+    assert custom_index_sizing(expected_cardinality=expected_cardinality) == (
+        bucket_count,
+        expected_cardinality,
+    )
+
+
+def test_custom_sizing_preserves_default_and_explicit_bucket_intent() -> None:
+    assert custom_index_sizing() == (DEFAULT_BUCKET_COUNT, None)
+    assert custom_index_sizing(bucket_count=17) == (17, None)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "field"),
+    [
+        ({"bucket_count": 64, "expected_cardinality": 4096}, "sizing"),
+        ({"bucket_count": 0}, "bucket_count"),
+        ({"expected_cardinality": 0}, "expected_cardinality"),
+        (
+            {"expected_cardinality": MAX_EXPECTED_CARDINALITY + 1},
+            "expected_cardinality",
+        ),
+        ({"expected_cardinality": True}, "expected_cardinality"),
+    ],
+)
+def test_custom_sizing_refuses_ambiguous_or_out_of_domain_hints(
+    kwargs: dict[str, object],
+    field: str,
+) -> None:
+    with pytest.raises(GrafxIndexError) as raised:
+        custom_index_sizing(**kwargs)
+
+    assert raised.value.details["field"] == field
 
 
 @pytest.mark.parametrize(

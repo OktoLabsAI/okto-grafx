@@ -140,6 +140,7 @@ from okto_grafx.domain.query.ast import (
     Direction,
     BinaryOperation,
     CaseExpression,
+    CreateIndexStatement,
     Expression,
     FunctionCall,
     ListExpression,
@@ -165,6 +166,7 @@ from okto_grafx.domain.query.parser import parse as parse_text
 from okto_grafx.domain.query.plan import (
     AggregateRows,
     AllNodesScan,
+    CreateIndex,
     CreateNodeTable,
     CreatedNode,
     CreatedRelationship,
@@ -602,6 +604,7 @@ class _Row:
 
 
 _WRITE_PLAN_NODES: tuple[type[PlanNode], ...] = (
+    CreateIndex,
     CreateNodeTable,
     CreateRelTable,
     CreateVectorSpace,
@@ -2129,6 +2132,7 @@ class QueryEngine:
         "_skip_claims",
         "_durable_skips",
         "_schema_artifact_section",
+        "_custom_index_preparer",
         "_page_stager",
         "_max_statement_writes",
         "_max_result_rows",
@@ -2152,6 +2156,7 @@ class QueryEngine:
         vectors: object = None,
         page_stager: Callable[[object, str, int, bytes], None] | None = None,
         schema_artifact_section: Callable[..., object] | None = None,
+        custom_index_preparer: Callable[..., CatalogIndexDefinition] | None = None,
         endpoint_locator_guard: AbstractContextManager[object] | None = None,
         max_statement_writes: int | None = None,
         max_result_rows: int | None = None,
@@ -2213,6 +2218,7 @@ class QueryEngine:
         self._vectors = vectors
         self._page_stager = page_stager
         self._schema_artifact_section = schema_artifact_section
+        self._custom_index_preparer = custom_index_preparer
         self._max_statement_writes = _require_optional_positive_limit(
             "max_statement_writes", max_statement_writes
         )
@@ -2337,6 +2343,29 @@ class QueryEngine:
     ) -> QueryResult:
         """Run one statement inside a transaction and return its rows."""
         return self._execute_parsed(self.parse(text), txn, parameters)
+
+    def create_index(
+        self,
+        *,
+        name: str,
+        table: str,
+        columns: tuple[str, ...],
+        bucket_count: int | None,
+        expected_cardinality: int | None,
+        txn: object,
+    ) -> QueryResult:
+        """Run the Python index door through the same analysis and plan as textual DDL."""
+        return self._execute_parsed(
+            CreateIndexStatement(
+                name=name,
+                variable="n",
+                table=table,
+                columns=columns,
+                bucket_count=bucket_count,
+                expected_cardinality=expected_cardinality,
+            ),
+            txn,
+        )
 
     def _execute_parsed(
         self,
@@ -2535,7 +2564,9 @@ class QueryEngine:
         """Walk the plan and produce the result."""
         root = plan.root
         statistics: dict[str, int] = {}
-        if isinstance(root, (CreateNodeTable, CreateRelTable, CreateVectorSpace)):
+        if isinstance(
+            root, (CreateIndex, CreateNodeTable, CreateRelTable, CreateVectorSpace)
+        ):
             self._schema(root, txn, statistics)
             return QueryResult(plan=root, statistics=dict(statistics))
         if not isinstance(root, ProduceResults):
@@ -2691,6 +2722,31 @@ class QueryEngine:
                 field="transaction",
                 value=type(txn).__name__,
             )
+        if isinstance(node, CreateIndex):
+            prepare = self._custom_index_preparer
+            if not callable(prepare):
+                raise GrafxUnsupportedOperation(
+                    "CREATE INDEX needs the transaction manager's detached exact-index "
+                    "preparation port.",
+                    field="indexes",
+                    value="custom_index_preparer",
+                )
+            staged_pages = getattr(txn, "staged_pages", None)
+            before = set(staged_pages()) if callable(staged_pages) else set()
+            prepare(
+                txn,
+                name=node.name,
+                table_name=node.table.name,
+                positions=node.positions,
+                bucket_count=node.bucket_count,
+                expected_cardinality=node.expected_cardinality,
+            )
+            after = set(staged_pages()) if callable(staged_pages) else set()
+            statistics["indexes_created"] = statistics.get("indexes_created", 0) + 1
+            statistics["pages_staged"] = statistics.get("pages_staged", 0) + len(
+                after - before
+            )
+            return
         # THE STATEMENT IS HELD UNTIL COMPLETE, like every row statement (see the hold
         # doctrine at the top of this module): a refusal must leave the transaction exactly as
         # it found it. Two things make that non-trivial here. The working catalog is MUTATED in
@@ -4007,25 +4063,103 @@ def _node_scan(
     changed, inserted = _transaction_row_view(context, node.table, include_held=False)
     single_source = isinstance(node.child, SingleRow)
     for row in engine._rows(node.child, context):
-        for ref, version in engine.heap.scan(node.table, snapshot):
-            if ref in changed:
-                latest = changed[ref]
-                if latest is None:
-                    continue
-                version = replace(version, values=latest)
-            bindings = {} if single_source else dict(row.bindings)
-            bindings[node.variable] = RowBinding(
-                variable=node.variable, table=node.table, ref=ref, version=version
-            )
-            context.count("rows_scanned")
-            yield _Row(bindings=bindings)
-        for reference, values in inserted:
-            bindings = {} if single_source else dict(row.bindings)
-            bindings[node.variable] = _pending_binding(
-                node.variable, node.table, values, reference=reference
-            )
-            context.count("rows_scanned")
-            yield _Row(bindings=bindings)
+        yield from _logical_node_rows_for_input(
+            engine,
+            table=node.table,
+            variable=node.variable,
+            input_row=row,
+            context=context,
+            snapshot=snapshot,
+            changed=changed,
+            inserted=inserted,
+            single_source=single_source,
+        )
+
+
+def _logical_node_rows_for_input(
+    engine: QueryEngine,
+    *,
+    table: TableDef,
+    variable: str,
+    input_row: _Row,
+    context: _Context,
+    snapshot: object,
+    changed: Mapping[object, tuple[Value, ...] | None],
+    inserted: Sequence[tuple[object, tuple[Value, ...]]],
+    single_source: bool,
+) -> Iterator[_Row]:
+    """Yield one table's scan-equivalent rows for an already-produced input row."""
+
+    for ref, version in engine.heap.scan(table, snapshot):
+        if ref in changed:
+            latest = changed[ref]
+            if latest is None:
+                continue
+            version = replace(version, values=latest)
+        bindings = {} if single_source else dict(input_row.bindings)
+        bindings[variable] = RowBinding(
+            variable=variable,
+            table=table,
+            ref=ref,
+            version=version,
+        )
+        context.count("rows_scanned")
+        yield _Row(bindings=bindings)
+    for reference, values in inserted:
+        bindings = {} if single_source else dict(input_row.bindings)
+        bindings[variable] = _pending_binding(
+            variable,
+            table,
+            values,
+            reference=reference,
+        )
+        context.count("rows_scanned")
+        yield _Row(bindings=bindings)
+
+
+_ENCODING_COMPLETE_EXACT_TYPES: frozenset[ValueType] = frozenset(
+    {
+        ValueType.BOOL,
+        ValueType.INT64,
+        ValueType.STRING,
+        ValueType.BYTES,
+        ValueType.TIMESTAMP,
+        ValueType.UUID,
+    }
+)
+"""Scalar kinds whose stored bytes are complete for the language's equality relation."""
+
+
+def _exact_probe_is_encoding_complete(
+    table: TableDef,
+    positions: Sequence[int],
+    values: Sequence[Value],
+) -> bool:
+    """Say whether one encoded key can represent every row equal to these probe values.
+
+    The query language deliberately compares INT64 and DOUBLE as numbers, and treats ``-0.0``
+    and ``0.0`` as equal.  Durable index keys retain the stored type tag and IEEE sign bit, so a
+    single encoded probe is incomplete for those cross-representation cases.  Nested values can
+    contain the same numeric cases, and MAP equality is independent of insertion order while its
+    storage encoding is not.  Those probes use the canonical scan before consuming any index
+    result; exact scalar probes retain the O(1)-directory access path.
+    """
+
+    for position, value in zip(positions, values):
+        if value is None:
+            return False
+        observed = value_type_of(value)
+        declared = table.columns[position].type
+        if observed is not declared:
+            return False
+        if observed in _ENCODING_COMPLETE_EXACT_TYPES:
+            continue
+        if observed is ValueType.DOUBLE:
+            number = float(value)  # type: ignore[arg-type]
+            if not isnan(number) and number != 0.0:
+                continue
+        return False
+    return True
 
 
 def _index_lookup_versions(
@@ -4098,12 +4232,6 @@ def _index_seek(
     be a second implementation of a rule that already has one, and the two would drift.
     """
     manager = engine.require_indexes()
-    selected_index = _catalog_active_index(
-        manager,
-        node.index,
-        context.schema(),
-        txn=getattr(context, "txn", None),
-    )
     snapshot = context.snapshot
     arity = len(node.table.columns)
     positions = tuple(node.table.column_index(name) for name in node.key_columns)
@@ -4119,11 +4247,56 @@ def _index_seek(
         and node.index == primary_key_index_name(node.table.name)
     )
     ended = _ended_by_this_transaction(context)
+    changed, inserted = _transaction_row_view(
+        context, node.table, include_held=False
+    )
     single_source = isinstance(node.child, SingleRow)
+    selected_index: object | None = None
+    index_resolved = False
     for row in engine._rows(node.child, context):
+        values = tuple(
+            _as_value(_evaluate(expression, row, context))
+            for expression in node.key_values
+        )
+        # ``x = NULL`` is UNKNOWN for every x, including NULL.  The durable key format can
+        # encode NULL, but probing it would turn that unknown predicate into matching rows.
+        if any(value is None for value in values):
+            continue
+        if not _exact_probe_is_encoding_complete(node.table, positions, values):
+            # Decide the scan fallback before resolving or consuming the active store.  The
+            # index bytes distinguish representations which query equality intentionally joins
+            # (INT64/DOUBLE, signed zero and nested numeric values), so a single hash probe could
+            # otherwise omit true rows.  Filter here because the planner correctly consumed the
+            # equality terms when it chose IndexSeek.
+            for candidate in _logical_node_rows_for_input(
+                engine,
+                table=node.table,
+                variable=node.variable,
+                input_row=row,
+                context=context,
+                snapshot=snapshot,
+                changed=changed,
+                inserted=inserted,
+                single_source=single_source,
+            ):
+                binding = candidate.bindings[node.variable]
+                if all(
+                    _equal(binding.version.values[position], value)
+                    for position, value in zip(positions, values)
+                ):
+                    yield candidate
+            continue
+        if not index_resolved:
+            selected_index = _catalog_active_index(
+                manager,
+                node.index,
+                context.schema(),
+                txn=getattr(context, "txn", None),
+            )
+            index_resolved = True
         template: list[Value] = [None] * arity
-        for position, expression in zip(positions, node.key_values):
-            template[position] = _as_value(_evaluate(expression, row, context))
+        for position, value in zip(positions, values):
+            template[position] = value
         key = index_key(template, positions)
         for ref, version in _index_lookup_versions(
             engine,
@@ -4137,6 +4310,14 @@ def _index_seek(
         ):
             if ref in ended:
                 continue  # ended by this transaction: the same rule the scan applies
+            if not all(
+                _equal(version.values[position], value)
+                for position, value in zip(positions, values)
+            ):
+                # Hash hits remain candidates.  The manager proves that the heap still derives
+                # this key; this second, cheap check proves that key-byte equality also means
+                # query-language equality before the planner's consumed predicate disappears.
+                continue
             bindings = {} if single_source else dict(row.bindings)
             bindings[node.variable] = RowBinding(
                 variable=node.variable, table=node.table, ref=ref, version=version

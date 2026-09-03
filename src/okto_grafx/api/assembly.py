@@ -532,6 +532,7 @@ def assemble_database(
             vectors=vectors,
             page_stager=transactions._stage_page_image,
             schema_artifact_section=transactions.schema_artifact_section,
+            custom_index_preparer=transactions.prepare_custom_exact_index,
             # Separate from BufferPool's lock: endpoint memo accounting is atomic, while the
             # heap walk it enables never holds this guard across page I/O.
             endpoint_locator_guard=threading.RLock(),

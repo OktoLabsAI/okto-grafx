@@ -34,6 +34,7 @@ from okto_grafx.domain.query.ast import (
     CaseExpression,
     ColumnSpec,
     CreateClause,
+    CreateIndexStatement,
     CreateNodeTableStatement,
     CreateRelTableStatement,
     CreateVectorSpaceStatement,
@@ -286,6 +287,8 @@ class _Parser:
     def _statement_body(self) -> Statement:
         """Parse one statement, choosing between the schema statements and a query."""
         if self._at_keyword("CREATE"):
+            if self._at_keyword("INDEX", 1):
+                return self._create_index()
             if self._at_keyword("NODE", 1) and self._at_keyword("TABLE", 2):
                 return self._create_node_table()
             if self._at_keyword("REL", 1) and self._at_keyword("TABLE", 2):
@@ -344,6 +347,81 @@ class _Parser:
                 value="UNION",
             )
         return UnionQuery(left=left, right=right)
+
+    def _create_index(self) -> CreateIndexStatement:
+        """Parse the P2-ID custom exact-index declaration."""
+        self._take_keyword("CREATE")
+        self._take_keyword("INDEX")
+        name = self._take_name("an index name")
+        self._take_keyword("FOR")
+        self._take_symbol("(")
+        variable = self._take_name("a node variable")
+        self._take_symbol(":")
+        table = self._take_name("a node table name")
+        self._take_symbol(")")
+        self._take_keyword("ON")
+        self._take_symbol("(")
+        if self._at_symbol(")"):
+            raise self._refuse(
+                "An index needs at least one key column", field="columns"
+            )
+        columns: list[str] = []
+        while True:
+            key_variable = self._take_name("the indexed node variable")
+            if key_variable != variable:
+                raise self._refuse(
+                    f"Every indexed column must belong to variable {variable!r}; got "
+                    f"{key_variable!r}",
+                    field="variable",
+                    value=key_variable,
+                )
+            self._take_symbol(".")
+            columns.append(self._take_name("an indexed column name"))
+            if not self._match_symbol(","):
+                break
+        self._take_symbol(")")
+
+        bucket_count: int | None = None
+        expected_cardinality: int | None = None
+        if self._match_keyword("OPTIONS"):
+            option_token = self._current
+            option = self._take_name("bucket_count or expected_cardinality")
+            folded = option.lower()
+            if option_token.quoted or folded not in {
+                "bucket_count",
+                "expected_cardinality",
+            }:
+                raise self._refuse(
+                    "An index sizing option is bucket_count or expected_cardinality; "
+                    f"got {option!r}",
+                    field="option",
+                    value=option,
+                )
+            self._take_symbol("=")
+            token = self._current
+            if token.kind is not TokenKind.INTEGER:
+                raise self._unexpected("a positive integer sizing value")
+            self._advance()
+            value = int(token.value)
+            if value <= 0:
+                raise self._refuse(
+                    f"The {folded} option must be positive; got {value}",
+                    field=folded,
+                    value=value,
+                )
+            if folded == "bucket_count":
+                bucket_count = value
+            else:
+                expected_cardinality = value
+
+        return CreateIndexStatement(
+            name=name,
+            variable=variable,
+            table=table,
+            columns=tuple(columns),
+            bucket_count=bucket_count,
+            expected_cardinality=expected_cardinality,
+        )
 
     def _create_node_table(self) -> CreateNodeTableStatement:
         """Parse ``CREATE NODE TABLE name(columns, PRIMARY KEY(column))``."""

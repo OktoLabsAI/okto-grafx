@@ -166,6 +166,21 @@ def test_a_seek_and_a_scan_return_the_same_rows(database) -> None:
     ).rows == ()
 
 
+def test_seek_keeps_numeric_equality_when_probe_and_column_have_different_tags(
+    database,
+) -> None:
+    """The language joins INT64 and DOUBLE even though durable index keys do not."""
+
+    with database.begin("write") as txn:
+        txn.execute("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:P {id: 1})")
+
+    statement = "MATCH (p:P) WHERE p.id = $key RETURN p.id"
+    assert IndexSeek.__name__ in _plan_operators(database, statement, {"key": 1.0})
+    assert database.execute(statement, {"key": 1.0}).rows == ((1,),)
+
+
 def test_an_exact_seek_reuses_the_heap_version_validated_by_the_index(
     database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
