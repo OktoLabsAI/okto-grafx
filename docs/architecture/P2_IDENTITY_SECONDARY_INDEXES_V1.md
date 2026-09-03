@@ -529,3 +529,28 @@ internal access path and every answer remains heap-validated. Deployment must ne
 Grafx build that understands catalog v2 before activating the capability, and rollback must use the
 pre-activation backup/logical procedure described above rather than reinstalling `0.0.1` against
 the migrated bytes.
+
+## 15. Implementation trace
+
+The implementation is intentionally split at reviewable durability boundaries:
+
+| Milestone | State | Evidence |
+|---|---|---|
+| Canonical unsigned identity key | complete | `fa0c298`; nine-byte `record_id_u64_v1` codec over the complete usable `u64` domain, not yet runtime-eligible by itself |
+| Catalog v2 and generation authority | complete | `4feec76`; deterministic v1/v2 codec, capability fence, logical definitions and immutable physical generation identity |
+| Catalog/commit-state coactivation | complete | `12414d0` + documentation `1e68ae7`; catalog v2 becomes authoritative before commit-state v2 is the final publication act |
+| ACTIVE runtime projection | complete | `99622af`; v2 exact-generation equality is enforced across composition, planner, row maintenance, redo, freshness, verifier and public inventory; v1 custom access paths remain compatible |
+| Record-aware identity lifecycle and generation-qualified WAL/redo | next | INSERT/UPDATE/DELETE, quota, rebuild, lookup, verification and replay must consume the durable `record_id` and must not redirect an old logical effect to a later physical generation |
+| Activation/DDL, sizing and growth-only rehash | pending | explicit `ensure_identity_indexes`, persistent `CREATE INDEX`/Python door, endpoint scope, deterministic sizing and foreground ACTIVE-to-STALE rotation |
+
+The ACTIVE projection uses a structural catalog map and a structural raw-registry map keyed by
+`(table_id, table_name)`. Per-row count/staging is therefore `O(K_t + S_txn)`, where `K_t` is the
+number of indexes on that table and `S_txn` its owner-observed speculative set; it does not scan
+all indexes in a growing graph. A name lookup for a catalog-v2 exact index resolves the logical
+definition directly and compares the complete runtime definition, including `artifact_nonce`.
+
+Quality evidence for `99622af`: the grouped index/query/transaction/recovery/API slice passed
+242/242 tests, focused discriminants passed, Ruff/compile/diff checks were green, and two
+independent adversarial reviews reported no remaining blocker for this boundary. This does not
+claim that identity indexes, DDL or rehash are already available; those remain the explicitly
+listed subsequent milestones above.

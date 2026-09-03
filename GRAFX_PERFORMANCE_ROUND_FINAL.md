@@ -431,6 +431,7 @@ O consenso não autoriza mudança de formato, redução das garantias concorrent
 | 2026-09-03 | fechamento agrupado de P1 | concluído por composição explícita | a regressão ampla terminou com `9.628 passed, 17 skipped, 1 failed`; a única falha foi a ausência de docstring no callback aninhado `count`, corrigida sem mudança de comportamento em `8f0af84`; o lote afetado passou 66/66. A suíte completa não foi reexecutada após essa correção documental |
 | 2026-09-03 | gate multiprocesso | concluído | 500/500 operações reconhecidas em 46,6 s, 510 registros incluindo dez seeds de contenção, 44 conflitos retryable absorvidos, zero perda, duplicata, phantom ou torn read e `verify("all")` limpo em live e reopen |
 | 2026-09-03 | seleção finita de P2 | nenhuma | nenhuma das três opções atingiu seu gatilho congelado; a rodada encerra sem mudança estrutural por hipótese |
+| 2026-09-03 | item 10 / P2-ID — projeção ACTIVE | concluído | `99622af` aplica a autoridade exata da geração ACTIVE a registry/planner/DML/redo/freshness/verifier/inventário, preserva os access paths custom v1 e limita count/staging por linha aos índices da própria tabela; gate agrupado 242/242, Ruff, compile e diff-check verdes, com duas revisões adversariais sem blocker |
 
 Esta seção registra fatos concluídos e trabalho explicitamente em andamento. H5 foi fechado. Por
 decisão explícita posterior do usuário, P0.3/P0.4 continuam evidência de engenharia, mas não são

@@ -202,6 +202,30 @@
   a autoridade ACTIVE do catálogo v2 sobre registry/planner/redo/staging/verifier/inventory; nenhum
   índice novo está elegível no runtime antes dessa projeção.
 
+  Essa entrega foi concluída em `99622af`. Catálogo e registry agora mantêm projeções estruturais
+  por identidade completa de tabela; resolução por nome no v2 consulta diretamente a definição
+  lógica e sua geração ACTIVE, e count/staging por linha visitam somente `K_t` índices da tabela
+  mais as observações especulativas da própria transação, sem materializar `O(total_indexes)`.
+  Catálogo v1 preserva sua semântica anterior: qualquer registro process-local válido de uma
+  tabela committed continua público, verificável e utilizável, inclusive quando o caller fornece
+  uma foto explícita do catálogo. Cada acelerador automático passa a declinar isoladamente, de
+  modo que um nome vetorial inexpressível não esconda PK/endpoints válidos. No v2, apenas a
+  definição física exata da geração ACTIVE alcança planner, DML, lookup, redo, freshness,
+  reconciliation, rebuild, verifier e inventário; BUILDING, STALE, nonce antigo e registros rogue
+  permanecem apenas sob ownership físico/compensação. `verify()` recusa cobertura incompleta se
+  uma geração exact ACTIVE estiver ausente ou divergente, em vez de produzir relatório falsamente
+  limpo. O fallback de colaboradores legados mantém a validação exact do manager e nunca desce
+  para lookup bruto do store. O gate agrupado dos 15 módulos afetados passou **242/242 testes**;
+  testes discriminantes adicionais, Ruff, `compileall` e `git diff --check` também passaram, e as
+  duas revisões adversariais terminaram sem blocker deste milestone.
+
+  O próximo submilestone permanece finito e não reabre essa projeção: tornar
+  `record_id_u64_v1` record-aware em quota/count, INSERT/UPDATE/DELETE, rebuild, lookup e verifier,
+  e qualificar a autoridade WAL/redo pela geração antes de permitir troca entre gerações com o
+  mesmo nome lógico. Depois vêm, nesta ordem, ativação/DDL persistente e escopo automático de
+  endpoints, sizing/criação de índices secundários e rehash growth-only. Itens 11--13 e sharding
+  não entram nesses passos.
+
 - **Run real do Pulse 0.3.3 na pasta padrão — reconstrução Grafx em andamento, SQLite preservado.**
   Antes da troca foi criado backup consistente do SQLite (`quick_check=ok`, zero violações de FK)
   e os artefatos Ladybug foram movidos, sem exclusão, para quarentena operacional. Os bindings de
