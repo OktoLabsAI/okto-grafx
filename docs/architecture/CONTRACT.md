@@ -1275,7 +1275,10 @@ M1: `oktografx_lease_wait_seconds`{outcome=granted|timeout|takeover} ·
 `oktografx_recovery_discarded_records_total`{origin_class=reapplicable|forensic} ·
 `oktografx_ledger_depth`{origin_class} · `oktografx_ledger_oldest_entry_age_seconds`{origin_class} ·
 `oktografx_quarantine_entries` · `oktografx_buffer_budget_used_bytes`{db} ·
+`oktografx_buffer_retained_estimate_bytes`{db,estimator=python-v1} ·
 `oktografx_buffer_budget_exceeded_total`{db} · `oktografx_database_opens_total` ·
+`oktografx_descriptor_cache_hits_total` · `oktografx_descriptor_cache_misses_total` ·
+`oktografx_descriptor_cache_evictions_total` ·
 `oktografx_recoveries_total`{outcome} ·
 `oktografx_baseline_ceiling_multiple`{ceiling=durable_commit|point_read|open_replay|vector_recall}
 
@@ -1295,6 +1298,17 @@ Query: `oktografx_query_phase_duration_seconds`{phase=parse|plan|execute} ·
 `oktografx_query_rows_returned_count` · `oktografx_query_errors_total`{code}
 
 `db` and `space` labels carry a **short hash / catalog name**, never a path or free text (TR-7).
+The `estimator` label is the closed singleton `python-v1`. Its value identifies the
+pointer-width-calibrated formula: engine-owned Page/frame objects, payload buffers, slot
+directories and buffer bookkeeping are included; allocator arenas, interpreter-specific header
+variations, collaborators and arbitrary read-view tokens are excluded. The gauge is an estimate
+of retained Python memory, not process RSS and not the eviction/admission budget. It is sampled
+on reported residency-topology changes; the immutable `Database.pool` health view recomputes the
+current estimate, so routine unpins do not acquire an O(resident frames) telemetry cost.
+Descriptor-cache counters are cumulative per local-device lifetime and deliberately carry no
+file/path label. The adapter snapshots their deltas under its own guard and emits afterward; when
+a pool storage call nests that operation, the existing contained-metrics boundary drains the
+emission only after the pool guard has also been released.
 Every metric here MUST appear in a `dashboards/*.json` panel (OR-5/OR-3) — the CI test asserts it.
 
 **D-26 commit-measurement boundary.** The default/public per-commit lease policy emits one local

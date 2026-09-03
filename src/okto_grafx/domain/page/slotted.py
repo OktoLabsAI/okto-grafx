@@ -18,6 +18,7 @@ the checksum field in the first four bytes.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from struct import calcsize
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -210,7 +211,9 @@ class Page:
 
     def live_bytes(self) -> int:
         """Return the payload bytes that live slots actually occupy, gaps excluded."""
-        return sum(length for offset, length in self._slots if (offset, length) != FREE_SLOT)
+        return sum(
+            length for offset, length in self._slots if (offset, length) != FREE_SLOT
+        )
 
     def compactable_space(self) -> int:
         """Return the payload bytes that would be free after compacting, directory excluded."""
@@ -303,7 +306,9 @@ class Page:
             self._data[offset : offset + len(content)] = content
             # Zero the tail that the shorter payload no longer covers, so the encoded image
             # depends only on the live content of the page.
-            self._data[offset + len(content) : offset + length] = bytes(length - len(content))
+            self._data[offset + len(content) : offset + length] = bytes(
+                length - len(content)
+            )
             self._slots[slot] = (offset, len(content))
             self._dirty = True
             return
@@ -353,6 +358,44 @@ class Page:
         """Return the ids of the slots that still hold a payload, in slot order."""
         return tuple(
             slot for slot, entry in enumerate(self._slots) if entry != FREE_SLOT
+        )
+
+    def _retained_bytes_estimate_v1(self) -> int:
+        """Estimate the Python memory retained by this page without copying its contents.
+
+        This is deliberately an internal, versioned diagnostic rather than an admission rule.
+        The model is calibrated by the interpreter's pointer width. It charges the payload
+        capacity, object/list headers, a conservative list-capacity allowance and each slot's
+        pair plus two integer values. Scalar page fields are charged as owned integers even when
+        an interpreter interns a particular value, so the result is stable as an upper estimate
+        instead of depending on incidental object sharing. Allocator arenas, the interpreter and
+        objects outside this page are not included.
+
+        Calling the concrete implementation through :class:`Page` lets the buffer pool inspect
+        a codec-produced subclass without dispatching to host code while its guard is held.
+        """
+        pointer = calcsize("P")
+        scalar_fields = 9
+        # A codec is a port and may return a ``Page`` subclass.  Calling the concrete built-in
+        # accessors keeps this diagnostic from dispatching to a hostile ``__getattribute__`` or
+        # list override while the buffer-pool guard is held.
+        slot_directory = object.__getattribute__(self, "_slots")
+        page_size = object.__getattribute__(self, "_page_size")
+        slots = list.__len__(slot_directory)
+        list_capacity = slots + slots // 4 + (8 if slots else 0)
+        object_header = 2 * pointer
+        integer_value = 4 * pointer
+        slot_value = 4 * pointer + 2 * integer_value
+        return (
+            object_header
+            + len(Page.__slots__) * pointer
+            + page_size
+            + 6 * pointer
+            + 5 * pointer
+            + list_capacity * pointer
+            + slots * slot_value
+            + scalar_fields * integer_value
+            + pointer
         )
 
     def compact(self) -> int:
@@ -471,7 +514,9 @@ class Page:
         position = self._page_size
         for offset, length in self._slots:
             position -= SLOT_ENTRY_SIZE
-            image[position : position + SLOT_ENTRY_SIZE] = encode_slot_entry(offset, length)
+            image[position : position + SLOT_ENTRY_SIZE] = encode_slot_entry(
+                offset, length
+            )
         image[0:PAGE_HEADER_SIZE] = self.header().encode()
         checksum = crc32c(bytes(image[CHECKSUM_SIZE : self._page_size]))
         image[0:CHECKSUM_SIZE] = checksum.to_bytes(CHECKSUM_SIZE, "little")

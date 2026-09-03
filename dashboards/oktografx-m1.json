@@ -1436,6 +1436,34 @@
         {"refId": "C", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(oktografx_commit_foreign_commits_total[5m]))", "legendFormat": "foreign commits/s", "range": true},
         {"refId": "D", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(oktografx_commit_retargets_total[5m]))", "legendFormat": "retargets/s", "range": true}
       ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Buffer retained-memory estimate",
+      "description": "Versioned estimate of Python memory retained by buffer frames, Page payloads, slot directories and pool bookkeeping. It is diagnostic and does not change the nominal eviction budget.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 102},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum by (db, estimator) (oktografx_buffer_retained_estimate_bytes)", "legendFormat": "{{db}} {{estimator}}", "range": true}
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Descriptor-cache outcomes",
+      "description": "Rates of bounded local descriptor-cache hits, misses and capacity-driven LRU evictions. Counters carry no file or path labels.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 102},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(oktografx_descriptor_cache_hits_total[5m]))", "legendFormat": "hits/s", "range": true},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(oktografx_descriptor_cache_misses_total[5m]))", "legendFormat": "misses/s", "range": true},
+        {"refId": "C", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(oktografx_descriptor_cache_evictions_total[5m]))", "legendFormat": "evictions/s", "range": true}
+      ]
     }
   ],
   "refresh": "30s",

@@ -42,6 +42,8 @@ from okto_grafx.engine import buffer_pool as pool_module
 from okto_grafx.engine.buffer_pool import (
     BUFFER_BUDGET_EXCEEDED_TOTAL,
     BUFFER_BUDGET_USED_BYTES,
+    BUFFER_RETAINED_ESTIMATE_BYTES,
+    BUFFER_RETAINED_ESTIMATOR_VERSION,
     FSYNC_DURATION_SECONDS,
     CHECKSUM_FAILURES_TOTAL,
     CHECKSUM_VERIFICATIONS_TOTAL,
@@ -57,7 +59,7 @@ from okto_grafx.engine.buffer_pool import (
     write_chain,
 )
 
-from .conftest import MemoryDevice, RecordingMetrics, make_pool
+from .conftest import SMALL_PAGE_SIZE, MemoryDevice, RecordingMetrics, make_pool
 
 FILE: str = "heap.dat"
 
@@ -190,6 +192,115 @@ def test_the_budget_is_reported_as_a_gauge_under_the_database_label() -> None:
     assert metrics.values_of(BUFFER_BUDGET_USED_BYTES)[-1] == pool.used_bytes()
     pool.invalidate()
     assert metrics.values_of(BUFFER_BUDGET_USED_BYTES)[-1] == 0.0
+
+
+def test_retained_memory_estimate_is_versioned_and_tracks_pages_and_slots() -> None:
+    device, metrics = MemoryDevice(), RecordingMetrics()
+    pool = make_pool(device, metrics, budget_pages=4, db_label="alpha")
+    empty = pool.retained_bytes_estimate()
+    assert empty > pool.used_bytes() == 0
+    assert pool.retained_bytes_estimator == BUFFER_RETAINED_ESTIMATOR_VERSION
+
+    device.create(FILE)
+    page = pool.allocate(FILE, int(PageType.HEAP))
+    admitted = pool.retained_bytes_estimate()
+    assert admitted > empty
+    nominal = pool.used_bytes()
+
+    page.insert_slot(b"one")
+    one_slot = pool.retained_bytes_estimate()
+    page.insert_slot(b"two")
+    two_slots = pool.retained_bytes_estimate()
+    assert empty < admitted < one_slot < two_slots
+    assert pool.used_bytes() == nominal == pool.page_size
+
+    labels = metrics.labels_of(BUFFER_RETAINED_ESTIMATE_BYTES)
+    assert labels
+    assert set(labels[-1]) == {"db", "estimator"}
+    assert labels[-1] == {
+        "db": "alpha",
+        "estimator": BUFFER_RETAINED_ESTIMATOR_VERSION,
+    }
+    assert all("path" not in observed and "file" not in observed for observed in labels)
+    sampled = metrics.values_of(BUFFER_RETAINED_ESTIMATE_BYTES)
+    assert sampled[-1] > sampled[0]
+
+
+def test_retained_estimator_never_dispatches_to_a_page_subclass_under_the_guard() -> (
+    None
+):
+    class HostilePage(Page):
+        __slots__ = ("armed", "callbacks")
+
+        def __init__(self) -> None:
+            self.armed = False
+            self.callbacks: list[str] = []
+            super().__init__(int(PageType.HEAP), page_size=SMALL_PAGE_SIZE)
+
+        def __getattribute__(self, name: str) -> object:
+            if name in {"_slots", "_page_size"} and object.__getattribute__(
+                self, "armed"
+            ):
+                object.__getattribute__(self, "callbacks").append(name)
+                raise AssertionError(
+                    "host Page callback entered the retained estimator"
+                )
+            return object.__getattribute__(self, name)
+
+    device = MemoryDevice(page_size=SMALL_PAGE_SIZE)
+    pool = make_pool(device, RecordingMetrics(), budget_pages=1)
+    page = HostilePage()
+    pool._frames[(FILE, 0)] = pool_module._Frame(page)
+    page.armed = True
+
+    assert pool.retained_bytes_estimate() > pool.used_bytes()
+    assert page.callbacks == []
+
+
+def test_retained_estimator_counts_a_retired_pinned_frame_until_its_release() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics(), budget_pages=1)
+    seed_pages(pool, 1)
+    held = pool.pin(FILE, 0)
+
+    assert pool.begin_read_view("foreign") is True
+    retired = pool.retained_bytes_estimate()
+    assert pool.used_bytes() == 0
+    assert (FILE, 0) in pool._doomed
+
+    pool.unpin(FILE, 0, page=held)
+    assert (FILE, 0) not in pool._doomed
+    assert pool.retained_bytes_estimate() < retired
+
+
+def test_retained_estimator_lifecycle_is_per_pool_and_does_not_change_admission() -> (
+    None
+):
+    device = MemoryDevice()
+    first = make_pool(device, RecordingMetrics(), budget_pages=1)
+    baseline = first.retained_bytes_estimate()
+    seed_pages(first, 2)
+    assert first.used_bytes() == first.budget_bytes
+    assert first.retained_bytes_estimate() > baseline
+
+    second = make_pool(device, RecordingMetrics(), budget_pages=1)
+    assert second.used_bytes() == 0
+    assert second.retained_bytes_estimate() == baseline
+    assert second.capacity_pages == first.capacity_pages == 1
+
+
+def test_disabled_metrics_never_walk_the_retained_object_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(_pool: BufferPool) -> int:
+        raise AssertionError("disabled metrics invoked the retained-memory estimator")
+
+    monkeypatch.setattr(BufferPool, "_retained_bytes_estimate", forbidden)
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics(enabled=False), budget_pages=1)
+    device.create(FILE)
+    page = pool.allocate(FILE, int(PageType.HEAP))
+    pool.unpin(FILE, page.page_index)
 
 
 def test_the_pool_registers_every_metric_before_it_emits_it() -> None:

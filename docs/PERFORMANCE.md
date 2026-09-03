@@ -403,6 +403,34 @@ and B `194/194`, with zero conflicts, retries, refusals or reopens; live and col
 generation, source authority and storage identity were stable. Its `4.421593/s` rate and CPU values
 are recorded only as observations.
 
+### Buffer retained-memory and descriptor-cache telemetry (0.0.2 development)
+
+`BufferPool.used_bytes()` remains the compatible nominal admission reading: resident frame count
+times configured page size. The separate `retained_bytes_estimate()` diagnostic uses the
+pointer-width-calibrated `python-v1` formula and covers pool-owned frame/Page objects, page payload
+buffers, slot directories, retired-pinned frames, dirty/modified/abandoned sets, epoch maps and
+metric-label containers. It intentionally excludes allocator arenas, interpreter-specific header
+variations, storage/codec/metrics collaborators and arbitrary read-view tokens. It is therefore an
+honest estimate of retained Python objects, not process RSS, and it does not yet change admission
+or eviction.
+
+The same value is exposed as
+`oktografx_buffer_retained_estimate_bytes{db,estimator="python-v1"}` and in the immutable
+`Database.pool` view. The gauge is sampled when the pool reports a residency-topology change;
+reading `Database.pool` recomputes the current diagnostic, including slot-directory changes made
+since that sample. This avoids turning each ordinary page release into a whole-pool telemetry
+walk. Changing the formula requires a new estimator value so historical series do not silently
+change meaning.
+
+The local descriptor cache now exposes cumulative `hits`, `misses` and capacity-driven LRU
+`evictions` through the immutable `Database.storage` view and the three unlabelled
+`oktografx_descriptor_cache_*_total` counters. No logical name, file or path is a label. The
+adapter records integers under its own guard, but sends metric deltas only after the public
+storage door has released that guard. The existing composition-level containment boundary also
+defers a nested storage emission until the enclosing buffer-pool guard is released. A
+disabled/no-op sink receives no registration or emission callback; counters and estimator state
+reset with their owning device/pool lifecycle.
+
 ### F1, CE-3 and M-PULSE-7 gate chain
 
 The M-PULSE-7 input ratchet is certified at Pulse Community

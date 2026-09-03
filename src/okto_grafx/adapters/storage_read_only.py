@@ -49,6 +49,13 @@ class ReadOnlyStorageDevice:
         if callable(invalidate):
             invalidate(file)
 
+    def descriptor_cache_stats(self) -> object:
+        """Forward the optional path-free descriptor-cache diagnostics capability."""
+        snapshot = getattr(self.__device, "descriptor_cache_stats", None)
+        if not callable(snapshot):
+            return None
+        return snapshot()
+
     def exists(self, file: str) -> bool:
         """Return whether ``file`` exists, preserving the wrapped observation."""
         return self.__device.exists(file)

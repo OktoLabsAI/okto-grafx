@@ -51,6 +51,7 @@ from okto_grafx.adapters.coordination_local import (
 from okto_grafx.adapters.graph_guard import ConditionGuard
 from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
 from okto_grafx.adapters.metrics_noop import NoOpMetricsSink
+from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.adapters.storage_read_only import ReadOnlyStorageDevice
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -293,6 +294,12 @@ def assemble_database(
         # It sits INSIDE the guard so a sink that refuses a descriptor cannot leave the device
         # this composition already opened holding its descriptors.
         register_catalog(metrics)
+        if type(raw_storage) is LocalStorageDevice:
+            # The storage protocol remains frozen: descriptor caching is an adapter detail.
+            # Bind its counters through the metrics port only for the concrete default adapter,
+            # and call the concrete method so a host subclass cannot inject a callback into the
+            # assembly window. LocalStorageDevice publishes outside its own descriptor guard.
+            LocalStorageDevice.bind_metrics(raw_storage, metrics)
         # Computed inside the guard, not before it: it was the one fallible statement in the
         # window between a complete registry and the guard that releases it, so a path it
         # could not encode leaked the device this composition had already opened.
@@ -326,6 +333,10 @@ def assemble_database(
             # rather than imported by the pool (the pure core imports none), and it is
             # re-entrant because a checkpoint flushes and an invalidation writes back.
             guard=threading.RLock(),
+            # This is the trusted composition adapter's existing deferral boundary, passed
+            # explicitly rather than discovered on a host-supplied metrics implementation.
+            # It drains pool and nested descriptor-cache emissions after the pool guard.
+            metrics_defer=metrics.defer,
             # Page 0 is a non-wrapping cross-process freshness clock. BufferPool owns the CAS,
             # while the composition root supplies its mechanism: one deterministic section per
             # index file in this database. Readers never take it; unrelated page-0 protocols are

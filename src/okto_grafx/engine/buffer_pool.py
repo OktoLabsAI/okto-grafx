@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import wraps
 from itertools import islice
+from struct import calcsize
 
 from okto_grafx.domain.errors import (
     GrafxBufferBudgetExceeded,
@@ -51,6 +52,8 @@ __all__ = [
     "MAX_SEQ",
     "BUFFER_POOL_METRICS",
     "BUFFER_BUDGET_USED_BYTES",
+    "BUFFER_RETAINED_ESTIMATE_BYTES",
+    "BUFFER_RETAINED_ESTIMATOR_VERSION",
     "BUFFER_BUDGET_EXCEEDED_TOTAL",
     "CHECKSUM_VERIFICATIONS_TOTAL",
     "CHECKSUM_FAILURES_TOTAL",
@@ -89,6 +92,16 @@ _READ_VIEW_BASELINE_UNSET: object = object()
 _READ_VIEW_MAX_TARGETS: int = 1024
 
 BUFFER_BUDGET_USED_BYTES: str = "oktografx_buffer_budget_used_bytes"
+BUFFER_RETAINED_ESTIMATE_BYTES: str = "oktografx_buffer_retained_estimate_bytes"
+BUFFER_RETAINED_ESTIMATOR_VERSION: str = "python-v1"
+"""Version of the callback-free retained-memory estimator exposed by this pool.
+
+The estimate covers the resident and retired-pinned frame graph plus the pool-owned residency,
+dirty-page, abandoned-page, epoch and label containers. It is not process RSS: allocator arenas,
+storage/codec/metrics collaborators and arbitrary objects held by the read-view token are outside
+its authority. Versioning prevents a more accurate future formula from silently changing the
+meaning of a time series.
+"""
 BUFFER_BUDGET_EXCEEDED_TOTAL: str = "oktografx_buffer_budget_exceeded_total"
 CHECKSUM_VERIFICATIONS_TOTAL: str = "oktografx_checksum_verifications_total"
 CHECKSUM_FAILURES_TOTAL: str = "oktografx_checksum_failures_total"
@@ -100,6 +113,7 @@ BUFFER_POOL_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
     for name in (
         BUFFER_BUDGET_USED_BYTES,
+        BUFFER_RETAINED_ESTIMATE_BYTES,
         BUFFER_BUDGET_EXCEEDED_TOTAL,
         CHECKSUM_VERIFICATIONS_TOTAL,
         CHECKSUM_FAILURES_TOTAL,
@@ -302,8 +316,16 @@ def _guarded(method: Callable[..., object]) -> Callable[..., object]:
     @wraps(method)
     def wrapper(self: object, *args: object, **kwargs: object) -> object:
         """Enter the pool's guard, run the door, leave the guard."""
-        with self._guard:  # type: ignore[attr-defined]
-            return method(self, *args, **kwargs)
+        defer_metrics = self._metrics_defer  # type: ignore[attr-defined]
+        if defer_metrics is None:
+            with self._guard:  # type: ignore[attr-defined]
+                return method(self, *args, **kwargs)
+        # The production containment adapter queues both pool telemetry and descriptor-cache
+        # telemetry emitted by nested storage calls. Its outer exit runs only after the pool
+        # guard has been released, so no host sink callback can re-enter a guarded pool door.
+        with defer_metrics():
+            with self._guard:  # type: ignore[attr-defined]
+                return method(self, *args, **kwargs)
 
     return wrapper
 
@@ -315,6 +337,7 @@ class BufferPool:
         "_storage",
         "_codec",
         "_metrics",
+        "_metrics_defer",
         "_budget_bytes",
         "_db_label",
         "_guard",
@@ -324,6 +347,7 @@ class BufferPool:
         "_page_size",
         "_frames",
         "_labels",
+        "_retained_labels",
         "_page_labels",
         "_data_labels",
         "_structure_epochs",
@@ -345,6 +369,7 @@ class BufferPool:
         budget_bytes: int,
         db_label: str,
         guard: AbstractContextManager[object] | None = None,
+        metrics_defer: Callable[[], AbstractContextManager[object]] | None = None,
         page_write_section: Callable[[str, PageIndex], AbstractContextManager[object]]
         | None = None,
         page_sequence_fence: Callable[[str, PageIndex], bool] | None = None,
@@ -353,6 +378,10 @@ class BufferPool:
         self._storage: StorageDevice = storage
         self._codec: PageCodec = codec
         self._metrics: MetricsSink = metrics
+        metrics_enabled = metrics.enabled
+        self._metrics_defer: Callable[[], AbstractContextManager[object]] | None = (
+            metrics_defer if metrics_enabled else None
+        )
         self._page_size: int = validate_page_size(storage.page_size)
         self._guard: AbstractContextManager[object] = (
             nullcontext() if guard is None else guard
@@ -384,6 +413,10 @@ class BufferPool:
         # Both label mappings belong to this instance. Nothing in this module holds data
         # that two databases could share, which is the structural half of FR-13 and BR-8.
         self._labels: dict[str, str] = {"db": self._db_label}
+        self._retained_labels: dict[str, str] = {
+            "db": self._db_label,
+            "estimator": BUFFER_RETAINED_ESTIMATOR_VERSION,
+        }
         self._page_labels: dict[str, str] = {"kind": "page"}
         self._data_labels: dict[str, str] = {"target": "data"}
         # Bumped whenever a page of a file is replaced wholesale, or the cache of that
@@ -394,10 +427,15 @@ class BufferPool:
         self._drop_epochs: dict[str, int] = {}
         self._every_file_drop: int = 0
         self._read_view_token: object = None
-        if metrics.enabled:
+        if metrics_enabled:
             for descriptor in BUFFER_POOL_METRICS:
                 metrics.register(descriptor)
             metrics.set_gauge(BUFFER_BUDGET_USED_BYTES, 0.0, self._labels)
+            metrics.set_gauge(
+                BUFFER_RETAINED_ESTIMATE_BYTES,
+                float(self._retained_bytes_estimate()),
+                self._retained_labels,
+            )
 
     # --- identity --------------------------------------------------------------------------
 
@@ -492,11 +530,112 @@ class BufferPool:
         """Return how many frames the budget can hold at once."""
         return self._budget_bytes // self._page_size
 
+    @property
+    def retained_bytes_estimator(self) -> str:
+        """Return the semantic version of :meth:`retained_bytes_estimate`."""
+        return BUFFER_RETAINED_ESTIMATOR_VERSION
+
     # --- residency -------------------------------------------------------------------------
 
     def used_bytes(self) -> int:
         """Return the bytes currently resident in this pool."""
         return len(self._frames) * self._page_size
+
+    @_guarded
+    def retained_bytes_estimate(self) -> int:
+        """Return the versioned estimate of Python memory this pool currently retains.
+
+        Unlike :meth:`used_bytes`, this diagnostic includes Page objects, slot directories,
+        frame wrappers and the pool's auxiliary bookkeeping.  It deliberately does not control
+        eviction in this release, so the long-standing nominal page budget remains compatible.
+        The walk follows only engine-owned objects and exact built-in containers; it never calls
+        a storage, codec, metrics or host callback.
+        """
+        return self._retained_bytes_estimate()
+
+    def _retained_bytes_estimate(self) -> int:
+        """Build the callback-free ``python-v1`` retained-object estimate under the guard."""
+        roots: tuple[object, ...] = (
+            self._frames,
+            self._doomed,
+            self._grown,
+            self._abandoned,
+            self._modified,
+            self._structure_epochs,
+            self._drop_epochs,
+            self._labels,
+            self._retained_labels,
+            self._page_labels,
+            self._data_labels,
+            self._work_probe,
+        )
+        stack = list(roots)
+        seen: set[int] = set()
+        pointer = calcsize("P")
+        retained = (2 + len(BufferPool.__slots__)) * pointer
+        while stack:
+            item = stack.pop()
+            identity = id(item)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            kind = type(item)
+            if item is None or kind is bool:
+                retained += pointer
+                continue
+            if kind in {int, float}:
+                retained += 4 * pointer
+                continue
+            if kind is str:
+                retained += 6 * pointer + len(item) * 4
+                continue
+            if kind in {bytes, bytearray}:
+                retained += 6 * pointer + len(item)
+                continue
+            if kind is tuple:
+                retained += (3 + len(item)) * pointer
+                stack.extend(item)
+                continue
+            if kind is list:
+                length = len(item)
+                capacity = length + length // 4 + (8 if length else 0)
+                retained += (5 + capacity) * pointer
+                stack.extend(item)
+                continue
+            if kind in {set, frozenset}:
+                retained += (8 + max(8, 2 * len(item))) * pointer
+                stack.extend(item)
+                continue
+            if kind in {dict, OrderedDict}:
+                links = 4 * len(item) if kind is OrderedDict else 0
+                retained += (8 + max(8, 3 * len(item)) + links) * pointer
+                for key, value in item.items():
+                    stack.append(key)
+                    stack.append(value)
+                continue
+            if kind is _Frame:
+                retained += (2 + len(_Frame.__slots__)) * pointer
+                stack.extend(
+                    (
+                        item.page,
+                        item.pins,
+                        item.doomed,
+                        item.discard_unwritten,
+                        item.device_base_seq,
+                    )
+                )
+                continue
+            if isinstance(item, Page):
+                retained += Page._retained_bytes_estimate_v1(item)
+                continue
+            if kind is _BufferWorkProbe:
+                retained += (2 + len(_BufferWorkProbe.__slots__)) * pointer
+                stack.extend((item.flushes, item.frames_examined))
+                continue
+            # No arbitrary object's traversal or __sizeof__ method is trusted while the pool
+            # guard is held. The current root set reaches this branch only if a future internal
+            # field acquires a new value type, where zero is safer than a host callback.
+        return retained
 
     @_guarded
     def _attach_work_probe(self, probe: _BufferWorkProbe) -> bool:
@@ -638,9 +777,13 @@ class BufferPool:
         adapters that do not need cross-process page fencing.
         """
         _require_page_index("page_index", page_index)
-        with self._guard:
-            with self._page_write_section(file, page_index):
-                yield
+        deferred = (
+            nullcontext() if self._metrics_defer is None else self._metrics_defer()
+        )
+        with deferred:
+            with self._guard:
+                with self._page_write_section(file, page_index):
+                    yield
 
     @contextmanager
     def _pinned(self, file: str, page_index: PageIndex) -> Iterator[Page]:
@@ -1656,6 +1799,11 @@ class BufferPool:
         if self._metrics.enabled:
             self._metrics.set_gauge(
                 BUFFER_BUDGET_USED_BYTES, float(self.used_bytes()), self._labels
+            )
+            self._metrics.set_gauge(
+                BUFFER_RETAINED_ESTIMATE_BYTES,
+                float(self._retained_bytes_estimate()),
+                self._retained_labels,
             )
 
     def __repr__(self) -> str:

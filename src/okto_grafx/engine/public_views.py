@@ -224,6 +224,9 @@ class StorageView:
     name: str
     page_size: int
     files: tuple[StorageFileView, ...]
+    descriptor_cache_hits: int | None = None
+    descriptor_cache_misses: int | None = None
+    descriptor_cache_evictions: int | None = None
 
     def list_files(self, prefix: str = "") -> tuple[str, ...]:
         """Return captured file names starting with ``prefix`` in stable order."""
@@ -364,10 +367,16 @@ class BufferPoolView:
     capacity_pages: int
     used_bytes_value: int
     db_label: str
+    retained_bytes_estimate_value: int
+    retained_bytes_estimator: str
 
     def used_bytes(self) -> int:
         """Return the resident byte count captured with this view."""
         return self.used_bytes_value
+
+    def retained_bytes_estimate(self) -> int:
+        """Return the versioned retained-memory estimate captured with this view."""
+        return self.retained_bytes_estimate_value
 
 
 @dataclass(frozen=True, slots=True)
@@ -3464,10 +3473,29 @@ def _storage_view(storage: Any) -> StorageView:
                 page_size,
             )
         )
+    hits: int | None = None
+    misses: int | None = None
+    evictions: int | None = None
+    descriptor_stats = getattr(storage, "descriptor_cache_stats", None)
+    if callable(descriptor_stats):
+        stats = descriptor_stats()
+        if stats is not None:
+            hits = _builtin_int(
+                getattr(stats, "hits"), field="storage.descriptor_cache_hits"
+            )
+            misses = _builtin_int(
+                getattr(stats, "misses"), field="storage.descriptor_cache_misses"
+            )
+            evictions = _builtin_int(
+                getattr(stats, "evictions"), field="storage.descriptor_cache_evictions"
+            )
     return StorageView(
         _builtin_text(storage.name, field="storage.name", empty=False),
         page_size,
         tuple(files),
+        hits,
+        misses,
+        evictions,
     )
 
 
@@ -3536,6 +3564,12 @@ def _pool_view(pool: Any) -> BufferPoolView:
         _builtin_int(pool.capacity_pages),
         _builtin_int(pool.used_bytes()),
         _builtin_text(pool.db_label, field="pool.db_label", empty=False),
+        _builtin_int(pool.retained_bytes_estimate()),
+        _builtin_text(
+            pool.retained_bytes_estimator,
+            field="pool.retained_bytes_estimator",
+            empty=False,
+        ),
     )
 
 

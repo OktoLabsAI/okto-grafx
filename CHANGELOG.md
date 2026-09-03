@@ -21,6 +21,11 @@ including the on-disk format.
 
 - Bumped the development version to `0.0.2` and started the bounded performance round governed by
   `GRAFX_PERFORMANCE_ROUND_FINAL.md`.
+- Added a separate, versioned `python-v1` estimate of Python memory retained by the buffer pool
+  without changing its nominal page admission budget. Descriptor-cache hits, misses and
+  capacity-driven evictions are now available as unlabelled metrics and immutable storage-view
+  counters; composed metric callbacks run only after the local storage and enclosing buffer-pool
+  guards are released.
 
 ## [0.0.1] — 2026-09-01
 
