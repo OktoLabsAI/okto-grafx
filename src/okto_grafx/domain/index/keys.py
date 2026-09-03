@@ -29,9 +29,11 @@ from okto_grafx.domain.page.checksum import crc32c
 __all__ = [
     "DEFAULT_BUCKET_COUNT",
     "MAX_BUCKET_COUNT",
+    "MAX_EXPECTED_CARDINALITY",
     "MIN_BUCKET_COUNT",
     "RECORD_ID_KEY_FORMAT_VERSION",
     "bucket_of",
+    "identity_index_sizing",
     "index_key",
     "record_id_key",
     "validate_bucket_count",
@@ -52,6 +54,14 @@ allocating a file the engine may never shrink (G6).
 DEFAULT_BUCKET_COUNT: int = 64
 """Buckets an index gets when its definition does not say. Small enough to stay cheap on a tiny
 database, large enough that the reference index really does spread keys across chains."""
+
+_TARGET_ENTRIES_PER_BUCKET: int = 64
+_AUTOMATIC_IDENTITY_MIN_EXPECTED: int = (
+    DEFAULT_BUCKET_COUNT * _TARGET_ENTRIES_PER_BUCKET
+)
+
+MAX_EXPECTED_CARDINALITY: int = MAX_BUCKET_COUNT * _TARGET_ENTRIES_PER_BUCKET
+"""Largest sizing hint representable by the eager hash directory."""
 
 RECORD_ID_KEY_FORMAT_VERSION: int = 1
 """Version tag prefixed to the canonical unsigned row-identity key."""
@@ -77,6 +87,51 @@ def validate_bucket_count(bucket_count: object) -> int:
             value=bucket_count,
         )
     return bucket_count
+
+
+def identity_index_sizing(visible_rows: object) -> tuple[int, int]:
+    """Return ``(expected_cardinality, bucket_count)`` for an automatic identity index.
+
+    The P2-ID v1 policy reserves one growth interval by doubling the rows visible in the fenced
+    build view, with the established 4096-entry floor.  Sixty-four expected entries share each
+    eagerly allocated bucket and the directory rounds upward to a power of two.  A request beyond
+    the finite eager-directory bound is refused rather than silently capped.
+    """
+
+    if isinstance(visible_rows, bool) or not isinstance(visible_rows, int):
+        raise GrafxIndexError(
+            "Automatic identity-index sizing needs an integer visible-row count; "
+            f"got {type(visible_rows).__name__}.",
+            field="visible_rows",
+            value=repr(visible_rows),
+        )
+    if visible_rows < 0:
+        raise GrafxIndexError(
+            "Automatic identity-index sizing needs a non-negative visible-row count; "
+            f"got {visible_rows}.",
+            field="visible_rows",
+            value=visible_rows,
+        )
+
+    expected = max(_AUTOMATIC_IDENTITY_MIN_EXPECTED, 2 * visible_rows)
+    if expected > MAX_EXPECTED_CARDINALITY:
+        raise GrafxIndexError(
+            "Automatic identity-index sizing exceeds the eager hash-directory limit: "
+            f"the largest representable expected cardinality is {MAX_EXPECTED_CARDINALITY}; "
+            f"{visible_rows} visible rows require {expected}.",
+            field="visible_rows",
+            value=visible_rows,
+            expected_cardinality=expected,
+            max_expected_cardinality=MAX_EXPECTED_CARDINALITY,
+        )
+
+    required = max(
+        MIN_BUCKET_COUNT,
+        (expected + _TARGET_ENTRIES_PER_BUCKET - 1)
+        // _TARGET_ENTRIES_PER_BUCKET,
+    )
+    bucket_count = 1 << (required - 1).bit_length()
+    return expected, validate_bucket_count(bucket_count)
 
 
 def index_key(values: Sequence[Value], positions: Sequence[int]) -> bytes:

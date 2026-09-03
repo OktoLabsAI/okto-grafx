@@ -72,6 +72,7 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import NO_CSN, RecordId, RecordRef
+from okto_grafx.domain.index.catalog import identity_index_name
 from okto_grafx.domain.index.definition import (
     RECORD_ID_KEY_DERIVATION,
     automatic_index_definitions,
@@ -7208,7 +7209,7 @@ def _endpoint_identity_index(
         )
 
     definition = candidates[0]
-    expected_name = f"rid_t_{table.table_id:08x}"
+    expected_name = identity_index_name(table.table_id)
     if (
         definition.name != expected_name
         or definition.table_id != table.table_id

@@ -25,7 +25,10 @@ from okto_grafx.domain.index.definition import (
     index_generation_file,
     require_index_name,
 )
-from okto_grafx.domain.index.keys import MAX_BUCKET_COUNT, validate_bucket_count
+from okto_grafx.domain.index.keys import (
+    MAX_EXPECTED_CARDINALITY,
+    validate_bucket_count,
+)
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.schema import is_identifier
 
@@ -34,6 +37,7 @@ __all__ = [
     "CatalogIndexDefinition",
     "IndexGenerationDescriptor",
     "IndexGenerationState",
+    "identity_index_name",
 ]
 
 IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY: str = "identity_secondary_indexes_v1"
@@ -43,7 +47,22 @@ _MAX_U32: int = 0xFFFFFFFF
 _MAX_U64: int = 0xFFFFFFFFFFFFFFFF
 _IDENTITY_INDEX_PREFIX: str = "rid_t_"
 _GENERATION_LOGICAL_NAME = re.compile(r"g_[0-9a-f]{16}", re.IGNORECASE)
-_MAX_EXPECTED_CARDINALITY: int = MAX_BUCKET_COUNT * 64
+
+
+def identity_index_name(table_id: object) -> str:
+    """Return the sole reserved logical identity-index name for one catalog table id."""
+
+    if (
+        isinstance(table_id, bool)
+        or not isinstance(table_id, int)
+        or not 1 <= table_id <= _MAX_U32
+    ):
+        raise GrafxIndexError(
+            "An identity index name needs a table_id between 1 and 4294967295.",
+            field="table_id",
+            value=repr(table_id),
+        )
+    return f"{_IDENTITY_INDEX_PREFIX}{table_id:08x}"
 
 
 class IndexGenerationState(str, Enum):
@@ -225,11 +244,11 @@ class CatalogIndexDefinition:
         if self.expected_cardinality is not None and (
             isinstance(self.expected_cardinality, bool)
             or not isinstance(self.expected_cardinality, int)
-            or not 1 <= self.expected_cardinality <= _MAX_EXPECTED_CARDINALITY
+            or not 1 <= self.expected_cardinality <= MAX_EXPECTED_CARDINALITY
         ):
             raise GrafxIndexError(
                 "An expected cardinality must fit the eager hash-directory limit "
-                f"1..{_MAX_EXPECTED_CARDINALITY}, or be None.",
+                f"1..{MAX_EXPECTED_CARDINALITY}, or be None.",
                 field="expected_cardinality",
                 value=repr(self.expected_cardinality),
                 index=self.name,
@@ -265,7 +284,7 @@ class CatalogIndexDefinition:
         occupies_identity_namespace = self.registry_key.startswith(
             _IDENTITY_INDEX_PREFIX
         )
-        expected_identity_name = f"{_IDENTITY_INDEX_PREFIX}{self.table_id:08x}"
+        expected_identity_name = identity_index_name(self.table_id)
         if is_identity:
             if self.positions:
                 raise GrafxIndexError(

@@ -36,6 +36,7 @@ from okto_grafx.domain.index.catalog import (
     CatalogIndexDefinition,
     IndexGenerationDescriptor,
     IndexGenerationState,
+    identity_index_name,
 )
 from okto_grafx.domain.index.definition import (
     COLUMN_KEY_DERIVATION,
@@ -868,7 +869,7 @@ class Catalog:
         if require_endpoint_identity or require_active_identity:
             for endpoint_name in sorted(endpoints):
                 table = self._tables[endpoint_name]
-                key = f"rid_t_{table.table_id:08x}"
+                key = identity_index_name(table.table_id)
                 identity = by_key.get(key)
                 if identity is None:
                     refuse(

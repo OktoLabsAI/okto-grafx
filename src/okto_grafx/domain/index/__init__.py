@@ -17,6 +17,7 @@ from okto_grafx.domain.index.catalog import (
     CatalogIndexDefinition,
     IndexGenerationDescriptor,
     IndexGenerationState,
+    identity_index_name,
 )
 from okto_grafx.domain.index.contract import SecondaryIndex, StagingTransaction
 from okto_grafx.domain.index.definition import (
@@ -45,9 +46,11 @@ from okto_grafx.domain.index.header import (
 from okto_grafx.domain.index.keys import (
     DEFAULT_BUCKET_COUNT,
     MAX_BUCKET_COUNT,
+    MAX_EXPECTED_CARDINALITY,
     MIN_BUCKET_COUNT,
     RECORD_ID_KEY_FORMAT_VERSION,
     bucket_of,
+    identity_index_sizing,
     index_key,
     record_id_key,
     validate_bucket_count,
@@ -86,6 +89,7 @@ __all__ = [
     "INDEX_HEADER_SLOT",
     "IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY",
     "MAX_BUCKET_COUNT",
+    "MAX_EXPECTED_CARDINALITY",
     "MAX_INDEX_KEY_BYTES",
     "MIN_BUCKET_COUNT",
     "RECORD_ID_KEY_DERIVATION",
@@ -108,6 +112,8 @@ __all__ = [
     "entry_visible",
     "index_file",
     "index_generation_file",
+    "identity_index_name",
+    "identity_index_sizing",
     "index_key",
     "record_id_key",
     "is_reclaimable",
