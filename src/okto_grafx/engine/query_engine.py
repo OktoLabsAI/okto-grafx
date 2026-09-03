@@ -101,11 +101,18 @@ from okto_grafx.domain.model.value import (
     Value,
     ValueType,
     VectorValue,
+    decode_value,
     encode_value,
     value_type_of,
 )
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
+from okto_grafx.domain.ports.query_spill import (
+    QuerySpillFactory,
+    QuerySpillSorter,
+    QuerySpillWorkspace,
+)
+from okto_grafx.domain.query.memory import LogicalMemoryBudget
 from okto_grafx.domain.txn.context import (
     SIZING_ENDPOINT,
     PendingRowRef,
@@ -1161,7 +1168,9 @@ class _SkipEffect:
     owner: object
 
 
-_SchemaEffect = _IndexSchemaEffect | _IndexObservationEffect | _VectorMapEffect | _SkipEffect
+_SchemaEffect = (
+    _IndexSchemaEffect | _IndexObservationEffect | _VectorMapEffect | _SkipEffect
+)
 
 
 class _EndpointLocatorCapacity(Exception):
@@ -1346,9 +1355,7 @@ class _EndpointIdentityLocator:
         self._cursor = None
         self._first.clear()
         self._closed = True
-        self._budget.release(
-            bytes_=self._charged_bytes, entries=self._charged_entries
-        )
+        self._budget.release(bytes_=self._charged_bytes, entries=self._charged_entries)
         self._charged_bytes = 0
         self._charged_entries = 0
 
@@ -1420,7 +1427,10 @@ class _EndpointTxnMemo:
         return slot
 
     def install(
-        self, table_id: int, slot: _EndpointLocatorSlot, locator: _EndpointIdentityLocator
+        self,
+        table_id: int,
+        slot: _EndpointLocatorSlot,
+        locator: _EndpointIdentityLocator,
     ) -> bool:
         """Publish a fully built locator only while its paid slot is still live."""
         if (
@@ -2031,6 +2041,8 @@ class QueryEngine:
         "_max_statement_writes",
         "_max_result_rows",
         "_max_intermediate_rows",
+        "_query_memory_budget_bytes",
+        "_query_spill",
         "_max_traversal_expansions",
         "_max_traversal_paths",
     )
@@ -2051,6 +2063,8 @@ class QueryEngine:
         max_statement_writes: int | None = None,
         max_result_rows: int | None = None,
         max_intermediate_rows: int | None = None,
+        query_memory_budget_bytes: int | None = None,
+        query_spill: QuerySpillFactory | None = None,
         max_traversal_expansions: int | None = None,
         max_traversal_paths: int | None = None,
     ) -> None:
@@ -2114,6 +2128,19 @@ class QueryEngine:
         self._max_intermediate_rows = _require_optional_positive_limit(
             "max_intermediate_rows", max_intermediate_rows
         )
+        self._query_memory_budget_bytes = _require_optional_positive_limit(
+            "query_memory_budget_bytes", query_memory_budget_bytes
+        )
+        if self._query_memory_budget_bytes is not None and not isinstance(
+            query_spill, QuerySpillFactory
+        ):
+            raise GrafxConfigurationError(
+                "query_memory_budget_bytes needs a QuerySpillFactory supplied by the "
+                "composition root.",
+                field="query_spill",
+                value=type(query_spill).__name__,
+            )
+        self._query_spill = query_spill
         self._max_traversal_expansions = _require_optional_positive_limit(
             "max_traversal_expansions", max_traversal_expansions
         )
@@ -2310,7 +2337,9 @@ class QueryEngine:
             _validate_bound_subscript_types(plan, bound)
             _validate_bound_label_arguments(plan, bound)
             rows = self._rows(root.child, context)
-            elapsed = self._clock.monotonic() - started if self._metrics.enabled else 0.0
+            elapsed = (
+                self._clock.monotonic() - started if self._metrics.enabled else 0.0
+            )
             return _QueryResultCursor(
                 engine=self,
                 root=root,
@@ -2353,18 +2382,18 @@ class QueryEngine:
         # exist. Withholding it plans the scan the engine planned before any index existed, which
         # is slower and right. The index says so itself through `stale`, and `Database.
         # stale_indexes` is where an operator sees which ones need rebuilding.
-        tables = {
-            (table.table_id, table.name): table for table in catalog.tables()
-        }
+        tables = {(table.table_id, table.name): table for table in catalog.tables()}
         return tuple(
             index.definition
             for index in listing()
             if not getattr(index, "stale", False)
             and index.definition.table_id not in without_indexes_for
             and (
-                (table := tables.get(
-                    (index.definition.table_id, index.definition.table_name)
-                ))
+                (
+                    table := tables.get(
+                        (index.definition.table_id, index.definition.table_name)
+                    )
+                )
                 is not None
                 and index_definition_matches_table(index.definition, table)
             )
@@ -2440,7 +2469,14 @@ class QueryEngine:
         _validate_bound_subscript_types(plan, parameters)
         _validate_bound_label_arguments(plan, parameters)
         stream = self._rows(root.child, context)
-        rows = self._collect_result_rows(stream) if root.columns else tuple(stream)
+        stream_failure: BaseException | None = None
+        try:
+            rows = self._collect_result_rows(stream) if root.columns else tuple(stream)
+        except BaseException as caught:
+            stream_failure = caught
+            raise
+        finally:
+            _close_iterator(stream, stream_failure)
         context.release()
         produced: tuple[tuple[Value, ...], ...] = ()
         if root.columns:
@@ -2465,6 +2501,40 @@ class QueryEngine:
         if self._max_intermediate_rows is None or node is context.result_node:
             return rows
         return self._admit_intermediate_rows(node, context, rows)
+
+    def _spill_workspace(
+        self, operator: str
+    ) -> tuple[QuerySpillWorkspace, LogicalMemoryBudget]:
+        """Open the configured adapter workspace for one blocking physical operator."""
+        limit = self._query_memory_budget_bytes
+        factory = self._query_spill
+        if limit is None or factory is None:
+            raise GrafxConfigurationError(
+                "A bounded query spill was requested without its configured adapter.",
+                field="query_spill",
+                value="missing",
+            )
+        budget = LogicalMemoryBudget(limit, operator=operator)
+        try:
+            workspace = factory.open(budget)
+        except GrafxError:
+            raise
+        except Exception as failure:
+            raise GrafxConfigurationError(
+                "The query spill adapter could not open a workspace.",
+                field="query_spill",
+                value=type(failure).__name__,
+            ) from failure
+        if not isinstance(workspace, QuerySpillWorkspace):
+            closer = getattr(workspace, "close", None)
+            if callable(closer):
+                closer()
+            raise GrafxConfigurationError(
+                "The query spill adapter returned a malformed workspace.",
+                field="query_spill",
+                value=type(workspace).__name__,
+            )
+        return workspace, budget
 
     def _collect_result_rows(self, rows: Iterator[_Row]) -> tuple[_Row, ...]:
         """Collect public results incrementally, refusing before retaining row limit + 1."""
@@ -2667,9 +2737,7 @@ class QueryEngine:
         added to the skip report -- so another open transaction's attachments are untouched.
         """
         boundary = (
-            self._schema_artifact_section(
-                sync_if=self._needs_committed_artifact_sync
-            )
+            self._schema_artifact_section(sync_if=self._needs_committed_artifact_sync)
             if self._schema_artifact_section is not None
             else nullcontext()
         )
@@ -2691,9 +2759,7 @@ class QueryEngine:
                         if callable(drop):
                             drop(effect.artifact)
                     elif isinstance(effect, _VectorMapEffect):
-                        settle = getattr(
-                            self._vectors, "_settle_attachment", None
-                        )
+                        settle = getattr(self._vectors, "_settle_attachment", None)
                         if callable(settle):
                             settle(
                                 effect.space,
@@ -2839,16 +2905,12 @@ class QueryEngine:
         if committed:
             for effect in effects or ():
                 if isinstance(effect, _IndexSchemaEffect):
-                    settle_index = getattr(
-                        self._indexes, "settle_speculative", None
-                    )
+                    settle_index = getattr(self._indexes, "settle_speculative", None)
                     if callable(settle_index):
                         settle_index(effect.artifact, committed=True)
                     continue
                 if isinstance(effect, _VectorMapEffect):
-                    settle = getattr(
-                        self._vectors, "_settle_attachment", None
-                    )
+                    settle = getattr(self._vectors, "_settle_attachment", None)
                     if callable(settle):
                         settle(
                             effect.space,
@@ -2945,9 +3007,7 @@ class QueryEngine:
         )
         return registered
 
-    def _record_skipped_index(
-        self, table_name: str, undo: list[_SchemaEffect]
-    ) -> None:
+    def _record_skipped_index(self, table_name: str, undo: list[_SchemaEffect]) -> None:
         """Acquire one owner token for a speculative unindexed-table diagnostic."""
         owner = object()
         self._skip_claims.setdefault(table_name, set()).add(owner)
@@ -4503,10 +4563,967 @@ def _passes(operator: str | None, score: float, threshold: float) -> bool:
     return True
 
 
+_SPILL_KEY_HEADER = b"OGQK\x01"
+_SPILL_PAYLOAD_HEADER = b"OGQP\x01"
+_SPILL_BIG_INTEGER = b"OGQI\x01"
+_SPILL_NAN_IDENTITY = b"OGQN\x01"
+_SPILL_VECTOR_IDENTITY = b"OGQW\x01"
+_SPILL_VALUE_SCALAR = b"OGQV\x01"
+_SPILL_VALUE_SEQUENCE = b"OGQL\x01"
+_SPILL_VALUE_MAP = b"OGQM\x01"
+_SPILL_VALUE_PATH = b"OGQH\x01"
+_SPILL_VALUE_BINDING = b"OGQB\x01"
+_SPILL_VALUE_PENDING = b"OGQR\x01"
+_AGGREGATE_GROUP_OVERHEAD = 64
+_AGGREGATE_SLOT_OVERHEAD = 64
+_AGGREGATE_VALUE_OVERHEAD = 16
+_NAN_IDENTITY_OVERHEAD = 64
+_HELD_BINDING_OVERHEAD = 128
+
+
+class _NaNIdentityRegistry:
+    """Keep NaN identities live and bounded for legacy grouping/distinct semantics.
+
+    Python's existing frozen query signatures treat a repeated NaN object as the same value,
+    but independently created NaNs as different values. An integer ``id`` alone cannot preserve
+    that rule once streaming releases an object because the allocator may reuse its address. The
+    registry therefore authenticates every lookup with ``is`` and holds a strong reference until
+    the blocking aggregate closes. Each retained identity has one documented fixed logical
+    charge, so this otherwise unspillable bit of interpreter identity remains bounded.
+    """
+
+    __slots__ = ("_workspace", "_entries", "_next_token", "_closed")
+
+    def __init__(self, workspace: QuerySpillWorkspace) -> None:
+        self._workspace = workspace
+        self._entries: dict[int, tuple[float, int]] = {}
+        self._next_token = 0
+        self._closed = False
+
+    def token(self, value: float) -> int:
+        """Return one stable token per live object, never merely per reused address."""
+        if self._closed:
+            raise RuntimeError("A closed NaN identity registry cannot be reused.")
+        identity = id(value)
+        existing = self._entries.get(identity)
+        if existing is not None:
+            if (
+                existing[0] is not value
+            ):  # pragma: no cover - a strong ref forbids reuse
+                raise RuntimeError("A live NaN identity was reused by the interpreter.")
+            return existing[1]
+        self._workspace.reserve(
+            _NAN_IDENTITY_OVERHEAD,
+            reason="aggregate_nan_identity",
+        )
+        token = self._next_token
+        try:
+            self._entries[identity] = (value, token)
+        except BaseException:
+            self._workspace.release(_NAN_IDENTITY_OVERHEAD)
+            raise
+        self._next_token += 1
+        return token
+
+    def close(self) -> None:
+        """Release every fixed identity slot; idempotent."""
+        if self._closed:
+            return
+        retained = len(self._entries) * _NAN_IDENTITY_OVERHEAD
+        self._entries.clear()
+        if retained:
+            self._workspace.release(retained)
+        self._closed = True
+
+
+def _spill_encode(value: Value, *, key: bool) -> bytes:
+    """Encode one temporary query value behind a purpose/version header."""
+    return (_SPILL_KEY_HEADER if key else _SPILL_PAYLOAD_HEADER) + encode_value(value)
+
+
+def _spill_decode(payload: bytes, *, key: bool) -> Value:
+    """Decode one complete temporary value, refusing cross-purpose or trailing bytes."""
+    if type(payload) is not bytes:
+        raise GrafxCorruptionDetected(
+            "A temporary query spill record is not immutable bytes.",
+            field="query_spill.record",
+            value=type(payload).__name__,
+        )
+    header = _SPILL_KEY_HEADER if key else _SPILL_PAYLOAD_HEADER
+    if not payload.startswith(header):
+        raise GrafxCorruptionDetected(
+            "A temporary query spill record has an invalid purpose or version header.",
+            field="query_spill.header",
+            value="invalid",
+        )
+    value, following = decode_value(payload, len(header))
+    if following != len(payload):
+        raise GrafxCorruptionDetected(
+            "A temporary query spill record carries trailing bytes.",
+            field="query_spill.record",
+            value="trailing_bytes",
+            offset=following,
+            available=len(payload),
+        )
+    return value
+
+
+def _spill_pack_internal(
+    value: object,
+    *,
+    nan_identities: _NaNIdentityRegistry | None = None,
+) -> Value:
+    """Map engine-private comparison/signature shapes onto the safe Value codec."""
+    if type(value) is int and not INT64_MIN <= value <= INT64_MAX:
+        return (_SPILL_BIG_INTEGER, str(value))
+    if isinstance(value, float):
+        if isnan(value) and nan_identities is not None:
+            return (_SPILL_NAN_IDENTITY, str(nan_identities.token(value)))
+        # Python equality intentionally treats both signed zeros as one frozen key. Their IEEE
+        # encodings differ, so byte-keyed grouping must canonicalise the sign to stay equivalent
+        # to the in-memory set/dict path.
+        if value == 0.0:
+            return 0.0
+    if isinstance(value, VectorValue):
+        # The durable Value codec rounds VECTOR_F32 components. A query parameter may still carry
+        # two unequal Python floats which round to the same durable bytes, while signed zeros are
+        # equal in the existing in-memory semantics. Encode an explicit identity shape with f64
+        # component values so spill is both injective for unequal values and canonical for zeros.
+        return (
+            _SPILL_VECTOR_IDENTITY,
+            value.dtype,
+            value.space_ref,
+            tuple(
+                _spill_pack_internal(component, nan_identities=nan_identities)
+                for component in value.values
+            ),
+        )
+    if isinstance(value, tuple):
+        return tuple(
+            _spill_pack_internal(item, nan_identities=nan_identities) for item in value
+        )
+    if isinstance(value, list):
+        return tuple(
+            _spill_pack_internal(item, nan_identities=nan_identities) for item in value
+        )
+    if isinstance(value, dict):
+        return {
+            _spill_pack_internal(
+                item, nan_identities=nan_identities
+            ): _spill_pack_internal(nested, nan_identities=nan_identities)
+            for item, nested in value.items()
+        }
+    return cast(Value, value)
+
+
+def _spill_unpack_internal(value: Value) -> object:
+    """Reverse :func:`_spill_pack_internal` for trusted comparison records."""
+    if isinstance(value, tuple):
+        if len(value) == 2 and value[0] == _SPILL_BIG_INTEGER:
+            encoded = value[1]
+            if not isinstance(encoded, str):
+                raise GrafxCorruptionDetected(
+                    "A temporary query spill integer marker is malformed.",
+                    field="query_spill.key",
+                    value="invalid_integer",
+                )
+            try:
+                return int(encoded)
+            except ValueError as failure:
+                raise GrafxCorruptionDetected(
+                    "A temporary query spill integer marker is malformed.",
+                    field="query_spill.key",
+                    value="invalid_integer",
+                ) from failure
+        if len(value) == 2 and value[0] == _SPILL_NAN_IDENTITY:
+            identity = value[1]
+            if (
+                not isinstance(identity, str)
+                or not identity.isascii()
+                or not identity.isdigit()
+            ):
+                raise GrafxCorruptionDetected(
+                    "A temporary query spill NaN marker is malformed.",
+                    field="query_spill.key",
+                    value="invalid_nan_identity",
+                )
+            return ("nan_identity", int(identity))
+        return tuple(_spill_unpack_internal(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            _spill_unpack_internal(item): _spill_unpack_internal(nested)
+            for item, nested in value.items()
+        }
+    return value
+
+
+def _spill_signature(
+    value: object,
+    nan_identities: _NaNIdentityRegistry,
+) -> bytes:
+    """Return a safe exact byte identity for one existing frozen query signature."""
+    return _spill_encode(
+        _spill_pack_internal(_freeze(value), nan_identities=nan_identities),
+        key=True,
+    )
+
+
+def _spill_path_value(value: _PathValue) -> Value:
+    """Encode one capability-free path DTO without collapsing its nominal validation."""
+
+    def identity(item: _PathIdentity) -> Value:
+        return (item.offset, item.table)
+
+    nodes: tuple[Value, ...] = tuple(
+        (
+            identity(node.identity),
+            node.label,
+            tuple((name, _spill_detach_value(item)) for name, item in node.properties),
+        )
+        for node in value.nodes
+    )
+    relationships: tuple[Value, ...] = tuple(
+        (
+            identity(relationship.source),
+            identity(relationship.target),
+            relationship.label,
+            identity(relationship.identity),
+            tuple(
+                (name, _spill_detach_value(item))
+                for name, item in relationship.properties
+            ),
+        )
+        for relationship in value.relationships
+    )
+    return (_SPILL_VALUE_PATH, nodes, relationships)
+
+
+def _spill_detach_value(value: object) -> Value:
+    """Remove row/page capabilities before a value crosses into the spill adapter."""
+    if type(value) is _PathValue:
+        return _spill_path_value(value)
+    if isinstance(value, RowBinding):
+        return _spill_detach_value(_as_value(value))
+    if isinstance(value, (list, tuple)):
+        return (
+            _SPILL_VALUE_SEQUENCE,
+            tuple(_spill_detach_value(item) for item in value),
+        )
+    if isinstance(value, dict):
+        return (
+            _SPILL_VALUE_MAP,
+            tuple(
+                (_spill_detach_value(item), _spill_detach_value(nested))
+                for item, nested in value.items()
+            ),
+        )
+    return (_SPILL_VALUE_SCALAR, cast(Value, value))
+
+
+def _spill_restore_identity(value: Value, *, field: str) -> _PathIdentity:
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 2
+        or type(value[0]) is not int
+        or type(value[1]) is not int
+    ):
+        raise GrafxCorruptionDetected(
+            "A temporary projected-path identity is malformed.",
+            field=field,
+            value="path_identity",
+        )
+    return _PathIdentity(offset=value[0], table=value[1])
+
+
+def _spill_restore_properties(
+    value: Value, *, field: str
+) -> tuple[tuple[str, Value], ...]:
+    if not isinstance(value, tuple):
+        raise GrafxCorruptionDetected(
+            "Temporary projected-path properties are malformed.",
+            field=field,
+            value="path_properties",
+        )
+    restored: list[tuple[str, Value]] = []
+    for position, pair in enumerate(value):
+        if (
+            not isinstance(pair, tuple)
+            or len(pair) != 2
+            or not isinstance(pair[0], str)
+        ):
+            raise GrafxCorruptionDetected(
+                "A temporary projected-path property is malformed.",
+                field=field,
+                value=position,
+            )
+        restored.append((pair[0], _spill_restore_value(pair[1])))
+    return tuple(restored)
+
+
+def _spill_restore_path(value: tuple[Value, ...]) -> _PathValue:
+    if (
+        len(value) != 3
+        or not isinstance(value[1], tuple)
+        or not isinstance(value[2], tuple)
+    ):
+        raise GrafxCorruptionDetected(
+            "A temporary projected path is malformed.",
+            field="query_spill.path",
+            value="path",
+        )
+    nodes: list[_PathNodeValue] = []
+    for position, item in enumerate(value[1]):
+        if (
+            not isinstance(item, tuple)
+            or len(item) != 3
+            or not isinstance(item[1], str)
+        ):
+            raise GrafxCorruptionDetected(
+                "A temporary projected path node is malformed.",
+                field="query_spill.path",
+                value=position,
+            )
+        nodes.append(
+            _PathNodeValue(
+                identity=_spill_restore_identity(
+                    item[0], field="query_spill.path.node_identity"
+                ),
+                label=item[1],
+                properties=_spill_restore_properties(
+                    item[2], field="query_spill.path.node_properties"
+                ),
+            )
+        )
+    relationships: list[_PathRelationshipValue] = []
+    for position, item in enumerate(value[2]):
+        if (
+            not isinstance(item, tuple)
+            or len(item) != 5
+            or not isinstance(item[2], str)
+        ):
+            raise GrafxCorruptionDetected(
+                "A temporary projected path relationship is malformed.",
+                field="query_spill.path",
+                value=position,
+            )
+        relationships.append(
+            _PathRelationshipValue(
+                source=_spill_restore_identity(
+                    item[0], field="query_spill.path.relationship_source"
+                ),
+                target=_spill_restore_identity(
+                    item[1], field="query_spill.path.relationship_target"
+                ),
+                label=item[2],
+                identity=_spill_restore_identity(
+                    item[3], field="query_spill.path.relationship_identity"
+                ),
+                properties=_spill_restore_properties(
+                    item[4], field="query_spill.path.relationship_properties"
+                ),
+            )
+        )
+    return _PathValue(nodes=tuple(nodes), relationships=tuple(relationships))  # type: ignore[arg-type]
+
+
+def _spill_restore_value(value: Value) -> Value:
+    """Restore exactly one tagged detached query value from a spill payload."""
+    if not isinstance(value, tuple) or not value or type(value[0]) is not bytes:
+        raise GrafxCorruptionDetected(
+            "A temporary detached query value is malformed.",
+            field="query_spill.value",
+            value="untagged",
+        )
+    tag = value[0]
+    if tag == _SPILL_VALUE_SCALAR and len(value) == 2:
+        if value_type_of(value[1]) not in (ValueType.LIST, ValueType.MAP):
+            return value[1]
+    if tag == _SPILL_VALUE_SEQUENCE and len(value) == 2 and isinstance(value[1], tuple):
+        return tuple(_spill_restore_value(item) for item in value[1])
+    if tag == _SPILL_VALUE_MAP and len(value) == 2 and isinstance(value[1], tuple):
+        restored: dict[Value, Value] = {}
+        for position, pair in enumerate(value[1]):
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise GrafxCorruptionDetected(
+                    "A temporary detached query map is malformed.",
+                    field="query_spill.value",
+                    value=position,
+                )
+            key = _spill_restore_value(pair[0])
+            try:
+                restored[key] = _spill_restore_value(pair[1])
+            except TypeError as failure:
+                raise GrafxCorruptionDetected(
+                    "A temporary detached query map has an unhashable key.",
+                    field="query_spill.value",
+                    value=position,
+                ) from failure
+        return restored
+    if tag == _SPILL_VALUE_PATH:
+        return cast(Value, _spill_restore_path(value))
+    raise GrafxCorruptionDetected(
+        "A temporary detached query value has an unknown tag or shape.",
+        field="query_spill.value",
+        value="invalid_tag",
+    )
+
+
+def _spill_private_int(value: Value, *, field: str) -> int:
+    """Decode one engine-private integer represented through the safe Value codec."""
+    unpacked = _spill_unpack_internal(value)
+    if type(unpacked) is not int:
+        raise GrafxCorruptionDetected(
+            "A temporary query row carries a malformed private integer.",
+            field=field,
+            value=type(unpacked).__name__,
+        )
+    return unpacked
+
+
+class _SpillRowCodec:
+    """Safely detach and restore a projected row without retaining one capability per row."""
+
+    __slots__ = (
+        "_context",
+        "_workspace",
+        "_expressions",
+        "_expression_tokens",
+        "_held_by_identity",
+        "_held_by_token",
+        "_held_bytes",
+        "_closed",
+    )
+
+    def __init__(self, context: _Context, workspace: QuerySpillWorkspace) -> None:
+        self._context = context
+        self._workspace = workspace
+        self._expressions: list[Expression] = []
+        self._expression_tokens: dict[Expression, int] = {}
+        self._held_by_identity: dict[int, tuple[HeapVersion, int, int]] = {}
+        self._held_by_token: dict[int, HeapVersion] = {}
+        self._held_bytes = 0
+        self._closed = False
+
+    def encode(self, row: _Row) -> bytes:
+        """Encode bindings, computed expressions and columns behind one versioned envelope."""
+        if self._closed:
+            raise RuntimeError("A closed spill row codec cannot be reused.")
+        bindings: tuple[Value, ...] = tuple(
+            (name, self._detach(value)) for name, value in row.bindings.items()
+        )
+        computed: Value = (
+            None
+            if row.computed is None
+            else tuple(
+                (self._expression_token(expression), self._detach(value))
+                for expression, value in row.computed.items()
+            )
+        )
+        columns: Value = (
+            None
+            if row.columns is None
+            else tuple(
+                (name, self._detach(value)) for name, value in row.columns.items()
+            )
+        )
+        return _spill_encode(
+            ("operator-row", bindings, computed, columns),
+            key=False,
+        )
+
+    def decode(self, payload: bytes) -> _Row:
+        """Restore one row using only its safe bytes and plan/catalog objects already retained."""
+        value = _spill_decode(payload, key=False)
+        if (
+            not isinstance(value, tuple)
+            or len(value) != 4
+            or value[0] != "operator-row"
+            or not isinstance(value[1], tuple)
+            or (value[2] is not None and not isinstance(value[2], tuple))
+            or (value[3] is not None and not isinstance(value[3], tuple))
+        ):
+            raise GrafxCorruptionDetected(
+                "A temporary query operator row is malformed.",
+                field="query_spill.record",
+                value="operator_row",
+            )
+        bindings = self._named_values(value[1], field="query_spill.row.bindings")
+        computed: dict[Expression, object] | None = None
+        if isinstance(value[2], tuple):
+            computed = {}
+            for position, pair in enumerate(value[2]):
+                if (
+                    not isinstance(pair, tuple)
+                    or len(pair) != 2
+                    or type(pair[0]) is not int
+                    or not 0 <= pair[0] < len(self._expressions)
+                ):
+                    raise GrafxCorruptionDetected(
+                        "A temporary query row carries a malformed computed expression.",
+                        field="query_spill.row.computed",
+                        value=position,
+                    )
+                expression = self._expressions[pair[0]]
+                if expression in computed:
+                    raise GrafxCorruptionDetected(
+                        "A temporary query row repeats a computed expression.",
+                        field="query_spill.row.computed",
+                        value=position,
+                    )
+                computed[expression] = self._restore(pair[1])
+        columns = (
+            None
+            if value[3] is None
+            else self._named_values(value[3], field="query_spill.row.columns")
+        )
+        return _Row(bindings=bindings, computed=computed, columns=columns)
+
+    def close(self) -> None:
+        """Release the bounded identities that cannot be reconstructed from value bytes."""
+        if self._closed:
+            return
+        self._held_by_identity.clear()
+        self._held_by_token.clear()
+        retained = self._held_bytes
+        self._held_bytes = 0
+        if retained:
+            self._workspace.release(retained)
+        self._closed = True
+
+    def _expression_token(self, expression: Expression) -> int:
+        token = self._expression_tokens.get(expression)
+        if token is not None:
+            return token
+        token = len(self._expressions)
+        self._expressions.append(expression)
+        self._expression_tokens[expression] = token
+        return token
+
+    def _held_token(self, version: HeapVersion) -> int:
+        identity = id(version)
+        existing = self._held_by_identity.get(identity)
+        if existing is not None:
+            if (
+                existing[0] is not version
+            ):  # pragma: no cover - a strong ref forbids reuse
+                raise RuntimeError(
+                    "A live held-row identity was reused by the interpreter."
+                )
+            return existing[1]
+        token = len(self._held_by_token)
+        detached_values = self._detach(version.values)
+        charge = _HELD_BINDING_OVERHEAD + len(_spill_encode(detached_values, key=False))
+        self._workspace.reserve(charge, reason="distinct_held_binding_identity")
+        try:
+            self._held_by_identity[identity] = (version, token, charge)
+            self._held_by_token[token] = version
+        except BaseException:
+            self._held_by_identity.pop(identity, None)
+            self._held_by_token.pop(token, None)
+            self._workspace.release(charge)
+            raise
+        self._held_bytes += charge
+        return token
+
+    def _detach(self, value: object) -> Value:
+        if isinstance(value, RowBinding):
+            reference: Value
+            if isinstance(value.ref, PendingRowRef):
+                reference = (
+                    "pending",
+                    _spill_pack_internal(value.ref.txn_id),
+                    _spill_pack_internal(value.ref.table_id),
+                    _spill_pack_internal(value.ref.token),
+                )
+            elif value.ref is None and value.record_id == 0:
+                reference = ("held", self._held_token(value.version))
+            else:
+                reference = ("stored",)
+            return (
+                _SPILL_VALUE_BINDING,
+                value.variable,
+                value.table.table_id,
+                reference,
+                _spill_pack_internal(value.record_id),
+                self._detach(value.version.values),
+                value.polymorphic,
+            )
+        if isinstance(value, PendingRowRef):
+            return (
+                _SPILL_VALUE_PENDING,
+                _spill_pack_internal(value.txn_id),
+                _spill_pack_internal(value.table_id),
+                _spill_pack_internal(value.token),
+            )
+        if type(value) is _PathValue:
+            return _spill_path_value(value)
+        if isinstance(value, (list, tuple)):
+            return (
+                _SPILL_VALUE_SEQUENCE,
+                tuple(self._detach(item) for item in value),
+            )
+        if isinstance(value, dict):
+            return (
+                _SPILL_VALUE_MAP,
+                tuple(
+                    (self._detach(item), self._detach(nested))
+                    for item, nested in value.items()
+                ),
+            )
+        return (_SPILL_VALUE_SCALAR, cast(Value, value))
+
+    def _restore(self, value: Value) -> object:
+        if not isinstance(value, tuple) or not value or type(value[0]) is not bytes:
+            raise GrafxCorruptionDetected(
+                "A temporary detached operator value is malformed.",
+                field="query_spill.value",
+                value="untagged_operator_value",
+            )
+        tag = value[0]
+        if tag == _SPILL_VALUE_BINDING:
+            return self._restore_binding(value)
+        if tag == _SPILL_VALUE_PENDING:
+            return self._restore_pending(value)
+        if tag == _SPILL_VALUE_SCALAR and len(value) == 2:
+            kind = value_type_of(value[1])
+            if kind not in (ValueType.LIST, ValueType.MAP):
+                return value[1]
+        if (
+            tag == _SPILL_VALUE_SEQUENCE
+            and len(value) == 2
+            and isinstance(value[1], tuple)
+        ):
+            return tuple(self._restore(item) for item in value[1])
+        if tag == _SPILL_VALUE_MAP and len(value) == 2 and isinstance(value[1], tuple):
+            restored: dict[object, object] = {}
+            for position, pair in enumerate(value[1]):
+                if not isinstance(pair, tuple) or len(pair) != 2:
+                    raise GrafxCorruptionDetected(
+                        "A temporary detached operator map is malformed.",
+                        field="query_spill.value",
+                        value=position,
+                    )
+                key = self._restore(pair[0])
+                try:
+                    restored[key] = self._restore(pair[1])
+                except TypeError as failure:
+                    raise GrafxCorruptionDetected(
+                        "A temporary detached operator map has an unhashable key.",
+                        field="query_spill.value",
+                        value=position,
+                    ) from failure
+            return restored
+        if tag == _SPILL_VALUE_PATH:
+            return _spill_restore_path(value)
+        raise GrafxCorruptionDetected(
+            "A temporary detached operator value has an unknown tag or shape.",
+            field="query_spill.value",
+            value="invalid_operator_tag",
+        )
+
+    def _restore_pending(self, value: tuple[Value, ...]) -> PendingRowRef:
+        if len(value) != 4:
+            raise GrafxCorruptionDetected(
+                "A temporary pending-row identity is malformed.",
+                field="query_spill.row.binding",
+                value="pending_shape",
+            )
+        txn_id = _spill_private_int(value[1], field="query_spill.row.binding")
+        table_id = _spill_private_int(value[2], field="query_spill.row.binding")
+        token = _spill_private_int(value[3], field="query_spill.row.binding")
+        if txn_id < 1 or table_id < 1 or token >= 0:
+            raise GrafxCorruptionDetected(
+                "A temporary pending-row identity is outside its private domain.",
+                field="query_spill.row.binding",
+                value="pending_domain",
+            )
+        return PendingRowRef(txn_id=txn_id, table_id=table_id, token=token)
+
+    def _restore_binding(self, value: tuple[Value, ...]) -> RowBinding:
+        if (
+            len(value) != 7
+            or not isinstance(value[1], str)
+            or type(value[2]) is not int
+            or not isinstance(value[3], tuple)
+            or type(value[6]) is not bool
+        ):
+            raise GrafxCorruptionDetected(
+                "A temporary row binding is malformed.",
+                field="query_spill.row.binding",
+                value="binding_shape",
+            )
+        table = self._context.schema().table_by_id(value[2])
+        record_id = _spill_private_int(value[4], field="query_spill.row.binding")
+        restored_values = self._restore(value[5])
+        if not isinstance(restored_values, tuple) or len(restored_values) > table.arity:
+            raise GrafxCorruptionDetected(
+                "A temporary row binding carries malformed values.",
+                field="query_spill.row.binding",
+                value="binding_values",
+            )
+        reference = value[3]
+        version: HeapVersion
+        ref: object
+        if len(reference) == 2 and reference[0] == "held" and type(reference[1]) is int:
+            try:
+                version = self._held_by_token[reference[1]]
+            except KeyError as failure:
+                raise GrafxCorruptionDetected(
+                    "A temporary row binding names an unknown held identity.",
+                    field="query_spill.row.binding",
+                    value="unknown_held_identity",
+                ) from failure
+            ref = None
+        else:
+            version = HeapVersion(
+                record_id=record_id,
+                xmin=0,
+                xmax=0,
+                values=cast(tuple[Value, ...], restored_values),
+                prev=None,
+                schema_version=table.schema_version,
+                deleted=False,
+                table_id=table.table_id,
+            )
+            if len(reference) == 1 and reference[0] == "stored":
+                if record_id < 1:
+                    raise GrafxCorruptionDetected(
+                        "A temporary stored binding has no durable record identity.",
+                        field="query_spill.row.binding",
+                        value=record_id,
+                    )
+                ref = None
+            elif len(reference) == 4 and reference[0] == "pending":
+                ref = self._restore_pending(
+                    cast(tuple[Value, ...], (_SPILL_VALUE_PENDING, *reference[1:]))
+                )
+                if ref.table_id != table.table_id:
+                    raise GrafxCorruptionDetected(
+                        "A temporary pending binding disagrees with its table.",
+                        field="query_spill.row.binding",
+                        value=ref.table_id,
+                    )
+            else:
+                raise GrafxCorruptionDetected(
+                    "A temporary row binding carries an unknown reference kind.",
+                    field="query_spill.row.binding",
+                    value="binding_reference",
+                )
+        return RowBinding(
+            variable=value[1],
+            table=table,
+            ref=ref,
+            version=version,
+            polymorphic=value[6],
+        )
+
+    def _named_values(
+        self, value: tuple[Value, ...], *, field: str
+    ) -> dict[str, object]:
+        restored: dict[str, object] = {}
+        for position, pair in enumerate(value):
+            if (
+                not isinstance(pair, tuple)
+                or len(pair) != 2
+                or not isinstance(pair[0], str)
+                or pair[0] in restored
+            ):
+                raise GrafxCorruptionDetected(
+                    "A temporary query row carries malformed named values.",
+                    field=field,
+                    value=position,
+                )
+            restored[pair[0]] = self._restore(pair[1])
+        return restored
+
+
+def _spill_compare(left: object, right: object) -> int:
+    """Compare two already-normalised internal values without truthy shortcuts."""
+    if left == right:
+        return 0
+    if left < right:  # type: ignore[operator]
+        return -1
+    if right < left:  # type: ignore[operator]
+        return 1
+    return 0
+
+
+def _spill_pair_key(payload: bytes, *, kind: str) -> tuple[bytes, int]:
+    """Decode a ``(bytes, ordinal)`` key used by grouping passes."""
+    value = _spill_decode(payload, key=True)
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 3
+        or value[0] != kind
+        or type(value[1]) is not bytes
+        or type(value[2]) is not int
+        or value[2] < 0
+    ):
+        raise GrafxCorruptionDetected(
+            "A temporary query spill ordering key is malformed.",
+            field="query_spill.key",
+            value=kind,
+        )
+    return value[1], value[2]
+
+
+def _compare_group_spill_keys(left: bytes, right: bytes) -> int:
+    """Order grouping input by signature, retaining source order inside a group."""
+    left_signature, left_ordinal = _spill_pair_key(left, kind="group")
+    right_signature, right_ordinal = _spill_pair_key(right, kind="group")
+    return _spill_compare(left_signature, right_signature) or _spill_compare(
+        left_ordinal, right_ordinal
+    )
+
+
+def _compare_distinct_row_spill_keys(left: bytes, right: bytes) -> int:
+    """Order projected rows by frozen identity and then original encounter order."""
+    left_signature, left_ordinal = _spill_pair_key(left, kind="distinct-row")
+    right_signature, right_ordinal = _spill_pair_key(right, kind="distinct-row")
+    return _spill_compare(left_signature, right_signature) or _spill_compare(
+        left_ordinal, right_ordinal
+    )
+
+
+def _compare_ordinal_spill_keys(left: bytes, right: bytes) -> int:
+    """Restore first-encounter order for materialised aggregate groups."""
+    left_value = _spill_decode(left, key=True)
+    right_value = _spill_decode(right, key=True)
+    if type(left_value) is not int or type(right_value) is not int:
+        raise GrafxCorruptionDetected(
+            "A temporary query spill ordinal is malformed.",
+            field="query_spill.key",
+            value="ordinal",
+        )
+    return _spill_compare(left_value, right_value)
+
+
+def _distinct_spill_key(payload: bytes) -> tuple[int, bytes, int]:
+    value = _spill_decode(payload, key=True)
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 4
+        or value[0] != "distinct"
+        or type(value[1]) is not int
+        or value[1] < 0
+        or type(value[2]) is not bytes
+        or type(value[3]) is not int
+        or value[3] < 0
+    ):
+        raise GrafxCorruptionDetected(
+            "A temporary distinct-aggregate key is malformed.",
+            field="query_spill.key",
+            value="distinct",
+        )
+    return value[1], value[2], value[3]
+
+
+def _compare_distinct_spill_keys(left: bytes, right: bytes) -> int:
+    left_index, left_signature, left_ordinal = _distinct_spill_key(left)
+    right_index, right_signature, right_ordinal = _distinct_spill_key(right)
+    return (
+        _spill_compare(left_index, right_index)
+        or _spill_compare(left_signature, right_signature)
+        or _spill_compare(left_ordinal, right_ordinal)
+    )
+
+
+def _accepted_spill_key(payload: bytes) -> tuple[int, int]:
+    value = _spill_decode(payload, key=True)
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 3
+        or value[0] != "accepted"
+        or type(value[1]) is not int
+        or value[1] < 0
+        or type(value[2]) is not int
+        or value[2] < 0
+    ):
+        raise GrafxCorruptionDetected(
+            "A temporary accepted-aggregate key is malformed.",
+            field="query_spill.key",
+            value="accepted",
+        )
+    return value[1], value[2]
+
+
+def _compare_accepted_spill_keys(left: bytes, right: bytes) -> int:
+    left_index, left_ordinal = _accepted_spill_key(left)
+    right_index, right_ordinal = _accepted_spill_key(right)
+    return _spill_compare(left_index, right_index) or _spill_compare(
+        left_ordinal, right_ordinal
+    )
+
+
+def _sort_spill_key(payload: bytes) -> tuple[tuple[tuple[int, object, bool], ...], int]:
+    value = _spill_decode(payload, key=True)
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 3
+        or value[0] != "sort"
+        or not isinstance(value[1], tuple)
+        or type(value[2]) is not int
+        or value[2] < 0
+    ):
+        raise GrafxCorruptionDetected(
+            "A temporary sorted-row key is malformed.",
+            field="query_spill.key",
+            value="sort",
+        )
+    components: list[tuple[int, object, bool]] = []
+    for component in value[1]:
+        if (
+            not isinstance(component, tuple)
+            or len(component) != 3
+            or type(component[0]) is not int
+            or type(component[2]) is not bool
+        ):
+            raise GrafxCorruptionDetected(
+                "A temporary sorted-row component is malformed.",
+                field="query_spill.key",
+                value="sort_component",
+            )
+        components.append(
+            (component[0], _spill_unpack_internal(component[1]), component[2])
+        )
+    return tuple(components), value[2]
+
+
+def _compare_sort_spill_keys(left: bytes, right: bytes) -> int:
+    left_components, left_ordinal = _sort_spill_key(left)
+    right_components, right_ordinal = _sort_spill_key(right)
+    if len(left_components) != len(right_components):
+        raise GrafxCorruptionDetected(
+            "Temporary sorted rows disagree on their key arity.",
+            field="query_spill.key",
+            value="sort_arity",
+        )
+    for (left_rank, left_value, descending), (
+        right_rank,
+        right_value,
+        right_descending,
+    ) in zip(left_components, right_components):
+        if descending != right_descending:
+            raise GrafxCorruptionDetected(
+                "Temporary sorted rows disagree on a key direction.",
+                field="query_spill.key",
+                value="sort_direction",
+            )
+        compared = _spill_compare(left_rank, right_rank)
+        if not compared:
+            compared = _spill_compare(left_value, right_value)
+        if compared:
+            return -compared if descending else compared
+    return _spill_compare(left_ordinal, right_ordinal)
+
+
 def _aggregate_rows(
     engine: QueryEngine, node: AggregateRows, context: _Context
 ) -> Iterator[_Row]:
     """Produce one row per group, carrying the grouping keys and the aggregates."""
+    if getattr(engine, "_query_memory_budget_bytes", None) is not None:
+        yield from _spilled_aggregate_rows(engine, node, context)
+        return
     groups: dict[object, tuple[list[object], dict[Expression, _Accumulator]]] = {}
     order: list[object] = []
     for row in engine._rows(node.child, context):
@@ -4561,9 +5578,7 @@ class _Accumulator:
         self._aggregation = aggregation
         self._function = aggregation.function
         self._seen: set[object] | None = set() if aggregation.call.distinct else None
-        self._values: list[object] | None = (
-            [] if self._function == "COLLECT" else None
-        )
+        self._values: list[object] | None = [] if self._function == "COLLECT" else None
         self._count = 0
         self._total: float = 0.0
         self._extreme: object = None
@@ -4576,9 +5591,20 @@ class _Accumulator:
             self._count += 1
             return
         value = _evaluate(call.arguments[0], row, context)
+        self.add_value(value)
+
+    def add_value(
+        self,
+        value: object,
+        *,
+        sort_key: tuple[int, object] | None = None,
+        apply_distinct: bool = True,
+    ) -> None:
+        """Fold one pre-evaluated value, optionally already externally deduplicated."""
         if value is None:
             return
-        if call.distinct:
+        call = self._aggregation.call
+        if apply_distinct and call.distinct:
             frozen = _freeze(value)
             seen = self._seen
             assert seen is not None
@@ -4592,7 +5618,7 @@ class _Accumulator:
             assert values is not None
             values.append(value)
         elif name in ("MIN", "MAX"):
-            key = _sort_key(value)
+            key = _sort_key(value) if sort_key is None else sort_key
             extreme_key = self._extreme_key
             if extreme_key is None or (
                 key < extreme_key if name == "MIN" else not key < extreme_key
@@ -4622,6 +5648,494 @@ class _Accumulator:
         if name == "AVG":
             return self._total / self._count
         return self._extreme
+
+
+def _aggregate_input_payload(
+    node: AggregateRows,
+    row: _Row,
+    context: _Context,
+    nan_identities: _NaNIdentityRegistry,
+) -> tuple[bytes, bytes, tuple[Value, ...]]:
+    """Evaluate and safely encode one aggregate input row before releasing it."""
+    raw_keys = tuple(_evaluate(item.expression, row, context) for item in node.grouping)
+    keys = tuple(_spill_detach_value(value) for value in raw_keys)
+    signature = _spill_encode(
+        _spill_pack_internal(
+            tuple(_freeze(value) for value in raw_keys),
+            nan_identities=nan_identities,
+        ),
+        key=True,
+    )
+    entries: list[Value] = []
+    for aggregation in node.aggregations:
+        call = aggregation.call
+        if call.star:
+            entries.append(("star",))
+            continue
+        raw = _evaluate(call.arguments[0], row, context)
+        if raw is None:
+            entries.append(("null",))
+            continue
+        entries.append(
+            (
+                "value",
+                _spill_detach_value(raw),
+                _spill_signature(raw, nan_identities) if call.distinct else b"",
+                _spill_pack_internal(_sort_key(raw)),
+            )
+        )
+    payload = _spill_encode(
+        ("aggregate-input", keys, tuple(entries)),
+        key=False,
+    )
+    return signature, payload, keys
+
+
+def _decode_aggregate_input(
+    payload: bytes,
+) -> tuple[tuple[Value, ...], tuple[Value, ...]]:
+    value = _spill_decode(payload, key=False)
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 3
+        or value[0] != "aggregate-input"
+        or not isinstance(value[1], tuple)
+        or not isinstance(value[2], tuple)
+    ):
+        raise GrafxCorruptionDetected(
+            "A temporary aggregate input record is malformed.",
+            field="query_spill.record",
+            value="aggregate_input",
+        )
+    return tuple(_spill_restore_value(item) for item in value[1]), value[2]
+
+
+def _decode_aggregate_entry(
+    entry: Value,
+) -> tuple[str, Value | None, bytes | None, tuple[int, object] | None]:
+    if not isinstance(entry, tuple) or not entry or not isinstance(entry[0], str):
+        raise GrafxCorruptionDetected(
+            "A temporary aggregate value record is malformed.",
+            field="query_spill.record",
+            value="aggregate_value",
+        )
+    kind = entry[0]
+    if kind in ("star", "null") and len(entry) == 1:
+        return kind, None, None, None
+    if kind != "value" or len(entry) != 4 or type(entry[2]) is not bytes:
+        raise GrafxCorruptionDetected(
+            "A temporary aggregate value record is malformed.",
+            field="query_spill.record",
+            value="aggregate_value",
+        )
+    unpacked = _spill_unpack_internal(entry[3])
+    if (
+        not isinstance(unpacked, tuple)
+        or len(unpacked) != 2
+        or type(unpacked[0]) is not int
+    ):
+        raise GrafxCorruptionDetected(
+            "A temporary aggregate comparison key is malformed.",
+            field="query_spill.key",
+            value="aggregate_sort_key",
+        )
+    return kind, _spill_restore_value(entry[1]), entry[2], (unpacked[0], unpacked[1])
+
+
+def _aggregate_distinct_payload(
+    index: int,
+    ordinal: int,
+    value: Value,
+    sort_key: tuple[int, object],
+) -> bytes:
+    return _spill_encode(
+        (
+            "aggregate-distinct-value",
+            index,
+            ordinal,
+            _spill_detach_value(value),
+            _spill_pack_internal(sort_key),
+        ),
+        key=False,
+    )
+
+
+def _decode_aggregate_distinct_payload(
+    payload: bytes,
+) -> tuple[int, int, Value, tuple[int, object]]:
+    value = _spill_decode(payload, key=False)
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 5
+        or value[0] != "aggregate-distinct-value"
+        or type(value[1]) is not int
+        or value[1] < 0
+        or type(value[2]) is not int
+        or value[2] < 0
+    ):
+        raise GrafxCorruptionDetected(
+            "A temporary distinct aggregate payload is malformed.",
+            field="query_spill.record",
+            value="aggregate_distinct_value",
+        )
+    unpacked = _spill_unpack_internal(value[4])
+    if (
+        not isinstance(unpacked, tuple)
+        or len(unpacked) != 2
+        or type(unpacked[0]) is not int
+    ):
+        raise GrafxCorruptionDetected(
+            "A temporary distinct aggregate comparison key is malformed.",
+            field="query_spill.key",
+            value="aggregate_distinct_sort_key",
+        )
+    return (
+        value[1],
+        value[2],
+        _spill_restore_value(value[3]),
+        (unpacked[0], unpacked[1]),
+    )
+
+
+def _close_iterator(iterator: object, primary: BaseException | None = None) -> None:
+    """Close a spill iterator, attaching cleanup evidence to an existing failure."""
+    close = getattr(iterator, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except BaseException as failure:
+        if primary is None:
+            raise
+        primary.add_note(
+            "A temporary query spill iterator also failed to close with "
+            f"{type(failure).__name__}: {failure}"
+        )
+
+
+class _SpilledAggregateState:
+    """Bounded state for one group, with DISTINCT values delegated to external sorters."""
+
+    def __init__(
+        self,
+        node: AggregateRows,
+        keys: tuple[Value, ...],
+        first_ordinal: int,
+        workspace: QuerySpillWorkspace,
+    ) -> None:
+        self._node = node
+        self.keys = keys
+        self.first_ordinal = first_ordinal
+        self._workspace = workspace
+        self._accumulators = [_Accumulator(item) for item in node.aggregations]
+        self._extra = [0 for _item in node.aggregations]
+        self._base = (
+            _AGGREGATE_GROUP_OVERHEAD
+            + len(_spill_encode(_spill_detach_value(keys), key=False))
+            + len(node.aggregations) * _AGGREGATE_SLOT_OVERHEAD
+        )
+        workspace.reserve(self._base, reason="aggregate_group_state")
+        self._distinct: QuerySpillSorter | None = None
+        self._closed = False
+
+    def add(self, entries: tuple[Value, ...], ordinal: int) -> None:
+        if len(entries) != len(self._node.aggregations):
+            raise GrafxCorruptionDetected(
+                "A temporary aggregate row disagrees with the plan arity.",
+                field="query_spill.record",
+                value=len(entries),
+                expected=len(self._node.aggregations),
+            )
+        for index, (aggregation, entry) in enumerate(
+            zip(self._node.aggregations, entries)
+        ):
+            kind, value, signature, sort_key = _decode_aggregate_entry(entry)
+            if kind == "star":
+                self._accumulators[index]._count += 1
+                continue
+            if kind == "null":
+                continue
+            assert value is not None and signature is not None and sort_key is not None
+            if aggregation.call.distinct:
+                if self._distinct is None:
+                    self._distinct = self._workspace.sorter(
+                        _compare_distinct_spill_keys
+                    )
+                self._distinct.append(
+                    _spill_encode(("distinct", index, signature, ordinal), key=True),
+                    _aggregate_distinct_payload(index, ordinal, value, sort_key),
+                )
+                continue
+            self._fold(index, value, sort_key)
+
+    def finish(self) -> bytes:
+        """Finish external DISTINCT passes and encode one aggregate output row."""
+        if self._distinct is not None:
+            accepted = self._workspace.sorter(_compare_accepted_spill_keys)
+            records = self._distinct.records()
+            previous: tuple[int, bytes] | None = None
+            failure: BaseException | None = None
+            try:
+                for key, payload in records:
+                    index, signature, ordinal = _distinct_spill_key(key)
+                    identity = (index, signature)
+                    if identity == previous:
+                        continue
+                    previous = identity
+                    accepted.append(
+                        _spill_encode(("accepted", index, ordinal), key=True),
+                        payload,
+                    )
+            except BaseException as caught:
+                failure = caught
+                raise
+            finally:
+                cleanup_failure: BaseException | None = failure
+                for resource in (records, self._distinct):
+                    try:
+                        _close_iterator(resource)
+                    except BaseException as close_failure:
+                        if cleanup_failure is None:
+                            cleanup_failure = close_failure
+                        else:
+                            cleanup_failure.add_note(
+                                "Distinct aggregate cleanup also failed with "
+                                f"{type(close_failure).__name__}: {close_failure}"
+                            )
+                if failure is None and cleanup_failure is not None:
+                    raise cleanup_failure
+
+            ordered = accepted.records()
+            failure = None
+            try:
+                for _key, payload in ordered:
+                    index, _ordinal, value, sort_key = (
+                        _decode_aggregate_distinct_payload(payload)
+                    )
+                    if not 0 <= index < len(self._accumulators):
+                        raise GrafxCorruptionDetected(
+                            "A temporary distinct aggregate index is outside the plan.",
+                            field="query_spill.record",
+                            value=index,
+                        )
+                    self._fold(index, value, sort_key)
+            except BaseException as caught:
+                failure = caught
+                raise
+            finally:
+                cleanup_failure = failure
+                for resource in (ordered, accepted):
+                    try:
+                        _close_iterator(resource)
+                    except BaseException as close_failure:
+                        if cleanup_failure is None:
+                            cleanup_failure = close_failure
+                        else:
+                            cleanup_failure.add_note(
+                                "Accepted aggregate cleanup also failed with "
+                                f"{type(close_failure).__name__}: {close_failure}"
+                            )
+                if failure is None and cleanup_failure is not None:
+                    raise cleanup_failure
+
+        results = tuple(accumulator.result() for accumulator in self._accumulators)
+        payload = _spill_encode(
+            (
+                "aggregate-output",
+                _spill_detach_value(self.keys),
+                _spill_detach_value(results),
+            ),
+            key=False,
+        )
+        self.close()
+        return payload
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        for amount in self._extra:
+            if amount:
+                self._workspace.release(amount)
+        self._workspace.release(self._base)
+        self._closed = True
+
+    def _fold(self, index: int, value: Value, sort_key: tuple[int, object]) -> None:
+        accumulator = self._accumulators[index]
+        name = accumulator._function
+        old_charge = self._extra[index]
+        new_charge = old_charge
+        if name == "COLLECT":
+            new_charge += _AGGREGATE_VALUE_OVERHEAD + len(
+                _spill_encode(_spill_detach_value(value), key=False)
+            )
+        elif name in ("MIN", "MAX"):
+            extreme_key = accumulator._extreme_key
+            replaces = extreme_key is None or (
+                sort_key < extreme_key if name == "MIN" else not sort_key < extreme_key
+            )
+            if replaces:
+                new_charge = _AGGREGATE_VALUE_OVERHEAD + len(
+                    _spill_encode(_spill_detach_value(value), key=False)
+                )
+        difference = new_charge - old_charge
+        if difference > 0:
+            self._workspace.reserve(difference, reason="aggregate_value_state")
+        elif difference < 0:
+            self._workspace.release(-difference)
+        self._extra[index] = new_charge
+        accumulator.add_value(value, sort_key=sort_key, apply_distinct=False)
+
+
+def _decode_aggregate_output(payload: bytes, node: AggregateRows) -> _Row:
+    value = _spill_decode(payload, key=False)
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 3
+        or value[0] != "aggregate-output"
+        or not isinstance(value[1], tuple)
+        or not isinstance(value[2], tuple)
+    ):
+        raise GrafxCorruptionDetected(
+            "A temporary aggregate output record is malformed.",
+            field="query_spill.record",
+            value="aggregate_output",
+        )
+    keys = _spill_restore_value(value[1])
+    results = _spill_restore_value(value[2])
+    if (
+        not isinstance(keys, tuple)
+        or len(keys) != len(node.grouping)
+        or not isinstance(results, tuple)
+        or len(results) != len(node.aggregations)
+    ):
+        raise GrafxCorruptionDetected(
+            "A temporary aggregate result value is malformed.",
+            field="query_spill.record",
+            value="aggregate_results",
+        )
+    computed: dict[Expression, object] = {
+        item.expression: item_value for item, item_value in zip(node.grouping, keys)
+    }
+    computed.update(
+        {
+            aggregation.call: item_value
+            for aggregation, item_value in zip(node.aggregations, results)
+        }
+    )
+    return _Row(bindings={}, computed=computed)
+
+
+def _spilled_aggregate_rows(
+    engine: QueryEngine, node: AggregateRows, context: _Context
+) -> Iterator[_Row]:
+    """Group through bounded external passes, retaining only one aggregate state in core."""
+    workspace, _budget = engine._spill_workspace(node.label)
+    nan_identities = _NaNIdentityRegistry(workspace)
+    source = workspace.sorter(_compare_group_spill_keys)
+    output = workspace.sorter(_compare_ordinal_spill_keys)
+    current: _SpilledAggregateState | None = None
+    source_records: Iterator[tuple[bytes, bytes]] | None = None
+    output_records: Iterator[tuple[bytes, bytes]] | None = None
+    failure: BaseException | None = None
+    saw_rows = False
+    try:
+        for ordinal, row in enumerate(engine._rows(node.child, context)):
+            if ordinal > INT64_MAX:
+                raise GrafxQueryBudgetExceeded(
+                    "Aggregate input cardinality exceeds the spill ordinal domain.",
+                    field="query_memory_budget_bytes",
+                    operator=node.label,
+                    limit=INT64_MAX,
+                    observed=ordinal,
+                )
+            signature, payload, _keys = _aggregate_input_payload(
+                node, row, context, nan_identities
+            )
+            source.append(
+                _spill_encode(("group", signature, ordinal), key=True), payload
+            )
+            saw_rows = True
+
+        if not saw_rows and not node.grouping:
+            computed: dict[Expression, object] = {
+                aggregation.call: _Accumulator(aggregation).result()
+                for aggregation in node.aggregations
+            }
+            yield _Row(bindings={}, computed=computed)
+            return
+
+        source_records = source.records()
+        current_signature: bytes | None = None
+        for key, payload in source_records:
+            signature, ordinal = _spill_pair_key(key, kind="group")
+            keys, entries = _decode_aggregate_input(payload)
+            if current_signature != signature:
+                if current is not None:
+                    output.append(
+                        _spill_encode(current.first_ordinal, key=True), current.finish()
+                    )
+                current = _SpilledAggregateState(node, keys, ordinal, workspace)
+                current_signature = signature
+            assert current is not None
+            current.add(entries, ordinal)
+        if current is not None:
+            output.append(
+                _spill_encode(current.first_ordinal, key=True), current.finish()
+            )
+            current = None
+
+        output_records = output.records()
+        for _key, payload in output_records:
+            yield _decode_aggregate_output(payload, node)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        cleanup_failure: BaseException | None = failure
+        if current is not None:
+            try:
+                current.close()
+            except BaseException as close_failure:
+                if cleanup_failure is None:
+                    cleanup_failure = close_failure
+                else:
+                    cleanup_failure.add_note(
+                        "Aggregate state cleanup also failed with "
+                        f"{type(close_failure).__name__}: {close_failure}"
+                    )
+        for iterator in (source_records, output_records):
+            try:
+                _close_iterator(iterator)
+            except BaseException as close_failure:
+                if cleanup_failure is None:
+                    cleanup_failure = close_failure
+                else:
+                    cleanup_failure.add_note(
+                        "A query spill iterator also failed to close with "
+                        f"{type(close_failure).__name__}: {close_failure}"
+                    )
+        try:
+            nan_identities.close()
+        except BaseException as close_failure:
+            if cleanup_failure is None:
+                cleanup_failure = close_failure
+            else:
+                cleanup_failure.add_note(
+                    "NaN identity cleanup also failed with "
+                    f"{type(close_failure).__name__}: {close_failure}"
+                )
+        try:
+            workspace.close()
+        except BaseException as close_failure:
+            if cleanup_failure is None:
+                cleanup_failure = close_failure
+            else:
+                cleanup_failure.add_note(
+                    "Query spill workspace cleanup also failed with "
+                    f"{type(close_failure).__name__}: {close_failure}"
+                )
+        if failure is None and cleanup_failure is not None:
+            raise cleanup_failure
 
 
 def _project_rows(
@@ -4695,6 +6209,9 @@ def _distinct_rows(
     engine: QueryEngine, node: DistinctRows, context: _Context
 ) -> Iterator[_Row]:
     """Keep the first row of each distinct projection, in the order they arrived."""
+    if getattr(engine, "_query_memory_budget_bytes", None) is not None:
+        yield from _spilled_distinct_rows(engine, node, context)
+        return
     seen: set[object] = set()
     for row in engine._rows(node.child, context):
         columns = row.columns if row.columns is not None else {}
@@ -4705,6 +6222,91 @@ def _distinct_rows(
             continue
         seen.add(signature)
         yield row
+
+
+def _spilled_distinct_rows(
+    engine: QueryEngine, node: DistinctRows, context: _Context
+) -> Iterator[_Row]:
+    """Deduplicate externally, then restore each first occurrence's input order."""
+    workspace, _budget = engine._spill_workspace(node.label)
+    nan_identities = _NaNIdentityRegistry(workspace)
+    row_codec = _SpillRowCodec(context, workspace)
+    source = workspace.sorter(_compare_distinct_row_spill_keys)
+    output = workspace.sorter(_compare_ordinal_spill_keys)
+    source_records: Iterator[tuple[bytes, bytes]] | None = None
+    output_records: Iterator[tuple[bytes, bytes]] | None = None
+    failure: BaseException | None = None
+    try:
+        for ordinal, row in enumerate(engine._rows(node.child, context)):
+            if ordinal > INT64_MAX:
+                raise GrafxQueryBudgetExceeded(
+                    "Distinct input cardinality exceeds the spill ordinal domain.",
+                    field="query_memory_budget_bytes",
+                    operator=node.label,
+                    limit=INT64_MAX,
+                    observed=ordinal,
+                )
+            columns = row.columns if row.columns is not None else {}
+            signature = _spill_encode(
+                _spill_pack_internal(
+                    tuple(
+                        (name, _freeze(value))
+                        for name, value in sorted(columns.items())
+                    ),
+                    nan_identities=nan_identities,
+                ),
+                key=True,
+            )
+            source.append(
+                _spill_encode(("distinct-row", signature, ordinal), key=True),
+                row_codec.encode(row),
+            )
+
+        source_records = source.records()
+        previous: bytes | None = None
+        for key, payload in source_records:
+            signature, ordinal = _spill_pair_key(key, kind="distinct-row")
+            if signature == previous:
+                continue
+            previous = signature
+            output.append(_spill_encode(ordinal, key=True), payload)
+
+        output_records = output.records()
+        for _key, payload in output_records:
+            yield row_codec.decode(payload)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        cleanup_failure: BaseException | None = failure
+        for iterator in (source_records, output_records):
+            try:
+                _close_iterator(iterator)
+            except BaseException as close_failure:
+                if cleanup_failure is None:
+                    cleanup_failure = close_failure
+                else:
+                    cleanup_failure.add_note(
+                        "A distinct spill iterator also failed to close with "
+                        f"{type(close_failure).__name__}: {close_failure}"
+                    )
+        for resource, description in (
+            (row_codec, "Distinct row-codec cleanup"),
+            (nan_identities, "Distinct NaN-identity cleanup"),
+            (workspace, "Distinct spill workspace cleanup"),
+        ):
+            try:
+                resource.close()
+            except BaseException as close_failure:
+                if cleanup_failure is None:
+                    cleanup_failure = close_failure
+                else:
+                    cleanup_failure.add_note(
+                        f"{description} also failed with "
+                        f"{type(close_failure).__name__}: {close_failure}"
+                    )
+        if failure is None and cleanup_failure is not None:
+            raise cleanup_failure
 
 
 def _sort_rows(
@@ -4719,6 +6321,9 @@ def _sort_rows(
     only SKIP + LIMIT candidates in a worst-first heap, reducing memory to O(K) and comparisons
     to O(N log K); the full stable sort remains the unbounded path.
     """
+    if getattr(engine, "_query_memory_budget_bytes", None) is not None:
+        yield from _spilled_sort_rows(engine, node, context)
+        return
     if node.retained_limit is not None:
         yield from _top_rows(engine, node, node.retained_limit, context)
         return
@@ -4729,6 +6334,115 @@ def _sort_rows(
             reverse=key.descending,
         )
     yield from rows
+
+
+def _sort_row_payload(row: _Row) -> bytes:
+    """Encode one projected row after detaching every page-backed capability."""
+    if row.columns is None:
+        raise GrafxPlanError(
+            "A spillable SortRows must consume projected columns.",
+            field="query_spill.sort",
+            value="unprojected_row",
+        )
+    columns: tuple[Value, ...] = tuple(
+        (name, _spill_detach_value(value)) for name, value in row.columns.items()
+    )
+    return _spill_encode(("sorted-row", columns), key=False)
+
+
+def _decode_sort_row(payload: bytes) -> _Row:
+    """Rebuild a capability-free projected row from one complete spill payload."""
+    value = _spill_decode(payload, key=False)
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 2
+        or value[0] != "sorted-row"
+        or not isinstance(value[1], tuple)
+    ):
+        raise GrafxCorruptionDetected(
+            "A temporary sorted row is malformed.",
+            field="query_spill.record",
+            value="sorted_row",
+        )
+    columns: dict[str, object] = {}
+    for position, pair in enumerate(value[1]):
+        if (
+            not isinstance(pair, tuple)
+            or len(pair) != 2
+            or not isinstance(pair[0], str)
+            or not pair[0]
+            or pair[0] in columns
+        ):
+            raise GrafxCorruptionDetected(
+                "A temporary sorted row carries malformed columns.",
+                field="query_spill.record",
+                value=position,
+            )
+        columns[pair[0]] = _spill_restore_value(pair[1])
+    return _Row(bindings={}, columns=columns)
+
+
+def _spilled_sort_rows(
+    engine: QueryEngine, node: SortRows, context: _Context
+) -> Iterator[_Row]:
+    """Order projected rows through a bounded adapter-owned external merge."""
+    workspace, _budget = engine._spill_workspace(node.label)
+    sorter = workspace.sorter(_compare_sort_spill_keys)
+    records: Iterator[tuple[bytes, bytes]] | None = None
+    failure: BaseException | None = None
+    try:
+        for ordinal, row in enumerate(engine._rows(node.child, context)):
+            if ordinal > INT64_MAX:
+                raise GrafxQueryBudgetExceeded(
+                    "Sorted input cardinality exceeds the spill ordinal domain.",
+                    field="query_memory_budget_bytes",
+                    operator=node.label,
+                    limit=INT64_MAX,
+                    observed=ordinal,
+                )
+            components: tuple[Value, ...] = tuple(
+                (
+                    rank,
+                    _spill_pack_internal(comparable),
+                    key.descending,
+                )
+                for key in node.keys
+                for rank, comparable in ((_sort_key(_sort_value(key, row, context))),)
+            )
+            sorter.append(
+                _spill_encode(("sort", components, ordinal), key=True),
+                _sort_row_payload(row),
+            )
+        records = sorter.records()
+        for _key, payload in records:
+            yield _decode_sort_row(payload)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        cleanup_failure: BaseException | None = failure
+        try:
+            _close_iterator(records)
+        except BaseException as close_failure:
+            if cleanup_failure is None:
+                cleanup_failure = close_failure
+            else:
+                cleanup_failure.add_note(
+                    "A query spill iterator also failed to close with "
+                    f"{type(close_failure).__name__}: {close_failure}"
+                )
+        try:
+            workspace.close()
+        except BaseException as close_failure:
+            if cleanup_failure is None:
+                cleanup_failure = close_failure
+            else:
+                cleanup_failure.add_note(
+                    "Query spill workspace cleanup also failed with "
+                    f"{type(close_failure).__name__}: {close_failure}"
+                )
+        if failure is None and cleanup_failure is not None:
+            raise cleanup_failure
 
 
 @dataclass(slots=True)
@@ -5151,7 +6865,9 @@ def _incident_edges(
                 reference,
                 tuple(values[:ENDPOINT_COLUMN_COUNT]),
             )
-        for ref, endpoints in engine.heap.scan_relationship_endpoints(candidate, snapshot):
+        for ref, endpoints in engine.heap.scan_relationship_endpoints(
+            candidate, snapshot
+        ):
             incident = (leaves and endpoints[0] == endpoint_identity) or (
                 lands and endpoints[1] == endpoint_identity
             )
@@ -5562,9 +7278,7 @@ def _materialise_edge(
     )
     endpoints: list[object] = []
     guards: list[tuple[TableDef, bytes]] = []
-    physical: list[
-        tuple[str, TableDef, RecordId, RecordRef, RowBinding]
-    ] = []
+    physical: list[tuple[str, TableDef, RecordId, RecordRef, RowBinding]] = []
     for end, variable, table_name, endpoint_column in endpoint_specs:
         if table_name is None:
             raise GrafxConfigurationError(
@@ -5582,7 +7296,10 @@ def _materialise_edge(
                 field=end,
                 value=variable,
             )
-        if binding.table != endpoint_table or binding.version.table_id != endpoint_table.table_id:
+        if (
+            binding.table != endpoint_table
+            or binding.version.table_id != endpoint_table.table_id
+        ):
             raise GrafxPlanError(
                 f"The {end} of a {edge.table.name!r} edge must be a row of "
                 f"{endpoint_table.name!r}, but {variable!r} is bound to "

@@ -7,7 +7,7 @@ the first transaction.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field as dataclass_field, fields
 from ipaddress import ip_address
 from math import isfinite
 
@@ -285,6 +285,7 @@ class DatabaseConfig:
     read_only: bool = False
     descriptor_revalidation: DescriptorRevalidationMode = "strict"
     max_query_value_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS
+    query_memory_budget_bytes: int | None = dataclass_field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         """Reject any unusable field with a GrafxConfigurationError that names it."""
@@ -355,6 +356,7 @@ class DatabaseConfig:
             "max_statement_writes",
             "max_result_rows",
             "max_intermediate_rows",
+            "query_memory_budget_bytes",
             "max_traversal_expansions",
             "max_traversal_paths",
             "max_transaction_rows",

@@ -384,6 +384,15 @@ plan runs, by the components that own those questions.
 Operators: `SingleRow`, `NodeScan`, `IndexSeek`, `TraverseRelationship`, `Filter`, `Project`,
 `Aggregate`, `Distinct`, `Sort`, `Skip`, `Limit`, and the write operators.
 
+By default, blocking sort, result-DISTINCT and aggregate operators retain their historical
+in-memory structures. Setting `query_memory_budget_bytes` gives each such operator an independent
+deterministic logical byte counter and routes it through an internal spill port. The pure engine owns safe, versioned,
+capability-free records and total ordering; `LocalQuerySpillFactory` alone owns OS temporary files
+and bounded external merge passes. Spill artifacts sit outside the database directory and close on
+success, failure, cancellation or cursor close. The counter is deliberately not RSS, and the
+existing result/intermediate-row limits remain separate. `docs/architecture/CONTRACT.md` defines
+the exact charges and exclusions.
+
 The planner chooses `IndexSeek` when an index's **whole key** is constrained by equality — the whole
 key and nothing less, because a hash index stores the encoding of all its key columns as one key, so
 a seek that constrained only some of them would ask for a key that was never written.

@@ -560,6 +560,13 @@ make the same trust decision explicitly through `NativeCrc32c(..., verify_runtim
 Supplying a custom registry replaces the seven ports, but does not disable this process-wide
 `checksum` selection.
 
+`QuerySpillFactory` is a separate, internal composition capability rather than an eighth registry
+slot. It exists only when `query_memory_budget_bytes` selects bounded blocking-query execution:
+the engine owns opaque, versioned record meaning, while the default `LocalQuerySpillFactory` owns
+temporary paths, host I/O and external merging. Keeping it outside `PortRegistry` preserves the
+seven-slot public adapter contract and does not expose a filesystem mechanism to `domain/` or
+`engine/`.
+
 ### Substituting an adapter
 
 Anything that satisfies the protocol is acceptable — the registry checks structurally, so you do not
@@ -625,6 +632,7 @@ refused with the field name the caller actually wrote.
 | `max_statement_writes` | `None` | Optional hard limit on logical row writes retained by one statement |
 | `max_result_rows` | `None` | Optional hard limit on public result rows; row N+1 is refused before it is retained and before any remaining input is consumed |
 | `max_intermediate_rows` | `None` | Optional hard limit per non-terminal physical operator over one execution; it is not a cumulative query-wide count |
+| `query_memory_budget_bytes` | `None` | Optional logical retained-byte ceiling per blocking sort, result-DISTINCT or aggregate operator; enables safe adapter-backed external spill without measuring RSS |
 | `max_traversal_expansions` | `None` | Optional cumulative per-query limit on relationship candidates examined by graph-pattern operators; candidate N+1 is refused before derived landing/filter work |
 | `max_traversal_paths` | `None` | Optional cumulative per-query limit on visible paths admitted by graph-pattern operators; path N+1 is refused before frontier retention or return |
 | `max_query_value_characters` | `65536` | Per-string parameter/result boundary; configurable from 1 through the hard 1,048,576-character guard; query-source literals keep their separate 16,384-character ceiling |
@@ -704,10 +712,36 @@ their independent 16,384-character lexer ceiling. Applications may lower the val
 to the hard 1,048,576-character guard; values above the effective ceiling are refused before page
 access. The option is process-local and does not change the on-disk format.
 
-These are admission limits, not a complete query-memory budget. They do not bound payload bytes,
-internal structures, auxiliary scans, RSS, deadlines, spill or stream results. Sort,
-aggregate, distinct and eager operators may retain up to the configured rows or states before their
-first yield; the memory of those payloads and structures is not bounded here.
+`query_memory_budget_bytes` is a separate opt-in positive integer. `None` preserves the previous
+in-memory sort, top-N, result-DISTINCT and aggregation paths. When configured, each `SortRows`,
+`DistinctRows` and `AggregateRows` gets its own counter and uses adapter-owned external merge runs,
+so input cardinality no longer causes those operators' retained logical bytes to grow without the
+configured ceiling. The counter is deterministic **logical retention, never process RSS**: a
+buffered/run-head record is
+charged `32 + len(versioned_key) + len(versioned_payload)` bytes; one active aggregate group is
+charged 64 bytes plus its versioned detached key and 64 bytes per aggregate slot; each retained
+`COLLECT` or `MIN`/`MAX` value adds 16 bytes plus its versioned detached value; each strongly
+retained NaN identity adds 64 bytes; and a transaction-private held-row identity needed by
+result-DISTINCT adds 128 bytes plus its versioned detached values. Python object headers, allocator
+arenas, encoding/comparison temporaries, OS caches and the final caller-owned result are
+deliberately outside this portable accounting model.
+
+Spill records use purpose- and version-tagged `Value` encodings and a versioned run header; they
+never use pickle. Files live in an isolated adapter temporary directory, outside the database
+namespace; binary merge levels keep their in-memory path metadata O(log N), and all artifacts are
+removed on success, refusal, cancellation and cursor close. Cleanup failure is not silently
+accepted. A single record must fit beside another merge head, so its logical charge must be at most
+half the configured budget. Result `DISTINCT` and aggregate `DISTINCT` values spill too, preserving
+the first occurrence and its order. `COLLECT` still
+has to become one public tuple, so a group whose result itself exceeds the budget is refused rather
+than represented by a disk proxy. Enabling this option also routes `ORDER BY ... LIMIT` through the
+bounded external path instead of the faster O(K) top-N heap.
+
+`max_result_rows` and `max_intermediate_rows` remain independent and authoritative with spill
+enabled. This first byte-budget boundary does not cover `EagerRows`, vector-search candidate
+materialisation, deadlines, RSS or public result retention; use the row limits and cursor API for
+those separate boundaries. It changes no snapshot, transaction, WAL, OCC, durable format,
+multiwriter or multireader rule.
 
 ---
 
@@ -729,7 +763,7 @@ translate exceptions it raises later. Such an exception can therefore propagate 
 | `GrafxRecoveryRefused` | ❌ | Recovery would not be safe; the evidence is preserved |
 | `GrafxBufferBudgetExceeded` | ✅ | The working set exceeded the budget |
 | `GrafxTransactionBudgetExceeded` | ❌ | An enabled statement, transaction or final WAL-batch limit was exceeded before partial persistence |
-| `GrafxQueryBudgetExceeded` | ❌ | An enabled public-result or per-operator intermediate row limit was exceeded before statement release |
+| `GrafxQueryBudgetExceeded` | ❌ | An enabled row, traversal or logical query-memory limit was exceeded before statement release |
 | `GrafxSchemaVersionMismatch` | ❌ | This build cannot read this database |
 | `GrafxPortNotConfigured` | ❌ | An incomplete registry, naming every missing slot |
 | `GrafxTransactionStateError` | ❌ | The transaction is not in a state that allows this |

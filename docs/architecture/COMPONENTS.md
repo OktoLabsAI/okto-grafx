@@ -752,10 +752,28 @@ preserve the old statistics surface; enabled fields report their admitted counte
 For a grouped endpoint fallback the candidate is what its adjacency map yields, not every physical
 relationship row read once to construct that map; the underlying auxiliary scan remains uncharged.
 
-The scope is deliberately admission plus bounded terminal streaming, not complete query memory:
-there is no deadline, spill or byte/RSS budget here. Sort, aggregate, distinct and eager operators may retain up
-to the admitted rows or states before their first yield; payload bytes, internal structures and
-non-traversal auxiliary scans are not charged.
+`query_memory_budget_bytes` adds an independent, opt-in byte boundary for `SortRows`,
+`DistinctRows` and `AggregateRows`. `None` keeps their prior in-memory/top-N paths. A configured
+operator shares one
+deterministic logical-retention counter with an internal `QuerySpillWorkspace`; the local adapter
+uses isolated, versioned external merge runs outside the database namespace. It charges each
+buffered or merge-head record as `32 + versioned key bytes + versioned payload bytes`. Aggregate
+core state additionally charges 64 bytes plus the versioned group key, 64 bytes per aggregate,
+16 bytes plus the versioned value for retained `COLLECT`/extreme state, and 64 bytes for each
+strongly retained NaN identity. Result-DISTINCT additionally charges a transaction-private held-row
+identity as 128 bytes plus its versioned detached values. These strong slots preserve the existing
+identity-sensitive grouping/DISTINCT rules without allowing allocator-address reuse; exhaustion
+fails closed.
+
+This is logical accounting, not RSS estimation: interpreter headers, allocator arenas, transient
+codec/comparator work, OS caches and the materialised public result are excluded. A record larger
+than half the budget is refused because a two-way merge needs two simultaneous heads. Aggregate
+DISTINCT uses external passes; an intrinsically oversized `COLLECT` result is refused because the
+public value remains a tuple, not a disk proxy. Temporary artifacts are removed on success, error,
+cancellation and cursor close, and no pickle or executable serialization is used. The existing row
+and traversal limits still apply independently. `EagerRows`, vector candidate materialisation,
+deadlines and public result retention remain outside this byte boundary. Snapshot,
+write atomicity, WAL/OCC, durable formats and multi-process rules are unchanged.
 
 ### Fase 1.4 / P1.15 — OpenMetrics loopback-by-default bind (C0/C8/C11; CLOSED)
 

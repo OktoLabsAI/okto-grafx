@@ -1293,10 +1293,12 @@ option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`
   public terminal is result-only, while a terminal with no public columns counts as intermediate.
 - **CLOSED** — both overruns raise non-retryable `GrafxQueryBudgetExceeded`. Refusal neither
   truncates state nor releases a partial write statement to the transaction.
-- **BOUNDARY** — these two fields do not limit cumulative work, payload bytes, internal structures,
-  auxiliary scans, RSS, streaming, deadlines, traversal or spill. Sort, aggregate, distinct and
-  eager operators may retain up to the admitted rows or states before their first yield; this is
-  row admission, not a complete query-memory budget.
+- **HISTORICAL BOUNDARY** — these two *row* fields do not limit cumulative work, payload bytes,
+  internal structures, auxiliary scans, RSS, streaming, deadlines, traversal or spill. At this
+  2026-08-25 milestone, sort, aggregate, distinct and eager operators could retain up to the
+  admitted rows or states before their first yield. The later, independent
+  `query_memory_budget_bytes` contract now bounds sort, result-DISTINCT and aggregate logical
+  retention; `README.md` and `CONTRACT.md` describe its exact coverage and exclusions.
 
 ## P1.15 / Fase 1.4 — OpenMetrics bind boundary (CLOSED, 2026-08-25)
 

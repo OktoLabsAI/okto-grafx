@@ -15,6 +15,7 @@ to substitute your own.
     [coordinator](#coordinator--processcoordinator) · [codec](#codec--pagecodec) ·
     [metrics](#metrics--metricssink) · [events](#events--eventsink) ·
     [vector_math](#vector_math--vectormath)
+- [The query spill capability](#the-query-spill-capability-not-a-registry-port)
 - [The checksum slot](#the-checksum-slot-not-a-registry-port)
 - [Writing an adapter](#writing-an-adapter)
 - [Composing a custom registry](#composing-a-custom-registry)
@@ -254,6 +255,52 @@ bound whichever adapter happened to be installed would make the **ranking of a q
 machine it ran on. So `auto` means "let the composition root choose", and the composition root
 chooses the answer that is the same everywhere. Asking for `"numpy"` is a decision the caller makes
 with that in mind.
+
+---
+
+## The query spill capability (not a registry port)
+
+`QuerySpillFactory` is an internal composition capability used only when
+`query_memory_budget_bytes` is configured for sort, result-DISTINCT or aggregation. It deliberately does not extend `PortRegistry.REQUIRED`:
+custom registries keep their frozen seven-slot contract, and callers do not gain a live temporary
+filesystem capability through `Database`.
+
+The boundary is still a ports-and-adapters boundary. `domain/ports/query_spill.py` defines opaque
+append-then-read sorters and an operator workspace; the engine supplies only versioned immutable
+key/payload bytes, a total comparator and one shared `LogicalMemoryBudget`. The shipped
+`LocalQuerySpillFactory` in `adapters/query_spill_local.py` alone imports `tempfile` and `os`, chooses
+host paths and performs bounded two-way external merges. No path crosses into `domain/` or
+`engine/`, and temporary runs never enter the durable database namespace.
+
+The adapter contract is intentionally narrow:
+
+```
+factory.open(budget) -> workspace
+workspace.sorter(total_comparator) -> sorter
+sorter.append(versioned_key, versioned_payload)
+sorter.records() -> ordered iterator[(key, payload)]
+sorter.close(); workspace.close()
+```
+
+Every buffered record and merge head is charged by the same engine-created logical counter as
+`32 + len(key) + len(payload)`. A record must fit within half the limit because a merge retains two
+heads. Before admitting engine-owned aggregate state, `workspace.reserve()` flushes spill buffers
+that can make room. This is deterministic logical accounting, not an RSS claim; Python allocator
+metadata, transient comparisons and OS caches are outside it. Completed runs compact eagerly into
+binary merge levels, so even the adapter's uncharged path metadata is O(log N), not one path per
+input record.
+
+Run files carry an `OGXS` format marker and version byte, fixed-size length headers and the
+engine's purpose/version-tagged safe `Value` records. Pickle and executable deserialization are
+forbidden. Invalid/truncated/oversized records fail as corruption; host I/O errors use the Grafx
+storage taxonomy. All sorters and the isolated temporary directory close on success, exception,
+cancellation and public cursor close. A cleanup failure remains a query failure (or is attached to
+the primary failure); it is not treated as successful completion.
+
+This capability changes only temporary query execution. It is not a durable format, storage,
+transaction, WAL, OCC, reader or writer port. A custom spill adapter is therefore not currently a
+public `connect()` extension point; widening that composition API would be a separate contract
+decision.
 
 ---
 

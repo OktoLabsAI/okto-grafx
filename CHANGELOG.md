@@ -16,6 +16,11 @@ including the on-disk format.
   statement once, returns only aggregate counters and preserves the existing transaction/WAL/OCC
   path. A failure at any item rolls all batch staging back to its initial savepoint even when the
   caller catches the error and later commits other work.
+- Added the opt-in `query_memory_budget_bytes` limit. Blocking sort, result-DISTINCT and
+  grouping/aggregation use safe, versioned adapter-owned external merge runs under deterministic
+  logical-byte accounting; aggregate DISTINCT, stable mixed-value/NaN ordering, cleanup on every
+  exit and the existing row limits remain intact. The default `None` preserves the previous
+  execution paths.
 
 ### Changed
 

@@ -50,6 +50,7 @@ def test_defaults_match_the_contract() -> None:
     assert config.max_statement_writes is None
     assert config.max_result_rows is None
     assert config.max_intermediate_rows is None
+    assert config.query_memory_budget_bytes is None
     assert config.max_traversal_expansions is None
     assert config.max_traversal_paths is None
     assert config.max_query_value_characters == DEFAULT_MAX_QUERY_VALUE_CHARACTERS
@@ -74,14 +75,16 @@ def test_descriptor_revalidation_extends_the_positional_surface_only_at_its_tail
 ):
     """An old positional call must still bind its last argument to ``read_only``."""
     configured = DatabaseConfig(path=":memory:", read_only=True)
-    fields = dataclasses.fields(DatabaseConfig)
+    fields = tuple(
+        field for field in dataclasses.fields(DatabaseConfig) if not field.kw_only
+    )
     assert tuple(field.name for field in fields[-3:]) == (
         "read_only",
         "descriptor_revalidation",
         "max_query_value_characters",
     )
 
-    legacy_arguments = dataclasses.astuple(configured)[:-2]
+    legacy_arguments = tuple(getattr(configured, field.name) for field in fields[:-2])
     legacy = DatabaseConfig(*legacy_arguments)
     assert legacy == configured
     assert legacy.read_only is True
@@ -92,22 +95,25 @@ def test_descriptor_revalidation_extends_the_positional_surface_only_at_its_tail
     assert opted_in.descriptor_revalidation == "generation"
 
 
-def test_query_value_character_limit_is_bounded_and_extends_the_positional_tail() -> None:
+def test_query_value_character_limit_is_bounded_and_extends_the_positional_tail() -> (
+    None
+):
+    base = DatabaseConfig(path=":memory:")
+    positional = tuple(
+        getattr(base, field.name)
+        for field in dataclasses.fields(DatabaseConfig)
+        if not field.kw_only
+    )
     configured = DatabaseConfig(
         ":memory:",
-        *(
-            dataclasses.astuple(DatabaseConfig(path=":memory:"))[1:-2]
-            + ("generation", 70_000)
-        ),
+        *(positional[1:-2] + ("generation", 70_000)),
     )
     assert configured.descriptor_revalidation == "generation"
     assert configured.max_query_value_characters == 70_000
 
     for rejected in (0, -1, MAX_QUERY_VALUE_CHARACTERS + 1):
         with pytest.raises(GrafxConfigurationError) as caught:
-            DatabaseConfig(
-                path=":memory:", max_query_value_characters=rejected
-            )
+            DatabaseConfig(path=":memory:", max_query_value_characters=rejected)
         assert caught.value.details["field"] == "max_query_value_characters"
 
 
@@ -262,6 +268,7 @@ def test_an_invalid_transaction_budget_is_rejected(field: str, value: object) ->
     [
         "max_result_rows",
         "max_intermediate_rows",
+        "query_memory_budget_bytes",
         "max_traversal_expansions",
         "max_traversal_paths",
     ],
@@ -766,6 +773,7 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         max_statement_writes=_HostileInt(64),
         max_result_rows=_HostileInt(256),
         max_intermediate_rows=_HostileInt(512),
+        query_memory_budget_bytes=_HostileInt(4096),
         max_traversal_expansions=_HostileInt(1024),
         max_traversal_paths=_HostileInt(2048),
         max_query_value_characters=_HostileInt(65_536),
@@ -787,6 +795,7 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         "max_statement_writes",
         "max_result_rows",
         "max_intermediate_rows",
+        "query_memory_budget_bytes",
         "max_traversal_expansions",
         "max_traversal_paths",
         "max_query_value_characters",

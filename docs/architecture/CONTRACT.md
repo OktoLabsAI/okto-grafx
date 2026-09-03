@@ -411,6 +411,7 @@ class DatabaseConfig:
     max_statement_writes: int | None = None
     max_result_rows: int | None = None
     max_intermediate_rows: int | None = None
+    query_memory_budget_bytes: int | None = dataclass_field(default=None, kw_only=True)
     max_traversal_expansions: int | None = None
     max_traversal_paths: int | None = None
     max_transaction_rows: int | None = None
@@ -516,10 +517,40 @@ successful query reports the corresponding admitted `traversal_expansions` or `t
 count.
 
 Any overrun raises non-retryable `GrafxQueryBudgetExceeded`. Refusal does not truncate state and
-does not release any write from the refused statement. These are not payload-byte, RSS, streaming,
-deadline or spill limits. Sort, aggregate, distinct and eager operators may retain up to configured
-rows or states before their first yield; payload bytes, internal structures and auxiliary scans
-behind those rows are not bounded by these fields.
+does not release any write from the refused statement.
+
+`query_memory_budget_bytes` is a separate process-local positive exact integer or `None`, declared
+keyword-only so the pre-existing positional `DatabaseConfig` surface does not shift. `None`
+preserves the old in-memory sort/top-N, result-DISTINCT and aggregate strategies. When configured,
+every `SortRows`, `DistinctRows` and `AggregateRows` gets an independent `LogicalMemoryBudget`
+shared with an internal adapter-owned spill workspace. Sort, result-DISTINCT and
+grouping/aggregation, including aggregate DISTINCT, use versioned external merge runs and retain no
+input-cardinality-sized collection beyond that counter. A buffered/merge-head record costs
+`32 + len(key) + len(payload)` logical bytes. One live
+aggregate group costs 64 bytes plus its versioned detached keys and 64 bytes per aggregate slot;
+retained `COLLECT` and `MIN`/`MAX` values cost 16 bytes plus their versioned detached value. Each
+strong NaN identity costs 64 bytes: the strong reference plus an `is` check preserves the existing
+rule that one repeated NaN object compares as the same frozen key while distinct NaN objects never
+collide through allocator address reuse. A transaction-private held-row identity required to
+reconstruct result-DISTINCT ordering costs 128 bytes plus its versioned detached values. All
+charges use the same operator counter.
+
+The budget is a deterministic portable admission model, **not RSS**. Python object headers,
+allocator arenas, transient encoding/comparison work, OS page cache and the final public result
+are not charged. A single spill record may consume at most half the budget so two merge heads fit.
+An aggregate `COLLECT` whose public tuple itself outgrows the counter is refused; no disk-proxy
+value is introduced. Result-DISTINCT performs one signature/ordinal pass and one ordinal pass, so
+the first occurrence and encounter order remain exact. `EagerRows`, vector candidate
+materialisation, deadlines and public terminal storage remain outside this first byte boundary. `max_result_rows`,
+`max_intermediate_rows` and traversal limits remain independent and authoritative.
+
+Temporary serialization is closed and non-executable: `OGXS` plus a run-version byte frames fixed
+lengths, while keys and payloads use distinct purpose/version prefixes over the complete safe
+`Value` codec. No pickle is admitted. Projected bindings/paths are detached before host I/O; the
+operator retains its original transaction snapshot. The workspace lives outside the database
+namespace and is cleaned on success, error, cancellation and cursor close; cleanup refusal cannot
+turn into success. This option changes no database files, WAL, write atomicity, OCC, durability,
+multiwriter or multireader rule.
 
 `max_query_value_characters` is a separate public-boundary guard. It defaults to 65,536 and may be
 configured from 1 through 1,048,576 characters. It applies to every string parameter (including a
@@ -1045,6 +1076,8 @@ class QueryEngine:
     def __init__(..., *, max_statement_writes: int | None = None,
                  max_result_rows: int | None = None,
                  max_intermediate_rows: int | None = None,
+                 query_memory_budget_bytes: int | None = None,
+                 query_spill: QuerySpillFactory | None = None,
                  max_traversal_expansions: int | None = None,
                  max_traversal_paths: int | None = None)
     def parse(self, text: str) -> "Statement"
@@ -1411,7 +1444,10 @@ terminal. `batch_size` is an exact positive integer no greater than 65,536. A fu
 perform hidden look-ahead, so callers must exhaust or close the cursor. The cursor is neither
 serializable nor safe for concurrent consumption. `max_result_rows` remains cumulative over the
 cursor and refuses row N+1; early close accounts only rows actually pulled. Blocking operators
-below the terminal preserve their documented semantics and may still materialise internal state.
+below the terminal preserve their documented semantics. With `query_memory_budget_bytes=None` they
+retain their prior in-memory state; with it configured, sort, result-DISTINCT and aggregate use the
+bounded spill contract above and cursor close removes their temporary workspace before releasing
+the reader.
 
 `Transaction.executemany(text, parameter_sets) -> ExecuteManyReport` is the additive bulk-write
 door. It accepts exactly one updating `Query` without `RETURN` on an active write transaction;

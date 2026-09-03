@@ -27,6 +27,12 @@ from okto_grafx.domain.ports.metrics import (
     MetricKind,
     MetricsSink,
 )
+from okto_grafx.domain.ports.query_spill import (
+    QuerySpillFactory,
+    QuerySpillSorter,
+    QuerySpillWorkspace,
+    SpillComparator,
+)
 from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.ports.vectormath import DistanceMetric, VectorMath
 
@@ -46,7 +52,11 @@ __all__ = [
     "PageCodec",
     "ProcessCoordinator",
     "ReaderHandle",
+    "QuerySpillFactory",
+    "QuerySpillSorter",
+    "QuerySpillWorkspace",
     "StorageDevice",
+    "SpillComparator",
     "UNBOUNDED_LABEL_CARDINALITY_LIMIT",
     "VectorMath",
 ]

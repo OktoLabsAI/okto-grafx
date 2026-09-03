@@ -51,6 +51,7 @@ from okto_grafx.adapters.coordination_local import (
 from okto_grafx.adapters.graph_guard import ConditionGuard
 from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
 from okto_grafx.adapters.metrics_noop import NoOpMetricsSink
+from okto_grafx.adapters.query_spill_local import LocalQuerySpillFactory
 from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.adapters.storage_read_only import ReadOnlyStorageDevice
 from okto_grafx.domain.errors import (
@@ -532,6 +533,8 @@ def assemble_database(
             max_statement_writes=config.max_statement_writes,
             max_result_rows=config.max_result_rows,
             max_intermediate_rows=config.max_intermediate_rows,
+            query_memory_budget_bytes=config.query_memory_budget_bytes,
+            query_spill=LocalQuerySpillFactory(),
             max_traversal_expansions=config.max_traversal_expansions,
             max_traversal_paths=config.max_traversal_paths,
         )
