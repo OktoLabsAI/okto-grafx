@@ -934,7 +934,7 @@ class BufferPool:
                             load = prepared_load
 
             if budget_failure is not None:
-                if self._metrics_enabled:
+                if self._metrics_active():
                     self._metrics.increment(
                         BUFFER_BUDGET_EXCEEDED_TOTAL, 1.0, self._labels
                     )
@@ -1462,7 +1462,7 @@ class BufferPool:
         the exact same timer and failure counter as :meth:`checkpoint`.
         """
         self._wait_for_evictions(file)
-        if self._metrics_enabled:
+        if self._metrics_active():
             with self._metrics.time(FSYNC_DURATION_SECONDS, self._data_labels):
                 self._barrier(file)
         else:
@@ -1473,7 +1473,7 @@ class BufferPool:
         try:
             self._storage.durable_barrier(file)
         except GrafxDurabilityBarrierFailed:
-            if self._metrics_enabled:
+            if self._metrics_active():
                 self._metrics.increment(BARRIER_FAILURES_TOTAL, 1.0, None)
             raise
 
@@ -1576,7 +1576,7 @@ class BufferPool:
             )
         )
         if own_proved:
-            if self._metrics_enabled:
+            if self._metrics_active():
                 self._metrics.increment(
                     READ_VIEW_DROPS_TOTAL, 1.0, {"view_origin": "own"}
                 )
@@ -1625,7 +1625,7 @@ class BufferPool:
                 files=files,
             )
         self._read_view_token = token
-        if self._metrics_enabled:
+        if self._metrics_active():
             self._metrics.increment(
                 READ_VIEW_DROPS_TOTAL, 1.0, {"view_origin": "foreign"}
             )
@@ -2174,7 +2174,7 @@ class BufferPool:
                     observed = self._flight_state_epoch
                     condition.wait_for(lambda: self._flight_state_epoch != observed)
                     continue
-                if self._metrics_enabled:
+                if self._metrics_active():
                     self._metrics.increment(
                         BUFFER_BUDGET_EXCEEDED_TOTAL, 1.0, self._labels
                     )
@@ -2205,7 +2205,7 @@ class BufferPool:
                 return Page(
                     int(PageType.FREE), page_size=self._page_size, page_index=page_index
                 )
-            if self._metrics_enabled:
+            if self._metrics_active():
                 self._metrics.increment(
                     CHECKSUM_VERIFICATIONS_TOTAL, 1.0, self._page_labels
                 )
@@ -2213,7 +2213,7 @@ class BufferPool:
                 page = self._codec.decode_page(raw, verify=True)
             except GrafxCorruptionDetected as detected:
                 failure = detected
-                if self._metrics_enabled:
+                if self._metrics_active():
                     self._metrics.increment(
                         CHECKSUM_FAILURES_TOTAL, 1.0, self._page_labels
                     )
@@ -2412,9 +2412,14 @@ class BufferPool:
     def _usage_reading(self) -> tuple[float, float] | None:
         """Capture callback-free usage under the guard, or None when telemetry is disabled."""
 
-        if not self._metrics_enabled:
+        if not self._metrics_active():
             return None
         return (float(self.used_bytes()), float(self._retained_bytes_estimate()))
+
+    def _metrics_active(self) -> bool:
+        """Honor a sink switched off after assembly without enabling an unsafe late opt-in."""
+
+        return self._metrics_enabled and self._metrics.enabled
 
     def _emit_usage(self, reading: tuple[float, float]) -> None:
         """Emit a previously captured usage pair; callers hold no pool guard."""
