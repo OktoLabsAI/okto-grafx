@@ -2109,20 +2109,21 @@ def _index_lookup_versions(
     key: bytes,
     snapshot: object,
     *,
-    exact: bool,
+    reuse_validated_version: bool,
     ended: Collection[object],
 ) -> Iterator[tuple[object, HeapVersion]]:
     """Yield index hits with their versions, reusing exact validation when available.
 
-    ``IndexManager.lookup_versions`` is deliberately internal.  The fallback keeps QueryEngine's
-    existing collaborator boundary working for a custom manager that only implements the frozen
-    ``lookup`` door; the built-in exact path never takes it.  That fallback remains deliberately
-    lazy: ``LIMIT`` and owner overlays must be able to stop before a later hit is read, exactly as
-    before this optimisation. Proximity indexes take the same lazy fallback because their
-    contract intentionally performs no heap validation in the manager.
+    ``IndexManager.lookup_versions`` is deliberately internal. Retaining every accepted version
+    is safe only for a key whose semantic contract bounds its cardinality (currently an automatic
+    primary key). General exact indexes -- notably relationship endpoint indexes for a hub --
+    keep the lazy fallback so memory does not grow as ``degree * payload``. The fallback also
+    preserves the existing collaborator boundary for a custom manager that only implements the
+    frozen ``lookup`` door. ``LIMIT`` and owner overlays can stop before a later hit is read,
+    exactly as before this optimisation.
     """
     lookup_versions = getattr(manager, "lookup_versions", None)
-    if exact and callable(lookup_versions):
+    if reuse_validated_version and callable(lookup_versions):
         yield from lookup_versions(name, key, snapshot)
         return
     lookup = getattr(manager, "lookup")
@@ -2149,6 +2150,17 @@ def _index_seek(
     snapshot = context.snapshot
     arity = len(node.table.columns)
     positions = tuple(node.table.column_index(name) for name in node.key_columns)
+    primary_position = (
+        None
+        if node.table.primary_key is None
+        else node.table.column_index(node.table.primary_key)
+    )
+    reuse_validated_version = (
+        node.visibility is IndexVisibility.EXACT
+        and primary_position is not None
+        and positions == (primary_position,)
+        and node.index == primary_key_index_name(node.table.name)
+    )
     ended = _ended_by_this_transaction(context)
     single_source = isinstance(node.child, SingleRow)
     for row in engine._rows(node.child, context):
@@ -2162,7 +2174,7 @@ def _index_seek(
             node.index,
             key,
             snapshot,
-            exact=node.visibility is IndexVisibility.EXACT,
+            reuse_validated_version=reuse_validated_version,
             ended=ended,
         ):
             if ref in ended:
@@ -2205,9 +2217,9 @@ def _edge_steps(
     **By index**, when every direction the pattern walks has its endpoint index present, owned
     by this table, and FRESH. A stored relationship row leads with its endpoints, so "the edges
     leaving this node" is exactly the question the ``ef_``/``et_`` indexes answer, and
-    ``IndexManager.lookup_versions`` discharges section 8.7 on the way: every candidate is
-    validated against the heap under this snapshot, so the hits are the edges the scan would have
-    kept, together with the immutable versions that proved them.
+    ``IndexManager.lookup`` discharges section 8.7 on the way: every candidate is validated
+    against the heap under this snapshot. Endpoint hits deliberately remain ref-only here:
+    retaining every decoded payload would make transient memory proportional to a hub's degree.
     Before this existed, a reverse hop into a well-referenced node of a 2500-node graph read all
     3600 edges and cost 1.46 s.
 
@@ -2290,7 +2302,7 @@ def _edge_steps(
                 cast(str, from_name),
                 index_key((cast(Value, record_id), None), (0,)),
                 snapshot,
-                exact=True,
+                reuse_validated_version=False,
                 ended=ended,
             ):
                 if ref in ended:
@@ -2307,7 +2319,7 @@ def _edge_steps(
                 cast(str, to_name),
                 index_key((None, cast(Value, record_id)), (1,)),
                 snapshot,
-                exact=True,
+                reuse_validated_version=False,
                 ended=ended,
             ):
                 if ref in ended:

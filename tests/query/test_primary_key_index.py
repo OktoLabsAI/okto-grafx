@@ -188,8 +188,14 @@ def test_an_exact_seek_reuses_the_heap_version_validated_by_the_index(
     assert len(reads) == 1
 
 
-@pytest.mark.parametrize("exact", (False, True), ids=("proximity", "lookup-only-exact"))
-def test_index_version_fallback_reads_hits_lazily(exact: bool) -> None:
+@pytest.mark.parametrize(
+    "reuse_validated_version",
+    (False, True),
+    ids=("ref-only", "lookup-only-manager"),
+)
+def test_index_version_fallback_reads_hits_lazily(
+    reuse_validated_version: bool,
+) -> None:
     """A LIMIT may stop before a later fallback hit, preserving its corruption surface."""
     reads: list[str] = []
 
@@ -211,7 +217,7 @@ def test_index_version_fallback_reads_hits_lazily(exact: bool) -> None:
         "idx",
         b"key",
         object(),
-        exact=exact,
+        reuse_validated_version=reuse_validated_version,
         ended=(),
     )
 
@@ -226,7 +232,7 @@ def test_index_version_fallback_reads_hits_lazily(exact: bool) -> None:
         "idx",
         b"key",
         object(),
-        exact=exact,
+        reuse_validated_version=reuse_validated_version,
         ended={"first", "corrupt-third"},
     )
     assert next(owner_filtered) == ("second", "version-second")

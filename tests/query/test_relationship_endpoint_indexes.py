@@ -101,37 +101,44 @@ def test_endpoint_acceleration_crosses_the_central_exact_view_fence(
 ) -> None:
     _small_graph(database)
     crossed: list[str] = []
-    original = IndexManager.validated_versions
+    original = IndexManager.validated
 
     def recording(self, index, key, snapshot):
         crossed.append(index.name)
         return original(self, index, key, snapshot)
 
-    monkeypatch.setattr(IndexManager, "validated_versions", recording)
+    monkeypatch.setattr(IndexManager, "validated", recording)
     assert sorted(
         database.execute("MATCH (a:A {id: 1})-[:E]->(b:B) RETURN b.id").rows
     ) == [(1,), (2,)]
     assert edge_from_index_name("E") in crossed
 
 
-def test_endpoint_seek_reuses_every_exact_version_read_under_the_fence(
+def test_endpoint_seek_does_not_retain_every_exact_version_for_a_hub(
     database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The start and its two indexed edges each need one heap read, not two."""
+    """Endpoint hits stay lazy instead of retaining ``degree * payload`` versions."""
     _small_graph(database)
     reads: list[object] = []
     original = HeapStore.read
+    original_versions = IndexManager.lookup_versions
 
     def recording(self, ref):
         reads.append(ref)
         return original(self, ref)
 
+    def guarded_versions(self, name, key, snapshot):
+        if name in {edge_from_index_name("E"), edge_to_index_name("E")}:
+            pytest.fail("endpoint indexes must not retain every validated heap version")
+        return original_versions(self, name, key, snapshot)
+
     monkeypatch.setattr(HeapStore, "read", recording)
+    monkeypatch.setattr(IndexManager, "lookup_versions", guarded_versions)
     result = database.execute("MATCH (a:A {id: 1})-[:E]->(b:B) RETURN b.id")
 
     assert sorted(result.rows) == [(1,), (2,)]
-    assert len(reads) == 3
-    assert len(set(reads)) == len(reads)
+    assert len(reads) == 5
+    assert len(set(reads)) == 3
 
 
 def test_a_whole_table_frontier_scans_without_spending_the_fan_limit_first(
