@@ -380,6 +380,14 @@ disabled. `60fc96b` makes emission honor the current disabled state while retain
 fail-closed rule against unsafe late enablement; its focused regression passed before the final
 gate. Ruff lint, `compileall` and `git diff --check` also passed.
 
+Checkpoint SHA: `60fc96b`. Reproducible grouped invocation:
+
+```text
+python -m pytest tests/query tests/api/test_executemany.py tests/api/test_public_query_boundaries.py tests/api/test_public_boundary_concurrency.py tests/storage_core/test_buffer_pool.py tests/storage_core/test_buffer_pool_single_flight.py tests/storage_core/test_checksum.py tests/storage_adapters/test_descriptor_cache_telemetry.py tests/observability/test_metrics_catalog.py tests/foundation/test_config.py tests/foundation/test_packaging.py tests/test_import_boundary.py -q
+```
+
+Collection and result: `2,916 collected / 2,916 passed`.
+
 The repository-wide Ruff formatting baseline still contains 256 historical files that would be
 reformatted. It was not mechanically rewritten in this performance milestone. New item-8 files
 and the directly changed hot paths passed scoped format checks; this distinction is intentional
