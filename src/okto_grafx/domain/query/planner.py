@@ -3014,9 +3014,18 @@ class _Planner:
         residual filter, DISTINCT and an aggregate each drop rows; a sort by anything other than
         the score means the k best by score are not the k the query wants; a SKIP is fusible only
         by adding it to the limit, because the rows it drops still have to be produced.
+
+        An updating clause is deliberately never fused.  Its following RETURN window controls
+        only the rows delivered to the caller; every matched row must still reach DELETE or SET.
         """
         clause = statement.return_clause
-        if clause is None or residual or clause.distinct or self.analysis.aggregated:
+        if (
+            clause is None
+            or statement.updating_clauses
+            or residual
+            or clause.distinct
+            or self.analysis.aggregated
+        ):
             return None
         if clause.limit is None or len(clause.sort_items) != 1:
             return None

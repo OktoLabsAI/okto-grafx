@@ -286,6 +286,23 @@ def test_a_skip_is_added_to_the_neighbour_count_rather_than_dropped() -> None:
     )
 
 
+@pytest.mark.parametrize("updating", ["DELETE n", "SET n.layer = 9"])
+def test_a_return_window_never_bounds_a_vector_search_that_writes(
+    updating: str,
+) -> None:
+    """DELETE/SET consume the complete match before RETURN applies SKIP or LIMIT."""
+    planned = plan_text(
+        "MATCH (n:Chunk) "
+        "WHERE similarity(n.embedding, $q, space => 'minilm_v2') > 0.2 "
+        f"{updating} "
+        "RETURN n.id, similarity_score() AS score ORDER BY score DESC SKIP 1 LIMIT 2"
+    )
+    search = find_operator(planned.root, "VectorSearch")
+    assert isinstance(search, VectorSearch)
+    assert search.k is None
+    assert search.bounded is False
+
+
 def test_a_search_with_no_limit_scores_every_candidate() -> None:
     planned = plan_text(
         "MATCH (n:Chunk) WHERE similarity(n.embedding, $q, space => 'minilm_v2') > 0.2 "

@@ -17,8 +17,11 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.ids import RecordRef
 from okto_grafx.domain.model.record import HeapVersion
 from okto_grafx.domain.model.schema import TableDef
+from okto_grafx.domain.query.plan import VectorSearch
+from okto_grafx.domain.txn.context import RowOperation
 from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.engine.heap_store import HeapStore
+from okto_grafx.engine.query_engine import RowBinding, _Context, _direct_vector_search
 from okto_grafx.engine.vector_engine import VectorEngine
 
 from .stack import (
@@ -398,10 +401,10 @@ def test_a_direct_hit_with_a_corrupt_or_invisible_identity_fails_closed(
     )
 
 
-def test_a_mutable_direct_hit_cannot_switch_the_row_staged_for_delete(
+def test_a_mutable_direct_hit_cannot_switch_the_validated_read_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The reference checked at the adapter boundary is the exact one a write consumes."""
+    """A read-only fast-path binding keeps the exact reference checked at its boundary."""
     stack = build_query_stack(
         vector_nullable=False,
         vector_exact_scan_threshold=32,
@@ -465,7 +468,43 @@ def test_a_mutable_direct_hit_cannot_switch_the_row_staged_for_delete(
         return replace(result, hits=(mutable,))  # type: ignore[arg-type]
 
     monkeypatch.setattr(VectorEngine, "search", switching_search)
+    planned = stack.engine.planned(
+        stack.engine.parse(DIRECT.replace("LIMIT 3", "LIMIT 1"))
+    )
+    search = next(node for node in planned.root.walk() if isinstance(node, VectorSearch))
+    context = _Context(
+        engine=stack.engine,
+        txn=_transaction(stack),
+        parameters={"q": [1.0, 0.0, 0.0, 0.0]},
+        analysis=planned.analysis,
+        statistics={},
+        coalesce_types={},
+        timestamp_values={},
+        case_types={},
+    )
+    rows = _direct_vector_search(stack.engine, stack.vectors, search, context)
+
+    assert rows is not None and len(rows) == 1
+    binding = rows[0].bindings["n"]
+    assert isinstance(binding, RowBinding)
+    mutable = exposed[0]
+    assert isinstance(mutable, SwitchingHit)
+    assert binding.ref == mutable.validated_ref
+    assert binding.ref != mutable.substituted_ref
+    assert mutable.ref_reads == 1
+    assert mutable.record_id_reads == 1
+    assert mutable.score_reads == 1
+
+
+def test_return_limit_never_reduces_the_rows_deleted_by_a_vector_match() -> None:
+    """LIMIT shapes the returned window after a write; every matched row is still deleted."""
+    stack = build_query_stack(
+        vector_nullable=False,
+        vector_exact_scan_threshold=32,
+    )
+    _seed(stack, count=4)
     transaction = _transaction(stack)
+
     result = stack.engine.execute(
         "MATCH (n:Chunk) "
         "WHERE similarity(n.embedding, $q, space => 'minilm_v2') > -2.0 "
@@ -475,15 +514,44 @@ def test_a_mutable_direct_hit_cannot_switch_the_row_staged_for_delete(
         {"q": [1.0, 0.0, 0.0, 0.0]},
     )
 
-    assert result.statistics["vector_direct_accesses"] == 1
-    assert len(transaction.row_intents) == 1
-    mutable = exposed[0]
-    assert isinstance(mutable, SwitchingHit)
-    assert transaction.row_intents[0].reference == mutable.validated_ref
-    assert transaction.row_intents[0].reference != mutable.substituted_ref
-    assert mutable.ref_reads == 1
-    assert mutable.record_id_reads == 1
-    assert mutable.score_reads == 1
+    search = next(node for node in result.plan.walk() if isinstance(node, VectorSearch))
+    assert search.k is None
+    assert len(result.rows) == 1
+    assert [intent.operation for intent in transaction.row_intents] == [
+        RowOperation.DELETE
+    ] * 4
+    assert len({intent.reference for intent in transaction.row_intents}) == 4
+    assert result.statistics["rows_deleted"] == 4
+    assert "vector_direct_accesses" not in result.statistics
+
+
+def test_return_limit_never_reduces_the_rows_updated_by_a_vector_match() -> None:
+    """SET also consumes the complete match before the caller's one-row return window."""
+    stack = build_query_stack(
+        vector_nullable=False,
+        vector_exact_scan_threshold=32,
+    )
+    _seed(stack, count=4)
+    transaction = _transaction(stack)
+
+    result = stack.engine.execute(
+        "MATCH (n:Chunk) "
+        "WHERE similarity(n.embedding, $q, space => 'minilm_v2') > -2.0 "
+        "SET n.layer = 9 "
+        "RETURN n.id, similarity_score() AS score ORDER BY score DESC LIMIT 1",
+        transaction,
+        {"q": [1.0, 0.0, 0.0, 0.0]},
+    )
+
+    search = next(node for node in result.plan.walk() if isinstance(node, VectorSearch))
+    assert search.k is None
+    assert len(result.rows) == 1
+    assert [intent.operation for intent in transaction.row_intents] == [
+        RowOperation.UPDATE
+    ] * 4
+    assert all(intent.values[1] == 9 for intent in transaction.row_intents)
+    assert result.statistics["rows_updated"] == 4
+    assert "vector_direct_accesses" not in result.statistics
 
 
 def test_cold_reopen_keeps_the_direct_approximate_path(tmp_path: Path) -> None:
