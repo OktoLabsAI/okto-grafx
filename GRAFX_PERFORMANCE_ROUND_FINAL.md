@@ -347,7 +347,7 @@ O consenso não autoriza mudança de formato, redução das garantias concorrent
 
 | Data | Marco | Estado | Evidência |
 |---|---|---|---|
-| 2026-09-02 | P0.0 — branch da rodada | concluído | `feature/v0.0.2` criada diretamente de `c5ab19d874e59962ba1b66eaa7ab682d1e8b7fac` |
+| 2026-09-02 | P0.0 — branch e ambiente da rodada | concluído | `feature/v0.0.2` criada diretamente de `c5ab19d874e59962ba1b66eaa7ab682d1e8b7fac`; ambiente/configuração em `docs/PERFORMANCE_ROUND_0_0_2.md` |
 | 2026-09-02 | versão de desenvolvimento | concluído | `pyproject.toml`, pacote e README em `0.0.2`; testes pontuais de packaging/CLI verdes |
 
 Esta seção registra somente fatos concluídos. Resultados P1 não serão promovidos antes do restante de P0 e do fechamento de H5, conforme a seção 6.
