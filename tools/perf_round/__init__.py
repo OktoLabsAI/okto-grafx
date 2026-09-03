@@ -1,11 +1,11 @@
 """Versioned instruments of performance round 0.0.2 (GRAFX_PERFORMANCE_ROUND_FINAL.md, P0.2).
 
-Three small modules that provide the initial P0.2 primitives, sharing one receipt format and one
-set of fail-closed guards:
+The modules share one receipt format and one set of fail-closed guards:
 
 * ``receipt``       -- provenance receipt, inventory hashes, data-home and declared-copy guards;
 * ``board_copy``    -- copy a board directory and PROVE source and copy byte-identical;
 * ``baseline_runs`` -- N >= 3 independent runs of an existing instrument, per mode, with dispersion.
+* ``profile_pulse_card`` -- one external py-spy profile of a spawned disposable Pulse replay.
 
 Nothing here is a gate, nothing here opens the default data home, and no raw output produced here
 is an official result: every receipt says ``official: false`` and carries the machine sample
