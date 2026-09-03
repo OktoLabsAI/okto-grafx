@@ -48,7 +48,7 @@ its chain, which is exactly what section 8.5 step 4 needs in order to log the wr
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 from typing import cast
 
@@ -228,10 +228,12 @@ _ERRORS_TOTAL = metric("oktografx_query_errors_total").name
 # database setting because changing either value may affect cost, never answers or durability.
 _ENDPOINT_LOCATOR_MAX_BYTES: int = 64 * 1024 * 1024
 _ENDPOINT_LOCATOR_MAX_ENTRIES: int = 1_000_000
-_ENDPOINT_LOCATOR_IDENTITY_BYTES: int = 128
-_ENDPOINT_LOCATOR_PAGE_BYTES: int = 96
-_ENDPOINT_LOCATOR_CURSOR_BYTES_PER_PAGE: int = 8
-_ENDPOINT_LOCATOR_CURSOR_BASE_BYTES: int = 512
+_ENDPOINT_LOCATOR_MEMO_BYTES: int = 1_024
+_ENDPOINT_LOCATOR_TABLE_BYTES: int = 512
+_ENDPOINT_LOCATOR_IDENTITY_BYTES: int = 384
+_ENDPOINT_LOCATOR_PAGE_BYTES: int = 192
+_ENDPOINT_LOCATOR_CURSOR_BYTES_PER_PAGE: int = 32
+_ENDPOINT_LOCATOR_CURSOR_BASE_BYTES: int = 2_048
 
 QUERY_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
@@ -881,29 +883,56 @@ class _EndpointLocatorStale(Exception):
 
 
 class _EndpointLocatorBudget:
-    """One shared, explicit memory allowance for all locators of one transaction."""
+    """One shared, explicit and atomic allowance for every locator of one engine."""
 
-    __slots__ = ("_max_bytes", "_max_entries", "_used_bytes", "_used_entries")
+    __slots__ = (
+        "_guard",
+        "_max_bytes",
+        "_max_entries",
+        "_used_bytes",
+        "_used_entries",
+    )
 
-    def __init__(self, *, max_bytes: int, max_entries: int) -> None:
+    def __init__(
+        self,
+        *,
+        max_bytes: int,
+        max_entries: int,
+        guard: AbstractContextManager[object] | None = None,
+    ) -> None:
         self._max_bytes = max_bytes
         self._max_entries = max_entries
         self._used_bytes = 0
         self._used_entries = 0
+        # Mechanism belongs to the composition root.  The no-op default keeps direct core
+        # construction deterministic; production hands this budget the same private RLock as
+        # the endpoint memo registry.
+        self._guard = nullcontext() if guard is None else guard
 
     def reserve(self, *, bytes_: int, entries: int) -> None:
         """Reserve derived state atomically, or ask the caller to use canonical lookup."""
-        next_bytes = self._used_bytes + bytes_
-        next_entries = self._used_entries + entries
-        if next_bytes > self._max_bytes or next_entries > self._max_entries:
-            raise _EndpointLocatorCapacity
-        self._used_bytes = next_bytes
-        self._used_entries = next_entries
+        with self._guard:
+            next_bytes = self._used_bytes + bytes_
+            next_entries = self._used_entries + entries
+            if next_bytes > self._max_bytes or next_entries > self._max_entries:
+                raise _EndpointLocatorCapacity
+            self._used_bytes = next_bytes
+            self._used_entries = next_entries
 
     def release(self, *, bytes_: int, entries: int) -> None:
         """Return an exact reservation held by a closing locator."""
-        self._used_bytes -= bytes_
-        self._used_entries -= entries
+        with self._guard:
+            self._used_bytes -= bytes_
+            self._used_entries -= entries
+
+
+@dataclass(slots=True)
+class _EndpointLocatorSlot:
+    """One paid table-registry entry and its non-overlapping lifecycle state."""
+
+    state: str = "building"
+    locator: _EndpointIdentityLocator | None = None
+    active: bool = False
 
 
 class _EndpointIdentityLocator:
@@ -1054,8 +1083,9 @@ class _EndpointTxnMemo:
     """All bounded endpoint locators owned by one exact transaction and schema picture."""
 
     __slots__ = (
+        "_base_charged",
+        "_retired",
         "budget",
-        "disabled_tables",
         "locators",
         "schema",
         "snapshot",
@@ -1074,15 +1104,131 @@ class _EndpointTxnMemo:
         self.snapshot = snapshot
         self.schema = schema
         self.budget = budget
-        self.locators: dict[int, _EndpointIdentityLocator] = {}
-        self.disabled_tables: set[int] = set()
+        self.locators: dict[int, _EndpointLocatorSlot] = {}
+        self._retired = False
+        self._base_charged = False
+        # This pays for the memo object, the engine's txn-id mapping entry and the empty table
+        # registry before any of them becomes reachable.  Every later table slot is charged by
+        # claim().  There is therefore no side container that can grow after saturation.
+        budget.reserve(bytes_=_ENDPOINT_LOCATOR_MEMO_BYTES, entries=1)
+        self._base_charged = True
 
-    def close(self) -> None:
-        """Close every locator before this transaction/snapshot can be forgotten."""
-        for locator in tuple(self.locators.values()):
-            locator.close()
-        self.locators.clear()
-        self.disabled_tables.clear()
+    def claim(self, table_id: int) -> _EndpointLocatorSlot:
+        """Install one paid construction slot; caller holds the injected registry guard."""
+        if self._retired:
+            raise _EndpointLocatorStale
+        present = self.locators.get(table_id)
+        if present is not None:
+            return present
+        slot = _EndpointLocatorSlot()
+        self.budget.reserve(bytes_=_ENDPOINT_LOCATOR_TABLE_BYTES, entries=1)
+        try:
+            self.locators[table_id] = slot
+        except BaseException:
+            self.budget.release(bytes_=_ENDPOINT_LOCATOR_TABLE_BYTES, entries=1)
+            raise
+        return slot
+
+    def install(
+        self, table_id: int, slot: _EndpointLocatorSlot, locator: _EndpointIdentityLocator
+    ) -> bool:
+        """Publish a fully built locator only while its paid slot is still live."""
+        if (
+            self._retired
+            or self.locators.get(table_id) is not slot
+            or slot.state != "building"
+        ):
+            self._discard_slot(table_id, slot)
+            return False
+        slot.locator = locator
+        slot.state = "ready"
+        slot.active = True
+        return True
+
+    def acquire(self, table_id: int) -> tuple[str, _EndpointLocatorSlot | None]:
+        """Lease one ready cursor to one caller without making page I/O a critical section."""
+        if self._retired:
+            return "retired", None
+        slot = self.locators.get(table_id)
+        if slot is None:
+            return "missing", None
+        if slot.state != "ready" or slot.active:
+            return slot.state if not slot.active else "busy", slot
+        slot.active = True
+        return "ready", slot
+
+    def finish(
+        self,
+        table_id: int,
+        slot: _EndpointLocatorSlot,
+        *,
+        disposition: str,
+    ) -> _EndpointIdentityLocator | None:
+        """Finish one lease and return a locator that may now be closed outside the guard."""
+        slot.active = False
+        if self.locators.get(table_id) is not slot:
+            return slot.locator
+        if self._retired or disposition == "evict":
+            return self._discard_slot(table_id, slot)
+        if disposition == "disable":
+            locator = slot.locator
+            slot.locator = None
+            slot.state = "disabled"
+            return locator
+        return None
+
+    def abandon_build(
+        self,
+        table_id: int,
+        slot: _EndpointLocatorSlot,
+        *,
+        disabled: bool,
+    ) -> None:
+        """Resolve a failed construction without allocating an unmetered disabled set."""
+        if self.locators.get(table_id) is not slot:
+            return
+        if self._retired or not disabled:
+            self._discard_slot(table_id, slot)
+            return
+        slot.state = "disabled"
+
+    def is_disabled(self, table_id: int) -> bool:
+        """Return whether this paid table slot permanently chose canonical lookup."""
+        slot = self.locators.get(table_id)
+        return slot is not None and slot.state == "disabled"
+
+    def retire(self) -> tuple[_EndpointIdentityLocator, ...]:
+        """Detach inactive state now and defer live/building slots to their owner."""
+        self._retired = True
+        closers: list[_EndpointIdentityLocator] = []
+        for table_id, slot in tuple(self.locators.items()):
+            if slot.active or slot.state == "building":
+                continue
+            locator = self._discard_slot(table_id, slot)
+            if locator is not None:
+                closers.append(locator)
+        self._release_base_if_empty()
+        return tuple(closers)
+
+    def _discard_slot(
+        self, table_id: int, slot: _EndpointLocatorSlot
+    ) -> _EndpointIdentityLocator | None:
+        """Remove exactly this table slot and return its locator without closing it."""
+        if self.locators.get(table_id) is not slot:
+            return slot.locator
+        self.locators.pop(table_id)
+        self.budget.release(bytes_=_ENDPOINT_LOCATOR_TABLE_BYTES, entries=1)
+        locator = slot.locator
+        slot.locator = None
+        slot.state = "retired"
+        self._release_base_if_empty()
+        return locator
+
+    def _release_base_if_empty(self) -> None:
+        """Return the memo/map reservation once retirement has no outstanding owner."""
+        if self._retired and not self.locators and self._base_charged:
+            self.budget.release(bytes_=_ENDPOINT_LOCATOR_MEMO_BYTES, entries=1)
+            self._base_charged = False
 
 
 class QueryEngine:
@@ -1110,6 +1256,7 @@ class QueryEngine:
         "_owner_memo",
         "_endpoint_memo",
         "_endpoint_budget",
+        "_endpoint_guard",
         "_txn_effects",
         "_skip_claims",
         "_durable_skips",
@@ -1132,6 +1279,7 @@ class QueryEngine:
         vectors: object = None,
         page_stager: Callable[[object, str, int, bytes], None] | None = None,
         schema_artifact_section: Callable[..., object] | None = None,
+        endpoint_locator_guard: AbstractContextManager[object] | None = None,
         max_statement_writes: int | None = None,
         max_result_rows: int | None = None,
         max_intermediate_rows: int | None = None,
@@ -1159,10 +1307,17 @@ class QueryEngine:
         # Endpoint identities are resolved by one bounded canonical prefix walk per table and
         # transaction.  Unlike the owner landing memo this state is explicitly metered, because
         # a write that names many identities must never create an unbounded executor cache.
+        # Its lock is separate from BufferPool's: holding the page-cache lock while entering the
+        # heap would invert ownership.  Only registry/accounting phases enter this guard; the
+        # locator's actual heap walk happens after it has been released.
+        self._endpoint_guard = (
+            nullcontext() if endpoint_locator_guard is None else endpoint_locator_guard
+        )
         self._endpoint_memo: dict[int, _EndpointTxnMemo] = {}
         self._endpoint_budget = _EndpointLocatorBudget(
             max_bytes=_ENDPOINT_LOCATOR_MAX_BYTES,
             max_entries=_ENDPOINT_LOCATOR_MAX_ENTRIES,
+            guard=self._endpoint_guard,
         )
         # Every out-of-transaction effect each open schema transaction has made -- indexes
         # registered, spaces attached, skip-report entries, index files created -- in the order
@@ -1862,9 +2017,14 @@ class QueryEngine:
 
     def _settle_endpoint_memo(self, txn_id: int) -> None:
         """Close one transaction's bounded derived walks on commit, rollback or retry."""
-        memo = self._endpoint_memo.pop(txn_id, None)
-        if memo is not None:
-            memo.close()
+        with self._endpoint_guard:
+            memo = self._endpoint_memo.pop(txn_id, None)
+            closers = () if memo is None else memo.retire()
+        # Cursor close is currently memory-only, but keeping collaborator work outside the
+        # registry guard makes the phase boundary explicit and prevents a later close hook from
+        # silently turning settlement into heap I/O under the lock.
+        for locator in closers:
+            locator.close()
 
     @property
     def skipped_indexes(self) -> tuple[str, ...]:
@@ -3905,24 +4065,41 @@ def _endpoint_txn_memo(
     if isinstance(txn_id, bool) or not isinstance(txn_id, int):
         return None
     snapshot = context.snapshot
+    # Catalog refresh can read pages.  Establish the picture before entering the endpoint-only
+    # registry guard; that guard never owns a heap or buffer-pool operation.
     schema = context.schema()
-    memo = engine._endpoint_memo.get(txn_id)
-    if memo is not None and (
-        memo.txn is not context.txn
-        or memo.snapshot is not snapshot
-        or memo.schema is not schema
-    ):
-        memo.close()
-        engine._endpoint_memo.pop(txn_id, None)
-        memo = None
-    if memo is None:
-        memo = _EndpointTxnMemo(
-            txn=context.txn,
-            snapshot=snapshot,
-            schema=schema,
-            budget=engine._endpoint_budget,
-        )
-        engine._endpoint_memo[txn_id] = memo
+    closers: tuple[_EndpointIdentityLocator, ...] = ()
+    try:
+        with engine._endpoint_guard:
+            memo = engine._endpoint_memo.get(txn_id)
+            if memo is not None and (
+                memo.txn is not context.txn
+                or memo.snapshot is not snapshot
+                or memo.schema is not schema
+            ):
+                engine._endpoint_memo.pop(txn_id, None)
+                closers = memo.retire()
+                memo = None
+            if memo is None:
+                try:
+                    candidate = _EndpointTxnMemo(
+                        txn=context.txn,
+                        snapshot=snapshot,
+                        schema=schema,
+                        budget=engine._endpoint_budget,
+                    )
+                except _EndpointLocatorCapacity:
+                    candidate = None
+                if candidate is not None:
+                    try:
+                        engine._endpoint_memo[txn_id] = candidate
+                    except BaseException:
+                        candidate.retire()
+                        raise
+                    memo = candidate
+    finally:
+        for locator in closers:
+            locator.close()
     return memo
 
 
@@ -3950,21 +4127,43 @@ def _visible_identity_with_ref(
     reasons to fall back.  Stored-data mismatches and corruption propagate unchanged.
     """
     memo = _endpoint_txn_memo(engine, context)
-    if memo is None or table.table_id in memo.disabled_tables:
+    if memo is None:
         return _canonical_identity_with_ref(engine, context, table, record_id)
-    locator = memo.locators.get(table.table_id)
-    if locator is not None and (
-        locator.table is not table
-        or locator.epoch != engine.heap._derived_read_epoch()
-    ):
-        locator.close()
-        memo.locators.pop(table.table_id, None)
-        # The current call goes through the canonical door.  A later call may start a fresh walk
-        # if the epoch has stabilised; no result straddles two physical views.
+    build = False
+    close_before_fallback: _EndpointIdentityLocator | None = None
+    with engine._endpoint_guard:
+        state, slot = memo.acquire(table.table_id)
+        if state == "missing":
+            try:
+                slot = memo.claim(table.table_id)
+            except (_EndpointLocatorCapacity, _EndpointLocatorStale):
+                slot = None
+            else:
+                build = True
+        elif state == "ready":
+            assert slot is not None
+            locator = slot.locator
+            assert locator is not None
+            if (
+                locator.table is not table
+                or locator.epoch != engine.heap._derived_read_epoch()
+            ):
+                close_before_fallback = memo.finish(
+                    table.table_id, slot, disposition="evict"
+                )
+                locator = None
+        else:
+            # A paid disabled marker, a construction in progress and a concurrent active use all
+            # choose the unchanged canonical door.  None allocates a second side structure.
+            locator = None
+    if close_before_fallback is not None:
+        close_before_fallback.close()
+    if slot is None or (not build and locator is None):
         return _canonical_identity_with_ref(engine, context, table, record_id)
-    if locator is None:
+
+    if build:
         try:
-            locator = _EndpointIdentityLocator(
+            candidate = _EndpointIdentityLocator(
                 heap=engine.heap,
                 table=table,
                 snapshot=context.snapshot,
@@ -3972,26 +4171,39 @@ def _visible_identity_with_ref(
                 page_size=engine._pool.page_size,
             )
         except _EndpointLocatorCapacity:
-            memo.disabled_tables.add(table.table_id)
+            with engine._endpoint_guard:
+                memo.abandon_build(table.table_id, slot, disabled=True)
             return _canonical_identity_with_ref(engine, context, table, record_id)
-        memo.locators[table.table_id] = locator
+        except BaseException:
+            with engine._endpoint_guard:
+                memo.abandon_build(table.table_id, slot, disabled=False)
+            raise
+        with engine._endpoint_guard:
+            installed = memo.install(table.table_id, slot, candidate)
+        if not installed:
+            candidate.close()
+            return _canonical_identity_with_ref(engine, context, table, record_id)
+        locator = candidate
+
+    disposition = "keep"
     try:
         return locator.locate(record_id)
     except _EndpointLocatorCapacity:
-        locator.close()
-        memo.locators.pop(table.table_id, None)
-        memo.disabled_tables.add(table.table_id)
+        disposition = "disable"
         return _canonical_identity_with_ref(engine, context, table, record_id)
     except _EndpointLocatorStale:
-        locator.close()
-        memo.locators.pop(table.table_id, None)
+        disposition = "evict"
         return _canonical_identity_with_ref(engine, context, table, record_id)
-    except GrafxError:
+    except BaseException:
         # A stored-data refusal is the answer.  Drop the partial accelerator, but never turn the
         # same call into a fallback that could hide or reorder the failure.
-        locator.close()
-        memo.locators.pop(table.table_id, None)
+        disposition = "evict"
         raise
+    finally:
+        with engine._endpoint_guard:
+            closer = memo.finish(table.table_id, slot, disposition=disposition)
+        if closer is not None:
+            closer.close()
 
 
 def _raise_missing_endpoint(

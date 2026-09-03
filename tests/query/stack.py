@@ -14,6 +14,7 @@ path is asked about.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -599,6 +600,7 @@ def build_query_stack(
         clock=clock,
         indexes=indexes,
         vectors=vectors,
+        endpoint_locator_guard=threading.RLock(),
         max_result_rows=max_result_rows,
         max_intermediate_rows=max_intermediate_rows,
     )
