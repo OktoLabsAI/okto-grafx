@@ -235,6 +235,22 @@ _ENDPOINT_LOCATOR_PAGE_BYTES: int = 192
 _ENDPOINT_LOCATOR_CURSOR_BYTES_PER_PAGE: int = 32
 _ENDPOINT_LOCATOR_CURSOR_BASE_BYTES: int = 2_048
 
+# A landing result retains a decoded HeapVersion, unlike the endpoint locator above.  These
+# ceilings are consequently smaller and shared by every open transaction on this engine.  The
+# serialized payload is charged at sixteen times its size, plus fixed Python-object overhead.  The
+# factor remains conservative even for maps of many small scalar pairs, whose dict/key/value
+# object graph can be much wider than its compact encoding.  Exhaustion changes cost only: the
+# table's retained results are discarded and subsequent identities use the canonical D-02 door.
+_OWNER_LANDING_MAX_BYTES: int = 32 * 1024 * 1024
+_OWNER_LANDING_MAX_ENTRIES: int = 131_072
+_OWNER_LANDING_MEMO_BYTES: int = 1_024
+_OWNER_LANDING_TABLE_BYTES: int = 512
+_OWNER_LANDING_VIEW_BASE_BYTES: int = 1_024
+_OWNER_LANDING_OVERLAY_ENTRY_BYTES: int = 192
+_OWNER_LANDING_RESULT_BASE_BYTES: int = 512
+_OWNER_LANDING_MISS_BYTES: int = 192
+_OWNER_LANDING_PAYLOAD_MULTIPLIER: int = 16
+
 QUERY_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
     for name in (
@@ -1231,6 +1247,438 @@ class _EndpointTxnMemo:
             self._base_charged = False
 
 
+class _OwnerLandingCapacity(Exception):
+    """Internal signal that decoded landing retention reached its complete allowance."""
+
+
+class _OwnerLandingBudget:
+    """One explicit, engine-wide allowance for transaction-local decoded landings."""
+
+    __slots__ = (
+        "_guard",
+        "_max_bytes",
+        "_max_entries",
+        "_used_bytes",
+        "_used_entries",
+    )
+
+    def __init__(
+        self,
+        *,
+        max_bytes: int,
+        max_entries: int,
+        guard: AbstractContextManager[object] | None = None,
+    ) -> None:
+        self._max_bytes = max_bytes
+        self._max_entries = max_entries
+        self._used_bytes = 0
+        self._used_entries = 0
+        self._guard = nullcontext() if guard is None else guard
+
+    def reserve(self, *, bytes_: int, entries: int) -> None:
+        """Reserve before retaining an object, or leave the counters untouched."""
+        with self._guard:
+            next_bytes = self._used_bytes + bytes_
+            next_entries = self._used_entries + entries
+            if next_bytes > self._max_bytes or next_entries > self._max_entries:
+                raise _OwnerLandingCapacity
+            self._used_bytes = next_bytes
+            self._used_entries = next_entries
+
+    def release(self, *, bytes_: int, entries: int) -> None:
+        """Release one exact reservation while transaction settlement is fail-safe."""
+        with self._guard:
+            self._used_bytes -= bytes_
+            self._used_entries -= entries
+
+
+def _owner_landing_result_bytes(
+    table: TableDef, found: tuple[object, HeapVersion] | None
+) -> int | None:
+    """Return a conservative charge, or decline optional retention without changing the row."""
+    if found is None:
+        return _OWNER_LANDING_MISS_BYTES
+    try:
+        stored_bytes = len(encode_tuple(table, found[1].values))
+    except (GrafxError, MemoryError):
+        # Accounting is optional acceleration.  The version was already decoded and validated by
+        # the heap (or built by the owner's validated intent reducer), so a failure to size a
+        # second encoding must not replace that query answer with an accounting-only refusal.
+        return None
+    return (
+        _OWNER_LANDING_RESULT_BASE_BYTES
+        + stored_bytes * _OWNER_LANDING_PAYLOAD_MULTIPLIER
+    )
+
+
+class _OwnerLandingView:
+    """Resolve only requested node identities and retain them under an explicit budget.
+
+    This is R1 of D-03.  Physical identities go through the canonical, snapshot-bound D-02
+    locator; pending identities are answered only from this transaction's reduced insert view.
+    ``changed`` and ``ended`` are then applied in the same order as the former full-table map.
+
+    Results are memoized across statements only while the transaction, snapshot, schema,
+    fingerprint and heap epoch still vouch for them.  Admission precedes every cache mutation.  If
+    any result would exceed the shared bytes or entries ceiling, all decoded results of this table
+    are discarded and this view becomes lookup-only.  The query is never refused for acceleration
+    capacity.  When both this result cache and the D-02 prefix locator exceed their independent
+    ceilings, the honest residual worst case is one canonical O(N) lookup per distinct landing;
+    eliminating that case requires the separately governed persistent identity access path.
+    """
+
+    __slots__ = (
+        "_active",
+        "_base_bytes",
+        "_base_entries",
+        "_budget",
+        "_cache",
+        "_cache_bytes",
+        "_cache_enabled",
+        "_cache_entries",
+        "_changed",
+        "_context",
+        "_ended",
+        "_engine",
+        "_epoch",
+        "_fingerprint",
+        "_guard",
+        "_pending",
+        "_retired",
+        "_snapshot",
+        "_table",
+    )
+
+    def __init__(
+        self,
+        *,
+        engine: QueryEngine,
+        context: _Context,
+        table: TableDef,
+        fingerprint: tuple,
+        changed: dict[object, tuple[Value, ...] | None],
+        inserted: Sequence[tuple[object, tuple[Value, ...]]],
+        ended: frozenset[object],
+        budget: _OwnerLandingBudget | None,
+        guard: AbstractContextManager[object],
+    ) -> None:
+        pending_count = sum(
+            isinstance(reference, PendingRowRef) for reference, _values in inserted
+        )
+        overlay_entries = len(changed) + pending_count + len(ended)
+        base_bytes = (
+            _OWNER_LANDING_VIEW_BASE_BYTES
+            + overlay_entries * _OWNER_LANDING_OVERLAY_ENTRY_BYTES
+        )
+        base_entries = 1 + overlay_entries
+        if budget is not None:
+            budget.reserve(bytes_=base_bytes, entries=base_entries)
+        try:
+            self._engine = engine
+            self._context = context
+            self._table = table
+            self._snapshot = context.snapshot
+            self._fingerprint = fingerprint
+            self._epoch = engine.heap._derived_read_epoch()
+            self._changed = changed
+            self._ended = ended
+            self._budget = budget
+            self._guard = guard
+            self._base_bytes = base_bytes if budget is not None else 0
+            self._base_entries = base_entries if budget is not None else 0
+            self._cache: dict[
+                object, tuple[tuple[object, HeapVersion] | None, int]
+            ] = {}
+            self._cache_bytes = 0
+            self._cache_entries = 0
+            self._cache_enabled = budget is not None
+            self._active = 0
+            self._retired = False
+            self._pending = {
+                reference: values
+                for reference, values in inserted
+                if isinstance(reference, PendingRowRef)
+            }
+        except BaseException:
+            if budget is not None:
+                budget.release(bytes_=base_bytes, entries=base_entries)
+            raise
+
+    def matches(
+        self,
+        *,
+        table: TableDef,
+        snapshot: object,
+        fingerprint: tuple,
+        epoch: int,
+    ) -> bool:
+        """Return whether every authority captured by this derived view is still current."""
+        return (
+            not self._retired
+            and self._table == table
+            and self._snapshot is snapshot
+            and self._fingerprint == fingerprint
+            and self._epoch == epoch
+        )
+
+    def rebind(self, context: _Context) -> None:
+        """Use the current statement context after an unchanged transaction fingerprint."""
+        self._context = context
+
+    def get(self, identity: object) -> tuple[object, HeapVersion] | None:
+        """Return one owner-visible identity, memoizing only after successful admission."""
+        with self._guard:
+            if self._retired:
+                raise GrafxTransactionStateError(
+                    "A transaction-local landing view was retired before its query finished.",
+                    field="owner_landing_view",
+                    table=self._table.name,
+                    table_id=self._table.table_id,
+                )
+            cached = self._cache.get(identity)
+            if cached is not None:
+                return cached[0]
+            self._active += 1
+            context = self._context
+        lease_open = True
+        try:
+            # The identity door can walk and decode heap pages.  It is deliberately outside the
+            # injected registry guard; only the immutable overlay references above are leased.
+            found = self._resolve(identity, context)
+            charge = _owner_landing_result_bytes(self._table, found)
+            with self._guard:
+                try:
+                    if (
+                        not self._retired
+                        and self._cache_enabled
+                        and charge is not None
+                        and identity not in self._cache
+                    ):
+                        budget = self._budget
+                        if budget is not None:
+                            try:
+                                budget.reserve(bytes_=charge, entries=1)
+                            except _OwnerLandingCapacity:
+                                self._discard_results_locked()
+                                self._cache_enabled = False
+                            else:
+                                try:
+                                    self._cache[identity] = (found, charge)
+                                except BaseException:
+                                    budget.release(bytes_=charge, entries=1)
+                                    raise
+                                self._cache_bytes += charge
+                                self._cache_entries += 1
+                finally:
+                    self._leave_locked()
+                    lease_open = False
+            return found
+        finally:
+            if lease_open:
+                with self._guard:
+                    self._leave_locked()
+
+    def close(self) -> None:
+        """Drop payloads, overlays and their exact charges at transaction settlement."""
+        with self._guard:
+            if self._retired:
+                return
+            self._retired = True
+            self._discard_results_locked()
+            if self._active == 0:
+                self._release_base_locked()
+
+    def forfeit_retention(self) -> None:
+        """Turn an uninstalled candidate into an unmetered, statement-local fallback view."""
+        with self._guard:
+            self._discard_results_locked()
+            self._release_base_locked(clear_overlays=False)
+            self._cache_enabled = False
+            self._budget = None
+
+    def _resolve(
+        self, identity: object, context: _Context
+    ) -> tuple[object, HeapVersion] | None:
+        """Apply the former full-map overlay to one physical or pending identity."""
+        if isinstance(identity, PendingRowRef):
+            values = self._pending.get(identity)
+            if values is None:
+                return None
+            return (
+                identity,
+                HeapVersion(
+                    record_id=0,
+                    xmin=NO_CSN,
+                    xmax=NO_CSN,
+                    values=values,
+                    prev=None,
+                    schema_version=self._table.schema_version,
+                    deleted=False,
+                    table_id=self._table.table_id,
+                ),
+            )
+
+        physical = _visible_identity_with_ref(
+            self._engine,
+            context,
+            self._table,
+            cast(RecordId, identity),
+        )
+        if physical is None:
+            return None
+        ref, version = physical
+        if ref in self._ended:
+            return None
+        if ref in self._changed:
+            values = self._changed[ref]
+            if values is None:
+                return None
+            version = replace(version, values=values)
+        return ref, version
+
+    def _leave_locked(self) -> None:
+        """Finish one heap-I/O lease; caller holds the injected re-entrant guard."""
+        self._active -= 1
+        if self._retired and self._active == 0:
+            self._release_base_locked()
+
+    def _discard_results_locked(self) -> None:
+        """Release every decoded result without disturbing the overlay needed for fallback."""
+        if self._cache_entries == 0:
+            self._cache.clear()
+            return
+        budget = self._budget
+        if budget is not None:
+            budget.release(bytes_=self._cache_bytes, entries=self._cache_entries)
+        self._cache.clear()
+        self._cache_bytes = 0
+        self._cache_entries = 0
+
+    def _release_base_locked(self, *, clear_overlays: bool = True) -> None:
+        """Release the view/map charge after no in-flight resolver can observe its overlays."""
+        budget = self._budget
+        if budget is not None and self._base_entries:
+            budget.release(bytes_=self._base_bytes, entries=self._base_entries)
+        self._base_bytes = 0
+        self._base_entries = 0
+        if clear_overlays:
+            self._changed.clear()
+            self._pending.clear()
+            self._ended = frozenset()
+
+
+@dataclass(slots=True)
+class _OwnerLandingSlot:
+    """One paid table-registry slot whose view may be built outside the guard."""
+
+    state: str = "building"
+    view: _OwnerLandingView | None = None
+
+
+class _OwnerLandingTxnMemo:
+    """All bounded lazy landing views owned by one transaction and catalog picture."""
+
+    __slots__ = (
+        "_base_charged",
+        "_budget",
+        "_retired",
+        "schema",
+        "snapshot",
+        "tables",
+        "txn",
+    )
+
+    def __init__(
+        self,
+        *,
+        txn: object,
+        snapshot: object,
+        schema: Catalog,
+        budget: _OwnerLandingBudget,
+    ) -> None:
+        self.txn = txn
+        self.snapshot = snapshot
+        self.schema = schema
+        self._budget = budget
+        self.tables: dict[int, _OwnerLandingSlot] = {}
+        self._retired = False
+        self._base_charged = False
+        # Pay for the memo object, engine txn-id entry and empty table registry before any is
+        # reachable.  A saturated budget therefore cannot grow a side registry of fallbacks.
+        budget.reserve(bytes_=_OWNER_LANDING_MEMO_BYTES, entries=1)
+        self._base_charged = True
+
+    def claim(self, table_id: int) -> _OwnerLandingSlot:
+        """Install one paid build slot; caller holds the injected registry guard."""
+        if self._retired:
+            raise _OwnerLandingCapacity
+        present = self.tables.get(table_id)
+        if present is not None:
+            return present
+        self._budget.reserve(bytes_=_OWNER_LANDING_TABLE_BYTES, entries=1)
+        slot = _OwnerLandingSlot()
+        try:
+            self.tables[table_id] = slot
+        except BaseException:
+            self._budget.release(bytes_=_OWNER_LANDING_TABLE_BYTES, entries=1)
+            raise
+        return slot
+
+    def begin_rebuild(
+        self, table_id: int, slot: _OwnerLandingSlot
+    ) -> _OwnerLandingView | None:
+        """Detach an invalid view while preserving its already-paid table slot."""
+        if self._retired or self.tables.get(table_id) is not slot:
+            return None
+        previous = slot.view
+        slot.view = None
+        slot.state = "building"
+        return previous
+
+    def install(
+        self, table_id: int, slot: _OwnerLandingSlot, view: _OwnerLandingView
+    ) -> bool:
+        """Publish a complete view only while its paid build slot is still current."""
+        if (
+            self._retired
+            or self.tables.get(table_id) is not slot
+            or slot.state != "building"
+        ):
+            return False
+        slot.view = view
+        slot.state = "ready"
+        return True
+
+    def abandon_build(self, table_id: int, slot: _OwnerLandingSlot) -> None:
+        """Release a failed build slot without leaving an unmetered disabled marker."""
+        if self.tables.get(table_id) is not slot:
+            return
+        self.tables.pop(table_id)
+        slot.state = "retired"
+        self._budget.release(bytes_=_OWNER_LANDING_TABLE_BYTES, entries=1)
+        self._release_base_if_empty()
+
+    def retire(self) -> tuple[_OwnerLandingView, ...]:
+        """Detach all complete views and release registry charges at settlement."""
+        self._retired = True
+        closers: list[_OwnerLandingView] = []
+        for table_id, slot in tuple(self.tables.items()):
+            self.tables.pop(table_id)
+            self._budget.release(bytes_=_OWNER_LANDING_TABLE_BYTES, entries=1)
+            if slot.view is not None:
+                closers.append(slot.view)
+                slot.view = None
+            slot.state = "retired"
+        self._release_base_if_empty()
+        return tuple(closers)
+
+    def _release_base_if_empty(self) -> None:
+        """Return the memo/map charge exactly once after retirement."""
+        if self._retired and not self.tables and self._base_charged:
+            self._budget.release(bytes_=_OWNER_LANDING_MEMO_BYTES, entries=1)
+            self._base_charged = False
+
+
 class QueryEngine:
     """The query surface of one database (CONTRACT.md section 8.9).
 
@@ -1254,6 +1702,7 @@ class QueryEngine:
         "_skipped_indexes",
         "_working",
         "_owner_memo",
+        "_owner_budget",
         "_endpoint_memo",
         "_endpoint_budget",
         "_endpoint_guard",
@@ -1298,20 +1747,22 @@ class QueryEngine:
         # leaks the copy until the process ends, which is memory, not a wrong answer -- txn ids
         # are never reused, so a stale entry can never be read.
         self._working: dict[int, Catalog] = {}
-        # Each open transaction's landing memo: the owner-visible rows of each node table it
-        # has resolved, keyed by txn id then table id, with the snapshot and fingerprint that
-        # vouch for the entry (see _owner_landing_view). Dropped by settle_schema exactly as
-        # the working catalog is, with the same shrug about a caller that never settles: txn
-        # ids are never reused, so a stale entry can never be read.
-        self._owner_memo: dict[int, dict[int, tuple[object, object, dict]]] = {}
+        # Each open transaction's bounded, lazy landing views.  They retain only identities a
+        # traversal actually requested and die through settle_schema on commit, rollback or
+        # retry.  The shared budget bounds all decoded payload retention across transactions.
+        self._owner_memo: dict[int, _OwnerLandingTxnMemo] = {}
         # Endpoint identities are resolved by one bounded canonical prefix walk per table and
-        # transaction.  Unlike the owner landing memo this state is explicitly metered, because
-        # a write that names many identities must never create an unbounded executor cache.
+        # transaction.  Both endpoint refs and decoded owner landings are explicitly metered.
         # Its lock is separate from BufferPool's: holding the page-cache lock while entering the
         # heap would invert ownership.  Only registry/accounting phases enter this guard; the
-        # locator's actual heap walk happens after it has been released.
+        # locator and landing heap walks happen after it has been released.
         self._endpoint_guard = (
             nullcontext() if endpoint_locator_guard is None else endpoint_locator_guard
+        )
+        self._owner_budget = _OwnerLandingBudget(
+            max_bytes=_OWNER_LANDING_MAX_BYTES,
+            max_entries=_OWNER_LANDING_MAX_ENTRIES,
+            guard=self._endpoint_guard,
         )
         self._endpoint_memo: dict[int, _EndpointTxnMemo] = {}
         self._endpoint_budget = _EndpointLocatorBudget(
@@ -1998,7 +2449,7 @@ class QueryEngine:
                     if not claims:
                         self._skip_claims.pop(effect.table, None)
             self._working.pop(txn_id, None)
-            self._owner_memo.pop(txn_id, None)
+            self._settle_owner_memo(txn_id)
             self._settle_endpoint_memo(txn_id)
             self._txn_effects.pop(txn_id, None)
             return
@@ -2011,9 +2462,19 @@ class QueryEngine:
         if working is not None or effects:
             self._unwind_schema_statement(effects or [])
         self._working.pop(txn_id, None)
-        self._owner_memo.pop(txn_id, None)
+        self._settle_owner_memo(txn_id)
         self._settle_endpoint_memo(txn_id)
         self._txn_effects.pop(txn_id, None)
+
+    def _settle_owner_memo(self, txn_id: int) -> None:
+        """Release one transaction's decoded landing state on every terminal path."""
+        with self._endpoint_guard:
+            memo = self._owner_memo.pop(txn_id, None)
+            closers = () if memo is None else memo.retire()
+        # A view can have an identity lookup in flight.  close() retires its cache immediately
+        # and defers overlay release to that caller, without keeping this registry guard held.
+        for view in closers:
+            view.close()
 
     def _settle_endpoint_memo(self, txn_id: int) -> None:
         """Close one transaction's bounded derived walks on commit, rollback or retry."""
@@ -2753,8 +3214,8 @@ def _edge_steps(
                     by_target.setdefault(version.values[1], []).append((ref, version))
             for ref, version in pending:
                 # Their endpoints may be pending identities themselves, which is exactly the key
-                # `_owner_nodes` answers to, so a created edge between two created nodes needs no
-                # special case here.
+                # the lazy owner landing view answers to, so a created edge between two created
+                # nodes needs no special case here.
                 if outgoing:
                     by_source.setdefault(version.values[0], []).append((ref, version))
                 if incoming:
@@ -2896,17 +3357,17 @@ def _traverse(
         relationship_changes, pending_edges = _owner_edges(context, relationship)
     from_table = catalog.table(relationship.from_table)
     to_table = catalog.table(relationship.to_table)
-    nodes_by_id: dict[int, dict[int, tuple[object, HeapVersion]]] = {}
+    landing_views: dict[int, _OwnerLandingView] = {}
 
     ended = _ended_by_this_transaction(context)
 
     def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
-        """Return the version of one node its owner can see, indexing each table once."""
-        found = nodes_by_id.get(table.table_id)
-        if found is None:
-            found = _owner_landing_view(engine, context, table, ended)
-            nodes_by_id[table.table_id] = found
-        return found.get(identity)  # type: ignore[arg-type]
+        """Return one owner-visible node through a single lazy view per landing table."""
+        view = landing_views.get(table.table_id)
+        if view is None:
+            view = _owner_landing_view(engine, context, table, ended)
+            landing_views[table.table_id] = view
+        return view.get(identity)
 
     outgoing = node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
     incoming = node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
@@ -2950,8 +3411,8 @@ def _traverse(
                         and bound_target.table.table_id == next_table.table_id
                     ):
                         # The landing IS the bound row, which arrived through operators that
-                        # already validated its visibility -- so the full-table scan node_at
-                        # would take to re-prove it is not paid.
+                        # already validated its visibility -- so even the lazy identity proof
+                        # node_at would take to re-prove it is not paid.
                         landing = (bound_target.ref, bound_target.version)
                     else:
                         landing = node_at(next_table, next_id)
@@ -3021,15 +3482,15 @@ def _traverse_any(
     catalog = context.schema()
     ended = _ended_by_this_transaction(context)
     dirty_tables = _intent_table_ids(context.txn)
-    nodes_by_id: dict[int, dict[int, tuple[object, HeapVersion]]] = {}
+    landing_views: dict[int, _OwnerLandingView] = {}
 
     def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
-        """Return the version of one node its owner can see, indexing each table once."""
-        found = nodes_by_id.get(table.table_id)
-        if found is None:
-            found = _owner_landing_view(engine, context, table, ended)
-            nodes_by_id[table.table_id] = found
-        return found.get(identity)  # type: ignore[arg-type]
+        """Return one owner-visible node through a single lazy view per landing table."""
+        view = landing_views.get(table.table_id)
+        if view is None:
+            view = _owner_landing_view(engine, context, table, ended)
+            landing_views[table.table_id] = view
+        return view.get(identity)
 
     walkers = []
     for table in node.tables:
@@ -3109,15 +3570,15 @@ def _relationship_scan(
     if relationship.table_id in dirty_tables:
         changed, pending = _owner_edges(context, relationship)
     ended = _ended_by_this_transaction(context)
-    nodes_by_id: dict[int, dict[object, tuple[object, HeapVersion]]] = {}
+    landing_views: dict[int, _OwnerLandingView] = {}
 
     def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
         """Resolve one endpoint against the transaction-private landing view."""
-        found = nodes_by_id.get(table.table_id)
-        if found is None:
-            found = _owner_landing_view(engine, context, table, ended)
-            nodes_by_id[table.table_id] = found
-        return found.get(identity)
+        view = landing_views.get(table.table_id)
+        if view is None:
+            view = _owner_landing_view(engine, context, table, ended)
+            landing_views[table.table_id] = view
+        return view.get(identity)
 
     def judged(version: HeapVersion, ref: object) -> RowBinding | None:
         """Return the edge binding when the predicate keeps this edge, refusing non-booleans."""
@@ -4818,47 +5279,50 @@ def _overlay_identity(binding: RowBinding) -> object:
     return binding.record_id
 
 
-def _owner_nodes(
-    engine: QueryEngine,
-    context: _Context,
-    table: TableDef,
-    ended: frozenset[object] | set[object],
-) -> dict[object, tuple[object, HeapVersion]]:
-    """Return every row of a node table its owner can see, keyed by what names it.
-
-    Three things fold together here, and they have to fold in one place: the committed rows this
-    snapshot can see, the property pictures this transaction has replaced, and the rows it has
-    created but not committed. A reader outside the transaction never calls this at all, so the
-    view is owner-only by construction rather than by a rule someone has to remember.
-    """
-    changed, inserted = _transaction_row_view(context, table, include_held=False)
-    found: dict[object, tuple[object, HeapVersion]] = {}
-    for ref, version in engine.heap.scan(table, context.snapshot):
-        if ref in ended:
-            continue  # a row this transaction ended is not a landing
-        if ref in changed:
-            values = changed[ref]
-            if values is None:
-                continue
-            version = replace(version, values=values)
-        found[version.record_id] = (ref, version)
-    for reference, values in inserted:
-        if not isinstance(reference, PendingRowRef):
-            continue
-        found[reference] = (
-            reference,
-            HeapVersion(
-                record_id=0,
-                xmin=NO_CSN,
-                xmax=NO_CSN,
-                values=values,
-                prev=None,
-                schema_version=table.schema_version,
-                deleted=False,
-                table_id=table.table_id,
-            ),
-        )
-    return found
+def _owner_landing_txn_memo(
+    engine: QueryEngine, context: _Context
+) -> _OwnerLandingTxnMemo | None:
+    """Return the lazy landing memo owned by this exact transaction and read picture."""
+    txn_id = getattr(context.txn, "txn_id", None)
+    if not isinstance(txn_id, int) or isinstance(txn_id, bool):
+        return None
+    snapshot = context.snapshot
+    # Establishing the catalog picture may read pages in other compositions.  The private
+    # derived-state guard never owns that collaborator work.
+    schema = context.schema()
+    closers: tuple[_OwnerLandingView, ...] = ()
+    try:
+        with engine._endpoint_guard:
+            memo = engine._owner_memo.get(txn_id)
+            if memo is not None and (
+                memo.txn is not context.txn
+                or memo.snapshot is not snapshot
+                or memo.schema is not schema
+            ):
+                engine._owner_memo.pop(txn_id, None)
+                closers = memo.retire()
+                memo = None
+            if memo is None:
+                try:
+                    candidate = _OwnerLandingTxnMemo(
+                        txn=context.txn,
+                        snapshot=snapshot,
+                        schema=schema,
+                        budget=engine._owner_budget,
+                    )
+                except _OwnerLandingCapacity:
+                    candidate = None
+                if candidate is not None:
+                    try:
+                        engine._owner_memo[txn_id] = candidate
+                    except BaseException:
+                        candidate.retire()
+                        raise
+                    memo = candidate
+    finally:
+        for view in closers:
+            view.close()
+    return memo
 
 
 def _landing_fingerprint(context: _Context, table: TableDef) -> tuple:
@@ -4890,41 +5354,122 @@ def _owner_landing_view(
     context: _Context,
     table: TableDef,
     ended: frozenset[object] | set[object],
-) -> dict[object, tuple[object, HeapVersion]]:
-    """Return :func:`_owner_nodes` for this table, resolved once per transaction, not per statement.
+) -> _OwnerLandingView:
+    """Return a bounded, transaction-local, lazy identity view for one landing table.
 
-    The memo lives on the engine keyed by txn id and dies in ``settle_schema`` with the rest
-    of the transaction's bookkeeping. An entry answers again only while three things still
-    hold: the SAME snapshot object (a manager retry opens a successor view under the same
-    context), an equal :func:`_landing_fingerprint` (any write to this table changes it; a
-    write to another table does not), and implicitly the ``ended`` set -- which needs no slot
-    of its own, because the refs of this table inside ``ended`` are derived entirely from the
-    intents and held rows the fingerprint already covers, and refs of other tables can never
-    collide with this table's (a :class:`RecordRef` names a page of the one shared heap).
+    The former ST-6 map decoded and retained every visible row on the first landing.  This R1
+    view asks the D-02 identity door only for IDs an edge actually names, while keeping the same
+    ``ended``/``changed``/``inserted`` owner overlay.  Its decoded-result cache is admitted under
+    explicit engine-wide bytes and entries ceilings before it grows and is discarded on quota.
+    There is deliberately no R2 full scan: without evidence and a second complete admission
+    design it would reintroduce both the O(table) cold cost and wide-table payload retention.
 
     Two deliberate exclusions, decided in ST-6 and not to be revisited casually:
     ``require_endpoints`` is NOT routed through here (the door checks visibility of a row the
     caller names; the memo filters ``ended`` -- same table, different question) and neither is
     ``_incident_edges`` (a DETACH DELETE invalidates its own view as it goes, so the memo
     would rebuild per statement and pay its bookkeeping for nothing).
-
-    The memo's memory is engine working state, like the working catalog above it. It is NOT
-    metered by the admission budgets: ``max_transaction_rows``/``max_transaction_bytes`` and
-    the query row budgets meter what a transaction asks to write and to answer, and a
-    traversal that merely lands on a wide table asks for neither.
     """
-    txn_id = getattr(context.txn, "txn_id", None)
-    if not isinstance(txn_id, int) or isinstance(txn_id, bool):
-        return _owner_nodes(engine, context, table, ended)
-    snapshot = context.snapshot
     fingerprint = _landing_fingerprint(context, table)
-    memo = engine._owner_memo.setdefault(txn_id, {})
-    entry = memo.get(table.table_id)
-    if entry is not None and entry[0] is snapshot and entry[1] == fingerprint:
-        return entry[2]
-    found = _owner_nodes(engine, context, table, ended)
-    memo[table.table_id] = (snapshot, fingerprint, found)
-    return found
+    memo = _owner_landing_txn_memo(engine, context)
+    epoch = engine.heap._derived_read_epoch()
+    slot: _OwnerLandingSlot | None = None
+    install = False
+    previous: _OwnerLandingView | None = None
+    if memo is not None:
+        with engine._endpoint_guard:
+            slot = memo.tables.get(table.table_id)
+            if slot is None:
+                try:
+                    slot = memo.claim(table.table_id)
+                except _OwnerLandingCapacity:
+                    slot = None
+                else:
+                    install = True
+            elif slot.state == "ready":
+                entry = slot.view
+                assert entry is not None
+                if entry.matches(
+                    table=table,
+                    snapshot=context.snapshot,
+                    fingerprint=fingerprint,
+                    epoch=epoch,
+                ):
+                    entry.rebind(context)
+                    return entry
+                previous = memo.begin_rebuild(table.table_id, slot)
+                install = previous is not None
+            else:
+                # A concurrent builder already owns the one paid slot.  This statement uses an
+                # unretained fallback rather than creating another side structure.
+                slot = None
+    if previous is not None:
+        previous.close()
+
+    try:
+        changed, inserted = _transaction_row_view(context, table, include_held=False)
+        owned_refs = set(changed)
+        owned_refs.update(
+            held.reference
+            for held in context.staged_rows
+            if held.table.table_id == table.table_id and held.reference is not None
+        )
+        table_ended = frozenset(
+            reference for reference in owned_refs if reference in ended
+        )
+    except BaseException:
+        # A claimed table slot is a reservation, not a disabled marker.  Even an allocation
+        # failure while reducing the owner's overlay must not strand it until settlement.
+        if memo is not None and slot is not None:
+            with engine._endpoint_guard:
+                memo.abandon_build(table.table_id, slot)
+        raise
+
+    budget = engine._owner_budget if install else None
+    try:
+        view = _OwnerLandingView(
+            engine=engine,
+            context=context,
+            table=table,
+            fingerprint=fingerprint,
+            changed=changed,
+            inserted=inserted,
+            ended=table_ended,
+            budget=budget,
+            guard=engine._endpoint_guard,
+        )
+    except _OwnerLandingCapacity:
+        # A table slot was admitted before its view.  Give that reservation back before making
+        # the statement-local fallback; no failed-admission marker or payload survives here.
+        if memo is not None and slot is not None:
+            with engine._endpoint_guard:
+                memo.abandon_build(table.table_id, slot)
+        return _OwnerLandingView(
+            engine=engine,
+            context=context,
+            table=table,
+            fingerprint=fingerprint,
+            changed=changed,
+            inserted=inserted,
+            ended=table_ended,
+            budget=None,
+            guard=engine._endpoint_guard,
+        )
+    except BaseException:
+        if memo is not None and slot is not None:
+            with engine._endpoint_guard:
+                memo.abandon_build(table.table_id, slot)
+        raise
+
+    if not install or memo is None or slot is None:
+        return view
+    with engine._endpoint_guard:
+        installed = memo.install(table.table_id, slot, view)
+    if not installed:
+        # Settlement or memo replacement won the publication race.  Preserve this statement's
+        # already-computed overlay, but return every retention charge before exposing the view.
+        view.forfeit_retention()
+    return view
 
 
 def _owner_edges(
