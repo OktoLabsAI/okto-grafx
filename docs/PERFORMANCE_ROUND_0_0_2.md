@@ -80,7 +80,7 @@ handoff `hof_5278e93d6f09409cbce04bbbcbe787f1` was accepted.
 
 ## P0.2 — reproducible instruments
 
-Status: **in progress; fail-closed primitives are integrated, concrete post-drain workload driver is pending**.
+Status: **complete; the post-drain execution remains P0.3/P0.4 work**.
 
 Commit `c276dec` (source branch `perf/v002-p0-instruments-claude@9635146`) versions the
 canonical receipt, authenticated board-copy and independent-series primitives under
@@ -96,10 +96,34 @@ independent homes/copies, child provenance, finite nonnegative samples, process-
 explicit dispersion. Hash sidecars detect accidental or local tampering; they are deliberately not
 presented as authority signatures.
 
-The focused package regression passed 31 tests, plus Ruff, compileall and `git diff --check`.
-Independent adversarial review passed the final executed-instrument binding and POSIX process-group
-termination checks. No benchmark ran and no live board was accessed. P0.2 closes only after the
-concrete card/profile driver is versioned and used on the authenticated post-drain copy.
+The concrete Pulse driver was integrated in `be286fa` and `2d43d75` from immutable source branch
+`perf/v002-p0-card-driver@e8a6be0`. It pins Community and Core independently, requires a fresh
+full-data-home clone for every run, validates the imported source files and the authenticated Grafx
+route, isolates exactly one eligible historical card in one SQLite write transaction, calls the
+public `ConsolidationProcessor.process_batch()` lifecycle and proves one ACK plus one committed
+target audit without emitting row values.
+
+RAW runs install no hooks. Instrumented runs use bounded, reversible hooks for heap walks, header
+and tuple decodes, buffer-pool load calls, index candidates, query statistics and transaction
+outcomes. Recorder failure invalidates the sample but cannot replace the result or exception of the
+operation observed. A pre-existing pooled handle is reported separately from actual `connect`
+calls. Queue/audit equality receipts use an ephemeral process-keyed HMAC, preventing the published
+digest from becoming a low-entropy payload oracle.
+
+The driver enforces only thermal and memory configurations it can make true: `warm` performs a
+proved sequential read of the active graph before open, `mixed` explicitly means uncontrolled OS
+cache, and `cold` is refused because portable user-space code cannot prove cache eviction. The
+pinned Pulse adapter does not expose Grafx buffer sizing, so any value other than its actual 64 MiB
+default is refused before runtime initialization. A parent-PID marker blocks accidental direct use;
+like the self-hashed manifest, it is not claimed as an authority boundary against a malicious local
+operator. A signed authority bundle remains a separately governed future item.
+
+The focused regression passed 46 tests, plus Ruff, `py_compile` and `git diff --check`. Two
+development smokes on synthetic disposable Pulse homes — one RAW and one instrumented — each
+processed exactly one card, appended one target audit and preserved the Grafx route. They are not a
+RAW-vs-instrumented comparison and are not P0.3 evidence. No live board was accessed. P0.3 still
+owns the authenticated post-drain run, external `py-spy` profile and separate unique physical
+census; P0.4 still owns the independent same-code series.
 
 ## P1.1 — commit-window instrumentation (D-26)
 
@@ -153,4 +177,5 @@ blocked by that locator dependency; P1.6 and P1.7 remain conditional on post-dra
 | 2026-09-03 | P1.2 D-01 isolated implementation | full focused heap suite and Ruff passed; branch published, promotion pending P0.3/P0.4 |
 | 2026-09-03 | P1.3 D-04 isolated implementation | focused primary-key-index suite and Ruff passed; branch published, promotion pending P0.3/P0.4 |
 | 2026-09-03 | P1.4 D-02 prototype | rejected because it could mask visible duplicate corruption; deferred to P2-ID |
-| 2026-09-03 | P0.2 fail-closed primitives | receipts, authenticated copy and independent-series runner integrated at `c276dec`; 31 focused tests and static checks passed; concrete post-drain workload driver remains pending |
+| 2026-09-03 | P0.2 fail-closed primitives | receipts, authenticated copy and independent-series runner integrated at `c276dec`; 31 focused tests and static checks passed; driver completion is recorded in the next row |
+| 2026-09-03 | P0.2 authenticated Pulse card driver | integrated at `be286fa` + `2d43d75` from `perf/v002-p0-card-driver@e8a6be0`; 46 focused tests and static checks passed; synthetic RAW/instrumented lifecycle smokes passed without touching the live board; P0.3/P0.4 execution remains pending |
