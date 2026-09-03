@@ -125,6 +125,44 @@ RAW-vs-instrumented comparison and are not P0.3 evidence. No live board was acce
 owns the authenticated post-drain run, external `py-spy` profile and separate unique physical
 census; P0.4 still owns the independent same-code series.
 
+## P0.3 — post-drain profile and census
+
+Status: **tooling complete and published; execution on the Pulse corpus remains pending until the
+live backfill drains**.
+
+Branch `perf/v002-p0-census`, through commit `222a854`, adds the two distinct observations required
+by the frozen plan without conflating either with a baseline:
+
+- The instrumented replay now records actual endpoint lookup hits and resolves their distance to
+  the post-workload table-chain tail without subtracting opaque page identifiers. It reconciles
+  every retained coordinate with endpoint lookup counters and refuses truncation. It also records
+  dynamic calls and failures for vector search and vector rebuild.
+- `profile_pulse_card.py` creates exactly one fresh full-home clone, starts the replay as its direct
+  child and attaches exactly py-spy 0.4.2 as a sibling to the internal `Popen` PID. A nonce-bound
+  READY/GO protocol releases the real operation only after py-spy confirms attachment. The CLI has
+  no PID escape hatch and the fixed profiler command excludes locals, full filenames, native frames
+  and subprocess following. Its speedscope sample count must match py-spy's terminal summary with
+  zero errors.
+- Profiler process-tree CPU and I/O are sampled deltas from a mandatory snapshot immediately before
+  GO. They are explicitly lower bounds; RSS/private are tree peaks. The profiler sibling is excluded,
+  while post-validation and runtime close remain inside the profile scope and are labeled as such.
+- `pulse_graph_census_once.py` performs one separate, untimed structural census. It launches the
+  hash-pinned census child on another byte-identical clone, authenticates the Grafx binding, opens
+  it read-only with `recovery_policy="refuse"`, requires clean positive page and record verification,
+  and independently proves that the clone and serve-lock inventory stayed unchanged.
+- The census walks only private headers with `copy_content=False` and emits aggregates, never record
+  IDs, page IDs, references, CSNs or payloads. MVCC “dead” means only “not live under the current
+  `HeapVersion.live` predicate”; it does not prove vacuum eligibility. Vector counts are static
+  catalog presence and do not claim search/build activity. The one-shot runner reconciles verifier,
+  heap-slot, MVCC-class and locality totals before accepting the artifact.
+
+The milestone regression covered 98 focused instrument tests in one combined run. Ruff,
+`py_compile`, `git diff --check`, command-line contract checks, an isolated real-Grafx census smoke
+and a synthetic py-spy 0.4.2 multi-thread smoke were also successful. The synthetic profiler
+artifact reconciled 43 samples and zero errors; it is developmental evidence only. No default or
+live Pulse data home was opened, copied or profiled. Consequently P0.3 is not yet marked complete,
+and no P1 branch is promoted on the strength of tooling alone.
+
 ## P1.1 — commit-window instrumentation (D-26)
 
 Status: **developed on an isolated branch; not promoted**.
@@ -179,3 +217,4 @@ blocked by that locator dependency; P1.6 and P1.7 remain conditional on post-dra
 | 2026-09-03 | P1.4 D-02 prototype | rejected because it could mask visible duplicate corruption; deferred to P2-ID |
 | 2026-09-03 | P0.2 fail-closed primitives | receipts, authenticated copy and independent-series runner integrated at `c276dec`; 31 focused tests and static checks passed; driver completion is recorded in the next row |
 | 2026-09-03 | P0.2 authenticated Pulse card driver | integrated at `be286fa` + `2d43d75` from `perf/v002-p0-card-driver@e8a6be0`; 46 focused tests and static checks passed; synthetic RAW/instrumented lifecycle smokes passed without touching the live board; P0.3/P0.4 execution remains pending |
+| 2026-09-03 | P0.3 profiler/census tooling | published on `perf/v002-p0-census@222a854`; endpoint locality, dynamic vector activity, guarded py-spy capture and reconciled read-only census implemented; combined milestone regression 98/98 passed; real corpus execution waits for the live backfill to drain |
