@@ -180,7 +180,7 @@ and no P1 branch is promoted on the strength of tooling alone.
 
 ## P1.1 — commit-window instrumentation (D-26)
 
-Status: **developed on an isolated branch; not promoted**.
+Status: **integrated on `feature/v0.0.2`**.
 
 Branch `perf/v002-d26-commit-metrics`, commit
 `5abfd396ea352eb4eac9e20902d4ab55f0bc8898`, adds closed-cardinality timings for writer-lease and
@@ -188,28 +188,35 @@ commit-section wait/hold windows, timings for the ten internal commit phases, an
 pages/bytes, examined frames, flush calls, foreign commits and retargets. Metric delivery remains
 outside the exclusive sections and uncertain acquisition/release paths suppress the local trace.
 
-Focused commit, containment, catalog and import-boundary tests passed, together with Ruff and
-dashboard JSON validation. Promotion remains deferred until P0.3/P0.4 can run after the live
-backfill drains, as required by the governing plan.
+The implementation was promoted as `7aa410d`; `59020a4` then moved foreign durable-gap completion
+out of the `occ` phase and documented it under `other`, so recovery work cannot be mistaken for
+local validation cost. The focused commit file passed 18/18 after integration, together with Ruff
+and `git diff --check`. P0.3/P0.4 remain evidence runs, not promotion gates, by the user's explicit
+decision; correctness, integrity, WAL and concurrency gates remain mandatory.
 
 ## P1.2/P1.3 — isolated Python-path optimizations
 
-Status: **developed on isolated branches; not promoted**.
+Status: **integrated on `feature/v0.0.2`**.
 
 - D-01 is published as `perf/v002-d01-header-peek` at
   `1239a0e519295b9f2b127d88d3155c7fdd352daf`. It peeks the three visibility fields with one
   header unpack for rejected versions and retains full `RecordHeader` construction for accepted
-  versions. The focused heap suite and Ruff passed.
+  versions. It was promoted in `b23bcbc` + `07dfb02`; the full focused heap suite and Ruff passed.
 - D-04 is published as `perf/v002-d04-index-version` at
   `e898fe766b29e61c867b44679a5f0f1e77b724d9`. It reuses the heap version already validated by
-  the index path while preserving ended/changed fallback filtering. The focused primary-key-index
-  suite and Ruff passed.
+  the index path while preserving ended/changed fallback filtering. It was promoted and hardened
+  in `2e6bbf9` + `f6e7531` + `873f419` + `bc3ede4`: only automatic PK seeks retain the decoded
+  version, while endpoint/general exact indexes keep lazy ref reads so memory cannot grow with hub
+  degree. The focused PK/endpoint/visibility suites and Ruff passed.
 
 The D-02 tail-first endpoint prototype was not retained: with a corrupt visible duplicate near the
 head, it could accept a later row and hide the corruption currently surfaced by the public scan
-order. No safe performance change was proven without a uniqueness/min-max access path, so P1.4 is
-deferred to the existing P2-ID decision instead of weakening fail-closed behaviour. P1.5 remains
-blocked by that locator dependency; P1.6 and P1.7 remain conditional on post-drain measurements.
+order. It remains rejected. P1.4 is instead implementing a transaction-private, budgeted canonical
+prefix locator: it preserves head-to-tail validation and amortizes repeated endpoint checks from
+`O(E*N)` to `O(N+E)` when a transaction shares a snapshot, falling back to the unchanged canonical
+lookup on quota exhaustion. P1.5 follows that port; P1.6 remains conditional. P1.7 is being handled
+as the already-selected, byte-equivalent single-WAL-image change rather than waiting on a release
+performance gate.
 
 ## Test cadence
 
@@ -226,10 +233,11 @@ blocked by that locator dependency; P1.6 and P1.7 remain conditional on post-dra
 | 2026-09-02 | Version bump and branch bootstrap | packaging and CLI version tests passed |
 | 2026-09-03 | P0.1 H5 diagnosis and page-0 repair | 14 isolated multiprocess tests, neighboring index/recovery suites and Ruff passed; no live board accessed |
 | 2026-09-03 | P0.1 Pulse-flow relevance audit | pinned Community source contains no production vector-index rebuild call; H5 same-handle fence is not on the backfill path |
-| 2026-09-03 | P1.1 D-26 isolated implementation | focused commit/metrics/containment/catalog tests and Ruff passed; branch published, promotion pending P0.3/P0.4 |
-| 2026-09-03 | P1.2 D-01 isolated implementation | full focused heap suite and Ruff passed; branch published, promotion pending P0.3/P0.4 |
-| 2026-09-03 | P1.3 D-04 isolated implementation | focused primary-key-index suite and Ruff passed; branch published, promotion pending P0.3/P0.4 |
-| 2026-09-03 | P1.4 D-02 prototype | rejected because it could mask visible duplicate corruption; deferred to P2-ID |
+| 2026-09-03 | P1.1 D-26 integrated | `7aa410d` + `59020a4`; focused commit/metrics/containment/catalog tests and Ruff passed; foreign gap is not charged to OCC |
+| 2026-09-03 | P1.2 D-01 integrated | `b23bcbc` + `07dfb02`; full focused heap suite and Ruff passed |
+| 2026-09-03 | P1.3 D-04 integrated | `2e6bbf9` + `f6e7531` + `873f419` + `bc3ede4`; focused PK/endpoint/visibility suites and Ruff passed; high-cardinality indexes remain lazy |
+| 2026-09-03 | P1.4 D-02 tail-first prototype | rejected because it could mask visible duplicate corruption; strict canonical-prefix replacement in progress |
 | 2026-09-03 | P0.2 fail-closed primitives | receipts, authenticated copy and independent-series runner integrated at `c276dec`; 31 focused tests and static checks passed; driver completion is recorded in the next row |
 | 2026-09-03 | P0.2 authenticated Pulse card driver | integrated at `be286fa` + `2d43d75` from `perf/v002-p0-card-driver@e8a6be0`; 46 focused tests and static checks passed; synthetic RAW/instrumented lifecycle smokes passed without touching the live board; P0.3/P0.4 execution remains pending |
 | 2026-09-03 | P0.3 profiler/census tooling | published on `perf/v002-p0-census@222a854`; endpoint locality, dynamic vector activity, guarded py-spy capture and reconciled read-only census implemented; combined milestone regression 98/98 passed; real corpus execution waits for the live backfill to drain |
+| 2026-09-03 | P0.3 profiler/census hardening | `89cb893`; exact per-page endpoint weights replace the 100k-hit cap, direct-interpreter preflight prevents wrong-PID attach; focused 28/28 and Ruff passed; no Pulse data accessed |
