@@ -146,6 +146,14 @@ Depois de o backfill terminar:
 - medir distribuição de distância do acerto à cauda, versões vivas/mortas e presença de busca/build vetorial;
 - nunca anexar profiler ao worker de produção.
 
+Estado de implementação: os instrumentos estão prontos em `perf/v002-p0-census@222a854`, mas esta
+etapa só termina quando forem executados sobre uma cópia declarada e estável após o drain. O replay
+instrumentado mede dinamicamente a localidade dos acertos de endpoint e chamadas de busca/rebuild
+vetorial. O censo separado é estático, read-only e sem timing: “dead” não significa vacuum-safe, e
+presença de catálogo vetorial não significa atividade. O profiler aceita somente o PID do filho que
+ele próprio criou e usa READY/GO antes da operação; seus deltas de CPU/I/O partem do snapshot
+pré-GO, enquanto o perfil inclui também pós-validação e fechamento, ambos explicitamente rotulados.
+
 #### P0.4 — baseline same-code
 
 - mínimo de três execuções independentes por modo, com warmup descartado;
@@ -355,5 +363,6 @@ O consenso não autoriza mudança de formato, redução das garantias concorrent
 | 2026-09-03 | P1.3 — D-04 | desenvolvido, não promovido | versão já validada reutilizada no caminho de índice em `perf/v002-d04-index-version` / `e898fe766b29e61c867b44679a5f0f1e77b724d9`; suíte focada de primary-key index e Ruff verdes |
 | 2026-09-03 | P1.4 — D-02 | diferido para P2-ID | o protótipo cauda-primeiro ocultou uma duplicata corrupta visível no início da cadeia; sem prova de unicidade/min-max, promovê-lo enfraqueceria a recusa de corrupção exigida pelo plano |
 | 2026-09-03 | P0.2 — instrumentos reproduzíveis | concluído; execução pós-drain permanece em P0.3/P0.4 | primitivas integradas em `c276dec`; driver autenticado integrado em `be286fa` + `2d43d75`, com origem imutável `perf/v002-p0-card-driver@e8a6be0`. Cada run usa clone integral descartável, pins separados de Community/Core, rota Grafx autenticada, lifecycle público de exatamente um card, oráculos de ACK/audit, RAW sem hooks e instrumentação bounded/reversível. `warm` é leitura sequencial provada, `mixed` é cache não controlado, `cold` é recusado; budget diferente dos 64 MiB realmente suportados também é recusado. Regressão focada 46/46, Ruff, `py_compile`, diff-check e duas auditorias adversariais PASS; smokes sintéticos RAW/instrumentado passaram, sem acesso ao board vivo e sem comparação inválida entre os dois modos |
+| 2026-09-03 | P0.3 — perfil/censo | instrumentos concluídos; execução pós-drain pendente | `perf/v002-p0-census@222a854`: localidade dinâmica de endpoint e atividade vetorial no replay, profiler py-spy one-shot com READY/GO e contadores pré-GO, além de censo agregado read-only com inventário imutável e reconciliação independente. Regressão combinada 98/98, Ruff, `py_compile`, diff-check e smokes sintéticos/isolados verdes; nenhum acesso ao board vivo |
 
 Esta seção registra somente fatos concluídos. Resultados P1 não serão promovidos antes do restante de P0 e do fechamento de H5, conforme a seção 6.

@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
+from okto_grafx.errors import GrafxConfigurationError
 from okto_grafx.domain.model.record import RecordHeader
 from okto_grafx.engine import heap_store
 from okto_grafx.engine.buffer_pool import BufferPool
@@ -18,6 +19,7 @@ from okto_grafx.engine.database import Database, Transaction
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import IndexManager
 from okto_grafx.engine.query_engine import QueryEngine
+from okto_grafx.engine.vector_engine import VectorEngine
 from tools.perf_round import baseline_runs, board_copy, receipt, replay_pulse_card
 from tools.perf_round.pulse_card_instrumentation import (
     InstrumentationError,
@@ -31,6 +33,7 @@ from tools.perf_round.replay_pulse_card import (
     SUPPORTED_PULSE_BUFFER_BUDGET_BYTES,
     _apply_thermal_protocol,
     _manifest_subtree,
+    _require_serve_lock_released,
     _validate_supported_run_config,
     _validate_runner_parent,
     _validate_target_row,
@@ -50,11 +53,18 @@ def _descriptors() -> dict[str, object]:
         "heap_walk": inspect.getattr_static(HeapStore, "_walk"),
         "heap_read": inspect.getattr_static(HeapStore, "read"),
         "heap_scan": inspect.getattr_static(HeapStore, "scan"),
+        "heap_require_endpoints": inspect.getattr_static(
+            HeapStore, "require_endpoints"
+        ),
         "heap_lookup": inspect.getattr_static(HeapStore, "lookup"),
         "index_lookup": inspect.getattr_static(IndexManager, "lookup"),
+        "vector_search": inspect.getattr_static(VectorEngine, "search"),
         "query_execute": inspect.getattr_static(QueryEngine, "execute"),
         "database_begin": inspect.getattr_static(Database, "begin"),
         "database_retry": inspect.getattr_static(Database, "retry"),
+        "database_rebuild_vector": inspect.getattr_static(
+            Database, "rebuild_vector_index"
+        ),
         "transaction_commit": inspect.getattr_static(Transaction, "commit"),
         "transaction_rollback": inspect.getattr_static(Transaction, "rollback"),
     }
@@ -93,6 +103,13 @@ def test_instrumentation_restores_exact_descriptors_and_omits_query_text() -> No
     assert report["counters"]["transaction_commit_succeeded"] == 2
     assert report["database_open_total"] == 1
     assert report["baseline_handle_total"] == 0
+    assert report["vector_activity"] == {
+        "observed": True,
+        "search_calls": 0,
+        "search_failures": 0,
+        "rebuild_calls": 0,
+        "rebuild_failures": 0,
+    }
     rendered = json.dumps(report, sort_keys=True)
     assert secret not in rendered
     assert "CREATE NODE TABLE" not in rendered
@@ -109,6 +126,135 @@ def test_nested_instrumentation_is_refused_and_first_instance_restores() -> None
     finally:
         first.close()
     assert _descriptors() == before
+
+
+def test_instrumentation_counts_actual_endpoint_lookups_without_serializing_refs() -> (
+    None
+):
+    probe = PulseCardInstrumentation()
+    secret = "endpoint-value-must-not-leak"
+    with okto_grafx.connect(":memory:") as database:
+        with database.begin("write") as transaction:
+            transaction.execute(
+                "CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))"
+            )
+            transaction.execute(
+                "CREATE REL TABLE Knows(FROM Person TO Person, note STRING)"
+            )
+            transaction.execute(
+                f"CREATE (:Person {{id: 1, name: '{secret}'}}), "
+                "(:Person {id: 2, name: 'other'})"
+            )
+
+        probe.observe_database(database)
+        probe.install()
+        try:
+            with database.begin("write") as transaction:
+                transaction.execute(
+                    "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
+                    "CREATE (a)-[:Knows {note: 'observed'}]->(b)"
+                )
+        finally:
+            probe.close()
+
+        locality = probe.endpoint_hit_locality(database)
+
+    report = probe.report()
+    assert report["counters"]["endpoint_validation_calls"] == 1
+    assert report["counters"]["endpoint_lookup_calls"] == 2
+    assert report["counters"]["endpoint_lookup_hits"] == 2
+    assert report["endpoint_hit_coordinates"] == {
+        "total": 2,
+        "retained": 2,
+        "truncated": False,
+        "serialized": False,
+    }
+    assert locality == {
+        "semantics": "actual_endpoint_lookup_hits_to_post_workload_tail_pages",
+        "exact": True,
+        "extra_reads_outside_timed_workload": True,
+        "total": 2,
+        "distance_pages": {
+            "total": 2,
+            "min": 0,
+            "p50": 0,
+            "p90": 0,
+            "p99": 0,
+            "max": 0,
+            "last_10_percent": 2,
+            "last_10_percent_ratio": 1.0,
+        },
+        "p1_4_last_10_percent_threshold_met": True,
+        "p1_4_threshold_evaluable": True,
+    }
+    rendered = json.dumps(report, sort_keys=True)
+    assert secret not in rendered
+    assert "table_id" not in rendered
+    assert "page_id" not in rendered
+
+
+def test_failed_endpoint_validation_restores_context_and_preserves_error() -> None:
+    probe = PulseCardInstrumentation()
+    with okto_grafx.connect(":memory:") as database:
+        with database.begin("write") as transaction:
+            transaction.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
+            transaction.execute("CREATE REL TABLE Knows(FROM Person TO Person)")
+            transaction.execute("CREATE (:Person {id: 1})")
+        person = database.catalog.catalog.table("Person")
+        knows = database.catalog.catalog.table("Knows")
+        with database.begin("read") as transaction:
+            probe.observe_database(database)
+            probe.install()
+            try:
+                with pytest.raises(GrafxConfigurationError) as raised:
+                    database._heap.require_endpoints(
+                        knows, (99, 100), transaction.snapshot
+                    )
+                assert raised.value.code == "configuration_error"
+                assert getattr(probe._lookup_local, "endpoint_depth", 0) == 0
+                assert (
+                    database._heap.lookup(person, 1, transaction.snapshot) is not None
+                )
+            finally:
+                probe.close()
+
+    report = probe.report()
+    assert report["instrumentation_complete"] is True
+    assert report["counters"]["endpoint_validation_failed"] == 1
+    assert report["counters"]["endpoint_lookup_calls"] == 1
+    assert report["counters"]["endpoint_lookup_misses"] == 1
+    assert report["counters"]["heap_lookup_calls"] == 2
+
+
+def test_endpoint_hit_from_an_unbound_database_invalidates_the_sample() -> None:
+    probe = PulseCardInstrumentation()
+    with (
+        okto_grafx.connect(":memory:") as target,
+        okto_grafx.connect(":memory:") as foreign,
+    ):
+        for database in (target, foreign):
+            with database.begin("write") as transaction:
+                transaction.execute(
+                    "CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))"
+                )
+                transaction.execute("CREATE REL TABLE Knows(FROM Person TO Person)")
+                transaction.execute("CREATE (:Person {id: 1}), (:Person {id: 2})")
+
+        probe.observe_database(target)
+        probe.install()
+        try:
+            with foreign.begin("write") as transaction:
+                transaction.execute(
+                    "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
+                    "CREATE (a)-[:Knows]->(b)"
+                )
+        finally:
+            probe.close()
+
+    report = probe.report()
+    assert report["instrumentation_complete"] is False
+    assert report["observation_failures"] == {"endpoint_hit_coordinate": 2}
+    assert report["endpoint_hit_coordinates"]["total"] == 0
 
 
 def test_preexisting_handle_is_not_reported_as_a_database_open() -> None:
@@ -278,6 +424,18 @@ def test_child_requires_its_direct_baseline_runner_parent(
     monkeypatch.setenv("OKTO_GRAFX_PERF_RUNNER_PID", str(os.getppid() + 1))
     with pytest.raises(DriverRefused, match="launched directly"):
         _validate_runner_parent()
+
+
+@pytest.mark.parametrize(
+    "name", (".okto-pulse-serve.lock", ".okto-pulse-serve.lock.acquire")
+)
+def test_child_refuses_a_serve_lock_artifact_after_release(
+    tmp_path: Path, name: str
+) -> None:
+    (tmp_path / name).write_text("left behind", encoding="utf-8")
+
+    with pytest.raises(DriverRefused, match="remained after lock release"):
+        _require_serve_lock_released(tmp_path)
 
 
 def test_queue_and_audit_oracles_reject_every_undeclared_effect() -> None:
