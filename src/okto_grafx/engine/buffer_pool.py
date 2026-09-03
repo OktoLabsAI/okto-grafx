@@ -893,21 +893,38 @@ class BufferPool:
                             continue
                         budget_failure = self._budget_failure(file, page_index)
                     else:
-                        victim_frame = self._frames.pop(victim)
+                        victim_frame = self._frames[victim]
+                        prepared_load = _PageLoad(owner, self._load_epoch(file))
+                        prepared_eviction = (
+                            _PageEviction(owner, victim_frame)
+                            if victim_frame.page.dirty
+                            else None
+                        )
+                        # Construct both tickets while the victim is still authoritative. Publish
+                        # the reservations before removing it, all under the same guard: an
+                        # allocation failure can then only leave the original resident frame, and
+                        # no waiter can observe the short-lived over-counted transition.
+                        try:
+                            self._loads[key] = prepared_load
+                            if prepared_eviction is not None:
+                                self._evictions[victim] = prepared_eviction
+                            self._frames.pop(victim)
+                        except BaseException:
+                            self._loads.pop(key, None)
+                            self._evictions.pop(victim, None)
+                            raise
                         if victim_frame.page.dirty:
-                            eviction = _PageEviction(owner, victim_frame)
+                            assert prepared_eviction is not None
+                            eviction = prepared_eviction
                             eviction_key = victim
-                            self._evictions[victim] = eviction
                             # Claim this logical admission now so a second caller of the same key
                             # cannot evict another frame while the first victim is written. It
                             # does not count as a second capacity slot until that victim leaves.
-                            load = _PageLoad(owner, self._load_epoch(file))
-                            self._loads[key] = load
+                            load = prepared_load
                         else:
                             # Clean eviction and target reservation are one atomic replacement;
                             # no competitor can steal the slot this caller just made.
-                            load = _PageLoad(owner, self._load_epoch(file))
-                            self._loads[key] = load
+                            load = prepared_load
 
             if budget_failure is not None:
                 if self._metrics_enabled:
@@ -929,9 +946,19 @@ class BufferPool:
                     if self._loads.get(key) is load:
                         del self._loads[key]
                         self._signal_flight_state()
-                        usage = self._usage_reading()
+                        try:
+                            usage = self._usage_reading()
+                        except BaseException:
+                            # Diagnostics never replace the load/publication failure that owns
+                            # this cleanup path.
+                            usage = None
                 if usage is not None:
-                    self._emit_usage(usage)
+                    try:
+                        self._emit_usage(usage)
+                    except BaseException:
+                        # Preserve the exact primary failure for direct, uncontained test/host
+                        # compositions as well as the contained production composition.
+                        pass
                 raise
 
             usage: tuple[float, float] | None = None
@@ -943,20 +970,41 @@ class BufferPool:
                     # fail-closed guard here: the detached object has no publication authority.
                     retry = True
                 else:
-                    del self._loads[key]
                     resident = self._frames.get(key)
                     if resident is not None:
                         self._frames.move_to_end(key)
                         resident.pins += 1
                         page = resident.page
                     elif load.valid and load.epoch == self._load_epoch(file):
-                        admitted = _Frame(page)
-                        admitted.pins = 1
-                        self._frames[key] = admitted
-                        usage = self._usage_reading()
+                        admitted: _Frame | None = None
+                        try:
+                            admitted = _Frame(page)
+                            admitted.pins = 1
+                            self._frames[key] = admitted
+                        except BaseException:
+                            # The load ticket remains authoritative until both construction and
+                            # insertion succeed. Remove it and wake every waiter on either failure,
+                            # without leaving a phantom pinned frame behind.
+                            if (
+                                admitted is not None
+                                and self._frames.get(key) is admitted
+                            ):
+                                del self._frames[key]
+                            del self._loads[key]
+                            self._signal_flight_state()
+                            raise
                     else:
                         retry = True
+                    del self._loads[key]
                     self._signal_flight_state()
+                    if not retry and resident is None:
+                        try:
+                            usage = self._usage_reading()
+                        except BaseException:
+                            # Publication already succeeded and waiters were notified. An
+                            # allocation failure in diagnostic sampling cannot turn that pin into
+                            # a reported load failure whose caller would be unable to release it.
+                            usage = None
             if retry:
                 continue
             if usage is not None:

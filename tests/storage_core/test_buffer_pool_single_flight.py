@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 from collections.abc import Mapping
 
+import pytest
+
 from okto_grafx.adapters.codec_v1 import PageCodecV1
 from okto_grafx.adapters.graph_guard import ConditionGuard
 from okto_grafx.domain.errors import (
@@ -15,6 +17,7 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.ids import PageIndex
 from okto_grafx.domain.page import Page, PageType
 from okto_grafx.domain.ports.metrics import MetricDescriptor
+from okto_grafx.engine import buffer_pool as buffer_pool_module
 from okto_grafx.engine.buffer_pool import BufferPool
 
 from .conftest import MemoryDevice, RecordingMetrics, SMALL_PAGE_SIZE
@@ -631,6 +634,106 @@ def test_failed_dirty_eviction_restores_the_frame_and_wakes_capacity_waiters() -
     assert pool.is_resident(FILE, 1)
     assert (FILE, 0) in pool.modified_pages()
     pool.unpin(FILE, 1, page=pages[0])
+
+
+def test_eviction_ticket_memory_error_never_orphans_a_dirty_victim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = MemoryDevice()
+    stored_pages(device, 2)
+    pool, _guard = concurrent_pool(
+        device, budget_pages=1, metrics=RecordingMetrics(enabled=False)
+    )
+    dirty = pool.pin(FILE, 0)
+    dirty.insert_slot(b"work-that-must-remain-owned")
+    pool.unpin(FILE, 0, dirty=True, page=dirty)
+    expected = MemoryError("injected eviction-ticket allocation failure")
+
+    class RefusingEvictionTicket:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            raise expected
+
+    monkeypatch.setattr(buffer_pool_module, "_PageEviction", RefusingEvictionTicket)
+
+    with pytest.raises(MemoryError) as raised:
+        pool.pin(FILE, 1)
+
+    assert raised.value is expected
+    assert pool.is_resident(FILE, 0)
+    assert pool._frames[(FILE, 0)].page is dirty
+    assert pool.has_dirty_pages(FILE)
+    assert pool.modified_pages(FILE) == frozenset({(FILE, 0)})
+    assert pool._loads == {}
+    assert pool._evictions == {}
+
+
+def test_frame_memory_error_removes_the_load_and_wakes_a_same_key_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = MemoryDevice()
+    stored_pages(device, 1)
+    entered = threading.Event()
+    release = threading.Event()
+    reads = 0
+
+    def block_first_read(file: str, page_index: PageIndex, raw: bytes) -> bytes:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            entered.set()
+            assert release.wait(timeout=5)
+        return raw
+
+    device.page_reader = block_first_read
+    pool, guard = concurrent_pool(device, metrics=RecordingMetrics(enabled=False))
+    real_frame = buffer_pool_module._Frame
+    expected = MemoryError("injected frame allocation failure")
+    allocations = 0
+
+    class FailFirstFrameAllocation:
+        def __new__(cls, *args: object, **kwargs: object) -> object:
+            nonlocal allocations
+            allocations += 1
+            if allocations == 1:
+                raise expected
+            return real_frame(*args, **kwargs)
+
+    monkeypatch.setattr(buffer_pool_module, "_Frame", FailFirstFrameAllocation)
+    pages: list[Page] = []
+    failures: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            pages.append(pool.pin(FILE, 0))
+        except BaseException as failure:  # noqa: BLE001 - exact thread outcome is asserted
+            failures.append(failure)
+
+    first = threading.Thread(target=worker)
+    first.start()
+    assert entered.wait(timeout=5)
+    waiter = threading.Thread(target=worker)
+    waiter.start()
+    assert guard.waited.wait(timeout=5)
+    release.set()
+    first.join(timeout=5)
+    assert not first.is_alive()
+    waiter.join(timeout=1)
+    waiter_stuck = waiter.is_alive()
+    if waiter_stuck:
+        # Leave no non-daemon waiter behind when this regression is run red-first or mutated.
+        with pool._guard:
+            pool._signal_flight_state()
+        waiter.join(timeout=5)
+    assert not waiter_stuck
+    assert not waiter.is_alive()
+
+    assert failures == [expected]
+    assert len(pages) == 1
+    assert reads == 2
+    assert pool._loads == {}
+    assert pool._evictions == {}
+    assert pool.is_resident(FILE, 0)
+    pool.unpin(FILE, 0, page=pages[0])
 
 
 def test_page_fence_waits_for_detached_eviction_before_taking_its_section() -> None:
