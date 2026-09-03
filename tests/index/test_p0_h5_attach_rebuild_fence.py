@@ -24,13 +24,21 @@ MESSAGE and DETAILS, and each arm pins what this commit actually does:
   touches that vector index -- met the page-0 sequence fence AFTER the barrier, came back as
   a non-retryable "already committed" refusal and left the handle in ``recovery_required``.
   The commit path now rebases a clean page-0 frame on the same certificate mismatch the read
-  path already rebases on; the fence itself is untouched.
+  path already rebases on -- through ``discard_clean_page``, so a PINNED clean frame is doomed
+  rather than left resident -- and the fence itself is untouched.
+
+The central cases run again across real processes (``subprocess`` children that import THIS
+tree's ``src``): the writer is the test process, the cold open and the attaching participant
+are children.
 
 Every database lives under ``tmp_path``; nothing here opens a live board.
 """
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -426,3 +434,133 @@ def test_a_dirty_page_zero_still_meets_the_sequence_fence(
         assert writer.closed
     with connect(root, page_size=PAGE_SIZE) as check:
         assert not check.verify("all").findings
+
+
+def test_a_pinned_clean_page_zero_is_doomed_not_reused_when_the_device_moved(
+    board: tuple[Path, Database],
+) -> None:
+    """A clean page-0 frame that is PINNED during the commit cannot be reused either.
+
+    ``BufferPool.discard`` leaves a pinned frame resident (it only marks it clean), so an
+    advance that ran on it would still carry the old device base into the fence after the
+    barrier. The rebase therefore goes through ``discard_clean_page``, which dooms the pinned
+    frame: its holder keeps the Page object, a new pin reads the device generation, and the
+    doomed bytes are never written back.
+    """
+    root, creator = board
+    from okto_grafx.domain.page.file_header import HEADER_PAGE_INDEX
+
+    with connect(root, page_size=PAGE_SIZE) as writer:
+        index = _vector_index(writer)
+        _create_person(writer, "elsewhere")
+        before = index._fresh_certificate()
+        with writer._pool.pinned(index.file, HEADER_PAGE_INDEX) as held:
+            assert not held.dirty
+            with connect(root, page_size=PAGE_SIZE):
+                pass
+            advanced = index._fresh_certificate()
+            assert advanced.seq > before.seq
+            # The pin is still held here: the commit must not reuse the frame behind it.
+            _create_note(writer, "while-pinned")
+            published = index._fresh_certificate()
+            assert published.seq > advanced.seq
+            assert not held.dirty  # the doomed frame was never written
+        _create_note(writer, "after-release")
+        assert len(_search_notes(writer).rows) == ROWS + 2
+    with connect(root, page_size=PAGE_SIZE) as check:
+        assert not check.verify("all").findings
+
+
+# --- the same cases across real processes --------------------------------------------------
+
+_COLD_OPEN_CHILD = r"""
+import sys
+sys.path.insert(0, sys.argv[2])
+from okto_grafx import connect
+with connect(sys.argv[1], page_size=int(sys.argv[3])):
+    pass
+print("cold-open-done", flush=True)
+"""
+
+_ATTACH_CHILD = r"""
+import json
+import sys
+sys.path.insert(0, sys.argv[2])
+from okto_grafx import connect
+db = connect(sys.argv[1], page_size=int(sys.argv[3]))
+report = {"stale_indexes": list(db.stale_indexes), "seeks": []}
+for turn in range(3):
+    with db.begin("write") as writer:
+        writer.execute(
+            "CREATE (p:Person {id: $id, name: $name})",
+            {"id": f"child-{turn}", "name": f"child-{turn}"},
+        )
+    with db.begin("read") as reader:
+        result = reader.execute(
+            "MATCH (c:Company) WHERE c.id = $id RETURN c.name", {"id": "c1"}
+        )
+    report["seeks"].append({"rows": len(result.rows), **dict(result.statistics)})
+report["fence"] = db._indexes.index("pk_Company")._completed_rebuild_through
+db.close()
+print(json.dumps(report), flush=True)
+"""
+
+
+def _run_child(script: str, root: Path) -> str:
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(root), str(_SRC), str(PAGE_SIZE)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout.strip().splitlines()[-1]
+
+
+def test_a_cold_open_in_another_process_does_not_wedge_this_live_writer(
+    board: tuple[Path, Database],
+) -> None:
+    """The defect's central case with a REAL foreign participant: the cold open is a process."""
+    root, creator = board
+    creator.close()
+    with connect(root, page_size=PAGE_SIZE) as writer:
+        index = _vector_index(writer)
+        assert len(_search_notes(writer).rows) == ROWS
+        before = index._fresh_certificate()
+        _create_person(writer, "elsewhere")
+        assert _run_child(_COLD_OPEN_CHILD, root) == "cold-open-done"
+        advanced = index._fresh_certificate()
+        assert advanced.seq > before.seq, "the foreign cold open must have moved page 0"
+        _create_note(writer, "after-foreign-cold-open")
+        published = index._fresh_certificate()
+        assert published.seq > advanced.seq
+        _create_note(writer, "after-foreign-cold-open-2")
+        _create_person(writer, "elsewhere-2")
+        assert len(_search_notes(writer).rows) == ROWS + 2
+    with connect(root, page_size=PAGE_SIZE) as check:
+        assert not check.verify("all").findings
+        assert len(_search_notes(check).rows) == ROWS + 2
+
+
+def test_an_attaching_process_keeps_exact_seeks_after_its_own_commits_elsewhere(
+    board: tuple[Path, Database],
+) -> None:
+    """Arm 1 with a REAL attaching participant: the original H5 does not hold across processes."""
+    root, creator = board
+    report = json.loads(_run_child(_ATTACH_CHILD, root))
+    assert report["stale_indexes"] == []
+    assert report["fence"] is None
+    assert len(report["seeks"]) == 3
+    for seek in report["seeks"]:
+        assert seek["rows"] == 1
+        assert seek.get("rows_seeked", 0) == 1, seek
+        assert seek.get("rows_scanned", 0) == 0, seek
+    # The creator, still open, sees the child's commits and keeps its own seeks.
+    _assert_seeked(_seek_company(creator, "c2"))
+    with creator.begin("read") as reader:
+        result = reader.execute(
+            "MATCH (p:Person) WHERE p.id = $id RETURN p.name", {"id": "child-2"}
+        )
+    _assert_seeked(result)
+    assert not creator.verify("all").findings
