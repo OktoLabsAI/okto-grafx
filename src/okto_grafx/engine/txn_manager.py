@@ -229,6 +229,15 @@ _LIVE_FLAGS: int = ~1
 """Mask that clears the deleted bit of a record header, from CONTRACT.md section 6.4."""
 
 
+@dataclass(slots=True)
+class _MaterializedAttempt:
+    """The stamped page values of one commit attempt, bound to its txn id and CSN."""
+
+    txn_id: int
+    csn: Csn
+    pages: dict[tuple[str, PageIndex], Page]
+
+
 @dataclass(frozen=True, slots=True)
 class _RowWrite:
     """One heap change a commit made: the version it created and the version it ended.
@@ -620,7 +629,7 @@ class TransactionManager:
         "_reader_stall_threshold",
         "_refresh_interval",
         "_descriptor",
-        "_materialized_pages",
+        "_materialized",
         "_file_ids",
         "_participant_section_name",
         "_retain_lease",
@@ -770,9 +779,11 @@ class TransactionManager:
                 value=type(descriptor).__name__,
             )
         self._descriptor: str = descriptor
-        # Page VALUES stamped by the last _build_records, keyed by (file, page_index): the
-        # retarget re-stamps and re-encodes these instead of decoding the logged bytes again.
-        self._materialized_pages: dict[tuple[str, PageIndex], Page] = {}
+        # The page VALUES the current commit attempt stamped, bound to that attempt's txn id
+        # and materialised CSN: the retarget of the SAME attempt re-stamps and re-encodes
+        # them instead of decoding the logged bytes again; anything else takes the
+        # verifying path. Cleared once the attempt's batch is final.
+        self._materialized: _MaterializedAttempt | None = None
         self._file_ids: FileIdMap = FileIdMap(
             heap_file=_file_name_of(heap, "heap.dat"),
             catalog_file=_file_name_of(catalog, "catalog.dat"),
@@ -2879,6 +2890,7 @@ class TransactionManager:
                                     )
                                 if commit_trace is not None:
                                     commit_trace.increment(COMMIT_RETARGETS_TOTAL)
+                            self._materialized = None
                             self._validate_wal_batch_budget(txn, records)
                             self._validate_lease(lease)
                             if commit_trace is not None:
@@ -3491,7 +3503,9 @@ class TransactionManager:
         self._validate_pending_index_records(txn, pending)
         images: list[tuple[str, PageIndex, bytes]] = []
         records: list[WalRecordLike] = []
-        self._materialized_pages = {}
+        self._materialized = _MaterializedAttempt(
+            txn_id=int(txn.txn_id), csn=predicted, pages={}
+        )
         for file, page_index in staged:
             image = txn.page_images.get((file, page_index))
             if image is None:
@@ -3596,8 +3610,20 @@ class TransactionManager:
 
         corrected_images: list[tuple[str, PageIndex, bytes]] = []
         corrected_records: list[WalRecordLike] = []
+        attempt = self._materialized
+        # Only the pages THIS attempt materialised at old_csn may be re-stamped: a page value
+        # left by another transaction or by an earlier materialisation of this one would
+        # carry bytes the log never saw, so any mismatch takes the verifying path.
+        reusable = (
+            attempt.pages
+            if attempt is not None
+            and attempt.txn_id == int(txn.txn_id)
+            and attempt.csn == old_csn
+            else {}
+        )
+        self._materialized = None
         for file, page_index, image in images:
-            page = self._materialized_pages.get((file, page_index))
+            page = reusable.get((file, page_index))
             if page is None:
                 # Not produced by _build_records in this attempt (a caller-built batch):
                 # the bytes are all there is, so they are verified before being re-stamped.
@@ -4402,6 +4428,7 @@ class TransactionManager:
                     )
                 if trace is not None:
                     trace.increment(COMMIT_RETARGETS_TOTAL)
+            self._materialized = None
             self._validate_wal_batch_budget(reservation, records)
             self._validate_lease(lease)
             if trace is not None:
@@ -4967,7 +4994,7 @@ class TransactionManager:
         """
         page = self._pool.codec.decode_page(image, verify=True)
         self._stamp_page(page, file, page_index, csn, rows)
-        self._materialized_pages[(file, page_index)] = page
+        self._remember_materialized(file, page_index, page)
         return self._pool.codec.encode_page(page)
 
     def _local_image(
@@ -4988,8 +5015,15 @@ class TransactionManager:
         with self._pool.pinned(file, page_index) as resident:
             page = resident.copy()
         self._stamp_page(page, file, page_index, csn, rows)
-        self._materialized_pages[(file, page_index)] = page
+        self._remember_materialized(file, page_index, page)
         return self._pool.codec.encode_page(page)
+
+    def _remember_materialized(
+        self, file: str, page_index: PageIndex, page: Page
+    ) -> None:
+        """Keep a stamped page value for the retarget of the attempt that produced it."""
+        if self._materialized is not None:
+            self._materialized.pages[(file, page_index)] = page
 
     def _apply_images(
         self,
