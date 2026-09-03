@@ -50,6 +50,7 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
+from heapq import heappop, heappush, heapreplace
 from math import isnan
 from typing import cast
 
@@ -4204,8 +4205,14 @@ def _sort_rows(
 
     Sorting one key at a time from the least significant is what lets each key carry its own
     direction while the sort stays stable, and a stable sort over a deterministic input is what
-    makes the same query answer in the same order on every run.
+    makes the same query answer in the same order on every run.  A LIMIT lets the planner attach
+    a physical retention bound.  That path consumes the same complete child stream but retains
+    only SKIP + LIMIT candidates in a worst-first heap, reducing memory to O(K) and comparisons
+    to O(N log K); the full stable sort remains the unbounded path.
     """
+    if node.retained_limit is not None:
+        yield from _top_rows(engine, node, node.retained_limit, context)
+        return
     rows = list(engine._rows(node.child, context))
     for key in reversed(node.keys):
         rows.sort(
@@ -4213,6 +4220,81 @@ def _sort_rows(
             reverse=key.descending,
         )
     yield from rows
+
+
+@dataclass(slots=True)
+class _TopCandidate:
+    """One retained row whose heap order is the reverse of its query order.
+
+    Python's heap exposes its smallest member.  Reversing ``__lt__`` therefore places the worst
+    retained candidate at the root, where a better incoming row can replace it in O(log K).
+    ``position`` is the final key and preserves the stable-sort promise for equal multi-key
+    values, including a mix of ascending and descending keys.
+    """
+
+    keys: tuple[tuple[tuple[int, object], bool], ...]
+    position: int
+    row: _Row
+
+    def precedes(self, other: _TopCandidate) -> bool:
+        """Return whether this row appears before ``other`` in the requested stable order."""
+        for (left, descending), (right, _other_descending) in zip(
+            self.keys, other.keys
+        ):
+            if left == right:
+                continue
+            if left < right:
+                return not descending
+            if right < left:
+                return descending
+            # A shared ORDER BY key is expected to be total.  Treat an unordered pair as a tie
+            # nonetheless, so a malformed/collaborator value cannot make heap order unstable.
+        return self.position < other.position
+
+    def __lt__(self, other: _TopCandidate) -> bool:
+        """Put the later query row first in the min-heap."""
+        return other.precedes(self)
+
+
+def _top_rows(
+    engine: QueryEngine,
+    node: SortRows,
+    retained_limit: Expression,
+    context: _Context,
+) -> Iterator[_Row]:
+    """Order a bounded result while retaining at most SKIP + LIMIT child rows."""
+    limit = _window(retained_limit, context, "LIMIT")
+    skipped = (
+        _window(node.retained_skip, context, "SKIP")
+        if node.retained_skip is not None
+        else 0
+    )
+    retained = skipped + limit
+    heap: list[_TopCandidate] = []
+    for position, row in enumerate(engine._rows(node.child, context)):
+        keys = tuple(
+            (_sort_key(_sort_value(key, row, context)), key.descending)
+            for key in node.keys
+        )
+        if retained == 0:
+            # Consuming the child is observable for write pipelines and query budgets even when
+            # LIMIT 0 means no row can survive this physical operator.  Evaluating the keys too
+            # preserves ORDER BY refusals rather than turning LIMIT 0 into an expression bypass.
+            continue
+        candidate = _TopCandidate(
+            keys=keys,
+            position=position,
+            row=row,
+        )
+        if len(heap) < retained:
+            heappush(heap, candidate)
+        elif candidate.precedes(heap[0]):
+            heapreplace(heap, candidate)
+
+    # The heap yields worst first under its reversed comparator; reversing those pops restores
+    # exact query order without another O(K log K) sort.
+    worst_first = [heappop(heap).row for _ in range(len(heap))]
+    yield from reversed(worst_first)
 
 
 def _sort_value(key: SortItem, row: _Row, context: _Context) -> object:

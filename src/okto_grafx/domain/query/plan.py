@@ -645,10 +645,19 @@ class DistinctRows(PlanNode):
 
 @dataclass(frozen=True, slots=True)
 class SortRows(PlanNode):
-    """Rows of the child in the order the query asked for."""
+    """Rows of the child in the order the query asked for.
+
+    ``retained_limit`` is a physical bound, not another semantic window.  When present, the
+    executor may keep only ``retained_skip + retained_limit`` rows while it orders the child;
+    the ordinary :class:`SkipRows` and :class:`LimitRows` above this node still apply the query's
+    window.  Keeping both expressions separate avoids turning two valid INT64 parameters into
+    an overflowing query-language addition merely to communicate an execution bound.
+    """
 
     child: PlanNode
     keys: tuple[SortItem, ...]
+    retained_limit: Expression | None = None
+    retained_skip: Expression | None = None
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator whose rows are ordered."""
@@ -656,7 +665,17 @@ class SortRows(PlanNode):
 
     def details(self) -> Mapping[str, object]:
         """Return the sort keys and their directions."""
-        return {"keys": ", ".join(key.describe() for key in self.keys)}
+        details: dict[str, object] = {
+            "keys": ", ".join(key.describe() for key in self.keys)
+        }
+        if self.retained_limit is not None:
+            limit = self.retained_limit.describe()
+            details["retains"] = (
+                limit
+                if self.retained_skip is None
+                else f"{self.retained_skip.describe()} + {limit}"
+            )
+        return details
 
 
 @dataclass(frozen=True, slots=True)
@@ -923,8 +942,45 @@ def validate_plan(root: PlanNode) -> PlanNode:
             field="plan",
             value=type(root).__name__,
         )
+    _refuse_unmatched_sort_retention(root)
     _refuse_post_filtered_search(root)
     return root
+
+
+def _refuse_unmatched_sort_retention(root: PlanNode) -> None:
+    """Refuse a physical top-N bound that is not the exact semantic window above it.
+
+    A retained sort intentionally discards rows.  It is correct only when the immediately
+    enclosing SKIP/LIMIT operators discard those same rows semantically; accepting a forged or
+    future rewrite with any other shape would turn a performance hint into silent under-delivery.
+    """
+    ancestors: list[PlanNode] = []
+    for node, depth in root.traverse():
+        del ancestors[depth:]
+        if isinstance(node, SortRows) and node.retained_limit is not None:
+            parent = ancestors[-1] if ancestors else None
+            if node.retained_skip is None:
+                matched = (
+                    isinstance(parent, LimitRows)
+                    and parent.count == node.retained_limit
+                )
+            else:
+                grandparent = ancestors[-2] if len(ancestors) >= 2 else None
+                matched = (
+                    isinstance(parent, SkipRows)
+                    and parent.count == node.retained_skip
+                    and isinstance(grandparent, LimitRows)
+                    and grandparent.count == node.retained_limit
+                )
+            if not matched:
+                raise GrafxPlanError(
+                    "A bounded sort must be enclosed by the exact SKIP/LIMIT window whose "
+                    "rows it retains.",
+                    field="operator",
+                    value=node.label,
+                    reason="unmatched_retention",
+                )
+        ancestors.append(node)
 
 
 def _refuse_post_filtered_search(root: PlanNode) -> None:

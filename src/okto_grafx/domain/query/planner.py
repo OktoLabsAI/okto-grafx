@@ -3195,7 +3195,12 @@ class _Planner:
         if clause.distinct:
             pipeline = DistinctRows(child=pipeline)
         if clause.sort_items:
-            pipeline = SortRows(child=pipeline, keys=clause.sort_items)
+            pipeline = SortRows(
+                child=pipeline,
+                keys=clause.sort_items,
+                retained_limit=clause.limit,
+                retained_skip=clause.skip if clause.limit is not None else None,
+            )
         if clause.skip is not None:
             pipeline = SkipRows(child=pipeline, count=clause.skip)
         if clause.limit is not None:
