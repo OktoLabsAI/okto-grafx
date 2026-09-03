@@ -109,7 +109,7 @@ def test_a_gap_completed_publication_is_never_own(
         last_csn=durable.last_csn - 1,
         checkpoint_lsn=durable.checkpoint_lsn,
     )
-    foreign.manager._commit_state_store.publish(rolled)
+    foreign.manager._commit_state_store.publish(rolled, previous=durable)
 
     calls: list[tuple[object, bool]] = []
     original = BufferPool.begin_read_view
@@ -184,7 +184,8 @@ def test_a_token_returning_to_an_old_own_number_is_not_own(
             last_committed_lsn=own_lsn,
             last_csn=own_lsn,
             checkpoint_lsn=durable.checkpoint_lsn,
-        )
+        ),
+        previous=durable,
     )
     _warm(stack, 3)
     txn = stack.manager.begin("read")

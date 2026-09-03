@@ -158,7 +158,9 @@ def test_checkpoint_hint_is_explicitly_lenient_without_weakening_strict_read() -
         store.read()
 
 
-def test_format_two_checkpoint_hint_hides_length_damage_but_strict_read_refuses() -> None:
+def test_format_two_checkpoint_hint_hides_length_damage_but_strict_read_refuses() -> (
+    None
+):
     device = MemoryStorageDevice()
     store = CommitStateStore(
         device,
@@ -167,7 +169,10 @@ def test_format_two_checkpoint_hint_hides_length_damage_but_strict_read_refuses(
         file_nonce=17,
         control_format_version=2,
     )
-    store.publish(CommitState(last_committed_lsn=7, last_csn=7, checkpoint_lsn=4))
+    store.publish(
+        CommitState(last_committed_lsn=7, last_csn=7, checkpoint_lsn=4),
+        previous=CommitState(),
+    )
     device.append_log(COMMIT_STATE_FILE, b"unexpected-suffix")
 
     assert store.checkpoint_hint() == 0
@@ -184,7 +189,7 @@ def test_publish_uses_an_owner_exclusive_temporary_and_the_frozen_durability_ord
     device.clear_trail()
     state = CommitState(last_committed_lsn=13, last_csn=13, checkpoint_lsn=8)
 
-    CommitStateStore(device, owner_id=OWNER).publish(state)
+    CommitStateStore(device, owner_id=OWNER).publish(state, previous=CommitState())
 
     relevant = [
         (call.method, call.file, call.args_summary)
@@ -217,10 +222,11 @@ def test_format_two_migrates_the_legacy_state_then_uses_one_page_write() -> None
     )
 
     assert store.read() == original
-    store.publish(CommitState(last_committed_lsn=9, last_csn=9, checkpoint_lsn=4))
+    intermediate = CommitState(last_committed_lsn=9, last_csn=9, checkpoint_lsn=4)
+    store.publish(intermediate, previous=original)
     device.clear_trail()
     final = CommitState(last_committed_lsn=12, last_csn=12, checkpoint_lsn=4)
-    store.publish(final)
+    store.publish(final, previous=intermediate)
 
     relevant = [
         (call.method, call.file)

@@ -77,6 +77,10 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import NO_LSN, Lsn
+from okto_grafx.domain.model.catalog import (
+    CATALOG_FORMAT_VERSION,
+    CATALOG_LEGACY_FORMAT_VERSION,
+)
 from okto_grafx.domain.ledger.classification import classify_failure, classify_record
 from okto_grafx.domain.ledger.entry import LedgerOriginClass, LedgerReason
 from okto_grafx.domain.ledger.payload import LedgerPayload
@@ -106,7 +110,7 @@ from okto_grafx.domain.recovery.report import (
     stronger_outcome,
 )
 from okto_grafx.domain.recovery.retry import RETRYABLE_KEY, is_retryable
-from okto_grafx.domain.txn.commit_state import CommitState
+from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FORMAT_VERSION, CommitState
 from okto_grafx.domain.txn.records import decode_page_write
 from okto_grafx.domain.wal.record import WalRecordType
 from okto_grafx.engine.buffer_pool import BufferPool
@@ -293,9 +297,7 @@ than by a caller that skipped the fence.
 """
 
 
-def _control_record_size_allowed(
-    storage: StorageDevice, name: str, size: int
-) -> bool:
+def _control_record_size_allowed(storage: StorageDevice, name: str, size: int) -> bool:
     """Accept legacy records, plus exactly one three-page format-2 writer lease.
 
     A size merely below the slot-file ceiling is not enough: that would let arbitrary oversized
@@ -641,6 +643,7 @@ class RecoveryManager:
         self._require_permit(permit)
         self._check_meta()
         state = self._state_store.read()
+        self._state_store.redundancy_needs_repair(state)
         plan = plan_recovery(self._wal.scan_all(), floor_lsn=state.checkpoint_lsn)
         if plan.unsupported is not None:
             raise GrafxSchemaVersionMismatch(
@@ -691,6 +694,8 @@ class RecoveryManager:
         findings: list[RecoveryFinding] = []
         self._check_meta()
         state, state_was_damaged = self._read_recovery_state()
+        if not state_was_damaged:
+            self._state_store.redundancy_needs_repair(state)
         manager = self._index_manager
         plan = self._scan(findings, floor_lsn=state.checkpoint_lsn)
         if plan.unsupported is not None:
@@ -1494,16 +1499,32 @@ class RecoveryManager:
             else:
                 marker(target)
 
-        # WAL remains the durability authority; publication below is the last visible act.
-        if target > state.last_committed_lsn or state_was_damaged:
-            self._state_store.publish(
-                CommitState(
-                    last_committed_lsn=target,
-                    last_csn=target,
-                    checkpoint_lsn=state.checkpoint_lsn,
-                    format_version=state.format_version,
-                )
+        # WAL remains the durability authority; publication below is the last visible act. A
+        # replayed catalog-v2 activation promotes the same-size mixed-fleet fence, including the
+        # crash window after catalog apply and before the original publisher reached commit.state.
+        format_version = self._commit_state_format_for_catalog(state.format_version)
+        needs_publication = (
+            target > state.last_committed_lsn
+            or state_was_damaged
+            or format_version != state.format_version
+        )
+        published_state = (
+            CommitState(
+                last_committed_lsn=target,
+                last_csn=target,
+                checkpoint_lsn=state.checkpoint_lsn,
+                format_version=format_version,
             )
+            if needs_publication
+            else state
+        )
+        if needs_publication:
+            self._state_store.publish(
+                published_state,
+                previous=state,
+                previous_was_damaged=state_was_damaged,
+            )
+        self._state_store.repair_redundancy(published_state)
 
         replayed = page_result.effects_replayed + index_result.effects_replayed
         if replayed and self._metrics.enabled:
@@ -1574,8 +1595,71 @@ class RecoveryManager:
         """
         try:
             return self._state_store.read(), False
+        except GrafxCorruptionDetected as failure:
+            if failure.details.get("commit_state_reconstructible", False) is not True:
+                raise
+            minimum_format = failure.details.get(
+                "commit_state_minimum_format_version", 1
+            )
+            return (
+                CommitState(
+                    format_version=self._commit_state_format_for_catalog(
+                        minimum_format, tolerate_unreadable=True
+                    )
+                ),
+                True,
+            )
+
+    def _commit_state_format_for_catalog(
+        self, fallback: int, *, tolerate_unreadable: bool = False
+    ) -> int:
+        """Derive the non-downgradable control fence from durable catalog pages.
+
+        Recovery runs before normal startup adopts the catalog, so it reads through the
+        non-destructive ``read_from_pages`` door. During the initial damaged-state probe a torn
+        catalog may still be repairable by retained WAL and is tolerated; before publication the
+        same uncertainty is a refusal, never permission to emit version 1 over catalog v2.
+        """
+
+        reader = getattr(self._catalog, "read_from_pages", None)
+        if not callable(reader):
+            return fallback
+        bootstrap_probe = getattr(self._catalog, "is_bootstrapped", None)
+        if callable(bootstrap_probe) and not bootstrap_probe():
+            if fallback == COMMIT_STATE_FORMAT_VERSION:
+                raise GrafxRecoveryRefused(
+                    "Commit-state format 2 requires a bootstrapped catalog format 2; recovery "
+                    "will not infer or lower that fleet fence.",
+                    field="format_version",
+                    commit_state_format=fallback,
+                    catalog_bootstrapped=False,
+                )
+            return fallback
+        try:
+            catalog = reader()
         except GrafxCorruptionDetected:
-            return CommitState(), True
+            if tolerate_unreadable:
+                return fallback
+            raise
+        observed = getattr(catalog, "format_version", None)
+        if observed == CATALOG_FORMAT_VERSION:
+            return COMMIT_STATE_FORMAT_VERSION
+        if observed != CATALOG_LEGACY_FORMAT_VERSION:
+            raise GrafxRecoveryRefused(
+                f"Recovery read unsupported catalog format {observed!r} before publication.",
+                field="format_version",
+                value=observed,
+                supported=CATALOG_FORMAT_VERSION,
+            )
+        if fallback == COMMIT_STATE_FORMAT_VERSION:
+            raise GrafxRecoveryRefused(
+                "Commit-state format 2 requires catalog format 2, but durable catalog pages "
+                "still decode as version 1; recovery will not downgrade the fleet fence.",
+                field="format_version",
+                commit_state_format=fallback,
+                catalog_format=observed,
+            )
+        return fallback
 
     def _validate_publication_lineage(
         self,

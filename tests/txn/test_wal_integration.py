@@ -106,7 +106,9 @@ class _PostWriteWalFailureDevice:
 
 def _wal_bytes(root: Path) -> dict[str, bytes]:
     """Return the exact retained WAL namespace and contents."""
-    return {path.name: path.read_bytes() for path in sorted((root / "wal").glob("*.wal"))}
+    return {
+        path.name: path.read_bytes() for path in sorted((root / "wal").glob("*.wal"))
+    }
 
 
 def _real_wal(device: object, clock: object, metrics: object) -> WalManager:
@@ -125,8 +127,11 @@ def _real_wal(device: object, clock: object, metrics: object) -> WalManager:
 def _stage(stack: Stack, page_index: int, payload: bytes) -> object:
     """Open a write transaction that changes one page of the heap."""
     txn = stack.manager.begin("write")
-    txn.owner._stage_page_image(txn,
-        HEAP, page_index, make_page_image(stack.codec, [payload], page_index=page_index)
+    txn.owner._stage_page_image(
+        txn,
+        HEAP,
+        page_index,
+        make_page_image(stack.codec, [payload], page_index=page_index),
     )
     txn.note_write(stack.manager.partition_of(1, payload))
     return txn
@@ -214,10 +219,14 @@ def test_optimistic_validation_reads_the_real_log_and_refuses_a_real_conflict(
     second = build_stack(database_root, wal_factory=_real_wal, owner_id="real-b")
     shared = first.manager.partition_of(1, b"contended")
     loser = second.manager.begin("write")
-    loser.owner._stage_page_image(loser, HEAP, 6, make_page_image(second.codec, [b"b"], page_index=6))
+    loser.owner._stage_page_image(
+        loser, HEAP, 6, make_page_image(second.codec, [b"b"], page_index=6)
+    )
     loser.note_write(shared)
     winner = first.manager.begin("write")
-    winner.owner._stage_page_image(winner, HEAP, 5, make_page_image(first.codec, [b"a"], page_index=5))
+    winner.owner._stage_page_image(
+        winner, HEAP, 5, make_page_image(first.codec, [b"a"], page_index=5)
+    )
     winner.note_write(shared)
     first.manager.commit(winner)
     second.wal.open()  # a second participant re-reads what the first appended
@@ -225,7 +234,9 @@ def test_optimistic_validation_reads_the_real_log_and_refuses_a_real_conflict(
         second.manager.commit(loser)
     assert raised.value.retryable is True
     successor = second.manager.retry(loser)
-    successor.owner._stage_page_image(successor, HEAP, 6, make_page_image(second.codec, [b"b"], page_index=6))
+    successor.owner._stage_page_image(
+        successor, HEAP, 6, make_page_image(second.codec, [b"b"], page_index=6)
+    )
     successor.note_write(shared)
     assert second.manager.commit(successor).wrote is True
     assert read_page_payloads(first.pool, HEAP, 5) == (b"a",)
@@ -237,7 +248,8 @@ def test_a_reopened_log_finds_every_commit_this_component_wrote(
 ) -> None:
     stack = build_stack(database_root, wal_factory=_real_wal, owner_id="real-a")
     numbers = [
-        stack.manager.commit(_stage(stack, page, bytes([page]))).csn for page in (3, 4, 5)
+        stack.manager.commit(_stage(stack, page, bytes([page]))).csn
+        for page in (3, 4, 5)
     ]
     reopened = build_stack(database_root, wal_factory=_real_wal, owner_id="real-c")
     assert reopened.wal.last_lsn == numbers[-1]
@@ -270,7 +282,9 @@ def test_the_page_on_the_device_is_byte_identical_to_the_image_in_the_log(
         if record.record_type == WalRecordType.WRITE_PAGE
     ]
     assert len(logged) == 1
-    on_device = real_stack.codec.decode_page(real_stack.storage.read_page(HEAP, 7), verify=True)
+    on_device = real_stack.codec.decode_page(
+        real_stack.storage.read_page(HEAP, 7), verify=True
+    )
     in_log = real_stack.codec.decode_page(logged[0].image, verify=True)
     assert on_device.page_lsn == in_log.page_lsn
     assert on_device.page_type == in_log.page_type
@@ -279,7 +293,9 @@ def test_the_page_on_the_device_is_byte_identical_to_the_image_in_the_log(
     # The sequence counter is deliberately NOT compared: amendment A21 has the buffer pool
     # advance it by two on every write-back, so the field is expected to move and asserting
     # either way about it would assert nothing (A72).
-    assert on_device.seq % 2 == 0, "a durable image always carries an even counter (A21)"
+    assert on_device.seq % 2 == 0, (
+        "a durable image always carries an even counter (A21)"
+    )
 
 
 def test_the_stamp_is_above_every_number_the_log_had_assigned_before_the_batch(
@@ -321,8 +337,11 @@ def test_a_checkpoint_installs_a_durable_commit_whose_pages_never_reached_the_de
     writer = build_stack(root, storage=device, wal_factory=_real_wal, owner_id="lost-b")
     doomed = writer.manager.begin("write")
     for page in (3, 4):
-        doomed.owner._stage_page_image(doomed,
-            "heap.dat", page, make_page_image(writer.codec, [b"lost"], page_index=page)
+        doomed.owner._stage_page_image(
+            doomed,
+            "heap.dat",
+            page,
+            make_page_image(writer.codec, [b"lost"], page_index=page),
         )
     doomed.note_write(writer.manager.partition_of(1, b"lost"))
     # Keep both step 3.6 and the immediate post-barrier redo from reaching the device.  A
@@ -339,7 +358,9 @@ def test_a_checkpoint_installs_a_durable_commit_whose_pages_never_reached_the_de
     )
     # The number the lost pages carry is the exact COMMIT LSN planned with any segment header.
     logged_stamp = max(
-        writer.codec.decode_page(decode_page_write(record.payload).image, verify=True).page_lsn
+        writer.codec.decode_page(
+            decode_page_write(record.payload).image, verify=True
+        ).page_lsn
         for record in writer.wal.read_from(1)
         if record.record_type == WalRecordType.WRITE_PAGE
         and decode_page_write(record.payload).page_index == 3
@@ -352,7 +373,9 @@ def test_a_checkpoint_installs_a_durable_commit_whose_pages_never_reached_the_de
     # Another participant commits above it and publishes, which is what a checkpoint would rest on.
     other = build_stack(root, storage=device, wal_factory=_real_wal, owner_id="other-a")
     later = other.manager.begin("write")
-    later.owner._stage_page_image(later, HEAP, 5, make_page_image(other.codec, [b"later"], page_index=5))
+    later.owner._stage_page_image(
+        later, HEAP, 5, make_page_image(other.codec, [b"later"], page_index=5)
+    )
     # A different table's partition: the lost commit's COMMIT record sits in the log above this
     # snapshot, and optimistic validation would refuse a write to the partition it named.
     later.note_write(other.manager.partition_of(2, b"later"))
@@ -423,9 +446,7 @@ def test_checkpoint_refuses_a_committed_page_image_for_a_control_file(
     before = make_page_image(
         stack.codec, [b"control-original"], page_index=0, page_lsn=0
     )
-    forged = make_page_image(
-        stack.codec, [b"wal-misroute"], page_index=0, page_lsn=100
-    )
+    forged = make_page_image(stack.codec, [b"wal-misroute"], page_index=0, page_lsn=100)
     stack.storage.write_page(victim, 0, before)
 
     committed = stack.wal.append_many(
@@ -443,12 +464,14 @@ def test_checkpoint_refuses_a_committed_page_image_for_a_control_file(
         )
     )
     stack.wal.barrier()
+    previous = stack.manager._read_commit_state()  # noqa: SLF001 - deliberate window
     stack.manager._publish(  # noqa: SLF001 - construct the cross-process published window
         CommitState(
             last_committed_lsn=committed,
             last_csn=committed,
             checkpoint_lsn=0,
-        )
+        ),
+        previous=previous,
     )
     state_path = root / Path(COMMIT_STATE_FILE)
     state_before = state_path.read_bytes()

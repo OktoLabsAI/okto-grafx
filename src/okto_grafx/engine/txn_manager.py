@@ -70,6 +70,7 @@ from typing import Any, Literal
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
+    GrafxCorruptionDetected,
     GrafxError,
     GrafxIndexError,
     GrafxLeaseStolen,
@@ -79,6 +80,10 @@ from okto_grafx.domain.errors import (
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
     GrafxWriteConflict,
+)
+from okto_grafx.domain.model.catalog import (
+    CATALOG_FORMAT_VERSION,
+    CATALOG_LEGACY_FORMAT_VERSION,
 )
 from okto_grafx.domain.ids import (
     NO_CSN,
@@ -102,7 +107,7 @@ from okto_grafx.domain.model.schema import ENDPOINT_COLUMN_COUNT, encode_tuple
 from okto_grafx.domain.page import HEADER_PAGE_INDEX, Page
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.txn.commit_record import CommitPayload, FileIdMap, PageTouch
-from okto_grafx.domain.txn.commit_state import CommitState
+from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FORMAT_VERSION, CommitState
 from okto_grafx.domain.txn.context import (
     CommitReport,
     PendingRowRef,
@@ -2079,7 +2084,8 @@ class TransactionManager:
                             last_csn=published.last_csn,
                             checkpoint_lsn=published.last_committed_lsn,
                             format_version=published.format_version,
-                        )
+                        ),
+                        previous=published,
                     )
                     # Recycling belongs to the same stable-WAL picture as redo and checkpoint
                     # publication.  Releasing COMMIT_SECTION before this call let startup
@@ -2266,7 +2272,8 @@ class TransactionManager:
                         last_csn=current.last_csn,
                         checkpoint_lsn=checkpoint_lsn,
                         format_version=current.format_version,
-                    )
+                    ),
+                    previous=current,
                 )
                 self._advance_participant_pin(floor=checkpoint_lsn)
                 reader_present = self._reader_horizon() is not None
@@ -2343,9 +2350,11 @@ class TransactionManager:
                 last_committed_lsn=target,
                 last_csn=target,
                 checkpoint_lsn=durable.checkpoint_lsn,
-                format_version=durable.format_version,
+                format_version=self._commit_state_format_for_catalog(
+                    durable, inspect_durable_catalog=True
+                ),
             )
-            self._publish(completed)
+            self._publish(completed, previous=durable)
             self._published_high_water = _larger(self._published_high_water, target)
             if trace is not None and foreign_commit_count is not None:
                 trace.increment(COMMIT_FOREIGN_COMMITS_TOTAL, foreign_commit_count[0])
@@ -2964,6 +2973,10 @@ class TransactionManager:
                         self._published_high_water = _larger(
                             self._published_high_water, committed
                         )
+                        catalog_touched = any(
+                            file == self._file_ids.catalog_file
+                            for file, _page_index, _image in images
+                        )
                         try:
                             if commit_trace is not None:
                                 commit_trace.phase("apply")
@@ -2977,7 +2990,9 @@ class TransactionManager:
                                 commit_trace.phase("publish")
                             with self._close_wait_hazard():
                                 self._publish_commit_state(
-                                    durable, committed
+                                    durable,
+                                    committed,
+                                    catalog_touched=catalog_touched,
                                 )  # step 3.7
                         except BaseException as failure:
                             if commit_trace is not None:
@@ -2987,7 +3002,11 @@ class TransactionManager:
                                 try:
                                     with self._close_wait_hazard():
                                         recovered = self._recover_post_barrier(
-                                            txn, durable, committed, rows
+                                            txn,
+                                            durable,
+                                            committed,
+                                            rows,
+                                            catalog_touched=catalog_touched,
                                         )
                                 except BaseException as recovery_failure:
                                     # Recovery is cleanup for the already-recorded failure.  It may
@@ -3800,6 +3819,8 @@ class TransactionManager:
         previous: CommitState,
         committed: Csn,
         rows: Sequence[_RowWrite],
+        *,
+        catalog_touched: bool = False,
     ) -> bool:
         """Close the P4 window for THIS commit as far as it can be closed from here.
 
@@ -3819,7 +3840,9 @@ class TransactionManager:
         try:
             self._drop_index_changes(txn)
             self._redo_onto_device(previous.last_committed_lsn, committed)
-            self._publish_commit_state(previous, committed)
+            self._publish_commit_state(
+                previous, committed, catalog_touched=catalog_touched
+            )
             return True
         except BaseException:
             pass
@@ -5064,7 +5087,13 @@ class TransactionManager:
         for file in sorted(touched):
             self._pool.flush(file)
 
-    def _publish_commit_state(self, previous: CommitState, committed: Csn) -> None:
+    def _publish_commit_state(
+        self,
+        previous: CommitState,
+        committed: Csn,
+        *,
+        catalog_touched: bool = False,
+    ) -> None:
         """Publish the new commit state, preserving the checkpoint another component set.
 
         The checkpoint LSN is read and written back rather than replaced. It belongs to whoever
@@ -5088,16 +5117,61 @@ class TransactionManager:
             last_committed_lsn=committed,
             last_csn=committed,
             checkpoint_lsn=previous.checkpoint_lsn,
-            format_version=previous.format_version,
+            format_version=self._commit_state_format_for_catalog(
+                previous, inspect_durable_catalog=catalog_touched
+            ),
         )
-        self._publish(state)
+        self._publish(state, previous=previous)
         # Remembered only here, and only after the publish landed: this is the one door that
         # publishes a commit THIS manager produced (both the live step 3.7 and its post-barrier
         # redo republication call it). The gap completion and the checkpoint publish through
         # _publish directly and stay foreign to the read-view exemption.
         self._own_published_lsn = committed
 
-    def _publish(self, state: CommitState) -> None:
+    def _commit_state_format_for_catalog(
+        self, previous: CommitState, *, inspect_durable_catalog: bool
+    ) -> int:
+        """Return the monotonic mixed-fleet fence required by durable catalog authority.
+
+        A commit that did not touch the catalog preserves the already-published monotonic fence
+        without parsing an O(catalog) payload. A catalog commit and foreign-gap completion call
+        this only after page images have been applied and flushed, and read the pages
+        non-destructively. They therefore cannot confuse an unsaved LIVE catalog copy with
+        durable authority.
+
+        Direct unit compositions historically pass small catalog doubles. A double with no
+        semantic ``format_version`` cannot request a promotion, so the established version is
+        preserved. Production always wires ``CatalogStore``.
+        """
+
+        if not inspect_durable_catalog:
+            return previous.format_version
+        reader = getattr(self._catalog, "read_from_pages", None)
+        if not callable(reader):
+            return previous.format_version
+        observed = getattr(reader(), "format_version", None)
+        if observed is None:
+            return previous.format_version
+        if observed == CATALOG_FORMAT_VERSION:
+            return COMMIT_STATE_FORMAT_VERSION
+        if observed != CATALOG_LEGACY_FORMAT_VERSION:
+            raise GrafxCorruptionDetected(
+                f"The runtime catalog reports unsupported format version {observed!r}.",
+                field="format_version",
+                value=observed,
+                supported=CATALOG_FORMAT_VERSION,
+            )
+        if previous.format_version == COMMIT_STATE_FORMAT_VERSION:
+            raise GrafxCorruptionDetected(
+                "The published commit-state fence is version 2 but durable catalog authority "
+                "is version 1; a writer cannot downgrade either side.",
+                field="format_version",
+                commit_state_format=previous.format_version,
+                catalog_format=observed,
+            )
+        return previous.format_version
+
+    def _publish(self, state: CommitState, *, previous: CommitState) -> None:
         """Write the state to a temporary of this participant and replace the published file.
 
         Every generic publication forfeits the own-view provenance FIRST: a gap completion or
@@ -5107,7 +5181,7 @@ class TransactionManager:
         """
         self._own_published_lsn = None
         with self._close_wait_hazard():
-            self._commit_state_store.publish(state)
+            self._commit_state_store.publish(state, previous=previous)
 
     def _read_commit_state(self) -> CommitState:
         """Read the published state, riding out a device condition that is worth trying again.

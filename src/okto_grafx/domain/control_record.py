@@ -65,6 +65,7 @@ class ControlRecordRead:
     payload: bytes
     format_version: int
     generation: int
+    valid_payloads: tuple[bytes, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,7 +135,12 @@ def _page(*, page_type: PageType, seq: int, body: bytes, page_size: int) -> byte
 
 
 def _checked_page(
-    raw: bytes, *, page_type: PageType, page_size: int, file: str
+    raw: bytes,
+    *,
+    page_type: PageType,
+    page_size: int,
+    file: str,
+    permit_checksum_mismatch: bool = False,
 ) -> bytes:
     """Return a page after validating its envelope, or raise precise corruption."""
     if len(raw) != page_size:
@@ -147,7 +153,7 @@ def _checked_page(
         )
     header = PageHeader.decode(raw)
     expected = crc32c(raw[CHECKSUM_SIZE:])
-    if header.checksum != expected:
+    if header.checksum != expected and not permit_checksum_mismatch:
         raise GrafxCorruptionDetected(
             "The checksum of a control page does not match its bytes.",
             file=file,
@@ -192,11 +198,22 @@ def _encode_header(
 
 
 def _decode_header(
-    raw: bytes, *, database_uuid: bytes, record_kind: int, page_size: int, file: str
+    raw: bytes,
+    *,
+    database_uuid: bytes,
+    record_kind: int,
+    page_size: int,
+    file: str,
+    permit_page_checksum_mismatch: bool = False,
+    permit_inner_checksum_mismatch: bool = False,
 ) -> _Header:
     """Decode page zero and bind it to this database, file kind, and page size."""
     body = _checked_page(
-        raw, page_type=PageType.CONTROL_HEADER, page_size=page_size, file=file
+        raw,
+        page_type=PageType.CONTROL_HEADER,
+        page_size=page_size,
+        file=file,
+        permit_checksum_mismatch=permit_page_checksum_mismatch,
     )
     expected_length = _HEADER_BODY.size + _HEADER_CRC.size
     if len(body) < expected_length:
@@ -227,7 +244,10 @@ def _decode_header(
             field="format_version",
             value=version,
         )
-    if stored_crc != crc32c(body[: _HEADER_BODY.size]):
+    if (
+        stored_crc != crc32c(body[: _HEADER_BODY.size])
+        and not permit_inner_checksum_mismatch
+    ):
         raise GrafxCorruptionDetected(
             "The inner checksum of the control header does not match.",
             file=file,
@@ -391,11 +411,12 @@ class TwoSlotControlRecordStore:
             return None
         expected_size = CONTROL_FILE_PAGES * self._storage.page_size
         if len(image) != expected_size:
-            return ControlRecordRead(image, 1, 0)
+            return ControlRecordRead(image, 1, 0, (image,))
         damage: GrafxCorruptionDetected | None = None
         for attempt in range(CONTROL_READ_ATTEMPTS):
             try:
-                _header, chosen, _target = self._decode_complete_image(image)
+                _header, slots = self._decode_slots(image)
+                chosen, _target = self._select_slot(slots)
                 if chosen is None:
                     raise GrafxCorruptionDetected(
                         "Both slots of the control record are invalid or empty.",
@@ -411,7 +432,12 @@ class TwoSlotControlRecordStore:
                         observed=self._last_seen,
                     )
                 self._last_seen = chosen.generation
-                return ControlRecordRead(chosen.payload, 2, chosen.generation)
+                return ControlRecordRead(
+                    chosen.payload,
+                    2,
+                    chosen.generation,
+                    self._valid_payloads(slots),
+                )
             except GrafxCorruptionDetected as failure:
                 damage = failure
                 if attempt + 1 < CONTROL_READ_ATTEMPTS:
@@ -422,43 +448,195 @@ class TwoSlotControlRecordStore:
 
     def publish(self, payload: bytes) -> int:
         """Publish payload in one slot write+barrier, bootstrapping/migrating atomically once."""
+        return self.publish_checked(payload, expected_current=None, publications=1)
+
+    @staticmethod
+    def damage_is_replaceable(failure: GrafxCorruptionDetected) -> bool:
+        """Return whether WAL-authorized recovery may rebuild this physical damage.
+
+        Binding, magic, version and canonical-role mismatches can describe a valid foreign file,
+        not torn local bytes, and are deliberately excluded.
+        """
+        return failure.details.get("field") in {
+            "checksum",
+            "header_crc32c",
+            "slots",
+        }
+
+    def valid_payloads_behind_replaceable_damage(
+        self, failure: GrafxCorruptionDetected
+    ) -> tuple[bytes, ...]:
+        """Inspect slots without discarding a fence hidden by header-checksum damage.
+
+        Recovery may replace a torn header only after its remaining independent checksum and
+        every semantic binding still establish which database, nonce and record kind own the
+        slots. The slot pages then validate themselves against that header. No other header
+        failure is relaxed, and ambiguous equal generations remain a refusal.
+        """
+        field = failure.details.get("field")
+        if field not in {"checksum", "header_crc32c"}:
+            return ()
+        image = self._read_exact_image()
+        page_size = self._storage.page_size
+        header_start = CONTROL_HEADER_PAGE * page_size
+        header = _decode_header(
+            image[header_start : header_start + page_size],
+            database_uuid=self._database_uuid,
+            record_kind=self._kind,
+            page_size=page_size,
+            file=self._file,
+            permit_page_checksum_mismatch=field == "checksum",
+            permit_inner_checksum_mismatch=field == "header_crc32c",
+        )
+        slots = tuple(
+            _decode_slot(
+                image[page * page_size : (page + 1) * page_size],
+                header=header,
+                page_size=page_size,
+                file=self._file,
+            )
+            for page in CONTROL_SLOT_PAGES
+        )
+        self._select_slot(slots)
+        return self._valid_payloads(slots)
+
+    def publish_checked(
+        self,
+        payload: bytes,
+        *,
+        expected_current: tuple[bytes | None, ...] | None,
+        publications: int,
+        replace_damaged: bool = False,
+    ) -> int:
+        """Publish one payload repeatedly after checking the current logical bytes once.
+
+        The commit-state feature fence uses two publications for its first version transition.
+        Preflighting the complete generation budget before the first page write prevents a
+        half-promoted record at the generation ceiling. Other control records continue to use
+        :meth:`publish`, which is this operation with one publication and no compare guard.
+        """
         if type(payload) is not bytes:
             raise GrafxConfigurationError(
                 "A control payload must be exact bytes.",
                 field="payload",
                 value=type(payload).__name__,
             )
+        if type(publications) is not int or publications < 1:
+            raise GrafxConfigurationError(
+                "A checked control publication needs a positive exact publication count.",
+                field="publications",
+                value=repr(publications),
+            )
+        if type(replace_damaged) is not bool:
+            raise GrafxConfigurationError(
+                "Damaged-control replacement authority must be an exact bool.",
+                field="replace_damaged",
+                value=type(replace_damaged).__name__,
+            )
+        if expected_current is not None and (
+            type(expected_current) is not tuple
+            or not expected_current
+            or any(
+                item is not None and type(item) is not bytes
+                for item in expected_current
+            )
+        ):
+            raise GrafxConfigurationError(
+                "Expected control payloads must be a non-empty tuple of exact bytes or None.",
+                field="expected_current",
+                value=type(expected_current).__name__,
+            )
         expected_size = CONTROL_FILE_PAGES * self._storage.page_size
         image = self._read_file_image(complete_legacy=False)
+        if image is None:
+            observed: bytes | None = None
+            header = None
+            chosen = None
+            target = CONTROL_SLOT_PAGES[0]
+        elif len(image) != expected_size:
+            observed = image
+            header = None
+            chosen = None
+            target = CONTROL_SLOT_PAGES[0]
+        else:
+            try:
+                header, chosen, target = self._decode_complete_image(image)
+            except GrafxCorruptionDetected as failure:
+                if not replace_damaged or not self.damage_is_replaceable(failure):
+                    raise
+                self._bootstrap(payload)
+                self._last_seen = 1
+                publications -= 1
+                if publications == 0:
+                    return 1
+                image = self._read_exact_image()
+                header, chosen, target = self._decode_complete_image(image)
+            if chosen is None and replace_damaged:
+                self._bootstrap(payload)
+                self._last_seen = 1
+                publications -= 1
+                if publications == 0:
+                    return 1
+                image = self._read_exact_image()
+                header, chosen, target = self._decode_complete_image(image)
+            observed = None if chosen is None else chosen.payload
+        if expected_current is not None and observed not in expected_current:
+            raise GrafxCorruptionDetected(
+                "The control record changed after its publisher read the predecessor.",
+                file=self._file,
+                field="current_payload",
+            )
         if image is None or len(image) != expected_size:
             self._bootstrap(payload)
             self._last_seen = 1
-            return 1
-        header, chosen, target = self._decode_complete_image(image)
-        if chosen is None:
+            publications -= 1
+            if publications == 0:
+                return 1
+            image = self._read_exact_image()
+            header, chosen, target = self._decode_complete_image(image)
+        if header is None or chosen is None:
             raise GrafxCorruptionDetected(
                 "Both slots of the control record are invalid or empty.",
                 file=self._file,
                 field="slots",
             )
-        if chosen.generation == MAX_U64:
+        if chosen.generation > MAX_U64 - publications:
             raise GrafxCorruptionDetected(
-                "The control record generation cannot advance without wrapping.",
+                "The control record cannot advance the complete publication without wrapping.",
                 file=self._file,
                 field="generation",
                 value=chosen.generation,
+                required=publications,
             )
-        generation = chosen.generation + 1
-        slot_image = _encode_slot(
-            header=header,
-            generation=generation,
-            payload=payload,
-            page_size=self._storage.page_size,
-        )
-        self._storage.write_page(self._file, target, slot_image)
-        self._storage.durable_barrier(self._file)
-        self._last_seen = generation
+        generation = chosen.generation
+        for _publication in range(publications):
+            generation += 1
+            slot_image = _encode_slot(
+                header=header,
+                generation=generation,
+                payload=payload,
+                page_size=self._storage.page_size,
+            )
+            self._storage.write_page(self._file, target, slot_image)
+            self._storage.durable_barrier(self._file)
+            target = (
+                CONTROL_SLOT_PAGES[1]
+                if target == CONTROL_SLOT_PAGES[0]
+                else CONTROL_SLOT_PAGES[0]
+            )
+            self._last_seen = generation
         return generation
+
+    @staticmethod
+    def _valid_payloads(slots: tuple[_Slot, _Slot]) -> tuple[bytes, ...]:
+        """Return populated, outer-valid payloads in descending generation order."""
+        populated = (slot for slot in slots if slot.valid and slot.generation > 0)
+        return tuple(
+            slot.payload
+            for slot in sorted(
+                populated, key=lambda item: item.generation, reverse=True
+            )
+        )
 
     def _read_file_image(self, *, complete_legacy: bool = True) -> bytes | None:
         """Read one stable legacy payload or complete slot image through one proved descriptor.
@@ -531,6 +709,12 @@ class TwoSlotControlRecordStore:
 
     def _decode_complete_image(self, image: bytes) -> tuple[_Header, _Slot | None, int]:
         """Decode one exact three-page image without taking another storage descriptor."""
+        header, slots = self._decode_slots(image)
+        chosen, target = self._select_slot(slots)
+        return header, chosen, target
+
+    def _decode_slots(self, image: bytes) -> tuple[_Header, tuple[_Slot, _Slot]]:
+        """Decode one exact image into its bound header and both physical slots."""
         page_size = self._storage.page_size
         expected_size = CONTROL_FILE_PAGES * page_size
         if len(image) != expected_size:
@@ -569,8 +753,7 @@ class TwoSlotControlRecordStore:
                 file=self._file,
             ),
         )
-        chosen, target = self._select_slot(slots)
-        return header, chosen, target
+        return header, slots
 
     def _read_header(self) -> _Header:
         """Read and decode the immutable page-zero binding."""

@@ -59,7 +59,12 @@ HEAP = "heap.dat"
 def _stage(stack: Stack, page_index: int = 3, payload: bytes = b"row") -> object:
     """Open a write transaction that changes one page of the heap."""
     txn = stack.manager.begin("write")
-    txn.owner._stage_page_image(txn, HEAP, page_index, make_page_image(stack.codec, [payload], page_index=page_index))
+    txn.owner._stage_page_image(
+        txn,
+        HEAP,
+        page_index,
+        make_page_image(stack.codec, [payload], page_index=page_index),
+    )
     txn.note_write(stack.manager.partition_of(1, payload))
     return txn
 
@@ -75,7 +80,9 @@ def _poisonable_vector(stack: Stack) -> tuple[VectorFixture, VectorHnswIndex]:
     return database, index
 
 
-def _fault_stack(root: Path, **overrides: object) -> tuple[Stack, FaultInjectingStorageDevice]:
+def _fault_stack(
+    root: Path, **overrides: object
+) -> tuple[Stack, FaultInjectingStorageDevice]:
     """Build a participant whose every device call is recorded and can be interrupted."""
     device = FaultInjectingStorageDevice(
         LocalStorageDevice(root, page_size=DEFAULT_PAGE_SIZE), seed=7
@@ -99,8 +106,14 @@ def test_no_page_is_written_before_the_log_barrier_returns(database_root: Path) 
         for index, (method, file) in enumerate(methods)
         if method == "durable_barrier" and file == WAL_FILE
     )
-    appends = [index for index, (method, file) in enumerate(methods) if method == "append_log" and file == WAL_FILE]
-    writes = [index for index, (method, _file) in enumerate(methods) if method == "write_page"]
+    appends = [
+        index
+        for index, (method, file) in enumerate(methods)
+        if method == "append_log" and file == WAL_FILE
+    ]
+    writes = [
+        index for index, (method, _file) in enumerate(methods) if method == "write_page"
+    ]
     assert appends, "the commit appended nothing to the log"
     assert max(appends) < barrier
     assert writes and min(writes) > barrier
@@ -113,19 +126,28 @@ def test_the_published_state_is_replaced_only_after_every_page_is_in_place(
     stack, device = _fault_stack(database_root)
     txn = stack.manager.begin("write")
     for page_index in (3, 4, 5):
-        txn.owner._stage_page_image(txn,
-            HEAP, page_index, make_page_image(stack.codec, [b"row"], page_index=page_index)
+        txn.owner._stage_page_image(
+            txn,
+            HEAP,
+            page_index,
+            make_page_image(stack.codec, [b"row"], page_index=page_index),
         )
     txn.note_write(stack.manager.partition_of(1, b"row"))
     device.clear_trail()
     stack.manager.commit(txn)
-    methods = [(record.method, record.file, record.args_summary) for record in device.trail()]
+    methods = [
+        (record.method, record.file, record.args_summary) for record in device.trail()
+    ]
     publish = next(
         index
         for index, (method, _file, summary) in enumerate(methods)
         if method == "atomic_replace" and COMMIT_STATE_FILE in summary
     )
-    writes = [index for index, (method, file, _s) in enumerate(methods) if method == "write_page" and file == HEAP]
+    writes = [
+        index
+        for index, (method, file, _s) in enumerate(methods)
+        if method == "write_page" and file == HEAP
+    ]
     assert len(writes) >= 3
     assert max(writes) < publish
 
@@ -149,7 +171,9 @@ def test_commit_reuses_the_state_read_inside_the_section_before_publishing(
         commit_lock_timeout=5.0,
     )
     txn = manager.begin("write")
-    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
+    txn.owner._stage_page_image(
+        txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3)
+    )
     txn.note_write(manager.partition_of(1, b"row"))
 
     reads = 0
@@ -161,9 +185,11 @@ def test_commit_reuses_the_state_read_inside_the_section_before_publishing(
         reads += 1
         return original_read(store)
 
-    def traced_publish(store: CommitStateStore, state: CommitState) -> None:
+    def traced_publish(
+        store: CommitStateStore, state: CommitState, *, previous: CommitState
+    ) -> None:
         trail.append("publish:commit.state")
-        original_publish(store, state)
+        original_publish(store, state, previous=previous)
 
     monkeypatch.setattr(CommitStateStore, "read", counted_read)
     monkeypatch.setattr(CommitStateStore, "publish", traced_publish)
@@ -175,7 +201,9 @@ def test_commit_reuses_the_state_read_inside_the_section_before_publishing(
     assert trail.index("publish:commit.state") < trail.index("leave:commit")
 
 
-def test_the_epoch_is_validated_before_any_byte_reaches_the_device(database_root: Path) -> None:
+def test_the_epoch_is_validated_before_any_byte_reaches_the_device(
+    database_root: Path,
+) -> None:
     """Step 2 and BR-7: the guard runs before the commit section, not inside the writes."""
     trail: list[str] = []
     stack, device = _fault_stack(database_root)
@@ -193,13 +221,17 @@ def test_the_epoch_is_validated_before_any_byte_reaches_the_device(database_root
         commit_lock_timeout=5.0,
     )
     txn = manager.begin("write")
-    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
+    txn.owner._stage_page_image(
+        txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3)
+    )
     txn.note_write(manager.partition_of(1, b"row"))
     trail.clear()
     device.clear_trail()
     manager.commit(txn)
     assert trail.index("validate_epoch") < trail.index("enter:commit")
-    assert trail.count("validate_epoch") >= 2, "step 3.1 re-validates inside the section"
+    assert trail.count("validate_epoch") >= 2, (
+        "step 3.1 re-validates inside the section"
+    )
     inside = trail[trail.index("enter:commit") : trail.index("leave:commit")]
     assert "validate_epoch" in inside
 
@@ -223,7 +255,9 @@ def test_the_lease_is_released_only_after_the_commit_section_is_left(
         commit_lock_timeout=5.0,
     )
     txn = manager.begin("write")
-    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
+    txn.owner._stage_page_image(
+        txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3)
+    )
     txn.note_write(manager.partition_of(1, b"row"))
     trail.clear()
     manager.commit(txn)
@@ -260,14 +294,20 @@ def test_a_takeover_inside_the_commit_window_refuses_before_the_first_byte(
         commit_lock_timeout=5.0,
     )
     txn = manager.begin("write")
-    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3))
+    txn.owner._stage_page_image(
+        txn, HEAP, 3, make_page_image(stack.codec, [b"row"], page_index=3)
+    )
     txn.note_write(manager.partition_of(1, b"row"))
     before = stack.storage.log_size(WAL_FILE)
     device.clear_trail()
     with pytest.raises(GrafxStaleEpoch):
         manager.commit(txn)
     assert stack.storage.log_size(WAL_FILE) == before
-    assert not [record for record in device.trail() if record.method == "append_log" and record.file == WAL_FILE]
+    assert not [
+        record
+        for record in device.trail()
+        if record.method == "append_log" and record.file == WAL_FILE
+    ]
     assert not [record for record in device.trail() if record.method == "write_page"]
 
 
@@ -288,7 +328,11 @@ def test_the_logged_image_carries_the_commit_number_so_a_replay_can_apply_it(
     """A logged image stamped with zero would be refused by its own redo rule and lost."""
     txn = _stage(stack, page_index=4, payload=b"redoable")
     report = stack.manager.commit(txn)
-    writes = [record for record in stack.wal.records() if record.record_type == WalRecordType.WRITE_PAGE]
+    writes = [
+        record
+        for record in stack.wal.records()
+        if record.record_type == WalRecordType.WRITE_PAGE
+    ]
     assert len(writes) == 1
     written = decode_page_write(writes[0].payload)
     assert written.file == HEAP and written.page_index == 4
@@ -298,11 +342,17 @@ def test_the_logged_image_carries_the_commit_number_so_a_replay_can_apply_it(
 
 def test_the_commit_record_carries_the_sets_that_were_validated(stack: Stack) -> None:
     txn = stack.manager.begin("write")
-    txn.owner._stage_page_image(txn, HEAP, 6, make_page_image(stack.codec, [b"x"], page_index=6))
+    txn.owner._stage_page_image(
+        txn, HEAP, 6, make_page_image(stack.codec, [b"x"], page_index=6)
+    )
     txn.note_read(stack.manager.partition_of(1, b"a"))
     txn.note_write(stack.manager.partition_of(2, b"b"))
     report = stack.manager.commit(txn)
-    commits = [record for record in stack.wal.records() if record.record_type == WalRecordType.COMMIT]
+    commits = [
+        record
+        for record in stack.wal.records()
+        if record.record_type == WalRecordType.COMMIT
+    ]
     assert len(commits) == 1 and commits[0].lsn == report.csn
     payload = CommitPayload.decode(commits[0].payload)
     assert payload.snapshot_lsn == 0
@@ -315,7 +365,9 @@ def test_the_commit_record_carries_the_sets_that_were_validated(stack: Stack) ->
     assert [touch.page_index for touch in payload.page_touches] == [6]
 
 
-def test_the_published_state_names_the_commit_and_keeps_the_checkpoint(stack: Stack) -> None:
+def test_the_published_state_names_the_commit_and_keeps_the_checkpoint(
+    stack: Stack,
+) -> None:
     """The checkpoint belongs to whoever checkpoints; a commit must not reset it."""
     stack.manager.commit(_stage(stack, page_index=3))
     published = stack.manager.published_state()
@@ -339,7 +391,9 @@ def test_the_published_state_names_the_commit_and_keeps_the_checkpoint(stack: St
 def test_the_published_lsn_never_goes_backwards_across_commits(stack: Stack) -> None:
     seen = [stack.manager.published_lsn()]
     for index in range(4):
-        stack.manager.commit(_stage(stack, page_index=3 + index, payload=bytes([index])))
+        stack.manager.commit(
+            _stage(stack, page_index=3 + index, payload=bytes([index]))
+        )
         seen.append(stack.manager.published_lsn())
     assert seen == sorted(seen)
     assert len(set(seen)) == len(seen)
@@ -348,7 +402,9 @@ def test_the_published_lsn_never_goes_backwards_across_commits(stack: Stack) -> 
 # --- the read-only path (step 1) ----------------------------------------------------------------
 
 
-def test_a_read_transaction_commits_without_touching_the_device(database_root: Path) -> None:
+def test_a_read_transaction_commits_without_touching_the_device(
+    database_root: Path,
+) -> None:
     stack, device = _fault_stack(database_root)
     stack.manager.commit(_stage(stack, page_index=3))
     txn = stack.manager.begin("read")
@@ -365,7 +421,9 @@ def test_a_read_transaction_commits_without_touching_the_device(database_root: P
     ]
 
 
-def test_a_write_transaction_that_staged_nothing_writes_no_commit_record(stack: Stack) -> None:
+def test_a_write_transaction_that_staged_nothing_writes_no_commit_record(
+    stack: Stack,
+) -> None:
     """A record whose only content is that nothing happened is a record nobody can use."""
     before = len(stack.wal.records())
     txn = stack.manager.begin("write")
@@ -388,7 +446,9 @@ def test_a_caller_cannot_stage_a_checksum_valid_physical_page(stack: Stack) -> N
     stack.manager.rollback(txn)
 
 
-def test_direct_page_map_mutation_is_refused_before_wal_or_publication(stack: Stack) -> None:
+def test_direct_page_map_mutation_is_refused_before_wal_or_publication(
+    stack: Stack,
+) -> None:
     """The observable context map carries no authority without a matching private proof."""
     txn = stack.manager.begin("write")
     txn.page_images[(HEAP, 7)] = make_page_image(
@@ -432,7 +492,9 @@ def test_replacing_a_privately_staged_image_breaks_its_proof(stack: Stack) -> No
 def test_a_read_transaction_cannot_stage_work(stack: Stack) -> None:
     txn = stack.manager.begin("read")
     with pytest.raises(GrafxTransactionStateError):
-        txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(stack.codec, [b"x"], page_index=3))
+        txn.owner._stage_page_image(
+            txn, HEAP, 3, make_page_image(stack.codec, [b"x"], page_index=3)
+        )
     with pytest.raises(GrafxTransactionStateError):
         txn.note_write(1)
 
@@ -515,7 +577,9 @@ def test_a_transaction_cannot_be_committed_through_another_manager(
     first = make_stack()  # type: ignore[operator]
     second = make_stack()  # type: ignore[operator]
     txn = first.manager.begin("write")
-    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(first.codec, [b"x"], page_index=3))
+    txn.owner._stage_page_image(
+        txn, HEAP, 3, make_page_image(first.codec, [b"x"], page_index=3)
+    )
     txn.note_write(first.manager.partition_of(1, b"x"))
     with pytest.raises(GrafxTransactionStateError) as raised:
         second.manager.commit(txn)
@@ -614,9 +678,7 @@ def test_a_foreign_escape_after_gap_redo_latches_before_it_repropagates(
         page_lsn=1,
     )
 
-    def apply_gap(
-        manager: TransactionManager, checkpoint: int, through: int
-    ) -> int:
+    def apply_gap(manager: TransactionManager, checkpoint: int, through: int) -> int:
         assert manager is stack.manager
         assert (checkpoint, through) == (0, 1)
         assert apply_page_image(stack.pool, HEAP, 4, image) is True
@@ -624,9 +686,12 @@ def test_a_foreign_escape_after_gap_redo_latches_before_it_repropagates(
 
     failure = RuntimeError("publication callback failed")
 
-    def fail_publication(manager: TransactionManager, state: CommitState) -> None:
+    def fail_publication(
+        manager: TransactionManager, state: CommitState, *, previous: CommitState
+    ) -> None:
         assert manager is stack.manager
         assert state.last_committed_lsn == 1
+        assert previous.last_committed_lsn == 0
         assert stack.wal.barriers == 1, "gap completion must barrier before publication"
         raise failure
 
@@ -673,7 +738,9 @@ def test_a_visible_commit_cannot_be_redone_or_published_without_a_gap_barrier(
         raise failure
 
     def forbidden(*_arguments: object, **_keywords: object) -> object:
-        raise AssertionError("redo/publication ran before WAL durability was established")
+        raise AssertionError(
+            "redo/publication ran before WAL durability was established"
+        )
 
     monkeypatch.setattr(stack.wal, "barrier", fail_barrier)
     monkeypatch.setattr(TransactionManager, "_redo_onto_device", forbidden)
@@ -695,7 +762,11 @@ def test_a_full_device_during_the_append_leaves_no_page_and_no_publication(
     stack, device = _fault_stack(database_root)
     stack.manager.commit(_stage(stack, page_index=3, payload=b"first"))
     before_state = stack.manager.published_state()
-    before_page = read_page_payloads(stack.pool, HEAP, 4) if stack.storage.page_count(HEAP) > 4 else ()
+    before_page = (
+        read_page_payloads(stack.pool, HEAP, 4)
+        if stack.storage.page_count(HEAP) > 4
+        else ()
+    )
     txn = _stage(stack, page_index=4, payload=b"never")
     device.clear_trail()
     # Lease acquisition writes its atomic-replace temporary first; the second append is WAL.
@@ -723,9 +794,7 @@ def test_foreign_unstage_cleanup_never_replaces_the_append_failure_and_latches(
     txn = _stage(stack, page_index=4, payload=b"never")
     cleanup_calls: list[object] = []
 
-    def fail_index_cleanup(
-        manager: TransactionManager, cleaned: object
-    ) -> int:
+    def fail_index_cleanup(manager: TransactionManager, cleaned: object) -> int:
         assert manager is stack.manager
         assert cleaned is txn
         cleanup_calls.append(cleaned)
@@ -1043,7 +1112,9 @@ def test_a_commit_numbered_at_or_below_the_published_one_is_refused_before_the_b
         commit_lock_timeout=5.0,
     )
     txn = manager.begin("write")
-    txn.owner._stage_page_image(txn, HEAP, 9, make_page_image(stack.codec, [b"rewound"], page_index=9))
+    txn.owner._stage_page_image(
+        txn, HEAP, 9, make_page_image(stack.codec, [b"rewound"], page_index=9)
+    )
     txn.note_write(manager.partition_of(1, b"rewound"))
     with pytest.raises(GrafxTransactionStateError) as raised:
         manager.commit(txn)
@@ -1065,7 +1136,6 @@ def test_an_ordinary_commit_passes_the_forward_number_check(stack: Stack) -> Non
     second = stack.manager.commit(_stage(stack, page_index=4, payload=b"b"))
     assert second.csn > first.csn
     assert stack.manager.published_lsn() == second.csn
-
 
 
 class _StaleSizeDevice:
@@ -1117,13 +1187,16 @@ def test_a_published_state_replaced_between_two_reads_is_re_read_not_reported_as
     the code that resolves it is the re-read: without it the very first attempt raises.
     """
     device = _StaleSizeDevice(
-        SharedDirectoryDevice(database_root, page_size=DEFAULT_PAGE_SIZE), COMMIT_STATE_FILE
+        SharedDirectoryDevice(database_root, page_size=DEFAULT_PAGE_SIZE),
+        COMMIT_STATE_FILE,
     )
     stack = build_stack(database_root, storage=device)
     report = stack.manager.commit(_stage(stack, page_index=3, payload=b"raced"))
     device.armed = True
     assert stack.manager.published_lsn() == report.csn
-    assert device.inflated == 1, "the stale size was never served, so nothing was ridden out"
+    assert device.inflated == 1, (
+        "the stale size was never served, so nothing was ridden out"
+    )
 
 
 class _FlakyReadDevice:
@@ -1244,8 +1317,11 @@ def test_a_retained_lease_is_published_once_and_not_per_commit(
     stack = build_stack(database_root, storage=device, retain_lease=True)
     for page in (3, 4, 5, 6):
         txn = stack.manager.begin("write")
-        txn.owner._stage_page_image(txn,
-            HEAP, page, make_page_image(stack.codec, [bytes([page])], page_index=page)
+        txn.owner._stage_page_image(
+            txn,
+            HEAP,
+            page,
+            make_page_image(stack.codec, [bytes([page])], page_index=page),
         )
         txn.note_write(stack.manager.partition_of(1, bytes([page])))
         assert stack.manager.commit(txn).wrote is True
@@ -1262,8 +1338,11 @@ def test_the_default_publishes_the_lease_for_every_commit(database_root: Path) -
     stack = build_stack(database_root, storage=device)
     for page in (3, 4, 5, 6):
         txn = stack.manager.begin("write")
-        txn.owner._stage_page_image(txn,
-            HEAP, page, make_page_image(stack.codec, [bytes([page])], page_index=page)
+        txn.owner._stage_page_image(
+            txn,
+            HEAP,
+            page,
+            make_page_image(stack.codec, [bytes([page])], page_index=page),
         )
         txn.note_write(stack.manager.partition_of(1, bytes([page])))
         stack.manager.commit(txn)
@@ -1278,8 +1357,11 @@ def test_a_retained_lease_keeps_one_epoch_across_commits(database_root: Path) ->
     epochs = []
     for page in (3, 4, 5):
         txn = stack.manager.begin("write")
-        txn.owner._stage_page_image(txn,
-            HEAP, page, make_page_image(stack.codec, [bytes([page])], page_index=page)
+        txn.owner._stage_page_image(
+            txn,
+            HEAP,
+            page,
+            make_page_image(stack.codec, [bytes([page])], page_index=page),
         )
         txn.note_write(stack.manager.partition_of(1, bytes([page])))
         stack.manager.commit(txn)
@@ -1291,14 +1373,18 @@ def test_closing_gives_a_retained_lease_back(database_root: Path) -> None:
     """A retained lease outliving its manager makes every other participant wait out the stall."""
     holder = build_stack(database_root, retain_lease=True, owner_id="holder")
     txn = holder.manager.begin("write")
-    txn.owner._stage_page_image(txn, HEAP, 3, make_page_image(holder.codec, [b"x"], page_index=3))
+    txn.owner._stage_page_image(
+        txn, HEAP, 3, make_page_image(holder.codec, [b"x"], page_index=3)
+    )
     txn.note_write(holder.manager.partition_of(1, b"x"))
     holder.manager.commit(txn)
     holder.manager.close()
 
     successor = build_stack(database_root, owner_id="successor")
     other = successor.manager.begin("write")
-    other.owner._stage_page_image(other, HEAP, 4, make_page_image(successor.codec, [b"y"], page_index=4))
+    other.owner._stage_page_image(
+        other, HEAP, 4, make_page_image(successor.codec, [b"y"], page_index=4)
+    )
     other.note_write(successor.manager.partition_of(2, b"y"))
     assert successor.manager.commit(other).wrote is True
 
@@ -1315,8 +1401,11 @@ def test_the_default_still_lets_two_participants_take_turns(make_stack) -> None:
     for index, participant in enumerate((first, second, first, second)):
         page = 10 + index
         txn = participant.manager.begin("write")
-        txn.owner._stage_page_image(txn,
-            HEAP, page, make_page_image(participant.codec, [bytes([index])], page_index=page)
+        txn.owner._stage_page_image(
+            txn,
+            HEAP,
+            page,
+            make_page_image(participant.codec, [bytes([index])], page_index=page),
         )
         txn.note_write(participant.manager.partition_of(index + 1, bytes([index])))
         assert participant.manager.commit(txn).wrote is True

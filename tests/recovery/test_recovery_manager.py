@@ -181,9 +181,20 @@ def test_writable_recovery_barriers_a_clean_foreign_tail_before_publication(
         events.append("barrier")
         return original_barrier(manager, first_lsn, through_lsn)
 
-    def publish(store: CommitStateStore, state: CommitState) -> None:
+    def publish(
+        store: CommitStateStore,
+        state: CommitState,
+        *,
+        previous: CommitState,
+        previous_was_damaged: bool = False,
+    ) -> None:
         events.append("publish")
-        original_publish(store, state)
+        original_publish(
+            store,
+            state,
+            previous=previous,
+            previous_was_damaged=previous_was_damaged,
+        )
 
     monkeypatch.setattr(WalManager, "force_barrier_range", barrier)
     monkeypatch.setattr(CommitStateStore, "publish", publish)
@@ -214,7 +225,14 @@ def test_recovery_never_publishes_when_its_wal_barrier_escapes(
     ) -> tuple[str, ...]:
         raise failure
 
-    def forbidden_publish(_store: CommitStateStore, _state: CommitState) -> None:
+    def forbidden_publish(
+        _store: CommitStateStore,
+        _state: CommitState,
+        *,
+        previous: CommitState,
+        previous_was_damaged: bool = False,
+    ) -> None:
+        del previous, previous_was_damaged
         raise AssertionError(
             "recovery published state without a successful WAL barrier"
         )
@@ -236,9 +254,7 @@ def test_failed_recovery_poisoning_reaches_vector_indexes_and_preserves_the_prim
     vectors, index = _poisonable_vector(stack)
     primary = RuntimeError("recovery stopped after applying a prefix")
 
-    def fail_after_prefix(
-        _manager: RecoveryManager, _permit: object
-    ) -> RecoveryReport:
+    def fail_after_prefix(_manager: RecoveryManager, _permit: object) -> RecoveryReport:
         raise primary
 
     monkeypatch.setattr(RecoveryManager, "_run_fenced", fail_after_prefix)
@@ -277,12 +293,16 @@ def test_checkpoint_complete_writable_recovery_does_not_barrier_an_idle_wal(
     stack: Stack, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     committed = _commit(stack, 3, b"already-checkpointed")
+    checkpoint_state = CommitState(
+        last_committed_lsn=committed,
+        last_csn=committed,
+        checkpoint_lsn=committed,
+    )
     CommitStateStore(stack.storage, owner_id="checkpoint-test").publish(
-        CommitState(
-            last_committed_lsn=committed,
-            last_csn=committed,
-            checkpoint_lsn=committed,
-        )
+        checkpoint_state,
+        previous=CommitStateStore(
+            stack.storage, owner_id="checkpoint-test-reader"
+        ).read(),
     )
     reopened = _reopened(stack)
     calls = 0
@@ -371,6 +391,9 @@ def test_recovery_refuses_to_cut_below_the_checkpoint_before_any_mutation(
     """A cut below the replay floor would let a later WAL batch reuse filtered LSNs."""
     checkpoint = _commit(stack, 3, b"checkpointed")
     device = stack.storage
+    previous = CommitStateStore(  # type: ignore[arg-type]
+        device, owner_id="checkpoint-floor-reader"
+    ).read()
     CommitStateStore(  # type: ignore[arg-type]
         device, owner_id="checkpoint-floor-test"
     ).publish(
@@ -378,7 +401,8 @@ def test_recovery_refuses_to_cut_below_the_checkpoint_before_any_mutation(
             last_committed_lsn=checkpoint,
             last_csn=checkpoint,
             checkpoint_lsn=checkpoint,
-        )
+        ),
+        previous=previous,
     )
 
     segment = _segment(stack)

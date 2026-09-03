@@ -19,7 +19,11 @@ from pathlib import Path
 import pytest
 
 from okto_grafx import connect
-from okto_grafx.domain.errors import GrafxDeviceFull, GrafxError, GrafxUnsupportedOperation
+from okto_grafx.domain.errors import (
+    GrafxDeviceFull,
+    GrafxError,
+    GrafxUnsupportedOperation,
+)
 from okto_grafx.domain.page import PageType
 from okto_grafx.domain.txn.commit_state import CommitState
 from okto_grafx.engine.buffer_pool import BufferPool
@@ -31,7 +35,9 @@ SEGMENT_BYTES: int = 64 * 1024
 
 
 def _segments(path: Path) -> list[str]:
-    return sorted(os.path.basename(name) for name in glob.glob(str(path / "wal" / "*.wal")))
+    return sorted(
+        os.path.basename(name) for name in glob.glob(str(path / "wal" / "*.wal"))
+    )
 
 
 def _people(database: object, *, at_least: int = 0) -> int:
@@ -44,7 +50,9 @@ def _schema(database: object) -> None:
         txn.execute("CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))")
 
 
-def test_a_checkpoint_reclaims_the_segments_the_database_no_longer_needs(tmp_path: Path) -> None:
+def test_a_checkpoint_reclaims_the_segments_the_database_no_longer_needs(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "db"
     database = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
     try:
@@ -140,7 +148,9 @@ def test_a_foreign_writer_commits_during_the_checkpoint_data_barrier(
             finally:
                 checkpoint_done.set()
 
-        monkeypatch.setattr(BufferPool, "durability_barrier", pause_first_checkpoint_barrier)
+        monkeypatch.setattr(
+            BufferPool, "durability_barrier", pause_first_checkpoint_barrier
+        )
         checkpoint_thread = threading.Thread(
             target=run_checkpoint, name="concurrent-data-barrier"
         )
@@ -157,7 +167,9 @@ def test_a_foreign_writer_commits_during_the_checkpoint_data_barrier(
         assert writer.execute("MATCH (p:P {id: 1}) RETURN p.name").rows == (
             ("during-barrier",),
         )
-        assert not checkpoint_done.is_set(), "the checkpoint must still be inside phase B"
+        assert not checkpoint_done.is_set(), (
+            "the checkpoint must still be inside phase B"
+        )
 
         release_barrier.set()
         checkpoint_thread.join(timeout=10.0)
@@ -370,15 +382,15 @@ def test_a_checkpoint_with_a_live_local_snapshot_keeps_the_monolithic_fence(
         writer_txn = writer.begin("write")
         writer_txn.execute("CREATE (:P {id: 9, name: 'waited'})")
 
-        def pause_checkpoint_barrier(
-            pool: BufferPool, file: str | None = None
-        ) -> None:
+        def pause_checkpoint_barrier(pool: BufferPool, file: str | None = None) -> None:
             nonlocal paused
             if pool is checkpointer._pool and not paused:
                 paused = True
                 barrier_entered.set()
                 if not release_barrier.wait(timeout=5.0):
-                    raise AssertionError("the test did not release the monolithic checkpoint")
+                    raise AssertionError(
+                        "the test did not release the monolithic checkpoint"
+                    )
             original_barrier(pool, file)
 
         def run_checkpoint() -> None:
@@ -503,7 +515,9 @@ def test_a_long_lived_checkpointer_adopts_foreign_schema_before_logical_redo(
         assert checkpointer.attached_indexes == ()
         checkpointer.checkpoint()
 
-        assert tuple(table.name for table in checkpointer.catalog.catalog.tables()) == ("P",)
+        assert tuple(table.name for table in checkpointer.catalog.catalog.tables()) == (
+            "P",
+        )
         assert checkpointer.indexes.index("pk_P").name == "pk_P"
         assert checkpointer.attached_indexes == ("pk_P",)
         assert checkpointer.execute("MATCH (p:P) RETURN p.id").rows == ((7,),)
@@ -535,14 +549,23 @@ def test_checkpoint_index_inventory_is_serialized_with_a_post_barrier_commit(
         original_open = IndexManager.open
 
         def fail_commit_publication(
-            store: CommitStateStore, state: CommitState
+            store: CommitStateStore,
+            state: CommitState,
+            *,
+            previous: CommitState,
+            previous_was_damaged: bool = False,
         ) -> None:
             if threading.current_thread().name == "latching-commit":
                 raise GrafxDeviceFull(
                     "The test refuses publication after the commit barrier.",
                     file="control/commit.state",
                 )
-            original_publish(store, state)
+            original_publish(
+                store,
+                state,
+                previous=previous,
+                previous_was_damaged=previous_was_damaged,
+            )
 
         def pause_checkpoint_inventory(
             manager: IndexManager,
@@ -554,7 +577,9 @@ def test_checkpoint_index_inventory_is_serialized_with_a_post_barrier_commit(
             if threading.current_thread().name == "checkpoint-postlude":
                 inventory_entered.set()
                 if not release_inventory.wait(timeout=5.0):
-                    raise AssertionError("the test did not release checkpoint inventory")
+                    raise AssertionError(
+                        "the test did not release checkpoint inventory"
+                    )
             return original_open(
                 manager,
                 published_lsn,
@@ -657,7 +682,9 @@ def test_maintenance_index_inventory_fences_a_foreign_commit(
             ):
                 inventory_entered.set()
                 if not release_inventory.wait(timeout=5.0):
-                    raise AssertionError("the test did not release maintenance inventory")
+                    raise AssertionError(
+                        "the test did not release maintenance inventory"
+                    )
             return original_open(
                 manager,
                 published_lsn,
@@ -685,7 +712,9 @@ def test_maintenance_index_inventory_fences_a_foreign_commit(
         maintenance_thread = threading.Thread(
             target=run_maintenance, name="stable-maintenance-inventory"
         )
-        commit_thread = threading.Thread(target=run_commit, name="foreign-inventory-commit")
+        commit_thread = threading.Thread(
+            target=run_commit, name="foreign-inventory-commit"
+        )
         maintenance_thread.start()
         assert inventory_entered.wait(timeout=5.0)
         commit_thread.start()
@@ -779,7 +808,9 @@ def test_startup_index_inventory_fences_a_foreign_commit(
             commit_done.set()
 
     monkeypatch.setattr(IndexManager, "open", pause_startup_inventory)
-    connect_thread = threading.Thread(target=run_connect, name="stable-startup-inventory")
+    connect_thread = threading.Thread(
+        target=run_connect, name="stable-startup-inventory"
+    )
     commit_thread = threading.Thread(target=run_commit, name="foreign-startup-commit")
     try:
         connect_thread.start()
@@ -816,7 +847,7 @@ def test_startup_index_inventory_fences_a_foreign_commit(
         reopened.close()
 
 
-_OTHER_PROCESS = r'''
+_OTHER_PROCESS = r"""
 import sys, time
 sys.path.insert(0, sys.argv[2])
 from okto_grafx import connect
@@ -836,10 +867,10 @@ db._transactions.refresh_due_readers(
 )
 print("COMMITTED", flush=True)
 time.sleep(60)   # hold the pages in memory; the test kills this process before it flushes
-'''
+"""
 
 
-_CHECKPOINT_CRASH_PROCESS = r'''
+_CHECKPOINT_CRASH_PROCESS = r"""
 import os, sys
 sys.path.insert(0, sys.argv[2])
 from okto_grafx import connect
@@ -880,7 +911,7 @@ else:
 
 db.checkpoint()
 os._exit(99)
-'''
+"""
 
 
 @pytest.mark.parametrize(
@@ -1026,7 +1057,9 @@ def test_a_checkpoint_never_reclaims_a_page_another_process_has_not_flushed(
             }
             assert protected, "the scenario needs WAL newer than the reader snapshot"
             report = checkpointer.checkpoint()
-            assert report.recycled, "the scenario needs the checkpoint to actually reclaim"
+            assert report.recycled, (
+                "the scenario needs the checkpoint to actually reclaim"
+            )
             assert report.reader_present is True
             assert report.horizon_lsn == snapshot
             assert protected <= set(report.retained)
