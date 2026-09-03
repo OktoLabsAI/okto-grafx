@@ -398,6 +398,94 @@ def test_a_direct_hit_with_a_corrupt_or_invisible_identity_fails_closed(
     )
 
 
+def test_a_mutable_direct_hit_cannot_switch_the_row_staged_for_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reference checked at the adapter boundary is the exact one a write consumes."""
+    stack = build_query_stack(
+        vector_nullable=False,
+        vector_exact_scan_threshold=32,
+    )
+    _seed(stack, count=4)
+    table = stack.table("Chunk")
+    visible_refs = tuple(
+        ref for ref, _version in stack.heap.scan(table, Snapshot(FIXTURE_READ_LSN))
+    )
+    original = VectorEngine.search
+    exposed: list[object] = []
+
+    class SwitchingHit:
+        """Return a different valid ref on a second read, exposing a check/use split."""
+
+        def __init__(
+            self,
+            *,
+            validated_ref: RecordRef,
+            substituted_ref: RecordRef,
+            record_id: int,
+            score: float,
+        ) -> None:
+            self.validated_ref = validated_ref
+            self.substituted_ref = substituted_ref
+            self._record_id = record_id
+            self._score = score
+            self.ref_reads = 0
+            self.record_id_reads = 0
+            self.score_reads = 0
+
+        @property
+        def ref(self) -> RecordRef:
+            self.ref_reads += 1
+            if self.ref_reads == 1:
+                return self.validated_ref
+            return self.substituted_ref
+
+        @property
+        def record_id(self) -> int:
+            self.record_id_reads += 1
+            return self._record_id
+
+        @property
+        def score(self) -> float:
+            self.score_reads += 1
+            return self._score
+
+    def switching_search(self: VectorEngine, **arguments: object) -> object:
+        """Wrap the one requested hit in a stateful adapter-boundary object."""
+        result = original(self, **arguments)  # type: ignore[arg-type]
+        source = result.hits[0]
+        substituted_ref = next(ref for ref in visible_refs if ref != source.ref)
+        mutable = SwitchingHit(
+            validated_ref=source.ref,
+            substituted_ref=substituted_ref,
+            record_id=source.record_id,
+            score=source.score,
+        )
+        exposed.append(mutable)
+        return replace(result, hits=(mutable,))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(VectorEngine, "search", switching_search)
+    transaction = _transaction(stack)
+    result = stack.engine.execute(
+        "MATCH (n:Chunk) "
+        "WHERE similarity(n.embedding, $q, space => 'minilm_v2') > -2.0 "
+        "DELETE n "
+        "RETURN n.id, similarity_score() AS score ORDER BY score DESC LIMIT 1",
+        transaction,
+        {"q": [1.0, 0.0, 0.0, 0.0]},
+    )
+
+    assert result.statistics["vector_direct_accesses"] == 1
+    assert len(transaction.row_intents) == 1
+    mutable = exposed[0]
+    assert isinstance(mutable, SwitchingHit)
+    assert transaction.row_intents[0].reference == mutable.validated_ref
+    assert transaction.row_intents[0].reference != mutable.substituted_ref
+    assert mutable.ref_reads == 1
+    assert mutable.record_id_reads == 1
+    assert mutable.score_reads == 1
+
+
 def test_cold_reopen_keeps_the_direct_approximate_path(tmp_path: Path) -> None:
     """Both the cardinality cache and HNSW picture may be cold without widening trust."""
     root = tmp_path / "database"

@@ -4270,10 +4270,11 @@ def _direct_vector_search(
     _record_vector_search_statistics(context, result, candidate_count)
     threshold_value = _threshold_value(node, (), context)
 
-    materialised: list[tuple[object, HeapVersion]] = []
+    materialised: list[tuple[RecordRef, int, float, HeapVersion]] = []
     for hit in result.hits:
         ref = getattr(hit, "ref", None)
         record_id = getattr(hit, "record_id", None)
+        score = getattr(hit, "score")
         if type(ref) is not RecordRef or type(record_id) is not int or record_id < 1:
             raise GrafxIndexError(
                 "A vector hit must name one positive record id and one exact heap reference.",
@@ -4297,13 +4298,16 @@ def _direct_vector_search(
                 page=ref.page,
                 slot=ref.slot,
             )
-        materialised.append((hit, version))
+        # The hit belongs to an adapter boundary and need not be an immutable VectorHit.  Keep
+        # exactly the values whose physical witness was checked: re-reading ``hit.ref`` while
+        # emitting the RowBinding would permit a stateful object to substitute a different row
+        # after revalidation (a classic check/use split in a DELETE or SET pipeline).
+        materialised.append((ref, record_id, score, version))
 
     context.count("vector_direct_accesses")
     context.count("vector_rows_materialized", len(materialised))
     rows: list[_Row] = []
-    for hit, version in materialised:
-        score = getattr(hit, "score")
+    for ref, _record_id, score, version in materialised:
         if threshold_value is not None and not _passes(
             node.threshold_operator, score, threshold_value
         ):
@@ -4314,7 +4318,7 @@ def _direct_vector_search(
                     node.variable: RowBinding(
                         variable=node.variable,
                         table=scan.table,
-                        ref=getattr(hit, "ref"),
+                        ref=ref,
                         version=version,
                     ),
                     node.score_column: score,
