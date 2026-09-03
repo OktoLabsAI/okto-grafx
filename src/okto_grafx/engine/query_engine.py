@@ -72,11 +72,12 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import NO_CSN, RecordId, RecordRef
-from okto_grafx.domain.index.keys import index_key
 from okto_grafx.domain.index.definition import (
+    RECORD_ID_KEY_DERIVATION,
     automatic_index_definitions,
     index_definition_matches_table,
 )
+from okto_grafx.domain.index.keys import index_key, record_id_key
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.engine.index_manager import (
     edge_from_index_name,
@@ -851,6 +852,12 @@ class _Context:
     _ends_staged: frozenset[object] | None = None
     path_identities: dict[tuple[object, ...], int] = field(default_factory=dict)
     path_identities_issued: int = 0
+    # The identity door chooses its access path once per complete table identity.  ``None`` is
+    # a deliberate, statement-stable canonical fallback; a store value is the exact ACTIVE
+    # generation this statement selected and must never be replaced by a quiet fallback later.
+    endpoint_identity_indexes: dict[tuple[int, str], object | None] = field(
+        default_factory=dict
+    )
 
     def already_ended(self, reference: object) -> bool:
         """Answer whether this exact version has already been told to stop.
@@ -7142,19 +7149,153 @@ def _canonical_identity_with_ref(
     return engine.heap._lookup_with_ref(table, record_id, context.snapshot)
 
 
+def _endpoint_identity_index(
+    engine: QueryEngine,
+    context: _Context,
+    table: TableDef,
+) -> object | None:
+    """Choose this statement's identity access path once for one complete table identity.
+
+    Catalog v1 and a v2 table without an ACTIVE identity generation retain the canonical heap
+    path.  The same is true when the selected physical store is already known stale before this
+    statement adopts it.  Each verdict is cached: publication or repair during the statement
+    cannot make one table alternate between two authorities.
+
+    Once an ACTIVE, fresh generation is selected, every later failure belongs to that access
+    path and must propagate.  In particular, this function never re-resolves a cached store and
+    never converts a read refusal into a heap scan.  The catalog projection is table-local, so
+    the decision costs O(indexes for this table), never O(all database indexes).
+    """
+    identity = (table.table_id, table.name)
+    cache = getattr(context, "endpoint_identity_indexes", None)
+    if cache is None:
+        # Narrow unit collaborators predating the concrete slotted _Context may not expose the
+        # cache yet.  Give mutable ones the same statement-stable behaviour without weakening
+        # the production type.
+        cache = {}
+        try:
+            setattr(context, "endpoint_identity_indexes", cache)
+        except (AttributeError, TypeError):
+            pass
+    if identity in cache:
+        return cache[identity]
+
+    catalog = context.schema()
+    if catalog.format_version == CATALOG_LEGACY_FORMAT_VERSION:
+        cache[identity] = None
+        return None
+
+    projected = catalog.active_index_definitions_for(
+        table.table_id,
+        table_name=table.name,
+    )
+    candidates = tuple(
+        definition
+        for definition in projected
+        if definition.key_derivation == RECORD_ID_KEY_DERIVATION
+    )
+    if not candidates:
+        cache[identity] = None
+        return None
+    if len(candidates) != 1:
+        raise GrafxCorruptionDetected(
+            f"Table {table.name!r} projects {len(candidates)} ACTIVE identity indexes; exactly "
+            "one generation may own a table's RecordId access path.",
+            table=table.name,
+            table_id=table.table_id,
+            field="identity_index",
+            count=len(candidates),
+        )
+
+    definition = candidates[0]
+    expected_name = f"rid_t_{table.table_id:08x}"
+    if (
+        definition.name != expected_name
+        or definition.table_id != table.table_id
+        or definition.table_name != table.name
+        or definition.positions
+        or definition.visibility is not IndexVisibility.EXACT
+    ):
+        raise GrafxCorruptionDetected(
+            f"Catalog identity index {definition.name!r} does not describe the complete "
+            f"identity access path of table {table.name!r}.",
+            table=table.name,
+            table_id=table.table_id,
+            field="identity_index",
+            index=definition.name,
+        )
+
+    manager = engine.require_indexes()
+    index = _catalog_active_index(manager, definition.name, catalog)
+    if index is None or getattr(index, "definition", None) != definition:
+        raise GrafxIndexError(
+            f"Catalog-selected identity index {definition.name!r} has no registered store "
+            "with its exact ACTIVE physical definition.",
+            table=table.name,
+            table_id=table.table_id,
+            field="index_authority",
+            index=definition.name,
+            registered=index is not None,
+        )
+    if getattr(index, "stale", False):
+        cache[identity] = None
+        return None
+    if not callable(getattr(manager, "validated_versions", None)):
+        raise GrafxUnsupportedOperation(
+            f"Identity index {definition.name!r} is ACTIVE, but this index framework cannot "
+            "return its heap-validated versions.",
+            table=table.name,
+            table_id=table.table_id,
+            field="component",
+            value="validated_versions",
+            index=definition.name,
+        )
+
+    cache[identity] = index
+    return index
+
+
 def _visible_identity_with_ref(
     engine: QueryEngine,
     context: _Context,
     table: TableDef,
     record_id: RecordId,
 ) -> tuple[RecordRef, HeapVersion] | None:
-    """Resolve one identity under this snapshot through a bounded, reusable prefix locator.
+    """Resolve one identity through the statement's fixed index or canonical heap access path.
 
-    This is intentionally independent of CREATE relationship.  It returns the generic
-    ``RecordRef + HeapVersion`` pair P1.5 will need, while the transaction-owned lifecycle and
-    memory policy remain in the executor.  Capacity and stale derived state are the only two
-    reasons to fall back.  Stored-data mismatches and corruption propagate unchanged.
+    A catalog-v2 ACTIVE identity generation is definitive: a validated miss is absence, and two
+    visible versions are corruption.  No heap scan follows either result.  Tables without that
+    access path retain the bounded reusable prefix locator below, including all of its existing
+    capacity, lifecycle and fail-closed stored-data behaviour.
     """
+    identity_index = _endpoint_identity_index(engine, context, table)
+    if identity_index is not None:
+        manager = engine.require_indexes()
+        # Selection already proved this capability.  Do not catch AttributeError or any other
+        # read failure here: after adoption, fallback would hide a generation change or damage.
+        found = tuple(
+            manager.validated_versions(
+                identity_index,
+                record_id_key(record_id),
+                context.snapshot,
+            )
+        )
+        if not found:
+            return None
+        if len(found) > 1:
+            raise GrafxCorruptionDetected(
+                f"Identity index {identity_index.name!r} resolved record {record_id} of "
+                f"table {table.name!r} to {len(found)} snapshot-visible versions.",
+                file=identity_index.file,
+                table=table.name,
+                table_id=table.table_id,
+                record_id=record_id,
+                field="record_id",
+                index=identity_index.name,
+                count=len(found),
+            )
+        return found[0]
+
     memo = _endpoint_txn_memo(engine, context)
     if memo is None:
         return _canonical_identity_with_ref(engine, context, table, record_id)
