@@ -9,6 +9,14 @@ including the on-disk format.
 
 ### Added
 
+- Added durable equality-only custom indexes through transactional `CREATE INDEX` and
+  `Database.create_index()`. Ordered compound keys, explicit bucket counts and deterministic
+  expected-cardinality sizing share one planner and one catalog-v2 shadow-build protocol. The
+  Python door returns a detached ACTIVE `IndexView` with a certified nonce and freshness
+  horizons only after durable publication.
+- Added explicit, idempotent `Database.ensure_identity_indexes()` activation for catalog-v2
+  primary-key, relationship-endpoint and unsigned record-identity access paths. Catalog v2 is a
+  one-way mixed-fleet fence; vector/proximity indexes remain schema-derived.
 - Added snapshot-owning, read-only query cursors through `db.query(...).cursor()`. Iteration pulls
   detached results in bounded batches without materialising the public terminal; early close can
   never stage a write and always releases the reader transaction.

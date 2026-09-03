@@ -11,7 +11,7 @@
 
 - **Linha `0.0.2` iniciada sob o plano de performance congelado.** A branch canônica de trabalho é
   `feature/v0.0.2`; o bump de versão, o ambiente P0.0 e o diagnóstico/correção multiprocesso P0.1
-  estão publicados, e o marco de código integrado mais recente é `283cffa`. A auditoria do Pulse Community pinado em `d50c034`
+  estão publicados, e o marco de código integrado mais recente é `2fa81b1`. A auditoria do Pulse Community pinado em `d50c034`
   (Core `f602c7c`) confirmou que o backfill
   não chama `rebuild_vector_index`, portanto a cerca process-local de um rebuild manual não é um
   blocker do fluxo real. D-26, D-01 e D-04 foram promovidos depois dos testes focados: D-26 mede
@@ -255,9 +255,27 @@
   5/5, Ruff lint, compile e diff-check ficaram verdes, e duas revisões adversariais encerraram sem
   blocker residual.
 
-  O próximo submilestone permanece finito: porta DDL/Python para índices secundários exatos e
-  sizing customizado. Depois vem rehash growth-only. Itens 11--13 e sharding não entram nesses
-  passos.
+  A criação de índices secundários exatos customizados foi concluída em `2fa81b1`. A gramática
+  `CREATE INDEX` e a porta `Database.create_index()` compartilham análise, planner, sizing e o
+  mesmo protocolo transacional: migração/reparo automático v2 e shadow custom são admitidos como
+  um lote, construídos sob writer lease + `COMMIT_SECTION`, barrierados antes do catálogo e
+  publicados por um único commit WAL/OCC. Índices compostos preservam a ordem declarada;
+  `bucket_count` e `expected_cardinality` são exclusivos; o default continua 64 e o sizing por
+  cardinalidade usa `next_pow2(ceil(N/64))` dentro de `1..4096` buckets. A porta Python exige uma
+  `Sequence` ordenada, recusa set/dict/generator antes de abrir transação e retorna `IndexView`
+  ACTIVE destacado com nonce, metadados e horizons recém-certificados. O executor preserva a
+  igualdade da linguagem: `NULL` não casa, e representações que a query considera equivalentes
+  mas o codec distingue (INT64/DOUBLE, zero com sinal e valores aninhados) escolhem scan canônico
+  antes de consumir o índice. A fronteira pública canonicaliza definições lógicas sem callbacks
+  hostis e mantém índices vector/proximity derivados do schema no catálogo v2.
+
+  Gates do marco: 394/394 no slice grammar/planner/query/txn/API e 281/281 no slice público,
+  concorrência de fronteira, activation/v2/reopen; `verify("all")` live e cold passou, além de
+  Ruff, `compileall` e `diff --check`. A revisão adversarial encontrou quatro blockers reais
+  (callback lógico hostil, perda de vector no inventário v2, receipt sem horizons e coleções não
+  ordenadas) e confirmou todos fechados, sem blocker residual. O próximo e último submilestone
+  do item 10 permanece exatamente o rehash foreground growth-only. Itens 11--13 e sharding não
+  entram nesse passo.
 
 - **Run real do Pulse 0.3.3 na pasta padrão — reconstrução Grafx em andamento, SQLite preservado.**
   Antes da troca foi criado backup consistente do SQLite (`quick_check=ok`, zero violações de FK)

@@ -73,6 +73,7 @@ openCypher in the Kùzu dialect, executed by a planner that produces one operato
 | Supported | Notes |
 |---|---|
 | `CREATE NODE TABLE` / `CREATE REL TABLE` | with `PRIMARY KEY`, typed columns, `FROM`/`TO` |
+| `CREATE INDEX` | equality-only exact index over one or more ordered node properties; optional deterministic sizing |
 | `CREATE VECTOR SPACE` | dimension, metric, storage dtype |
 | `CREATE` (nodes and relationships) | patterns with inline properties |
 | `MATCH` … `WHERE` … `RETURN` | equality, comparison, `STARTS WITH`, `ENDS WITH`, boolean operators |
@@ -122,6 +123,16 @@ transactions like any other.
 - **A stale index is never used.** A stale index is a *subset* of the heap, which validation cannot
   repair, so both the planner and the uniqueness check fall back to the scan they did before any
   index existed: slower, and right.
+- **Custom exact indexes are durable catalog authority.** Create one transactionally with
+  `CREATE INDEX by_email FOR (p:Person) ON (p.email)` or with
+  `db.create_index("by_email", "Person", ("email",))`. Ordered compound keys are supported.
+  Choose either `bucket_count=` or `expected_cardinality=`; with neither, the default is 64
+  buckets. The Python door owns a dedicated write transaction and returns an immutable
+  `IndexView` only after the shadow generation and catalog commit are durable.
+- **Catalog-v2 activation is a one-way compatibility fence.** `db.create_index(...)` and the
+  explicit idempotent `db.ensure_identity_indexes()` may activate it. Every process that can open
+  that database must therefore run a Grafx build that understands catalog v2; rollback uses a
+  pre-activation backup or logical export, not an older binary against migrated bytes.
 
 ### Embeddings, first class
 
@@ -397,9 +408,9 @@ streaming the terminal does not by itself make an unbounded sort, distinct or gr
 Properties such as `db.catalog`, `db.indexes`, `db.wal`, `db.storage` and `db.metrics` are frozen
 snapshots for schema, inventory and diagnostics. They never retain the storage device, page pool,
 WAL, transaction manager or adapter callbacks. Writes go through transactions or explicit gated
-database methods (`checkpoint`, `recover`, `flush`, `publish_metrics`); there is no `unsafe=True`
-escape. `Transaction` exposes `snapshot`, `mode`, `txn_id`, `active` and `report`, but never its
-mutable engine context.
+database methods (`create_index`, `ensure_identity_indexes`, `checkpoint`, `recover`, `flush`,
+`publish_metrics`); there is no `unsafe=True` escape. `Transaction` exposes `snapshot`, `mode`,
+`txn_id`, `active` and `report`, but never its mutable engine context.
 
 ### In memory
 

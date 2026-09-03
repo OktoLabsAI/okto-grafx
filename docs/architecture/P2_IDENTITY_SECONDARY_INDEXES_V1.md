@@ -555,7 +555,8 @@ The implementation is intentionally split at reviewable durability boundaries:
 | Record-aware identity lifecycle | complete | `0d353ae`; quota, INSERT/UPDATE/DELETE, validated lookup, rebuild and bidirectional verification consume the durable `record_id`; logical WAL continues to name the immutable index definition |
 | Statement-stable endpoint routing | complete | `01c496d`; ACTIVE identity lookup is `O(K_t)` to select and hash-directed thereafter; miss is definitive and post-selection failures never fall back |
 | Activation and automatic DDL scope | complete | `ba8ca9a`; explicit/idempotent `ensure_identity_indexes`, automatic v2 generations for later NODE/REL DDL, endpoint identity scope, bounded build admission and pre-publication durability barriers |
-| Custom secondary indexes and growth-only rehash | next | `CREATE INDEX`/Python door, deterministic custom sizing, then foreground ACTIVE-to-STALE rotation with the recovery matrix in section 12 |
+| Custom secondary indexes | complete | `2fa81b1`; transactional `CREATE INDEX` and Python/maintenance doors, ordered compound keys, deterministic sizing, detached committed receipt and query-equality-safe execution |
+| Growth-only rehash | next | foreground ACTIVE-to-STALE generation rotation with the recovery matrix in section 12 |
 
 The ACTIVE projection uses a structural catalog map and a structural raw-registry map keyed by
 `(table_id, table_name)`. Per-row count/staging is therefore `O(K_t + S_txn)`, where `K_t` is the
@@ -596,6 +597,19 @@ rollback releases every process-local claim/cache binding, and retry uses fresh 
 activation/DDL/quota/planner/config gate passed 367 tests; the post-format DDL fault slice passed
 5/5, Ruff lint, compile and diff checks were green, and two adversarial reviews found no remaining
 blocker in the delivered boundary.
+
+Quality evidence for `2fa81b1`: textual DDL and `Database.create_index()` share one analyzed plan
+and seal migration/repair plus the custom shadow into one fresh dedicated transaction. Quota and
+all caller refusals precede catalog staging or generation-file creation; build and verification
+occur under the existing writer/publication fences and catalog activation remains the only
+reachability point. Ordered compound positions and deterministic sizing survive cold reopen, and
+the returned `IndexView` carries the ACTIVE nonce, logical metadata and freshly certified header
+horizons. Query execution treats hash hits as candidates, keeps `NULL` equality unknown and takes
+the canonical scan before consuming an index whenever the durable encoding cannot represent the
+language's wider equality relation. The public inventory strips hostile descriptor subclasses and
+continues to expose schema-derived vector/proximity indexes under catalog v2. Focused composed
+gates passed 394/394 and 281/281 tests with live/cold `verify("all")`, Ruff, compile and diff checks;
+the final adversarial review reported no remaining blocker.
 
 The WAL is intentionally **not** qualified by physical generation. A logical name cannot be
 rebound to different table/positions/visibility/derivation, a rehash shadow is complete through
