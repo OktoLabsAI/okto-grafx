@@ -206,12 +206,31 @@ def test_index_version_fallback_reads_hits_lazily(exact: bool) -> None:
 
     engine = SimpleNamespace(heap=SimpleNamespace(read=read))
     hits = query_engine_module._index_lookup_versions(
-        engine, LookupOnlyManager(), "idx", b"key", object(), exact=exact
+        engine,
+        LookupOnlyManager(),
+        "idx",
+        b"key",
+        object(),
+        exact=exact,
+        ended=(),
     )
 
     assert reads == [], "constructing the fallback must not touch the heap"
     assert next(hits) == ("first", "version-first")
     assert reads == ["first"]
+
+    reads.clear()
+    owner_filtered = query_engine_module._index_lookup_versions(
+        engine,
+        LookupOnlyManager(),
+        "idx",
+        b"key",
+        object(),
+        exact=exact,
+        ended={"first", "corrupt-third"},
+    )
+    assert next(owner_filtered) == ("second", "version-second")
+    assert reads == ["second"], "ended hits must be filtered before fallback heap reads"
 
 
 def test_a_deleted_row_is_not_returned_by_a_seek(database) -> None:
