@@ -4351,6 +4351,30 @@ class IndexManager:
             return tuple(reader.lookup(key, snapshot))
         return self.validated(index, key, snapshot)
 
+    def lookup_versions(
+        self, name: str, key: bytes, snapshot: SnapshotLike
+    ) -> tuple[tuple[RecordRef, HeapVersion], ...]:
+        """Return exact-index locations together with the heap versions that validated them.
+
+        This is an engine-internal sibling of :meth:`lookup`, not a third visibility contract.
+        An EXACT lookup already has to read each candidate while the index certificate is stable;
+        returning that immutable version lets the query executor consume the proof instead of
+        reading and decoding the same heap slot again outside the stable view.  A PROXIMITY index
+        deliberately does not consult the heap, so it keeps using :meth:`lookup` and this door
+        refuses that contract rather than silently changing it.
+        """
+        index = self.index(name)
+        if index.visibility is IndexVisibility.PROXIMITY:
+            raise GrafxIndexError(
+                f"Index {index.name!r} has proximity visibility and does not validate heap "
+                "versions during lookup.",
+                field="visibility",
+                value=index.visibility.value,
+                index=index.name,
+                file=index.file,
+            )
+        return self.validated_versions(index, key, snapshot)
+
     def validated(
         self, index: IndexStore, key: bytes, snapshot: SnapshotLike
     ) -> tuple[RecordRef, ...]:
@@ -4363,14 +4387,48 @@ class IndexManager:
         is the contract rather than a defect. A candidate that cannot be READ is a different
         matter and is raised: the heap is the truth, and a truth that will not decode is damage.
         """
+        return self._validated_items(
+            index,
+            key,
+            snapshot,
+            project=lambda ref, _version: ref,
+        )
+
+    def validated_versions(
+        self, index: IndexStore, key: bytes, snapshot: SnapshotLike
+    ) -> tuple[tuple[RecordRef, HeapVersion], ...]:
+        """Return the exact candidates and the versions read while validating them.
+
+        Keeping the pair inside one stable-view callback is the important part: the page-0
+        certificate still brackets both index traversal and heap validation, and callers cannot
+        accidentally turn one exact hit into two heap decodes.
+        """
+        return self._validated_items(
+            index,
+            key,
+            snapshot,
+            project=lambda ref, version: (ref, version),
+        )
+
+    def _validated_items(
+        self,
+        index: IndexStore,
+        key: bytes,
+        snapshot: SnapshotLike,
+        *,
+        project: Callable[[RecordRef, HeapVersion], _ReadResult],
+    ) -> tuple[_ReadResult, ...]:
+        """Validate exact candidates once and project each accepted heap proof."""
         read_lsn = index._require_exact_read_lsn(snapshot)
         definition = index.definition
         wanted = index._require_key(key)
 
-        def confirm(certificate: _IndexReadCertificate) -> tuple[RecordRef, ...]:
+        def confirm(
+            certificate: _IndexReadCertificate,
+        ) -> tuple[_ReadResult, ...]:
             """Validate candidates against heap frames bound to this index generation."""
             self._prepare_heap_view(index.file, certificate)
-            confirmed: list[RecordRef] = []
+            confirmed: list[_ReadResult] = []
             for entry in index._candidates_unchecked(wanted):
                 version = self._heap.read(entry.ref)
                 if version.table_id != definition.table_id:
@@ -4387,7 +4445,7 @@ class IndexManager:
                     continue
                 if definition.entry_key_for(version.values) != entry.key:
                     continue
-                confirmed.append(entry.ref)
+                confirmed.append(project(entry.ref, version))
             return tuple(confirmed)
 
         return index._stable_view(read_lsn, confirm)
