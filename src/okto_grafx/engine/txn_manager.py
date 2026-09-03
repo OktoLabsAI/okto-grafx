@@ -620,6 +620,7 @@ class TransactionManager:
         "_reader_stall_threshold",
         "_refresh_interval",
         "_descriptor",
+        "_materialized_pages",
         "_file_ids",
         "_participant_section_name",
         "_retain_lease",
@@ -769,6 +770,9 @@ class TransactionManager:
                 value=type(descriptor).__name__,
             )
         self._descriptor: str = descriptor
+        # Page VALUES stamped by the last _build_records, keyed by (file, page_index): the
+        # retarget re-stamps and re-encodes these instead of decoding the logged bytes again.
+        self._materialized_pages: dict[tuple[str, PageIndex], Page] = {}
         self._file_ids: FileIdMap = FileIdMap(
             heap_file=_file_name_of(heap, "heap.dat"),
             catalog_file=_file_name_of(catalog, "catalog.dat"),
@@ -3487,17 +3491,23 @@ class TransactionManager:
         self._validate_pending_index_records(txn, pending)
         images: list[tuple[str, PageIndex, bytes]] = []
         records: list[WalRecordLike] = []
+        self._materialized_pages = {}
         for file, page_index in staged:
             image = txn.page_images.get((file, page_index))
             if image is None:
-                image = self._read_image(file, page_index)
-            stamped = self._committed_image(
-                file,
-                page_index,
-                image,
-                predicted,
-                rows,
-            )
+                # Materialised in this process: the resident frame is the authority and was
+                # verified when it entered the pool. Copy it, stamp the copy, encode ONCE.
+                stamped = self._local_image(file, page_index, predicted, rows)
+            else:
+                # Staged by a collaborator as bytes: the bytes are the authority and are
+                # decoded with verification before anything is stamped into them.
+                stamped = self._committed_image(
+                    file,
+                    page_index,
+                    image,
+                    predicted,
+                    rows,
+                )
             images.append((file, page_index, stamped))
             records.append(
                 WalRecord(
@@ -3587,13 +3597,23 @@ class TransactionManager:
         corrected_images: list[tuple[str, PageIndex, bytes]] = []
         corrected_records: list[WalRecordLike] = []
         for file, page_index, image in images:
-            corrected = self._committed_image(
-                file,
-                page_index,
-                image,
-                new_csn,
-                rows,
-            )
+            page = self._materialized_pages.get((file, page_index))
+            if page is None:
+                # Not produced by _build_records in this attempt (a caller-built batch):
+                # the bytes are all there is, so they are verified before being re-stamped.
+                corrected = self._committed_image(
+                    file,
+                    page_index,
+                    image,
+                    new_csn,
+                    rows,
+                )
+            else:
+                # The page value was already validated (decoded with verification, or
+                # copied from a verified frame) and stamped with old_csn: re-stamp it to
+                # the terminal LSN and encode once more, without decoding the bytes again.
+                self._stamp_page(page, file, page_index, new_csn, rows)
+                corrected = self._pool.codec.encode_page(page)
             corrected_images.append((file, page_index, corrected))
             corrected_records.append(
                 WalRecord(
@@ -4906,23 +4926,22 @@ class TransactionManager:
                 touched.add(item.ended.page)
         return tuple(sorted(touched))
 
-    def _committed_image(
+    def _stamp_page(
         self,
+        page: Page,
         file: str,
         page_index: PageIndex,
-        image: bytes,
         csn: Csn,
         rows: Sequence[_RowWrite],
-    ) -> bytes:
-        """Return the post-commit image without publishing the CSN into a live frame.
+    ) -> None:
+        """Stamp the commit number into a page VALUE: page_lsn and the heap headers this commit owns.
 
         Heap work has to be materialised before the page half of optimistic validation is known,
         but a WAL append can still fail after that.  The resident/device version therefore keeps
-        the reserved provisional sentinel until the WAL barrier returns.  Only this local copy is
-        rewritten to the predicted commit number; it is the byte-identical image appended to WAL
-        and installed by :meth:`_apply_images` after the barrier.
+        the reserved provisional sentinel until the WAL barrier returns.  Only a local value is
+        rewritten to the predicted commit number; its encoding is the byte-identical image
+        appended to WAL and installed by :meth:`_apply_images` after the barrier.
         """
-        page = self._pool.codec.decode_page(image, verify=True)
         if page.page_lsn < csn:
             page.page_lsn = csn
         if file == self._heap_file:
@@ -4931,12 +4950,46 @@ class TransactionManager:
                     self._restamp_page(page, item.born, xmin=csn)
                 if item.ended is not None and item.ended.page == page_index:
                     self._restamp_page(page, item.ended, xmax=csn)
+
+    def _committed_image(
+        self,
+        file: str,
+        page_index: PageIndex,
+        image: bytes,
+        csn: Csn,
+        rows: Sequence[_RowWrite],
+    ) -> bytes:
+        """Return the post-commit image of BYTES a collaborator staged, after verifying them.
+
+        A pre-staged image is the authority for its page and came from outside this frame
+        pool, so it is decoded with verification, structurally and by checksum, before the
+        commit number is stamped into it. The decoded value is kept for a retarget.
+        """
+        page = self._pool.codec.decode_page(image, verify=True)
+        self._stamp_page(page, file, page_index, csn, rows)
+        self._materialized_pages[(file, page_index)] = page
         return self._pool.codec.encode_page(page)
 
-    def _read_image(self, file: str, page_index: PageIndex) -> bytes:
-        """Return the current image of one resident page, as the log will carry it."""
-        with self._pool.pinned(file, page_index) as page:
-            return self._pool.codec.encode_page(page)
+    def _local_image(
+        self,
+        file: str,
+        page_index: PageIndex,
+        csn: Csn,
+        rows: Sequence[_RowWrite],
+    ) -> bytes:
+        """Return the post-commit image of a page THIS process materialised, encoded once.
+
+        The resident frame was verified when it entered the pool and is the authority for
+        its page, so the image is built from an independent copy of it -- stamp the copy,
+        encode the copy -- instead of encoding the frame, decoding and verifying the bytes
+        this process just produced, and encoding them again. The frame is never touched:
+        it stays provisional until the WAL barrier returns. The copy is kept for a retarget.
+        """
+        with self._pool.pinned(file, page_index) as resident:
+            page = resident.copy()
+        self._stamp_page(page, file, page_index, csn, rows)
+        self._materialized_pages[(file, page_index)] = page
+        return self._pool.codec.encode_page(page)
 
     def _apply_images(
         self,
