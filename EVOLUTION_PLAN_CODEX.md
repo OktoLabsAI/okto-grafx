@@ -167,6 +167,29 @@
   permanece fora desta autorização. Group commit continua fora da fila porque a medição histórica
   foi aproximadamente `1,002x`; plan cache continua somente hipótese a medir.
 
+  **Item 10 / P2-ID iniciado com contrato finito em 2026-09-03.** O ADR aceito
+  [`P2_IDENTITY_SECONDARY_INDEXES_V1.md`](docs/architecture/P2_IDENTITY_SECONDARY_INDEXES_V1.md)
+  congela o catálogo v2 como capability/fence de frota, a migração explícita e idempotente (sem
+  upgrade por mero `connect()`), gerações físicas shadow sem republish do mesmo path, sizing e
+  rehash growth-only sob o `COMMIT_SECTION`, índices exatos customizados/compostos e o fallback
+  versus fail-closed. B+tree, range/full-text, rehash online, sharding e itens 11--13 não entram
+  nesse alvo. O primeiro milestone `fa0c298` implementa e testa o codec canônico de nove bytes
+  `record_id_u64_v1` sobre todo o domínio utilizável `1..2**64-2` e generaliza a derivação interna
+  para receber a identidade completa da versão, sem ainda tornar o novo access path elegível.
+  A auditoria do downgrade fence acrescentou uma exigência necessária, sem ampliar a feature: a
+  ativação do catálogo v2 co-publicará `control/commit.state` v2 no mesmo layout de 36 bytes. Isso
+  impede inclusive um processo `0.0.1` já aberto de mutar recovery/checkpoint depois que o WAL da
+  ativação tiver sido reciclado; publishers posteriores preservarão monotonicamente a versão 2.
+  O milestone `4feec76` conclui o formato antes de torná-lo elegível no runtime: catálogo v1
+  continua byte a byte idêntico e é o default; catálogo v2 persiste apenas access paths exatos
+  compatíveis, com capability obrigatória, definições lógicas, gerações físicas, ordem canônica,
+  unicidade global de nonce e cross-references fail-closed. Vetores/proximity continuam derivados
+  pelo tipo especializado do schema. O mesmo milestone fixa o payload `commit.state` v2 de 36
+  bytes e preserva monotonicamente uma versão já publicada. Gates agrupados: `132 passed` no codec
+  e contratos adjacentes, mais `207 passed` no `CatalogStore`, publicação e visões públicas. A
+  próxima entrega é a porta transacional de promoção/coativação e sua matriz de recovery; até ela,
+  nenhum fluxo comum promove automaticamente um banco v1.
+
 - **Run real do Pulse 0.3.3 na pasta padrão — reconstrução Grafx em andamento, SQLite preservado.**
   Antes da troca foi criado backup consistente do SQLite (`quick_check=ok`, zero violações de FK)
   e os artefatos Ladybug foram movidos, sem exclusão, para quarentena operacional. Os bindings de
