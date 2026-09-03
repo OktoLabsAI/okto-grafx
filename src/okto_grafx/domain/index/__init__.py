@@ -12,6 +12,12 @@ rule true on disk.
 
 from __future__ import annotations
 
+from okto_grafx.domain.index.catalog import (
+    IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY,
+    CatalogIndexDefinition,
+    IndexGenerationDescriptor,
+    IndexGenerationState,
+)
 from okto_grafx.domain.index.contract import SecondaryIndex, StagingTransaction
 from okto_grafx.domain.index.definition import (
     COLUMN_KEY_DERIVATION,
@@ -21,6 +27,7 @@ from okto_grafx.domain.index.definition import (
     RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
     index_file,
+    index_generation_file,
     require_index_name,
 )
 from okto_grafx.domain.index.entry import (
@@ -77,14 +84,18 @@ __all__ = [
     "INDEX_HEADER_FORMAT_VERSION",
     "INDEX_HEADER_SIZE",
     "INDEX_HEADER_SLOT",
+    "IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY",
     "MAX_BUCKET_COUNT",
     "MAX_INDEX_KEY_BYTES",
     "MIN_BUCKET_COUNT",
     "RECORD_ID_KEY_DERIVATION",
     "RECORD_ID_KEY_FORMAT_VERSION",
     "IndexChange",
+    "CatalogIndexDefinition",
     "IndexDefinition",
     "IndexEntry",
+    "IndexGenerationDescriptor",
+    "IndexGenerationState",
     "IndexHeader",
     "IndexOperation",
     "IndexVisibility",
@@ -96,6 +107,7 @@ __all__ = [
     "change_of",
     "entry_visible",
     "index_file",
+    "index_generation_file",
     "index_key",
     "record_id_key",
     "is_reclaimable",

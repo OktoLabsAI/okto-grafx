@@ -44,6 +44,7 @@ __all__ = [
     "INDEX_FILE_SUFFIX",
     "IndexDefinition",
     "index_file",
+    "index_generation_file",
     "require_index_name",
 ]
 
@@ -77,6 +78,22 @@ def index_file(name: str) -> str:
     path looks like on this platform.
     """
     return f"{INDEX_DIRECTORY}/{require_index_name(name)}{INDEX_FILE_SUFFIX}"
+
+
+def index_generation_file(artifact_nonce: object) -> str:
+    """Return the canonical physical path derived from one non-zero generation nonce."""
+
+    if (
+        isinstance(artifact_nonce, bool)
+        or not isinstance(artifact_nonce, int)
+        or not 1 <= artifact_nonce <= 0xFFFFFFFFFFFFFFFF
+    ):
+        raise GrafxIndexError(
+            "An index generation needs a non-zero unsigned 64-bit artifact nonce.",
+            field="artifact_nonce",
+            value=repr(artifact_nonce),
+        )
+    return index_file(f"g_{artifact_nonce:016x}")
 
 
 def require_index_name(name: object) -> str:
@@ -129,6 +146,7 @@ class IndexDefinition:
     visibility: IndexVisibility
     bucket_count: int = DEFAULT_BUCKET_COUNT
     key_derivation: str = COLUMN_KEY_DERIVATION
+    artifact_nonce: int = 0
 
     def __post_init__(self) -> None:
         """Refuse a definition that could not name a file, a table, or a key."""
@@ -194,6 +212,18 @@ class IndexDefinition:
                 field="key_derivation",
                 value=repr(self.key_derivation),
             )
+        if (
+            isinstance(self.artifact_nonce, bool)
+            or not isinstance(self.artifact_nonce, int)
+            or not 0 <= self.artifact_nonce <= 0xFFFFFFFFFFFFFFFF
+        ):
+            raise GrafxIndexError(
+                f"Index {self.name!r} needs an unsigned 64-bit artifact nonce; got "
+                f"{self.artifact_nonce!r}.",
+                field="artifact_nonce",
+                value=repr(self.artifact_nonce),
+                index=self.name,
+            )
         object.__setattr__(self, "visibility", IndexVisibility.parse(self.visibility))
         object.__setattr__(
             self, "bucket_count", validate_bucket_count(self.bucket_count)
@@ -209,6 +239,7 @@ class IndexDefinition:
         visibility: IndexVisibility | str,
         bucket_count: int = DEFAULT_BUCKET_COUNT,
         key_derivation: str = COLUMN_KEY_DERIVATION,
+        artifact_nonce: int = 0,
     ) -> IndexDefinition:
         """Return the definition of an index over these columns of this table.
 
@@ -249,6 +280,7 @@ class IndexDefinition:
             visibility=IndexVisibility.parse(visibility),
             bucket_count=bucket_count,
             key_derivation=key_derivation,
+            artifact_nonce=artifact_nonce,
         )
 
     @property
@@ -269,7 +301,11 @@ class IndexDefinition:
     @property
     def file(self) -> str:
         """Return the paged file this index is stored in."""
-        return index_file(self.name)
+        return (
+            index_file(self.name)
+            if self.artifact_nonce == 0
+            else index_generation_file(self.artifact_nonce)
+        )
 
     def key_for(self, values: Sequence[Value]) -> bytes:
         """Return the index key of a row of this table.
@@ -445,6 +481,19 @@ def index_definition_matches_table(
     }
     expected = automatic.get(definition.registry_key)
     if expected is not None:
-        return definition == expected
+        # Bucket count and artifact nonce describe one physical generation, not the logical
+        # schema provenance. Rehashed automatic exact indexes therefore remain the same access
+        # path. The concrete type is still load-bearing for specialized derivations: accepting
+        # a base IndexDefinition in place of VectorIndexDefinition would preserve the digest but
+        # lose the vector key implementation on reopen.
+        return (
+            type(definition) is type(expected)
+            and definition.name == expected.name
+            and definition.table_id == expected.table_id
+            and definition.table_name == expected.table_name
+            and definition.positions == expected.positions
+            and definition.visibility is expected.visibility
+            and definition.key_derivation == expected.key_derivation
+        )
     stored_arity = len(table.columns) + (2 if table.kind == "rel" else 0)
     return all(position < stored_arity for position in definition.positions)

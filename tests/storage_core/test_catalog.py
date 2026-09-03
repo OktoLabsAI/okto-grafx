@@ -16,14 +16,21 @@ from okto_grafx.domain.errors import (
     GrafxSchemaVersionMismatch,
     GrafxSpaceRetired,
 )
-from okto_grafx.domain.model.catalog import CATALOG_FORMAT_VERSION, CATALOG_MAGIC, Catalog
+from okto_grafx.domain.model.catalog import (
+    CATALOG_FORMAT_VERSION,
+    CATALOG_LEGACY_FORMAT_VERSION,
+    CATALOG_MAGIC,
+    Catalog,
+)
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.page import crc32c
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 
 
-def space(name: str = "minilm", space_id: int = 1, **overrides: object) -> EmbeddingSpaceDef:
+def space(
+    name: str = "minilm", space_id: int = 1, **overrides: object
+) -> EmbeddingSpaceDef:
     """Return an active embedding space with the fields these tests reuse."""
     fields: dict[str, object] = {
         "space_id": space_id,
@@ -161,7 +168,9 @@ def test_a_vector_column_must_point_at_a_space_that_exists() -> None:
         name="Chunk",
         columns=(
             ColumnDef(name="id", type=ValueType.INT64, nullable=False),
-            ColumnDef(name="embedding", type=ValueType.VECTOR_F32, vector_space="minilm"),
+            ColumnDef(
+                name="embedding", type=ValueType.VECTOR_F32, vector_space="minilm"
+            ),
         ),
     )
     with pytest.raises(GrafxConfigurationError) as raised:
@@ -180,7 +189,11 @@ def test_a_vector_column_may_not_point_at_a_retired_space() -> None:
             table(
                 name="Chunk",
                 columns=(
-                    ColumnDef(name="embedding", type=ValueType.VECTOR_F32, vector_space="minilm"),
+                    ColumnDef(
+                        name="embedding",
+                        type=ValueType.VECTOR_F32,
+                        vector_space="minilm",
+                    ),
                 ),
                 primary_key=None,
             )
@@ -195,7 +208,11 @@ def test_a_vector_column_must_match_the_precision_of_its_space() -> None:
             table(
                 name="Chunk",
                 columns=(
-                    ColumnDef(name="embedding", type=ValueType.VECTOR_F32, vector_space="minilm"),
+                    ColumnDef(
+                        name="embedding",
+                        type=ValueType.VECTOR_F32,
+                        vector_space="minilm",
+                    ),
                 ),
                 primary_key=None,
             )
@@ -210,7 +227,9 @@ def populated() -> Catalog:
     """Return a catalog with two spaces, one of them retired, and three tables."""
     catalog = Catalog()
     catalog.add_space(space())
-    catalog.add_space(space(name="e5", space_id=2, dimension=1024, storage_dtype="float64"))
+    catalog.add_space(
+        space(name="e5", space_id=2, dimension=1024, storage_dtype="float64")
+    )
     catalog.retire_space("e5")
     catalog.add_table(table())
     catalog.add_table(
@@ -220,7 +239,9 @@ def populated() -> Catalog:
             columns=(
                 ColumnDef(name="id", type=ValueType.INT64, nullable=False),
                 ColumnDef(name="layer", type=ValueType.STRING),
-                ColumnDef(name="embedding", type=ValueType.VECTOR_F32, vector_space="minilm"),
+                ColumnDef(
+                    name="embedding", type=ValueType.VECTOR_F32, vector_space="minilm"
+                ),
             ),
         )
     )
@@ -266,7 +287,8 @@ def test_serialisation_is_stable_for_the_same_catalog() -> None:
 def test_the_serialised_form_opens_with_its_magic_and_version() -> None:
     raw = populated().serialize()
     assert raw.startswith(CATALOG_MAGIC)
-    assert int.from_bytes(raw[8:10], "little") == CATALOG_FORMAT_VERSION
+    assert CATALOG_FORMAT_VERSION == 2
+    assert int.from_bytes(raw[8:10], "little") == CATALOG_LEGACY_FORMAT_VERSION
 
 
 def test_a_retired_space_stays_retired_across_a_round_trip() -> None:
@@ -346,9 +368,7 @@ def test_a_catalog_is_never_equal_to_something_else() -> None:
 # --- the load path upholds the invariants the write path enforces --------------------------------
 
 
-def forge(
-    tables: tuple[TableDef, ...], spaces: tuple[EmbeddingSpaceDef, ...]
-) -> bytes:
+def forge(tables: tuple[TableDef, ...], spaces: tuple[EmbeddingSpaceDef, ...]) -> bytes:
     """Return catalog bytes as a foreign or version-skewed writer could have produced them.
 
     The checksum is correct, so nothing about these bytes is damaged: they are exactly what a
@@ -359,7 +379,7 @@ def forge(
 
     body = module._PREAMBLE.pack(
         CATALOG_MAGIC,
-        CATALOG_FORMAT_VERSION,
+        CATALOG_LEGACY_FORMAT_VERSION,
         0,
         len(tables),
         len(spaces),
@@ -404,12 +424,16 @@ def test_a_stored_catalog_with_two_spaces_of_the_same_id_is_refused() -> None:
     assert raised.value.details["field"] == "space_id"
 
 
-def test_a_stored_vector_column_pointing_at_a_space_that_is_not_there_is_refused() -> None:
+def test_a_stored_vector_column_pointing_at_a_space_that_is_not_there_is_refused() -> (
+    None
+):
     ghost = table(
         name="Chunk",
         table_id=1,
         columns=(
-            ColumnDef(name="embedding", type=ValueType.VECTOR_F32, vector_space="ghost"),
+            ColumnDef(
+                name="embedding", type=ValueType.VECTOR_F32, vector_space="ghost"
+            ),
         ),
         primary_key=None,
     )
@@ -424,7 +448,9 @@ def test_a_stored_vector_column_of_the_wrong_precision_is_refused() -> None:
         name="Chunk",
         table_id=1,
         columns=(
-            ColumnDef(name="embedding", type=ValueType.VECTOR_F32, vector_space="minilm"),
+            ColumnDef(
+                name="embedding", type=ValueType.VECTOR_F32, vector_space="minilm"
+            ),
         ),
         primary_key=None,
     )
@@ -441,11 +467,15 @@ def test_a_table_pointing_at_a_retired_space_still_loads() -> None:
         name="Chunk",
         table_id=1,
         columns=(
-            ColumnDef(name="embedding", type=ValueType.VECTOR_F32, vector_space="minilm"),
+            ColumnDef(
+                name="embedding", type=ValueType.VECTOR_F32, vector_space="minilm"
+            ),
         ),
         primary_key=None,
     )
-    loaded = Catalog.deserialize(forge((chunk,), (space("minilm", 1, state="retired"),)))
+    loaded = Catalog.deserialize(
+        forge((chunk,), (space("minilm", 1, state="retired"),))
+    )
     assert not loaded.space("minilm").is_active
     assert loaded.table("Chunk").column("embedding").vector_space == "minilm"
 
@@ -475,10 +505,19 @@ def with_nullable_byte(value: int) -> bytes:
     # and the presence byte of its vector space. The two neighbours are asserted so that a
     # change to the layout fails this helper instead of quietly forging the wrong byte.
     position = len(encoded) - 2
-    assert encoded[position - 1] == int(ValueType.INT64), "the type tag is not where it was"
-    assert encoded[position + 1] == 0, "the vector-space presence byte is not where it was"
+    assert encoded[position - 1] == int(ValueType.INT64), (
+        "the type tag is not where it was"
+    )
+    assert encoded[position + 1] == 0, (
+        "the vector-space presence byte is not where it was"
+    )
     forged = encoded[:position] + bytes((value,)) + encoded[position + 1 :]
-    body = module._PREAMBLE.pack(CATALOG_MAGIC, CATALOG_FORMAT_VERSION, 0, 1, 0, 2, 1) + forged
+    body = (
+        module._PREAMBLE.pack(
+            CATALOG_MAGIC, CATALOG_LEGACY_FORMAT_VERSION, 0, 1, 0, 2, 1
+        )
+        + forged
+    )
     return body + module._CHECKSUM.pack(crc32c(body))
 
 
@@ -488,8 +527,15 @@ def test_a_nullable_byte_that_is_neither_zero_nor_one_is_refused() -> None:
     The nullable byte read every other value as False, so a column a foreign writer had marked
     nullable came back required -- and the difference only shows the first time a null is stored.
     """
-    assert Catalog.deserialize(with_nullable_byte(1)).table("Person").column("id").nullable
-    assert not Catalog.deserialize(with_nullable_byte(0)).table("Person").column("id").nullable
+    assert (
+        Catalog.deserialize(with_nullable_byte(1)).table("Person").column("id").nullable
+    )
+    assert (
+        not Catalog.deserialize(with_nullable_byte(0))
+        .table("Person")
+        .column("id")
+        .nullable
+    )
     for value in (2, 3, 255):
         with pytest.raises(GrafxCorruptionDetected) as raised:
             Catalog.deserialize(with_nullable_byte(value))

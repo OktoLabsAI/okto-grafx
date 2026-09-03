@@ -1501,6 +1501,7 @@ class RecoveryManager:
                     last_committed_lsn=target,
                     last_csn=target,
                     checkpoint_lsn=state.checkpoint_lsn,
+                    format_version=state.format_version,
                 )
             )
 

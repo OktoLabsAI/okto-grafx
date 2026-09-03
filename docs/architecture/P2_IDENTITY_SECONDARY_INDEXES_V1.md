@@ -40,7 +40,8 @@ without letting an incomplete, stale or foreign index return a short answer.
 
 P2-ID v1 delivers exactly these capabilities:
 
-- catalog format 2 with the required capability `identity_secondary_indexes_v1`;
+- catalog format 2 with the required capability `identity_secondary_indexes_v1`, coactivated
+  with commit-state payload format 2 as the pre-mutation mixed-fleet fence;
 - durable logical definitions and explicit physical index generations;
 - one automatic exact `RecordId -> RecordRef` index for each node table used as a relationship
   endpoint;
@@ -77,17 +78,36 @@ an ordinary read, reopen or unrelated schema operation must not silently cross a
 boundary. Only the explicit activation protocol in section 7 publishes v2. Once activated, every
 later catalog image remains v2 and retains the required capability.
 
-The v2 checksum covers the complete body, including capabilities, logical definitions and physical
-generation records. Encoding is deterministic: capabilities sort by their byte spelling, logical
-indexes by their case-folded registry key and generations by nonce. Duplicate names, non-canonical
-order, duplicate nonces, unknown enum/state codes, trailing bytes, inconsistent counts and invalid
-cross-references are corruption, not values to normalize while reading.
+Catalog v2 is the semantic authority, but it is not by itself an adequate fence for a `0.0.1`
+process that was already open. In particular, after activation WAL has been checkpointed and
+recycled, the old recovery path may retain its process-local v1 catalog and mutate recovery state
+before it reinterprets `catalog.dat`. Activation therefore also publishes commit-state payload
+format 2. It retains the exact 36-byte layout and checksum of format 1 and changes only the version
+field. Released `0.0.1` already reads this record before begin/write, DDL artifact work, checkpoint
+and recovery mutation, and refuses an intact future version. A larger payload is forbidden because
+the old recovery path classifies a length mismatch as recoverable corruption rather than a version
+fence.
+
+The two authorities are coactivated under `COMMIT_SECTION`: catalog v2 becomes durable through its
+normal WAL transaction, and commit-state v2 is its final publication act. Every later commit and
+checkpoint preserves version 2. No path may publish version 1 once catalog v2 has committed.
+
+The v2 catalog checksum covers the complete body, including capabilities, logical definitions and
+physical generation records. Required capabilities use a bounded `u64` bitset; bit zero names
+`identity_secondary_indexes_v1`, and an unknown required bit is a typed capability/version refusal.
+Encoding is deterministic: logical indexes sort by their case-folded registry key and generations
+by nonce. Duplicate names, non-canonical order, duplicate nonces, unknown enum/state codes,
+trailing bytes, inconsistent counts and invalid cross-references are corruption, not values to
+normalize while reading.
 
 ### 3.2 Persisted logical definition
 
-Catalog v2 persists every index the committed registry is allowed to use: existing automatic
-primary-key, relationship-endpoint and vector definitions; the identity definitions from this ADR;
-and user-created exact definitions. A logical definition contains at least:
+Catalog v2 persists the exact indexes controlled by this capability: automatic primary-key and
+relationship-endpoint definitions when they receive a physical generation, the identity
+definitions from this ADR, and user-created exact definitions. Existing proximity/vector indexes
+remain derived from their durable table/embedding-space schema and retain their current specialized
+runtime type; P2-ID v1 neither serializes them as a generic definition nor changes their lifecycle.
+A persisted logical definition contains at least:
 
 ```text
 name
@@ -248,20 +268,23 @@ before chains become material.
 ## 7. Activation and migration protocol
 
 The activation point is the committed catalog v2 image. Before it, catalog v1 and the old access
-paths remain authoritative. After it, only the persisted v2 definitions and their active
-generations may populate the committed registry.
+paths remain authoritative. After it, catalog-managed exact paths come only from persisted v2
+definitions and their active generations; unchanged automatic vector/proximity paths continue to
+come from the durable table schema and their specialized composer.
 
 The v1-to-v2 operation is:
 
 1. open writable and complete normal WAL recovery before migration;
 2. acquire `COMMIT_SECTION` and refresh the durable catalog inside it;
-3. inventory all existing automatic definitions and all required endpoint identity definitions;
+3. inventory all existing automatic **exact** definitions and all required endpoint identity
+   definitions; vector/proximity definitions continue to be composed from schema;
 4. build every missing generation as a distinct shadow against one fenced published view;
 5. verify and durably flush every shadow; no v2 catalog byte has yet been published;
 6. build one canonical v2 catalog containing the capability, all logical definitions and all
    active generation records;
 7. stage that catalog through the existing catalog page-image/WAL transaction, retain both OCC
-   validations, append and force WAL before applying/publishing catalog pages;
+   validations, append and force WAL before applying catalog pages, then publish the same commit
+   in the unchanged 36-byte commit-state payload with format version 2;
 8. synchronize the in-memory registry only from the committed catalog authority.
 
 An empty, read-only or ordinary v1 open does not run these steps. Activation occurs only through
@@ -284,8 +307,8 @@ be stated in release notes and Pulse deployment documentation before activation.
 | `0.0.2` writable, catalog v1, ordinary work | Opens and recovers v1 normally. It does not migrate merely by opening. An operation requiring P2-ID follows section 7. |
 | `0.0.2` read-only, catalog v2 | Opens and uses only freshly certified active generations. It never repairs, builds, activates or deletes an artifact. |
 | `0.0.2` writable, catalog v2 | Uses persisted definitions, stages every active-index effect in the existing transaction/WAL protocol and may run explicit foreground rehash. |
-| `0.0.1`, cold open of catalog v2 | Refuses with `GrafxSchemaVersionMismatch`; it must not bootstrap, quarantine, downgrade or mutate the database. |
-| `0.0.1` already open when v2 activates | A pinned read may finish. Its next row write, DDL, checkpoint/recycle or recovery mutation must re-read catalog authority inside the relevant section and refuse **before** WAL append, page materialization or publication. |
+| `0.0.1`, cold open of catalog v2 | Refuses the coactivated commit-state/catalog future version with `GrafxSchemaVersionMismatch`; it must not bootstrap, quarantine, downgrade or mutate the database. |
+| `0.0.1` already open when v2 activates | A pinned read may finish. Its next begin, row write, DDL, checkpoint/recycle or recovery mutation reads commit-state v2 first and refuses **before** read-view invalidation/write-back, WAL append, page materialization or publication. |
 | crash while building a shadow | Catalog v1 or the former v2 active generation remains authoritative. The incomplete/unreferenced file is ignored and retained as an orphan. |
 | crash after shadow barrier, before catalog WAL commit | The complete shadow is still unreachable. Reopen uses the old authority; later maintenance may identify the orphan by nonce. |
 | crash during catalog activation | Existing WAL recovery converges to the complete old catalog or the complete committed v2 catalog. It never publishes a prefix of its index-definition set. |
@@ -294,11 +317,11 @@ be stated in release notes and Pulse deployment documentation before activation.
 | restore/logical import | Logical rows/schema are authoritative; generation files are rebuilt and newly nonced. A copied generation is never trusted without matching database/catalog/header authority. |
 
 The already-open `0.0.1` row is a release blocker, not an aspirational test. In particular, a
-staged old transaction that waited while activation held `COMMIT_SECTION` must refresh after it
-acquires the section and fail before appending its WAL. Recovery that encounters a committed v2
-catalog image may apply only the idempotent image necessary to discover that authority; it must not
-publish later heap/index effects or advance commit/checkpoint state under a build that cannot decode
-the catalog.
+staged old transaction that waited while activation held `COMMIT_SECTION` must read the v2 commit
+state after it acquires the section and fail before appending its WAL. Recovery must fail at that
+same first control-state read, including after activation WAL has been recycled; it must not repair
+the ledger, truncate WAL, publish heap/index effects or advance commit/checkpoint state under a
+build that cannot decode the catalog.
 
 ## 9. Lookup, fallback and correctness boundary
 
@@ -405,6 +428,8 @@ The following existing guarantees are unchanged and are acceptance conditions:
    snapshots, writer leases, WAL retention and recovery-required latch semantics are unchanged.
 9. Quotas count the complete build/DDL/catalog/WAL work before publication and fail closed. DELETE
    intents retain their fixed-entry quota behavior and do not encode an empty value tuple.
+10. Commit-state formats 1 and 2 have the same 36-byte layout. Activation publishes format 2 only
+    after the catalog commit is durable, and every later publisher preserves that version.
 
 ## 12. Focused quality gates
 
@@ -414,13 +439,17 @@ grouped at the milestone rather than repeated after every patch.
 1. **Catalog codec:** deterministic v2 round-trip; v1 read and byte-preserving non-activation;
    checksum/truncation/count/order/duplicate/cross-reference corruption; unknown required
    capability; and the released/frozen v1 decoder refusing v2.
-2. **Mixed fleet:** a real already-open v1 process stages before activation and then loses row
-   write, DDL, checkpoint/recycle and recovery doors before WAL or durable file change; a cold v1
-   process also refuses v2.
+2. **Mixed fleet:** frozen `0.0.1` decoding classifies the same-size commit-state v2 record as
+   version mismatch, never corruption; a real already-open v1 process stages before activation and
+   then loses begin, row write, DDL, checkpoint/recycle and recovery doors before read-view
+   write-back, WAL or durable file change; a cold v1 process also refuses v2. The recovery case is
+   repeated after activation WAL has been checkpointed/recycled.
 3. **Unsigned identity:** golden bytes for `1`, `2**63-1`, `2**63` and `2**64-2`; refusal of zero,
    `2**64-1`, bool, negative and overflow; deterministic cross-process bucket/key results.
-4. **Definition persistence:** custom, compound and all automatic definitions survive cold reopen;
-   process-local unregistered definitions are never planner authority.
+4. **Definition persistence:** custom, compound, identity and generation-managed automatic exact
+   definitions survive cold reopen; vector/proximity definitions continue to survive through their
+   table schema and specialized composer. Process-local unregistered exact definitions are never
+   planner authority.
 5. **Identity lifecycle:** insert, payload update with stable id/new ref, delete, rollback, conflict,
    pending-owner/outsider, self-loop, parallel relationships and cold reopen all match the canonical
    heap oracle.

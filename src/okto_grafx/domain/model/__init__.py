@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
+    CATALOG_LEGACY_FORMAT_VERSION,
     CATALOG_MAGIC,
     Catalog,
 )
@@ -61,6 +62,7 @@ from okto_grafx.domain.model.value import (
 
 __all__ = [
     "CATALOG_FORMAT_VERSION",
+    "CATALOG_LEGACY_FORMAT_VERSION",
     "CATALOG_MAGIC",
     "INT64_MAX",
     "INT64_MIN",

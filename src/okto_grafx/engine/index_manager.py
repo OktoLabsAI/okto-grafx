@@ -638,6 +638,20 @@ class IndexStore:
                 index=definition.name,
                 file=self.file,
             )
+        if (
+            definition.artifact_nonce != 0
+            and header.artifact_nonce != definition.artifact_nonce
+        ):
+            raise GrafxIndexError(
+                f"The file {self.file!r} carries artifact nonce "
+                f"{header.artifact_nonce}, but catalog authority selected "
+                f"{definition.artifact_nonce} for index {definition.name!r}.",
+                field="artifact_nonce",
+                index=definition.name,
+                file=self.file,
+                expected=definition.artifact_nonce,
+                observed=header.artifact_nonce,
+            )
         wanted = 1 + header.bucket_count
         if self._pool.storage.page_count(self.file) < wanted:
             raise GrafxCorruptionDetected(
@@ -727,6 +741,20 @@ class IndexStore:
                 field="visibility",
                 index=definition.name,
                 file=self.file,
+            )
+        if (
+            definition.artifact_nonce != 0
+            and header.artifact_nonce != definition.artifact_nonce
+        ):
+            raise GrafxIndexError(
+                f"The file {self.file!r} carries artifact nonce "
+                f"{header.artifact_nonce}, but catalog authority selected "
+                f"{definition.artifact_nonce} for index {definition.name!r}.",
+                field="artifact_nonce",
+                index=definition.name,
+                file=self.file,
+                expected=definition.artifact_nonce,
+                observed=header.artifact_nonce,
             )
         return header
 
@@ -3128,7 +3156,9 @@ class IndexManager:
                 index=existing.name,
             )
         created_file = False
-        nonce = self._artifact_nonce() if self._artifact_nonce is not None else 0
+        nonce = index.definition.artifact_nonce
+        if nonce == 0 and self._artifact_nonce is not None:
+            nonce = self._artifact_nonce()
         index._set_creation_nonce(nonce)
         header: IndexHeader
         if existing_only:

@@ -1028,6 +1028,7 @@ class TransactionManager:
             last_committed_lsn=self._published_high_water,
             last_csn=self._published_high_water,
             checkpoint_lsn=durable.checkpoint_lsn,
+            format_version=durable.format_version,
         )
 
     @staticmethod
@@ -2077,6 +2078,7 @@ class TransactionManager:
                             last_committed_lsn=published.last_committed_lsn,
                             last_csn=published.last_csn,
                             checkpoint_lsn=published.last_committed_lsn,
+                            format_version=published.format_version,
                         )
                     )
                     # Recycling belongs to the same stable-WAL picture as redo and checkpoint
@@ -2263,6 +2265,7 @@ class TransactionManager:
                         last_committed_lsn=current.last_committed_lsn,
                         last_csn=current.last_csn,
                         checkpoint_lsn=checkpoint_lsn,
+                        format_version=current.format_version,
                     )
                 )
                 self._advance_participant_pin(floor=checkpoint_lsn)
@@ -2340,6 +2343,7 @@ class TransactionManager:
                 last_committed_lsn=target,
                 last_csn=target,
                 checkpoint_lsn=durable.checkpoint_lsn,
+                format_version=durable.format_version,
             )
             self._publish(completed)
             self._published_high_water = _larger(self._published_high_water, target)
@@ -4511,6 +4515,7 @@ class TransactionManager:
                 last_committed_lsn=committed,
                 last_csn=committed,
                 checkpoint_lsn=previous.checkpoint_lsn,
+                format_version=previous.format_version,
             ),
             committed,
         )
@@ -5083,6 +5088,7 @@ class TransactionManager:
             last_committed_lsn=committed,
             last_csn=committed,
             checkpoint_lsn=previous.checkpoint_lsn,
+            format_version=previous.format_version,
         )
         self._publish(state)
         # Remembered only here, and only after the publish landed: this is the one door that

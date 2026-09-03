@@ -1135,6 +1135,9 @@ def _commit_state(value: Any) -> CommitState:
         checkpoint_lsn=_builtin_int(
             _domain_field(value, CommitState, "checkpoint_lsn")
         ),
+        format_version=_builtin_int(
+            _domain_field(value, CommitState, "format_version")
+        ),
     )
 
 

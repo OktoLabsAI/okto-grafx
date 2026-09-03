@@ -7,11 +7,12 @@ may only point at a space that already exists and still accepts writes.
 
 Its serialised form is self-describing and checksummed, because the catalog is what every other
 file is interpreted through: losing it silently would turn every heap page into an unreadable
-blob. The layout is
+blob. The common layout is
 
     magic 8B "GRFXCTLG" | format_version u16 | reserved u16 |
     table_count u32 | space_count u32 | next_table_id u32 | next_space_id u32 |
-    tables | spaces | crc32c u32
+    [v2: required_capabilities u64 | index_count u32 | reserved u32] |
+    tables | spaces | [v2: indexes] | crc32c u32
 
 with tables ordered by table_id and spaces ordered by space_id, so the same catalog always
 serialises to the same bytes.
@@ -20,13 +21,29 @@ serialises to the same bytes.
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterable
+from typing import NoReturn
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
+    GrafxIndexError,
     GrafxSchemaVersionMismatch,
     GrafxSpaceRetired,
 )
+from okto_grafx.domain.index.catalog import (
+    IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY,
+    CatalogIndexDefinition,
+    IndexGenerationDescriptor,
+    IndexGenerationState,
+)
+from okto_grafx.domain.index.definition import (
+    COLUMN_KEY_DERIVATION,
+    RECORD_ID_KEY_DERIVATION,
+    IndexDefinition,
+    automatic_index_definitions,
+)
+from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.schema import (
     SPACE_STATE_ACTIVE,
     ColumnDef,
@@ -38,6 +55,7 @@ from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 
 __all__ = [
+    "CATALOG_LEGACY_FORMAT_VERSION",
     "CATALOG_MAGIC",
     "CATALOG_FORMAT_VERSION",
     "Catalog",
@@ -46,16 +64,39 @@ __all__ = [
 CATALOG_MAGIC: bytes = b"GRFXCTLG"
 """The eight bytes that open a serialised catalog."""
 
-CATALOG_FORMAT_VERSION: int = 1
-"""The catalog format this build writes. Every earlier version stays readable."""
+CATALOG_LEGACY_FORMAT_VERSION: int = 1
+"""The format kept by ordinary databases until P2-ID is explicitly activated."""
+
+CATALOG_FORMAT_VERSION: int = 2
+"""The newest catalog format this build can read and write."""
 
 _PREAMBLE = struct.Struct("<8sHHIIII")
+_V2_EXTENSION = struct.Struct("<QII")
+_INDEX_META = struct.Struct("<BBBBHHQ")
+_INDEX_GENERATION = struct.Struct("<QIB3x")
 _U8 = struct.Struct("<B")
 _U16 = struct.Struct("<H")
 _U32 = struct.Struct("<I")
+_U64 = struct.Struct("<Q")
 _F64 = struct.Struct("<d")
 _CHECKSUM = struct.Struct("<I")
 _MAX_TEXT = 0xFFFF
+
+_IDENTITY_SECONDARY_INDEXES_V1_BIT = 1 << 0
+_KNOWN_CAPABILITY_BITS = _IDENTITY_SECONDARY_INDEXES_V1_BIT
+_CAPABILITY_TO_BIT = {
+    IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY: _IDENTITY_SECONDARY_INDEXES_V1_BIT
+}
+_VISIBILITY_TO_TAG = {IndexVisibility.EXACT: 1}
+_TAG_TO_VISIBILITY = {value: key for key, value in _VISIBILITY_TO_TAG.items()}
+_DERIVATION_TO_TAG = {COLUMN_KEY_DERIVATION: 1, RECORD_ID_KEY_DERIVATION: 2}
+_TAG_TO_DERIVATION = {value: key for key, value in _DERIVATION_TO_TAG.items()}
+_STATE_TO_TAG = {
+    IndexGenerationState.BUILDING: 1,
+    IndexGenerationState.ACTIVE: 2,
+    IndexGenerationState.STALE: 3,
+}
+_TAG_TO_STATE = {value: key for key, value in _STATE_TO_TAG.items()}
 
 
 class Catalog:
@@ -66,7 +107,16 @@ class Catalog:
     definition is refused with a typed error rather than applied.
     """
 
-    __slots__ = ("_tables", "_tables_by_id", "_spaces", "_spaces_by_id")
+    __slots__ = (
+        "_tables",
+        "_tables_by_id",
+        "_spaces",
+        "_spaces_by_id",
+        "_format_version",
+        "_required_capabilities",
+        "_indexes",
+        "_indexes_by_key",
+    )
 
     def __init__(self) -> None:
         """Build an empty catalog."""
@@ -74,6 +124,10 @@ class Catalog:
         self._tables_by_id: dict[int, TableDef] = {}
         self._spaces: dict[str, EmbeddingSpaceDef] = {}
         self._spaces_by_id: dict[int, EmbeddingSpaceDef] = {}
+        self._format_version: int = CATALOG_LEGACY_FORMAT_VERSION
+        self._required_capabilities: frozenset[str] = frozenset()
+        self._indexes: dict[str, CatalogIndexDefinition] = {}
+        self._indexes_by_key: dict[str, CatalogIndexDefinition] = {}
 
     # --- reading ---------------------------------------------------------------------------
 
@@ -84,6 +138,40 @@ class Catalog:
     def spaces(self) -> tuple[EmbeddingSpaceDef, ...]:
         """Return every embedding space, ordered by space_id."""
         return tuple(self._spaces_by_id[key] for key in sorted(self._spaces_by_id))
+
+    @property
+    def format_version(self) -> int:
+        """Return the exact format this value will preserve when serialized."""
+
+        return self._format_version
+
+    def required_capabilities(self) -> tuple[str, ...]:
+        """Return required feature capabilities in deterministic spelling order."""
+
+        return tuple(sorted(self._required_capabilities))
+
+    def index_definitions(self) -> tuple[CatalogIndexDefinition, ...]:
+        """Return catalog-managed exact indexes in canonical registry order."""
+
+        return tuple(self._indexes_by_key[key] for key in sorted(self._indexes_by_key))
+
+    def has_index_definition(self, name: str) -> bool:
+        """Return whether a catalog-managed logical index has this folded name."""
+
+        return isinstance(name, str) and name.lower() in self._indexes_by_key
+
+    def index_definition(self, name: str) -> CatalogIndexDefinition:
+        """Return one catalog-managed definition by case-insensitive logical name."""
+
+        key = name.lower() if isinstance(name, str) else ""
+        try:
+            return self._indexes_by_key[key]
+        except KeyError as failure:
+            raise GrafxConfigurationError(
+                f"There is no catalog-managed index named {name!r}.",
+                field="index",
+                value=repr(name),
+            ) from failure
 
     def has_table(self, name: str) -> bool:
         """Return True when a table with that name exists."""
@@ -150,6 +238,99 @@ class Catalog:
         return not self._tables and not self._spaces
 
     # --- writing ---------------------------------------------------------------------------
+
+    def upgrade_index_catalog(
+        self, definitions: Iterable[CatalogIndexDefinition] = ()
+    ) -> Catalog:
+        """Explicitly cross the one-way v1-to-v2 capability boundary.
+
+        Validation is complete before this object changes. Repeating the exact activation is a
+        no-op; changing an already-active authority uses the dedicated add/replace operations.
+        """
+
+        try:
+            proposed = tuple(definitions)
+        except TypeError as failure:
+            raise GrafxConfigurationError(
+                "Index-catalog activation needs an iterable of definitions.",
+                field="definitions",
+                value=type(definitions).__name__,
+            ) from failure
+        validated = self._validated_index_authority(
+            proposed,
+            stored=False,
+            require_endpoint_identity=True,
+            require_active_identity=True,
+        )
+        if self._format_version == CATALOG_FORMAT_VERSION:
+            if self.index_definitions() == tuple(
+                validated[key] for key in sorted(validated)
+            ):
+                return self
+            raise GrafxConfigurationError(
+                "Catalog format 2 is already active; use add_index_definition or "
+                "replace_index_definition to change its authority.",
+                field="format_version",
+                value=self._format_version,
+            )
+        if self._format_version != CATALOG_LEGACY_FORMAT_VERSION:
+            raise GrafxSchemaVersionMismatch(
+                f"Catalog format {self._format_version} cannot be upgraded by this build.",
+                field="format_version",
+                value=self._format_version,
+                supported=CATALOG_FORMAT_VERSION,
+            )
+        self._format_version = CATALOG_FORMAT_VERSION
+        self._required_capabilities = frozenset(
+            (IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY,)
+        )
+        self._install_indexes(validated)
+        return self
+
+    def add_index_definition(
+        self, definition: CatalogIndexDefinition
+    ) -> CatalogIndexDefinition:
+        """Add one v2-managed logical index after validating the complete authority."""
+
+        self._require_index_catalog()
+        proposed = (*self.index_definitions(), definition)
+        validated = self._validated_index_authority(proposed, stored=False)
+        self._install_indexes(validated)
+        return definition
+
+    def replace_index_definition(
+        self, definition: CatalogIndexDefinition
+    ) -> CatalogIndexDefinition:
+        """Replace only physical generations or sizing of an existing logical definition."""
+
+        self._require_index_catalog()
+        if not isinstance(definition, CatalogIndexDefinition):
+            raise GrafxConfigurationError(
+                "A catalog index replacement needs a CatalogIndexDefinition.",
+                field="definition",
+                value=type(definition).__name__,
+            )
+        existing = self._indexes_by_key.get(definition.registry_key)
+        if existing is None:
+            raise GrafxConfigurationError(
+                f"Index {definition.name!r} is not present and cannot be replaced.",
+                field="name",
+                value=definition.name,
+            )
+        if _logical_index_identity(existing) != _logical_index_identity(definition):
+            raise GrafxConfigurationError(
+                "Replacing an index may change only expected_cardinality and physical "
+                "generations, never its logical meaning.",
+                field="definition",
+                index=existing.name,
+            )
+        proposed = tuple(
+            definition if item.registry_key == definition.registry_key else item
+            for item in self.index_definitions()
+        )
+        validated = self._validated_index_authority(proposed, stored=False)
+        self._install_indexes(validated)
+        return definition
 
     def add_table(self, table: TableDef) -> TableDef:
         """Install a table, refusing a duplicate name or id and an unusable vector column."""
@@ -256,10 +437,35 @@ class Catalog:
 
     def serialize(self) -> bytes:
         """Return the checksummed bytes of this catalog, in a stable order."""
+        if self._format_version not in {
+            CATALOG_LEGACY_FORMAT_VERSION,
+            CATALOG_FORMAT_VERSION,
+        }:
+            raise GrafxSchemaVersionMismatch(
+                f"This build cannot serialize catalog format {self._format_version}.",
+                field="format_version",
+                value=self._format_version,
+                supported=CATALOG_FORMAT_VERSION,
+            )
+        indexes: tuple[CatalogIndexDefinition, ...] = ()
+        capability_bits = 0
+        if self._format_version == CATALOG_FORMAT_VERSION:
+            validated = self._validated_index_authority(
+                self.index_definitions(),
+                stored=False,
+                require_endpoint_identity=True,
+            )
+            indexes = tuple(validated[key] for key in sorted(validated))
+            capability_bits = _encode_capabilities(self._required_capabilities)
+            if not capability_bits & _IDENTITY_SECONDARY_INDEXES_V1_BIT:
+                raise GrafxConfigurationError(
+                    "Catalog format 2 requires identity_secondary_indexes_v1.",
+                    field="required_capabilities",
+                )
         parts: list[bytes] = [
             _PREAMBLE.pack(
                 CATALOG_MAGIC,
-                CATALOG_FORMAT_VERSION,
+                self._format_version,
                 0,
                 len(self._tables_by_id),
                 len(self._spaces_by_id),
@@ -267,10 +473,14 @@ class Catalog:
                 self.next_space_id(),
             )
         ]
+        if self._format_version == CATALOG_FORMAT_VERSION:
+            parts.append(_V2_EXTENSION.pack(capability_bits, len(indexes), 0))
         for table in self.tables():
             parts.append(_encode_table(table))
         for space in self.spaces():
             parts.append(_encode_space(space))
+        for definition in indexes:
+            parts.append(_encode_catalog_index(definition))
         body = b"".join(parts)
         return body + _CHECKSUM.pack(crc32c(body))
 
@@ -284,9 +494,15 @@ class Catalog:
                 field="catalog",
                 value=len(raw),
             )
-        magic, format_version, _reserved, table_count, space_count, next_table, next_space = (
-            _PREAMBLE.unpack_from(raw, 0)
-        )
+        (
+            magic,
+            format_version,
+            reserved,
+            table_count,
+            space_count,
+            next_table,
+            next_space,
+        ) = _PREAMBLE.unpack_from(raw, 0)
         if magic != CATALOG_MAGIC:
             raise GrafxCorruptionDetected(
                 f"These bytes do not start with the catalog magic; got {magic!r}.",
@@ -297,6 +513,12 @@ class Catalog:
             raise GrafxSchemaVersionMismatch(
                 f"This build reads catalog format {CATALOG_FORMAT_VERSION} and below; the "
                 f"stored catalog declares {format_version}.",
+                field="format_version",
+                value=format_version,
+            )
+        if format_version < CATALOG_LEGACY_FORMAT_VERSION:
+            raise GrafxCorruptionDetected(
+                f"The catalog declares invalid format version {format_version}.",
                 field="format_version",
                 value=format_version,
             )
@@ -313,8 +535,38 @@ class Catalog:
             )
         catalog = cls()
         offset = _PREAMBLE.size
+        required_capabilities: frozenset[str] = frozenset()
+        index_count = 0
+        if format_version == CATALOG_FORMAT_VERSION:
+            if reserved != 0:
+                raise GrafxCorruptionDetected(
+                    "Catalog format 2 requires the common reserved word to be zero.",
+                    field="reserved",
+                    value=reserved,
+                    offset=10,
+                )
+            _require(raw, offset, _V2_EXTENSION.size, "catalog-v2 extension")
+            capability_bits, index_count, extension_reserved = (
+                _V2_EXTENSION.unpack_from(raw, offset)
+            )
+            offset += _V2_EXTENSION.size
+            required_capabilities = _decode_capabilities(capability_bits)
+            if IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY not in required_capabilities:
+                raise GrafxCorruptionDetected(
+                    "Catalog format 2 omits its required identity-index capability.",
+                    field="required_capabilities",
+                    value=capability_bits,
+                )
+            if extension_reserved != 0:
+                raise GrafxCorruptionDetected(
+                    "The catalog-v2 extension reserved word must be zero.",
+                    field="reserved",
+                    value=extension_reserved,
+                    offset=offset - _U32.size,
+                )
         tables: list[TableDef] = []
         spaces: list[EmbeddingSpaceDef] = []
+        indexes: list[CatalogIndexDefinition] = []
         # A schema value validates itself when it is built, and on the CREATE path a refusal is a
         # configuration mistake: a caller named an impossible table. Here the caller is a stored
         # file, and the same refusal means something else entirely -- the bytes do not describe a
@@ -328,14 +580,28 @@ class Catalog:
             for _ in range(space_count):
                 space, offset = _decode_space(raw, offset)
                 spaces.append(space)
-        except GrafxConfigurationError as invalid:
+            for _ in range(index_count):
+                definition, offset = _decode_catalog_index(raw, offset)
+                indexes.append(definition)
+        except (GrafxConfigurationError, GrafxIndexError) as invalid:
             raise GrafxCorruptionDetected(
                 f"A stored catalog describes something this build cannot serve: "
                 f"{invalid.message}",
                 field=str(invalid.details.get("field", "catalog")),
                 value=invalid.details.get("value"),
             ) from invalid
+        if format_version == CATALOG_FORMAT_VERSION:
+            _require_canonical_order(tables, spaces, indexes)
         catalog._install_loaded(tables, spaces)
+        if format_version == CATALOG_FORMAT_VERSION:
+            validated = catalog._validated_index_authority(
+                indexes,
+                stored=True,
+                require_endpoint_identity=True,
+            )
+            catalog._format_version = format_version
+            catalog._required_capabilities = required_capabilities
+            catalog._install_indexes(validated)
         if offset != body_end:
             raise GrafxCorruptionDetected(
                 f"A serialised catalog decoded {offset} of {body_end} body bytes.",
@@ -358,12 +624,172 @@ class Catalog:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Catalog):
             return NotImplemented
-        return self._tables == other._tables and self._spaces == other._spaces
+        return (
+            self._tables == other._tables
+            and self._spaces == other._spaces
+            and self._format_version == other._format_version
+            and self._required_capabilities == other._required_capabilities
+            and self._indexes_by_key == other._indexes_by_key
+        )
 
     def __repr__(self) -> str:
         return f"Catalog(tables={len(self._tables)}, spaces={len(self._spaces)})"
 
     # --- internals -------------------------------------------------------------------------
+
+    def _require_index_catalog(self) -> None:
+        """Refuse an index-authority mutation before explicit v2 activation."""
+
+        if self._format_version != CATALOG_FORMAT_VERSION or (
+            IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY not in self._required_capabilities
+        ):
+            raise GrafxConfigurationError(
+                "Persistent index definitions require explicit catalog-v2 activation.",
+                field="format_version",
+                value=self._format_version,
+            )
+
+    def _install_indexes(self, definitions: dict[str, CatalogIndexDefinition]) -> None:
+        """Adopt one already-validated logical index authority."""
+
+        self._indexes_by_key = dict(definitions)
+        self._indexes = {
+            definition.name: definition for definition in definitions.values()
+        }
+
+    def _validated_index_authority(
+        self,
+        definitions: Iterable[CatalogIndexDefinition],
+        *,
+        stored: bool,
+        require_endpoint_identity: bool = False,
+        require_active_identity: bool = False,
+    ) -> dict[str, CatalogIndexDefinition]:
+        """Validate cross-record, namespace and global-generation invariants."""
+
+        error_type = GrafxCorruptionDetected if stored else GrafxConfigurationError
+
+        def refuse(message: str, *, field: str, **details: object) -> NoReturn:
+            raise error_type(message, field=field, **details)
+
+        automatic: dict[str, object] = {}
+        for table in self.tables():
+            for candidate in automatic_index_definitions(table):
+                automatic[candidate.registry_key] = candidate
+
+        endpoints: set[str] = set()
+        for relation in self.tables():
+            if relation.kind != "rel":
+                continue
+            for endpoint_name in (relation.from_table, relation.to_table):
+                endpoint = self._tables.get(str(endpoint_name))
+                if endpoint is None or endpoint.kind != "node":
+                    refuse(
+                        f"Relationship {relation.name!r} points at missing or non-node "
+                        f"endpoint {endpoint_name!r}.",
+                        field="endpoint",
+                        value=endpoint_name,
+                        table=relation.name,
+                    )
+                endpoints.add(endpoint.name)
+
+        by_key: dict[str, CatalogIndexDefinition] = {}
+        nonces: dict[int, str] = {}
+        for definition in definitions:
+            if not isinstance(definition, CatalogIndexDefinition):
+                refuse(
+                    "Catalog index authority contains a value of the wrong type.",
+                    field="definition",
+                    value=type(definition).__name__,
+                )
+            if definition.registry_key in by_key:
+                refuse(
+                    f"Catalog index name {definition.name!r} is duplicated without regard "
+                    "to case.",
+                    field="name",
+                    value=definition.name,
+                )
+            table = self._tables_by_id.get(definition.table_id)
+            if table is None or table.name != definition.table_name:
+                refuse(
+                    f"Index {definition.name!r} does not name one committed table identity.",
+                    field="table_id",
+                    value=definition.table_id,
+                    table_name=definition.table_name,
+                )
+            stored_arity = len(table.columns) + (2 if table.kind == "rel" else 0)
+            for position in definition.positions:
+                if position >= stored_arity:
+                    refuse(
+                        f"Index {definition.name!r} position {position} is outside table "
+                        f"{table.name!r}, whose stored arity is {stored_arity}.",
+                        field="positions",
+                        value=position,
+                        index=definition.name,
+                    )
+
+            is_identity = definition.key_derivation == RECORD_ID_KEY_DERIVATION
+            if is_identity:
+                if table.kind != "node" or table.name not in endpoints:
+                    refuse(
+                        f"Identity index {definition.name!r} belongs only to a node used as "
+                        "a relationship endpoint.",
+                        field="table_id",
+                        value=definition.table_id,
+                        index=definition.name,
+                    )
+            elif definition.automatic:
+                candidate = automatic.get(definition.registry_key)
+                if candidate is None or not _matches_automatic_exact(
+                    definition, candidate
+                ):
+                    refuse(
+                        f"Automatic index {definition.name!r} does not match the table's "
+                        "schema-derived exact definition.",
+                        field="definition",
+                        index=definition.name,
+                    )
+            elif definition.registry_key in automatic:
+                refuse(
+                    f"Custom index {definition.name!r} collides with a schema-derived "
+                    "automatic index name.",
+                    field="name",
+                    value=definition.name,
+                )
+
+            for generation in definition.generations:
+                owner = nonces.get(generation.artifact_nonce)
+                if owner is not None:
+                    refuse(
+                        f"Physical generation nonce {generation.artifact_nonce} is owned by "
+                        f"both {owner!r} and {definition.name!r}.",
+                        field="artifact_nonce",
+                        value=generation.artifact_nonce,
+                    )
+                nonces[generation.artifact_nonce] = definition.name
+            by_key[definition.registry_key] = definition
+
+        if require_endpoint_identity or require_active_identity:
+            for endpoint_name in sorted(endpoints):
+                table = self._tables[endpoint_name]
+                key = f"rid_t_{table.table_id:08x}"
+                identity = by_key.get(key)
+                if identity is None:
+                    refuse(
+                        f"Endpoint table {endpoint_name!r} has no durable identity index "
+                        "definition.",
+                        field="identity_index",
+                        table=endpoint_name,
+                    )
+                if require_active_identity and identity.active_generation() is None:
+                    refuse(
+                        f"Endpoint table {endpoint_name!r} has no active identity-index "
+                        "generation.",
+                        field="generations",
+                        table=endpoint_name,
+                        index=identity.name,
+                    )
+        return by_key
 
     def _install_table(self, table: TableDef) -> None:
         self._tables[table.name] = table
@@ -441,6 +867,255 @@ class Catalog:
                         table=table.name,
                     )
             self._install_table(table)
+
+
+def _logical_index_identity(definition: CatalogIndexDefinition) -> tuple[object, ...]:
+    """Return fields a physical generation or sizing hint may never redefine."""
+
+    return (
+        definition.name,
+        definition.table_id,
+        definition.table_name,
+        definition.positions,
+        definition.visibility,
+        definition.key_derivation,
+        definition.automatic,
+    )
+
+
+def _matches_automatic_exact(
+    definition: CatalogIndexDefinition, candidate: object
+) -> bool:
+    """Match logical schema provenance while deliberately ignoring physical generation fields."""
+
+    return (
+        isinstance(candidate, IndexDefinition)
+        and candidate.visibility is IndexVisibility.EXACT
+        and candidate.key_derivation == COLUMN_KEY_DERIVATION
+        and definition.name == candidate.name
+        and definition.table_id == candidate.table_id
+        and definition.table_name == candidate.table_name
+        and definition.positions == candidate.positions
+        and definition.visibility is candidate.visibility
+        and definition.key_derivation == candidate.key_derivation
+    )
+
+
+def _encode_capabilities(capabilities: frozenset[str]) -> int:
+    """Encode every required capability, refusing one this build cannot uphold."""
+
+    bits = 0
+    for capability in capabilities:
+        bit = _CAPABILITY_TO_BIT.get(capability)
+        if bit is None:
+            raise GrafxSchemaVersionMismatch(
+                f"This build cannot write required catalog capability {capability!r}.",
+                field="required_capabilities",
+                value=capability,
+            )
+        bits |= bit
+    return bits
+
+
+def _decode_capabilities(bits: int) -> frozenset[str]:
+    """Decode a required-capability bitset, never ignoring an unknown required bit."""
+
+    unknown = bits & ~_KNOWN_CAPABILITY_BITS
+    if unknown:
+        raise GrafxSchemaVersionMismatch(
+            f"The catalog requires unsupported capability bits 0x{unknown:016x}.",
+            field="required_capabilities",
+            value=bits,
+            unsupported=unknown,
+        )
+    return frozenset(
+        capability for capability, bit in _CAPABILITY_TO_BIT.items() if bits & bit
+    )
+
+
+def _encode_catalog_index(definition: CatalogIndexDefinition) -> bytes:
+    """Return one deterministic catalog-v2 logical definition and its generations."""
+
+    if len(definition.positions) > 0xFFFF:
+        raise GrafxConfigurationError(
+            "A catalog index may contain at most 65535 positions.",
+            field="positions",
+            value=len(definition.positions),
+            index=definition.name,
+        )
+    if len(definition.generations) > 0xFFFF:
+        raise GrafxConfigurationError(
+            "A catalog index may retain at most 65535 physical generations.",
+            field="generations",
+            value=len(definition.generations),
+            index=definition.name,
+        )
+    try:
+        visibility_tag = _VISIBILITY_TO_TAG[definition.visibility]
+        derivation_tag = _DERIVATION_TO_TAG[definition.key_derivation]
+    except KeyError as failure:
+        raise GrafxConfigurationError(
+            f"Index {definition.name!r} uses a contract catalog format 2 cannot encode.",
+            field="definition",
+            index=definition.name,
+        ) from failure
+    parts = [
+        _encode_text(definition.name),
+        _U32.pack(definition.table_id),
+        _encode_text(definition.table_name),
+        _INDEX_META.pack(
+            visibility_tag,
+            derivation_tag,
+            1 if definition.automatic else 0,
+            0,
+            len(definition.positions),
+            len(definition.generations),
+            definition.expected_cardinality or 0,
+        ),
+    ]
+    parts.extend(_U32.pack(position) for position in definition.positions)
+    parts.extend(
+        _INDEX_GENERATION.pack(
+            generation.artifact_nonce,
+            generation.bucket_count,
+            _STATE_TO_TAG[generation.state],
+        )
+        for generation in definition.generations
+    )
+    return b"".join(parts)
+
+
+def _decode_catalog_index(
+    raw: bytes, offset: int
+) -> tuple[CatalogIndexDefinition, int]:
+    """Decode one catalog-v2 logical index without normalizing stored order or tags."""
+
+    name, offset = _decode_text(raw, offset)
+    _require(raw, offset, _U32.size, "index table_id")
+    table_id = _U32.unpack_from(raw, offset)[0]
+    offset += _U32.size
+    table_name, offset = _decode_text(raw, offset)
+    _require(raw, offset, _INDEX_META.size, "index metadata")
+    (
+        visibility_tag,
+        derivation_tag,
+        automatic,
+        reserved,
+        position_count,
+        generation_count,
+        expected_cardinality,
+    ) = _INDEX_META.unpack_from(raw, offset)
+    offset += _INDEX_META.size
+    if reserved != 0:
+        raise GrafxCorruptionDetected(
+            f"Index {name!r} has a non-zero reserved metadata byte.",
+            field="reserved",
+            value=reserved,
+            index=name,
+        )
+    visibility = _TAG_TO_VISIBILITY.get(visibility_tag)
+    if visibility is None:
+        raise GrafxCorruptionDetected(
+            f"Index {name!r} declares unknown visibility tag {visibility_tag}.",
+            field="visibility",
+            value=visibility_tag,
+            index=name,
+        )
+    key_derivation = _TAG_TO_DERIVATION.get(derivation_tag)
+    if key_derivation is None:
+        raise GrafxCorruptionDetected(
+            f"Index {name!r} declares unknown key-derivation tag {derivation_tag}.",
+            field="key_derivation",
+            value=derivation_tag,
+            index=name,
+        )
+    if automatic not in (0, 1):
+        raise GrafxCorruptionDetected(
+            f"Index {name!r} automatic flag must be zero or one; got {automatic}.",
+            field="automatic",
+            value=automatic,
+            index=name,
+        )
+    positions: list[int] = []
+    for _ in range(position_count):
+        _require(raw, offset, _U32.size, "index position")
+        positions.append(_U32.unpack_from(raw, offset)[0])
+        offset += _U32.size
+    generations: list[IndexGenerationDescriptor] = []
+    for _ in range(generation_count):
+        _require(raw, offset, _INDEX_GENERATION.size, "index generation")
+        artifact_nonce, bucket_count, state_tag = _INDEX_GENERATION.unpack_from(
+            raw, offset
+        )
+        if bytes(raw[offset + 13 : offset + 16]) != b"\x00\x00\x00":
+            raise GrafxCorruptionDetected(
+                f"Index {name!r} generation {artifact_nonce} has non-zero reserved bytes.",
+                field="reserved",
+                index=name,
+                artifact_nonce=artifact_nonce,
+            )
+        offset += _INDEX_GENERATION.size
+        state = _TAG_TO_STATE.get(state_tag)
+        if state is None:
+            raise GrafxCorruptionDetected(
+                f"Index {name!r} generation {artifact_nonce} declares unknown state tag "
+                f"{state_tag}.",
+                field="state",
+                value=state_tag,
+                index=name,
+                artifact_nonce=artifact_nonce,
+            )
+        generations.append(
+            IndexGenerationDescriptor(
+                artifact_nonce=artifact_nonce,
+                bucket_count=bucket_count,
+                state=state,
+            )
+        )
+    return (
+        CatalogIndexDefinition(
+            name=name,
+            table_id=table_id,
+            table_name=table_name,
+            positions=tuple(positions),
+            visibility=visibility,
+            key_derivation=key_derivation,
+            automatic=automatic == 1,
+            expected_cardinality=expected_cardinality or None,
+            generations=tuple(generations),
+        ),
+        offset,
+    )
+
+
+def _require_canonical_order(
+    tables: list[TableDef],
+    spaces: list[EmbeddingSpaceDef],
+    indexes: list[CatalogIndexDefinition],
+) -> None:
+    """Refuse a v2 writer that did not emit the one canonical record order."""
+
+    table_ids = [table.table_id for table in tables]
+    space_ids = [space.space_id for space in spaces]
+    index_keys = [definition.registry_key for definition in indexes]
+    if table_ids != sorted(table_ids):
+        raise GrafxCorruptionDetected(
+            "Catalog-v2 tables are not ordered by table_id.",
+            field="table_order",
+            value=table_ids,
+        )
+    if space_ids != sorted(space_ids):
+        raise GrafxCorruptionDetected(
+            "Catalog-v2 spaces are not ordered by space_id.",
+            field="space_order",
+            value=space_ids,
+        )
+    if index_keys != sorted(index_keys):
+        raise GrafxCorruptionDetected(
+            "Catalog-v2 indexes are not ordered by case-folded logical name.",
+            field="index_order",
+            value=index_keys,
+        )
 
 
 def _encode_text(text: str) -> bytes:
