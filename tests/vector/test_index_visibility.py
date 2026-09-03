@@ -118,6 +118,24 @@ def test_a_tombstoned_entry_stays_in_the_index_as_a_bridge(database: VectorFixtu
     assert index.live_count() == before - 1
 
 
+def test_a_broken_warm_count_cannot_turn_a_durable_tombstone_into_a_failed_commit(
+    database: VectorFixture,
+) -> None:
+    """D-12 cache arithmetic is advisory; the durable change remains authoritative."""
+    space, table, refs = _populate(database, 1)
+    index = database.engine.index("space")
+    assert len(index.graph()) == 1
+    assert index.live_count() == 1
+    with index._guard:  # noqa: SLF001 - inject only the derived-cache fault
+        index._live_count = 0  # noqa: SLF001
+
+    database.delete_row(table, refs[0], 1, space, (0.0, 1.0, 2.0, 3.0), csn=40)
+
+    assert index.stale is False
+    assert index.check_freshness(index.built_through_lsn) is False
+    assert index.live_count() == 0
+
+
 def test_a_key_mismatched_tombstone_keeps_the_warm_count_without_guessing(
     database: VectorFixture,
 ) -> None:

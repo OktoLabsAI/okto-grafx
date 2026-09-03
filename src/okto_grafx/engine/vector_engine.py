@@ -1041,12 +1041,12 @@ class VectorHnswIndex(ProximityIndex):
             ):
                 next_count = self._live_count + delta
                 if next_count < 0:
-                    raise GrafxIndexError(
-                        f"Index {self.name!r} derived a negative live count.",
-                        field="live_count",
-                        index=self.name,
-                        file=self.file,
-                    )
+                    # The entry change is already durable.  A broken derived
+                    # metric must never turn that fact into a failed commit or
+                    # a recovery path: forget it and let the next fenced read
+                    # take the canonical walk.
+                    self._discard_live_count_locked()
+                    return
                 self._live_count = next_count
 
     def _note(self, picture: _GraphSnapshot, change: IndexChange) -> bool:
