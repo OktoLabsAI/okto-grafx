@@ -247,6 +247,7 @@ _OWNER_LANDING_MEMO_BYTES: int = 1_024
 _OWNER_LANDING_TABLE_BYTES: int = 512
 _OWNER_LANDING_VIEW_BASE_BYTES: int = 1_024
 _OWNER_LANDING_OVERLAY_ENTRY_BYTES: int = 192
+_OWNER_LANDING_FINGERPRINT_ENTRY_BYTES: int = 256
 _OWNER_LANDING_RESULT_BASE_BYTES: int = 512
 _OWNER_LANDING_MISS_BYTES: int = 192
 _OWNER_LANDING_PAYLOAD_MULTIPLIER: int = 16
@@ -1311,6 +1312,42 @@ def _owner_landing_result_bytes(
     )
 
 
+def _owner_landing_fingerprint_charge(
+    table: TableDef, fingerprint: tuple
+) -> tuple[int, int] | None:
+    """Conservatively meter the complete intent history retained for invalidation.
+
+    The reduced overlay may contain one row after hundreds of updates to the same reference, but
+    the content fingerprint deliberately retains every update so savepoint rollback cannot alias
+    an earlier state.  Charge every history tuple plus each values object graph before a view can
+    retain the fingerprint.  Failure to size this optional acceleration declines retention; it
+    never replaces the query answer.
+    """
+    _schema_version, intents, held = fingerprint
+    entries = len(intents) + len(held)
+    payload_bytes = 0
+    try:
+        for history in (intents, held):
+            for item in history:
+                values = item[3]
+                # RowIntent.DELETE uses the empty tuple and _HeldRow DELETE uses None as their
+                # absence markers.  Both pay the fixed entry, but neither has a payload to size.
+                if values is not None and item[0] not in (
+                    RowOperation.DELETE,
+                    _HELD_DELETE,
+                ):
+                    payload_bytes += len(
+                        encode_tuple(table, cast(tuple[Value, ...], values))
+                    )
+    except (GrafxError, MemoryError):
+        return None
+    return (
+        entries * _OWNER_LANDING_FINGERPRINT_ENTRY_BYTES
+        + payload_bytes * _OWNER_LANDING_PAYLOAD_MULTIPLIER,
+        entries,
+    )
+
+
 class _OwnerLandingView:
     """Resolve only requested node identities and retain them under an explicit budget.
 
@@ -1337,7 +1374,6 @@ class _OwnerLandingView:
         "_cache_enabled",
         "_cache_entries",
         "_changed",
-        "_context",
         "_ended",
         "_engine",
         "_epoch",
@@ -1366,19 +1402,28 @@ class _OwnerLandingView:
             isinstance(reference, PendingRowRef) for reference, _values in inserted
         )
         overlay_entries = len(changed) + pending_count + len(ended)
+        fingerprint_bytes = 0
+        fingerprint_entries = 0
+        if budget is not None:
+            fingerprint_charge = _owner_landing_fingerprint_charge(table, fingerprint)
+            if fingerprint_charge is None:
+                raise _OwnerLandingCapacity
+            fingerprint_bytes, fingerprint_entries = fingerprint_charge
         base_bytes = (
             _OWNER_LANDING_VIEW_BASE_BYTES
             + overlay_entries * _OWNER_LANDING_OVERLAY_ENTRY_BYTES
+            + fingerprint_bytes
         )
-        base_entries = 1 + overlay_entries
+        base_entries = 1 + overlay_entries + fingerprint_entries
         if budget is not None:
             budget.reserve(bytes_=base_bytes, entries=base_entries)
         try:
             self._engine = engine
-            self._context = context
             self._table = table
             self._snapshot = context.snapshot
-            self._fingerprint = fingerprint
+            # An uninstalled statement-local fallback is never compared for reuse and therefore
+            # must not keep an unmetered history merely to answer this statement.
+            self._fingerprint = fingerprint if budget is not None else ()
             self._epoch = engine.heap._derived_read_epoch()
             self._changed = changed
             self._ended = ended
@@ -1421,11 +1466,9 @@ class _OwnerLandingView:
             and self._epoch == epoch
         )
 
-    def rebind(self, context: _Context) -> None:
-        """Use the current statement context after an unchanged transaction fingerprint."""
-        self._context = context
-
-    def get(self, identity: object) -> tuple[object, HeapVersion] | None:
+    def get(
+        self, identity: object, context: _Context
+    ) -> tuple[object, HeapVersion] | None:
         """Return one owner-visible identity, memoizing only after successful admission."""
         with self._guard:
             if self._retired:
@@ -1439,7 +1482,6 @@ class _OwnerLandingView:
             if cached is not None:
                 return cached[0]
             self._active += 1
-            context = self._context
         lease_open = True
         try:
             # The identity door can walk and decode heap pages.  It is deliberately outside the
@@ -1493,6 +1535,7 @@ class _OwnerLandingView:
         with self._guard:
             self._discard_results_locked()
             self._release_base_locked(clear_overlays=False)
+            self._fingerprint = ()
             self._cache_enabled = False
             self._budget = None
 
@@ -1565,6 +1608,7 @@ class _OwnerLandingView:
             self._changed.clear()
             self._pending.clear()
             self._ended = frozenset()
+            self._fingerprint = ()
 
 
 @dataclass(slots=True)
@@ -3367,7 +3411,7 @@ def _traverse(
         if view is None:
             view = _owner_landing_view(engine, context, table, ended)
             landing_views[table.table_id] = view
-        return view.get(identity)
+        return view.get(identity, context)
 
     outgoing = node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
     incoming = node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
@@ -3490,7 +3534,7 @@ def _traverse_any(
         if view is None:
             view = _owner_landing_view(engine, context, table, ended)
             landing_views[table.table_id] = view
-        return view.get(identity)
+        return view.get(identity, context)
 
     walkers = []
     for table in node.tables:
@@ -3578,7 +3622,7 @@ def _relationship_scan(
         if view is None:
             view = _owner_landing_view(engine, context, table, ended)
             landing_views[table.table_id] = view
-        return view.get(identity)
+        return view.get(identity, context)
 
     def judged(version: HeapVersion, ref: object) -> RowBinding | None:
         """Return the edge binding when the predicate keeps this edge, refusing non-booleans."""
@@ -5395,7 +5439,6 @@ def _owner_landing_view(
                     fingerprint=fingerprint,
                     epoch=epoch,
                 ):
-                    entry.rebind(context)
                     return entry
                 previous = memo.begin_rebuild(table.table_id, slot)
                 install = previous is not None

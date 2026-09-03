@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import gc
 import queue
 import threading
+import weakref
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 
@@ -13,8 +14,12 @@ import okto_grafx.engine.query_engine as query_engine_module
 from okto_grafx.domain.errors import GrafxCorruptionDetected
 from okto_grafx.domain.ids import RecordRef
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
+from okto_grafx.domain.model.schema import encode_tuple
 from okto_grafx.engine.query_engine import (
+    _OWNER_LANDING_FINGERPRINT_ENTRY_BYTES,
     _OWNER_LANDING_MEMO_BYTES,
+    _OWNER_LANDING_OVERLAY_ENTRY_BYTES,
+    _OWNER_LANDING_PAYLOAD_MULTIPLIER,
     _OWNER_LANDING_TABLE_BYTES,
     _OWNER_LANDING_VIEW_BASE_BYTES,
     _OwnerLandingBudget,
@@ -25,17 +30,33 @@ from okto_grafx.engine.query_engine import (
 from tests.query.stack import QueryStack, build_query_stack
 
 
-def _context(stack: QueryStack, *, txn_id: int = 71) -> object:
+class _LandingContext:
+    """The minimal weak-referenceable statement authority consumed by a landing view."""
+
+    __slots__ = ("_schema", "snapshot", "staged_rows", "txn", "__weakref__")
+
+    def __init__(
+        self,
+        stack: QueryStack,
+        *,
+        txn: object | None = None,
+        txn_id: int = 71,
+    ) -> None:
+        transaction = stack.transaction(1_000) if txn is None else txn
+        transaction.txn_id = txn_id
+        self.txn = transaction
+        self.snapshot = transaction.snapshot
+        self._schema = stack.catalog_store.catalog
+        self.staged_rows: list[object] = []
+
+    def schema(self) -> object:
+        """Return the exact catalog picture shared by sibling statement contexts."""
+        return self._schema
+
+
+def _context(stack: QueryStack, *, txn_id: int = 71) -> _LandingContext:
     """Return the narrow owner context consumed by the landing view."""
-    transaction = stack.transaction(1_000)
-    transaction.txn_id = txn_id
-    schema = stack.catalog_store.catalog
-    return SimpleNamespace(
-        txn=transaction,
-        snapshot=transaction.snapshot,
-        schema=lambda: schema,
-        staged_rows=[],
-    )
+    return _LandingContext(stack, txn_id=txn_id)
 
 
 def _insert_people(stack: QueryStack, count: int) -> list[RecordRef]:
@@ -63,7 +84,7 @@ def test_header_corruption_before_the_requested_landing_is_not_hidden() -> None:
         stack.engine, context, stack.table("Person"), frozenset()
     )
     with pytest.raises(GrafxCorruptionDetected) as raised:
-        view.get(3)
+        view.get(3, context)
     assert raised.value.details["field"] == "record_header"
     stack.engine.settle_schema(71, committed=False)
 
@@ -85,7 +106,7 @@ def test_requested_landing_payload_corruption_is_not_hidden() -> None:
         stack.engine, context, stack.table("Person"), frozenset()
     )
     with pytest.raises(GrafxCorruptionDetected) as raised:
-        view.get(1)
+        view.get(1, context)
     assert raised.value.details["declared"] == header.payload_len + 1
     assert raised.value.details["observed"] == header.payload_len
     stack.engine.settle_schema(71, committed=False)
@@ -130,8 +151,8 @@ def test_result_quota_discards_retention_but_never_denies_the_landing(
         stack.engine, context, stack.table("Person"), frozenset()
     )
 
-    assert view.get(1)[0] == ref
-    assert view.get(1)[0] == ref
+    assert view.get(1, context)[0] == ref
+    assert view.get(1, context)[0] == ref
     assert calls == 2, "the saturated result cache fell back without retaining either payload"
     memo = stack.engine._owner_memo[71]
     slot = memo.tables[stack.table("Person").table_id]
@@ -164,11 +185,141 @@ def test_view_admission_failure_releases_its_table_slot_and_uses_local_fallback(
         stack.engine, context, stack.table("Person"), frozenset()
     )
 
-    assert view.get(1)[0] == ref
+    assert view.get(1, context)[0] == ref
     assert view._budget is None
     assert stack.engine._owner_memo[71].tables == {}
     assert stack.engine._owner_budget._used_bytes == _OWNER_LANDING_MEMO_BYTES
     assert stack.engine._owner_budget._used_entries == 1
+    stack.engine.settle_schema(71, committed=False)
+    assert stack.engine._owner_budget._used_bytes == 0
+    assert stack.engine._owner_budget._used_entries == 0
+
+
+def test_many_updates_of_one_ref_are_charged_by_full_fingerprint_history() -> None:
+    stack = build_query_stack()
+    ref = _insert_people(stack, 1)[0]
+    table = stack.table("Person")
+    context = _context(stack)
+    for revision in range(32):
+        context.txn.stage_row_update(
+            table,
+            ref,
+            (1, f"revision-{revision}-{'x' * 32}", revision, "city"),
+        )
+
+    # This is exactly what the former accounting charged: one reduced changed row.  The complete
+    # 32-entry fingerprint must no longer fit behind that O(1) overlay allowance.
+    reduced_allowance = (
+        _OWNER_LANDING_MEMO_BYTES
+        + _OWNER_LANDING_TABLE_BYTES
+        + _OWNER_LANDING_VIEW_BASE_BYTES
+        + _OWNER_LANDING_OVERLAY_ENTRY_BYTES
+    )
+    stack.engine._owner_budget = _OwnerLandingBudget(
+        max_bytes=reduced_allowance,
+        max_entries=10_000,
+        guard=stack.engine._endpoint_guard,
+    )
+
+    view = _owner_landing_view(stack.engine, context, table, frozenset())
+
+    assert view._budget is None
+    assert view._fingerprint == ()
+    assert stack.engine._owner_memo[71].tables == {}
+    assert stack.engine._owner_budget._used_bytes == _OWNER_LANDING_MEMO_BYTES
+    found = view.get(1, context)
+    assert found is not None
+    assert found[1].values == (1, f"revision-31-{'x' * 32}", 31, "city")
+    stack.engine.settle_schema(71, committed=False)
+    assert stack.engine._owner_budget._used_bytes == 0
+    assert stack.engine._owner_budget._used_entries == 0
+
+
+def test_a_memoized_view_does_not_retain_its_statement_context() -> None:
+    stack = build_query_stack()
+    ref = _insert_people(stack, 1)[0]
+    table = stack.table("Person")
+    context = _context(stack)
+    values = (1, "updated", 9, "city")
+    context.txn.stage_row_update(table, ref, values)
+    context_ref = weakref.ref(context)
+    view = _owner_landing_view(stack.engine, context, table, frozenset())
+    expected_bytes = (
+        _OWNER_LANDING_MEMO_BYTES
+        + _OWNER_LANDING_TABLE_BYTES
+        + _OWNER_LANDING_VIEW_BASE_BYTES
+        + _OWNER_LANDING_OVERLAY_ENTRY_BYTES
+        + _OWNER_LANDING_FINGERPRINT_ENTRY_BYTES
+        + len(encode_tuple(table, values)) * _OWNER_LANDING_PAYLOAD_MULTIPLIER
+    )
+    assert stack.engine._owner_budget._used_bytes == expected_bytes
+    assert stack.engine._owner_budget._used_entries == 5
+
+    del context
+    gc.collect()
+
+    assert context_ref() is None
+    assert view._fingerprint != ()
+    stack.engine.settle_schema(71, committed=False)
+    assert view._fingerprint == ()
+    assert stack.engine._owner_budget._used_bytes == 0
+    assert stack.engine._owner_budget._used_entries == 0
+
+
+def test_concurrent_callers_supply_their_own_statement_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = build_query_stack()
+    refs = _insert_people(stack, 2)
+    versions = {identity: stack.heap.read(refs[identity - 1]) for identity in (1, 2)}
+    first = _context(stack)
+    second = _LandingContext(stack, txn=first.txn, txn_id=71)
+    first_view = _owner_landing_view(
+        stack.engine, first, stack.table("Person"), frozenset()
+    )
+    second_view = _owner_landing_view(
+        stack.engine, second, stack.table("Person"), frozenset()
+    )
+    assert second_view is first_view
+    rendezvous = threading.Barrier(2)
+    outcomes: queue.SimpleQueue[object] = queue.SimpleQueue()
+
+    def observed_lookup(
+        engine: object,
+        context: object,
+        table: object,
+        identity: int,
+    ) -> object:
+        expected = first if identity == 1 else second
+        assert context is expected
+        rendezvous.wait(5)
+        return refs[identity - 1], versions[identity]
+
+    monkeypatch.setattr(
+        query_engine_module, "_visible_identity_with_ref", observed_lookup
+    )
+
+    def resolve(identity: int, context: _LandingContext) -> None:
+        try:
+            outcomes.put(first_view.get(identity, context))
+        except BaseException as failure:  # pragma: no cover - rendered by parent assertion
+            outcomes.put(failure)
+
+    threads = (
+        threading.Thread(target=resolve, args=(1, first)),
+        threading.Thread(target=resolve, args=(2, second)),
+    )
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+        assert not thread.is_alive()
+
+    found = tuple(outcomes.get_nowait() for _thread in threads)
+    for result in found:
+        if isinstance(result, BaseException):
+            raise result
+    assert {result[1].record_id for result in found} == {1, 2}
     stack.engine.settle_schema(71, committed=False)
     assert stack.engine._owner_budget._used_bytes == 0
     assert stack.engine._owner_budget._used_entries == 0
@@ -188,7 +339,7 @@ def test_saturation_cannot_grow_an_unaccounted_owner_transaction_registry() -> N
         view = _owner_landing_view(
             stack.engine, context, stack.table("Person"), frozenset()
         )
-        assert view.get(1)[0] == ref
+        assert view.get(1, context)[0] == ref
         view.close()
         stack.engine.settle_schema(txn_id, committed=False)
 
@@ -325,7 +476,7 @@ def test_settlement_retires_an_active_view_without_holding_the_guard_for_lookup(
 
     def resolve() -> None:
         try:
-            outcome.put(view.get(1))
+            outcome.put(view.get(1, context))
         except BaseException as failure:  # pragma: no cover - rendered by parent assertion
             outcome.put(failure)
 

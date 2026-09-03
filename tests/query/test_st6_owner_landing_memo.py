@@ -213,12 +213,20 @@ def test_a_landing_created_in_the_transaction_appears_and_the_view_settles(
         assert decodes["B"] == 0
 
 
-def test_a_landing_ended_by_this_transaction_is_not_matched(database) -> None:
+def test_a_deleted_landing_remains_admitted_and_reusable(database, decodes) -> None:
     _graph(database)
     with database.begin("write") as txn:
         txn.execute("MATCH (a:A)-[r:E]->(b:B {id: 1}) DELETE r")
         txn.execute("MATCH (b:B {id: 1}) DELETE b")
         assert sorted(txn.execute(TRAVERSE).rows) == [(2, "t2")]
+        memo = database._queries._owner_memo[txn.txn_id]
+        slot = memo.tables[database._catalog.catalog.table("B").table_id]
+        assert slot.state == "ready"
+        assert slot.view is not None
+        assert slot.view._budget is database._queries._owner_budget
+        decodes.clear()
+        assert sorted(txn.execute(TRAVERSE).rows) == [(2, "t2")]
+        assert decodes["B"] == 0
 
 
 def test_a_refused_statement_savepoint_does_not_poison_the_cached_view(
