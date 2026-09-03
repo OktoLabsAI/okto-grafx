@@ -62,6 +62,7 @@ PROFILE_GATE_PROTOCOL = "ready-file-stdin-v1"
 PROFILE_GATE_PROTOCOL_ENV = "OKTO_GRAFX_PERF_PROFILE_GATE_PROTOCOL"
 PROFILE_GATE_READY_PATH_ENV = "OKTO_GRAFX_PERF_PROFILE_READY_PATH"
 PROFILE_GATE_TOKEN_ENV = "OKTO_GRAFX_PERF_PROFILE_GATE_TOKEN"
+_SERVE_LOCK_FILES = (".okto-pulse-serve.lock", ".okto-pulse-serve.lock.acquire")
 
 QUEUE_COLUMNS = (
     "id",
@@ -429,6 +430,13 @@ def _validate_runner_parent() -> None:
         )
 
 
+def _require_serve_lock_released(copy_root: Path) -> None:
+    if any(os.path.lexists(copy_root / name) for name in _SERVE_LOCK_FILES):
+        raise DriverRefused(
+            "the disposable clone serve-lock artifacts remained after lock release"
+        )
+
+
 def _profile_start_barrier(copy_root: Path) -> dict[str, Any]:
     """Optionally wait until the direct parent proves that its profiler attached.
 
@@ -464,7 +472,9 @@ def _profile_start_barrier(copy_root: Path) -> dict[str, Any]:
         or copy_root in ready_path.parents
         or ready_path in copy_root.parents
     ):
-        raise DriverRefused("the profiler READY path and disposable clone must be disjoint")
+        raise DriverRefused(
+            "the profiler READY path and disposable clone must be disjoint"
+        )
     if ready_path.exists():
         raise DriverRefused("the profiler READY path already exists")
     if not ready_path.parent.is_dir():
@@ -477,7 +487,9 @@ def _profile_start_barrier(copy_root: Path) -> dict[str, Any]:
             handle.flush()
             os.fsync(handle.fileno())
     except OSError as failure:
-        raise DriverRefused("the profiler READY marker could not be published") from failure
+        raise DriverRefused(
+            "the profiler READY marker could not be published"
+        ) from failure
 
     expected_go = f"go-v1:{token}\n"
     try:
@@ -1132,6 +1144,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         close_all_graphs_on_shutdown()
 
+    _require_serve_lock_released(args.copy)
+    document["serve_lock_artifacts_absent"] = True
     document["_perf_round"] = {
         "python_executable": str(Path(sys.executable).resolve()),
         **runtime_files,

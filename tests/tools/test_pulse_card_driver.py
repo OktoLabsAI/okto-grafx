@@ -33,6 +33,7 @@ from tools.perf_round.replay_pulse_card import (
     SUPPORTED_PULSE_BUFFER_BUDGET_BYTES,
     _apply_thermal_protocol,
     _manifest_subtree,
+    _require_serve_lock_released,
     _validate_supported_run_config,
     _validate_runner_parent,
     _validate_target_row,
@@ -423,6 +424,18 @@ def test_child_requires_its_direct_baseline_runner_parent(
     monkeypatch.setenv("OKTO_GRAFX_PERF_RUNNER_PID", str(os.getppid() + 1))
     with pytest.raises(DriverRefused, match="launched directly"):
         _validate_runner_parent()
+
+
+@pytest.mark.parametrize(
+    "name", (".okto-pulse-serve.lock", ".okto-pulse-serve.lock.acquire")
+)
+def test_child_refuses_a_serve_lock_artifact_after_release(
+    tmp_path: Path, name: str
+) -> None:
+    (tmp_path / name).write_text("left behind", encoding="utf-8")
+
+    with pytest.raises(DriverRefused, match="remained after lock release"):
+        _require_serve_lock_released(tmp_path)
 
 
 def test_queue_and_audit_oracles_reject_every_undeclared_effect() -> None:

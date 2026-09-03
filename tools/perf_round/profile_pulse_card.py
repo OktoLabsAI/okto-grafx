@@ -123,6 +123,12 @@ class ProcessRun:
     profiler_lines: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ProcessCounters:
+    cpu_by_process: Mapping[tuple[int, float], float]
+    io_by_process: Mapping[tuple[int, float], tuple[int, int]]
+
+
 def _overlaps(left: Path, right: Path) -> bool:
     left = left.resolve()
     right = right.resolve()
@@ -216,7 +222,9 @@ def _resolve_profiler() -> ProfilerBinary:
         raise ProfileRefused("py-spy record --help failed")
     for required in ("--pid", "--output", "--format", "--rate", "--threads"):
         if required not in help_text:
-            raise ProfileRefused(f"py-spy record does not expose required option {required}")
+            raise ProfileRefused(
+                f"py-spy record does not expose required option {required}"
+            )
     if "--locals" in help_text:
         raise ProfileRefused("the pinned record command unexpectedly exposes --locals")
     return ProfilerBinary(
@@ -256,7 +264,9 @@ def _creation_flags() -> int:
     return subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
 
 
-def _spawn_target(argv: Sequence[str], environment: Mapping[str, str]) -> subprocess.Popen:
+def _spawn_target(
+    argv: Sequence[str], environment: Mapping[str, str]
+) -> subprocess.Popen:
     return subprocess.Popen(
         list(argv),
         cwd=SOURCE_ROOT,
@@ -292,10 +302,14 @@ def _wait_for_ready(
                     & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
                     or ready_path.resolve() != ready_path
                 ):
-                    raise ProfileRefused("the READY marker is not an independent regular file")
+                    raise ProfileRefused(
+                        "the READY marker is not an independent regular file"
+                    )
                 observed = ready_path.read_bytes()
             except OSError as failure:
-                raise ProfileRefused("the READY marker could not be authenticated") from failure
+                raise ProfileRefused(
+                    "the READY marker could not be authenticated"
+                ) from failure
             if observed == expected:
                 return time.monotonic() - started
             if len(observed) >= len(expected):
@@ -316,18 +330,23 @@ def _prove_target_identity(
         executable_matches = executable == Path(sys.executable).resolve()
         created = float(process.create_time())
     except Exception as failure:  # noqa: BLE001 - every unavailable proof refuses attach
-        raise ProfileRefused("could not prove the spawned replay process identity") from failure
+        raise ProfileRefused(
+            "could not prove the spawned replay process identity"
+        ) from failure
     creation_matches = spawn_wall_time - 2.0 <= created <= time.time() + 2.0
     if target.poll() is not None or not (
         parent_matches and executable_matches and creation_matches
     ):
-        raise ProfileRefused("the process selected for profiling is not the spawned direct child")
+        raise ProfileRefused(
+            "the process selected for profiling is not the spawned direct child"
+        )
     return process, {
         "pid": target.pid,
         "pid_source": "internal_subprocess_popen",
         "parent_pid_matches_runner": parent_matches,
         "executable": str(executable),
         "executable_matches_receipt_python": executable_matches,
+        "create_time": created,
         "creation_time_in_spawn_window": creation_matches,
         "ready_nonce_matched": True,
     }
@@ -387,7 +406,9 @@ def _await_profiler_attach(
         try:
             line = messages.get(timeout=remaining)
         except queue.Empty as failure:
-            raise ProfileRefused("timed out waiting for py-spy to confirm attach") from failure
+            raise ProfileRefused(
+                "timed out waiting for py-spy to confirm attach"
+            ) from failure
         if line is None:
             raise ProfileRefused("py-spy exited before confirming attach")
         if not line:
@@ -407,7 +428,9 @@ def _release_target(target: subprocess.Popen, *, token: str) -> None:
         target.stdin.flush()
         target.stdin.close()
     except (BrokenPipeError, OSError, UnicodeError) as failure:
-        raise ProfileRefused("the profiler GO marker could not be delivered") from failure
+        raise ProfileRefused(
+            "the profiler GO marker could not be delivered"
+        ) from failure
 
 
 def _sample_tree(root: Any, aggregate: dict[str, Any]) -> None:
@@ -457,9 +480,7 @@ def _sample_tree(root: Any, aggregate: dict[str, Any]) -> None:
             )
     if sampled:
         aggregate["samples"] += 1
-        aggregate["process_count_peak"] = max(
-            aggregate["process_count_peak"], sampled
-        )
+        aggregate["process_count_peak"] = max(aggregate["process_count_peak"], sampled)
         aggregate["peak_rss_bytes"] = max(aggregate["peak_rss_bytes"], rss)
         if private_complete:
             aggregate["private_samples"] += 1
@@ -468,11 +489,72 @@ def _sample_tree(root: Any, aggregate: dict[str, Any]) -> None:
             )
 
 
+def _counter_snapshot(root: Any) -> ProcessCounters:
+    """Capture process-lifetime counters immediately before GO for later subtraction."""
+    try:
+        import psutil  # type: ignore[import-not-found]
+
+        members = [root, *root.children(recursive=True)]
+    except Exception as failure:  # noqa: BLE001 - the pre-GO baseline is mandatory
+        raise ProfileRefused("pre-GO process counters were unavailable") from failure
+    cpu_by_process: dict[tuple[int, float], float] = {}
+    io_by_process: dict[tuple[int, float], tuple[int, int]] = {}
+    for member in members:
+        try:
+            identity = (int(member.pid), float(member.create_time()))
+            cpu = member.cpu_times()
+            io = member.io_counters()
+        except (
+            psutil.NoSuchProcess,
+            psutil.AccessDenied,
+            NotImplementedError,
+        ) as failure:
+            raise ProfileRefused(
+                "pre-GO process counters were unavailable"
+            ) from failure
+        cpu_by_process[identity] = float(cpu.user) + float(cpu.system)
+        io_by_process[identity] = (
+            int(getattr(io, "read_bytes", 0)),
+            int(getattr(io, "write_bytes", 0)),
+        )
+    if not cpu_by_process:
+        raise ProfileRefused("pre-GO process counters were unavailable")
+    return ProcessCounters(cpu_by_process=cpu_by_process, io_by_process=io_by_process)
+
+
+def _counter_deltas(
+    observed_cpu: Mapping[tuple[int, float], float],
+    observed_io: Mapping[tuple[int, float], tuple[int, int]],
+    baseline: ProcessCounters,
+) -> tuple[float, int, int]:
+    for identity, value in observed_cpu.items():
+        if value < baseline.cpu_by_process.get(identity, 0.0):
+            raise ProfileRefused("a sampled CPU counter moved backwards after GO")
+    for identity, value in observed_io.items():
+        before = baseline.io_by_process.get(identity, (0, 0))
+        if value[0] < before[0] or value[1] < before[1]:
+            raise ProfileRefused("a sampled I/O counter moved backwards after GO")
+    cpu_seconds = sum(
+        value - baseline.cpu_by_process.get(identity, 0.0)
+        for identity, value in observed_cpu.items()
+    )
+    read_bytes = sum(
+        value[0] - baseline.io_by_process.get(identity, (0, 0))[0]
+        for identity, value in observed_io.items()
+    )
+    write_bytes = sum(
+        value[1] - baseline.io_by_process.get(identity, (0, 0))[1]
+        for identity, value in observed_io.items()
+    )
+    return cpu_seconds, read_bytes, write_bytes
+
+
 def _watch_target(
     target: subprocess.Popen,
     profiler: subprocess.Popen,
     root: Any,
     *,
+    counter_baseline: ProcessCounters,
     timeout_seconds: float,
     poll_seconds: float,
 ) -> tuple[dict[str, Any], float]:
@@ -498,8 +580,11 @@ def _watch_target(
         _sample_tree(root, aggregate)
         time.sleep(poll_seconds)
     wall_seconds = time.monotonic() - started
-    cpu_seconds = sum(aggregate.pop("cpu_by_process").values())
-    io_totals = list(aggregate.pop("io_by_process").values())
+    cpu_seconds, io_read_bytes, io_write_bytes = _counter_deltas(
+        aggregate.pop("cpu_by_process"),
+        aggregate.pop("io_by_process"),
+        counter_baseline,
+    )
     result = {
         **aggregate,
         "peak_rss_bytes_tree": (
@@ -508,16 +593,21 @@ def _watch_target(
         "peak_private_bytes_tree": (
             aggregate["peak_private_bytes"] if aggregate["private_samples"] else None
         ),
-        "cpu_seconds_observed_tree": cpu_seconds,
-        "io_read_bytes_observed_tree": sum(item[0] for item in io_totals),
-        "io_write_bytes_observed_tree": sum(item[1] for item in io_totals),
+        "cpu_seconds_sampled_delta_from_pre_go": cpu_seconds,
+        "io_read_bytes_sampled_delta_from_pre_go": io_read_bytes,
+        "io_write_bytes_sampled_delta_from_pre_go": io_write_bytes,
+        "counter_delta_semantics": (
+            "last_sample_minus_immediate_pre_go_by_pid_and_create_time_lower_bound"
+        ),
         "timed_out": timed_out,
         "scope": "spawned_replay_process_tree_excludes_profiler_sibling",
     }
     result.pop("peak_rss_bytes")
     result.pop("peak_private_bytes")
     if result["samples"] == 0 or result["private_samples"] == 0:
-        raise ProfileRefused("OS RSS/private counters were unavailable for the replay tree")
+        raise ProfileRefused(
+            "OS RSS/private counters were unavailable for the replay tree"
+        )
     if timed_out:
         raise ProfileRefused("the profiled replay exceeded its finite timeout")
     return result, wall_seconds
@@ -538,7 +628,9 @@ def _finish_profiler(
         except Exception:  # noqa: BLE001 - process may already be disappearing
             root = None
         _terminate_process_tree(profiler, root)
-        raise ProfileRefused("py-spy did not finish after the target exited") from failure
+        raise ProfileRefused(
+            "py-spy did not finish after the target exited"
+        ) from failure
     drain_thread.join(timeout=2.0)
     if drain_thread.is_alive():
         raise ProfileRefused("py-spy diagnostics did not reach EOF")
@@ -562,7 +654,9 @@ def _cleanup_processes(*processes: subprocess.Popen | None) -> None:
     for process in processes:
         try:
             _ensure_stopped(process)
-        except BaseException as exc:  # preserve proof failure, but still stop every sibling
+        except (
+            BaseException
+        ) as exc:  # preserve proof failure, but still stop every sibling
             if failure is None:
                 failure = exc
     if failure is not None:
@@ -606,24 +700,29 @@ def _run_profiled_process(
         if profiler.stdout is None:
             raise ProfileRefused("py-spy diagnostics pipe was not created")
         messages: queue.Queue[str | None] = queue.Queue()
-        drain_thread = _start_profiler_drain(
-            profiler.stdout, messages, profiler_lines
-        )
+        drain_thread = _start_profiler_drain(profiler.stdout, messages, profiler_lines)
         attach_wait = _await_profiler_attach(
             profiler, messages, timeout_seconds=attach_timeout_seconds
         )
+        confirmed_root, confirmed_identity = _prove_target_identity(
+            target, spawn_wall_time=spawn_wall
+        )
+        if confirmed_identity["create_time"] != identity["create_time"]:
+            raise ProfileRefused("the profiled target identity changed after attach")
+        identity["identity_revalidated_after_attach"] = True
+        root = confirmed_root
+        counter_baseline = _counter_snapshot(root)
         _release_target(target, token=token)
         os_tree, target_wall = _watch_target(
             target,
             profiler,
             root,
+            counter_baseline=counter_baseline,
             timeout_seconds=timeout_seconds,
             poll_seconds=poll_seconds,
         )
         target_exit = int(target.returncode)
-        profiler_exit, lines = _finish_profiler(
-            profiler, drain_thread, profiler_lines
-        )
+        profiler_exit, lines = _finish_profiler(profiler, drain_thread, profiler_lines)
         if target_exit != 0:
             raise ProfileRefused("the profiled replay did not complete successfully")
         if profiler_exit != 0:
@@ -666,7 +765,9 @@ def _validate_profile_artifact(
     sample_count = 0
     for profile in document["profiles"]:
         if not isinstance(profile, dict) or profile.get("type") != "sampled":
-            raise ProfileRefused("the speedscope artifact contains a non-sampled profile")
+            raise ProfileRefused(
+                "the speedscope artifact contains a non-sampled profile"
+            )
         samples = profile.get("samples")
         weights = profile.get("weights")
         if not isinstance(samples, list) or not isinstance(weights, list):
@@ -677,7 +778,9 @@ def _validate_profile_artifact(
 
     def contains_locals(value: Any) -> bool:
         if isinstance(value, dict):
-            return "locals" in value or any(contains_locals(item) for item in value.values())
+            return "locals" in value or any(
+                contains_locals(item) for item in value.values()
+            )
         if isinstance(value, list):
             return any(contains_locals(item) for item in value)
         return False
@@ -692,7 +795,11 @@ def _validate_profile_artifact(
     if len(summaries) != 1:
         raise ProfileRefused("py-spy emitted no unique terminal sample summary")
     reported_samples, reported_errors = summaries[0]
-    if reported_errors != 0 or reported_samples <= 0 or sample_count != reported_samples:
+    if (
+        reported_errors != 0
+        or reported_samples <= 0
+        or sample_count != reported_samples
+    ):
         raise ProfileRefused("py-spy samples are empty, erroneous or unreconciled")
     return {
         "path": str(path.resolve()),
@@ -721,10 +828,24 @@ def _validate_clone_commits(
 
 
 def _validate_arguments(args: argparse.Namespace) -> None:
-    if args.page_size <= 0:
-        raise ProfileRefused("--page-size must be positive")
+    if args.mode not in ("strict", "generation"):
+        raise ProfileRefused("--mode must be strict or generation")
+    if args.kind not in ("raw", "instrumented"):
+        raise ProfileRefused("--kind must be raw or instrumented")
+    if args.thermal not in ("warm", "mixed"):
+        raise ProfileRefused("--thermal must be warm or mixed")
+    if isinstance(args.seed, bool) or not isinstance(args.seed, int):
+        raise ProfileRefused("--seed must be an integer")
+    if (
+        isinstance(args.page_size, bool)
+        or not isinstance(args.page_size, int)
+        or args.page_size <= 0
+    ):
+        raise ProfileRefused("--page-size must be a positive integer")
     if args.buffer_budget_bytes != SUPPORTED_PULSE_BUFFER_BUDGET_BYTES:
-        raise ProfileRefused("the pinned Pulse adapter supports only a 67108864-byte budget")
+        raise ProfileRefused(
+            "the pinned Pulse adapter supports only a 67108864-byte budget"
+        )
     if args.checksum != "auto":
         raise ProfileRefused("the pinned Pulse adapter supports only --checksum auto")
     for name in (
@@ -735,7 +856,9 @@ def _validate_arguments(args: argparse.Namespace) -> None:
     ):
         value = float(getattr(args, name))
         if not (0 < value < float("inf")):
-            raise ProfileRefused(f"--{name.replace('_', '-')} must be finite and positive")
+            raise ProfileRefused(
+                f"--{name.replace('_', '-')} must be finite and positive"
+            )
     if not 0.02 <= args.poll_seconds <= 5.0:
         raise ProfileRefused("--poll-seconds must be between 0.02 and 5")
     args.board_id = _canonical_uuid(args.board_id, field="board_id")
@@ -755,7 +878,9 @@ def profile_once(args: argparse.Namespace) -> dict[str, Any]:
         pins.pulse_core_root,
     )
     if any(_overlaps(out_dir, path) for path in protected):
-        raise ProfileRefused("--out-dir must be disjoint from copies and pinned source trees")
+        raise ProfileRefused(
+            "--out-dir must be disjoint from copies and pinned source trees"
+        )
     if out_dir.exists():
         raise ProfileRefused("--out-dir already exists")
     if not out_dir.parent.is_dir():
@@ -768,7 +893,9 @@ def profile_once(args: argparse.Namespace) -> dict[str, Any]:
     profile_path = out_dir / PROFILE_NAME
     receipt_path = out_dir / RECEIPT_NAME
     for artifact in (clone, child_output, ready_path, profile_path, receipt_path):
-        if artifact.exists() or any(_overlaps(artifact, home) for home in (declared_copy,)):
+        if artifact.exists() or any(
+            _overlaps(artifact, home) for home in (declared_copy,)
+        ):
             raise ProfileRefused("profile paths are stale or overlap the declared copy")
 
     clone_manifest = _clone_copy(declared_copy, clone)
@@ -779,9 +906,7 @@ def profile_once(args: argparse.Namespace) -> dict[str, Any]:
         pulse_core=args.pulse_core_sha,
     )
     token = secrets.token_hex(32)
-    target_environment = child_environment(
-        clone, pins.pulse_root, pins.pulse_core_root
-    )
+    target_environment = child_environment(clone, pins.pulse_root, pins.pulse_core_root)
     target_environment.update(
         {
             PROFILE_GATE_PROTOCOL_ENV: PROFILE_GATE_PROTOCOL,
@@ -847,7 +972,10 @@ def profile_once(args: argparse.Namespace) -> dict[str, Any]:
         process_run.profiler_lines,
         started_wall_time=profile_started_wall,
     )
-    if not child_output.is_file() or child_output.stat().st_mtime < profile_started_wall - 1.0:
+    if (
+        not child_output.is_file()
+        or child_output.stat().st_mtime < profile_started_wall - 1.0
+    ):
         raise ProfileRefused("the replay wrote no fresh JSON output")
     try:
         child_document = json.loads(child_output.read_text(encoding="utf-8"))
@@ -877,6 +1005,8 @@ def profile_once(args: argparse.Namespace) -> dict[str, Any]:
         "released": True,
     }:
         raise ProfileRefused("the replay did not attest the released profiler barrier")
+    if child_document.get("serve_lock_artifacts_absent") is not True:
+        raise ProfileRefused("the replay did not attest complete serve-lock release")
     if token in child_output.read_text(encoding="utf-8"):
         raise ProfileRefused("the replay output leaked its profiler barrier nonce")
 
