@@ -11,7 +11,7 @@
 
 - **Linha `0.0.2` iniciada sob o plano de performance congelado.** A branch canônica de trabalho é
   `feature/v0.0.2`; o bump de versão, o ambiente P0.0 e o diagnóstico/correção multiprocesso P0.1
-  estão publicados, e o marco de código integrado mais recente é `b445736`. A auditoria do Pulse Community pinado em `d50c034`
+  estão publicados, e o marco de código integrado mais recente é `283cffa`. A auditoria do Pulse Community pinado em `d50c034`
   (Core `f602c7c`) confirmou que o backfill
   não chama `rebuild_vector_index`, portanto a cerca process-local de um rebuild manual não é um
   blocker do fluxo real. D-26, D-01 e D-04 foram promovidos depois dos testes focados: D-26 mede
@@ -78,6 +78,63 @@
   congelados, portanto nenhuma alteração estrutural foi iniciada por hipótese. A limpeza futura dos
   `control/txn-*.lock` acumulados permanece dívida explícita e exige ADR mais prova multiprocesso
   contra split-lock antes de qualquer remoção automática.
+
+- **Fila pós-P1 congelada e autorizada em 2026-09-03.** O fechamento da rodada P1/P2 acima não
+  encerra por colisão de numeração os débitos históricos P1.5--P2.3 deste plano. A execução seguinte
+  tem exatamente estes nove itens antes do próximo checkpoint: (1) acumuladores O(1), incluindo a
+  correção da ordem não total de `NaN`; (2) memoização process-local da validação do provider CRC-32C
+  e alinhamento contratual D-29(c/d); (3) top-N para `ORDER BY ... LIMIT`; (4) budgets de caminhos e
+  expansões de traversal; (5) accounting/telemetria honesta de memória residente e métricas bounded
+  do cache de descriptors; (6) HNSW como access path ponta a ponta, mantendo fallback canônico e sem
+  cache persistido; (7) single-flight de cold miss e I/O fora do lock global sem estreitar as
+  garantias multiwriter/multireader; (8) cursor/streaming, budget em bytes e spill; e (9)
+  `executemany`/bulk ingest atômico sobre o protocolo WAL/OCC existente. Os itens 1--9 não podem
+  alterar bytes duráveis, recovery ou as premissas de concorrência. A exceção descoberta durante o
+  item 1 foi autorizada como correção: `DOUBLE` aceita `NaN`, mas `_sort_key` o entregava ao TimSort
+  sem ordem total; a nova regra deve ser determinística, compartilhada por `ORDER BY` e `MIN/MAX` e
+  coberta por diferencial.
+
+  Estado incremental desta fila: o item 1 está integrado em `da48d6a`; `COUNT`, `SUM`, `AVG`,
+  `MIN` e `MAX` mantêm estado O(1) por grupo, `COLLECT` continua materializado e `DISTINCT` retém
+  apenas seu conjunto de unicidade. A exceção `NaN` foi fechada com ordem total compartilhada
+  (depois dos demais números em ASC, antes em DESC), preservando estabilidade; 435 testes
+  relacionados passaram no candidato e a revisão integrada acrescentou diferencial com top-N. O
+  item 3 está integrado em `b71846d` + `841127a`: `ORDER BY ... SKIP ... LIMIT` consome o child
+  integral, mas retém no máximo `K = SKIP + LIMIT` em heap estável, com memória O(K) e tempo
+  O(N log K); planos com bound físico sem a janela semântica exata são recusados. O item 4 está
+  integrado em `8447ded`: `max_traversal_expansions` e `max_traversal_paths` são limites positivos
+  opt-in, cumulativos por query e aplicados a traversal tipado, sem tipo e scan de relações; N+1 é
+  recusado antes de retenção/retorno e os campos desabilitados preservam a superfície anterior de
+  estatísticas. O contrato explicita que a construção do fallback agrupado e o HNSW interno não
+  são cobrados por esses dois contadores. Os gates combinados focados de top-N/budgets passaram;
+  nenhuma suíte longa foi executada neste subcheckpoint. O item 5 está integrado em `283cffa`:
+  `used_bytes` preserva o budget nominal compatível e uma métrica/health view separada, versionada
+  como `python-v1`, estima o grafo de objetos Python retido, inclusive frames aposentados ainda
+  pinados, sem alegar RSS nem governar eviction. Hits, misses e evictions do cache LRU de
+  descriptors são cumulativos por device, sem labels de arquivo/path, e seus callbacks são
+  entregues somente fora dos guards de storage e buffer; 668 testes focados conjuntos passaram na
+  revisão isolada. A parte cursor/streaming do item 8 está integrada em `c4cba57`: `QueryCursor`
+  possui uma transação read-only e seu snapshot até EOF/close, destaca lotes limitados e preserva
+  cumulativamente `max_result_rows`; budget em bytes e spill continuam em implementação. O item 9
+  está integrado em `ae5c89f`: `Transaction.executemany` faz parse único, consome/canonicaliza um
+  mapping por vez fora do page access, replana cada DML sem `RETURN` e reverte todo o lote ao mark
+  externo em qualquer falha, sem mudar commit/WAL/OCC. O conflito de composição entre o AST
+  `Query` e o novo tipo público homônimo, além do pin incompleto de `__all__`, foi corrigido em
+  `f1ab724`; a regressão combinada cursor + bulk + packaging + import boundary passou. O
+  microbenchmark indicativo de 200 inserts observou `2,77x` sem PK e `1,74x` com PK, sem caráter de
+  SLO; a validação de unicidade sobre muitos intents com PK e a reconciliação repetida do budget em
+  bytes permanecem débitos superlineares explícitos, não escondidos como ganhos de `executemany`.
+  O item 2 está em correção após revisão adversarial; itens 6 e 7 e o restante do item 8 seguem em
+  branches isolados.
+
+  Somente quando 1--9 estiverem implementados, documentados, auditados e aprovados numa regressão
+  agrupada haverá o checkpoint que libera o segundo grupo já autorizado: (10) P2-ID com sizing,
+  rehash e índices de identidade/secundários; (11) vacuum/compaction MVCC; (12) WAL
+  delta/chunked/fisiológico; e (13) codec nativo além do CRC. Cada item 10--13 ainda exige seu ADR,
+  migração/compatibilidade quando aplicável e gates próprios de recovery, mas não nova decisão de
+  escopo do usuário após o checkpoint. Sharding/layout físico por tabela era o item 14 da lista e
+  permanece fora desta autorização. Group commit continua fora da fila porque a medição histórica
+  foi aproximadamente `1,002x`; plan cache continua somente hipótese a medir.
 
 - **Run real do Pulse 0.3.3 na pasta padrão — reconstrução Grafx em andamento, SQLite preservado.**
   Antes da troca foi criado backup consistente do SQLite (`quick_check=ok`, zero violações de FK)
