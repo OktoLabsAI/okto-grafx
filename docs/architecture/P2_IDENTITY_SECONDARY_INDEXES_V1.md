@@ -540,8 +540,9 @@ The implementation is intentionally split at reviewable durability boundaries:
 | Catalog v2 and generation authority | complete | `4feec76`; deterministic v1/v2 codec, capability fence, logical definitions and immutable physical generation identity |
 | Catalog/commit-state coactivation | complete | `12414d0` + documentation `1e68ae7`; catalog v2 becomes authoritative before commit-state v2 is the final publication act |
 | ACTIVE runtime projection | complete | `99622af`; v2 exact-generation equality is enforced across composition, planner, row maintenance, redo, freshness, verifier and public inventory; v1 custom access paths remain compatible |
-| Record-aware identity lifecycle and generation-qualified WAL/redo | next | INSERT/UPDATE/DELETE, quota, rebuild, lookup, verification and replay must consume the durable `record_id` and must not redirect an old logical effect to a later physical generation |
-| Activation/DDL, sizing and growth-only rehash | pending | explicit `ensure_identity_indexes`, persistent `CREATE INDEX`/Python door, endpoint scope, deterministic sizing and foreground ACTIVE-to-STALE rotation |
+| Record-aware identity lifecycle | complete | `0d353ae`; quota, INSERT/UPDATE/DELETE, validated lookup, rebuild and bidirectional verification consume the durable `record_id`; logical WAL continues to name the immutable index definition |
+| Activation/DDL and endpoint scope | next | explicit `ensure_identity_indexes`, persistent `CREATE INDEX`/Python door and one index-versus-fallback decision per statement |
+| Sizing and growth-only rehash | pending | deterministic sizing, secondary-index creation and foreground ACTIVE-to-STALE rotation with the recovery matrix in section 12 |
 
 The ACTIVE projection uses a structural catalog map and a structural raw-registry map keyed by
 `(table_id, table_name)`. Per-row count/staging is therefore `O(K_t + S_txn)`, where `K_t` is the
@@ -554,3 +555,22 @@ Quality evidence for `99622af`: the grouped index/query/transaction/recovery/API
 independent adversarial reviews reported no remaining blocker for this boundary. This does not
 claim that identity indexes, DDL or rehash are already available; those remain the explicitly
 listed subsequent milestones above.
+
+Quality evidence for `0d353ae`: 435 grouped index and transaction tests passed. Dedicated tests
+cover unsigned identities above `2**63`, stable identity across UPDATE, heap-authoritative DELETE,
+quota/staging equality, validated lookup, rebuild and both verifier directions. Ruff lint,
+`compileall` and diff checks passed, and the adversarial review found no blocker. Catalog v1's raw
+registry remains visible only to its historical component diagnostic; catalog v2 verification
+still refuses BUILDING, STALE and rogue registrations.
+
+The WAL is intentionally **not** qualified by physical generation. A logical name cannot be
+rebound to different table/positions/visibility/derivation, a rehash shadow is complete through
+its fenced horizon before activation, and index effects are idempotent. Recovery may therefore
+apply an older logical effect to the current ACTIVE generation as repetition/repair of state the
+shadow already contains. Adding a nonce to the WAL would contradict sections 11 and 13 and is not
+a prerequisite for the remaining P2-ID work; the rehash crash matrix must prove these premises.
+Endpoint routing must likewise make one access-path decision per `(table_id, table_name)` and
+statement. If an ACTIVE identity index was selected, zero hits are definitive and any later
+staleness, certificate change or damage propagates fail-closed; fallback is allowed only when it
+was selected before the first identity result. Results from index and locator/scan must never be
+mixed inside one statement.

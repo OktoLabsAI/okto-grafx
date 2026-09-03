@@ -219,12 +219,21 @@
   testes discriminantes adicionais, Ruff, `compileall` e `git diff --check` também passaram, e as
   duas revisões adversariais terminaram sem blocker deste milestone.
 
-  O próximo submilestone permanece finito e não reabre essa projeção: tornar
-  `record_id_u64_v1` record-aware em quota/count, INSERT/UPDATE/DELETE, rebuild, lookup e verifier,
-  e qualificar a autoridade WAL/redo pela geração antes de permitir troca entre gerações com o
-  mesmo nome lógico. Depois vêm, nesta ordem, ativação/DDL persistente e escopo automático de
-  endpoints, sizing/criação de índices secundários e rehash growth-only. Itens 11--13 e sharding
-  não entram nesses passos.
+  O lifecycle record-aware foi concluído em `0d353ae`: quota/count, INSERT, UPDATE, DELETE,
+  lookup validado, rebuild e verifier derivam `record_id_u64_v1` da identidade durável completa;
+  UPDATE conserva o mesmo ID entre referências físicas e DELETE usa ID/valores lidos do heap,
+  sem reencodar o tuple vazio do intent para quota. O catálogo v1 recuperou apenas sua superfície
+  diagnóstica histórica para reportar registros inválidos; catálogo v2 continua estritamente
+  ACTIVE-only. O gate agrupado passou 435/435 testes, com Ruff lint, `compileall`, diff-check e
+  revisão adversarial sem blocker. O WAL permanece deliberadamente lógico por nome, como
+  congelado no ADR: o significado de uma definição não pode mudar, o shadow de rehash cobre
+  integralmente o horizonte cercado e redo anterior é idempotente sobre a nova geração. A matriz
+  de rehash/recovery deverá provar essas premissas, sem adicionar nonce ou novo formato WAL.
+
+  O próximo submilestone permanece finito: ativação/DDL persistente e escopo automático de
+  endpoints, com a escolha índice-versus-fallback fixada uma única vez por statement. Depois vêm
+  sizing/criação de índices secundários e rehash growth-only. Itens 11--13 e sharding não entram
+  nesses passos.
 
 - **Run real do Pulse 0.3.3 na pasta padrão — reconstrução Grafx em andamento, SQLite preservado.**
   Antes da troca foi criado backup consistente do SQLite (`quick_check=ok`, zero violações de FK)
