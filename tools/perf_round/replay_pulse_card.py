@@ -7,10 +7,11 @@ public ``ConsolidationProcessor.process_batch`` lifecycle, and proves that exact
 ACKed and audited.  The supported runner always constructs a fresh per-run clone and the child
 refuses the implicit default home plus direct invocation outside that parent process.
 
-Use this only through ``baseline_runs.py --data-home-policy declared-copy-clone``.  RAW runs
-install no hooks.  Instrumented runs use bounded, reversible hooks and must be profiled from the
-outside with ``py-spy record`` without ``--locals``.  No payload, card text, query text, row value,
-record reference, key, plan or commit number is written to the JSON artifact.
+Use this only through ``baseline_runs.py --data-home-policy declared-copy-clone`` or the one-shot
+``profile_pulse_card.py`` runner.  RAW runs install no hooks.  Instrumented runs use bounded,
+reversible hooks and must be profiled from the outside with ``py-spy record`` without
+``--locals``.  No payload, card text, query text, row value, record reference, key, plan or commit
+number is written to the JSON artifact.
 
 The parent-PID marker and self-hashed manifests prevent accidental misuse; they are deliberately
 not an authority boundary against a malicious local operator.  A signed authority bundle remains
@@ -57,6 +58,10 @@ WARM_READ_CHUNK_BYTES = 1024 * 1024
 _SNAPSHOT_HMAC_KEY = os.urandom(32)
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_IMPORT_ROOT = SOURCE_ROOT / "src"
+PROFILE_GATE_PROTOCOL = "ready-file-stdin-v1"
+PROFILE_GATE_PROTOCOL_ENV = "OKTO_GRAFX_PERF_PROFILE_GATE_PROTOCOL"
+PROFILE_GATE_READY_PATH_ENV = "OKTO_GRAFX_PERF_PROFILE_READY_PATH"
+PROFILE_GATE_TOKEN_ENV = "OKTO_GRAFX_PERF_PROFILE_GATE_TOKEN"
 
 QUEUE_COLUMNS = (
     "id",
@@ -420,8 +425,72 @@ def _validate_runner_parent() -> None:
         ) from failure
     if expected_parent <= 0 or expected_parent != os.getppid():
         raise DriverRefused(
-            "this child must be launched directly by tools/perf_round/baseline_runs.py"
+            "this child must be launched directly by a tools/perf_round runner"
         )
+
+
+def _profile_start_barrier(copy_root: Path) -> dict[str, Any]:
+    """Optionally wait until the direct parent proves that its profiler attached.
+
+    The nonce and direct-parent marker prevent accidental cross-wiring between concurrent
+    disposable runs.  They are not an authority boundary against a malicious local operator.
+    With no barrier variables the ordinary baseline driver remains unchanged.
+    """
+
+    values = {
+        "protocol": os.environ.get(PROFILE_GATE_PROTOCOL_ENV),
+        "ready_path": os.environ.get(PROFILE_GATE_READY_PATH_ENV),
+        "token": os.environ.get(PROFILE_GATE_TOKEN_ENV),
+    }
+    present = {name for name, value in values.items() if value is not None}
+    if not present:
+        return {"enabled": False, "protocol": None, "released": False}
+    if present != set(values):
+        raise DriverRefused("the optional profiler barrier environment is incomplete")
+    if values["protocol"] != PROFILE_GATE_PROTOCOL:
+        raise DriverRefused("the optional profiler barrier protocol is unsupported")
+    token = values["token"]
+    if (
+        type(token) is not str
+        or len(token) != 64
+        or any(character not in "0123456789abcdef" for character in token)
+    ):
+        raise DriverRefused("the optional profiler barrier token is invalid")
+
+    ready_path = guard_not_data_home(Path(str(values["ready_path"])))
+    copy_root = copy_root.resolve()
+    if (
+        ready_path == copy_root
+        or copy_root in ready_path.parents
+        or ready_path in copy_root.parents
+    ):
+        raise DriverRefused("the profiler READY path and disposable clone must be disjoint")
+    if ready_path.exists():
+        raise DriverRefused("the profiler READY path already exists")
+    if not ready_path.parent.is_dir():
+        raise DriverRefused("the profiler READY parent directory does not exist")
+
+    ready_text = f"ready-v1:{token}\n"
+    try:
+        with ready_path.open("x", encoding="ascii", newline="\n") as handle:
+            handle.write(ready_text)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as failure:
+        raise DriverRefused("the profiler READY marker could not be published") from failure
+
+    expected_go = f"go-v1:{token}\n"
+    try:
+        observed_go = sys.stdin.readline(len(expected_go) + 1)
+    except (OSError, UnicodeError) as failure:
+        raise DriverRefused("the profiler GO marker could not be read") from failure
+    if observed_go != expected_go:
+        raise DriverRefused("the direct parent did not release the profiler barrier")
+    return {
+        "enabled": True,
+        "protocol": PROFILE_GATE_PROTOCOL,
+        "released": True,
+    }
 
 
 def _module_file(module: Any, *, root_env: str, package: str) -> str:
@@ -867,8 +936,9 @@ async def _run(
             )
             if instrumentation is not None:
                 instrumentation.install()
-            started_ns = time.perf_counter_ns()
             try:
+                profile_barrier = _profile_start_barrier(args.copy)
+                started_ns = time.perf_counter_ns()
                 processed = int(await processor.process_batch())
                 wall_ns = time.perf_counter_ns() - started_ns
                 pending_native = await blocking.join(30.0)
@@ -976,6 +1046,7 @@ async def _run(
                 "after_workload": graph_tree_after_workload,
             },
             "thermal_protocol": thermal_protocol,
+            "profile_barrier": profile_barrier,
             "engine": {"before": engine_before, "after": engine_after},
             "wal_tree": {"before": wal_tree_before, "after": wal_tree_after},
             "instrumentation": instrument_report,
