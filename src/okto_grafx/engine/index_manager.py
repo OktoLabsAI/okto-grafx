@@ -52,7 +52,7 @@ with a located error instead of hanging (amendment A42).
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TypeVar
 
@@ -73,6 +73,7 @@ from okto_grafx.domain.ids import (
     PageIndex,
     RecordRef,
     SlotId,
+    is_committed_csn,
     is_open_end_csn,
     is_provisional_csn,
 )
@@ -83,6 +84,7 @@ from okto_grafx.domain.index.definition import (
     automatic_index_definitions,
     index_definition_matches_table,
     index_file,
+    index_generation_file,
 )
 from okto_grafx.domain.index.entry import INDEX_ENTRY_HEADER_SIZE, IndexEntry
 from okto_grafx.domain.index.header import (
@@ -163,6 +165,9 @@ restart that never asks the question again.
 
 INDEX_READ_RETRY_BUDGET: int = 2
 """Fresh exact-index views retried after a concurrent header transition before refusing."""
+
+_DETACHED_GENERATION_NONCE_ATTEMPTS: int = 64
+"""Bounded provider draws used to find one unowned physical-generation name."""
 
 TOMBSTONE_BACKLOG: str = "oktografx_vector_tombstone_backlog"
 RECONCILIATION_TOTAL: str = "oktografx_vector_reconciliation_total"
@@ -5089,6 +5094,273 @@ class IndexManager:
                 index.stage_delete(txn, key, ref, version.xmax)
                 staged += 1
         return staged
+
+    def _allocate_detached_generation_nonce(
+        self, occupied: Collection[int]
+    ) -> int:
+        """Return one provider nonce absent from catalog inventory and physical storage.
+
+        This is discovery, not reservation.  The later detached build's exclusive create is the
+        sole ownership proof; checking storage here only avoids predictably losing that race on
+        an orphan already present.  A provider contract violation refuses immediately, while
+        well-formed collisions are retried under a fixed bound.
+        """
+        if self._artifact_nonce is None:
+            raise GrafxIndexError(
+                "Allocating a detached index generation needs an artifact-nonce provider.",
+                field="artifact_nonce",
+                value=None,
+            )
+        try:
+            occupied_nonces = frozenset(occupied)
+        except TypeError as failure:
+            raise GrafxIndexError(
+                "Occupied artifact nonces must be a finite collection of unsigned integers.",
+                field="occupied",
+                value=type(occupied).__name__,
+            ) from failure
+        for nonce in occupied_nonces:
+            if (
+                isinstance(nonce, bool)
+                or not isinstance(nonce, int)
+                or not 1 <= nonce <= PROVISIONAL_CSN
+            ):
+                raise GrafxIndexError(
+                    "Occupied artifact nonces must be non-zero unsigned 64-bit integers.",
+                    field="occupied",
+                    value=repr(nonce),
+                )
+
+        for _attempt in range(_DETACHED_GENERATION_NONCE_ATTEMPTS):
+            try:
+                nonce = self._artifact_nonce()
+            except StopIteration as failure:
+                raise GrafxIndexError(
+                    "The artifact-nonce provider was exhausted before producing an unused "
+                    "generation.",
+                    field="artifact_nonce",
+                    retryable=True,
+                ) from failure
+            if (
+                isinstance(nonce, bool)
+                or not isinstance(nonce, int)
+                or not 1 <= nonce <= PROVISIONAL_CSN
+            ):
+                raise GrafxIndexError(
+                    "The artifact-nonce provider returned a value outside non-zero u64.",
+                    field="artifact_nonce",
+                    value=repr(nonce),
+                )
+            if nonce in occupied_nonces:
+                continue
+            if self._pool.storage.exists(index_generation_file(nonce)):
+                continue
+            return nonce
+        raise GrafxIndexError(
+            "The artifact-nonce provider did not produce an unused generation within the "
+            f"bounded {_DETACHED_GENERATION_NONCE_ATTEMPTS} attempts.",
+            field="artifact_nonce",
+            attempts=_DETACHED_GENERATION_NONCE_ATTEMPTS,
+            retryable=True,
+        )
+
+    def _build_detached_exact_generation(
+        self,
+        definition: IndexDefinition,
+        through_lsn: Lsn,
+    ) -> IndexStore:
+        """Build one complete, durable exact generation without publishing it.
+
+        The caller has already allocated the catalog-v2 generation nonce and fenced writers at
+        the global durable horizon supplied here.  This door deliberately does neither: it does
+        not allocate an identity, touch the registry, stage logical WAL or publish catalog
+        authority.  Exclusive physical-file creation is the ownership proof, so a competing or
+        orphaned path is refused rather than adopted.
+
+        Every committed heap version is retained, including historical versions, and every
+        committed end becomes a tombstone.  That makes the detached generation usable by
+        snapshots on either side of an update once a later catalog transaction publishes it.
+        Both verification directions run before the final data checkpoint establishes the
+        durability barrier.  A failed attempt leaves its uniquely nonced file unreachable and
+        drops this process's frames so a later unrelated flush cannot continue the orphan.
+        """
+        if not isinstance(definition, IndexDefinition):
+            raise GrafxIndexError(
+                "A detached index generation needs an IndexDefinition.",
+                field="definition",
+                value=type(definition).__name__,
+            )
+        if definition.visibility is not IndexVisibility.EXACT:
+            raise GrafxIndexError(
+                f"Detached generation {definition.name!r} must be an exact index.",
+                field="visibility",
+                value=definition.visibility.value,
+                index=definition.name,
+            )
+        if definition.artifact_nonce == 0:
+            raise GrafxIndexError(
+                f"Detached generation {definition.name!r} needs its catalog-assigned, "
+                "non-zero artifact nonce before construction.",
+                field="artifact_nonce",
+                value=definition.artifact_nonce,
+                index=definition.name,
+            )
+        position = _require_position("through_lsn", through_lsn)
+        table = self._heap.catalog.catalog.table_by_id(definition.table_id)
+        if not self._definition_matches_table_tolerantly(definition, table):
+            raise GrafxIndexError(
+                f"Detached generation {definition.name!r} does not describe committed table "
+                f"{table.name!r}.",
+                field="definition",
+                index=definition.name,
+                table=table.name,
+                table_id=table.table_id,
+            )
+
+        index = HashIndex(definition, self._pool, self._metrics)
+        index._set_creation_nonce(definition.artifact_nonce)
+        collision = next(
+            (
+                current
+                for current in self._indexes.values()
+                if current.file.casefold() == index.file.casefold()
+            ),
+            None,
+        )
+        if collision is not None:
+            raise GrafxIndexError(
+                f"Detached generation file {index.file!r} is already owned by registered "
+                f"index {collision.name!r}.",
+                field="file",
+                file=index.file,
+                index=definition.name,
+                registered=collision.name,
+            )
+
+        created = False
+        try:
+            # No preceding exists() observation grants ownership.  Only this exclusive create
+            # distinguishes our new orphan-safe generation from another participant's bytes.
+            self._pool.storage.create(index.file, exclusive=True)
+            created = True
+            index.create(proved_present=True)
+
+            for ref, version in self._heap.scan_all(table):
+                if is_provisional_csn(version.xmin):
+                    continue
+                if not is_committed_csn(version.xmin):
+                    raise GrafxCorruptionDetected(
+                        f"Record {version.record_id} of table {table.name!r} has invalid birth "
+                        f"stamp {version.xmin} during detached index construction.",
+                        file=self._heap.file,
+                        table=table.name,
+                        table_id=table.table_id,
+                        record_id=version.record_id,
+                        field="xmin",
+                        value=version.xmin,
+                    )
+                if version.xmin > position:
+                    raise GrafxIndexError(
+                        f"Detached generation {definition.name!r} is fenced through {position}, "
+                        f"but record {version.record_id} was committed at {version.xmin}.",
+                        field="through_lsn",
+                        value=position,
+                        observed=version.xmin,
+                        index=definition.name,
+                        table=table.name,
+                        record_id=version.record_id,
+                    )
+
+                ended_at: Csn | None = None
+                if not is_open_end_csn(version.xmax):
+                    if not is_committed_csn(version.xmax):
+                        raise GrafxCorruptionDetected(
+                            f"Record {version.record_id} of table {table.name!r} has invalid "
+                            f"end stamp {version.xmax} during detached index construction.",
+                            file=self._heap.file,
+                            table=table.name,
+                            table_id=table.table_id,
+                            record_id=version.record_id,
+                            field="xmax",
+                            value=version.xmax,
+                        )
+                    if version.xmax > position:
+                        raise GrafxIndexError(
+                            f"Detached generation {definition.name!r} is fenced through "
+                            f"{position}, but record {version.record_id} ended at "
+                            f"{version.xmax}.",
+                            field="through_lsn",
+                            value=position,
+                            observed=version.xmax,
+                            index=definition.name,
+                            table=table.name,
+                            record_id=version.record_id,
+                        )
+                    ended_at = version.xmax
+
+                key = definition.entry_key_for_record(
+                    version.record_id, version.values
+                )
+                if key is None:
+                    continue
+                index._apply_change(
+                    IndexChange(
+                        index=definition.name,
+                        operation=IndexOperation.INSERT,
+                        key=key,
+                        ref=ref,
+                    ),
+                    position,
+                )
+                if ended_at is not None:
+                    index._apply_change(
+                        IndexChange(
+                            index=definition.name,
+                            operation=IndexOperation.TOMBSTONE,
+                            key=key,
+                            ref=ref,
+                            csn=ended_at,
+                        ),
+                        position,
+                    )
+
+            # The header claim is flushed before verification, and the final checkpoint below
+            # then barriers the complete verified generation as one unreachable shadow.
+            index.advance_built_through(position)
+            entry_findings = self._verify_entries(index)
+            coverage_findings = self._verify_coverage(index)
+            findings = (*entry_findings, *coverage_findings)
+            if findings:
+                raise GrafxIndexError(
+                    f"Detached generation {definition.name!r} failed bidirectional "
+                    f"verification with {len(findings)} finding(s).",
+                    field="verification",
+                    index=definition.name,
+                    file=index.file,
+                    count=len(findings),
+                    kinds=tuple(finding.kind for finding in findings),
+                )
+            self._pool.checkpoint(index.file)
+            return index
+        except BaseException as failure:
+            if created:
+                self._discard_detached_generation_frames(index.file, failure)
+            raise
+
+    def _discard_detached_generation_frames(
+        self, file: str, failure: BaseException
+    ) -> None:
+        """Drop every local frame owned by one failed, never-published generation."""
+        self._heap_cache_certificates.pop(file, None)
+        try:
+            page_count = self._pool.storage.page_count(file)
+            for page_index in range(page_count):
+                self._pool.discard(file, page_index)
+        except BaseException as cleanup_failure:  # pragma: no cover - defensive note
+            failure.add_note(
+                "Discarding frames of the failed detached generation also failed: "
+                f"{cleanup_failure!r}"
+            )
 
     def validate_staged_rebuild_generations(self, txn: StagingTransaction) -> None:
         """Refuse a staged RESET whose generation another claim has already superseded.
