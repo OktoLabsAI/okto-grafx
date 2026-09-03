@@ -40,7 +40,7 @@ import struct
 from dataclasses import dataclass
 from enum import IntEnum
 from math import isfinite
-from typing import TypeAlias
+from typing import TypeAlias, cast
 
 from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxVectorValidationError
 from okto_grafx.domain.model.errors import SchemaMismatchError
@@ -463,6 +463,33 @@ def _encode_vector(vector: VectorValue, kind: ValueType) -> bytes:
     return _TAG.pack(int(kind)) + _U32.pack(dimension) + _U32.pack(vector.space_ref) + body
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidatedValue:
+    """The Python shape retained when the shared decoder does not materialise a value."""
+
+    python_type: str
+    unhashable_cause: str | None = None
+
+    @property
+    def hashable(self) -> bool:
+        """Return whether a materialised value of this shape can be a MAP key."""
+        return self.unhashable_cause is None
+
+
+_VALIDATED_NULL = _ValidatedValue("NoneType")
+_VALIDATED_BOOL = _ValidatedValue("bool")
+_VALIDATED_INT = _ValidatedValue("int")
+_VALIDATED_FLOAT = _ValidatedValue("float")
+_VALIDATED_STRING = _ValidatedValue("str")
+_VALIDATED_BYTES = _ValidatedValue("bytes")
+_VALIDATED_TIMESTAMP = _ValidatedValue("Timestamp")
+_VALIDATED_UUID = _ValidatedValue("Uuid")
+_VALIDATED_VECTOR = _ValidatedValue("VectorValue")
+_VALIDATED_TUPLE = _ValidatedValue("tuple")
+_VALIDATED_UNHASHABLE_TUPLE = _ValidatedValue("tuple", unhashable_cause="dict")
+_VALIDATED_MAP = _ValidatedValue("dict", unhashable_cause="dict")
+
+
 def decode_value(buf: bytes, offset: int = 0, *, depth: int = 0) -> tuple[Value, int]:
     """Decode one value starting at the offset and return it with the offset that follows it.
 
@@ -470,6 +497,29 @@ def decode_value(buf: bytes, offset: int = 0, *, depth: int = 0) -> tuple[Value,
     an encoder was ever allowed to write are corrupt, and they are reported as corrupt with the
     offset that carried them rather than as an interpreter failure with no location at all.
     """
+    value, following = _decode_value_mode(buf, offset, depth=depth, materialize=True)
+    return cast(Value, value), following
+
+
+def _validate_value(buf: bytes, offset: int = 0, *, depth: int = 0) -> int:
+    """Validate one encoded value and return its end without retaining its Python value.
+
+    This internal execution mode runs the materialising decoder's parser with a different sink.
+    Differential schema tests keep both modes pinned to one observable contract while this mode
+    avoids allocations a projection will discard.
+    """
+    _shape, following = _decode_value_mode(buf, offset, depth=depth, materialize=False)
+    return following
+
+
+def _decode_value_mode(
+    buf: bytes,
+    offset: int,
+    *,
+    depth: int,
+    materialize: bool,
+) -> tuple[Value | _ValidatedValue, int]:
+    """Parse one value, retaining it or only the shape needed by an enclosing MAP."""
     if depth > MAX_VALUE_DEPTH:
         raise GrafxCorruptionDetected(
             f"A stored value nests deeper than the {MAX_VALUE_DEPTH} levels the format allows.",
@@ -490,7 +540,7 @@ def decode_value(buf: bytes, offset: int = 0, *, depth: int = 0) -> tuple[Value,
         ) from failure
     kind = _KIND_OF_TAG[tag]
     if kind is ValueType.NULL:
-        return None, offset
+        return (None if materialize else _VALIDATED_NULL), offset
     if kind is ValueType.BOOL:
         _require(buf, offset, 1, "bool")
         raw = buf[offset]
@@ -501,69 +551,126 @@ def decode_value(buf: bytes, offset: int = 0, *, depth: int = 0) -> tuple[Value,
                 value=raw,
                 offset=offset,
             )
-        return raw == 1, offset + 1
+        return (raw == 1 if materialize else _VALIDATED_BOOL), offset + 1
     if kind is ValueType.INT64:
         _require(buf, offset, _I64.size, "int64")
-        return _I64.unpack_from(buf, offset)[0], offset + _I64.size
+        value = _I64.unpack_from(buf, offset)[0] if materialize else _VALIDATED_INT
+        return value, offset + _I64.size
     if kind is ValueType.DOUBLE:
         _require(buf, offset, _F64.size, "double")
-        return _F64.unpack_from(buf, offset)[0], offset + _F64.size
+        value = _F64.unpack_from(buf, offset)[0] if materialize else _VALIDATED_FLOAT
+        return value, offset + _F64.size
     if kind is ValueType.TIMESTAMP:
         _require(buf, offset, _I64.size, "timestamp")
-        return Timestamp(_I64.unpack_from(buf, offset)[0]), offset + _I64.size
+        value = (
+            Timestamp(_I64.unpack_from(buf, offset)[0])
+            if materialize
+            else _VALIDATED_TIMESTAMP
+        )
+        return value, offset + _I64.size
     if kind is ValueType.UUID:
         _require(buf, offset, _UUID_SIZE, "uuid")
-        return Uuid(bytes(buf[offset : offset + _UUID_SIZE])), offset + _UUID_SIZE
+        value = (
+            Uuid(bytes(buf[offset : offset + _UUID_SIZE]))
+            if materialize
+            else _VALIDATED_UUID
+        )
+        return value, offset + _UUID_SIZE
     if kind in (ValueType.STRING, ValueType.BYTES):
         _require(buf, offset, _U32.size, "length")
         length = _U32.unpack_from(buf, offset)[0]
         offset += _U32.size
         _require(buf, offset, length, kind.name.lower())
-        body = bytes(buf[offset : offset + length])
-        offset += length
+        following = offset + length
         if kind is ValueType.BYTES:
-            return body, offset
+            value = bytes(buf[offset:following]) if materialize else _VALIDATED_BYTES
+            return value, following
         try:
-            return body.decode("utf-8"), offset
+            text = bytes(buf[offset:following]).decode("utf-8")
         except UnicodeDecodeError as failure:
             raise GrafxCorruptionDetected(
                 "A stored STRING is not valid UTF-8.",
                 field="string",
-                offset=offset - length,
+                offset=offset,
                 length=length,
             ) from failure
+        return (text if materialize else _VALIDATED_STRING), following
     if kind is ValueType.LIST:
         _require(buf, offset, _U32.size, "length")
         count = _U32.unpack_from(buf, offset)[0]
         offset += _U32.size
         elements: list[Value] = []
+        hashable = True
         for _ in range(count):
-            element, offset = decode_value(buf, offset, depth=depth + 1)
-            elements.append(element)
-        return tuple(elements), offset
+            element, offset = _decode_value_mode(
+                buf,
+                offset,
+                depth=depth + 1,
+                materialize=materialize,
+            )
+            if materialize:
+                elements.append(cast(Value, element))
+            else:
+                hashable = hashable and cast(_ValidatedValue, element).hashable
+        if materialize:
+            return tuple(elements), offset
+        return (
+            _VALIDATED_TUPLE if hashable else _VALIDATED_UNHASHABLE_TUPLE
+        ), offset
     if kind is ValueType.MAP:
         _require(buf, offset, _U32.size, "length")
         count = _U32.unpack_from(buf, offset)[0]
         offset += _U32.size
         mapping: dict[Value, Value] = {}
         for _ in range(count):
-            key, offset = decode_value(buf, offset, depth=depth + 1)
-            item, offset = decode_value(buf, offset, depth=depth + 1)
-            try:
-                mapping[key] = item
-            except TypeError as failure:
+            key, offset = _decode_value_mode(
+                buf,
+                offset,
+                depth=depth + 1,
+                materialize=materialize,
+            )
+            item, offset = _decode_value_mode(
+                buf,
+                offset,
+                depth=depth + 1,
+                materialize=materialize,
+            )
+            if materialize:
+                materialized_key = cast(Value, key)
+                try:
+                    mapping[materialized_key] = cast(Value, item)
+                except TypeError as failure:
+                    raise GrafxCorruptionDetected(
+                        f"A stored MAP has a key of type "
+                        f"{type(materialized_key).__name__}, which cannot be one.",
+                        field="map_key",
+                        value=type(materialized_key).__name__,
+                        offset=offset,
+                    ) from failure
+                continue
+            shape = cast(_ValidatedValue, key)
+            if not shape.hashable:
+                failure = TypeError(f"unhashable type: {shape.unhashable_cause!r}")
                 raise GrafxCorruptionDetected(
-                    f"A stored MAP has a key of type {type(key).__name__}, which cannot be one.",
+                    f"A stored MAP has a key of type {shape.python_type}, which cannot be one.",
                     field="map_key",
-                    value=type(key).__name__,
+                    value=shape.python_type,
                     offset=offset,
                 ) from failure
-        return mapping, offset
-    return _decode_vector(buf, offset, kind)
+        if materialize:
+            return mapping, offset
+        return _VALIDATED_MAP, offset
+    return _decode_vector_mode(buf, offset, kind, materialize=materialize)
 
 
-def _decode_vector(buf: bytes, offset: int, kind: ValueType) -> tuple[Value, int]:
-    """Decode a vector body without re-judging its components (SPEC-VEC BR-5)."""
+def _decode_vector_mode(
+    buf: bytes,
+    offset: int,
+    kind: ValueType,
+    *,
+    materialize: bool,
+) -> tuple[Value | _ValidatedValue, int]:
+    """Parse a vector body without re-judging its components (SPEC-VEC BR-5)."""
     _require(buf, offset, _U32.size * 2, "vector header")
     dimension = _U32.unpack_from(buf, offset)[0]
     space_ref = _U32.unpack_from(buf, offset + _U32.size)[0]
@@ -571,12 +678,16 @@ def _decode_vector(buf: bytes, offset: int, kind: ValueType) -> tuple[Value, int
     single = kind is ValueType.VECTOR_F32
     width = _F32.size if single else _F64.size
     _require(buf, offset, dimension * width, "vector body")
+    following = offset + dimension * width
+    if not materialize:
+        return _VALIDATED_VECTOR, following
     components = struct.unpack_from(f"<{dimension}{'f' if single else 'd'}", buf, offset)
-    offset += dimension * width
     vector = VectorValue(
-        values=components, space_ref=space_ref, dtype="float32" if single else "float64"
+        values=components,
+        space_ref=space_ref,
+        dtype="float32" if single else "float64",
     )
-    return vector, offset
+    return vector, following
 
 
 def encode_values(values: tuple[Value, ...]) -> bytes:

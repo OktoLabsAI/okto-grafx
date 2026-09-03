@@ -27,6 +27,7 @@ from okto_grafx.domain.model.value import (
     VECTOR_VALUE_TYPES,
     Value,
     ValueType,
+    _validate_value,
     decode_value,
     encode_value,
     value_type_of,
@@ -641,25 +642,103 @@ def decode_tuple(table: TableDef, buf: bytes) -> tuple[Value, ...]:
     Trailing bytes are corruption, not a mismatch: a payload that decodes into the declared
     number of values and then continues did not come from this encoder.
     """
+    return _decode_tuple(table, buf, materialized_positions=None)
+
+
+def decode_relationship_endpoints(
+    table: TableDef, buf: bytes
+) -> tuple[RecordId, RecordId]:
+    """Return a relationship's endpoints after validating its complete stored tuple.
+
+    This is an internal projection for heap consumers that need only the fixed leading pair.
+    Every later value is still parsed by the same decoder and checked against its column, but
+    values outside positions 0 and 1 are not retained as Python objects.
+    """
+    if table.kind != "rel":
+        raise GrafxConfigurationError(
+            f"Table {table.name!r} is a {table.kind} table and has no relationship endpoints.",
+            field="kind",
+            value=table.kind,
+            table=table.name,
+            table_id=table.table_id,
+        )
+    values = _decode_tuple(
+        table,
+        buf,
+        materialized_positions=frozenset(range(ENDPOINT_COLUMN_COUNT)),
+    )
+    source, target = values
+    # TableDef fixes both positions as non-null INT64 columns.  _decode_tuple has just proved
+    # that the bytes satisfy those definitions, so these are RecordIds without another parser.
+    return int(source), int(target)  # type: ignore[arg-type]
+
+
+def _decode_tuple(
+    table: TableDef,
+    buf: bytes,
+    *,
+    materialized_positions: frozenset[int] | None,
+) -> tuple[Value, ...]:
+    """Validate one tuple and retain either every value or selected positions."""
     values: list[Value] = []
     offset = 0
-    for position, column in enumerate(table.columns):
-        tag_offset = offset
-        value, offset = decode_value(buf, offset)
-        if value is None:
-            if not column.nullable:
-                raise _reject(table, column, position, "a null is not allowed in this column.")
+    if materialized_positions is None:
+        for position, column in enumerate(table.columns):
+            tag_offset = offset
+            value, offset = decode_value(buf, offset)
+            if value is None:
+                if not column.nullable:
+                    raise _reject(
+                        table,
+                        column,
+                        position,
+                        "a null is not allowed in this column.",
+                    )
+                values.append(value)
+                continue
+            if buf[tag_offset] != int(column.type):
+                observed = value_type_of(value)
+                raise _reject(
+                    table,
+                    column,
+                    position,
+                    f"a stored {observed.name} value does not belong to "
+                    f"a {column.type.name} column.",
+                )
             values.append(value)
-            continue
-        if buf[tag_offset] != int(column.type):
-            observed = value_type_of(value)
-            raise _reject(
-                table,
-                column,
-                position,
-                f"a stored {observed.name} value does not belong to a {column.type.name} column.",
-            )
-        values.append(value)
+    else:
+        for position, column in enumerate(table.columns):
+            tag_offset = offset
+            materialize = position in materialized_positions
+            if materialize:
+                value, offset = decode_value(buf, offset)
+            else:
+                offset = _validate_value(buf, offset)
+                value = None
+            stored = ValueType(buf[tag_offset])
+            is_null = stored is ValueType.NULL
+            if is_null:
+                if not column.nullable:
+                    raise _reject(
+                        table,
+                        column,
+                        position,
+                        "a null is not allowed in this column.",
+                    )
+                if materialize:
+                    values.append(None)
+                continue
+            if stored is not column.type:
+                observed = value_type_of(value) if materialize else stored
+                raise _reject(
+                    table,
+                    column,
+                    position,
+                    f"a stored {observed.name} value does not belong to "
+                    f"a {column.type.name} column.",
+                )
+            if materialize:
+                values.append(value)  # type: ignore[arg-type]
     if offset != len(buf):
         raise GrafxCorruptionDetected(
             f"A row of table {table.name!r} decoded {offset} of {len(buf)} payload bytes.",

@@ -4339,7 +4339,7 @@ def _held_insert_position(context: _Context, binding: RowBinding) -> int | None:
 
 def _incident_edges(
     engine: QueryEngine, context: _Context, table: TableDef, endpoint_identity: object
-) -> Iterator[tuple[TableDef, object, HeapVersion]]:
+) -> Iterator[tuple[TableDef, object, tuple[Value, ...]]]:
     """Yield every live relationship touching one node, in either direction.
 
     A stored relationship leads with its two endpoints (W5c), so ``values[0]`` is the source and
@@ -4409,24 +4409,15 @@ def _incident_edges(
             yield (
                 candidate,
                 reference,
-                HeapVersion(
-                    record_id=0,
-                    xmin=NO_CSN,
-                    xmax=NO_CSN,
-                    values=values,
-                    prev=None,
-                    schema_version=candidate.schema_version,
-                    deleted=False,
-                    table_id=candidate.table_id,
-                ),
+                tuple(values[:ENDPOINT_COLUMN_COUNT]),
             )
-        for ref, version in engine.heap.scan(candidate, snapshot):
-            incident = (leaves and version.values[0] == endpoint_identity) or (
-                lands and version.values[1] == endpoint_identity
+        for ref, endpoints in engine.heap.scan_relationship_endpoints(candidate, snapshot):
+            incident = (leaves and endpoints[0] == endpoint_identity) or (
+                lands and endpoints[1] == endpoint_identity
             )
             if not incident:
                 continue
-            yield candidate, ref, version
+            yield candidate, ref, endpoints
 
 
 def _write_deletions(
@@ -4490,7 +4481,7 @@ def _write_deletions(
                 if isinstance(binding.ref, PendingRowRef)
                 else binding.record_id
             )
-            for edge_table, edge_ref, edge_version in _incident_edges(
+            for edge_table, edge_ref, edge_endpoints in _incident_edges(
                 engine, context, binding.table, endpoint_identity
             ):
                 if context.already_ended(edge_ref):
@@ -4499,7 +4490,7 @@ def _write_deletions(
                 context.hold_delete(
                     edge_table,
                     edge_ref,
-                    _partition_key(edge_table, edge_version.values),
+                    _partition_key(edge_table, edge_endpoints),
                 )
                 context.count("rows_deleted")
         context.hold_delete(

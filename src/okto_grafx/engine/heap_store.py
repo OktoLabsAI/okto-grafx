@@ -59,6 +59,7 @@ from okto_grafx.domain.model.schema import (
     SOURCE_COLUMN,
     TARGET_COLUMN,
     TableDef,
+    decode_relationship_endpoints,
     decode_tuple,
     encode_tuple,
 )
@@ -1257,6 +1258,38 @@ class HeapStore:
         for ref, header, content in self._walk(table, accept=visible):
             yield ref, self._decode_version_with_header(table, header, content)
 
+    def scan_relationship_endpoints(
+        self, table: TableDef, snapshot: SnapshotLike
+    ) -> Iterator[tuple[RecordRef, tuple[RecordId, RecordId]]]:
+        """Yield visible relationship references and endpoints in storage order.
+
+        The complete payload is reconstructed and validated against every declared column.  The
+        only difference from :meth:`scan` is materialisation: properties and ``HeapVersion`` are
+        not retained when the caller needs only the relationship partition.  Rejected headers
+        stay header-only, so an invisible version still incurs no payload or overflow read.
+        """
+        if table.kind != "rel":
+            raise GrafxConfigurationError(
+                f"Table {table.name!r} is a {table.kind} table and has no relationship endpoints.",
+                field="kind",
+                value=table.kind,
+                table=table.name,
+                table_id=table.table_id,
+            )
+
+        def visible(_record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+            """Return whether this snapshot may observe the relationship header."""
+            return snapshot.visible(xmin, xmax)
+
+        for ref, header, content in self._walk(table, accept=visible):
+            payload = self._validated_payload(table, header, content)
+            endpoints = decode_relationship_endpoints(table, payload)
+            # HeapVersion construction evaluates the tuple before the previous-version
+            # reference.  Preserve both that validation and its order without retaining either
+            # object: a u64 header field is wider than RecordRef's durable 48-bit encoding.
+            _previous = header.previous
+            yield ref, endpoints
+
     def scan_page(
         self,
         table: TableDef,
@@ -2159,6 +2192,22 @@ class HeapStore:
         self, table: TableDef, header: RecordHeader, content: bytes
     ) -> HeapVersion:
         """Decode a version whose header the page walk has already validated."""
+        payload = self._validated_payload(table, header, content)
+        return HeapVersion(
+            record_id=header.record_id,
+            xmin=header.xmin,
+            xmax=header.xmax,
+            values=decode_tuple(table, payload),
+            prev=header.previous,
+            schema_version=header.schema_version,
+            deleted=bool(header.flags & RECORD_FLAG_DELETED),
+            table_id=table.table_id,
+        )
+
+    def _validated_payload(
+        self, table: TableDef, header: RecordHeader, content: bytes
+    ) -> bytes:
+        """Return one payload after the checks shared by full and projected decoders."""
         if header.schema_version != table.schema_version:
             raise GrafxSchemaVersionMismatch(
                 f"A stored version of table {table.name!r} was written under schema version "
@@ -2180,16 +2229,7 @@ class HeapStore:
                 declared=header.payload_len,
                 observed=len(payload),
             )
-        return HeapVersion(
-            record_id=header.record_id,
-            xmin=header.xmin,
-            xmax=header.xmax,
-            values=decode_tuple(table, payload),
-            prev=header.previous,
-            schema_version=header.schema_version,
-            deleted=bool(header.flags & RECORD_FLAG_DELETED),
-            table_id=table.table_id,
-        )
+        return payload
 
     def _payload_of(self, header: RecordHeader, content: bytes) -> bytes:
         """Return the payload of a version, following its overflow chain when it has one."""
