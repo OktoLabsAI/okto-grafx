@@ -554,8 +554,8 @@ The implementation is intentionally split at reviewable durability boundaries:
 | ACTIVE runtime projection | complete | `99622af`; v2 exact-generation equality is enforced across composition, planner, row maintenance, redo, freshness, verifier and public inventory; v1 custom access paths remain compatible |
 | Record-aware identity lifecycle | complete | `0d353ae`; quota, INSERT/UPDATE/DELETE, validated lookup, rebuild and bidirectional verification consume the durable `record_id`; logical WAL continues to name the immutable index definition |
 | Statement-stable endpoint routing | complete | `01c496d`; ACTIVE identity lookup is `O(K_t)` to select and hash-directed thereafter; miss is definitive and post-selection failures never fall back |
-| Activation/DDL and endpoint scope | next | explicit `ensure_identity_indexes`, persistent physical activation and `CREATE INDEX`/Python door |
-| Sizing and growth-only rehash | pending | deterministic sizing, secondary-index creation and foreground ACTIVE-to-STALE rotation with the recovery matrix in section 12 |
+| Activation and automatic DDL scope | complete | `ba8ca9a`; explicit/idempotent `ensure_identity_indexes`, automatic v2 generations for later NODE/REL DDL, endpoint identity scope, bounded build admission and pre-publication durability barriers |
+| Custom secondary indexes and growth-only rehash | next | `CREATE INDEX`/Python door, deterministic custom sizing, then foreground ACTIVE-to-STALE rotation with the recovery matrix in section 12 |
 
 The ACTIVE projection uses a structural catalog map and a structural raw-registry map keyed by
 `(table_id, table_name)`. Per-row count/staging is therefore `O(K_t + S_txn)`, where `K_t` is the
@@ -582,6 +582,20 @@ store, physical-definition mismatch and missing heap-validation capability. The 
 relationship regression, Ruff, `compileall` and diff checks were green, and an independent
 adversarial review found no blocker. The real-store cold-reopen proof belongs to activation because
 catalog v1 deliberately has no persistent identity generation to reopen.
+
+Quality evidence for `ba8ca9a`: explicit activation builds and verifies every automatic exact and
+required endpoint-identity generation as an unreachable nonced shadow, then publishes the complete
+catalog v2 authority through the ordinary OCC/WAL/apply/publication protocol. Later catalog-v2 NODE
+and REL DDL creates the corresponding ACTIVE generations atomically; generations for new empty
+tables cross a physical durability barrier before catalog staging, while builds over committed
+endpoints retain complete-table OCC interests through commit. The keyword-only
+`max_index_build_entries` guard sums the exact final entries across a shadow batch and refuses at
+N+1 before catalog staging or the first generation-file create. Case-fold collisions preserve the
+supported scan-only table, RecordId generations cannot be selected as generic property indexes,
+rollback releases every process-local claim/cache binding, and retry uses fresh nonces. The grouped
+activation/DDL/quota/planner/config gate passed 367 tests; the post-format DDL fault slice passed
+5/5, Ruff lint, compile and diff checks were green, and two adversarial reviews found no remaining
+blocker in the delivered boundary.
 
 The WAL is intentionally **not** qualified by physical generation. A logical name cannot be
 rebound to different table/positions/visibility/derivation, a rehash shadow is complete through

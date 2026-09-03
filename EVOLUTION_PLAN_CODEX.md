@@ -241,9 +241,23 @@
   revisão adversarial não encontrou blocker. Cold reopen com `IndexManager` real permanece
   corretamente vinculado ao próximo milestone de ativação física, que cria o artefato necessário.
 
-  O próximo submilestone permanece finito: ativação física persistente e escopo automático de
-  endpoints por `ensure_identity_indexes()`, seguido pela porta DDL/Python de índices secundários.
-  Depois vêm sizing/criação e rehash growth-only. Itens 11--13 e sharding não entram nesses passos.
+  A ativação física e o crescimento automático do schema v2 foram concluídos em `ba8ca9a`.
+  `ensure_identity_indexes()` é explícito/idempotente, migra v1 em um único commit e constrói como
+  shadows nonced todas as gerações automáticas exatas mais os índices u64 das tabelas de endpoint.
+  NODE/REL criados depois da migração publicam suas gerações ACTIVE no mesmo commit do schema; um
+  REL também cria ou substitui identidades ausentes/stale dos endpoints antes de ficar visível.
+  Builds sobre heap committed mantêm todas as partições na OCC até o commit, enquanto gerações
+  vazias de tabela nova cruzam durability barrier antes de o catálogo poder referenciá-las.
+  `max_index_build_entries`, keyword-only e opt-in, soma entradas finais exatas do lote e recusa em
+  N+1 antes de `catalog.stage` ou do primeiro `g_*`; rollback limpa claims/cache e retry usa nonce
+  novo. Colisões case-fold continuam scan-only e índices RID não entram no planner genérico. O gate
+  agrupado activation/DDL/quota/planner/config passou 367 testes; o slice DDL pós-formatação passou
+  5/5, Ruff lint, compile e diff-check ficaram verdes, e duas revisões adversariais encerraram sem
+  blocker residual.
+
+  O próximo submilestone permanece finito: porta DDL/Python para índices secundários exatos e
+  sizing customizado. Depois vem rehash growth-only. Itens 11--13 e sharding não entram nesses
+  passos.
 
 - **Run real do Pulse 0.3.3 na pasta padrão — reconstrução Grafx em andamento, SQLite preservado.**
   Antes da troca foi criado backup consistente do SQLite (`quick_check=ok`, zero violações de FK)
