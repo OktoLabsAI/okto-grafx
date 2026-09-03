@@ -2186,7 +2186,20 @@ class QueryEngine:
         parameters: Mapping[str, object] | None = None,
     ) -> QueryResult:
         """Run one statement inside a transaction and return its rows."""
-        statement = self.parse(text)
+        return self._execute_parsed(self.parse(text), txn, parameters)
+
+    def _execute_parsed(
+        self,
+        statement: Statement,
+        txn: object,
+        parameters: Mapping[str, object] | None = None,
+    ) -> QueryResult:
+        """Run a parsed statement while still planning against current transaction state.
+
+        This internal door lets a bounded facade reuse syntax work for ``executemany``. Planning
+        is intentionally repeated: earlier items can dirty tables, and their indexes must then be
+        withheld so later items retain read-your-own-writes correctness.
+        """
         working = self._working.get(getattr(txn, "txn_id", None))
         if working is not None and not self._txn_stages_catalog(txn):
             working = None

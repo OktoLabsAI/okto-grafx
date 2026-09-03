@@ -26,6 +26,7 @@ from okto_grafx.domain.errors import GrafxConfigurationError, GrafxError
 from okto_grafx.engine.database import (
     Database,
     DatabaseIdentity,
+    ExecuteManyReport,
     Query,
     QueryCursor,
     Transaction,
@@ -39,6 +40,7 @@ __all__ = [
     "Database",
     "DatabaseConfig",
     "DatabaseIdentity",
+    "ExecuteManyReport",
     "PortRegistry",
     "Query",
     "QueryCursor",

@@ -28,6 +28,7 @@ from okto_grafx.domain.model import Timestamp, VectorValue
 from okto_grafx.engine.database import (
     Database,
     DatabaseIdentity,
+    ExecuteManyReport,
     Query,
     QueryCursor,
     ScanCursorV1,
@@ -43,6 +44,7 @@ __all__ = [
     "Database",
     "DatabaseConfig",
     "DatabaseIdentity",
+    "ExecuteManyReport",
     "PortRegistry",
     "Query",
     "QueryCursor",

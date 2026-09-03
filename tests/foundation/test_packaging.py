@@ -148,6 +148,7 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
         "Database",
         "DatabaseConfig",
         "DatabaseIdentity",
+        "ExecuteManyReport",
         "PortRegistry",
         "QueryResult",
         "ScanCursorV1",
@@ -166,6 +167,7 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
     assert okto_grafx.Timestamp.__module__ == "okto_grafx.domain.model.value"
     assert okto_grafx.VectorValue.__module__ == "okto_grafx.domain.model.value"
     assert okto_grafx.ScanCursorV1.__module__ == "okto_grafx.engine.database"
+    assert okto_grafx.ExecuteManyReport.__module__ == "okto_grafx.engine.database"
     assert okto_grafx.ScanPageV1.__module__ == "okto_grafx.engine.database"
     assert okto_grafx.ScanRowV1.__module__ == "okto_grafx.engine.database"
 

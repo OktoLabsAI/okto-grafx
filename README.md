@@ -241,6 +241,39 @@ db.checkpoint()      # puts committed state on the platter and reclaims the log
 db.close()
 ```
 
+### Atomic bulk writes
+
+Use `Transaction.executemany()` when many parameter mappings apply to the same updating query:
+
+```python
+with db.begin("write") as txn:
+    report = txn.executemany(
+        "CREATE (:Person {id: $id, name: $name, city: $city})",
+        (
+            {"id": row.id, "name": row.name, "city": row.city}
+            for row in incoming_rows
+        ),
+    )
+print(report.statements, report.statistics)
+```
+
+The iterable is consumed lazily, canonicalized one mapping at a time and applied in its original
+order. Grafx parses the fixed text once, but replans each item against the transaction's current
+overlay so later items see earlier writes correctly. The report is deliberately small: it carries
+only the executed statement count and summed statistics, never input payloads, plans or
+`QueryResult` objects.
+
+The batch is one savepoint inside the caller-owned transaction. If iteration, parameter binding,
+planning, a write budget or execution fails at any item, every change made by that
+`executemany()` call is discarded. Work staged before it remains intact, and the caller may catch
+the typed error, continue using the transaction and commit that earlier work. A successful call
+does not commit by itself; the surrounding transaction still uses the ordinary WAL, OCC and
+durability path exactly once when it commits.
+
+This door accepts one updating query with no `RETURN`. Reads, DDL, `UNION` and writes that return
+rows use `execute()` instead. It requires a write transaction even for an empty iterable, and all
+existing statement, transaction-byte/row and final WAL-batch budgets continue to apply.
+
 ### Handling a write conflict
 
 A conflict is the protocol working, not an error in your code. Retry with a fresh transaction.

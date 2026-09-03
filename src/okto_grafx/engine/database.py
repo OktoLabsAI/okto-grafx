@@ -32,7 +32,7 @@ detail is exactly the defect A47 was written about.
 from __future__ import annotations
 
 import struct
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
@@ -64,8 +64,10 @@ from okto_grafx.domain.ports.events import EventSink
 from okto_grafx.domain.ports.metrics import MetricsSink
 from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.ports.vectormath import VectorMath
+from okto_grafx.domain.query.ast import Query
 from okto_grafx.domain.query.limits import (
     DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+    MAX_MAP_ENTRIES,
     MAX_QUERY_VALUE_CHARACTERS,
 )
 from okto_grafx.domain.query.plan import PlanNode
@@ -129,6 +131,7 @@ from okto_grafx.engine.public_views import (
     _query_parameters_snapshot,
     _query_plan_view,
     _query_result_view,
+    _query_statistics_snapshot,
     _query_text_snapshot,
     _query_value_snapshot,
     _record_id_filter_snapshot,
@@ -164,6 +167,7 @@ __all__ = [
     "VERIFY_SCOPES",
     "Database",
     "DatabaseIdentity",
+    "ExecuteManyReport",
     "MetaStore",
     "Query",
     "QueryCursor",
@@ -250,6 +254,17 @@ def _note_cleanup_failure(primary: BaseException, cleanup: BaseException) -> Non
     except BaseException:
         # Exception note support is diagnostic only; an exotic exception implementation must
         # not replace either the primary failure or the cleanup result it was meant to report.
+        return
+
+
+def _note_batch_index(failure: GrafxError, batch_index: int) -> None:
+    """Add bounded batch context without letting hostile diagnostics replace the failure."""
+    try:
+        details = object.__getattribute__(failure, "details")
+        if type(details) is dict:
+            dict.setdefault(details, "batch_index", batch_index)
+    except BaseException:
+        # Diagnostic enrichment is optional; the original typed error remains authoritative.
         return
 
 
@@ -690,6 +705,31 @@ class ScanPageV1:
     next_cursor: ScanCursorV1 | None
 
 
+@dataclass(frozen=True, slots=True)
+class ExecuteManyReport:
+    """Bounded summary of an atomic :meth:`Transaction.executemany` call.
+
+    The report deliberately carries no statement results, plans or input parameter payloads.
+    Its statistics are the per-statement counters added in input order.
+    """
+
+    statements: int
+    statistics: Mapping[str, int]
+
+    def __post_init__(self) -> None:
+        """Own the small public summary and reject forged negative counters."""
+        statements = _builtin_int(self.statements, field="executemany.statements")
+        if statements < 0:
+            raise GrafxConfigurationError(
+                "An executemany statement count cannot be negative.",
+                field="executemany.statements",
+                value=statements,
+            )
+        statistics = _query_statistics_snapshot(self.statistics)
+        object.__setattr__(self, "statements", statements)
+        object.__setattr__(self, "statistics", statistics)
+
+
 def _scan_cursor_payload(
     value: object,
     *,
@@ -967,6 +1007,7 @@ class Transaction:
         "_report",
         "_finished",
         "_scan_owner",
+        "_batch_active",
         "__weakref__",
     )
 
@@ -977,6 +1018,7 @@ class Transaction:
         self._report: CommitReport | None = None
         self._finished: bool = False
         self._scan_owner: object = object()
+        self._batch_active: bool = False
 
     @property
     def mode(self) -> str:
@@ -1015,7 +1057,27 @@ class Transaction:
         pretending to run anything.
         """
         self._require_active()
+        self._require_batch_idle("execute")
         return self._database._run_statement(self._context, text, parameters)
+
+    def executemany(
+        self,
+        text: str,
+        parameter_sets: Iterable[Mapping[str, object]],
+    ) -> ExecuteManyReport:
+        """Stage one updating statement for every parameter mapping, atomically as a batch.
+
+        The input is consumed lazily and in order. If any item refuses, every change made by
+        this call is discarded while work staged before the call remains available to commit.
+        The caller still owns the transaction and chooses when to commit it.
+        """
+        self._require_active()
+        self._require_batch_idle("executemany")
+        self._batch_active = True
+        try:
+            return self._database._run_many(self._context, text, parameter_sets)
+        finally:
+            self._batch_active = False
 
     def scan_rows_v1(
         self,
@@ -1032,6 +1094,7 @@ class Transaction:
         """
 
         self._require_active()
+        self._require_batch_idle("scan_rows_v1")
         if self._context.mode is not TransactionMode.READ:
             raise GrafxTransactionStateError(
                 "scan_rows_v1 requires a read transaction.",
@@ -1067,6 +1130,7 @@ class Transaction:
         """
         with self._database._public_transition():
             self._require_active()
+            self._require_batch_idle("commit")
             try:
                 report = self._database._transactions.commit(self._context)
             except BaseException as failure:
@@ -1132,6 +1196,7 @@ class Transaction:
     def rollback(self) -> None:
         """Abandon this transaction. Rolling back twice is a no-op, never an error."""
         with self._database._public_transition():
+            self._require_batch_idle("rollback")
             if self._finished:
                 return
             try:
@@ -1182,6 +1247,17 @@ class Transaction:
                 "be used again; open a new one.",
                 txn_id=self._context.txn_id,
                 state=self._context.state.value,
+            )
+
+    def _require_batch_idle(self, operation: str) -> None:
+        """Keep callbacks from publishing or mutating a partially consumed batch."""
+        if self._batch_active:
+            raise GrafxTransactionStateError(
+                f"Transaction {self._context.txn_id} is consuming an executemany batch and "
+                f"cannot {operation} re-entrantly.",
+                txn_id=self._context.txn_id,
+                operation=operation,
+                active_operation="executemany",
             )
 
     def __repr__(self) -> str:
@@ -1837,6 +1913,7 @@ class Database:
             # again in its own participant section.
             self._require_open()
             transaction._require_active()
+            transaction._require_batch_idle("retry")
             context = transaction._context
             # TransactionManager.retry revalidates the CURRENT owned ACTIVE context, aborts it
             # and registers its successor in one participant section. Keeping a second outer
@@ -2142,6 +2219,162 @@ class Database:
                 raw_result,
                 max_string_characters=self._max_query_value_characters,
             )
+
+    def _run_many(
+        self,
+        context: TransactionContext,
+        text: str,
+        parameter_sets: Iterable[Mapping[str, object]],
+    ) -> ExecuteManyReport:
+        """Run one parsed updating statement over a streaming, atomic parameter batch."""
+        with self._public_operation("executemany"):
+            self._require_open()
+            engine = self._require_component(
+                "queries", self._queries, "the query engine (C10)"
+            )
+            statement_text = _query_text_snapshot(text)
+            with self._transactions.page_access_section():
+                self._require_open()
+                if not context.active:
+                    raise GrafxTransactionStateError(
+                        f"Transaction {context.txn_id} is {context.state.value} and cannot "
+                        "execute a batch.",
+                        txn_id=context.txn_id,
+                        state=context.state.value,
+                        operation="executemany",
+                    )
+                if context.mode is not TransactionMode.WRITE:
+                    raise GrafxTransactionStateError(
+                        "executemany requires a write transaction.",
+                        txn_id=context.txn_id,
+                        mode=context.mode.value,
+                        operation="executemany",
+                    )
+                self._public_contexts.setdefault(context.txn_id, context)
+                statement = engine.parse(statement_text)  # type: ignore[attr-defined]
+                if (
+                    not isinstance(statement, Query)
+                    or not statement.writes
+                    or statement.return_clause is not None
+                ):
+                    raise GrafxUnsupportedOperation(
+                        "executemany accepts one updating query without RETURN; use execute "
+                        "for reads, schema changes, UNION or result-producing writes.",
+                        field="statement",
+                        operation="executemany",
+                        value=type(statement).__name__,
+                    )
+                mark = context.staging_mark()
+
+            try:
+                if isinstance(parameter_sets, Mapping):
+                    raise GrafxConfigurationError(
+                        "executemany parameter_sets must be an iterable of mappings, not one "
+                        "mapping.",
+                        field="parameter_sets",
+                        value=_builtin_type_name(parameter_sets),
+                    )
+                try:
+                    iterator = iter(parameter_sets)
+                except GrafxError:
+                    raise
+                except Exception as failure:  # noqa: BLE001 - canonicalized public argument
+                    observed = _builtin_type_name(parameter_sets)
+                    raise GrafxConfigurationError(
+                        f"executemany parameter_sets must be iterable; got {observed}.",
+                        field="parameter_sets",
+                        value=observed,
+                        cause=_builtin_type_name(failure),
+                    ) from failure
+
+                completed = 0
+                aggregate: dict[str, int] = {}
+                while True:
+                    try:
+                        raw_parameters = next(iterator)
+                    except StopIteration:
+                        break
+                    except GrafxError as failure:
+                        _note_batch_index(failure, completed)
+                        raise
+                    if not isinstance(raw_parameters, Mapping):
+                        raise GrafxConfigurationError(
+                            "Every executemany parameter set must be a mapping.",
+                            field="parameter_sets",
+                            value=_builtin_type_name(raw_parameters),
+                            batch_index=completed,
+                        )
+                    try:
+                        detached_parameters = _query_parameters_snapshot(
+                            raw_parameters,
+                            max_string_characters=self._max_query_value_characters,
+                        )
+                    except GrafxError as failure:
+                        _note_batch_index(failure, completed)
+                        raise
+
+                    try:
+                        with self._transactions.page_access_section():
+                            self._require_open()
+                            if not context.active:
+                                raise GrafxTransactionStateError(
+                                    f"Transaction {context.txn_id} is "
+                                    f"{context.state.value} and cannot execute a batch.",
+                                    txn_id=context.txn_id,
+                                    state=context.state.value,
+                                    operation="executemany",
+                                    batch_index=completed,
+                                )
+                            raw_result = engine._execute_parsed(  # type: ignore[attr-defined]
+                                statement, context, detached_parameters
+                            )
+                    except GrafxError as failure:
+                        _note_batch_index(failure, completed)
+                        raise
+
+                    try:
+                        statistics = _query_statistics_snapshot(raw_result.statistics)
+                    except GrafxError as failure:
+                        _note_batch_index(failure, completed)
+                        raise
+                    for name, count in statistics.items():
+                        if name not in aggregate and len(aggregate) >= MAX_MAP_ENTRIES:
+                            raise GrafxConfigurationError(
+                                "An executemany report may carry at most "
+                                f"{MAX_MAP_ENTRIES} statistic names.",
+                                field="executemany.statistics",
+                                limit=MAX_MAP_ENTRIES,
+                                batch_index=completed,
+                            )
+                        aggregate[name] = aggregate.get(name, 0) + count
+                    completed += 1
+                    # Do not carry the previous item's plan, result or detached payload while
+                    # planning the next one. The iterator may retain its own values; this facade
+                    # retains only the fixed statement and the bounded aggregate.
+                    del raw_result, raw_parameters, detached_parameters, statistics
+
+                report = ExecuteManyReport(
+                    statements=completed,
+                    statistics=aggregate,
+                )
+                with self._transactions.page_access_section():
+                    self._require_open()
+                    if not context.active:
+                        raise GrafxTransactionStateError(
+                            f"Transaction {context.txn_id} is {context.state.value} and cannot "
+                            "finish a batch.",
+                            txn_id=context.txn_id,
+                            state=context.state.value,
+                            operation="executemany",
+                        )
+                    context.settle_staging_mark(mark)
+            except BaseException as failure:
+                try:
+                    context.discard_since(mark)
+                except BaseException as cleanup_failure:
+                    _note_cleanup_failure(failure, cleanup_failure)
+                raise
+            return report
 
     def _scan_rows_v1(
         self,

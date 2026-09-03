@@ -12,6 +12,10 @@ including the on-disk format.
 - Added snapshot-owning, read-only query cursors through `db.query(...).cursor()`. Iteration pulls
   detached results in bounded batches without materialising the public terminal; early close can
   never stage a write and always releases the reader transaction.
+- Added `Transaction.executemany()` for streaming parameterized DML batches. It parses one fixed
+  statement once, returns only aggregate counters and preserves the existing transaction/WAL/OCC
+  path. A failure at any item rolls all batch staging back to its initial savepoint even when the
+  caller catches the error and later commits other work.
 
 ### Changed
 

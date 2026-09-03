@@ -1324,6 +1324,7 @@ metrics remain available.
 ```python
 from okto_grafx import (
     Database,
+    ExecuteManyReport,
     Query,
     QueryCursor,
     QueryResult,
@@ -1366,6 +1367,25 @@ serializable nor safe for concurrent consumption. `max_result_rows` remains cumu
 cursor and refuses row N+1; early close accounts only rows actually pulled. Blocking operators
 below the terminal preserve their documented semantics and may still materialise internal state.
 
+`Transaction.executemany(text, parameter_sets) -> ExecuteManyReport` is the additive bulk-write
+door. It accepts exactly one updating `Query` without `RETURN` on an active write transaction;
+DDL, reads, `UNION` and result-producing writes are refused before `parameter_sets` is consumed.
+The text is canonicalized and parsed once. Every parameter mapping is then consumed lazily,
+deeply canonicalized outside page access and executed in input order; planning remains per item
+because an earlier item can dirty a table and make its committed index unsafe for a later item's
+owner-visible read. The result owns only `statements` and a bounded map of summed non-negative
+statistics and retains no parameter mapping, row, plan or `QueryResult`.
+
+The call takes one outer transaction staging mark before consuming the iterable. Every item keeps
+the existing statement-level handover discipline. Any `BaseException`, including iterator and
+canonicalization failures, discards back to the outer mark before it escapes; therefore catching
+the refusal and later committing cannot publish a successful prefix. Staging that preceded the
+call remains intact. Public execute, scan, commit, rollback and retry doors refuse re-entrant use
+of the same transaction while the iterable is being consumed, so executable host callbacks
+cannot commit a prefix. A successful call only settles the mark: it never commits, groups commits
+or changes WAL/OCC/durability. Empty batches are valid but still require write mode. Existing
+statement, transaction row/byte and final WAL-batch budgets are authoritative.
+
 `Transaction.scan_rows_v1(table, *, limit, cursor=None) -> ScanPageV1` is the bounded physical
 transfer door. It is valid only on an active read transaction and therefore reuses that
 transaction's fixed MVCC snapshot. `ScanRowV1.values` follows `TableDef.columns`; relationship
@@ -1373,8 +1393,8 @@ rows include `_from` and `_to` first and retain one row per physical occurrence.
 opaque, process-local, non-serializable, single-use and scoped to the database, transaction and
 table that minted it. Each call decodes at most `limit` rows and retains at most those payloads
 plus one pinned page; it does not use `QueryResult`, sorting or traversal. The DTOs remain detached
-after the transaction closes. This V1 door is not a logical archive, a second snapshot lifecycle
-or bulk import API.
+after the transaction closes. This V1 door is not a logical archive or a second snapshot
+lifecycle; bulk writes use `Transaction.executemany()` and do not share this cursor protocol.
 
 **P2.5 / Fase 1.6 — concrete facade result types (CLOSED).** The detached objects returned at the
 public boundary are named exactly: `Database.recovery_report -> RecoveryReport | None`,
