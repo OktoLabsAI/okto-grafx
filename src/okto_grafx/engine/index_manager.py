@@ -1625,16 +1625,19 @@ class IndexStore:
                     # would meet the page-0 sequence fence in the flush below -- AFTER the
                     # barrier -- and leave this handle in recovery_required over a conflict
                     # that was never about this commit. Drop that one clean frame so the
-                    # advance reads the device generation. Only page 0, and only when clean:
-                    # this commit's dirty buckets stay, and a dirty page 0 keeps meeting the
-                    # fence, which is the refusal this must not relax.
+                    # advance reads the device generation -- through the door header
+                    # transitions already use for a foreign refresh, which dooms a PINNED
+                    # clean frame rather than leaving it resident for the advance to reuse.
+                    # Only page 0, and only when clean: this commit's dirty buckets stay, and
+                    # a dirty page 0 keeps meeting the fence, which is the refusal this must
+                    # not relax.
                     dirty = {
                         page_index
                         for file, page_index in self._pool.modified_pages(self.file)
                         if file == self.file
                     }
                     if HEADER_PAGE_INDEX not in dirty:
-                        self._pool.discard(self.file, HEADER_PAGE_INDEX)
+                        self._pool.discard_clean_page(self.file, HEADER_PAGE_INDEX)
             if not durably_stale:
                 self._advance(stamp)
                 if moved_any:
