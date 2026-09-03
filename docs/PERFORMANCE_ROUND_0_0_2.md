@@ -78,6 +78,29 @@ reachable from the pinned backfill flow and is not a remaining Pulse P0 blocker.
 source code only, did not access the live data home, and was independently checked before Nexus
 handoff `hof_5278e93d6f09409cbce04bbbcbe787f1` was accepted.
 
+## P0.2 — reproducible instruments
+
+Status: **in progress; fail-closed primitives are integrated, concrete post-drain workload driver is pending**.
+
+Commit `c276dec` (source branch `perf/v002-p0-instruments-claude@9635146`) versions the
+canonical receipt, authenticated board-copy and independent-series primitives under
+`tools/perf_round/`. They bind each run to the exact Grafx/Pulse SHAs, source roots, Python,
+configuration, seed, thermal/kind labels and the instrument code actually executed. Direct Python
+scripts and inline `-c` payloads are supported; module execution and decoy paths are refused because
+their executed bytes cannot be proved by the receipt.
+
+The copy protocol rejects live data homes and their ancestors, proves source-before, copy and
+source-after inventories, and never publishes an unproved staging directory. Timeouts terminate the
+whole process tree and fail closed when termination cannot be proved. The series runner requires
+independent homes/copies, child provenance, finite nonnegative samples, process-tree memory and
+explicit dispersion. Hash sidecars detect accidental or local tampering; they are deliberately not
+presented as authority signatures.
+
+The focused package regression passed 31 tests, plus Ruff, compileall and `git diff --check`.
+Independent adversarial review passed the final executed-instrument binding and POSIX process-group
+termination checks. No benchmark ran and no live board was accessed. P0.2 closes only after the
+concrete card/profile driver is versioned and used on the authenticated post-drain copy.
+
 ## P1.1 — commit-window instrumentation (D-26)
 
 Status: **developed on an isolated branch; not promoted**.
@@ -130,3 +153,4 @@ blocked by that locator dependency; P1.6 and P1.7 remain conditional on post-dra
 | 2026-09-03 | P1.2 D-01 isolated implementation | full focused heap suite and Ruff passed; branch published, promotion pending P0.3/P0.4 |
 | 2026-09-03 | P1.3 D-04 isolated implementation | focused primary-key-index suite and Ruff passed; branch published, promotion pending P0.3/P0.4 |
 | 2026-09-03 | P1.4 D-02 prototype | rejected because it could mask visible duplicate corruption; deferred to P2-ID |
+| 2026-09-03 | P0.2 fail-closed primitives | receipts, authenticated copy and independent-series runner integrated at `c276dec`; 31 focused tests and static checks passed; concrete post-drain workload driver remains pending |
