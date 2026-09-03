@@ -234,7 +234,7 @@ does not trade the removed count walk for an `O(N)` rebuild after each local wri
 
 ## P1.7 — single WAL image per materialised page (D-09)
 
-Status: **implemented on `perf/v002-d09-single-wal-image`; not benchmarked; not promoted**.
+Status: **integrated on `feature/v0.0.2` as `c3ef29f` + `69368c3`**.
 
 - A page this process materialised is now logged from an independent copy of its resident
   frame (`Page.copy()`), stamped with the predicted commit number and encoded once, instead of
@@ -250,6 +250,11 @@ Status: **implemented on `perf/v002-d09-single-wal-image`; not benchmarked; not 
   share the payload buffer are caught. Gain is measured only by the synthetic microbench
   (`tools/perf_round/microbench_wal_image.py`, `[MEDIDO-micro]`); the hold fraction stays
   `A_MEDIR` under the D-26 instrumentation.
+
+The isolated synthetic receipt on a loaded Python 3.13 environment measured p50
+`5009 → 2031 µs/page` for an 8 KiB/40-slot image (`2.47x` for this materialisation step). This is
+not a whole-commit claim. Eight focused tests, six field/share mutants, the 75-test focused
+commit/WAL integration batch, Ruff and diff-check passed; no Pulse data was accessed.
 
 ## Test cadence
 
@@ -275,3 +280,4 @@ Status: **implemented on `perf/v002-d09-single-wal-image`; not benchmarked; not 
 | 2026-09-03 | P0.3 profiler/census tooling | published on `perf/v002-p0-census@222a854`; endpoint locality, dynamic vector activity, guarded py-spy capture and reconciled read-only census implemented; combined milestone regression 98/98 passed; real corpus execution waits for the live backfill to drain |
 | 2026-09-03 | P0.3 profiler/census hardening | `89cb893`; exact per-page endpoint weights replace the 100k-hit cap, direct-interpreter preflight prevents wrong-PID attach; focused 28/28 and Ruff passed; no Pulse data accessed |
 | 2026-09-03 | Vector D-12 integrated | `df09c2e` + `6f6b410` + `16fbc0a`; exact page-0-fenced count becomes hot `O(1)`, entry identity is `(key, ref)`, local HNSW updates stay incremental, foreign/recovery changes fall back to an exact walk; integrated focused vector/concurrency suite, Ruff and diff-check passed |
+| 2026-09-03 | P1.7 D-09 integrated | `c3ef29f` + `69368c3`; local WAL image is copied/stamped/encoded once, external bytes remain fully verified, retarget cache is attempt-bound; 8 focused + 75 commit/WAL neighboring tests, six mutants, Ruff and diff-check passed |
