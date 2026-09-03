@@ -564,3 +564,181 @@ def test_an_attaching_process_keeps_exact_seeks_after_its_own_commits_elsewhere(
         )
     _assert_seeked(result)
     assert not creator.verify("all").findings
+
+
+# --- the literal P0.1 acceptance arm: A creates+rebuilds+closes; B attaches+rebuilds+commits --
+
+_CREATOR_CHILD = r"""
+import sys
+sys.path.insert(0, sys.argv[2])
+from okto_grafx import connect
+from okto_grafx.domain.model.value import VectorValue
+SPACE = "note_embedding_idx"
+db = connect(sys.argv[1], page_size=int(sys.argv[3]))
+with db.begin("write") as schema:
+    schema.execute(
+        f"CREATE VECTOR SPACE {SPACE} "
+        "{dimension: 4, metric: 'cosine', normalized: false, storage_dtype: 'float64'}"
+    )
+    schema.execute(
+        f"CREATE NODE TABLE Note(id STRING, embedding VECTOR({SPACE}), PRIMARY KEY(id))"
+    )
+    schema.execute("CREATE NODE TABLE Person(id STRING, name STRING, PRIMARY KEY(id))")
+    schema.execute("CREATE NODE TABLE Company(id STRING, name STRING, PRIMARY KEY(id))")
+space_id = db.vectors.index(SPACE).space_id
+with db.begin("write") as rows:
+    for ordinal in range(3):
+        rows.execute(
+            "CREATE (p:Person {id: $id, name: $name})",
+            {"id": f"p{ordinal}", "name": f"Person {ordinal}"},
+        )
+        rows.execute(
+            "CREATE (c:Company {id: $id, name: $name})",
+            {"id": f"c{ordinal}", "name": f"Company {ordinal}"},
+        )
+        rows.execute(
+            "CREATE (n:Note {id: $id, embedding: $embedding})",
+            {
+                "id": f"n{ordinal}",
+                "embedding": VectorValue(
+                    values=(1.0, float(ordinal), 0.0, 0.0),
+                    space_ref=space_id,
+                    dtype="float64",
+                ),
+            },
+        )
+view = db.maintenance.rebuild_vector_index(SPACE)
+db.close()
+print("creator-done", flush=True)
+"""
+
+_ATTACH_REBUILD_CHILD = r"""
+import json
+import sys
+sys.path.insert(0, sys.argv[2])
+from okto_grafx import connect
+from okto_grafx.domain.errors import GrafxIndexError
+from okto_grafx.domain.model.value import VectorValue
+SPACE = "note_embedding_idx"
+db = connect(sys.argv[1], page_size=int(sys.argv[3]))
+report = {"stale_at_attach": list(db.stale_indexes)}
+
+
+def vector(second):
+    return VectorValue(
+        values=(1.0, second, 0.0, 0.0),
+        space_ref=db.vectors.index(SPACE).space_id,
+        dtype="float64",
+    )
+
+
+def search():
+    try:
+        with db.begin("read") as reader:
+            result = reader.execute(
+                "MATCH (n:Note) "
+                f"WHERE similarity(n.embedding, $query, space => '{SPACE}') > -1.5 "
+                "RETURN n.id",
+                {"query": vector(0.0)},
+            )
+    except GrafxIndexError as refused:
+        return {
+            "refused": True,
+            "retryable": refused.retryable,
+            "message": refused.message,
+            "field": refused.details.get("field"),
+            "built_through_lsn": refused.details.get("built_through_lsn"),
+            "required_lsn": refused.details.get("required_lsn"),
+        }
+    return {"refused": False, "rows": len(result.rows), **dict(result.statistics)}
+
+
+def seek(query, key):
+    with db.begin("read") as reader:
+        result = reader.execute(query, {"id": key})
+    return {"rows": len(result.rows), **dict(result.statistics)}
+
+
+report["search_before_rebuild"] = search()
+view = db.maintenance.rebuild_vector_index(SPACE)
+vector_index = db._indexes.index(view.name)
+report["rebuilt_through"] = view.built_through_lsn
+report["fence_after_rebuild"] = vector_index._completed_rebuild_through
+with db.begin("write") as writer:
+    writer.execute(
+        "CREATE (p:Person {id: $id, name: $name})", {"id": "b-person", "name": "B"}
+    )
+report["fence_after_commit_elsewhere"] = vector_index._completed_rebuild_through
+report["searches_after_commit_elsewhere"] = [search() for _ in range(3)]
+report["seek_company"] = seek("MATCH (c:Company) WHERE c.id = $id RETURN c.name", "c1")
+report["seek_note_by_pk"] = seek("MATCH (n:Note) WHERE n.id = $id RETURN n.id", "n1")
+report["stale_after"] = list(db.stale_indexes)
+report["vector_stale_flag"] = db.vectors.index(SPACE).stale
+with db.begin("write") as writer:
+    writer.execute(
+        "CREATE (n:Note {id: $id, embedding: $embedding})",
+        {"id": "b-note", "embedding": vector(9.0)},
+    )
+report["fence_after_touching_commit"] = vector_index._completed_rebuild_through
+report["search_after_touching_commit"] = search()
+db.close()
+print(json.dumps(report), flush=True)
+"""
+
+
+def test_a_creates_rebuilds_and_closes_then_b_attaches_rebuilds_and_commits_elsewhere(
+    tmp_path: Path,
+) -> None:
+    """The literal P0.1 arm, in three independent processes, pinned to what the engine does.
+
+    A creates the board, rebuilds the vector index and closes. B attaches, rebuilds the same
+    index, commits on a table that index does not cover, and queries. What B gets:
+
+    * exact seeks on the untouched tables stay seeks (``rows_seeked``, no scan);
+    * the vector index B itself rebuilt refuses B's own searches above the scanned position
+      at the process-local rebuild-fence site, retryably and identically on every retry --
+      not at the STALE site, and with ``stale_indexes`` empty. This is the design the door
+      test ``test_the_rebuild_claims_only_the_position_its_scan_covered`` pins: the claim is
+      the scan, and the next commit that stages work on that index carries it forward;
+    * that commit lifts the fence in B and the search answers;
+    * a cold participant verifies clean and searches the same durable index.
+
+    ``stale``/``fence`` invisible to the operator but refusing the rebuilder's own reads is
+    the finding, not a defect this delivery may "fix": lifting it would relax a pinned
+    fail-closed refusal and is an ADR decision.
+    """
+    root = tmp_path / "board"
+    assert _run_child(_CREATOR_CHILD, root) == "creator-done"
+    report = json.loads(_run_child(_ATTACH_REBUILD_CHILD, root))
+
+    assert report["stale_at_attach"] == []
+    assert report["search_before_rebuild"]["refused"] is False
+    assert report["search_before_rebuild"]["rows"] == ROWS
+    fenced = report["fence_after_rebuild"]
+    assert fenced == report["rebuilt_through"]
+    assert report["fence_after_commit_elsewhere"] == fenced
+    refusals = report["searches_after_commit_elsewhere"]
+    assert len(refusals) == RETRIES
+    for refusal in refusals:
+        assert refusal["refused"] is True, refusal
+        assert refusal["retryable"] is True
+        assert refusal["field"] == FIELD
+        assert "rebuilt through" in refusal["message"]
+        assert refusal["built_through_lsn"] == fenced
+        assert refusal["required_lsn"] > fenced
+    assert len({refusal["message"] for refusal in refusals}) == 1
+    for seek in (report["seek_company"], report["seek_note_by_pk"]):
+        assert seek["rows"] == 1
+        assert seek.get("rows_seeked", 0) == 1, seek
+        assert seek.get("rows_scanned", 0) == 0, seek
+    assert report["stale_after"] == []
+    assert report["vector_stale_flag"] is False
+    assert report["fence_after_touching_commit"] is None
+    assert report["search_after_touching_commit"]["refused"] is False
+    assert report["search_after_touching_commit"]["rows"] == ROWS + 1
+
+    with connect(root, page_size=PAGE_SIZE) as cold:
+        assert cold.stale_indexes == ()
+        assert not cold.verify("all").findings
+        assert len(_search_notes(cold).rows) == ROWS + 1
+        _assert_seeked(_seek_company(cold, "c1"))
