@@ -64,7 +64,7 @@ from okto_grafx.domain.ports.events import EventSink
 from okto_grafx.domain.ports.metrics import MetricsSink
 from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.ports.vectormath import VectorMath
-from okto_grafx.domain.query.ast import Query
+from okto_grafx.domain.query.ast import Query as QueryStatement
 from okto_grafx.domain.query.limits import (
     DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     MAX_MAP_ENTRIES,
@@ -2253,7 +2253,7 @@ class Database:
                 self._public_contexts.setdefault(context.txn_id, context)
                 statement = engine.parse(statement_text)  # type: ignore[attr-defined]
                 if (
-                    not isinstance(statement, Query)
+                    not isinstance(statement, QueryStatement)
                     or not statement.writes
                     or statement.return_clause is not None
                 ):
