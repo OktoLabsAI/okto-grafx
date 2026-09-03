@@ -469,6 +469,7 @@ class _GraphSnapshot:
     entry_of_node: dict[int, IndexEntry]
     record_of_node: dict[int, RecordId]
     mark: Lsn
+    live_count: int
 
     def certified(self, mark: Lsn) -> _GraphSnapshot:
         """Return this same picture -- same graph, same maps -- carrying a newer mark."""
@@ -478,6 +479,7 @@ class _GraphSnapshot:
             entry_of_node=self.entry_of_node,
             record_of_node=self.record_of_node,
             mark=mark,
+            live_count=self.live_count,
         )
 
 
@@ -511,6 +513,9 @@ class VectorHnswIndex(ProximityIndex):
         "_guard",
         "_refresh",
         "_snapshot",
+        "_live_count",
+        "_live_count_mark",
+        "_live_count_generation",
         "_graph_generation",
         "_building",
         "_builder",
@@ -561,6 +566,13 @@ class VectorHnswIndex(ProximityIndex):
         # The published picture, or None while there is none. Replaced by ONE assignment under
         # the guard, captured by ONE read; never edited into a different picture in place.
         self._snapshot: _GraphSnapshot | None = None
+        # The planner needs the cardinality of the durable entry set, not a
+        # snapshot-relative count.  Keep that answer process-local beside the
+        # graph it describes.  It is never a certificate: every read still
+        # enters ``_stable_view`` and rejects/rebases it when page 0 moved.
+        self._live_count: int | None = None
+        self._live_count_mark: Lsn | None = None
+        self._live_count_generation: object | None = None
         # Identity of the paged generation from which a graph may be published. A durable cache
         # rebase replaces this token even when built_through_lsn stays equal, so a build that
         # started over the superseded pages cannot publish after the rebase.
@@ -673,8 +685,52 @@ class VectorHnswIndex(ProximityIndex):
     # --- counting ---------------------------------------------------------------------------
 
     def live_count(self) -> int:
-        """Return how many entries have not been ended by any commit."""
-        return sum(1 for entry in self._stable_entries(NO_LSN) if entry.live)
+        """Return the exact durable live cardinality under one page-0 fence.
+
+        A hot count avoids an index walk, but never avoids the index view
+        proof.  A foreign writer therefore either leaves the same certificate
+        in place (and the cached count is exact), or causes ``begin_exact_read``
+        to rebase this handle and discard the derived count before it can be
+        observed.  The cold fallback deliberately remains the old exact walk.
+        """
+
+        def count(certificate: object) -> tuple[int, Lsn, object]:
+            mark = getattr(getattr(certificate, "header", None), "built_through_lsn", None)
+            if not isinstance(mark, int):
+                raise GrafxIndexError(
+                    f"Index {self.name!r} supplied no durable build position for live count.",
+                    field="certificate",
+                    index=self.name,
+                    file=self.file,
+                )
+            with self._guard:
+                if (
+                    self._live_count is not None
+                    and self._live_count_mark == mark
+                    and self._live_count_generation is self._graph_generation
+                ):
+                    return self._live_count, mark, self._graph_generation
+                picture = self._snapshot
+                if picture is not None and picture.mark == mark:
+                    return picture.live_count, mark, self._graph_generation
+                generation = self._graph_generation
+            # No pool or store operation occurs while the graph guard is held.
+            return (
+                sum(1 for entry in self.walk() if entry.live),
+                mark,
+                generation,
+            )
+
+        live, mark, generation = self._stable_view(NO_LSN, count)
+        with self._guard:
+            # A cache rebase while the stable read was finishing makes this
+            # measurement old immediately.  It may still be returned because
+            # the read fence proved it; it simply is not retained.
+            if generation is self._graph_generation:
+                self._live_count = live
+                self._live_count_mark = mark
+                self._live_count_generation = generation
+        return live
 
     def visible_count(self, snapshot: SnapshotLike) -> int:
         """Return how many entries one snapshot may see."""
@@ -706,7 +762,19 @@ class VectorHnswIndex(ProximityIndex):
         """
         with self._guard:
             self._snapshot = None
+            self._discard_live_count_locked()
             self._graph_generation = object()
+
+    def _discard_live_count_locked(self) -> None:
+        """Forget a derived count while the graph guard is already held."""
+        self._live_count = None
+        self._live_count_mark = None
+        self._live_count_generation = None
+
+    def _discard_live_count(self) -> None:
+        """Forget a count whose source moved but has no warm picture to update."""
+        with self._guard:
+            self._discard_live_count_locked()
 
     def graph(self) -> HnswGraph:
         """Return the graph of the current picture, building one when there is none or it is behind."""
@@ -863,11 +931,14 @@ class VectorHnswIndex(ProximityIndex):
             entry_of_node={},
             record_of_node={},
             mark=mark,
+            live_count=0,
         )
         for entry in sorted(
             self.walk(), key=lambda item: (item.born_csn, item.ref.encode())
         ):
             self._install(picture, entry)
+            if entry.live:
+                object.__setattr__(picture, "live_count", picture.live_count + 1)
         return picture
 
     def _retire(self, picture: _GraphSnapshot) -> None:
@@ -880,6 +951,7 @@ class VectorHnswIndex(ProximityIndex):
         with self._guard:
             if self._snapshot is picture:
                 self._snapshot = None
+                self._discard_live_count_locked()
 
     def _certify(self, picture: _GraphSnapshot, mark: Lsn) -> None:
         """Republish ``picture`` carrying ``mark``, if it is still the published one.
@@ -890,7 +962,13 @@ class VectorHnswIndex(ProximityIndex):
         """
         with self._guard:
             if self._snapshot is picture:
-                self._snapshot = picture.certified(mark)
+                certified = picture.certified(mark)
+                self._snapshot = certified
+                if (
+                    self._live_count_generation is self._graph_generation
+                    and self._live_count_mark == picture.mark
+                ):
+                    self._live_count_mark = mark
 
     def _install(self, picture: _GraphSnapshot, entry: IndexEntry) -> None:
         """Put one stored entry into a picture, resolving its components through the resolver.
@@ -953,6 +1031,26 @@ class VectorHnswIndex(ProximityIndex):
         picture.graph.insert(node, components)
         picture.node_of_ref[encoded] = node
 
+    def _adjust_live_count(self, picture: _GraphSnapshot, delta: int) -> None:
+        """Apply one already-proved warm change to its picture and count cache."""
+        next_count = picture.live_count + delta
+        if next_count < 0:
+            raise GrafxIndexError(
+                f"Index {self.name!r} derived a negative live count.",
+                field="live_count",
+                index=self.name,
+                file=self.file,
+            )
+        object.__setattr__(picture, "live_count", next_count)
+        with self._guard:
+            if (
+                self._snapshot is picture
+                and self._live_count is not None
+                and self._live_count_mark == picture.mark
+                and self._live_count_generation is self._graph_generation
+            ):
+                self._live_count = next_count
+
     def _note(self, picture: _GraphSnapshot, change: IndexChange) -> bool:
         """Bring one published picture in line with one applied change; say whether it survived.
 
@@ -984,13 +1082,15 @@ class VectorHnswIndex(ProximityIndex):
                     # the row (C9 round-2 B4: five nodes, live_count six, stale False).
                     self._retire(picture)
                     raise
+                self._adjust_live_count(picture, 1)
             return True
         if node is None:
             return True
         if change.operation is IndexOperation.TOMBSTONE:
-            picture.entry_of_node[node] = picture.entry_of_node[node].ended_at(
-                change.csn
-            )
+            previous = picture.entry_of_node[node]
+            picture.entry_of_node[node] = previous.ended_at(change.csn)
+            if previous.live:
+                self._adjust_live_count(picture, -1)
             return True
         # A removal mutates the graph's neighbour lists and unlinks a node; done in place under
         # a traversal on another thread, that traversal can step onto a node that is no longer
@@ -1017,6 +1117,10 @@ class VectorHnswIndex(ProximityIndex):
         current = picture is not None and picture.mark == self.built_through_lsn
         applied = super().commit(txn, csn)
         if picture is None:
+            # Metrics may have asked for a cold count before this commit.  No
+            # picture exists to receive the delta, so retaining it would let
+            # the next planner see the prior durable cardinality.
+            self._discard_live_count()
             return applied
         if not current:
             self._retire(picture)
@@ -1035,7 +1139,10 @@ class VectorHnswIndex(ProximityIndex):
         picture = self._snapshot
         current = picture is not None and picture.mark == self.built_through_lsn
         super().apply(record)
-        if change.index != self.name or picture is None:
+        if change.index != self.name:
+            return
+        if picture is None:
+            self._discard_live_count()
             return
         if not current:
             self._retire(picture)

@@ -16,6 +16,7 @@ import pytest
 
 from bench.harness.gate import DEFAULT_RECALL_TARGET
 from okto_grafx.domain.errors import GrafxConfigurationError
+from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.vector.filter import RecordIdFilter, admits_everything
 from okto_grafx.domain.vector.hnsw import HnswGraph
@@ -27,6 +28,7 @@ from okto_grafx.domain.vector.planner import (
     plan_regime,
 )
 from okto_grafx.runtime.config import DatabaseConfig
+import okto_grafx.engine.vector_engine as vector_engine_module
 
 from .conftest import (
     RecordingMetrics,
@@ -155,6 +157,70 @@ def test_only_the_approximate_regime_uses_the_configured_hnsw_beam(
     # The per-call diagnostic/testing override remains more specific than the database default.
     index.search(corpus[0], 5, SnapshotDouble(1000), ef=33)
     assert traversed_with == [777, 33]
+
+
+def test_a_warm_planner_uses_the_exact_live_count_without_an_entry_walk(
+    metrics: RecordingMetrics, clock: StepClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-12: a warm picture carries an exact planner count, not a second index walk."""
+    database, corpus = _corpus_database(metrics, clock, threshold=0, ef_search=CORPUS)
+    index = database.engine.index("space")
+    # The first approximate search builds the picture and establishes the
+    # same fence the hot search must retain.
+    database.engine.search(
+        space="space", query=corpus[0], k=5, snapshot=SnapshotDouble(1000)
+    )
+    oracle = index.live_count()
+    planned_sizes: list[int] = []
+    decoded = [0]
+    original_plan = vector_engine_module.plan_regime
+    original_decode = IndexEntry.decode.__func__
+
+    def record_plan(*, space_size: int, filter_cardinality: int | None, threshold: int):
+        planned_sizes.append(space_size)
+        return original_plan(
+            space_size=space_size,
+            filter_cardinality=filter_cardinality,
+            threshold=threshold,
+        )
+
+    def count_decode(cls, raw: bytes):
+        decoded[0] += 1
+        return original_decode(cls, raw)
+
+    monkeypatch.setattr(vector_engine_module, "plan_regime", record_plan)
+    monkeypatch.setattr(IndexEntry, "decode", classmethod(count_decode))
+    result = database.engine.search(
+        space="space", query=corpus[1], k=5, snapshot=SnapshotDouble(1000)
+    )
+
+    assert result.regime == REGIME_APPROXIMATE
+    assert planned_sizes == [oracle]
+    assert decoded == [0]
+
+    # A local INSERT and TOMBSTONE may update the warm picture, but they must
+    # update its exact count in the same step.  The oracle remains the durable
+    # walk; the patched decoder proves planning did not perform that walk.
+    table = database.table
+    assert table is not None
+    space = database.catalog_store.catalog.space("space")
+    added = database.insert_row(table, 999, 0, space, corpus[2], csn=999)
+    after_insert = sum(1 for entry in index.walk() if entry.live)
+    decoded[0] = 0
+    database.engine.search(
+        space="space", query=corpus[3], k=5, snapshot=SnapshotDouble(1000)
+    )
+    assert planned_sizes[-1] == after_insert
+    assert decoded == [0]
+
+    database.delete_row(table, added, 999, space, corpus[2], csn=1000)
+    after_tombstone = sum(1 for entry in index.walk() if entry.live)
+    decoded[0] = 0
+    database.engine.search(
+        space="space", query=corpus[4], k=5, snapshot=SnapshotDouble(1000)
+    )
+    assert planned_sizes[-1] == after_tombstone
+    assert decoded == [0]
 
 
 def test_the_two_regime_labels_are_the_bounded_domain_of_the_metric_label() -> None:

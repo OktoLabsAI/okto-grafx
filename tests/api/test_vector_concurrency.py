@@ -18,6 +18,7 @@ import pytest
 
 from okto_grafx import connect
 from okto_grafx.domain.errors import GrafxError
+import okto_grafx.engine.vector_engine as vector_engine_module
 
 DIM = 6
 
@@ -177,7 +178,9 @@ db.close()
 '''
 
 
-def test_a_warm_graph_learns_what_another_process_committed(tmp_path: Path) -> None:
+def test_a_warm_graph_learns_what_another_process_committed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The graph's only invalidation signals were this process's own commits (LESSONS L22).
 
     Parent warms the graph on 12 rows; a child inserts 8, deletes 4, updates 3. The parent's next
@@ -213,8 +216,24 @@ def test_a_warm_graph_learns_what_another_process_committed(tmp_path: Path) -> N
         assert child.stdout.strip() == "DONE"
 
         expected = sorted(set(range(1, 21)) - {2, 5, 13, 20})
+        planned_sizes: list[int] = []
+        original_plan = vector_engine_module.plan_regime
+
+        def record_plan(*, space_size: int, filter_cardinality, threshold: int):
+            planned_sizes.append(space_size)
+            return original_plan(
+                space_size=space_size,
+                filter_cardinality=filter_cardinality,
+                threshold=threshold,
+            )
+
+        monkeypatch.setattr(vector_engine_module, "plan_regime", record_plan)
         approximate = sorted(_search(parent, query, 100))
         assert approximate == expected, (approximate, expected)
+        # D-12: the fresh certificate must evict the parent's warm count, so
+        # planning sees the same exact cardinality as an index walk after the
+        # child inserted and tombstoned rows.
+        assert planned_sizes == [len(expected)]
 
         exact = connect(root, vector_exact_scan_threshold=4096)
         try:
