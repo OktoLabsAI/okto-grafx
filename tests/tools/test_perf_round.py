@@ -17,7 +17,7 @@ assert TEST_GRAFX_SHA is not None
 
 # A fake instrument: writes JSON with a metric derived from its run index and seed, no timing.
 _FAKE_INSTRUMENT = (
-    "import json, sys, pathlib; run = int(sys.argv[1]); out = pathlib.Path(sys.argv[2]); "
+    "import json, sys, pathlib, time; time.sleep(0.08); run = int(sys.argv[1]); out = pathlib.Path(sys.argv[2]); "
     "mode = sys.argv[3]; seed = int(sys.argv[4]); page = int(sys.argv[5]); budget = int(sys.argv[6]); "
     "checksum = sys.argv[7]; kind = sys.argv[8]; thermal = sys.argv[9]; copy = sys.argv[10] if len(sys.argv) > 10 else ''; "
     "import okto_grafx; "
@@ -50,7 +50,7 @@ def _fake_argv(*extra: str) -> list[str]:
 
 
 _FAKE_PULSE_INSTRUMENT = (
-    "import json, os, pathlib, sys; run = int(sys.argv[1]); out = pathlib.Path(sys.argv[2]); "
+    "import json, os, pathlib, sys, time; time.sleep(0.08); run = int(sys.argv[1]); out = pathlib.Path(sys.argv[2]); "
     "mode = sys.argv[3]; seed = int(sys.argv[4]); page = int(sys.argv[5]); budget = int(sys.argv[6]); "
     "checksum = sys.argv[7]; kind = sys.argv[8]; thermal = sys.argv[9]; copy = sys.argv[10]; "
     "import okto_grafx, okto_pulse.community, okto_pulse.core; data_dir = pathlib.Path(os.environ['DATA_DIR']).resolve(); "
