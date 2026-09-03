@@ -275,6 +275,7 @@ class PulseCardInstrumentation:
         from okto_grafx.engine.heap_store import HeapStore
         from okto_grafx.engine.index_manager import IndexManager
         from okto_grafx.engine.query_engine import QueryEngine
+        from okto_grafx.engine.vector_engine import VectorEngine
 
         original_connect = inspect.getattr_static(okto_grafx, "connect")
 
@@ -506,6 +507,7 @@ class PulseCardInstrumentation:
             return result
 
         self._patch(IndexManager, "lookup", index_lookup)
+        self._wrap_counted(VectorEngine, "search", "vector_search_calls")
 
         original_query_execute = inspect.getattr_static(QueryEngine, "execute")
 
@@ -528,6 +530,7 @@ class PulseCardInstrumentation:
 
         self._wrap_counted(Database, "begin", "transaction_begin_calls")
         self._wrap_counted(Database, "retry", "transaction_retry_calls")
+        self._wrap_counted(Database, "rebuild_vector_index", "vector_rebuild_calls")
         self._wrap_commit(Transaction)
         self._wrap_counted(Transaction, "rollback", "transaction_rollback_calls")
 
@@ -738,6 +741,13 @@ class PulseCardInstrumentation:
                 "index_candidates_returned": self._index_candidates.report(),
                 "query_duration_ns": self._query_duration_ns.report(),
                 "commit_duration_ns": self._commit_duration_ns.report(),
+                "vector_activity": {
+                    "observed": True,
+                    "search_calls": counters.get("vector_search_calls", 0),
+                    "search_failures": counters.get("vector_search_calls_failed", 0),
+                    "rebuild_calls": counters.get("vector_rebuild_calls", 0),
+                    "rebuild_failures": counters.get("vector_rebuild_calls_failed", 0),
+                },
                 "census_semantics": "repeated_decode_observations_not_unique_versions",
             }
 
@@ -761,5 +771,12 @@ def null_instrumentation_report() -> dict[str, Any]:
         "baseline_handles_observed": [],
         "baseline_handle_total": 0,
         "baseline_handles_truncated": False,
+        "vector_activity": {
+            "observed": False,
+            "search_calls": None,
+            "search_failures": None,
+            "rebuild_calls": None,
+            "rebuild_failures": None,
+        },
         "census_semantics": "not_collected_in_raw_run",
     }

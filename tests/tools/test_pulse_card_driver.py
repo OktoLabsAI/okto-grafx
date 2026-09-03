@@ -19,6 +19,7 @@ from okto_grafx.engine.database import Database, Transaction
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import IndexManager
 from okto_grafx.engine.query_engine import QueryEngine
+from okto_grafx.engine.vector_engine import VectorEngine
 from tools.perf_round import baseline_runs, board_copy, receipt, replay_pulse_card
 from tools.perf_round.pulse_card_instrumentation import (
     InstrumentationError,
@@ -56,9 +57,13 @@ def _descriptors() -> dict[str, object]:
         ),
         "heap_lookup": inspect.getattr_static(HeapStore, "lookup"),
         "index_lookup": inspect.getattr_static(IndexManager, "lookup"),
+        "vector_search": inspect.getattr_static(VectorEngine, "search"),
         "query_execute": inspect.getattr_static(QueryEngine, "execute"),
         "database_begin": inspect.getattr_static(Database, "begin"),
         "database_retry": inspect.getattr_static(Database, "retry"),
+        "database_rebuild_vector": inspect.getattr_static(
+            Database, "rebuild_vector_index"
+        ),
         "transaction_commit": inspect.getattr_static(Transaction, "commit"),
         "transaction_rollback": inspect.getattr_static(Transaction, "rollback"),
     }
@@ -97,6 +102,13 @@ def test_instrumentation_restores_exact_descriptors_and_omits_query_text() -> No
     assert report["counters"]["transaction_commit_succeeded"] == 2
     assert report["database_open_total"] == 1
     assert report["baseline_handle_total"] == 0
+    assert report["vector_activity"] == {
+        "observed": True,
+        "search_calls": 0,
+        "search_failures": 0,
+        "rebuild_calls": 0,
+        "rebuild_failures": 0,
+    }
     rendered = json.dumps(report, sort_keys=True)
     assert secret not in rendered
     assert "CREATE NODE TABLE" not in rendered
