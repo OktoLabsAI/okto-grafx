@@ -19,14 +19,15 @@ assert TEST_GRAFX_SHA is not None
 _FAKE_INSTRUMENT = (
     "import json, sys, pathlib; run = int(sys.argv[1]); out = pathlib.Path(sys.argv[2]); "
     "mode = sys.argv[3]; seed = int(sys.argv[4]); page = int(sys.argv[5]); budget = int(sys.argv[6]); "
-    "checksum = sys.argv[7]; kind = sys.argv[8]; copy = sys.argv[9] if len(sys.argv) > 9 else ''; "
+    "checksum = sys.argv[7]; kind = sys.argv[8]; thermal = sys.argv[9]; copy = sys.argv[10] if len(sys.argv) > 10 else ''; "
     "import okto_grafx; "
     "out.write_text(json.dumps({'summary': {'wall_ms': 100.0 + run, 'nested': [{'v': 7}]}, "
     "'copy': copy, 'mode': mode, 'seed': seed, 'home': __import__('os').environ.get('DATA_DIR'), "
     "'grafx_file': okto_grafx.__file__, '_perf_round': {'python_executable': "
     "str(pathlib.Path(sys.executable).resolve()), 'okto_grafx_file': str(pathlib.Path(okto_grafx.__file__).resolve()), "
     "'mode': mode, 'seed': seed, 'kind': kind, 'page_size': page, "
-    "'buffer_budget_bytes': budget, 'checksum': checksum, 'run': run}}))"
+    "'buffer_budget_bytes': budget, 'checksum': checksum, 'thermal': thermal, 'run': run, "
+    "'effective_data_dir': str(pathlib.Path(__import__('os').environ['DATA_DIR']).resolve())}}))"
 )
 
 
@@ -43,8 +44,57 @@ def _fake_argv(*extra: str) -> list[str]:
         "{buffer_budget_bytes}",
         "{checksum}",
         "{kind}",
+        "{thermal}",
         *extra,
     ]
+
+
+_FAKE_PULSE_INSTRUMENT = (
+    "import json, os, pathlib, sys; run = int(sys.argv[1]); out = pathlib.Path(sys.argv[2]); "
+    "mode = sys.argv[3]; seed = int(sys.argv[4]); page = int(sys.argv[5]); budget = int(sys.argv[6]); "
+    "checksum = sys.argv[7]; kind = sys.argv[8]; thermal = sys.argv[9]; copy = sys.argv[10]; "
+    "import okto_grafx, okto_pulse.community, okto_pulse.core; data_dir = pathlib.Path(os.environ['DATA_DIR']).resolve(); "
+    "out.write_text(json.dumps({'summary': {'wall_ms': 1.0}, 'copy': copy, "
+    "'_perf_round': {'python_executable': str(pathlib.Path(sys.executable).resolve()), "
+    "'okto_grafx_file': str(pathlib.Path(okto_grafx.__file__).resolve()), "
+    "'okto_pulse_community_file': str(pathlib.Path(okto_pulse.community.__file__).resolve()), "
+    "'okto_pulse_core_file': str(pathlib.Path(okto_pulse.core.__file__).resolve()), "
+    "'effective_data_dir': str(data_dir), 'mode': mode, 'seed': seed, 'kind': kind, "
+    "'thermal': thermal, 'page_size': page, 'buffer_budget_bytes': budget, "
+    "'checksum': checksum, 'run': run}}))"
+)
+
+
+def _fake_pulse_argv() -> list[str]:
+    return [
+        sys.executable,
+        "-c",
+        _FAKE_PULSE_INSTRUMENT,
+        "{run}",
+        "{out}",
+        "{mode}",
+        "{seed}",
+        "{page_size}",
+        "{buffer_budget_bytes}",
+        "{checksum}",
+        "{kind}",
+        "{thermal}",
+        "{copy}",
+    ]
+
+
+def _fake_pulse_roots(tmp_path: Path) -> tuple[Path, Path]:
+    community = tmp_path / "community"
+    core = tmp_path / "core"
+    (community / "src" / "okto_pulse" / "community").mkdir(parents=True)
+    (core / "src" / "okto_pulse" / "core").mkdir(parents=True)
+    (community / "src" / "okto_pulse" / "community" / "__init__.py").write_text(
+        "", encoding="utf-8"
+    )
+    (core / "src" / "okto_pulse" / "core" / "__init__.py").write_text(
+        "", encoding="utf-8"
+    )
+    return community, core
 
 
 @pytest.fixture(autouse=True)
@@ -368,6 +418,8 @@ def test_the_copier_cli_writes_a_receipt_whose_copy_input_is_derived_from_the_pr
                 "test-grafx-sha",
                 "--pulse-sha",
                 "test-pulse-sha",
+                "--pulse-core-sha",
+                "test-core-sha",
             ]
         )
         == 0
@@ -378,6 +430,7 @@ def test_the_copier_cli_writes_a_receipt_whose_copy_input_is_derived_from_the_pr
     assert roles["copy"]["declared_copy"] is True
     assert roles["source"]["declared_copy"] is False
     assert roles["copy"]["inventory_sha256"] == roles["source"]["inventory_sha256"]
+    assert written["commits"]["pulse_core"] == "test-core-sha"
 
 
 def test_a_source_change_discards_staging_and_never_publishes_a_copy(
@@ -572,6 +625,131 @@ def test_a_series_binds_the_child_to_a_fresh_clone_of_the_declared_copy(
     )
 
 
+def test_a_pulse_series_pins_community_and_core_and_uses_each_clone_as_data_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    community, core = _fake_pulse_roots(tmp_path)
+    shas = {community.resolve(): "community-sha", core.resolve(): "core-sha"}
+    monkeypatch.setattr(
+        baseline_runs, "git_sha_of", lambda path: shas.get(Path(path).resolve())
+    )
+    monkeypatch.setattr(baseline_runs, "_source_status", lambda *_args: [])
+    source = _board(tmp_path / "source-home")
+    declared = tmp_path / "declared-home"
+    board_copy.copy_board(
+        source,
+        declared,
+        declare_copy=True,
+        drained=False,
+        grafx_sha=TEST_GRAFX_SHA,
+        pulse_sha="community-sha",
+        pulse_core_sha="core-sha",
+    )
+
+    result = baseline_runs.run_series(
+        mode="strict",
+        thermal="warm",
+        runs=3,
+        warmup=0,
+        argv_template=_fake_pulse_argv(),
+        metrics={"wall_ms": "summary.wall_ms"},
+        out_dir=tmp_path / "pulse-series",
+        seed=4,
+        timeout_seconds=120.0,
+        inputs=[],
+        declared_copy=declared,
+        copy_policy="clone",
+        data_home_policy="declared-copy-clone",
+        kind="raw",
+        max_spread=0.5,
+        machine_idle_asserted=False,
+        grafx_sha=TEST_GRAFX_SHA,
+        pulse_sha="community-sha",
+        pulse_root=community,
+        pulse_core_sha="core-sha",
+        pulse_core_root=core,
+        page_size=8192,
+        buffer_budget_bytes=64 * 1024 * 1024,
+        checksum="auto",
+    )
+
+    assert result["commits"] == {
+        "grafx": TEST_GRAFX_SHA,
+        "pulse": "community-sha",
+        "pulse_core": "core-sha",
+    }
+    for run in result["results"]["runs"]:
+        assert run["data_home"] == run["copy"]["path"]
+        child = json.loads(Path(run["output"]).read_text(encoding="utf-8"))
+        assert child["copy"] == run["data_home"]
+        assert child["_perf_round"]["effective_data_dir"] == run["data_home"]
+        assert child["_perf_round"]["thermal"] == "warm"
+    assert result["results"]["expected_child_provenance"][
+        "okto_pulse_community_file"
+    ] == str(
+        (community / "src" / "okto_pulse" / "community" / "__init__.py").resolve()
+    )
+    assert result["results"]["expected_child_provenance"][
+        "okto_pulse_core_file"
+    ] == str((core / "src" / "okto_pulse" / "core" / "__init__.py").resolve())
+
+
+def test_a_pulse_series_refuses_unpinned_core_or_a_non_clone_data_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    community, core = _fake_pulse_roots(tmp_path)
+    shas = {community.resolve(): "community-sha", core.resolve(): "core-sha"}
+    monkeypatch.setattr(
+        baseline_runs, "git_sha_of", lambda path: shas.get(Path(path).resolve())
+    )
+    monkeypatch.setattr(baseline_runs, "_source_status", lambda *_args: [])
+    source = _board(tmp_path / "source-home")
+    declared = tmp_path / "declared-home"
+    board_copy.copy_board(source, declared, declare_copy=True, drained=False)
+    common = dict(
+        mode="strict",
+        thermal="warm",
+        runs=3,
+        warmup=0,
+        argv_template=_fake_pulse_argv(),
+        metrics={"wall_ms": "summary.wall_ms"},
+        seed=0,
+        timeout_seconds=10.0,
+        inputs=[],
+        declared_copy=declared,
+        copy_policy="clone",
+        kind="raw",
+        max_spread=0.5,
+        machine_idle_asserted=False,
+        grafx_sha=TEST_GRAFX_SHA,
+        pulse_sha="community-sha",
+        pulse_root=community,
+        page_size=8192,
+        buffer_budget_bytes=64 * 1024 * 1024,
+        checksum="auto",
+    )
+    with pytest.raises(baseline_runs.RunRefused, match="pulse-core-root"):
+        baseline_runs.run_series(
+            out_dir=tmp_path / "missing-core", data_home_policy="isolated", **common
+        )
+    with pytest.raises(baseline_runs.RunRefused, match="declared-copy-clone"):
+        baseline_runs.run_series(
+            out_dir=tmp_path / "empty-home",
+            data_home_policy="isolated",
+            pulse_core_sha="core-sha",
+            pulse_core_root=core,
+            **common,
+        )
+    with pytest.raises(baseline_runs.RunRefused, match="copy-policy clone"):
+        baseline_runs.run_series(
+            out_dir=tmp_path / "shared-home",
+            data_home_policy="declared-copy-clone",
+            pulse_core_sha="core-sha",
+            pulse_core_root=core,
+            **dict(common, copy_policy="verify"),
+        )
+
+
 def test_a_series_refuses_unbound_copies_stale_outputs_and_missing_timeouts(
     tmp_path: Path, fake_home: Path
 ) -> None:
@@ -716,6 +894,7 @@ def test_a_series_requires_the_actual_instrument_to_be_hashed(tmp_path: Path) ->
                 "{buffer_budget_bytes}",
                 "{checksum}",
                 "{kind}",
+                "{thermal}",
             ],
             metrics={"wall_ms": "summary.wall_ms"},
             out_dir=tmp_path / "no-instrument",
@@ -749,6 +928,7 @@ def test_a_decoy_python_file_cannot_bind_an_unhashed_module_instrument() -> None
         "{buffer_budget_bytes}",
         "{checksum}",
         "{kind}",
+        "{thermal}",
     ]
     with pytest.raises(baseline_runs.RunRefused, match="may not use -m"):
         baseline_runs._guard_argv(argv, has_copy=False)
@@ -767,6 +947,7 @@ def test_a_timed_out_or_broken_run_is_an_error_not_a_sample(tmp_path: Path) -> N
         "{buffer_budget_bytes}",
         "{checksum}",
         "{kind}",
+        "{thermal}",
     ]
     result = baseline_runs.run_series(
         mode="strict",
@@ -813,6 +994,7 @@ def test_a_timed_out_or_broken_run_is_an_error_not_a_sample(tmp_path: Path) -> N
         "{buffer_budget_bytes}",
         "{checksum}",
         "{kind}",
+        "{thermal}",
     ]
     result = baseline_runs.run_series(
         mode="strict",
@@ -936,9 +1118,15 @@ def test_child_provenance_is_required_and_exact() -> None:
         ),
         "mode": "strict",
         "seed": 7,
+        "thermal": "warm",
+        "effective_data_dir": str(Path.cwd().resolve()),
     }
     assert baseline_runs.validate_child_provenance({}, expected)
     observed = {"_perf_round": dict(expected)}
     assert baseline_runs.validate_child_provenance(observed, expected) == []
     observed["_perf_round"]["seed"] = 8
     assert "seed=8" in baseline_runs.validate_child_provenance(observed, expected)[0]
+    observed["_perf_round"].update(seed=7, thermal="cold")
+    assert "thermal='cold'" in baseline_runs.validate_child_provenance(
+        observed, expected
+    )[0]
