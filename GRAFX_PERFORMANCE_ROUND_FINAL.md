@@ -209,18 +209,43 @@ Nenhum sink/callback roda sob lease ou section; a emissão ocorre após `txn_man
 
 - regime R1 por identidade usando `lookup_with_ref`, com deduplicação;
 - reproduzir exatamente overlays `ended`, `changed`, `inserted` e `PendingRowRef`;
-- manter limiar de troca para scan quando identidades distintas tornarem o lookup pior;
+- avaliar um limiar de troca para scan somente se houver evidência e um R2 integralmente admitido;
 - proibir cache global ou por transação sem limite;
 - qualquer R2 deve cobrar bytes, ter quota, admissão, evicção/fallback e só avançar após `tracemalloc`/RSS demonstrarem segurança.
 
+**Disposição executada:** R1 mantido; limiar/R2 não selecionado. `1e2997e` + `13a5bda`
+integram a resolução por identidade sobre a porta D-02, deduplicam pousos e limitam, por handle,
+memo de transação, slot de tabela, view, overlays, fingerprint e resultados a 32 MiB/131.072
+entradas. A revisão recusou a primeira versão porque o histórico bruto do fingerprint e o
+`_Context` do statement podiam ficar retidos sem cobrança; o hardening passou a cobrar cada item
+do histórico e seu payload antes da publicação e a fornecer o contexto somente por chamada.
+`DELETE` participa do fingerprint e paga a carga fixa por entrada, mas seu tuple vazio é marcador
+de ausência de payload e não passa por `encode_tuple`; o teste mantém a view admitida, reutiliza o
+cache sem novo decode e os testes de settlement devolvem toda a quota. Dentro das quotas D-02 +
+D-03 o custo repetido é amortizado para `O(N+E)`; se ambas saturarem, permanece explicitamente o
+fallback de até um lookup canônico `O(N)` por identidade distinta. Introduzir R2 sem evidência
+recriaria a materialização integral e ampliaria a superfície de memória, portanto não faz parte
+do fechamento de P1.
+
 #### P1.6 — endpoint decode parcial, condicional (D-05 corrigido)
 
-Só implementar se P0 mostrar esse caminho em pelo menos 10% da parede do card observado. A implementação deve:
+A condição original era P0 mostrar esse caminho em pelo menos 10% da parede do card observado.
+Ela foi supersedida pela decisão posterior do usuário de retirar gates de performance e promover
+somente por qualidade; não se alega que o censo real tenha ocorrido. A implementação deve:
 
 - reconstruir payload overflow antes de ler offsets;
 - validar schema, comprimento, tags e estrutura também para linhas não incidentes, preservando a recusa atual;
 - manter paridade para inline, overflow multipágina, cadeia truncada, payload/tag inválidos, self-loop e overlays;
-- ser descartada se a validação necessária consumir o mesmo custo dentro da faixa de ruído.
+- publicar a evidência direcional sem transformar ausência de ganho temporal conclusivo em gate.
+
+**Disposição executada:** mantido em `bd12a5c`. O payload de toda relação visível continua sendo
+reconstruído e validado integralmente, inclusive propriedades de linhas não incidentes; somente os
+dois endpoints são retidos e `_incident_edges` deixa de construir o `HeapVersion` e o tuple de
+propriedades completos. Duas revisões adversariais passaram, incluindo paridade de recusas,
+overflow, ordem de validação, overlays e corrupção não incidente. O microbench curto no SHA
+integrado mediu `107452,15 -> 78707,15 ns/linha` (`1,365x`) no decoder sintético de 6.321 bytes.
+É evidência direcional e dependente do mix de propriedades, não ganho end-to-end nem mudança
+assintótica: `DETACH DELETE` continua `O(|R| + bytes dos payloads visíveis)`.
 
 #### P1.7 — gerar a imagem WAL uma vez, condicional (D-09 corrigido)
 
@@ -243,16 +268,13 @@ D-08 original não é uma opção: com 64 buckets continua `O(N/64)` e sua chave
 
 ## 7. Política de medição e decisão
 
-Performance não é gate de release nesta rodada. Os números têm duas funções: selecionar P2 e decidir manter ou reverter cada otimização.
-
-Uma alteração é mantida quando:
-
-- o ganho do alvo excede a faixa de ruído same-code;
-- o controle não apresenta regressão fora dessa faixa;
-- throughput, cauda, RSS, conflitos e write amplification relevantes são publicados;
-- todos os gates de qualidade passam.
-
-Se não houver ganho reproduzível, o patch é revertido e a rodada continua. Se houver falha de correção, integridade, recovery ou concorrência, o item fica bloqueado até ser corrigido; nunca é promovido por ser rápido.
+Performance não é gate de release nesta rodada. Por decisão explícita posterior do usuário,
+throughput, latência, RSS e comparações same-code orientam diagnóstico e a futura seleção de P2,
+mas não bloqueiam promoção. A regra provisória anterior de reverter automaticamente um patch por
+não superar a faixa de ruído está supersedida. Uma alteração P1 é mantida quando todos os gates de
+qualidade passam, sua direção de ganho é tecnicamente demonstrada e não há regressão funcional,
+de integridade, recovery ou concorrência. Evidência temporal curta nunca é extrapolada para o
+fluxo completo; uma regressão material observada continua exigindo correção ou reversão.
 
 Regras de benchmark:
 
@@ -285,9 +307,9 @@ Testes focados rodam por item. Suítes longas podem ser acumuladas após P1.2–
 |---|---|
 | D-01 | P1.2, aceita com unpack único e paridade de recusas |
 | D-02 | P1.4, redesenhada como locator especializado; `lookup` genérico intocado |
-| D-03 | P1.5, R1 com ref/dedupe/limiar; R2 somente budgetado |
+| D-03 | P1.5, R1 com ref/dedupe promovido; limiar/R2 não selecionado sem evidência e admissão completa |
 | D-04 | P1.3, aceita e prioritária |
-| D-05 | P1.6 condicional, overflow-safe e fail-closed |
+| D-05 | P1.6 promovida após retirada do gate temporal; overflow-safe, fail-closed e ainda `O(|R|)` |
 | D-06 | fora do lote; apenas passar extent já calculado pode voltar se medido; memo só seria admissível em `generation` |
 | D-07 | deferida; cache/zone map derivado requer budget e prova de invalidação |
 | D-08 | rejeitada como escrita; substituída por P2-ID integrado a rehash e chave `u64` |
@@ -367,6 +389,8 @@ O consenso não autoriza mudança de formato, redução das garantias concorrent
 | 2026-09-03 | P1.2 — D-01 | promovido | origem `perf/v002-d01-header-peek@1239a0e`; integrado em `b23bcbc` + `07dfb02`; suíte focada de heap e Ruff verdes |
 | 2026-09-03 | P1.3 — D-04 | promovido e limitado por cardinalidade | origem `perf/v002-d04-index-version@e898fe7`; integrado em `2e6bbf9` + `f6e7531` + `873f419` + `bc3ede4`; somente PK automática reutiliza a versão, enquanto endpoint/índice geral preserva leitura lazy e memória limitada; gates focados verdes |
 | 2026-09-03 | P1.4 — D-02 | promovido e endurecido | o protótipo cauda-primeiro foi rejeitado por ocultar duplicata corrupta; `49a9b03` integrou o cursor incremental cabeça→cauda e `e26af74` fechou hard cap/atomicidade/settlement e os dois momentos do reader multiprocesso. `fb984a7` alinhou a documentação da carga conservadora. Isolado 16/16, bateria agrupada 60/60, pós-integração 35/35, probe concorrente, Ruff e diff-check verdes; dentro da quota o custo repetido passa de `O(E*N)` para `O(N+E)`, com fallback canônico honesto quando ela satura |
+| 2026-09-03 | P1.5 — D-03 | R1 promovido e endurecido; limiar/R2 não selecionado | origem `perf/v002-d03-lazy-landing@e977285` + `7b152a9`; integrado em `1e2997e` + `13a5bda`. A revisão bloqueou fingerprint/contexto não cobrados antes da integração; o resultado final limita todo estado retido, mantém heap I/O fora do guard e trata `DELETE` como entrada fixa sem reencodar seu tuple vazio. 107 testes pós-integração, Ruff e diff-check verdes; 96 nós/9 pousos/2 identidades decodificam só 2 payloads e a repetição na transação decodifica zero |
+| 2026-09-03 | P1.6 — D-05 | promovido após retirada explícita do gate temporal | origem `perf/v002-d05-incident-endpoints@7751ea1`; integrado em `bd12a5c`. 250 testes pós-integração, duas revisões adversariais, diferencial adicional de 44 mil payloads malformados, Ruff e diff-check verdes. O decoder integrado mediu `1,365x` no payload sintético de 6.321 bytes; ganho somente do componente, mantendo o scan `O(|R|)` e validação fail-closed integral |
 | 2026-09-03 | lane vetorial — D-12 | promovido e endurecido | `df09c2e` integrou a contagem cercada; a revisão adversarial recusou deltas identificados apenas por `ref`; `6f6b410` alinhou a identidade a `(key, ref)` sem retirar o update incremental do HNSW e `16fbc0a` tornou falhas do cache derivado conservadoras, nunca falhas pós-barreira. Regressão integrada dos três arquivos afetados verde, Ruff e diff-check verdes; nenhum formato/WAL/protocolo de concorrência mudou |
 | 2026-09-03 | P1.7 — D-09 | promovido e verificado | origem `perf/v002-d09-single-wal-image@765cd07` + `56e7883`; integrado em `c3ef29f` + `69368c3`. Cópia profunda da página local elimina um encode+decode verificado antes da imagem WAL; pré-staged externo preserva verificação integral; retarget reutiliza somente `(txn_id, csn)` exatos. Diferencial byte-idêntico, 6 mutantes mortos, 8/8 focados e 75/75 com commit/WAL vizinhos, Ruff e diff-check verdes. Microbench sintético carregado: p50 `5009→2031 µs/página` (`2,47x` nessa etapa), sem alegar a mesma razão para o commit completo |
 | 2026-09-03 | P0.2 — instrumentos reproduzíveis | concluído; execução pós-drain permanece em P0.3/P0.4 | primitivas integradas em `c276dec`; driver autenticado integrado em `be286fa` + `2d43d75`, com origem imutável `perf/v002-p0-card-driver@e8a6be0`. Cada run usa clone integral descartável, pins separados de Community/Core, rota Grafx autenticada, lifecycle público de exatamente um card, oráculos de ACK/audit, RAW sem hooks e instrumentação bounded/reversível. `warm` é leitura sequencial provada, `mixed` é cache não controlado, `cold` é recusado; budget diferente dos 64 MiB realmente suportados também é recusado. Regressão focada 46/46, Ruff, `py_compile`, diff-check e duas auditorias adversariais PASS; smokes sintéticos RAW/instrumentado passaram, sem acesso ao board vivo e sem comparação inválida entre os dois modos |

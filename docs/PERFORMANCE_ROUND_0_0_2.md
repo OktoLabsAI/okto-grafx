@@ -220,7 +220,66 @@ heap I/O stays outside it. Saturation, stale state or a concurrently active curs
 unchanged canonical lookup; stored-data errors remain fail-closed. This amortizes repeated endpoint
 checks from `O(E*N)` to `O(N+E)` while the working set fits, with the fallback worst case stated
 honestly. The same reader was proved before and after a foreign-process reconciliation without
-crossing its old snapshot. P1.5 follows this internal port; P1.6 remains conditional.
+crossing its old snapshot. P1.5 consumes this internal port; the promoted P1.5/P1.6 outcomes are
+recorded below.
+
+## P1.5 — bounded lazy owner landing (D-03)
+
+Status: **integrated on `feature/v0.0.2` as `1e2997e` + `13a5bda`; R1 maintained,
+threshold/R2 not selected**.
+
+Traversal, untyped traversal and relationship scan now resolve only the node identities named by
+surviving edges through the D-02 internal identity door. A transaction reuses requested landings,
+including misses, without building and retaining every visible row of the landing table. The
+owner overlays remain complete for `changed`, `ended`, inserted rows and `PendingRowRef`.
+
+All retained state shares a per-handle ceiling of 32 MiB and 131,072 entries: transaction memo,
+table slots, views, overlays, the complete invalidation fingerprint and decoded results are
+reserved before publication. The first candidate was rejected before integration because repeated
+updates of one ref could retain an `O(k)` raw fingerprint behind an `O(1)` reduced-overlay charge,
+and because a view retained its statement `_Context`. `13a5bda` charges every fingerprint entry
+plus its encoded payload at a conservative multiplier and supplies statement context only to the
+individual lookup. Heap I/O stays outside the shared `RLock`; settlement can retire an active view
+and releases its remaining charge when that lookup exits.
+
+`DELETE` is an explicit accounting case: it remains in the fingerprint and pays the fixed entry
+charge, while its empty tuple is only an absence marker and is not passed to `encode_tuple`. The
+regression proves that a view containing a delete remains admitted and reusable (the second
+traversal performs zero landing decodes), while the settlement tests return the shared accounting
+to zero.
+
+On the focused wide-table proof, 96 nodes and nine edge landings naming two distinct identities
+produce zero landing-table scans and two payload decodes; repeating the traversal in the same
+transaction produces zero new decodes. While D-02 and D-03 remain inside their quotas, repeated
+landing work is amortized from `O(E*N)` to `O(N+E)`. If both quotas saturate, canonical fallback
+can still cost `O(N)` for each distinct requested identity. A full-scan R2/threshold was therefore
+not selected without the evidence and separately admitted memory design required by the plan.
+
+The integrated focused batch passed 107 tests, plus Ruff and `git diff --check`.
+
+## P1.6 — projected incident relationship endpoints (D-05)
+
+Status: **integrated on `feature/v0.0.2` as `bd12a5c`**.
+
+`DETACH DELETE` still walks every visible relationship and reconstructs every overflow payload,
+but it retains only the two fixed endpoints instead of materializing all properties and a complete
+`HeapVersion`. The materializing and validation-only modes share one value parser. Schema version,
+payload length, tags, complete nested shape, trailing bytes and `header.previous` keep the previous
+validation order; corruption in a visible non-incident relationship remains fail-closed before
+any partial delete is handed to the transaction. Pending/deleted overlays and self-loops retain
+their prior semantics.
+
+The original requirement for a real-card >=10% census was superseded by the user's later decision
+to remove performance gates; no such census is claimed. Promotion rests on quality: 250 focused
+tests passed after integration, two independent adversarial reviews passed, and an additional
+deterministic differential probe compared 44,000 malformed payloads without finding a difference
+in exception type, message, details or cause. Ruff and `git diff --check` also passed.
+
+The versioned synthetic decoder benchmark on Python 3.13.1 and the integrated SHA used a 6,321-byte
+payload and measured median `107452.15 -> 78707.15 ns/row`, or `1.365x`, over seven rounds of 2,000
+iterations. This is directional evidence for this decode/materialization component only. Strings
+still allocate temporary text to validate UTF-8, and the complete operation remains
+`O(|R| + bytes of visible payloads)`; no end-to-end `DETACH DELETE` speedup is claimed.
 
 ## Vector lane — exact fenced live cardinality (D-12)
 
@@ -279,6 +338,8 @@ commit/WAL integration batch, Ruff and diff-check passed; no Pulse data was acce
 | 2026-09-03 | P1.2 D-01 integrated | `b23bcbc` + `07dfb02`; full focused heap suite and Ruff passed |
 | 2026-09-03 | P1.3 D-04 integrated | `2e6bbf9` + `f6e7531` + `873f419` + `bc3ede4`; focused PK/endpoint/visibility suites and Ruff passed; high-cardinality indexes remain lazy |
 | 2026-09-03 | P1.4 D-02 canonical-prefix locator | `49a9b03` + `e26af74` + `fb984a7`; hard-capped per handle, atomic registry/accounting, no heap I/O under its guard, canonical fallback on saturation/stale/busy; isolated 16/16, grouped 60/60, integrated 35/35, multiprocess old-snapshot and adversarial concurrency proofs, Ruff/diff-check passed |
+| 2026-09-03 | P1.5 D-03 bounded lazy landing | origins `e977285` + `7b152a9`, integrated as `1e2997e` + `13a5bda`; first candidate blocked for uncharged fingerprint/context retention, final R1 fully admitted; `DELETE` pays fixed fingerprint entry without encoding its empty marker; integrated 107/107, Ruff/diff-check passed; R2 not selected |
+| 2026-09-03 | P1.6 D-05 endpoint projection | origin `7751ea1`, integrated as `bd12a5c`; 250/250 post-integration, two adversarial reviews and 44,000-case malformed differential passed; integrated microbench `1.365x` only for the synthetic decoder, with full fail-closed validation and unchanged `O(|R|)` scan |
 | 2026-09-03 | P0.2 fail-closed primitives | receipts, authenticated copy and independent-series runner integrated at `c276dec`; 31 focused tests and static checks passed; driver completion is recorded in the next row |
 | 2026-09-03 | P0.2 authenticated Pulse card driver | integrated at `be286fa` + `2d43d75` from `perf/v002-p0-card-driver@e8a6be0`; 46 focused tests and static checks passed; synthetic RAW/instrumented lifecycle smokes passed without touching the live board; P0.3/P0.4 execution remains pending |
 | 2026-09-03 | P0.3 profiler/census tooling | published on `perf/v002-p0-census@222a854`; endpoint locality, dynamic vector activity, guarded py-spy capture and reconciled read-only census implemented; combined milestone regression 98/98 passed; real corpus execution waits for the live backfill to drain |
