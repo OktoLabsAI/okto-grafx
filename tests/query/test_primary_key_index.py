@@ -29,6 +29,7 @@ import okto_grafx
 import okto_grafx.engine.index_manager as index_manager_module
 from okto_grafx.domain.errors import GrafxQueryError
 from okto_grafx.domain.query.plan import IndexSeek, NodeScan
+from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import IndexManager, primary_key_index_name
 
 
@@ -160,6 +161,29 @@ def test_a_seek_and_a_scan_return_the_same_rows(database) -> None:
     assert database.execute(
         "MATCH (p:Person) WHERE p.id = 9999 RETURN p.name"
     ).rows == ()
+
+
+def test_an_exact_seek_reuses_the_heap_version_validated_by_the_index(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One exact hit is decoded once, inside the stable index view."""
+    with database.begin("write") as txn:
+        txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:Person {id: 1, name: 'ada'})")
+
+    reads: list[object] = []
+    original = HeapStore.read
+
+    def recording(self, ref):
+        reads.append(ref)
+        return original(self, ref)
+
+    monkeypatch.setattr(HeapStore, "read", recording)
+    assert database.execute("MATCH (p:Person) WHERE p.id = 1 RETURN p.name").rows == (
+        ("ada",),
+    )
+    assert len(reads) == 1
 
 
 def test_a_deleted_row_is_not_returned_by_a_seek(database) -> None:

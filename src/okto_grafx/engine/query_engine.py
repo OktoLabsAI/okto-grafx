@@ -11,13 +11,13 @@ for similarity, the catalog store for schema. Nothing here reads a page directly
 decides visibility on its own -- the snapshot the transaction carries is the only view, and every
 row that reaches a caller passed through it.
 
-**How the two index contracts are honoured.** An index seek asks
-:meth:`~okto_grafx.engine.index_manager.IndexManager.lookup`, which is C7's own door and the one
-place the dual rule of CONTRACT.md section 8.7 is applied: an EXACT hit is a candidate that is
-validated against the heap under this snapshot before it is returned, a PROXIMITY hit is already
-decided by its birth stamp and its tombstone. This engine deliberately does NOT reimplement that
-choice. It records in the plan which contract the seek was built for, so a plan can be reviewed
-for having assumed the wrong one, and then asks the component that owns the rule.
+**How the two index contracts are honoured.** An index seek asks the index manager's paired
+``lookup``/``lookup_versions`` doors, which are where C7's dual rule of CONTRACT.md section 8.7 is
+applied: an EXACT hit is a candidate validated against the heap under this snapshot, while a
+PROXIMITY hit is already decided by its birth stamp and tombstone. The paired exact door returns
+the immutable version that discharged that proof, avoiding a second heap read. This engine does
+not reimplement either visibility rule; it records the contract in the plan and dispatches to the
+component that owns it.
 
 **How the similarity operator stays one pass.** The candidate set is the rows the operator's CHILD
 produced, handed to the vector subsystem as a
@@ -50,6 +50,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
+from typing import cast
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -69,6 +70,7 @@ from okto_grafx.domain.index.definition import (
     automatic_index_definitions,
     index_definition_matches_table,
 )
+from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.engine.index_manager import (
     edge_from_index_name,
     edge_to_index_name,
@@ -2100,6 +2102,29 @@ def _node_scan(
             yield _Row(bindings=bindings)
 
 
+def _index_lookup_versions(
+    engine: QueryEngine,
+    manager: object,
+    name: str,
+    key: bytes,
+    snapshot: object,
+    *,
+    exact: bool,
+) -> tuple[tuple[object, HeapVersion], ...]:
+    """Return index hits with their versions, reusing exact-index validation when available.
+
+    ``IndexManager.lookup_versions`` is deliberately internal.  The fallback keeps QueryEngine's
+    existing collaborator boundary working for a custom manager that only implements the frozen
+    ``lookup`` door; the built-in exact path never takes it.  Proximity indexes must take the
+    fallback because their contract intentionally performs no heap validation in the manager.
+    """
+    lookup_versions = getattr(manager, "lookup_versions", None)
+    if exact and callable(lookup_versions):
+        return tuple(lookup_versions(name, key, snapshot))
+    lookup = getattr(manager, "lookup")
+    return tuple((ref, engine.heap.read(ref)) for ref in lookup(name, key, snapshot))
+
+
 def _index_seek(
     engine: QueryEngine, node: IndexSeek, context: _Context
 ) -> Iterator[_Row]:
@@ -2121,10 +2146,16 @@ def _index_seek(
         for position, expression in zip(positions, node.key_values):
             template[position] = _as_value(_evaluate(expression, row, context))
         key = index_key(template, positions)
-        for ref in manager.lookup(node.index, key, snapshot):  # type: ignore[attr-defined]
+        for ref, version in _index_lookup_versions(
+            engine,
+            manager,
+            node.index,
+            key,
+            snapshot,
+            exact=node.visibility is IndexVisibility.EXACT,
+        ):
             if ref in ended:
                 continue  # ended by this transaction: the same rule the scan applies
-            version = engine.heap.read(ref)
             bindings = {} if single_source else dict(row.bindings)
             bindings[node.variable] = RowBinding(
                 variable=node.variable, table=node.table, ref=ref, version=version
@@ -2163,8 +2194,9 @@ def _edge_steps(
     **By index**, when every direction the pattern walks has its endpoint index present, owned
     by this table, and FRESH. A stored relationship row leads with its endpoints, so "the edges
     leaving this node" is exactly the question the ``ef_``/``et_`` indexes answer, and
-    ``IndexManager.lookup`` discharges section 8.7 on the way: every candidate is validated
-    against the heap under this snapshot, so the hits are the edges the scan would have kept.
+    ``IndexManager.lookup_versions`` discharges section 8.7 on the way: every candidate is
+    validated against the heap under this snapshot, so the hits are the edges the scan would have
+    kept, together with the immutable versions that proved them.
     Before this existed, a reverse hop into a well-referenced node of a 2500-node graph read all
     3600 edges and cost 1.46 s.
 
@@ -2241,24 +2273,36 @@ def _edge_steps(
         """Yield the node's edges from the endpoint indexes, validated against the heap."""
         if outgoing:
             context.count("edge_lookups")
-            for ref in lookup(from_name, index_key((record_id, None), (0,)), snapshot):
+            for ref, version in _index_lookup_versions(
+                engine,
+                manager,
+                cast(str, from_name),
+                index_key((cast(Value, record_id), None), (0,)),
+                snapshot,
+                exact=True,
+            ):
                 if ref in ended:
                     continue
-                version = engine.heap.read(ref)
-                version = owner_version(ref, version)
-                if version is None:
+                owner = owner_version(ref, version)
+                if owner is None:
                     continue
-                yield ref, version, to_table, version.values[1]
+                yield ref, owner, to_table, owner.values[1]
         if incoming:
             context.count("edge_lookups")
-            for ref in lookup(to_name, index_key((None, record_id), (1,)), snapshot):
+            for ref, version in _index_lookup_versions(
+                engine,
+                manager,
+                cast(str, to_name),
+                index_key((None, cast(Value, record_id)), (1,)),
+                snapshot,
+                exact=True,
+            ):
                 if ref in ended:
                     continue
-                version = engine.heap.read(ref)
-                version = owner_version(ref, version)
-                if version is None:
+                owner = owner_version(ref, version)
+                if owner is None:
                     continue
-                yield ref, version, from_table, version.values[0]
+                yield ref, owner, from_table, owner.values[0]
 
     maps: list[tuple[dict, dict]] = []
 
