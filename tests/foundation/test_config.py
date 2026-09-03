@@ -57,6 +57,7 @@ def test_defaults_match_the_contract() -> None:
     assert config.max_transaction_rows is None
     assert config.max_transaction_bytes is None
     assert config.max_wal_batch_bytes is None
+    assert config.max_index_build_entries is None
     assert config.metrics == "noop"
     assert config.metrics_destination is None
     assert config.allow_remote_metrics is False
@@ -78,6 +79,11 @@ def test_descriptor_revalidation_extends_the_positional_surface_only_at_its_tail
     fields = tuple(
         field for field in dataclasses.fields(DatabaseConfig) if not field.kw_only
     )
+    assert next(
+        field
+        for field in dataclasses.fields(DatabaseConfig)
+        if field.name == "max_index_build_entries"
+    ).kw_only
     assert tuple(field.name for field in fields[-3:]) == (
         "read_only",
         "descriptor_revalidation",
@@ -254,6 +260,7 @@ def test_a_positive_wal_maximum_is_canonicalized() -> None:
         "max_transaction_rows",
         "max_transaction_bytes",
         "max_wal_batch_bytes",
+        "max_index_build_entries",
     ],
 )
 @pytest.mark.parametrize("value", [0, -1, "1024", 1024.5, True])
@@ -780,6 +787,7 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         max_transaction_rows=_HostileInt(128),
         max_transaction_bytes=_HostileInt(16384),
         max_wal_batch_bytes=_HostileInt(8192),
+        max_index_build_entries=_HostileInt(4096),
         vector_exact_scan_threshold=_HostileInt(128),
         vector_ef_search=_HostileInt(640),
     )
@@ -802,6 +810,7 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         "max_transaction_rows",
         "max_transaction_bytes",
         "max_wal_batch_bytes",
+        "max_index_build_entries",
         "vector_exact_scan_threshold",
         "vector_ef_search",
     ):

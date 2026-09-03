@@ -76,6 +76,7 @@ from okto_grafx.domain.errors import (
     GrafxLeaseStolen,
     GrafxLeaseTimeout,
     GrafxRecoveryRefused,
+    GrafxSchemaVersionMismatch,
     GrafxTransactionBudgetExceeded,
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
@@ -84,6 +85,7 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
     CATALOG_LEGACY_FORMAT_VERSION,
+    Catalog,
 )
 from okto_grafx.domain.ids import (
     NO_CSN,
@@ -97,13 +99,26 @@ from okto_grafx.domain.ids import (
     TxnId,
 )
 from okto_grafx.domain.index.records import change_of
+from okto_grafx.domain.index.catalog import (
+    CatalogIndexDefinition,
+    IndexGenerationDescriptor,
+    IndexGenerationState,
+    identity_index_name,
+)
+from okto_grafx.domain.index.definition import (
+    RECORD_ID_KEY_DERIVATION,
+    IndexDefinition,
+    automatic_index_definitions,
+)
+from okto_grafx.domain.index.keys import identity_index_sizing
+from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.coordination import ProcessCoordinator
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
 from okto_grafx.domain.page.layout import MAX_U64
 from okto_grafx.domain.recovery.decision import CommittedReplay, committed_replay
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
-from okto_grafx.domain.model.schema import ENDPOINT_COLUMN_COUNT, encode_tuple
+from okto_grafx.domain.model.schema import ENDPOINT_COLUMN_COUNT, TableDef, encode_tuple
 from okto_grafx.domain.page import HEADER_PAGE_INDEX, Page
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.txn.commit_record import CommitPayload, FileIdMap, PageTouch
@@ -123,6 +138,7 @@ from okto_grafx.domain.txn.intents import (
 )
 from okto_grafx.domain.txn.partitions import (
     page_partition,
+    partition_key,
     partition_of,
     validate_partitions_per_table,
 )
@@ -281,6 +297,17 @@ class _IdentityPlan:
     record_ids: dict[int, int]
     leased_positions: frozenset[int]
     reservation_lsn: Lsn | None = None
+
+
+@dataclass(slots=True)
+class _IndexCatalogActivationPlan:
+    """Detached exact generations one transaction must finish before publishing catalog v2."""
+
+    definitions: tuple[IndexDefinition, ...]
+    page_images: tuple[tuple[tuple[str, PageIndex], bytes], ...]
+    read_partitions: frozenset[int]
+    write_partitions: frozenset[int]
+    state: Literal["planned", "built", "failed"] = "planned"
 
 
 @dataclass(frozen=True, slots=True)
@@ -625,6 +652,7 @@ class TransactionManager:
         "_partitions_per_table",
         "_identity_lease_size",
         "_identity_leases",
+        "_index_catalog_activation_plans",
         "_identity_process",
         "_identity_process_invalid",
         "_process_identity_provider",
@@ -650,6 +678,7 @@ class TransactionManager:
         "_max_transaction_rows",
         "_max_transaction_bytes",
         "_max_wal_batch_bytes",
+        "_max_index_build_entries",
         "_writable",
         "_closed",
         "_close_quiesced",
@@ -680,6 +709,7 @@ class TransactionManager:
         max_transaction_rows: int | None = None,
         max_transaction_bytes: int | None = None,
         max_wal_batch_bytes: int | None = None,
+        max_index_build_entries: int | None = None,
         database_uuid: bytes | None = None,
         control_format_version: int = 1,
         control_file_nonce: int = 0,
@@ -703,8 +733,11 @@ class TransactionManager:
         * ``writable`` -- the capability to open write transactions or checkpoint. Read-only
           composition passes ``False`` so both doors refuse before coordination, WAL or storage;
           the compatible default remains ``True`` for existing composition roots.
-        * the three ``max_*`` values -- opt-in transaction admission limits. ``None`` preserves
-          existing behaviour; direct composition must provide exact positive integers.
+        * the three transaction ``max_*`` values -- opt-in transaction admission limits.
+          ``None`` preserves existing behaviour; direct composition must provide exact positive
+          integers.
+        * ``max_index_build_entries`` -- the separate opt-in admission limit for detached exact
+          generation batches; it does not change transaction row/byte accounting.
         """
         if not isinstance(writable, bool):
             raise GrafxConfigurationError(
@@ -759,6 +792,9 @@ class TransactionManager:
         self._identity_process: object = provider()
         self._identity_process_invalid: bool = False
         self._identity_leases: dict[int, _IdentityLease] = {}
+        self._index_catalog_activation_plans: dict[
+            TxnId, _IndexCatalogActivationPlan
+        ] = {}
         self._commit_lock_timeout: float = _require_timeout(
             "commit_lock_timeout", commit_lock_timeout
         )
@@ -808,6 +844,9 @@ class TransactionManager:
         )
         self._max_wal_batch_bytes = _require_optional_positive_limit(
             "max_wal_batch_bytes", max_wal_batch_bytes
+        )
+        self._max_index_build_entries = _require_optional_positive_limit(
+            "max_index_build_entries", max_index_build_entries
         )
         self._lease_guard: LeaseGuard | None = None
         self._participant_section_name: str = (
@@ -1011,6 +1050,478 @@ class TransactionManager:
             image,
             capability=self._page_staging_capability,
         )
+
+    def prepare_identity_index_activation(self, txn: TransactionContext) -> bool:
+        """Stage one explicit, atomic catalog-v2 identity-index activation.
+
+        Preparation photographs committed catalog/index authority under ``COMMIT_SECTION`` and
+        stages only catalog page values.  The physical generations are deliberately deferred to
+        :meth:`_build_index_catalog_activation`: commit's first OCC pass must still get the last
+        word, and the detached files must be built while the writer lease and commit section are
+        both held.  ``False`` is the durable no-op result for a v2 catalog whose required identity
+        generations are already active and fresh.
+        """
+
+        self._require_not_closed("prepare identity-index activation")
+        self._require_owned(txn)
+        self._require_active(txn)
+        self._require_writable("prepare identity-index activation")
+        if txn.mode is not TransactionMode.WRITE:
+            raise GrafxTransactionStateError(
+                "Identity-index activation requires a write transaction.",
+                operation="prepare identity-index activation",
+                txn_id=txn.txn_id,
+                mode=txn.mode.value,
+            )
+        if txn.txn_id in self._index_catalog_activation_plans:
+            raise GrafxTransactionStateError(
+                "This transaction already owns an identity-index activation plan.",
+                operation="prepare identity-index activation",
+                txn_id=txn.txn_id,
+            )
+        if (
+            txn.wrote
+            or txn.read_partitions
+            or txn.row_refs
+            or txn._staging_marks
+            or txn._pending_row_refs
+            or txn._effective_row_tables is not None
+        ):
+            raise GrafxTransactionStateError(
+                "Identity-index activation requires a fresh, activation-only transaction.",
+                operation="prepare identity-index activation",
+                field="activation_transaction",
+                txn_id=txn.txn_id,
+            )
+
+        with self._participant_section():
+            self._require_not_closed("prepare identity-index activation")
+            self._require_current_active(txn)
+            self._require_recovery_complete()
+            with self.schema_artifact_section(sync_if=lambda: True):
+                source = getattr(self._catalog, "catalog", None)
+                if not isinstance(source, Catalog):
+                    raise GrafxUnsupportedOperation(
+                        "Identity-index activation needs the concrete persistent catalog.",
+                        operation="prepare identity-index activation",
+                        field="catalog",
+                        value=type(source).__name__,
+                    )
+                manager = self._index_manager
+                if manager is None:
+                    raise GrafxUnsupportedOperation(
+                        "Identity-index activation needs the exact index manager.",
+                        operation="prepare identity-index activation",
+                        field="indexes",
+                    )
+                published = self._published_state_in_section().last_committed_lsn
+                definitions = self._plan_identity_index_activation(
+                    txn,
+                    source,
+                    published,
+                )
+                if definitions is None:
+                    return False
+
+                candidate, runtime_definitions = definitions
+                self._validate_index_build_entry_budget(
+                    runtime_definitions,
+                    published,
+                    txn_id=txn.txn_id,
+                )
+                staged = self._catalog.stage(candidate)
+                for page_index, image in staged:
+                    self._stage_page_image(
+                        txn,
+                        self._file_ids.catalog_file,
+                        page_index,
+                        image,
+                    )
+                self._index_catalog_activation_plans[txn.txn_id] = (
+                    _IndexCatalogActivationPlan(
+                        runtime_definitions,
+                        tuple(sorted(txn.page_images.items())),
+                        frozenset(txn.read_partitions),
+                        frozenset(txn.write_partitions),
+                    )
+                )
+                return True
+
+    def _validate_index_build_entry_budget(
+        self,
+        definitions: Sequence[IndexDefinition],
+        through_lsn: Lsn,
+        *,
+        txn_id: TxnId,
+    ) -> None:
+        """Refuse an oversized activation batch before staging catalog or index bytes."""
+
+        limit = self._max_index_build_entries
+        if limit is None:
+            return
+        count = getattr(
+            self._index_manager,
+            "_count_detached_exact_generation_entries",
+            None,
+        )
+        if not callable(count):
+            raise GrafxUnsupportedOperation(
+                "Index-build admission needs exact detached-generation accounting.",
+                operation="prepare identity-index activation",
+                field="indexes",
+                value=type(self._index_manager).__name__,
+            )
+        observed = 0
+        for definition in definitions:
+            observed += count(
+                definition,
+                through_lsn,
+                remaining=limit - observed,
+            )
+            if observed > limit:
+                raise GrafxTransactionBudgetExceeded(
+                    f"Index shadow-build batch for transaction {txn_id} would exceed "
+                    f"max_index_build_entries: limit {limit}, observed {observed}.",
+                    field="max_index_build_entries",
+                    limit=limit,
+                    observed=observed,
+                    txn_id=txn_id,
+                )
+
+    def _plan_identity_index_activation(
+        self,
+        txn: TransactionContext,
+        source: Catalog,
+        published_lsn: Lsn,
+    ) -> tuple[Catalog, tuple[IndexDefinition, ...]] | None:
+        """Return a detached catalog candidate and every generation it must build."""
+
+        candidate = Catalog.deserialize(source.serialize())
+        endpoint_tables = self._identity_endpoint_tables(source)
+        occupied = self._index_generation_nonces(source)
+        runtime_definitions: list[IndexDefinition] = []
+
+        def allocate() -> int:
+            nonce = self._index_manager._allocate_detached_generation_nonce(occupied)
+            # Allocation is discovery rather than reservation.  Remembering the result in this
+            # plan is therefore mandatory: two planned shadows must never be offered one nonce.
+            occupied.add(nonce)
+            return nonce
+
+        if source.format_version == CATALOG_LEGACY_FORMAT_VERSION:
+            logical_definitions: list[CatalogIndexDefinition] = []
+            indexed_tables: dict[int, TableDef] = {}
+            for definition in self._automatic_exact_activation_definitions(source):
+                table = source.table_by_id(definition.table_id)
+                nonce = allocate()
+                generation = IndexGenerationDescriptor(
+                    artifact_nonce=nonce,
+                    bucket_count=definition.bucket_count,
+                    state=IndexGenerationState.ACTIVE,
+                )
+                logical = CatalogIndexDefinition(
+                    name=definition.name,
+                    table_id=definition.table_id,
+                    table_name=definition.table_name,
+                    positions=definition.positions,
+                    visibility=definition.visibility,
+                    key_derivation=definition.key_derivation,
+                    automatic=True,
+                    generations=(generation,),
+                )
+                logical_definitions.append(logical)
+                runtime_definitions.append(logical.runtime_definition(generation))
+                indexed_tables[table.table_id] = table
+
+            snapshot = Snapshot(published_lsn)
+            for table in endpoint_tables:
+                visible_rows = sum(1 for _ref, _version in self._heap.scan(table, snapshot))
+                expected, bucket_count = identity_index_sizing(visible_rows)
+                nonce = allocate()
+                generation = IndexGenerationDescriptor(
+                    artifact_nonce=nonce,
+                    bucket_count=bucket_count,
+                    state=IndexGenerationState.ACTIVE,
+                )
+                logical = CatalogIndexDefinition(
+                    name=identity_index_name(table.table_id),
+                    table_id=table.table_id,
+                    table_name=table.name,
+                    positions=(),
+                    visibility=IndexVisibility.EXACT,
+                    key_derivation=RECORD_ID_KEY_DERIVATION,
+                    automatic=True,
+                    expected_cardinality=expected,
+                    generations=(generation,),
+                )
+                logical_definitions.append(logical)
+                runtime_definitions.append(logical.runtime_definition(generation))
+                indexed_tables[table.table_id] = table
+
+            self._declare_complete_table_reads(txn, indexed_tables)
+            candidate.upgrade_index_catalog(logical_definitions)
+            return candidate, tuple(runtime_definitions)
+
+        if source.format_version != CATALOG_FORMAT_VERSION:
+            raise GrafxSchemaVersionMismatch(
+                f"Catalog format {source.format_version} cannot activate identity indexes.",
+                field="format_version",
+                value=source.format_version,
+                supported=CATALOG_FORMAT_VERSION,
+            )
+
+        changed_tables: dict[int, TableDef] = {}
+        snapshot = Snapshot(published_lsn)
+        for table in endpoint_tables:
+            name = identity_index_name(table.table_id)
+            try:
+                logical = source.index_definition(name)
+            except GrafxConfigurationError:
+                # A valid stored v2 catalog normally cannot take this branch.  Keeping the
+                # explicit repair shape is useful for a candidate that gained a relationship in
+                # the same future DDL protocol, while validation still owns the final verdict.
+                logical = None
+
+            active = None if logical is None else logical.active_generation()
+            needs_generation = active is None
+            if active is not None:
+                # Existing-only synchronization in schema_artifact_section has already resolved
+                # this exact catalog generation.  Absence or physical-definition mismatch must
+                # propagate fail-closed; only a well-formed but stale generation is rebuildable.
+                index = self._index_manager.active_index(name, catalog=source)
+                required = self._heap.committed_high_water(table)
+                needs_generation = bool(
+                    index.check_freshness(
+                        published_lsn,
+                        required_lsn=required,
+                        persist=False,
+                    )
+                )
+            if not needs_generation:
+                continue
+
+            visible_rows = sum(1 for _ref, _version in self._heap.scan(table, snapshot))
+            expected, sized_bucket_count = identity_index_sizing(visible_rows)
+            if logical is None:
+                bucket_count = sized_bucket_count
+                generations: tuple[IndexGenerationDescriptor, ...] = ()
+                expected_cardinality = expected
+            else:
+                bucket_count = (
+                    active.bucket_count
+                    if active is not None
+                    else max(
+                        generation.bucket_count
+                        for generation in logical.generations
+                    )
+                    if logical.generations
+                    else sized_bucket_count
+                )
+                generations = tuple(
+                    generation.mark_stale() for generation in logical.generations
+                )
+                expected_cardinality = logical.expected_cardinality
+
+            nonce = allocate()
+            generation = IndexGenerationDescriptor(
+                artifact_nonce=nonce,
+                bucket_count=bucket_count,
+                state=IndexGenerationState.ACTIVE,
+            )
+            replacement = CatalogIndexDefinition(
+                name=name,
+                table_id=table.table_id,
+                table_name=table.name,
+                positions=(),
+                visibility=IndexVisibility.EXACT,
+                key_derivation=RECORD_ID_KEY_DERIVATION,
+                automatic=True,
+                expected_cardinality=expected_cardinality,
+                generations=tuple(
+                    sorted(
+                        (*generations, generation),
+                        key=lambda item: item.artifact_nonce,
+                    )
+                ),
+            )
+            if logical is None:
+                candidate.add_index_definition(replacement)
+            else:
+                candidate.replace_index_definition(replacement)
+            runtime_definitions.append(replacement.runtime_definition(generation))
+            changed_tables[table.table_id] = table
+
+        if not runtime_definitions:
+            return None
+        self._declare_complete_table_reads(txn, changed_tables)
+        # Serialize now, before staging, so complete v2 authority validation cannot be deferred
+        # until after a detached file has been built.
+        candidate.serialize()
+        return candidate, tuple(runtime_definitions)
+
+    def _automatic_exact_activation_definitions(
+        self, catalog: Catalog
+    ) -> tuple[IndexDefinition, ...]:
+        """Choose one deterministic v1 automatic path for each physical registry name.
+
+        Table names are case-sensitive while index files and registry keys are not.  A valid v1
+        catalog can therefore contain ``Person`` and ``person`` while only one of ``pk_Person``
+        and ``pk_person`` is attachable; the other table deliberately uses the heap fallback.
+        Catalog v2 preserves that supported state by promoting the registered winner, or the
+        first table-id/name candidate when no process-local winner exists, rather than refusing
+        the whole migration or silently swapping which table is accelerated.
+        """
+
+        grouped: dict[str, list[IndexDefinition]] = {}
+        for table in catalog.tables():
+            for definition in automatic_index_definitions(table):
+                if definition.visibility is IndexVisibility.EXACT:
+                    grouped.setdefault(definition.registry_key, []).append(definition)
+
+        registered: dict[str, IndexDefinition] = {}
+        indexes = getattr(self._index_manager, "indexes", None)
+        if callable(indexes):
+            registered = {
+                index.definition.registry_key: index.definition for index in indexes()
+            }
+
+        selected: list[IndexDefinition] = []
+        for key in sorted(grouped):
+            candidates = sorted(
+                grouped[key],
+                key=lambda item: (item.table_id, item.table_name, item.name),
+            )
+            incumbent = registered.get(key)
+            winner = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if incumbent is not None
+                    and type(incumbent) is type(candidate)
+                    and incumbent.name == candidate.name
+                    and incumbent.table_id == candidate.table_id
+                    and incumbent.table_name == candidate.table_name
+                    and incumbent.positions == candidate.positions
+                    and incumbent.visibility is candidate.visibility
+                    and incumbent.key_derivation == candidate.key_derivation
+                ),
+                None,
+            )
+            if winner is not None:
+                assert incumbent is not None
+                selected.append(incumbent)
+            else:
+                selected.append(candidates[0])
+        return tuple(selected)
+
+    def _index_generation_nonces(self, catalog: Catalog) -> set[int]:
+        """Return every catalog or legacy-artifact nonce that this activation must avoid."""
+
+        occupied = {
+            generation.artifact_nonce
+            for definition in catalog.index_definitions()
+            for generation in definition.generations
+        }
+        indexes = getattr(self._index_manager, "indexes", None)
+        if callable(indexes):
+            for index in indexes():
+                header = index.open()
+                if header.artifact_nonce:
+                    occupied.add(header.artifact_nonce)
+        return occupied
+
+    @staticmethod
+    def _identity_endpoint_tables(catalog: Catalog) -> tuple[TableDef, ...]:
+        """Return each node table referenced by a relationship exactly once."""
+
+        by_name = {table.name: table for table in catalog.tables()}
+        selected: dict[int, TableDef] = {}
+        for relation in catalog.tables():
+            if relation.kind != "rel":
+                continue
+            for name in (relation.from_table, relation.to_table):
+                table = by_name.get(str(name))
+                if table is None or table.kind != "node":
+                    raise GrafxCorruptionDetected(
+                        f"Relationship {relation.name!r} points at missing or non-node "
+                        f"endpoint {name!r}.",
+                        field="endpoint",
+                        value=name,
+                        table=relation.name,
+                    )
+                selected[table.table_id] = table
+        return tuple(selected[key] for key in sorted(selected))
+
+    def _declare_complete_table_reads(
+        self, txn: TransactionContext, tables: dict[int, TableDef]
+    ) -> None:
+        """Fence every row partition of each heap table a detached build will scan."""
+
+        for table_id in sorted(tables):
+            for partition in range(self._partitions_per_table):
+                txn.note_read(partition_key(table_id, partition))
+
+    def _build_index_catalog_activation(
+        self, txn: TransactionContext, through_lsn: Lsn
+    ) -> None:
+        """Durably build planned shadows while commit owns writer and publication fences."""
+
+        plan = self._index_catalog_activation_plans.get(txn.txn_id)
+        if plan is None:
+            return
+        self._validate_index_catalog_activation_plan(txn, plan)
+        if plan.state == "built":
+            return
+        if plan.state == "failed":
+            raise GrafxTransactionStateError(
+                "A failed detached activation plan cannot be reused; roll back and retry with "
+                "new generation nonces.",
+                operation="build identity-index activation",
+                txn_id=txn.txn_id,
+            )
+        try:
+            for definition in plan.definitions:
+                self._index_manager._build_detached_exact_generation(
+                    definition,
+                    through_lsn,
+                )
+        except BaseException:
+            plan.state = "failed"
+            raise
+        plan.state = "built"
+
+    @staticmethod
+    def _validate_index_catalog_activation_plan(
+        txn: TransactionContext,
+        plan: _IndexCatalogActivationPlan,
+    ) -> None:
+        """Refuse any work added to the private activation transaction after planning.
+
+        Detached generations describe only the fenced durable heap.  Letting the same
+        transaction add a row afterwards would materialise that row provisionally before the
+        shadow build, where it is intentionally invisible, and could publish an ACTIVE index
+        that omits its own commit.  The public door always opens a fresh internal transaction;
+        this seal is the defensive invariant at the manager boundary.
+        """
+
+        if (
+            txn.row_intents
+            or txn.pending_records
+            or txn.row_refs
+            or txn._staging_marks
+            or txn._pending_row_refs
+            or txn._effective_row_tables not in (None, frozenset())
+            or tuple(sorted(txn.page_images.items())) != plan.page_images
+            or frozenset(txn.read_partitions) != plan.read_partitions
+            or frozenset(txn.write_partitions) != plan.write_partitions
+        ):
+            raise GrafxTransactionStateError(
+                "An identity-index activation transaction was modified after its catalog "
+                "shadow plan was sealed; roll it back and retry activation by itself.",
+                operation="build identity-index activation",
+                field="activation_transaction",
+                txn_id=txn.txn_id,
+            )
 
     def published_state(self) -> CommitState:
         """Return the published commit state, or an empty one when nothing was ever published."""
@@ -1779,6 +2290,7 @@ class TransactionManager:
                 txn._staging_marks.clear()
         reader_failure = self._release_reader(txn)
         failure = _accumulate_failure(failure, reader_failure)
+        self._index_catalog_activation_plans.pop(txn.txn_id, None)
         self._open.pop(txn.txn_id, None)
         mode = txn.mode.value
         if self._mode_counts[mode] > 0:
@@ -2576,6 +3088,9 @@ class TransactionManager:
                                         txn._pending_row_refs.clear()
                                         txn._staging_marks.clear()
                                 self._open.pop(txn.txn_id, None)
+                                self._index_catalog_activation_plans.pop(
+                                    txn.txn_id, None
+                                )
                             failure = _accumulate_failure(failure, txn_failure)
                         pin = self._participant_pin
                         if pin is not None:
@@ -2585,6 +3100,7 @@ class TransactionManager:
                             )
                         self._participant_pin = None
                         self._identity_leases.clear()
+                        self._index_catalog_activation_plans.clear()
                         self._open.clear()
                         for mode_name in self._mode_counts:
                             self._mode_counts[mode_name] = 0
@@ -2707,6 +3223,9 @@ class TransactionManager:
             self._require_writable("commit a write transaction")
             self._require_recovery_complete()
             self._validate_staged_inputs(txn)
+            activation_plan = self._index_catalog_activation_plans.get(txn.txn_id)
+            if activation_plan is not None:
+                self._validate_index_catalog_activation_plan(txn, activation_plan)
             txn.validate_budgets()
             # Preserve the long-standing fail-before-lock boundary for malformed or obviously
             # below-floor explicit ids. A fresh cross-process proof is repeated later under the
@@ -2929,6 +3448,12 @@ class TransactionManager:
                                     commit_trace.increment(COMMIT_RETARGETS_TOTAL)
                             self._materialized = None
                             self._validate_wal_batch_budget(txn, records)
+                            if commit_trace is not None and (
+                                txn.txn_id in self._index_catalog_activation_plans
+                            ):
+                                commit_trace.phase("index")
+                            with self._close_wait_hazard():
+                                self._build_index_catalog_activation(txn, current)
                             self._validate_lease(lease)
                             if commit_trace is not None:
                                 commit_trace.phase("append")
@@ -3010,6 +3535,24 @@ class TransactionManager:
                                 commit_trace.phase("index")
                             with self._close_wait_hazard():
                                 self._apply_index_changes(txn, committed)  # step 3.6
+                            if catalog_touched:
+                                # Catalog pages are now the durable runtime authority.  Adopt and
+                                # attach only existing files before publishing the v2 commit-state
+                                # fence; a referenced shadow that cannot be reopened is a
+                                # post-barrier failure and follows the ordinary redo path.
+                                with self._close_wait_hazard():
+                                    self._catalog.adopt(
+                                        self._catalog.read_from_pages()
+                                    )
+                                    observe = getattr(
+                                        self._index_manager,
+                                        "observe_published_lsn",
+                                        None,
+                                    )
+                                    if callable(observe):
+                                        observe(committed)
+                                    if self._index_sync is not None:
+                                        self._index_sync()
                             if commit_trace is not None:
                                 commit_trace.phase("publish")
                             with self._close_wait_hazard():
@@ -5581,6 +6124,7 @@ class TransactionManager:
         while this component holds anything (A91).
         """
         self._open.pop(txn.txn_id, None)
+        self._index_catalog_activation_plans.pop(txn.txn_id, None)
         if self._mode_counts[mode] > 0:
             self._mode_counts[mode] -= 1
         return self._mode_counts[mode]

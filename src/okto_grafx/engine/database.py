@@ -1309,6 +1309,10 @@ class Maintenance:
         """Delegate the repair to :meth:`Database.rebuild_vector_index`."""
         return self._database.rebuild_vector_index(space)
 
+    def ensure_identity_indexes(self) -> None:
+        """Delegate explicit persistent identity-index activation to the database."""
+        self._database.ensure_identity_indexes()
+
     def publish_metrics(self) -> None:
         """Delegate explicit metric publication to :meth:`Database.publish_metrics`."""
         self._database.publish_metrics()
@@ -2609,6 +2613,49 @@ class Database:
                 verifier = factory()  # type: ignore[operator]
                 report = verifier.verify(wanted_scope)  # type: ignore[attr-defined]
                 return _verification_report_view(report, requested_scope=wanted_scope)
+
+    def ensure_identity_indexes(self) -> None:
+        """Persist and activate every exact access path required by endpoint identities.
+
+        This is the explicit, one-way catalog-v1 to catalog-v2 door.  It constructs complete
+        nonced shadow generations under the ordinary writer/commit fences, barriers those files
+        before the catalog can name them, and publishes the complete catalog change through the
+        existing WAL-before-data protocol.  Repeating it after every required identity generation
+        is active and fresh performs no durable write.  Read-only handles always refuse the door,
+        including when the current durable state would make it a no-op.
+        """
+
+        with self._public_operation("ensure_identity_indexes"):
+            self._require_open()
+            self._require_writable("ensure identity indexes")
+            transaction = self.begin("write")
+            try:
+                self._transactions.prepare_identity_index_activation(
+                    transaction._context
+                )
+                transaction.commit()
+            except BaseException as failure:
+                if transaction._context.active:
+                    try:
+                        transaction.rollback()
+                    except BaseException as cleanup_failure:
+                        _note_cleanup_failure(failure, cleanup_failure)
+                raise
+
+            manager = self._indexes
+            active_indexes = getattr(manager, "active_indexes", None)
+            if callable(active_indexes):
+                active = tuple(active_indexes(catalog=self._catalog.catalog))
+                self._attached_indexes = tuple(
+                    _builtin_text(index.name, field="attached_index", empty=False)
+                    for index in active
+                )
+                self._stale_indexes = tuple(
+                    _builtin_text(index.name, field="stale_index", empty=False)
+                    for index in active
+                    if index.stale
+                )
+            return None
 
     def rebuild_vector_index(self, space: str) -> VectorIndexView:
         """Re-derive one vector index from the heap, and report it only once it is healthy.

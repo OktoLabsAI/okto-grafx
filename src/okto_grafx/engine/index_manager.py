@@ -52,7 +52,7 @@ with a located error instead of hanging (amendment A42).
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TypeVar
 
@@ -109,6 +109,7 @@ from okto_grafx.domain.index.visibility import (
 )
 from okto_grafx.domain.model.record import HeapVersion
 from okto_grafx.domain.model.catalog import CATALOG_LEGACY_FORMAT_VERSION
+from okto_grafx.domain.model.schema import TableDef
 from okto_grafx.domain.page import (
     HEADER_PAGE_INDEX,
     PAGE_HEADER_SIZE,
@@ -3083,7 +3084,9 @@ class IndexManager:
         "_heap_cache_certificates",
         "_artifact_nonce",
         "_artifact_claims",
+        "_detached_speculative_indexes",
         "_schema_observed",
+        "_schema_new_table_observed",
     )
 
     def __init__(
@@ -3110,7 +3113,9 @@ class IndexManager:
         self._heap_cache_certificates: dict[str, _IndexReadCertificate] = {}
         self._artifact_nonce = artifact_nonce
         self._artifact_claims: dict[IndexStore, set[object]] = {}
+        self._detached_speculative_indexes: set[IndexStore] = set()
         self._schema_observed: dict[int, dict[IndexStore, int]] = {}
+        self._schema_new_table_observed: dict[int, set[IndexStore]] = {}
 
     # --- registry ---------------------------------------------------------------------------
 
@@ -3450,18 +3455,93 @@ class IndexManager:
             raise
         return registered, artifact
 
+    def register_detached_speculative(
+        self,
+        index: IndexStore,
+        *,
+        complete_through: Lsn | None = None,
+    ) -> tuple[IndexStore, _SpeculativeIndexArtifact]:
+        """Observe a prebuilt nonced shadow without replacing committed registry authority.
+
+        A detached generation has already won exclusive ownership of its immutable physical
+        filename and completed verification.  Publishing it in ``_indexes`` before the catalog
+        commit would displace the old ACTIVE generation for every other transaction; routing it
+        through :meth:`register_speculative` would additionally treat its own nonced file as a
+        canonical collision and move the verified bytes aside.  This door validates the file,
+        claims it for rollback/provenance, and leaves it reachable only through the creating
+        transaction's explicit schema observation.
+        """
+        if not isinstance(index, IndexStore) or not isinstance(index, SecondaryIndex):
+            raise GrafxIndexError(
+                "A detached speculative index must implement the paged secondary-index "
+                "contract.",
+                field="index",
+                value=type(index).__name__,
+            )
+        if index.definition.artifact_nonce == 0:
+            raise GrafxIndexError(
+                f"Detached speculative index {index.name!r} needs a non-zero generation "
+                "nonce.",
+                field="artifact_nonce",
+                value=0,
+                index=index.name,
+            )
+        collision = next(
+            (
+                current
+                for current in self._indexes.values()
+                if current.file.casefold() == index.file.casefold()
+            ),
+            None,
+        )
+        if collision is not None:
+            raise GrafxIndexError(
+                f"Detached generation {index.file!r} is already registered as "
+                f"{collision.name!r}.",
+                field="file",
+                file=index.file,
+                index=index.name,
+                registered=collision.name,
+                retryable=True,
+            )
+        index._set_creation_nonce(index.definition.artifact_nonce)
+        if not index.exists() or not index.is_created():
+            raise GrafxIndexError(
+                f"Detached generation {index.file!r} is absent or incomplete.",
+                field="file",
+                file=index.file,
+                index=index.name,
+            )
+        index.open(proved_present=True)
+        self._finish_registration(
+            index,
+            complete_through=complete_through,
+            persist_stale=False,
+        )
+        generation = index._fresh_certificate()
+        artifact = self._claim_speculative(
+            index,
+            generation=generation,
+            created_file=False,
+            detached=True,
+        )
+        return index, artifact
+
     def _claim_speculative(
         self,
         index: IndexStore,
         *,
         generation: _IndexReadCertificate,
         created_file: bool,
+        detached: bool = False,
     ) -> _SpeculativeIndexArtifact:
         """Acquire one process-local DDL claim over an exact registry object."""
         owner = object()
         owners = self._artifact_claims.setdefault(index, set())
         try:
             owners.add(owner)
+            if detached:
+                self._detached_speculative_indexes.add(index)
             return _SpeculativeIndexArtifact(
                 index=index,
                 generation=generation,
@@ -3472,6 +3552,7 @@ class IndexManager:
             owners.discard(owner)
             if self._artifact_claims.get(index) is owners and not owners:
                 self._artifact_claims.pop(index, None)
+                self._detached_speculative_indexes.discard(index)
             raise
 
     def adopt_committed(
@@ -3562,9 +3643,11 @@ class IndexManager:
         claims = self._artifact_claims.get(expected)
         if claims is None or artifact.owner not in claims:
             return False
+        detached = expected in self._detached_speculative_indexes
         claims.remove(artifact.owner)
         if not claims:
             self._artifact_claims.pop(expected, None)
+            self._detached_speculative_indexes.discard(expected)
         if committed:
             return True
         if claims:
@@ -3572,6 +3655,12 @@ class IndexManager:
         key = expected.definition.registry_key
         current = self._indexes.get(key)
         if current is not expected:
+            if detached:
+                # A detached shadow deliberately never entered the global registry, but
+                # registration may still have bound a companion heap certificate while proving
+                # it.  Once its final rollback claim is gone, that cache key is unreachable too;
+                # retaining it would leak one entry for every refused schema statement.
+                self._heap_cache_certificates.pop(expected.file, None)
             return False
         if self._definition_is_durable(expected):
             return False
@@ -3615,6 +3704,25 @@ class IndexManager:
         created = index.stage_empty_observation(txn)
         observed = self._schema_observed.setdefault(txn_id, {})
         observed[index] = observed.get(index, 0) + 1
+        try:
+            committed_table = self._heap.catalog.catalog.table_by_id(
+                index.definition.table_id
+            )
+        except GrafxCorruptionDetected as failure:
+            if failure.details.get("field") != "table_id":
+                raise
+            committed_table = None
+        if committed_table is None or (
+            committed_table.name != index.definition.table_name
+            or not self._definition_matches_table_tolerantly(
+                index.definition,
+                committed_table,
+            )
+        ):
+            # A CREATE TABLE observation establishes the initial table watermark because every
+            # sibling index is born at this same schema commit.  An index added to an already
+            # committed table is different: schema bytes did not move that table's heap floor.
+            self._schema_new_table_observed.setdefault(txn_id, set()).add(index)
         return created
 
     def discard_schema_observation(
@@ -3636,6 +3744,11 @@ class IndexManager:
             observed[index] = remaining
         else:
             observed.pop(index, None)
+            new_table = self._schema_new_table_observed.get(txn_id)
+            if new_table is not None:
+                new_table.discard(index)
+                if not new_table:
+                    self._schema_new_table_observed.pop(txn_id, None)
             if not observed:
                 self._schema_observed.pop(txn_id, None)
         if created:
@@ -3678,7 +3791,15 @@ class IndexManager:
             )
         )
         for index in dict.fromkeys((*schema_indexes, *staged_indexes, *row_indexes)):
-            if self._indexes.get(index.definition.registry_key) is not index:
+            detached = (
+                index in schema_indexes
+                and index in self._detached_speculative_indexes
+                and bool(self._artifact_claims.get(index))
+            )
+            if (
+                self._indexes.get(index.definition.registry_key) is not index
+                and not detached
+            ):
                 raise GrafxIndexError(
                     f"Index {index.name!r} is no longer the registered artifact staged by "
                     f"transaction {txn_id}.",
@@ -4797,18 +4918,34 @@ class IndexManager:
         written_tables = _tables_written_by(txn)
         observed_tables: set[_TableIdentity] = set(written_tables or ())
         indexes = self._transaction_indexes(txn)
-        observations = {index.name: index.observed(txn) for index in indexes}
+        new_table_observations = self._schema_new_table_observed.get(
+            int(txn.txn_id), set()
+        )
+        # One transaction can hold the old committed generation and its detached replacement
+        # under the same logical name.  Object identity, not name, keeps their observations
+        # distinct until the catalog atomically selects the shadow.
+        observations = {index: index.observed(txn) for index in indexes}
         staged_tables = {
-            index.definition.table_id for index in indexes if observations[index.name]
+            index.definition.table_id for index in indexes if observations[index]
         }
         for index in indexes:
-            observed = observations[index.name]
+            observed = observations[index]
             moved = index.commit(txn, csn)
             identity = (
                 index.definition.table_id,
                 index.definition.table_name,
             )
-            if observed:
+            if observed and (
+                written_tables is None
+                or identity in written_tables
+                or index in new_table_observations
+            ):
+                # A schema-only observation proves the new artifact, not a heap mutation.
+                # Treating it as a row-table high-water advanced every older sibling index to
+                # the DDL commit without advancing its header, making a healthy PK unreadable
+                # immediately after adding an identity generation to that table.  Concrete
+                # transactions expose their exact written-table set; compatibility doubles
+                # without it retain the former observation-based inference.
                 observed_tables.add(identity)
             elif (written_tables is not None and identity in written_tables) or (
                 written_tables is None and index.definition.table_id in staged_tables
@@ -4844,12 +4981,14 @@ class IndexManager:
         for index in indexes:
             self._bind_local_heap_view(index)
         self._schema_observed.pop(int(txn.txn_id), None)
+        self._schema_new_table_observed.pop(int(txn.txn_id), None)
         return applied
 
     def rollback(self, txn: StagingTransaction) -> int:
         """Drop what this transaction staged into every index, and return how many were dropped."""
         dropped = sum(index.rollback(txn) for index in self.indexes())
         self._schema_observed.pop(int(txn.txn_id), None)
+        self._schema_new_table_observed.pop(int(txn.txn_id), None)
         return dropped
 
     def apply(self, record: WalRecord) -> bool:
@@ -5164,26 +5303,13 @@ class IndexManager:
             retryable=True,
         )
 
-    def _build_detached_exact_generation(
+    def _detached_exact_generation_source(
         self,
         definition: IndexDefinition,
         through_lsn: Lsn,
-    ) -> IndexStore:
-        """Build one complete, durable exact generation without publishing it.
+    ) -> tuple[Lsn, TableDef]:
+        """Validate one detached build request and return its fenced table source."""
 
-        The caller has already allocated the catalog-v2 generation nonce and fenced writers at
-        the global durable horizon supplied here.  This door deliberately does neither: it does
-        not allocate an identity, touch the registry, stage logical WAL or publish catalog
-        authority.  Exclusive physical-file creation is the ownership proof, so a competing or
-        orphaned path is refused rather than adopted.
-
-        Every committed heap version is retained, including historical versions, and every
-        committed end becomes a tombstone.  That makes the detached generation usable by
-        snapshots on either side of an update once a later catalog transaction publishes it.
-        Both verification directions run before the final data checkpoint establishes the
-        durability barrier.  A failed attempt leaves its uniquely nonced file unreachable and
-        drops this process's frames so a later unrelated flush cannot continue the orphan.
-        """
         if not isinstance(definition, IndexDefinition):
             raise GrafxIndexError(
                 "A detached index generation needs an IndexDefinition.",
@@ -5216,6 +5342,131 @@ class IndexManager:
                 table=table.name,
                 table_id=table.table_id,
             )
+        return position, table
+
+    def _detached_exact_generation_entries(
+        self,
+        definition: IndexDefinition,
+        position: Lsn,
+        table: TableDef,
+    ) -> Iterator[tuple[RecordRef, bytes, Csn | None]]:
+        """Yield exactly the durable entry images one detached generation will retain."""
+
+        for ref, version in self._heap.scan_all(table):
+            if is_provisional_csn(version.xmin):
+                continue
+            if not is_committed_csn(version.xmin):
+                raise GrafxCorruptionDetected(
+                    f"Record {version.record_id} of table {table.name!r} has invalid birth "
+                    f"stamp {version.xmin} during detached index construction.",
+                    file=self._heap.file,
+                    table=table.name,
+                    table_id=table.table_id,
+                    record_id=version.record_id,
+                    field="xmin",
+                    value=version.xmin,
+                )
+            if version.xmin > position:
+                raise GrafxIndexError(
+                    f"Detached generation {definition.name!r} is fenced through {position}, "
+                    f"but record {version.record_id} was committed at {version.xmin}.",
+                    field="through_lsn",
+                    value=position,
+                    observed=version.xmin,
+                    index=definition.name,
+                    table=table.name,
+                    record_id=version.record_id,
+                )
+
+            ended_at: Csn | None = None
+            if not is_open_end_csn(version.xmax):
+                if not is_committed_csn(version.xmax):
+                    raise GrafxCorruptionDetected(
+                        f"Record {version.record_id} of table {table.name!r} has invalid "
+                        f"end stamp {version.xmax} during detached index construction.",
+                        file=self._heap.file,
+                        table=table.name,
+                        table_id=table.table_id,
+                        record_id=version.record_id,
+                        field="xmax",
+                        value=version.xmax,
+                    )
+                if version.xmax > position:
+                    raise GrafxIndexError(
+                        f"Detached generation {definition.name!r} is fenced through "
+                        f"{position}, but record {version.record_id} ended at "
+                        f"{version.xmax}.",
+                        field="through_lsn",
+                        value=position,
+                        observed=version.xmax,
+                        index=definition.name,
+                        table=table.name,
+                        record_id=version.record_id,
+                    )
+                ended_at = version.xmax
+
+            key = definition.entry_key_for_record(version.record_id, version.values)
+            if key is not None:
+                yield ref, key, ended_at
+
+    def _count_detached_exact_generation_entries(
+        self,
+        definition: IndexDefinition,
+        through_lsn: Lsn,
+        *,
+        remaining: int | None = None,
+    ) -> int:
+        """Count final entries, stopping at ``remaining + 1`` when admission is bounded."""
+
+        if (
+            remaining is not None
+            and (
+                isinstance(remaining, bool)
+                or not isinstance(remaining, int)
+                or remaining < 0
+            )
+        ):
+            raise GrafxIndexError(
+                "A detached-generation entry remainder must be zero or more.",
+                field="remaining",
+                value=remaining,
+            )
+
+        position, table = self._detached_exact_generation_source(
+            definition, through_lsn
+        )
+        observed = 0
+        for _ref, _key, _ended_at in self._detached_exact_generation_entries(
+            definition, position, table
+        ):
+            observed += 1
+            if remaining is not None and observed > remaining:
+                return observed
+        return observed
+
+    def _build_detached_exact_generation(
+        self,
+        definition: IndexDefinition,
+        through_lsn: Lsn,
+    ) -> IndexStore:
+        """Build one complete, durable exact generation without publishing it.
+
+        The caller has already allocated the catalog-v2 generation nonce and fenced writers at
+        the global durable horizon supplied here.  This door deliberately does neither: it does
+        not allocate an identity, touch the registry, stage logical WAL or publish catalog
+        authority.  Exclusive physical-file creation is the ownership proof, so a competing or
+        orphaned path is refused rather than adopted.
+
+        Every committed heap version is retained, including historical versions, and every
+        committed end becomes a tombstone.  That makes the detached generation usable by
+        snapshots on either side of an update once a later catalog transaction publishes it.
+        Both verification directions run before the final data checkpoint establishes the
+        durability barrier.  A failed attempt leaves its uniquely nonced file unreachable and
+        drops this process's frames so a later unrelated flush cannot continue the orphan.
+        """
+        position, table = self._detached_exact_generation_source(
+            definition, through_lsn
+        )
 
         index = HashIndex(definition, self._pool, self._metrics)
         index._set_creation_nonce(definition.artifact_nonce)
@@ -5245,64 +5496,9 @@ class IndexManager:
             created = True
             index.create(proved_present=True)
 
-            for ref, version in self._heap.scan_all(table):
-                if is_provisional_csn(version.xmin):
-                    continue
-                if not is_committed_csn(version.xmin):
-                    raise GrafxCorruptionDetected(
-                        f"Record {version.record_id} of table {table.name!r} has invalid birth "
-                        f"stamp {version.xmin} during detached index construction.",
-                        file=self._heap.file,
-                        table=table.name,
-                        table_id=table.table_id,
-                        record_id=version.record_id,
-                        field="xmin",
-                        value=version.xmin,
-                    )
-                if version.xmin > position:
-                    raise GrafxIndexError(
-                        f"Detached generation {definition.name!r} is fenced through {position}, "
-                        f"but record {version.record_id} was committed at {version.xmin}.",
-                        field="through_lsn",
-                        value=position,
-                        observed=version.xmin,
-                        index=definition.name,
-                        table=table.name,
-                        record_id=version.record_id,
-                    )
-
-                ended_at: Csn | None = None
-                if not is_open_end_csn(version.xmax):
-                    if not is_committed_csn(version.xmax):
-                        raise GrafxCorruptionDetected(
-                            f"Record {version.record_id} of table {table.name!r} has invalid "
-                            f"end stamp {version.xmax} during detached index construction.",
-                            file=self._heap.file,
-                            table=table.name,
-                            table_id=table.table_id,
-                            record_id=version.record_id,
-                            field="xmax",
-                            value=version.xmax,
-                        )
-                    if version.xmax > position:
-                        raise GrafxIndexError(
-                            f"Detached generation {definition.name!r} is fenced through "
-                            f"{position}, but record {version.record_id} ended at "
-                            f"{version.xmax}.",
-                            field="through_lsn",
-                            value=position,
-                            observed=version.xmax,
-                            index=definition.name,
-                            table=table.name,
-                            record_id=version.record_id,
-                        )
-                    ended_at = version.xmax
-
-                key = definition.entry_key_for_record(
-                    version.record_id, version.values
-                )
-                if key is None:
-                    continue
+            for ref, key, ended_at in self._detached_exact_generation_entries(
+                definition, position, table
+            ):
                 index._apply_change(
                     IndexChange(
                         index=definition.name,

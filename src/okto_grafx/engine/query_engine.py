@@ -71,16 +71,27 @@ from okto_grafx.domain.errors import (
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
 )
-from okto_grafx.domain.ids import NO_CSN, RecordId, RecordRef
-from okto_grafx.domain.index.catalog import identity_index_name
+from okto_grafx.domain.ids import NO_CSN, Lsn, RecordId, RecordRef
+from okto_grafx.domain.index.catalog import (
+    CatalogIndexDefinition,
+    IndexGenerationDescriptor,
+    IndexGenerationState,
+    identity_index_name,
+)
 from okto_grafx.domain.index.definition import (
     RECORD_ID_KEY_DERIVATION,
+    IndexDefinition,
     automatic_index_definitions,
     index_definition_matches_table,
 )
-from okto_grafx.domain.index.keys import index_key, record_id_key
+from okto_grafx.domain.index.keys import (
+    identity_index_sizing,
+    index_key,
+    record_id_key,
+)
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.engine.index_manager import (
+    HashIndex,
     edge_from_index_name,
     edge_to_index_name,
     primary_key_index,
@@ -123,6 +134,7 @@ from okto_grafx.domain.txn.context import (
 )
 from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.txn.snapshot import Snapshot
+from okto_grafx.domain.wal.commit import partition_key
 from okto_grafx.domain.query.analysis import Aggregation, QueryAnalysis, analyze
 from okto_grafx.domain.query.ast import (
     Direction,
@@ -207,7 +219,11 @@ from okto_grafx.domain.query.tokens import (
 )
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.engine.buffer_pool import BufferPool
-from okto_grafx.domain.model.catalog import CATALOG_LEGACY_FORMAT_VERSION, Catalog
+from okto_grafx.domain.model.catalog import (
+    CATALOG_FORMAT_VERSION,
+    CATALOG_LEGACY_FORMAT_VERSION,
+    Catalog,
+)
 from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.metrics_catalog import MetricEmitter, metric
@@ -2030,10 +2046,51 @@ def _catalog_active_indexes(manager: object, catalog: Catalog) -> tuple[object, 
 
 
 def _catalog_active_index(
-    manager: object, name: str, catalog: Catalog
+    manager: object,
+    name: str,
+    catalog: Catalog,
+    *,
+    txn: object | None = None,
 ) -> object | None:
     """Return one catalog-authorized registered index, with a legacy-double fallback."""
 
+    scoped = getattr(manager, "active_indexes_for", None)
+    if txn is not None and callable(scoped):
+        logical = (
+            catalog.index_definition(name)
+            if catalog.format_version == CATALOG_FORMAT_VERSION
+            and catalog.has_index_definition(name)
+            else None
+        )
+        active_generation = None if logical is None else logical.active_generation()
+        expected = (
+            None
+            if logical is None or active_generation is None
+            else logical.runtime_definition(active_generation)
+        )
+        if expected is not None:
+            table = catalog.table_by_id(expected.table_id)
+            matches = tuple(
+                index
+                for index in scoped(
+                    expected.table_id,
+                    table_name=expected.table_name,
+                    table=table,
+                    txn=txn,
+                    catalog=catalog,
+                )
+                if getattr(index, "definition", None) == expected
+            )
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise GrafxIndexError(
+                    f"Transaction-scoped catalog authority resolved {len(matches)} stores "
+                    f"for index {name!r}.",
+                    field="index_authority",
+                    index=name,
+                    count=len(matches),
+                )
     active = getattr(manager, "active_index", None)
     if callable(active):
         return active(name, catalog=catalog)
@@ -2080,6 +2137,7 @@ class QueryEngine:
         "_query_spill",
         "_max_traversal_expansions",
         "_max_traversal_paths",
+        "_max_index_build_entries",
     )
 
     def __init__(
@@ -2102,6 +2160,7 @@ class QueryEngine:
         query_spill: QuerySpillFactory | None = None,
         max_traversal_expansions: int | None = None,
         max_traversal_paths: int | None = None,
+        max_index_build_entries: int | None = None,
     ) -> None:
         """Adopt one catalog, one heap, one pool and whichever engines this composition has."""
         self._catalog = catalog
@@ -2181,6 +2240,9 @@ class QueryEngine:
         )
         self._max_traversal_paths = _require_optional_positive_limit(
             "max_traversal_paths", max_traversal_paths
+        )
+        self._max_index_build_entries = _require_optional_positive_limit(
+            "max_index_build_entries", max_index_build_entries
         )
         self._metrics = MetricEmitter(metrics)
         self._clock = clock
@@ -2722,7 +2784,13 @@ class QueryEngine:
                     primary_key=node.primary_key,
                 )
             )
-            self._attach_primary_key_index(installed, statistics, undo, txn)
+            self._attach_primary_key_index(
+                installed,
+                statistics,
+                undo,
+                txn,
+                catalog=catalog,
+            )
             self._attach_vector_columns(installed, statistics, catalog, undo, txn)
             statistics["tables_created"] = statistics.get("tables_created", 0) + 1
         elif isinstance(node, CreateRelTable):
@@ -2736,7 +2804,13 @@ class QueryEngine:
                     to_table=node.to_table,
                 )
             )
-            self._attach_endpoint_indexes(installed, statistics, undo, txn)
+            self._attach_endpoint_indexes(
+                installed,
+                statistics,
+                undo,
+                txn,
+                catalog=catalog,
+            )
             statistics["tables_created"] = statistics.get("tables_created", 0) + 1
         else:  # pragma: no cover - the caller checked the type
             raise GrafxPlanError(
@@ -3031,10 +3105,22 @@ class QueryEngine:
         candidate: object,
         txn: object,
         undo: list[_SchemaEffect],
+        *,
+        detached: bool = False,
     ) -> object:
         """Register/adopt one index and journal its object, nonce and empty observation."""
-        register = getattr(self._indexes, "register_speculative", None)
+        register = getattr(
+            self._indexes,
+            "register_detached_speculative" if detached else "register_speculative",
+            None,
+        )
         if not callable(register):
+            if detached:
+                raise GrafxUnsupportedOperation(
+                    "Detached catalog generations need transaction-scoped index authority.",
+                    field="indexes",
+                    value=type(self._indexes).__name__,
+                )
             register = getattr(self._indexes, "register")
             registered = register(
                 candidate, complete_through=self._published_lsn_for_new_index()
@@ -3060,6 +3146,348 @@ class QueryEngine:
         )
         return registered
 
+    def _allocate_catalog_generation_nonce(self, catalog: Catalog) -> int:
+        """Allocate one v2 generation identity outside every known ownership domain.
+
+        The provider's storage probe excludes unreachable nonced files, while this inventory
+        also excludes catalog-owned generations and the durable identities of process-local
+        registrations.  Adding each planned definition to the working catalog before asking for
+        the next nonce makes a multi-index DDL one collision-free allocation sequence.
+        """
+        manager = self.require_indexes()
+        allocate = getattr(manager, "_allocate_detached_generation_nonce", None)
+        if not callable(allocate):
+            raise GrafxUnsupportedOperation(
+                "Catalog-v2 DDL needs the index manager's bounded artifact-nonce provider.",
+                field="artifact_nonce",
+                value=type(manager).__name__,
+            )
+        occupied = {
+            generation.artifact_nonce
+            for definition in catalog.index_definitions()
+            for generation in definition.generations
+        }
+        listing = getattr(manager, "indexes", None)
+        if callable(listing):
+            for index in listing():
+                header = index.open()
+                artifact_nonce = getattr(header, "artifact_nonce", 0)
+                if (
+                    isinstance(artifact_nonce, int)
+                    and not isinstance(artifact_nonce, bool)
+                    and artifact_nonce > 0
+                ):
+                    occupied.add(artifact_nonce)
+        return int(allocate(occupied))
+
+    def _automatic_index_namespace_available(
+        self,
+        definition: IndexDefinition,
+        catalog: Catalog,
+    ) -> bool:
+        """Preserve the supported scan-only result of an automatic-name collision."""
+        if catalog.has_index_definition(definition.name):
+            return False
+        manager = self.require_indexes()
+        listing = getattr(manager, "indexes", None)
+        if not callable(listing):
+            return True
+        for current in listing():
+            current_definition = getattr(current, "definition", None)
+            if getattr(current_definition, "registry_key", None) != definition.registry_key:
+                continue
+            return (
+                getattr(current_definition, "table_id", None) == definition.table_id
+                and getattr(current_definition, "table_name", None)
+                == definition.table_name
+            )
+        return True
+
+    def _plan_catalog_exact_generation(
+        self,
+        definition: IndexDefinition,
+        catalog: Catalog,
+        *,
+        expected_cardinality: int | None = None,
+        previous: CatalogIndexDefinition | None = None,
+    ) -> IndexDefinition:
+        """Add one ACTIVE nonced generation to the transaction's v2 catalog clone."""
+        nonce = self._allocate_catalog_generation_nonce(catalog)
+        generation = IndexGenerationDescriptor(
+            artifact_nonce=nonce,
+            bucket_count=definition.bucket_count,
+            state=IndexGenerationState.ACTIVE,
+        )
+        if previous is None:
+            logical = CatalogIndexDefinition(
+                name=definition.name,
+                table_id=definition.table_id,
+                table_name=definition.table_name,
+                positions=definition.positions,
+                visibility=definition.visibility,
+                key_derivation=definition.key_derivation,
+                automatic=True,
+                expected_cardinality=expected_cardinality,
+                generations=(generation,),
+            )
+            catalog.add_index_definition(logical)
+        else:
+            logical = replace(
+                previous,
+                expected_cardinality=(
+                    previous.expected_cardinality
+                    if previous.expected_cardinality is not None
+                    else expected_cardinality
+                ),
+                generations=tuple(
+                    sorted(
+                        (
+                            *(item.mark_stale() for item in previous.generations),
+                            generation,
+                        ),
+                        key=lambda item: item.artifact_nonce,
+                    )
+                ),
+            )
+            catalog.replace_index_definition(logical)
+        return logical.runtime_definition(generation)
+
+    def _materialize_catalog_exact_generation(
+        self,
+        definition: IndexDefinition,
+        txn: object,
+        undo: list[_SchemaEffect],
+        *,
+        committed_table: TableDef | None = None,
+    ) -> None:
+        """Create and observe one v2 generation without granting committed authority early."""
+        if committed_table is None:
+            candidate = HashIndex(definition, self._pool, self._metrics.sink)
+        else:
+            # `_schema` already owns COMMIT_SECTION through schema_artifact_section.  Grafx
+            # materialises heap rows only inside that same section, so the durable heap cannot
+            # move during this scan even though user staging continues outside it.  A writer
+            # lease is intentionally unnecessary here: the generation is an exclusive-created,
+            # unreachable orphan until the later ordinary commit acquires its lease, re-runs
+            # OCC over every table partition declared above, and publishes catalog authority.
+            build = getattr(
+                self.require_indexes(), "_build_detached_exact_generation", None
+            )
+            if not callable(build):
+                raise GrafxUnsupportedOperation(
+                    "An identity index over an existing endpoint needs detached exact-index "
+                    "construction.",
+                    field="indexes",
+                    value=type(self.require_indexes()).__name__,
+                    table=committed_table.name,
+                )
+            candidate = build(definition, self._published_lsn_for_new_index())
+        registered = self._stage_schema_index(
+            candidate,
+            txn,
+            undo,
+            detached=committed_table is not None,
+        )
+        if committed_table is None:
+            # A new table's empty nonced generation has no logical WAL record from which its
+            # header and bucket pages could be reconstructed.  Put that physical foundation on
+            # stable storage before the later catalog commit is allowed to name it.  Detached
+            # generations over committed tables already cross this barrier in their builder.
+            self._pool.checkpoint(registered.file)
+
+    def _validate_index_build_entry_budget(
+        self,
+        generations: Sequence[tuple[IndexDefinition, TableDef | None]],
+        through_lsn: Lsn,
+        txn: object,
+    ) -> None:
+        """Refuse an oversized v2 DDL batch before its first generation file exists."""
+
+        limit = self._max_index_build_entries
+        if limit is None:
+            return
+        observed = 0
+        for definition, committed_table in generations:
+            # A table declared by this statement has no durable heap versions yet.  Later row
+            # staging is governed by the ordinary statement/transaction budgets and does not
+            # belong to this detached shadow-build admission decision.
+            if committed_table is None:
+                continue
+            count = getattr(
+                self.require_indexes(),
+                "_count_detached_exact_generation_entries",
+                None,
+            )
+            if not callable(count):
+                raise GrafxUnsupportedOperation(
+                    "Index-build admission needs exact detached-generation accounting.",
+                    operation="create catalog-v2 indexes",
+                    field="indexes",
+                    value=type(self.require_indexes()).__name__,
+                )
+            observed += count(
+                definition,
+                through_lsn,
+                remaining=limit - observed,
+            )
+            if observed > limit:
+                txn_id = getattr(txn, "txn_id", None)
+                raise GrafxTransactionBudgetExceeded(
+                    f"Index shadow-build batch for transaction {txn_id} would exceed "
+                    f"max_index_build_entries: limit {limit}, observed {observed}.",
+                    field="max_index_build_entries",
+                    limit=limit,
+                    observed=observed,
+                    txn_id=txn_id,
+                )
+
+    def _committed_table_matching(self, table: TableDef) -> TableDef | None:
+        """Return the exact committed table, excluding a same-id speculative lookalike."""
+        try:
+            committed = self._catalog.catalog.table_by_id(table.table_id)
+        except GrafxError:
+            return None
+        return committed if committed == table else None
+
+    @staticmethod
+    def _declare_complete_table_read(txn: object, table: TableDef) -> None:
+        """Fence every OCC partition before deriving an identity generation from the heap."""
+        owner = getattr(txn, "owner", None)
+        partitions = getattr(owner, "partitions_per_table", None)
+        note_read = getattr(txn, "note_read", None)
+        if (
+            isinstance(partitions, bool)
+            or not isinstance(partitions, int)
+            or partitions < 1
+            or not callable(note_read)
+        ):
+            raise GrafxTransactionStateError(
+                "Catalog-v2 identity construction needs a transaction that can fence every "
+                "table partition.",
+                field="transaction",
+                value=type(txn).__name__,
+                table=table.name,
+            )
+        for partition in range(partitions):
+            note_read(partition_key(table.table_id, partition))
+
+    def _plan_endpoint_identity_generations(
+        self,
+        relation: TableDef,
+        catalog: Catalog,
+        txn: object,
+    ) -> tuple[tuple[IndexDefinition, TableDef | None], ...]:
+        """Plan missing ACTIVE RecordId generations for a new relation's endpoint tables."""
+        planned: list[tuple[IndexDefinition, TableDef | None]] = []
+        seen: set[int] = set()
+        published = self._published_lsn_for_new_index()
+        for endpoint_name in (relation.from_table, relation.to_table):
+            endpoint = catalog.table(str(endpoint_name))
+            if endpoint.table_id in seen:
+                continue
+            seen.add(endpoint.table_id)
+            name = identity_index_name(endpoint.table_id)
+            previous = (
+                catalog.index_definition(name)
+                if catalog.has_index_definition(name)
+                else None
+            )
+            committed = self._committed_table_matching(endpoint)
+            active_generation = (
+                None if previous is None else previous.active_generation()
+            )
+            if active_generation is not None:
+                manager = self.require_indexes()
+                scoped = getattr(manager, "active_indexes_for", None)
+                if not callable(scoped):
+                    raise GrafxUnsupportedOperation(
+                        "Catalog-v2 DDL needs transaction-scoped index authority.",
+                        field="indexes",
+                        value=type(manager).__name__,
+                        index=name,
+                    )
+                expected = previous.runtime_definition(active_generation)
+                matches = tuple(
+                    index
+                    for index in scoped(
+                        endpoint.table_id,
+                        table_name=endpoint.name,
+                        table=endpoint,
+                        txn=txn,
+                        catalog=catalog,
+                    )
+                    if getattr(index, "definition", None) == expected
+                )
+                if len(matches) != 1:
+                    raise GrafxIndexError(
+                        f"ACTIVE identity index {name!r} has {len(matches)} transaction-scoped "
+                        "physical stores; exactly one is required.",
+                        field="index_authority",
+                        index=name,
+                        table=endpoint.name,
+                        count=len(matches),
+                    )
+                active_index = matches[0]
+                required = (
+                    published
+                    if committed is None
+                    else self._heap.committed_high_water(committed)
+                )
+                stale = bool(
+                    active_index.check_freshness(
+                        published,
+                        required_lsn=required,
+                        persist=False,
+                    )
+                )
+                if not stale:
+                    continue
+                if committed is None:
+                    raise GrafxIndexError(
+                        f"Speculative ACTIVE identity index {name!r} became stale before "
+                        "relationship DDL could use it.",
+                        field="index_authority",
+                        index=name,
+                        table=endpoint.name,
+                        retryable=True,
+                    )
+
+            if committed is None:
+                visible_rows = 0
+            else:
+                # The sizing scan and detached full-history build rely on the same committed
+                # table.  Fence all of it before either read; the statement mark restores this
+                # interest set if any later definition or artifact refuses.
+                self._declare_complete_table_read(txn, committed)
+                visible_rows = sum(
+                    1 for _ref, _version in self._heap.scan(committed, Snapshot(published))
+                )
+            expected, sized_bucket_count = identity_index_sizing(visible_rows)
+            bucket_count = (
+                active_generation.bucket_count
+                if active_generation is not None
+                else max(item.bucket_count for item in previous.generations)
+                if previous is not None and previous.generations
+                else sized_bucket_count
+            )
+            provisional = IndexDefinition(
+                name=name,
+                table_id=endpoint.table_id,
+                table_name=endpoint.name,
+                positions=(),
+                visibility=IndexVisibility.EXACT,
+                bucket_count=bucket_count,
+                key_derivation=RECORD_ID_KEY_DERIVATION,
+            )
+            runtime = self._plan_catalog_exact_generation(
+                provisional,
+                catalog,
+                expected_cardinality=expected,
+                previous=previous,
+            )
+            planned.append((runtime, committed))
+        return tuple(planned)
+
     def _record_skipped_index(self, table_name: str, undo: list[_SchemaEffect]) -> None:
         """Acquire one owner token for a speculative unindexed-table diagnostic."""
         owner = object()
@@ -3073,6 +3501,8 @@ class QueryEngine:
         statistics: dict[str, int],
         undo: list[_SchemaEffect],
         txn: object,
+        *,
+        catalog: Catalog | None = None,
     ) -> None:
         """Create the index covering the primary key of a table this statement just created.
 
@@ -3092,7 +3522,50 @@ class QueryEngine:
         away for a facility the caller never asked for. This is the opposite of the vector case,
         where the column would be permanently unsearchable and refusing is the only honest answer.
         """
-        if self._indexes is None or table.primary_key is None:
+        if table.primary_key is None:
+            return
+        if catalog is not None and catalog.format_version == CATALOG_FORMAT_VERSION:
+            definitions = tuple(
+                definition
+                for definition in automatic_index_definitions(table)
+                if definition.visibility is IndexVisibility.EXACT
+            )
+            accepted = tuple(
+                definition
+                for definition in definitions
+                if self._automatic_index_namespace_available(definition, catalog)
+            )
+            if len(accepted) != 1:
+                statistics["indexes_skipped"] = (
+                    statistics.get("indexes_skipped", 0) + 1
+                )
+                self._record_skipped_index(table.name, undo)
+            if not accepted:
+                return
+            planned = tuple(
+                self._plan_catalog_exact_generation(definition, catalog)
+                for definition in accepted
+            )
+            # Prove the complete catalog value before the first physical artifact is created.
+            # A later failure can leave a uniquely named orphan, but never a process-visible
+            # partial authority or a semantic error discovered only after file creation.
+            catalog.serialize()
+            self._validate_index_build_entry_budget(
+                tuple((definition, None) for definition in planned),
+                self._published_lsn_for_new_index(),
+                txn,
+            )
+            for definition in planned:
+                self._materialize_catalog_exact_generation(
+                    definition,
+                    txn,
+                    undo,
+                )
+            statistics["indexes_created"] = (
+                statistics.get("indexes_created", 0) + len(planned)
+            )
+            return
+        if self._indexes is None:
             return
         try:
             index = primary_key_index(table, self._pool, self._metrics.sink)
@@ -3133,6 +3606,8 @@ class QueryEngine:
         statistics: dict[str, int],
         undo: list[_SchemaEffect],
         txn: object,
+        *,
+        catalog: Catalog | None = None,
     ) -> None:
         """Create the two indexes covering the endpoints of a relationship table just declared.
 
@@ -3142,6 +3617,60 @@ class QueryEngine:
         -- a table whose endpoint index cannot be created traverses by the scan it always did,
         and the name is reported through :attr:`skipped_indexes`.
         """
+        if catalog is not None and catalog.format_version == CATALOG_FORMAT_VERSION:
+            endpoint_definitions = tuple(
+                definition
+                for definition in automatic_index_definitions(table)
+                if definition.visibility is IndexVisibility.EXACT
+            )
+            accepted_endpoint_definitions = tuple(
+                definition
+                for definition in endpoint_definitions
+                if self._automatic_index_namespace_available(definition, catalog)
+            )
+            endpoint_generations = tuple(
+                self._plan_catalog_exact_generation(definition, catalog)
+                for definition in accepted_endpoint_definitions
+            )
+            identity_generations = self._plan_endpoint_identity_generations(
+                table,
+                catalog,
+                txn,
+            )
+            # This catches missing endpoint identity and every logical namespace collision
+            # before any generation file is created.  Physical failures after this point remain
+            # orphan-safe by nonce and statement unwind removes all process-local eligibility.
+            catalog.serialize()
+            self._validate_index_build_entry_budget(
+                tuple((definition, None) for definition in endpoint_generations)
+                + identity_generations,
+                self._published_lsn_for_new_index(),
+                txn,
+            )
+            for definition in endpoint_generations:
+                self._materialize_catalog_exact_generation(
+                    definition,
+                    txn,
+                    undo,
+                )
+            for definition, committed_table in identity_generations:
+                self._materialize_catalog_exact_generation(
+                    definition,
+                    txn,
+                    undo,
+                    committed_table=committed_table,
+                )
+            created = len(endpoint_generations) + len(identity_generations)
+            if created:
+                statistics["indexes_created"] = (
+                    statistics.get("indexes_created", 0) + created
+                )
+            if len(accepted_endpoint_definitions) < 2:
+                statistics["indexes_skipped"] = (
+                    statistics.get("indexes_skipped", 0) + 1
+                )
+                self._record_skipped_index(table.name, undo)
+            return
         if self._indexes is None:
             return
         try:
@@ -3569,7 +4098,12 @@ def _index_seek(
     be a second implementation of a rule that already has one, and the two would drift.
     """
     manager = engine.require_indexes()
-    selected_index = _catalog_active_index(manager, node.index, context.schema())
+    selected_index = _catalog_active_index(
+        manager,
+        node.index,
+        context.schema(),
+        txn=getattr(context, "txn", None),
+    )
     snapshot = context.snapshot
     arity = len(node.table.columns)
     positions = tuple(node.table.column_index(name) for name in node.key_columns)
@@ -3660,7 +4194,12 @@ def _edge_steps(
     def usable(name: str) -> object | None:
         """Return the store when that index is present, this table's own, and fresh."""
         try:
-            index = _catalog_active_index(manager, name, catalog)  # type: ignore[arg-type]
+            index = _catalog_active_index(  # type: ignore[arg-type]
+                manager,
+                name,
+                catalog,
+                txn=getattr(context, "txn", None),
+            )
         except GrafxError:
             return None
         if index is None:
@@ -7227,7 +7766,12 @@ def _endpoint_identity_index(
         )
 
     manager = engine.require_indexes()
-    index = _catalog_active_index(manager, definition.name, catalog)
+    index = _catalog_active_index(
+        manager,
+        definition.name,
+        catalog,
+        txn=getattr(context, "txn", None),
+    )
     if index is None or getattr(index, "definition", None) != definition:
         raise GrafxIndexError(
             f"Catalog-selected identity index {definition.name!r} has no registered store "
@@ -7864,7 +8408,12 @@ def _rows_carrying_key(
         return None
     name = primary_key_index_name(table.name)
     try:
-        index = _catalog_active_index(manager, name, context.schema())
+        index = _catalog_active_index(
+            manager,
+            name,
+            context.schema(),
+            txn=getattr(context, "txn", None),
+        )
     except GrafxError:
         return None  # no index covers this table's key
     if index is None:

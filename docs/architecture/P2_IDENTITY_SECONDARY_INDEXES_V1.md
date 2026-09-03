@@ -414,8 +414,15 @@ no durable write. This is the explicit upgrade door for an existing graph and th
 Pulse may invoke during a controlled migration. It is never called merely as a side effect of
 `connect()`.
 
-No global runtime tuning flag is added. Sizing belongs to the index definition/maintenance request,
-not `connect()`. Automatic identity sizing follows section 6 and can later be grown explicitly.
+No global runtime *sizing* flag is added. Sizing belongs to the index definition/maintenance
+request, not `connect()`. Automatic identity sizing follows section 6 and can later be grown
+explicitly. `connect(..., max_index_build_entries=N)` is instead an optional admission guard: it
+does not choose bucket counts or persisted definitions and `None` preserves prior behavior. A
+positive N bounds the final exact entries across one detached activation or catalog-v2 DDL batch.
+Each committed, non-provisional heap version that derives a key charges one entry; an ended version
+and its tombstone remain one final entry, while a newly declared empty table charges zero. The
+bounded preflight stops at N+1 and refuses before catalog staging or the first exclusive generation
+file creation.
 
 There is no `DROP INDEX` in this delivery. There is likewise no public path to choose an artifact
 nonce, physical filename, state or built-through horizon.
@@ -442,8 +449,13 @@ The following existing guarantees are unchanged and are acceptance conditions:
    descriptor modes are covered; `generation` does not substitute a freshness or OCC proof.
 8. Writer serialization for build/rehash uses the existing cross-process `COMMIT_SECTION`; reader
    snapshots, writer leases, WAL retention and recovery-required latch semantics are unchanged.
-9. Quotas count the complete build/DDL/catalog/WAL work before publication and fail closed. DELETE
-   intents retain their fixed-entry quota behavior and do not encode an empty value tuple.
+9. Transaction quotas continue to cover DDL/catalog/WAL staging, and DELETE intents retain their
+   fixed-entry quota behavior without encoding an empty value tuple. Detached exact generations
+   have the separate `max_index_build_entries` admission guard: activation and catalog-v2 DDL sum
+   one final entry per key-bearing committed heap version across the batch, stop at N+1, and raise
+   `GrafxTransactionBudgetExceeded(field="max_index_build_entries")` before catalog staging and
+   before any exclusive generation-file create. `None` is disabled and a new empty table counts
+   zero; no refusal publishes partial catalog or index authority.
 10. Commit-state formats 1 and 2 have the same 36-byte layout. Activation publishes format 2 only
     after the catalog commit is durable, and every later publisher preserves that version.
 

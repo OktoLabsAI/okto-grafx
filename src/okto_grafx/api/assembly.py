@@ -507,6 +507,7 @@ def assemble_database(
             max_transaction_rows=config.max_transaction_rows,
             max_transaction_bytes=config.max_transaction_bytes,
             max_wal_batch_bytes=config.max_wal_batch_bytes,
+            max_index_build_entries=config.max_index_build_entries,
             database_uuid=identity.database_uuid,
             control_format_version=identity.format_version,
             control_file_nonce=_new_control_file_nonce(),
@@ -541,6 +542,7 @@ def assemble_database(
             query_spill=LocalQuerySpillFactory(),
             max_traversal_expansions=config.max_traversal_expansions,
             max_traversal_paths=config.max_traversal_paths,
+            max_index_build_entries=config.max_index_build_entries,
         )
         attached = tuple(attached_names)
         adopted = set(attached)

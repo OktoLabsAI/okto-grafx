@@ -769,10 +769,10 @@ class Catalog:
         def refuse(message: str, *, field: str, **details: object) -> NoReturn:
             raise error_type(message, field=field, **details)
 
-        automatic: dict[str, object] = {}
+        automatic: dict[str, list[object]] = {}
         for table in self.tables():
             for candidate in automatic_index_definitions(table):
-                automatic[candidate.registry_key] = candidate
+                automatic.setdefault(candidate.registry_key, []).append(candidate)
 
         endpoints: set[str] = set()
         for relation in self.tables():
@@ -836,9 +836,10 @@ class Catalog:
                         index=definition.name,
                     )
             elif definition.automatic:
-                candidate = automatic.get(definition.registry_key)
-                if candidate is None or not _matches_automatic_exact(
-                    definition, candidate
+                candidates = automatic.get(definition.registry_key, ())
+                if not any(
+                    _matches_automatic_exact(definition, candidate)
+                    for candidate in candidates
                 ):
                     refuse(
                         f"Automatic index {definition.name!r} does not match the table's "

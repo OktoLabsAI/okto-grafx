@@ -417,6 +417,7 @@ class DatabaseConfig:
     max_transaction_rows: int | None = None
     max_transaction_bytes: int | None = None
     max_wal_batch_bytes: int | None = None
+    max_index_build_entries: int | None = dataclass_field(default=None, kw_only=True)
     metrics: str = "noop"                  # "noop" | "openmetrics" | "json"
     metrics_destination: str | None = None
     allow_remote_metrics: bool = False
@@ -486,6 +487,16 @@ The four transaction limits are operational, positive integers when set, and dis
 An exceeded limit raises non-retryable `GrafxTransactionBudgetExceeded`. Statement handover is
 restored to its exact pre-statement staging on refusal. The final WAL-batch limit is checked before
 `append_many`; no budget refusal truncates the WAL or persists a partial statement.
+
+`max_index_build_entries` is a separate, keyword-only shadow-build admission limit. `None` keeps
+the prior unbounded behavior; otherwise it is a positive exact integer. One entry is charged for
+each committed, non-provisional heap version whose target exact-index definition derives a key.
+An ended version still charges one final entry because its tombstone updates that same entry rather
+than adding another. The charge is summed across every detached generation in one activation or
+catalog-v2 DDL batch; a newly declared empty table contributes zero. Preflight stops after N+1 is
+observed and raises `GrafxTransactionBudgetExceeded(field="max_index_build_entries")` before
+catalog staging and before the first exclusive generation-file create. The option is an admission
+guard, not an index-sizing hint and not a persisted format field.
 
 The four query admission limits are positive integers when set and disabled by `None`. The row
 limits are:
@@ -846,7 +857,8 @@ class TransactionManager:
                  identity_lease_size: int = 64,
                  max_transaction_rows: int | None = None,
                  max_transaction_bytes: int | None = None,
-                 max_wal_batch_bytes: int | None = None)
+                 max_wal_batch_bytes: int | None = None,
+                 max_index_build_entries: int | None = None)
     def begin(self, mode: str) -> "TransactionContext"      # "read" | "write"
     def commit(self, txn: "TransactionContext") -> "CommitReport"
     def rollback(self, txn: "TransactionContext") -> None
@@ -1079,7 +1091,8 @@ class QueryEngine:
                  query_memory_budget_bytes: int | None = None,
                  query_spill: QuerySpillFactory | None = None,
                  max_traversal_expansions: int | None = None,
-                 max_traversal_paths: int | None = None)
+                 max_traversal_paths: int | None = None,
+                 max_index_build_entries: int | None = None)
     def parse(self, text: str) -> "Statement"
     def plan(self, statement: "Statement", snapshot: Snapshot) -> "PlanNode"
     def execute(self, text: str, txn, parameters: Mapping[str, object] | None = None) -> "QueryResult"

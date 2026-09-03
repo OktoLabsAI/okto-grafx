@@ -639,6 +639,7 @@ refused with the field name the caller actually wrote.
 | `max_transaction_rows` | `None` | Optional hard limit on retained `row_intents` in one transaction |
 | `max_transaction_bytes` | `None` | Optional hard limit on encoded row tuples, staged logical-record `encoded_length()` values and retained page-image generations; ordinary replacement charges the byte delta, while a rollback preimage held by a live statement mark remains charged until settle/discard |
 | `max_wal_batch_bytes` | `None` | Optional hard limit on the sum of final record `encoded_length()` values, including `COMMIT` and excluding `SEGMENT_HEADER`; checked before WAL append |
+| `max_index_build_entries` | `None` | Optional hard limit on final exact entries across one detached shadow-build batch; counted to at most N+1 and refused before catalog staging or the first generation file is created |
 | `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
 | `metrics_destination` | `None` | Required file path for `"json"`; for `"openmetrics"`, `None` means `127.0.0.1:0` and an explicit IPv6 destination uses `[address]:port` |
 | `allow_remote_metrics` | `False` | Exact boolean, valid only for `"openmetrics"`; permits a hostname or non-loopback address when explicitly `True` |

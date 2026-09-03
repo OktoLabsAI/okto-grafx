@@ -37,6 +37,7 @@ from dataclasses import dataclass, field, replace
 
 from okto_grafx.domain.errors import GrafxEmbeddingSpaceMismatch, GrafxPlanError
 from okto_grafx.domain.index.definition import (
+    COLUMN_KEY_DERIVATION,
     IndexDefinition,
     index_definition_matches_table,
 )
@@ -1208,6 +1209,14 @@ class _Planner:
         candidates: list[tuple[int, str, IndexDefinition, tuple[str, ...]]] = []
         for definition in self.indexes:
             if not index_definition_matches_table(definition, table):
+                continue
+            if (
+                definition.key_derivation != COLUMN_KEY_DERIVATION
+                or not definition.positions
+            ):
+                # RecordId and value-derived indexes have dedicated access paths.  In
+                # particular, the identity definition has no column positions, so treating
+                # ``all([])`` as a generic equality match would select it for every predicate.
                 continue
             if not all(position in by_position for position in definition.positions):
                 continue

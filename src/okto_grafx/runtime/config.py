@@ -275,6 +275,7 @@ class DatabaseConfig:
     max_transaction_rows: int | None = None
     max_transaction_bytes: int | None = None
     max_wal_batch_bytes: int | None = None
+    max_index_build_entries: int | None = dataclass_field(default=None, kw_only=True)
     metrics: str = "noop"
     metrics_destination: str | None = None
     allow_remote_metrics: bool = False
@@ -362,6 +363,7 @@ class DatabaseConfig:
             "max_transaction_rows",
             "max_transaction_bytes",
             "max_wal_batch_bytes",
+            "max_index_build_entries",
         ):
             value = getattr(self, field)
             if value is not None:
