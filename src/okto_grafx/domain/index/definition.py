@@ -23,10 +23,15 @@ from okto_grafx.domain.errors import GrafxIndexError
 from okto_grafx.domain.index.keys import (
     DEFAULT_BUCKET_COUNT,
     index_key,
+    record_id_key,
     validate_bucket_count,
 )
 from okto_grafx.domain.index.visibility import IndexVisibility
-from okto_grafx.domain.model.schema import MAX_IDENTIFIER_LENGTH, TableDef, is_identifier
+from okto_grafx.domain.model.schema import (
+    MAX_IDENTIFIER_LENGTH,
+    TableDef,
+    is_identifier,
+)
 from okto_grafx.domain.model.value import Value
 
 __all__ = [
@@ -34,6 +39,7 @@ __all__ = [
     "index_definition_matches_table",
     "COLUMN_KEY_DERIVATION",
     "DEFINITION_DIGEST_SIZE",
+    "RECORD_ID_KEY_DERIVATION",
     "INDEX_DIRECTORY",
     "INDEX_FILE_SUFFIX",
     "IndexDefinition",
@@ -58,6 +64,9 @@ written under one derivation cannot be opened under another -- which is the whol
 two derivations over the same columns produce different bytes for the same row and an index read
 under the wrong one answers with nothing while looking perfectly healthy.
 """
+
+RECORD_ID_KEY_DERIVATION: str = "record_id_u64_v1"
+"""The built-in derivation whose key is the row's stable unsigned identity."""
 
 
 def index_file(name: str) -> str:
@@ -142,7 +151,9 @@ class IndexDefinition:
                 field="table_id",
                 value=self.table_id,
             )
-        if not isinstance(self.positions, tuple) or not self.positions:
+        if not isinstance(self.positions, tuple) or (
+            not self.positions and self.key_derivation != RECORD_ID_KEY_DERIVATION
+        ):
             raise GrafxIndexError(
                 f"Index {self.name!r} needs at least one key column, as a tuple of positions.",
                 field="positions",
@@ -150,7 +161,11 @@ class IndexDefinition:
             )
         seen: set[int] = set()
         for position in self.positions:
-            if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+            if (
+                isinstance(position, bool)
+                or not isinstance(position, int)
+                or position < 0
+            ):
                 raise GrafxIndexError(
                     f"Index {self.name!r} needs every key column position to be a non-negative "
                     f"integer; got {position!r}.",
@@ -164,6 +179,14 @@ class IndexDefinition:
                     value=position,
                 )
             seen.add(position)
+        if self.key_derivation == RECORD_ID_KEY_DERIVATION and self.positions:
+            raise GrafxIndexError(
+                f"Identity index {self.name!r} keys RecordId, not stored columns, so its "
+                "positions tuple must be empty.",
+                field="positions",
+                value=repr(self.positions),
+                index=self.name,
+            )
         if not is_identifier(self.key_derivation):
             raise GrafxIndexError(
                 f"Index {self.name!r} must name its key derivation as an ASCII identifier; got "
@@ -172,7 +195,9 @@ class IndexDefinition:
                 value=repr(self.key_derivation),
             )
         object.__setattr__(self, "visibility", IndexVisibility.parse(self.visibility))
-        object.__setattr__(self, "bucket_count", validate_bucket_count(self.bucket_count))
+        object.__setattr__(
+            self, "bucket_count", validate_bucket_count(self.bucket_count)
+        )
 
     @classmethod
     def on(
@@ -267,6 +292,18 @@ class IndexDefinition:
             )
         return index_key(values, self.positions)
 
+    def key_for_record(self, record_id: object, values: Sequence[Value]) -> bytes:
+        """Return this definition's key with the complete heap-version identity available.
+
+        Column definitions retain their established value-only derivation.  The identity
+        derivation deliberately ignores stored values and uses the unsigned logical RecordId,
+        which is not representable by the public signed ``INT64`` value codec.
+        """
+
+        if self.key_derivation == RECORD_ID_KEY_DERIVATION:
+            return record_id_key(record_id)
+        return self.key_for(values)
+
     def entry_key_for(self, values: Sequence[Value]) -> bytes | None:
         """Return the stored key, or ``None`` when this row has no index entry.
 
@@ -277,6 +314,15 @@ class IndexDefinition:
 
         return self.key_for(values)
 
+    def entry_key_for_record(
+        self, record_id: object, values: Sequence[Value]
+    ) -> bytes | None:
+        """Return the stored key with RecordId available to non-column derivations."""
+
+        if self.key_derivation == RECORD_ID_KEY_DERIVATION:
+            return record_id_key(record_id)
+        return self.entry_key_for(values)
+
     def owes_entry(self, values: Sequence[Value]) -> bool:
         """Say whether this row owes an entry without deriving its potentially large key.
 
@@ -286,6 +332,18 @@ class IndexDefinition:
         """
 
         return True
+
+    def owes_entry_for_record(self, record_id: object, values: Sequence[Value]) -> bool:
+        """Say whether the complete heap version owes an entry.
+
+        Validating the identity here keeps WAL pre-counting and staging on the same domain.
+        Sparse value-derived definitions retain their existing predicate.
+        """
+
+        if self.key_derivation == RECORD_ID_KEY_DERIVATION:
+            record_id_key(record_id)
+            return True
+        return self.owes_entry(values)
 
     def digest(self) -> bytes:
         """Return the digest an index file stores to prove which definition wrote it.

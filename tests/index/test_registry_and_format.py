@@ -8,6 +8,7 @@ component is allowed to emit.
 from __future__ import annotations
 
 import hashlib
+import struct
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -20,6 +21,8 @@ from okto_grafx.domain.index import (
     DEFAULT_BUCKET_COUNT,
     MAX_BUCKET_COUNT,
     MIN_BUCKET_COUNT,
+    RECORD_ID_KEY_DERIVATION,
+    RECORD_ID_KEY_FORMAT_VERSION,
     IndexChange,
     IndexDefinition,
     IndexOperation,
@@ -28,6 +31,7 @@ from okto_grafx.domain.index import (
     change_of,
     index_file,
     index_key,
+    record_id_key,
     validate_bucket_count,
     wal_record_for,
 )
@@ -93,7 +97,9 @@ def test_an_unknown_index_name_is_refused_with_the_names_that_exist(
 
 
 def test_the_registry_answers_by_table(database: Database) -> None:
-    assert {index.name for index in database.manager.indexes_for(database.table.table_id)} == {
+    assert {
+        index.name for index in database.manager.indexes_for(database.table.table_id)
+    } == {
         "person_by_name",
         "person_near_name",
     }
@@ -108,14 +114,18 @@ def test_the_registry_lists_indexes_in_a_fixed_order(database: Database) -> None
     ]
 
 
-def test_registering_something_that_is_not_an_index_is_refused(database: Database) -> None:
+def test_registering_something_that_is_not_an_index_is_refused(
+    database: Database,
+) -> None:
     with pytest.raises(GrafxIndexError) as refused:
         database.manager.register(object())  # type: ignore[arg-type]
 
     assert refused.value.details["field"] == "index"
 
 
-def test_register_existing_only_never_repairs_an_incomplete_file(database: Database) -> None:
+def test_register_existing_only_never_repairs_an_incomplete_file(
+    database: Database,
+) -> None:
     """Inspection mode must not turn a zero-length/torn index into a created one."""
     candidate = HashIndex(
         exact_definition(database.table, name="incomplete"),
@@ -125,9 +135,7 @@ def test_register_existing_only_never_repairs_an_incomplete_file(database: Datab
     database.device.create(candidate.file)
 
     with pytest.raises(GrafxIndexError) as refused:
-        database.manager.register(
-            candidate, existing_only=True, persist_stale=False
-        )
+        database.manager.register(candidate, existing_only=True, persist_stale=False)
 
     assert refused.value.details["field"] == "file"
     assert database.device.page_count(candidate.file) == 0
@@ -148,12 +156,15 @@ def test_register_reuses_a_proved_directory_entry_without_rechecking_exists(
 
     monkeypatch.setattr(database.device, "exists", redundant_exists)
 
-    assert database.manager.register(
-        candidate,
-        existing_only=True,
-        persist_stale=False,
-        proved_present=True,
-    ) is candidate
+    assert (
+        database.manager.register(
+            candidate,
+            existing_only=True,
+            persist_stale=False,
+            proved_present=True,
+        )
+        is candidate
+    )
 
 
 def test_registering_a_store_that_does_not_answer_the_contract_is_refused(
@@ -161,7 +172,9 @@ def test_registering_a_store_that_does_not_answer_the_contract_is_refused(
 ) -> None:
     """``IndexStore`` is the shared store and deliberately not an index: it has no lookup."""
     bare = IndexStore(
-        exact_definition(database.table, name="bare_store"), database.pool, database.metrics
+        exact_definition(database.table, name="bare_store"),
+        database.pool,
+        database.metrics,
     )
 
     with pytest.raises(GrafxIndexError) as refused:
@@ -174,7 +187,9 @@ def test_an_update_stages_both_halves_on_every_index(database: Database) -> None
     """The old entry has to end and a new one has to exist, whatever the key did."""
     ref = database.insert(1, "Ada", BORN)
     txn = TransactionDouble(txn_id=3)
-    database.manager.stage_row_insert(txn, database.table.table_id, ref, (1, "Ada"), BORN)
+    database.manager.stage_row_insert(
+        txn, database.table.table_id, ref, (1, "Ada"), BORN
+    )
     database.manager.commit(txn, BORN)
     new_ref = database.heap.update(database.table, ref, (1, "Ada"), ENDED)
 
@@ -191,9 +206,15 @@ def test_an_update_stages_both_halves_on_every_index(database: Database) -> None
         IndexOperation.INSERT,
     ]
     key = database.key(1, "Ada")
-    assert database.manager.lookup("person_by_name", key, SnapshotDouble(ENDED)) == (new_ref,)
-    assert database.manager.lookup("person_near_name", key, SnapshotDouble(ENDED)) == (new_ref,)
-    assert database.manager.lookup("person_near_name", key, SnapshotDouble(BORN)) == (ref,)
+    assert database.manager.lookup("person_by_name", key, SnapshotDouble(ENDED)) == (
+        new_ref,
+    )
+    assert database.manager.lookup("person_near_name", key, SnapshotDouble(ENDED)) == (
+        new_ref,
+    )
+    assert database.manager.lookup("person_near_name", key, SnapshotDouble(BORN)) == (
+        ref,
+    )
 
 
 def test_an_exact_candidate_pointing_at_another_table_is_damage_and_not_a_miss(
@@ -227,7 +248,9 @@ def test_an_exact_candidate_pointing_at_another_table_is_damage_and_not_a_miss(
 # --- the definition ------------------------------------------------------------------------------
 
 
-def test_a_definition_names_the_columns_a_table_really_has(person_table: TableDef) -> None:
+def test_a_definition_names_the_columns_a_table_really_has(
+    person_table: TableDef,
+) -> None:
     with pytest.raises(GrafxIndexError) as refused:
         IndexDefinition.on(
             person_table,
@@ -268,7 +291,9 @@ def test_every_field_that_changes_what_a_file_means_changes_the_digest(
     assert IndexDefinition(**fields).digest() != base.digest()  # type: ignore[arg-type]
 
 
-def test_a_definition_names_its_file_the_way_the_contract_does(person_table: TableDef) -> None:
+def test_a_definition_names_its_file_the_way_the_contract_does(
+    person_table: TableDef,
+) -> None:
     assert exact_definition(person_table).file == "index/person_by_name.idx"
     assert index_file("thing") == "index/thing.idx"
 
@@ -319,6 +344,61 @@ def test_a_key_is_the_encoding_of_the_columns_in_the_order_they_were_named(
 def test_a_key_position_outside_the_row_is_refused() -> None:
     with pytest.raises(GrafxIndexError) as refused:
         index_key((1,), (5,))
+
+    assert refused.value.details["field"] == "positions"
+
+
+def test_identity_key_covers_the_full_usable_unsigned_domain() -> None:
+    """RecordId is u64 even though the public scalar INT64 codec is signed."""
+
+    assert record_id_key(1) == struct.pack("<BQ", RECORD_ID_KEY_FORMAT_VERSION, 1)
+    assert record_id_key(1 << 63) == struct.pack(
+        "<BQ", RECORD_ID_KEY_FORMAT_VERSION, 1 << 63
+    )
+    assert record_id_key((1 << 64) - 2) == struct.pack(
+        "<BQ", RECORD_ID_KEY_FORMAT_VERSION, (1 << 64) - 2
+    )
+
+
+@pytest.mark.parametrize("record_id", [True, 1.0, 0, -1, (1 << 64) - 1, 1 << 64])
+def test_identity_key_refuses_non_record_ids(record_id: object) -> None:
+    with pytest.raises(GrafxIndexError) as refused:
+        record_id_key(record_id)
+
+    assert refused.value.details["field"] == "record_id"
+
+
+def test_identity_definition_derives_from_record_id_not_values(
+    person_table: TableDef,
+) -> None:
+    identity = IndexDefinition(
+        name="id_Person",
+        table_id=person_table.table_id,
+        table_name=person_table.name,
+        positions=(),
+        visibility=IndexVisibility.EXACT,
+        bucket_count=TEST_BUCKET_COUNT,
+        key_derivation=RECORD_ID_KEY_DERIVATION,
+    )
+
+    assert identity.key_for_record(1 << 63, (1, "Ada")) == record_id_key(1 << 63)
+    assert identity.entry_key_for_record(7, (2, "Grace")) == record_id_key(7)
+    assert identity.owes_entry_for_record(7, ()) is True
+    with pytest.raises(GrafxIndexError) as refused:
+        identity.key_for((1, "Ada"))
+    assert refused.value.details["field"] == "key_derivation"
+
+
+def test_identity_definition_refuses_column_positions(person_table: TableDef) -> None:
+    with pytest.raises(GrafxIndexError) as refused:
+        IndexDefinition(
+            name="id_Person",
+            table_id=person_table.table_id,
+            table_name=person_table.name,
+            positions=(0,),
+            visibility=IndexVisibility.EXACT,
+            key_derivation=RECORD_ID_KEY_DERIVATION,
+        )
 
     assert refused.value.details["field"] == "positions"
 
@@ -456,7 +536,8 @@ def test_a_damaged_visibility_byte_is_refused_even_though_the_digest_matches(
         "the digest must still match, or the digest check would be what refuses"
     )
     cold = HashIndex(
-        exact_definition(database.table), make_pool(database.device, RecordingMetrics()),
+        exact_definition(database.table),
+        make_pool(database.device, RecordingMetrics()),
         RecordingMetrics(),
     )
 
@@ -546,11 +627,17 @@ def test_the_metrics_this_component_emits_are_the_frozen_ones() -> None:
     assert RECONCILIATION_TOTAL == "oktografx_vector_reconciliation_total"
 
 
-def test_a_proximity_index_reports_its_backlog_and_its_passes(database: Database) -> None:
+def test_a_proximity_index_reports_its_backlog_and_its_passes(
+    database: Database,
+) -> None:
     ref = database.insert(1, "Ada", BORN)
     txn = TransactionDouble(txn_id=3)
-    database.manager.stage_row_insert(txn, database.table.table_id, ref, (1, "Ada"), BORN)
-    database.manager.stage_row_delete(txn, database.table.table_id, ref, (1, "Ada"), ENDED)
+    database.manager.stage_row_insert(
+        txn, database.table.table_id, ref, (1, "Ada"), BORN
+    )
+    database.manager.stage_row_delete(
+        txn, database.table.table_id, ref, (1, "Ada"), ENDED
+    )
     database.manager.commit(txn, ENDED)
 
     assert database.metrics.values_of(TOMBSTONE_BACKLOG)[-1] == 1.0
@@ -573,7 +660,9 @@ def test_an_exact_index_reports_no_vector_metric(
     assert metrics.values_of(RECONCILIATION_TOTAL) == []
 
 
-def test_a_disabled_sink_is_never_asked_to_record_anything(person_table: TableDef) -> None:
+def test_a_disabled_sink_is_never_asked_to_record_anything(
+    person_table: TableDef,
+) -> None:
     """DoD item 6: the hot path pays nothing when metrics are off."""
     device = MemoryDevice()
     metrics = RecordingMetrics(enabled=False)
@@ -611,7 +700,9 @@ class DigestDefinition(IndexDefinition):
         return hashlib.blake2b(material, digest_size=16).digest()
 
 
-def _digest_definition(table: TableDef, *, name: str = "person_by_digest") -> DigestDefinition:
+def _digest_definition(
+    table: TableDef, *, name: str = "person_by_digest"
+) -> DigestDefinition:
     """Return a digest-keyed exact index over the name column of the table."""
     return DigestDefinition(
         name=name,
@@ -627,12 +718,21 @@ def _digest_definition(table: TableDef, *, name: str = "person_by_digest") -> Di
 def test_the_column_key_derivation_is_the_declared_one() -> None:
     """Amendment A68: the literal, because a later change to it invalidates every stored index."""
     assert COLUMN_KEY_DERIVATION == "columns"
-    assert IndexDefinition(
-        name="i", table_id=1, table_name="T", positions=(0,), visibility=IndexVisibility.EXACT
-    ).key_derivation == "columns"
+    assert (
+        IndexDefinition(
+            name="i",
+            table_id=1,
+            table_name="T",
+            positions=(0,),
+            visibility=IndexVisibility.EXACT,
+        ).key_derivation
+        == "columns"
+    )
 
 
-def test_the_key_derivation_travels_in_the_definition_digest(person_table: TableDef) -> None:
+def test_the_key_derivation_travels_in_the_definition_digest(
+    person_table: TableDef,
+) -> None:
     """Two derivations over the same columns produce different bytes for the same row.
 
     A file written under one and opened under the other would look up keys that were never
@@ -716,11 +816,15 @@ def test_verification_re_derives_a_key_with_the_rule_the_definition_declares(
     value, disagree on every entry, and report a clean index as wholly diverged -- for precisely
     the index kind whose results a caller cannot eyeball.
     """
-    index = HashIndex(_digest_definition(database.table), database.pool, database.metrics)
+    index = HashIndex(
+        _digest_definition(database.table), database.pool, database.metrics
+    )
     database.manager.register(index)
     ref = database.insert(1, "Ada", BORN)
     txn = TransactionDouble(txn_id=3)
-    database.manager.stage_row_insert(txn, database.table.table_id, ref, (1, "Ada"), BORN)
+    database.manager.stage_row_insert(
+        txn, database.table.table_id, ref, (1, "Ada"), BORN
+    )
     database.manager.commit(txn, BORN)
 
     assert database.manager.verify("person_by_digest") == ()
@@ -733,7 +837,9 @@ def test_a_row_that_drifted_under_a_declared_derivation_is_still_reported(
     database: Database,
 ) -> None:
     """The other side, so the clean answer above cannot be satisfied by never comparing."""
-    index = HashIndex(_digest_definition(database.table), database.pool, database.metrics)
+    index = HashIndex(
+        _digest_definition(database.table), database.pool, database.metrics
+    )
     database.manager.register(index)
     ref = database.insert(1, "Ada", BORN)
     key = index.definition.key_for((1, "Ada"))
@@ -755,7 +861,9 @@ def test_two_databases_keep_their_own_indexes(database: Database) -> None:
     other = build_database(name="other")
     txn = TransactionDouble(txn_id=1)
     ref = database.insert(1, "Ada", BORN)
-    database.manager.stage_row_insert(txn, database.table.table_id, ref, (1, "Ada"), BORN)
+    database.manager.stage_row_insert(
+        txn, database.table.table_id, ref, (1, "Ada"), BORN
+    )
     database.manager.commit(txn, BORN)
 
     assert other.entries() == {"person_by_name": (), "person_near_name": ()}

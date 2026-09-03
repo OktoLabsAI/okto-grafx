@@ -19,6 +19,7 @@ it does not need to be cryptographic: it decides placement, never identity.
 
 from __future__ import annotations
 
+import struct
 from collections.abc import Sequence
 
 from okto_grafx.domain.errors import GrafxIndexError
@@ -29,8 +30,10 @@ __all__ = [
     "DEFAULT_BUCKET_COUNT",
     "MAX_BUCKET_COUNT",
     "MIN_BUCKET_COUNT",
+    "RECORD_ID_KEY_FORMAT_VERSION",
     "bucket_of",
     "index_key",
+    "record_id_key",
     "validate_bucket_count",
 ]
 
@@ -49,6 +52,13 @@ allocating a file the engine may never shrink (G6).
 DEFAULT_BUCKET_COUNT: int = 64
 """Buckets an index gets when its definition does not say. Small enough to stay cheap on a tiny
 database, large enough that the reference index really does spread keys across chains."""
+
+RECORD_ID_KEY_FORMAT_VERSION: int = 1
+"""Version tag prefixed to the canonical unsigned row-identity key."""
+
+_RECORD_ID = struct.Struct("<BQ")
+_FIRST_RECORD_ID: int = 1
+_EXHAUSTED_RECORD_ID: int = 0xFFFFFFFFFFFFFFFF
 
 
 def validate_bucket_count(bucket_count: object) -> int:
@@ -106,6 +116,32 @@ def index_key(values: Sequence[Value], positions: Sequence[int]) -> bytes:
             )
         parts.append(encode_value(values[position]))
     return b"".join(parts)
+
+
+def record_id_key(record_id: object) -> bytes:
+    """Return the versioned canonical key of one usable unsigned 64-bit ``RecordId``.
+
+    ``ValueType.INT64`` is signed and therefore cannot encode half of the physical identity
+    domain.  Identity indexes use this private format instead: one format byte followed by the
+    little-endian unsigned value.  Zero and ``2**64 - 1`` are not usable row identities; the
+    latter is the durable exhausted marker.
+    """
+
+    if isinstance(record_id, bool) or not isinstance(record_id, int):
+        raise GrafxIndexError(
+            "An identity index key needs an integer RecordId; "
+            f"got {type(record_id).__name__}.",
+            field="record_id",
+            value=repr(record_id),
+        )
+    if not _FIRST_RECORD_ID <= record_id < _EXHAUSTED_RECORD_ID:
+        raise GrafxIndexError(
+            "An identity index key needs a RecordId from 1 up to but not including "
+            f"{_EXHAUSTED_RECORD_ID}; got {record_id}.",
+            field="record_id",
+            value=record_id,
+        )
+    return _RECORD_ID.pack(RECORD_ID_KEY_FORMAT_VERSION, record_id)
 
 
 def bucket_of(key: bytes, bucket_count: int) -> int:
