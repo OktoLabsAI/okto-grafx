@@ -13,7 +13,7 @@ import pytest
 import okto_grafx
 from okto_grafx.errors import GrafxConfigurationError
 from okto_grafx.domain.model.record import RecordHeader
-from okto_grafx.engine import heap_store
+from okto_grafx.engine import heap_store, query_engine
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.database import Database, Transaction
 from okto_grafx.engine.heap_store import HeapStore
@@ -57,6 +57,10 @@ def _descriptors() -> dict[str, object]:
             HeapStore, "require_endpoints"
         ),
         "heap_lookup": inspect.getattr_static(HeapStore, "lookup"),
+        "endpoint_identity": inspect.getattr_static(
+            query_engine, "_visible_identity_with_ref"
+        ),
+        "materialise_edge": inspect.getattr_static(query_engine, "_materialise_edge"),
         "index_lookup": inspect.getattr_static(IndexManager, "lookup"),
         "vector_search": inspect.getattr_static(VectorEngine, "search"),
         "query_execute": inspect.getattr_static(QueryEngine, "execute"),

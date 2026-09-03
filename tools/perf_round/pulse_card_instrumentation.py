@@ -275,7 +275,7 @@ class PulseCardInstrumentation:
         import okto_grafx
         from okto_grafx.domain.ids import is_committed_csn, is_open_end_csn
         from okto_grafx.domain.model.record import RecordHeader
-        from okto_grafx.engine import heap_store
+        from okto_grafx.engine import heap_store, query_engine
         from okto_grafx.engine.buffer_pool import BufferPool
         from okto_grafx.engine.database import Database, Transaction
         from okto_grafx.engine.heap_store import HeapStore
@@ -334,7 +334,13 @@ class PulseCardInstrumentation:
             @functools.wraps(original_record_peek)
             def record_peek(cls: type, raw: bytes) -> Any:
                 result = original_record_peek(cls, raw)
-                self._bump("record_header_peek_calls")
+                try:
+                    self._bump("record_header_peek_calls")
+                    stack = self._lookup_stack()
+                    if stack:
+                        stack[-1]["headers"] += 1
+                except BaseException:
+                    self._mark_observation_failure("record_header_peek")
                 return result
 
             self._patch(RecordHeader, "peek", classmethod(record_peek))
@@ -405,6 +411,98 @@ class PulseCardInstrumentation:
                 raise
 
         self._patch(HeapStore, "scan", scan)
+
+        original_materialise_edge = inspect.getattr_static(
+            query_engine, "_materialise_edge"
+        )
+
+        @functools.wraps(original_materialise_edge)
+        def materialise_edge(*args: object, **kwargs: object) -> Any:
+            # The optimized query path no longer routes through HeapStore.require_endpoints.
+            # Preserve the counter's semantic unit -- one edge validation -- at its executor
+            # boundary, including pending/physical mixtures and self-loops.
+            self._bump("endpoint_validation_calls")
+            previous_depth = 0
+            context_installed = False
+            try:
+                previous_depth = int(getattr(self._lookup_local, "endpoint_depth", 0))
+                self._lookup_local.endpoint_depth = previous_depth + 1
+                context_installed = True
+            except BaseException:
+                self._mark_observation_failure("endpoint_context")
+            try:
+                result = original_materialise_edge(*args, **kwargs)
+            except BaseException:
+                self._bump("endpoint_validation_failed")
+                raise
+            finally:
+                if context_installed:
+                    try:
+                        self._lookup_local.endpoint_depth = previous_depth
+                    except BaseException:
+                        self._mark_observation_failure("endpoint_context")
+            self._bump("endpoint_validation_succeeded")
+            return result
+
+        self._patch(query_engine, "_materialise_edge", materialise_edge)
+
+        original_visible_identity = inspect.getattr_static(
+            query_engine, "_visible_identity_with_ref"
+        )
+
+        @functools.wraps(original_visible_identity)
+        def visible_identity(
+            engine: Any, context: Any, table: Any, record_id: int
+        ) -> Any:
+            state: dict[str, Any] | None = None
+            stack: list[dict[str, Any]] | None = None
+            try:
+                state = {
+                    "headers": 0,
+                    "endpoint": True,
+                    "store": engine.heap,
+                    "table": table,
+                }
+                stack = self._lookup_stack()
+                stack.append(state)
+            except BaseException:
+                state = None
+                stack = None
+                self._mark_observation_failure("lookup_stack")
+            self._bump("heap_lookup_calls")
+            self._bump("endpoint_lookup_calls")
+            try:
+                result = original_visible_identity(engine, context, table, record_id)
+            except BaseException:
+                self._bump("heap_lookup_failed")
+                self._bump("endpoint_lookup_failed")
+                raise
+            finally:
+                if stack is not None and state is not None:
+                    try:
+                        stack.pop()
+                        self._record_sample(
+                            self._lookup_headers,
+                            int(state["headers"]),
+                            "lookup_headers_sample",
+                        )
+                    except BaseException:
+                        self._mark_observation_failure("lookup_stack")
+            if result is None:
+                self._bump("heap_lookup_misses")
+                self._bump("endpoint_lookup_misses")
+            else:
+                self._bump("heap_lookup_hits")
+                self._bump("endpoint_lookup_hits")
+                if state is not None:
+                    try:
+                        state["hit_page"] = int(result[0].page)
+                        self._record_endpoint_hit(engine.heap, table, state)
+                    except BaseException:
+                        self._mark_observation_failure("endpoint_hit_observation")
+            return result
+
+        self._patch(query_engine, "_visible_identity_with_ref", visible_identity)
 
         original_require_endpoints = inspect.getattr_static(
             HeapStore, "require_endpoints"
