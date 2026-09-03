@@ -23,7 +23,6 @@ from typing import Any
 MAX_SAMPLES = 100_000
 MAX_STATEMENTS = 100_000
 MAX_DATABASE_OPENS = 64
-MAX_ENDPOINT_HITS = 100_000
 
 _INSTALL_LOCK = threading.Lock()
 _ACTIVE_INSTRUMENTATION: PulseCardInstrumentation | None = None
@@ -91,7 +90,7 @@ class PulseCardInstrumentation:
         self._index_candidates = _BoundedSamples()
         self._query_duration_ns = _BoundedSamples()
         self._commit_duration_ns = _BoundedSamples()
-        self._endpoint_hit_coordinates: list[tuple[int, int]] = []
+        self._endpoint_hit_weights: dict[tuple[int, int], int] = {}
         self._endpoint_hit_total = 0
         self._target_heap: Any | None = None
 
@@ -157,7 +156,7 @@ class PulseCardInstrumentation:
     def _record_endpoint_hit(
         self, store: Any, table: Any, state: Mapping[str, Any]
     ) -> None:
-        """Retain a bounded private coordinate for post-workload aggregation.
+        """Fold one endpoint hit into exact private per-page weights for later aggregation.
 
         Coordinates never enter :meth:`report`.  The P0.3 driver resolves them against
         ``HeapStore.pages_of`` only after the timed workload and publishes an aggregate
@@ -178,24 +177,31 @@ class PulseCardInstrumentation:
                 raise ValueError("invalid endpoint hit coordinate")
             with self._event_lock:
                 self._endpoint_hit_total += 1
-                if len(self._endpoint_hit_coordinates) < MAX_ENDPOINT_HITS:
-                    self._endpoint_hit_coordinates.append((table_id, page))
+                key = (table_id, page)
+                self._endpoint_hit_weights[key] = (
+                    self._endpoint_hit_weights.get(key, 0) + 1
+                )
         except BaseException:
             self._mark_observation_failure("endpoint_hit_coordinate")
 
-    def _endpoint_hit_snapshot(self) -> tuple[tuple[int, int], ...]:
-        """Freeze private coordinates after every hook and workload thread stopped."""
+    def _endpoint_hit_snapshot(self) -> dict[tuple[int, int], int]:
+        """Freeze the private per-page weights after every hook and workload thread stopped.
+
+        The weights are bounded by the number of distinct (table, page) pairs observed,
+        never by a hit cap, so they stay exact for any number of endpoint hits.
+        """
         self._counter_snapshot()
         with self._event_lock:
-            return tuple(self._endpoint_hit_coordinates)
+            return dict(self._endpoint_hit_weights)
 
     def endpoint_hit_locality(self, database: Any) -> dict[str, Any]:
         """Resolve actual endpoint hits against post-workload chain order.
 
         This is deliberately called after :meth:`close`, outside the timed card operation.  It
         performs the extra ``pages_of`` walks needed to turn private coordinates into a safe
-        aggregate.  A truncated or unreconciled coordinate set is refused rather than presented
-        as evidence for the P1.4 locality threshold.
+        aggregate.  An unreconciled weight set is refused rather than presented as evidence for
+        the P1.4 locality threshold; there is no truncation mode because the weights are
+        exact by construction.
         """
 
         from tools.perf_round.heap_census import summarize_tail_distances
@@ -204,12 +210,12 @@ class PulseCardInstrumentation:
             raise InstrumentationError(
                 "endpoint locality was requested for a database other than the observed target"
             )
-        coordinates = self._endpoint_hit_snapshot()
+        weights_by_coordinate = self._endpoint_hit_snapshot()
         with self._event_lock:
             total = self._endpoint_hit_total
-        if len(coordinates) != total:
+        if sum(weights_by_coordinate.values()) != total:
             raise InstrumentationError(
-                "endpoint hit coordinates were truncated; locality is not exact"
+                "endpoint hit weights do not reconcile with the hit total"
             )
 
         counters = self._counter_snapshot()
@@ -219,9 +225,9 @@ class PulseCardInstrumentation:
             )
 
         table_weights: dict[int, dict[int, int]] = {}
-        for table_id, page in coordinates:
+        for (table_id, page), weight in weights_by_coordinate.items():
             weights = table_weights.setdefault(table_id, {})
-            weights[page] = weights.get(page, 0) + 1
+            weights[page] = weights.get(page, 0) + weight
 
         tables = {
             int(table.table_id): table for table in database.catalog.catalog.tables()
@@ -732,9 +738,8 @@ class PulseCardInstrumentation:
                 > len(self._baseline_handles),
                 "endpoint_hit_coordinates": {
                     "total": self._endpoint_hit_total,
-                    "retained": len(self._endpoint_hit_coordinates),
-                    "truncated": self._endpoint_hit_total
-                    > len(self._endpoint_hit_coordinates),
+                    "retained": self._endpoint_hit_total,
+                    "truncated": False,
                     "serialized": False,
                 },
                 "lookup_headers_examined": self._lookup_headers.report(),

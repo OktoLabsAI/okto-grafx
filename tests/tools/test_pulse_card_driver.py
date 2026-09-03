@@ -193,6 +193,42 @@ def test_instrumentation_counts_actual_endpoint_lookups_without_serializing_refs
     assert "page_id" not in rendered
 
 
+def test_endpoint_locality_stays_exact_beyond_one_hundred_thousand_hits() -> None:
+    """Synthetic: 100_001 hits on one page aggregate exactly with no truncation mode."""
+    import tools.perf_round.pulse_card_instrumentation as instrumentation_module
+
+    assert not hasattr(instrumentation_module, "MAX_ENDPOINT_HITS")
+    probe = PulseCardInstrumentation()
+    hits = 100_001
+    with okto_grafx.connect(":memory:") as database:
+        with database.begin("write") as transaction:
+            transaction.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
+            transaction.execute("CREATE (:Person {id: 1}), (:Person {id: 2})")
+        probe.observe_database(database)
+        table = next(t for t in database.catalog.catalog.tables() if t.name == "Person")
+        page = int(database._heap.pages_of(table)[0])
+        state = {"hit_page": page}
+        for _ in range(hits):
+            probe._bump("endpoint_lookup_hits")
+            probe._record_endpoint_hit(database._heap, table, state)
+        locality = probe.endpoint_hit_locality(database)
+
+    report = probe.report()
+    assert report["observation_failures"] == {}
+    assert report["endpoint_hit_coordinates"] == {
+        "total": hits,
+        "retained": hits,
+        "truncated": False,
+        "serialized": False,
+    }
+    assert locality["exact"] is True
+    assert locality["total"] == hits
+    assert locality["distance_pages"]["total"] == hits
+    assert locality["distance_pages"]["last_10_percent"] == hits
+    assert locality["distance_pages"]["last_10_percent_ratio"] == 1.0
+    assert locality["p1_4_threshold_evaluable"] is True
+
+
 def test_failed_endpoint_validation_restores_context_and_preserves_error() -> None:
     probe = PulseCardInstrumentation()
     with okto_grafx.connect(":memory:") as database:

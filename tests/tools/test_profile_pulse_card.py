@@ -19,6 +19,7 @@ from tools.perf_round.profile_pulse_card import (
     _counter_deltas,
     _parser,
     _profile_argv,
+    _require_direct_interpreter,
     _run_profiled_process,
     _validate_profile_artifact,
 )
@@ -80,6 +81,25 @@ def test_replay_profile_barrier_refuses_partial_or_wrong_parent_release(
     monkeypatch.setattr(sys, "stdin", io.StringIO("go-v1:" + "b" * 64 + "\n"))
     with pytest.raises(DriverRefused, match="did not release"):
         _profile_start_barrier(clone)
+
+
+def test_interpreter_preflight_refuses_a_launcher_and_passes_a_direct_interpreter(
+    tmp_path: Path,
+) -> None:
+    """A launcher that starts Python as a grandchild is refused before any PID is trusted."""
+    base = getattr(sys, "_base_executable", None) or sys.executable
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(
+        "import subprocess, sys\n"
+        "sys.exit(subprocess.run([sys.executable, *sys.argv[1:]]).returncode)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ProfileRefused, match="interpreter launcher detected"):
+        _require_direct_interpreter((base, str(launcher)))
+    report = _require_direct_interpreter((base,))
+    assert report["direct"] is True
+    assert report["child_pid_parent_is_runner"] is True
+    assert report["argv_prefix"] == [base]
 
 
 def test_profile_cli_has_no_operator_pid_and_argv_is_closed() -> None:

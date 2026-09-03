@@ -142,7 +142,8 @@ by the frozen plan without conflating either with a baseline:
 
 - The instrumented replay now records actual endpoint lookup hits and resolves their distance to
   the post-workload table-chain tail without subtracting opaque page identifiers. It reconciles
-  every retained coordinate with endpoint lookup counters and refuses truncation. It also records
+  the exact per-page hit weights with endpoint lookup counters; the weights are bounded by
+  the pages observed, never by a hit cap, so long cards cannot fail on truncation. It also records
   dynamic calls and failures for vector search and vector rebuild.
 - `profile_pulse_card.py` creates exactly one fresh full-home clone, starts the replay as its direct
   child and attaches exactly py-spy 0.4.2 as a sibling to the internal `Popen` PID. A nonce-bound
@@ -162,6 +163,13 @@ by the frozen plan without conflating either with a baseline:
   `HeapVersion.live` predicate”; it does not prove vacuum eligibility. Vector counts are static
   catalog presence and do not claim search/build activity. The one-shot runner reconciles verifier,
   heap-slot, MVCC-class and locality totals before accepting the artifact.
+
+Hardening after the adversarial review (`perf/v002-p03-hardening-claude`): the profiler runs
+a direct-interpreter preflight before the py-spy protocol and refuses, with an operational
+message, any launcher that starts Python as a grandchild (uv trampoline, `py` launcher, Store
+alias), because the PID/READY/GO proof and the attach would otherwise target the wrong
+process; and endpoint locality is aggregated incrementally per page, so the former 100 000-hit
+cap and its truncation failure no longer exist.
 
 The milestone regression covered 98 focused instrument tests in one combined run. Ruff,
 `py_compile`, `git diff --check`, command-line contract checks, an isolated real-Grafx census smoke

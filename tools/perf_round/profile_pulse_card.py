@@ -236,6 +236,65 @@ def _resolve_profiler() -> ProfilerBinary:
     )
 
 
+_INTERPRETER_PROBE = (
+    "import os, sys; print(os.getpid(), os.getppid(), sys.executable, sep=chr(10))"
+)
+
+
+def _require_direct_interpreter(
+    argv_prefix: Sequence[str] = (sys.executable,),
+    *,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Refuse a launcher between Popen and the interpreter before any PID is trusted.
+
+    A uv trampoline, the ``py`` launcher or a Store alias starts the real Python as a
+    grandchild: the PID returned by ``Popen`` is the launcher's, so the identity proof
+    would pass on the wrong process and py-spy would attach to a non-Python process. The
+    probe spawns the interpreter exactly as the replay will be spawned and requires the
+    Python that runs to be that very child.
+    """
+    argv = [*argv_prefix, "-c", _INTERPRETER_PROBE]
+    try:
+        probe = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+            cwd=SOURCE_ROOT,
+        )
+    except (OSError, subprocess.SubprocessError) as failure:
+        raise ProfileRefused("the interpreter preflight could not run") from failure
+    lines = probe.stdout.splitlines()
+    if probe.returncode != 0 or len(lines) < 3:
+        raise ProfileRefused("the interpreter preflight did not report its identity")
+    try:
+        child_pid = int(lines[0])
+        child_ppid = int(lines[1])
+    except ValueError as failure:
+        raise ProfileRefused(
+            "the interpreter preflight reported a malformed identity"
+        ) from failure
+    reported_executable = lines[2]
+    # subprocess.run does not expose the Popen pid it used; the parent relation is the
+    # decisive proof: the Python that ran must be OUR direct child.
+    if child_ppid != os.getpid():
+        raise ProfileRefused(
+            "interpreter launcher detected: "
+            f"{argv_prefix[0]} starts the Python process as a grandchild (pid {child_pid}, "
+            f"parent {child_ppid}, runner {os.getpid()}); a uv trampoline, the py launcher or a "
+            "Store alias breaks the PID/READY/GO proof and the py-spy attach. Run the profiler with "
+            "a direct interpreter (the base python.exe of the environment)."
+        )
+    return {
+        "direct": True,
+        "argv_prefix": [str(item) for item in argv_prefix],
+        "reported_executable": reported_executable,
+        "child_pid_parent_is_runner": True,
+    }
+
+
 def _profile_argv(
     profiler_command: Sequence[str], *, target_pid: int, output: Path
 ) -> list[str]:
@@ -869,6 +928,7 @@ def profile_once(args: argparse.Namespace) -> dict[str, Any]:
     _validate_arguments(args)
     pins = _validate_source_pins(args)
     profiler = _resolve_profiler()
+    interpreter = _require_direct_interpreter()
     declared_copy = guard_not_data_home(args.declared_copy)
     out_dir = guard_not_data_home(args.out_dir)
     protected = (
@@ -1038,6 +1098,7 @@ def profile_once(args: argparse.Namespace) -> dict[str, Any]:
     results = {
         "schema": SCHEMA,
         "complete": True,
+        "interpreter": interpreter,
         "target": process_run.target_identity,
         "processes": {
             "target_pid": process_run.target_pid,
