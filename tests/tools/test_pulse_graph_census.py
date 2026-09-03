@@ -18,6 +18,8 @@ from okto_grafx.runtime.config import DatabaseConfig
 from tools.perf_round import pulse_graph_census
 from tools.perf_round.pulse_graph_census import (
     GraphCensusRefused,
+    _expected_participant_lock_relative,
+    _inventory_delta_for_expected_participant_lock,
     _inventory_matches,
     _module_file,
     _open_and_collect,
@@ -28,8 +30,10 @@ from tools.perf_round.pulse_graph_census import (
     _validate_runner_parent,
     collect_heap_census,
 )
+from tools.perf_round.receipt import sha256_text
 
 BOARD_ID = "00000000-0000-0000-0000-000000000001"
+PARTICIPANT_LOCK_PATH = f"boards/{BOARD_ID}/grafx/generation/control/txn-0123abcd.lock"
 
 
 class _Table:
@@ -118,6 +122,7 @@ class _Database:
         self.pool = SimpleNamespace(budget_bytes=64 * 1024 * 1024)
         self.descriptor_revalidation = "strict"
         self.path = str(graph_path)
+        self._transactions = SimpleNamespace(_participant_section_name="txn-0123abcd")
         self.maintenance = SimpleNamespace(
             status=lambda: SimpleNamespace(recovery_required=False)
         )
@@ -286,9 +291,12 @@ def test_open_is_read_only_recovery_refusing_admitted_and_closed(
     monkeypatch.setattr(okto_grafx, "connect", connect)
     monkeypatch.setattr(pulse_graph_census, "_admit_database", admit)
 
-    result = _open_and_collect(graph, _args(tmp_path / "clone", tmp_path / "out"))
+    result, participant_section = _open_and_collect(
+        graph, _args(tmp_path / "clone", tmp_path / "out")
+    )
 
     assert result["counts"]["heap_record_slots_total"] == 2
+    assert participant_section == "txn-0123abcd"
     assert observed["path"] == graph
     assert observed["options"] == {
         "read_only": True,
@@ -379,6 +387,25 @@ def test_open_refuses_an_incomplete_close(
         _open_and_collect(graph, _args(tmp_path / "clone", tmp_path / "out"))
 
 
+def test_open_refuses_an_invalid_participant_section_and_still_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph = tmp_path / "graph"
+    graph.mkdir()
+    database = _Database(graph)
+    database._transactions._participant_section_name = "txn-NOT-HEX"
+    monkeypatch.setattr(
+        pulse_graph_census, "_connect_read_only", lambda _path, _args: database
+    )
+    monkeypatch.setattr(
+        pulse_graph_census, "_admit_database", lambda _database, _path, _args: None
+    )
+
+    with pytest.raises(GraphCensusRefused, match="participant section identity"):
+        _open_and_collect(graph, _args(tmp_path / "clone", tmp_path / "out"))
+    assert database.closed is True and database.close_complete is True
+
+
 def test_checkpointed_real_grafx_supports_the_header_only_census(
     tmp_path: Path,
 ) -> None:
@@ -461,12 +488,15 @@ def _stub_run_dependencies(
     for name in pulse_graph_census.DATA_HOME_ENV:
         monkeypatch.setenv(name, str(clone))
     monkeypatch.setenv("OKTO_GRAFX_PERF_RUNNER_PID", str(os.getppid()))
-    files = [{"path": "opaque", "size": 1, "sha256": "a" * 64}]
+    files = [
+        {"path": "opaque", "size": 1, "sha256": "a" * 64},
+        {"path": PARTICIPANT_LOCK_PATH, "size": 0, "sha256": sha256_text("")},
+    ]
     manifest = {
         "source": {"cloned_from_declared_copy": "b" * 64},
         "copy": {
             "sha256": "c" * 64,
-            "file_count": 1,
+            "file_count": 2,
             "total_bytes": 1,
             "files": files,
         },
@@ -501,7 +531,10 @@ def _stub_run_dependencies(
     monkeypatch.setattr(
         pulse_graph_census,
         "_open_and_collect",
-        lambda _path, _args: {"verification": {}, "counts": {}, "heap": {}},
+        lambda _path, _args: (
+            {"verification": {}, "counts": {}, "heap": {}},
+            "txn-0123abcd",
+        ),
     )
     monkeypatch.setattr(
         pulse_graph_census,
@@ -592,19 +625,22 @@ def test_run_requires_full_clone_and_proves_post_close_inventory(
         monkeypatch.setenv(name, str(clone))
     monkeypatch.setenv("OKTO_GRAFX_PERF_RUNNER_PID", str(os.getppid()))
 
-    files = [{"path": "opaque", "size": 1, "sha256": "a" * 64}]
+    files = [
+        {"path": "opaque", "size": 1, "sha256": "a" * 64},
+        {"path": PARTICIPANT_LOCK_PATH, "size": 0, "sha256": sha256_text("")},
+    ]
     manifest = {
         "source": {"cloned_from_declared_copy": "b" * 64},
         "copy": {
             "sha256": "c" * 64,
-            "file_count": 1,
+            "file_count": 2,
             "total_bytes": 1,
             "files": files,
         },
     }
     observed_inventory = {
         "sha256": "c" * 64,
-        "file_count": 1,
+        "file_count": 2,
         "total_bytes": 1,
         "files": files,
     }
@@ -639,9 +675,12 @@ def test_run_requires_full_clone_and_proves_post_close_inventory(
         lambda _root, _board: events.append("binding") or binding,
     )
 
-    def collect(_path: Path, _args: argparse.Namespace) -> dict[str, Any]:
+    def collect(_path: Path, _args: argparse.Namespace) -> tuple[dict[str, Any], str]:
         events.append("handle_open_collect_close")
-        return {"verification": {}, "counts": {}, "heap": {}}
+        return (
+            {"verification": {}, "counts": {}, "heap": {}},
+            "txn-0123abcd",
+        )
 
     def final_inventory(_root: Path, *, exclude: tuple[str, ...]) -> dict[str, Any]:
         assert exclude == (
@@ -665,11 +704,21 @@ def test_run_requires_full_clone_and_proves_post_close_inventory(
     ]
     assert document["clone_inventory"] == {
         "unchanged": True,
+        "raw_unchanged": True,
+        "unchanged_except_expected_participant_lock": True,
         "serve_lock_artifacts_absent": True,
         "sha256_before": "c" * 64,
         "sha256_after": "c" * 64,
-        "file_count": 1,
+        "file_count_before": 2,
+        "file_count_after": 2,
+        "file_count": 2,
+        "total_bytes_before": 1,
+        "total_bytes_after": 1,
         "total_bytes": 1,
+        "expected_participant_lock_path_sha256": sha256_text(
+            f"boards/{BOARD_ID}/grafx/generation/control/txn-0123abcd.lock"
+        ),
+        "expected_participant_lock_added_count": 0,
     }
     encoded = json.dumps(document, sort_keys=True)
     assert BOARD_ID not in encoded
@@ -710,12 +759,15 @@ def test_report_names_static_mvcc_and_vector_limits(
     for name in pulse_graph_census.DATA_HOME_ENV:
         monkeypatch.setenv(name, str(clone))
     monkeypatch.setenv("OKTO_GRAFX_PERF_RUNNER_PID", str(os.getppid()))
-    files = [{"path": "opaque", "size": 1, "sha256": "a" * 64}]
+    files = [
+        {"path": "opaque", "size": 1, "sha256": "a" * 64},
+        {"path": PARTICIPANT_LOCK_PATH, "size": 0, "sha256": sha256_text("")},
+    ]
     manifest = {
         "source": {"cloned_from_declared_copy": "b" * 64},
         "copy": {
             "sha256": "c" * 64,
-            "file_count": 1,
+            "file_count": 2,
             "total_bytes": 1,
             "files": files,
         },
@@ -752,7 +804,10 @@ def test_report_names_static_mvcc_and_vector_limits(
     monkeypatch.setattr(
         pulse_graph_census,
         "_open_and_collect",
-        lambda _path, _args: {"verification": {}, "counts": {}, "heap": {}},
+        lambda _path, _args: (
+            {"verification": {}, "counts": {}, "heap": {}},
+            "txn-0123abcd",
+        ),
     )
     monkeypatch.setattr(
         pulse_graph_census,
@@ -786,6 +841,106 @@ def test_inventory_proof_compares_file_population_not_only_tree_digest() -> None
         observed = dict(expected)
         observed[field] = changed
         assert _inventory_matches(expected, observed) is False
+
+
+def _participant_inventory_case(tmp_path: Path) -> tuple[str, dict, dict]:
+    clone = tmp_path / "clone"
+    graph = clone / "boards" / BOARD_ID / "grafx" / "generation"
+    graph.mkdir(parents=True)
+    lock_path = _expected_participant_lock_relative(
+        copy_root=clone, graph_path=graph, participant_section_name="txn-0123abcd"
+    )
+    stable = {"path": "opaque", "size": 1, "sha256": "a" * 64}
+    expected = {
+        "sha256": "b" * 64,
+        "file_count": 1,
+        "total_bytes": 1,
+        "files": [stable],
+    }
+    observed = {
+        "sha256": "c" * 64,
+        "file_count": 2,
+        "total_bytes": 1,
+        "files": [
+            stable,
+            {"path": lock_path, "size": 0, "sha256": sha256_text("")},
+        ],
+    }
+    return lock_path, expected, observed
+
+
+def test_inventory_delta_accepts_zero_or_one_captured_empty_lock(
+    tmp_path: Path,
+) -> None:
+    lock_path, expected, observed = _participant_inventory_case(tmp_path)
+
+    assert (
+        _inventory_delta_for_expected_participant_lock(
+            expected, expected, expected_relative_path=lock_path
+        )
+        is None
+    )
+    assert (
+        _inventory_delta_for_expected_participant_lock(
+            observed, observed, expected_relative_path=lock_path
+        )
+        == 0
+    )
+    nonempty = json.loads(json.dumps(observed))
+    nonempty["files"][1] = {"path": lock_path, "size": 1, "sha256": "d" * 64}
+    nonempty["total_bytes"] = 2
+    assert (
+        _inventory_delta_for_expected_participant_lock(
+            nonempty, nonempty, expected_relative_path=lock_path
+        )
+        is None
+    )
+    assert (
+        _inventory_delta_for_expected_participant_lock(
+            expected, observed, expected_relative_path=lock_path
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation", ("path", "name", "size", "hash", "second", "removed", "changed")
+)
+def test_inventory_delta_refuses_every_other_delta(
+    tmp_path: Path, mutation: str
+) -> None:
+    lock_path, expected, observed = _participant_inventory_case(tmp_path)
+    lock = observed["files"][1]
+    if mutation == "path":
+        lock["path"] = "control/txn-0123abcd.lock"
+    elif mutation == "name":
+        lock["path"] = f"{Path(lock_path).parent.as_posix()}/txn-0123abcg.lock"
+    elif mutation == "size":
+        lock["size"] = 1
+        observed["total_bytes"] = 2
+    elif mutation == "hash":
+        lock["sha256"] = "d" * 64
+    elif mutation == "second":
+        observed["files"].append(
+            {
+                "path": f"{Path(lock_path).parent.as_posix()}/txn-deadbeef.lock",
+                "size": 0,
+                "sha256": sha256_text(""),
+            }
+        )
+        observed["file_count"] = 3
+    elif mutation == "removed":
+        observed["files"] = [lock]
+        observed["file_count"] = 1
+        observed["total_bytes"] = 0
+    else:
+        observed["files"][0] = {"path": "opaque", "size": 1, "sha256": "e" * 64}
+    assert (
+        _inventory_delta_for_expected_participant_lock(
+            expected, observed, expected_relative_path=lock_path
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(

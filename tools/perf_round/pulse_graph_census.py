@@ -14,7 +14,9 @@ version-pinned ``HeapStore.pages_of``/``HeapStore._walk(copy_content=False)`` ce
 The result deliberately contains only aggregate counts.  It never emits a board, table, record,
 page or slot identity; a commit stamp; a value, key, query or physical graph path.  The clone is
 inventoried again only after the Grafx handle and the exclusive Pulse serve lock have closed.  A
-single JSON document is then created with exclusive ``open("x")`` semantics outside the clone.
+read-only Grafx participant may materialise its one empty advisory lock; that exact path is bound
+to the authenticated graph internally and disclosed only as an opaque SHA-256.  A single JSON
+document is then created with exclusive ``open("x")`` semantics outside the clone.
 """
 
 from __future__ import annotations
@@ -41,14 +43,17 @@ from tools.perf_round.receipt import (  # noqa: E402
     guard_not_data_home,
     inventory,
     require_declared_copy,
+    sha256_text,
     tool_sha256,
 )
 
-SCHEMA = "okto-grafx.perf-round-0.0.2.pulse-graph-census.v1"
+SCHEMA = "okto-grafx.perf-round-0.0.2.pulse-graph-census.v2"
 WORKLOAD_SEMANTICS = "untimed_read_only_post_drain_heap_census"
 _MANIFEST_FILES = (COPY_MANIFEST_NAME, COPY_MANIFEST_NAME + ".sha256")
 _SERVE_LOCK_FILES = (".okto-pulse-serve.lock", ".okto-pulse-serve.lock.acquire")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_PARTICIPANT_SECTION = re.compile(r"^txn-[0-9a-f]{8}$")
+_EMPTY_FILE_SHA256 = sha256_text("")
 
 
 class GraphCensusRefused(RuntimeError):
@@ -297,9 +302,12 @@ def _admit_database(database: Any, graph_path: Path, args: argparse.Namespace) -
     )
 
 
-def _open_and_collect(graph_path: Path, args: argparse.Namespace) -> dict[str, Any]:
+def _open_and_collect(
+    graph_path: Path, args: argparse.Namespace
+) -> tuple[dict[str, Any], str]:
     database = _connect_read_only(graph_path, args)
     result: dict[str, Any] | None = None
+    participant_section_name: str | None = None
     try:
         _admit_database(database, graph_path, args)
         status = database.maintenance.status()
@@ -319,6 +327,17 @@ def _open_and_collect(graph_path: Path, args: argparse.Namespace) -> dict[str, A
             raise GraphCensusRefused(
                 "the effective Grafx handle does not match the requested configuration"
             )
+        transactions = getattr(database, "_transactions", None)
+        participant_section_name = getattr(
+            transactions, "_participant_section_name", None
+        )
+        if (
+            type(participant_section_name) is not str
+            or _PARTICIPANT_SECTION.fullmatch(participant_section_name) is None
+        ):
+            raise GraphCensusRefused(
+                "the Grafx handle exposed no valid participant section identity"
+            )
         result = collect_heap_census(database)
     finally:
         database.close()
@@ -329,7 +348,9 @@ def _open_and_collect(graph_path: Path, args: argparse.Namespace) -> dict[str, A
         raise GraphCensusRefused("the read-only Grafx handle did not close completely")
     if result is None:
         raise GraphCensusRefused("the read-only Grafx census produced no aggregate")
-    return result
+    if participant_section_name is None:  # pragma: no cover - guarded before collection
+        raise GraphCensusRefused("the Grafx participant section identity was lost")
+    return result, participant_section_name
 
 
 def _inventory_matches(
@@ -339,6 +360,110 @@ def _inventory_matches(
         expected.get(field) == observed.get(field)
         for field in ("sha256", "file_count", "total_bytes", "files")
     )
+
+
+def _inventory_file_map(
+    document: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]] | None:
+    files = document.get("files")
+    if type(files) is not list:
+        return None
+    mapped: dict[str, Mapping[str, Any]] = {}
+    for entry in files:
+        if type(entry) is not dict or set(entry) != {"path", "size", "sha256"}:
+            return None
+        path = entry.get("path")
+        size = entry.get("size")
+        digest = entry.get("sha256")
+        if (
+            type(path) is not str
+            or not path
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or type(digest) is not str
+            or _SHA256.fullmatch(digest) is None
+            or path in mapped
+        ):
+            return None
+        mapped[path] = entry
+    return mapped
+
+
+def _expected_participant_lock_relative(
+    *, copy_root: Path, graph_path: Path, participant_section_name: str
+) -> str:
+    if _PARTICIPANT_SECTION.fullmatch(participant_section_name) is None:
+        raise GraphCensusRefused(
+            "the Grafx participant section name is outside the frozen lock grammar"
+        )
+    try:
+        graph_relative = graph_path.resolve().relative_to(copy_root.resolve())
+    except (OSError, RuntimeError, ValueError) as failure:
+        raise GraphCensusRefused(
+            "the participant lock is not inside the authenticated clone graph"
+        ) from failure
+    if not graph_relative.parts:
+        raise GraphCensusRefused("the authenticated graph cannot be the clone root")
+    return (graph_relative / "control" / f"{participant_section_name}.lock").as_posix()
+
+
+def _inventory_delta_for_expected_participant_lock(
+    expected: Mapping[str, Any],
+    observed: Mapping[str, Any],
+    *,
+    expected_relative_path: str,
+) -> int | None:
+    """Return 0/1 for strict equality or one exact empty participant-lock addition.
+
+    Both trees have already gone through :func:`inventory`, so no path is hidden from its
+    regular-file, reparse-point, hard-link and root-containment checks.  This comparison permits
+    only the one path derived from the authenticated graph and captured participant section;
+    every pre-existing entry remains part of the immutable proof.
+    """
+    expected_files = _inventory_file_map(expected)
+    observed_files = _inventory_file_map(observed)
+    if expected_files is None or observed_files is None:
+        return None
+    expected_lock = {
+        "path": expected_relative_path,
+        "size": 0,
+        "sha256": _EMPTY_FILE_SHA256,
+    }
+    if _inventory_matches(expected, observed):
+        return (
+            0 if expected_files.get(expected_relative_path) == expected_lock else None
+        )
+    expected_paths = set(expected_files)
+    observed_paths = set(observed_files)
+    if not expected_paths <= observed_paths:
+        return None
+    if any(observed_files[path] != expected_files[path] for path in expected_paths):
+        return None
+    added = observed_paths - expected_paths
+    if added != {expected_relative_path}:
+        return None
+    added_entry = observed_files[expected_relative_path]
+    if added_entry != expected_lock:
+        return None
+    expected_count = expected.get("file_count")
+    observed_count = observed.get("file_count")
+    expected_bytes = expected.get("total_bytes")
+    observed_bytes = observed.get("total_bytes")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (expected_count, observed_count, expected_bytes, observed_bytes)
+    ):
+        return None
+    if (
+        expected_count != len(expected_files)
+        or observed_count != len(observed_files)
+        or observed_count != expected_count + 1
+        or observed_bytes != expected_bytes
+        or observed.get("sha256") == expected.get("sha256")
+    ):
+        return None
+    return 1
 
 
 def _require_lock_artifacts_absent(copy_root: Path) -> None:
@@ -431,14 +556,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             board_id=args.board_id,
             page_size=args.page_size,
         )
-        aggregate = _open_and_collect(graph_path, args)
+        aggregate, participant_section_name = _open_and_collect(graph_path, args)
 
     _require_lock_artifacts_absent(args.copy)
     observed_inventory = inventory(args.copy, exclude=_MANIFEST_FILES)
-    if not _inventory_matches(expected_inventory, observed_inventory):
+    participant_lock_relative = _expected_participant_lock_relative(
+        copy_root=args.copy,
+        graph_path=graph_path,
+        participant_section_name=participant_section_name,
+    )
+    participant_lock_added_count = _inventory_delta_for_expected_participant_lock(
+        expected_inventory,
+        observed_inventory,
+        expected_relative_path=participant_lock_relative,
+    )
+    if participant_lock_added_count is None:
         raise GraphCensusRefused(
             "the disposable clone changed while the read-only census was running"
         )
+    raw_unchanged = participant_lock_added_count == 0
 
     return {
         "schema": SCHEMA,
@@ -471,12 +607,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         **aggregate,
         "clone_inventory": {
-            "unchanged": True,
+            "unchanged": raw_unchanged,
+            "raw_unchanged": raw_unchanged,
+            "unchanged_except_expected_participant_lock": True,
             "serve_lock_artifacts_absent": True,
             "sha256_before": expected_inventory["sha256"],
             "sha256_after": observed_inventory["sha256"],
+            "file_count_before": expected_inventory["file_count"],
+            "file_count_after": observed_inventory["file_count"],
             "file_count": observed_inventory["file_count"],
+            "total_bytes_before": expected_inventory["total_bytes"],
+            "total_bytes_after": observed_inventory["total_bytes"],
             "total_bytes": observed_inventory["total_bytes"],
+            "expected_participant_lock_path_sha256": sha256_text(
+                participant_lock_relative
+            ),
+            "expected_participant_lock_added_count": participant_lock_added_count,
         },
         "_perf_round": {
             "python_executable": str(Path(sys.executable).resolve()),

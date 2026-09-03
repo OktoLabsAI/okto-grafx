@@ -4,7 +4,8 @@ This is deliberately not the P0.4 baseline series: a structural census needs one
 post-drain observation, not three repeated walks.  The runner accepts only a previously declared
 stable copy, creates one byte-identical per-run clone, pins clean Grafx, Pulse Community and Pulse
 Core source trees, and launches :mod:`pulse_graph_census` as its direct child.  The child opens only
-the authenticated Grafx binding, read-only and recovery-refusing, and proves the clone unchanged.
+the authenticated Grafx binding, read-only and recovery-refusing.  Every pre-existing byte must
+remain unchanged; the single Grafx handle may add only its exact empty participant lock.
 
 The process-tree RSS/private figures and supervision wall time are operational diagnostics only.
 They are not workload timings, thermal evidence or a performance baseline.
@@ -13,12 +14,14 @@ They are not workload timings, thermal evidence or a performance baseline.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import re
 import sys
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 if __package__ in (None, ""):
@@ -41,7 +44,6 @@ from tools.perf_round.profile_pulse_card import (  # noqa: E402
 from tools.perf_round.pulse_graph_census import (  # noqa: E402
     SCHEMA as CHILD_SCHEMA,
     WORKLOAD_SEMANTICS,
-    _inventory_matches,
 )
 from tools.perf_round.receipt import (  # noqa: E402
     COPY_MANIFEST_NAME,
@@ -53,19 +55,38 @@ from tools.perf_round.receipt import (  # noqa: E402
     machine_sample,
     plain_input,
     sha256_file,
+    sha256_text,
     write_receipt,
 )
 from tools.perf_round.replay_pulse_card import (  # noqa: E402
     SUPPORTED_PULSE_BUFFER_BUDGET_BYTES,
 )
 
-SCHEMA = "okto-grafx.perf-round-0.0.2.pulse-graph-census-once.v1"
+SCHEMA = "okto-grafx.perf-round-0.0.2.pulse-graph-census-once.v2"
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 CENSUS_SCRIPT = SOURCE_ROOT / "tools" / "perf_round" / "pulse_graph_census.py"
 RUN_COPY_NAME = "graph_census_run_copy"
 CHILD_OUTPUT_NAME = "graph_census.json"
 RECEIPT_NAME = "graph_census_receipt.json"
 _MANIFEST_FILES = (COPY_MANIFEST_NAME, COPY_MANIFEST_NAME + ".sha256")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_PARTICIPANT_LOCK_FILE = re.compile(r"^txn-[0-9a-f]{8}\.lock$")
+_WINDOWS_RESERVED_SEGMENT = re.compile(
+    r"^(?:aux|con|nul|prn|com[1-9]|lpt[1-9])(?:\.|$)", re.IGNORECASE
+)
+_EMPTY_FILE_SHA256 = sha256_text("")
+_BINDING_FORMAT = "okto-pulse-community-graph-binding/1"
+_BINDING_FILE = "graph_backend_binding.json"
+_BINDING_KEYS = {
+    "binding_format",
+    "scope",
+    "scope_id",
+    "backend",
+    "generation",
+    "physical_path",
+    "page_size",
+    "binding_sha256",
+}
 
 
 class CensusOnceRefused(RuntimeError):
@@ -170,6 +191,208 @@ def _integer(value: Any, *, minimum: int, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise CensusOnceRefused(f"the census child returned an invalid {field}")
     return value
+
+
+def _inventory_file_map(
+    document: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]]:
+    files = document.get("files")
+    if type(files) is not list:
+        raise CensusOnceRefused("an inventory has no exact file population")
+    mapped: dict[str, Mapping[str, Any]] = {}
+    for entry in files:
+        if type(entry) is not dict or set(entry) != {"path", "size", "sha256"}:
+            raise CensusOnceRefused("an inventory contains a malformed file entry")
+        path = entry.get("path")
+        size = entry.get("size")
+        digest = entry.get("sha256")
+        if (
+            type(path) is not str
+            or not path
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or type(digest) is not str
+            or _SHA256.fullmatch(digest) is None
+            or path in mapped
+        ):
+            raise CensusOnceRefused("an inventory contains a malformed file entry")
+        mapped[path] = entry
+    return mapped
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate binding key")
+        result[key] = value
+    return result
+
+
+def _authenticated_graph_relative(
+    copy_root: Path,
+    *,
+    board_id: str,
+    page_size: int,
+    expected_inventory: Mapping[str, Any],
+) -> str:
+    """Authenticate the persisted Community binding without opening the graph database.
+
+    Keep this canonical JSON/path subset aligned with Community's
+    ``graph_backend_binding.py``; the independent runner deliberately does not import or start
+    Pulse while establishing the expected graph root.
+    """
+    binding_relative = f"boards/{board_id}/{_BINDING_FILE}"
+    expected_files = _inventory_file_map(expected_inventory)
+    expected_binding = expected_files.get(binding_relative)
+    binding_path = copy_root.joinpath(*PurePosixPath(binding_relative).parts)
+    try:
+        encoded = binding_path.read_bytes()
+    except OSError as failure:
+        raise CensusOnceRefused("the board graph binding is unreadable") from failure
+    if (
+        len(encoded) > 16 * 1024
+        or expected_binding is None
+        or expected_binding.get("size") != len(encoded)
+        or expected_binding.get("sha256") != hashlib.sha256(encoded).hexdigest()
+    ):
+        raise CensusOnceRefused("the board graph binding is outside the clone manifest")
+    try:
+        document = json.loads(
+            encoded.decode("utf-8"), object_pairs_hook=_strict_json_object
+        )
+    except (UnicodeDecodeError, ValueError) as failure:
+        raise CensusOnceRefused(
+            "the board graph binding is not strict JSON"
+        ) from failure
+    if type(document) is not dict or set(document) != _BINDING_KEYS:
+        raise CensusOnceRefused("the board graph binding has an invalid shape")
+    supplied_digest = document["binding_sha256"]
+    body = {key: value for key, value in document.items() if key != "binding_sha256"}
+    canonical = json.dumps(
+        body, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    generation = document["generation"]
+    if (
+        type(supplied_digest) is not str
+        or _SHA256.fullmatch(supplied_digest) is None
+        or sha256_text(canonical) != supplied_digest
+        or document["binding_format"] != _BINDING_FORMAT
+        or document["scope"] != "board"
+        or document["scope_id"] != board_id
+        or document["backend"] != "grafx"
+        or type(document["page_size"]) is not int
+        or document["page_size"] != page_size
+        or type(generation) is not str
+        or not generation
+        or len(generation) > 128
+        or generation in {".", ".."}
+        or any(character in generation for character in '\\/<>:"|?*')
+        or generation[-1] in {".", " "}
+        or _WINDOWS_RESERVED_SEGMENT.match(generation) is not None
+        or any(ord(character) < 32 for character in generation)
+    ):
+        raise CensusOnceRefused("the board graph binding did not authenticate")
+    graph_relative = PurePosixPath("boards", board_id, "grafx", generation)
+    if document["physical_path"] != graph_relative.as_posix():
+        raise CensusOnceRefused("the board graph binding path is not canonical")
+    graph_path = copy_root.joinpath(*graph_relative.parts)
+    if not graph_path.is_dir():
+        raise CensusOnceRefused("the bound Grafx database directory is absent")
+    return graph_relative.as_posix()
+
+
+def _validate_independent_inventory_delta(
+    expected: Mapping[str, Any],
+    observed: Mapping[str, Any],
+    child_inventory: Mapping[str, Any],
+    *,
+    expected_graph_relative: str,
+) -> None:
+    """Reprove the child-declared opaque participant-lock delta from a full inventory."""
+    expected_files = _inventory_file_map(expected)
+    observed_files = _inventory_file_map(observed)
+    expected_paths = set(expected_files)
+    observed_paths = set(observed_files)
+    if not expected_paths <= observed_paths or any(
+        observed_files[path] != expected_files[path] for path in expected_paths
+    ):
+        raise CensusOnceRefused(
+            "the one-shot runner found a removed or changed clone file"
+        )
+
+    added_paths = observed_paths - expected_paths
+    added_count = child_inventory.get("expected_participant_lock_added_count")
+    opaque_path = child_inventory.get("expected_participant_lock_path_sha256")
+    if (
+        isinstance(added_count, bool)
+        or not isinstance(added_count, int)
+        or added_count not in (0, 1)
+        or type(opaque_path) is not str
+        or _SHA256.fullmatch(opaque_path) is None
+        or len(added_paths) != added_count
+    ):
+        raise CensusOnceRefused(
+            "the one-shot runner could not reconcile the participant-lock count"
+        )
+
+    matching_paths = [
+        path for path in observed_paths if sha256_text(path) == opaque_path
+    ]
+    if len(matching_paths) != 1:
+        raise CensusOnceRefused(
+            "the participant-lock opaque path proof does not match the clone"
+        )
+    participant_path = matching_paths[0]
+    parsed = PurePosixPath(participant_path)
+    if (
+        parsed.parent != PurePosixPath(expected_graph_relative) / "control"
+        or _PARTICIPANT_LOCK_FILE.fullmatch(parsed.name) is None
+        or observed_files[participant_path]
+        != {
+            "path": participant_path,
+            "size": 0,
+            "sha256": _EMPTY_FILE_SHA256,
+        }
+        or (added_count == 1 and added_paths != {participant_path})
+        or (added_count == 0 and participant_path not in expected_paths)
+    ):
+        raise CensusOnceRefused(
+            "the participant-lock opaque path proof names no valid empty lock"
+        )
+
+    expected_count = _integer(
+        expected.get("file_count"), minimum=0, field="expected file count"
+    )
+    observed_count = _integer(
+        observed.get("file_count"), minimum=0, field="observed file count"
+    )
+    expected_bytes = _integer(
+        expected.get("total_bytes"), minimum=0, field="expected byte count"
+    )
+    observed_bytes = _integer(
+        observed.get("total_bytes"), minimum=0, field="observed byte count"
+    )
+    raw_unchanged = added_count == 0
+    if (
+        expected_count != len(expected_files)
+        or observed_count != len(observed_files)
+        or observed_count != expected_count + added_count
+        or observed_bytes != expected_bytes
+        or child_inventory.get("sha256_before") != expected.get("sha256")
+        or child_inventory.get("sha256_after") != observed.get("sha256")
+        or child_inventory.get("file_count_before") != expected_count
+        or child_inventory.get("file_count_after") != observed_count
+        or child_inventory.get("total_bytes_before") != expected_bytes
+        or child_inventory.get("total_bytes_after") != observed_bytes
+        or child_inventory.get("raw_unchanged") is not raw_unchanged
+        or child_inventory.get("unchanged") is not raw_unchanged
+        or ((observed.get("sha256") == expected.get("sha256")) is not raw_unchanged)
+    ):
+        raise CensusOnceRefused(
+            "the one-shot runner independently found the census clone changed"
+        )
 
 
 def _validate_aggregate(document: Mapping[str, Any]) -> None:
@@ -332,15 +555,51 @@ def _validate_child_document(
         raise CensusOnceRefused("the census child did not attest the safe Grafx route")
     _validate_aggregate(document)
     clone_inventory = document.get("clone_inventory")
+    expected_count = expected_clone_inventory.get("file_count")
+    expected_bytes = expected_clone_inventory.get("total_bytes")
     if (
         not isinstance(clone_inventory, dict)
-        or clone_inventory.get("unchanged") is not True
         or clone_inventory.get("serve_lock_artifacts_absent") is not True
+        or clone_inventory.get("unchanged_except_expected_participant_lock") is not True
         or clone_inventory.get("sha256_before")
         != expected_clone_inventory.get("sha256")
-        or clone_inventory.get("sha256_after") != expected_clone_inventory.get("sha256")
+        or type(clone_inventory.get("expected_participant_lock_path_sha256")) is not str
+        or _SHA256.fullmatch(clone_inventory["expected_participant_lock_path_sha256"])
+        is None
+        or isinstance(
+            clone_inventory.get("expected_participant_lock_added_count"), bool
+        )
+        or clone_inventory.get("expected_participant_lock_added_count") not in (0, 1)
+        or isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or expected_count < 0
+        or isinstance(expected_bytes, bool)
+        or not isinstance(expected_bytes, int)
+        or expected_bytes < 0
     ):
-        raise CensusOnceRefused("the census child did not prove its clone unchanged")
+        raise CensusOnceRefused(
+            "the census child did not prove its bounded clone inventory delta"
+        )
+    added_count = clone_inventory["expected_participant_lock_added_count"]
+    raw_unchanged = added_count == 0
+    after_digest = clone_inventory.get("sha256_after")
+    if (
+        clone_inventory.get("unchanged") is not raw_unchanged
+        or clone_inventory.get("raw_unchanged") is not raw_unchanged
+        or (
+            (after_digest == expected_clone_inventory.get("sha256"))
+            is not raw_unchanged
+        )
+        or clone_inventory.get("file_count_before") != expected_count
+        or clone_inventory.get("file_count_after") != expected_count + added_count
+        or clone_inventory.get("file_count") != expected_count + added_count
+        or clone_inventory.get("total_bytes_before") != expected_bytes
+        or clone_inventory.get("total_bytes_after") != expected_bytes
+        or clone_inventory.get("total_bytes") != expected_bytes
+    ):
+        raise CensusOnceRefused(
+            "the census child returned inconsistent clone inventory summaries"
+        )
 
 
 def census_once(args: argparse.Namespace) -> dict[str, Any]:
@@ -372,6 +631,12 @@ def census_once(args: argparse.Namespace) -> dict[str, Any]:
     expected_inventory = clone_manifest.get("copy")
     if not isinstance(expected_inventory, dict):
         raise CensusOnceRefused("the per-run clone has no inventory authority")
+    expected_graph_relative = _authenticated_graph_relative(
+        clone,
+        board_id=args.board_id,
+        page_size=args.page_size,
+        expected_inventory=expected_inventory,
+    )
 
     argv = _child_argv(args, clone=clone, child_output=child_output)
     machine_before = machine_sample(interval_seconds=1.0)
@@ -406,10 +671,14 @@ def census_once(args: argparse.Namespace) -> dict[str, Any]:
         expected_clone_inventory=expected_inventory,
     )
     observed_inventory = inventory(clone, exclude=_MANIFEST_FILES)
-    if not _inventory_matches(expected_inventory, observed_inventory):
-        raise CensusOnceRefused(
-            "the one-shot runner independently found the census clone changed"
-        )
+    child_clone_inventory = child_document["clone_inventory"]
+    _validate_independent_inventory_delta(
+        expected_inventory,
+        observed_inventory,
+        child_clone_inventory,
+        expected_graph_relative=expected_graph_relative,
+    )
+    raw_unchanged = child_clone_inventory["raw_unchanged"]
 
     results = {
         "schema": SCHEMA,
@@ -429,7 +698,15 @@ def census_once(args: argparse.Namespace) -> dict[str, Any]:
             "run_copy": str(clone.resolve()),
             "sha256_before": expected_inventory["sha256"],
             "sha256_after": observed_inventory["sha256"],
-            "unchanged": True,
+            "unchanged": raw_unchanged,
+            "raw_unchanged": raw_unchanged,
+            "unchanged_except_expected_participant_lock": True,
+            "expected_participant_lock_path_sha256": child_clone_inventory[
+                "expected_participant_lock_path_sha256"
+            ],
+            "expected_participant_lock_added_count": child_clone_inventory[
+                "expected_participant_lock_added_count"
+            ],
         },
         "supervision": {
             "wall_seconds_not_a_benchmark": supervision_wall_seconds,

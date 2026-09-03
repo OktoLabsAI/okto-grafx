@@ -15,11 +15,13 @@ from tools.perf_round import pulse_graph_census_once
 from tools.perf_round.profile_pulse_card import RuntimePins
 from tools.perf_round.pulse_graph_census_once import (
     CensusOnceRefused,
+    _authenticated_graph_relative,
     _child_argv,
     _parser,
     _validate_child_document,
+    _validate_independent_inventory_delta,
 )
-from tools.perf_round.receipt import sha256_file
+from tools.perf_round.receipt import sha256_file, sha256_text
 from tools.perf_round.replay_pulse_card import SUPPORTED_PULSE_BUFFER_BUDGET_BYTES
 
 BOARD_ID = "00000000-0000-0000-0000-000000000001"
@@ -71,7 +73,15 @@ def _child_document(
     clone: Path,
     pins: RuntimePins,
     digest: str,
+    after_digest: str | None = None,
+    lock_path: str = "graph/control/txn-0123abcd.lock",
+    added_count: int = 0,
+    file_count: int = 1,
+    total_bytes: int = 1,
 ) -> dict[str, Any]:
+    raw_unchanged = added_count == 0
+    if after_digest is None:
+        after_digest = digest if raw_unchanged else "f" * 64
     return {
         "schema": pulse_graph_census_once.CHILD_SCHEMA,
         "workload_semantics": pulse_graph_census_once.WORKLOAD_SEMANTICS,
@@ -127,10 +137,20 @@ def _child_document(
             },
         },
         "clone_inventory": {
-            "unchanged": True,
+            "unchanged": raw_unchanged,
+            "raw_unchanged": raw_unchanged,
+            "unchanged_except_expected_participant_lock": True,
             "serve_lock_artifacts_absent": True,
             "sha256_before": digest,
-            "sha256_after": digest,
+            "sha256_after": after_digest,
+            "file_count_before": file_count,
+            "file_count_after": file_count + added_count,
+            "file_count": file_count + added_count,
+            "total_bytes_before": total_bytes,
+            "total_bytes_after": total_bytes,
+            "total_bytes": total_bytes,
+            "expected_participant_lock_path_sha256": sha256_text(lock_path),
+            "expected_participant_lock_added_count": added_count,
         },
         "_perf_round": {
             "python_executable": str(Path(sys.executable).resolve()),
@@ -180,7 +200,11 @@ def test_child_validation_refuses_false_semantics_or_clone_proof(
     _validate_child_document(
         document,
         expected_provenance=expected,
-        expected_clone_inventory={"sha256": digest},
+        expected_clone_inventory={
+            "sha256": digest,
+            "file_count": 1,
+            "total_bytes": 1,
+        },
     )
 
     false_thermal = json.loads(json.dumps(document))
@@ -189,16 +213,37 @@ def test_child_validation_refuses_false_semantics_or_clone_proof(
         _validate_child_document(
             false_thermal,
             expected_provenance=expected,
-            expected_clone_inventory={"sha256": digest},
+            expected_clone_inventory={
+                "sha256": digest,
+                "file_count": 1,
+                "total_bytes": 1,
+            },
         )
 
     changed = json.loads(json.dumps(document))
     changed["clone_inventory"]["sha256_after"] = "e" * 64
-    with pytest.raises(CensusOnceRefused, match="clone unchanged"):
+    with pytest.raises(CensusOnceRefused, match="inconsistent clone inventory"):
         _validate_child_document(
             changed,
             expected_provenance=expected,
-            expected_clone_inventory={"sha256": digest},
+            expected_clone_inventory={
+                "sha256": digest,
+                "file_count": 1,
+                "total_bytes": 1,
+            },
+        )
+
+    missing = json.loads(json.dumps(document))
+    missing["clone_inventory"].pop("expected_participant_lock_path_sha256")
+    with pytest.raises(CensusOnceRefused, match="bounded clone inventory delta"):
+        _validate_child_document(
+            missing,
+            expected_provenance=expected,
+            expected_clone_inventory={
+                "sha256": digest,
+                "file_count": 1,
+                "total_bytes": 1,
+            },
         )
 
     inconsistent = json.loads(json.dumps(document))
@@ -207,7 +252,99 @@ def test_child_validation_refuses_false_semantics_or_clone_proof(
         _validate_child_document(
             inconsistent,
             expected_provenance=expected,
-            expected_clone_inventory={"sha256": digest},
+            expected_clone_inventory={
+                "sha256": digest,
+                "file_count": 1,
+                "total_bytes": 1,
+            },
+        )
+
+
+def test_one_shot_independently_refuses_a_forged_lock_path_hash() -> None:
+    lock_path = "graph/control/txn-0123abcd.lock"
+    stable = {"path": "opaque", "size": 1, "sha256": "a" * 64}
+    lock = {"path": lock_path, "size": 0, "sha256": sha256_text("")}
+    expected = {
+        "sha256": "b" * 64,
+        "file_count": 1,
+        "total_bytes": 1,
+        "files": [stable],
+    }
+    observed = {
+        "sha256": "c" * 64,
+        "file_count": 2,
+        "total_bytes": 1,
+        "files": [stable, lock],
+    }
+    proof = {
+        "unchanged": False,
+        "raw_unchanged": False,
+        "sha256_before": expected["sha256"],
+        "sha256_after": observed["sha256"],
+        "file_count_before": 1,
+        "file_count_after": 2,
+        "total_bytes_before": 1,
+        "total_bytes_after": 1,
+        "expected_participant_lock_added_count": 1,
+        "expected_participant_lock_path_sha256": sha256_text(lock_path),
+    }
+    _validate_independent_inventory_delta(
+        expected, observed, proof, expected_graph_relative="graph"
+    )
+    proof["expected_participant_lock_path_sha256"] = "d" * 64
+    with pytest.raises(CensusOnceRefused, match="opaque path proof"):
+        _validate_independent_inventory_delta(
+            expected, observed, proof, expected_graph_relative="graph"
+        )
+
+    sibling_path = "sibling/control/txn-0123abcd.lock"
+    sibling_lock = {**lock, "path": sibling_path}
+    observed["files"] = [stable, sibling_lock]
+    proof["expected_participant_lock_path_sha256"] = sha256_text(sibling_path)
+    with pytest.raises(CensusOnceRefused, match="no valid empty lock"):
+        _validate_independent_inventory_delta(
+            expected, observed, proof, expected_graph_relative="graph"
+        )
+
+
+def test_binding_authentication_refuses_float_page_size(tmp_path: Path) -> None:
+    graph_relative = f"boards/{BOARD_ID}/grafx/generation"
+    binding_relative = f"boards/{BOARD_ID}/graph_backend_binding.json"
+    binding = {
+        "binding_format": "okto-pulse-community-graph-binding/1",
+        "scope": "board",
+        "scope_id": BOARD_ID,
+        "backend": "grafx",
+        "generation": "generation",
+        "physical_path": graph_relative,
+        "page_size": 8192.0,
+    }
+    binding["binding_sha256"] = sha256_text(
+        json.dumps(binding, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    )
+    encoded = json.dumps(
+        binding, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    binding_path = tmp_path.joinpath(*binding_relative.split("/"))
+    binding_path.parent.mkdir(parents=True)
+    binding_path.write_text(encoded, encoding="utf-8")
+    tmp_path.joinpath(*graph_relative.split("/")).mkdir(parents=True)
+    expected_inventory = {
+        "files": [
+            {
+                "path": binding_relative,
+                "size": len(encoded.encode("utf-8")),
+                "sha256": sha256_text(encoded),
+            }
+        ]
+    }
+
+    with pytest.raises(CensusOnceRefused, match="did not authenticate"):
+        _authenticated_graph_relative(
+            tmp_path,
+            board_id=BOARD_ID,
+            page_size=8192,
+            expected_inventory=expected_inventory,
         )
 
 
@@ -218,13 +355,42 @@ def test_runner_clones_and_launches_exactly_one_authenticated_child(
     args.declared_copy.mkdir()
     pins = _pins(tmp_path)
     digest = "d" * 64
+    after_digest = "f" * 64
+    graph_relative = f"boards/{BOARD_ID}/grafx/generation"
+    lock_path = f"{graph_relative}/control/txn-0123abcd.lock"
+    binding_relative = f"boards/{BOARD_ID}/graph_backend_binding.json"
+    binding_body = {
+        "binding_format": "okto-pulse-community-graph-binding/1",
+        "scope": "board",
+        "scope_id": BOARD_ID,
+        "backend": "grafx",
+        "generation": "generation",
+        "physical_path": graph_relative,
+        "page_size": args.page_size,
+    }
+    binding_body["binding_sha256"] = sha256_text(
+        json.dumps(
+            binding_body, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
+    )
+    binding_text = json.dumps(
+        binding_body, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    stable_file = {"path": "opaque", "size": 1, "sha256": "e" * 64}
+    binding_file = {
+        "path": binding_relative,
+        "size": len(binding_text.encode("utf-8")),
+        "sha256": sha256_text(binding_text),
+    }
+    lock_file = {"path": lock_path, "size": 0, "sha256": sha256_text("")}
+    expected_bytes = 1 + binding_file["size"]
     manifest = {
         "source": {"sha256_after_copy": digest},
         "copy": {
             "sha256": digest,
-            "file_count": 1,
-            "total_bytes": 1,
-            "files": [{"path": "opaque", "size": 1, "sha256": "e" * 64}],
+            "file_count": 2,
+            "total_bytes": expected_bytes,
+            "files": [stable_file, binding_file],
         },
         "commits": {
             "grafx": args.grafx_sha,
@@ -241,6 +407,10 @@ def test_runner_clones_and_launches_exactly_one_authenticated_child(
         assert source == args.declared_copy.resolve()
         destination.mkdir()
         (destination / "opaque").write_text("x", encoding="ascii")
+        binding_path = destination.joinpath(*binding_relative.split("/"))
+        binding_path.parent.mkdir(parents=True)
+        binding_path.write_text(binding_text, encoding="utf-8")
+        destination.joinpath(*graph_relative.split("/")).mkdir(parents=True)
         observed["clone"] = destination
         return manifest
 
@@ -260,7 +430,19 @@ def test_runner_clones_and_launches_exactly_one_authenticated_child(
         assert pulse == pins.pulse_root and core == pins.pulse_core_root
         output = Path(argv[argv.index("--out") + 1])
         output.write_text(
-            json.dumps(_child_document(args, clone=home, pins=pins, digest=digest)),
+            json.dumps(
+                _child_document(
+                    args,
+                    clone=home,
+                    pins=pins,
+                    digest=digest,
+                    after_digest=after_digest,
+                    lock_path=lock_path,
+                    added_count=1,
+                    file_count=2,
+                    total_bytes=expected_bytes,
+                )
+            ),
             encoding="utf-8",
         )
         return SimpleNamespace(returncode=0)
@@ -280,7 +462,12 @@ def test_runner_clones_and_launches_exactly_one_authenticated_child(
     monkeypatch.setattr(
         pulse_graph_census_once,
         "inventory",
-        lambda path, *, exclude: dict(manifest["copy"]),
+        lambda path, *, exclude: {
+            "sha256": after_digest,
+            "file_count": 3,
+            "total_bytes": expected_bytes,
+            "files": [stable_file, binding_file, lock_file],
+        },
     )
 
     receipt = pulse_graph_census_once.census_once(args)
@@ -288,7 +475,10 @@ def test_runner_clones_and_launches_exactly_one_authenticated_child(
     assert observed["spawns"] == 1
     assert receipt["official"] is False
     assert receipt["results"]["one_shot"] is True
-    assert receipt["results"]["copy"]["unchanged"] is True
+    assert receipt["results"]["copy"]["raw_unchanged"] is False
+    assert (
+        receipt["results"]["copy"]["unchanged_except_expected_participant_lock"] is True
+    )
     assert receipt["results"]["supervision"]["wall_seconds_not_a_benchmark"] >= 0
     assert (args.out_dir / pulse_graph_census_once.RECEIPT_NAME).is_file()
     assert Path(
