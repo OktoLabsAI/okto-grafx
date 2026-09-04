@@ -268,6 +268,7 @@ with db.begin("write") as txn:
 # --- operations ---------------------------------------------------------------
 db.verify("all")     # walks pages, records and indexes; a clean database reports nothing
 db.checkpoint()      # puts committed state on the platter and reclaims the log
+db.maintenance.bloat()  # read-only header census; it does not authorize or run vacuum
 db.close()
 ```
 
@@ -419,6 +420,13 @@ WAL, transaction manager or adapter callbacks. Writes go through transactions or
 database methods (`create_index`, `rehash_index`, `ensure_identity_indexes`, `checkpoint`,
 `recover`, `flush`, `publish_metrics`); there is no `unsafe=True` escape. `Transaction` exposes
 `snapshot`, `mode`, `txn_id`, `active` and `report`, but never its mutable engine context.
+
+`db.maintenance.bloat(table=None)` is a conservative, header-only census at a non-pruning
+observation of the checkpoint-capped recyclable horizon; even TTL-stalled reader records remain
+pins. It reports ended versions and record-slot bytes that are eligible or retained by that
+horizon, but deliberately excludes overflow-page bytes and keeps
+`vacuum_safety_established=False`: observing potential bloat neither mutates the database nor
+certifies that physical reclamation is safe.
 
 ### In memory
 

@@ -1483,6 +1483,7 @@ class BufferPool:
         token: object = None,
         *,
         own: bool = False,
+        allow_writeback: bool = True,
         unfenced_file: str | None = None,
         changed_pages: Iterable[tuple[str, PageIndex]] | None = None,
         changed_files: Iterable[str] = (),
@@ -1512,8 +1513,10 @@ class BufferPool:
 
         A conservative full refresh retains invalidate's established behaviour and writes dirty
         unpinned frames before dropping them; direct engine composition relies on that door to
-        publish legitimate local work. A proved bounded foreign delta is zero-write and refuses
-        any targeted dirty frame capable of publication before moving a frame or the token.
+        publish legitimate local work. ``allow_writeback=False`` is the observational variant:
+        an unproved full refresh preflights every resident/doomed frame and refuses dirty state
+        before moving a frame, descriptor generation or token. A proved bounded foreign delta is
+        already zero-write and refuses any targeted dirty frame before moving state.
 
         ``own`` is the caller SAYING the token moved only because this participant itself
         published a commit (CQ-2/QW-4): the resident frames are the very committed state this
@@ -1537,6 +1540,12 @@ class BufferPool:
         mismatch takes the conservative full foreign refresh rather than applying an unbound or
         stale partial interval.
         """
+        if type(allow_writeback) is not bool:
+            raise GrafxConfigurationError(
+                "A read-view write-back choice must be exactly True or False.",
+                field="allow_writeback",
+                value=repr(allow_writeback),
+            )
         self._wait_for_evictions()
         previous = self._read_view_token
         pages: frozenset[tuple[str, PageIndex]] | None = None
@@ -1612,11 +1621,20 @@ class BufferPool:
                     files=frozenset(),
                     every_file=True,
                 )
-            else:
+            elif allow_writeback:
                 # No bounded proof is available. Preserve the established full-refresh
                 # semantics, including publication of legitimate local dirty work. Clean pinned
                 # readers are made discard-only by _invalidate before they can mutate late.
                 self._invalidate(None, doom_pinned=True)
+            else:
+                # Observational maintenance must not turn freshness into an implicit flush.
+                # The all-target preflight refuses before descriptor identity, cache state or
+                # the read-view token can move.
+                self._discard_clean_changes(
+                    pages=frozenset(),
+                    files=frozenset(),
+                    every_file=True,
+                )
         else:
             if unfenced_file is not None:
                 files = files | {unfenced_file}

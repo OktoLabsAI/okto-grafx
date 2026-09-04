@@ -65,6 +65,7 @@ from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import IndexManager, IndexStore
 from okto_grafx.engine.ledger_store import DamagedTail, LedgerStore
 from okto_grafx.engine.public_views import (
+    BloatReport,
     PUBLIC_DATABASE_VIEW_ALLOWLIST,
     CatalogView,
     IndexRegistryView,
@@ -75,6 +76,7 @@ from okto_grafx.engine.public_views import (
     QuarantineView,
     StorageFileView,
     StorageView,
+    TableBloatReport,
     VectorEngineView,
     VectorIndexView,
 )
@@ -176,6 +178,7 @@ _EXACT_DATACLASS_TYPES: frozenset[type[object]] = frozenset(
     {
         *(kind for _name, kind in PUBLIC_DATABASE_VIEW_ALLOWLIST),
         CatalogView,
+        BloatReport,
         ColumnDef,
         CommitState,
         DamagedTail,
@@ -195,6 +198,7 @@ _EXACT_DATACLASS_TYPES: frozenset[type[object]] = frozenset(
         SegmentInfo,
         Snapshot,
         StorageFileView,
+        TableBloatReport,
         TableDef,
         VectorIndexDefinition,
         VectorIndexView,
@@ -797,6 +801,20 @@ def test_maintenance_status_is_an_allowlisted_immutable_value_graph() -> None:
 
     assert type(status) is MaintenanceStatus
     _assert_capability_free(status, surface="maintenance.status")
+
+
+def test_bloat_report_is_an_allowlisted_immutable_value_graph() -> None:
+    """The bloat census returns detached scalar DTOs, never heap or database capabilities."""
+    with connect(":memory:") as database:
+        with database.begin("write") as schema:
+            schema.execute("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")
+        database.checkpoint()
+        report = database.maintenance.bloat()
+
+    assert type(report) is BloatReport
+    assert len(report.tables) == 1
+    assert type(report.tables[0]) is TableBloatReport
+    _assert_capability_free(report, surface="maintenance.bloat")
 
 
 def test_scalar_canonicalizers_bypass_every_host_override_and_return_exact_builtins() -> (

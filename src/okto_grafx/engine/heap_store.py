@@ -525,6 +525,24 @@ class RecordIdFloorPlan:
     advances: tuple[RecordIdFloorAdvance, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _HeapBloatSample:
+    """Header-only physical counts for one table at one conservative horizon."""
+
+    table_id: int
+    data_pages: int
+    slot_directory_entries: int
+    free_slots: int
+    stored_versions: int
+    ended_versions: int
+    horizon_eligible_versions: int
+    horizon_retained_versions: int
+    horizon_eligible_slot_bytes: int
+    horizon_retained_slot_bytes: int
+    overflow_versions: int
+    horizon_eligible_overflow_versions: int
+
+
 class HeapStore:
     """Insert, update, delete, read and scan record versions over a paged heap file."""
 
@@ -1549,6 +1567,122 @@ class HeapStore:
             pages.append(index)
             index = following
         return tuple(pages)
+
+    def _measure_bloat(self, table: TableDef, horizon: Lsn) -> _HeapBloatSample:
+        """Measure conservative slot bloat without decoding tuples or following overflow.
+
+        The horizon is the caller's already-derived recyclable horizon.  Only a version with a
+        structurally plausible committed lifetime (committed ``xmin`` and ``xmax`` with
+        ``xmin <= xmax``) can be called horizon-eligible.  Everything else remains merely stored:
+        this diagnostic is not a verifier and must never certify malformed or provisional
+        residue for destructive maintenance.
+
+        Byte counts are the lengths of record slots.  For an overflow-backed version that means
+        the fixed header and pointer only; the separately allocated overflow pages are counted
+        nowhere, intentionally.  Eligible and retained are a partition of ended versions only;
+        live and provisional versions stay in the stored total but are never described as bloat.
+        Slot directory entries are likewise reported but never priced as horizon-eligible because
+        their identifiers cannot currently be reused safely.
+        """
+        if (
+            isinstance(horizon, bool)
+            or not isinstance(horizon, int)
+            or not NO_LSN <= horizon < PROVISIONAL_CSN
+        ):
+            raise GrafxConfigurationError(
+                "A heap-bloat horizon must be a non-negative committed LSN.",
+                field="horizon_lsn",
+                value=repr(horizon),
+            )
+
+        extent = self._find_extent(table.table_id)
+        if extent is None:
+            return _HeapBloatSample(table.table_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+        data_pages = 0
+        directory_entries = 0
+        free_slots = 0
+        stored_versions = 0
+        ended_versions = 0
+        eligible_versions = 0
+        retained_versions = 0
+        eligible_bytes = 0
+        retained_bytes = 0
+        overflow_versions = 0
+        eligible_overflow_versions = 0
+        seen: set[PageIndex] = visited_pages()
+        limit = self._chain_limit()
+        index = extent.first_page
+
+        while index != NO_PAGE:
+            data_pages += 1
+            self._refuse_endless_chain(table, data_pages, limit)
+            if index in seen:
+                raise GrafxCorruptionDetected(
+                    f"The page chain of table {table.name!r} in {self._file!r} returns to "
+                    f"page {index}.",
+                    file=self._file,
+                    table=table.name,
+                    page=index,
+                    field="cycle",
+                )
+            seen.add(index)
+            with self._pool.pinned(self._file, index) as page:
+                self._require_table_page(page, table)
+                directory_entries += max(page.slot_count - FIRST_RECORD_SLOT, 0)
+                for slot in range(FIRST_RECORD_SLOT, page.slot_count):
+                    if page.is_slot_free(slot):
+                        free_slots += 1
+                        continue
+                    view = page.slot_view(slot)
+                    (
+                        flags,
+                        _reserved,
+                        _schema_version,
+                        _payload_len,
+                        _record_id,
+                        xmin,
+                        xmax,
+                        _previous,
+                    ) = RecordHeader.peek(view)
+                    slot_bytes = page.slot_length(slot)
+                    stored_versions += 1
+                    has_overflow = bool(flags & RECORD_FLAG_HAS_OVERFLOW)
+                    if has_overflow:
+                        overflow_versions += 1
+                    if not is_committed_csn(xmax):
+                        continue
+                    ended_versions += 1
+                    horizon_eligible = (
+                        is_committed_csn(xmin)
+                        and xmin <= xmax
+                        and xmax <= horizon
+                    )
+                    if horizon_eligible:
+                        eligible_versions += 1
+                        eligible_bytes += slot_bytes
+                        if has_overflow:
+                            eligible_overflow_versions += 1
+                    else:
+                        retained_versions += 1
+                        retained_bytes += slot_bytes
+                following = page.next_page
+            index = following
+
+        return _HeapBloatSample(
+            table_id=table.table_id,
+            data_pages=data_pages,
+            slot_directory_entries=directory_entries,
+            free_slots=free_slots,
+            stored_versions=stored_versions,
+            ended_versions=ended_versions,
+            horizon_eligible_versions=eligible_versions,
+            horizon_retained_versions=retained_versions,
+            horizon_eligible_slot_bytes=eligible_bytes,
+            horizon_retained_slot_bytes=retained_bytes,
+            overflow_versions=overflow_versions,
+            horizon_eligible_overflow_versions=eligible_overflow_versions,
+        )
 
     # --- internals ---------------------------------------------------------------------------
 

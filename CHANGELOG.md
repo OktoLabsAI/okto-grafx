@@ -9,6 +9,10 @@ including the on-disk format.
 
 ### Added
 
+- Added `db.maintenance.bloat(table=None)`, an immutable, read-only and header-only census of
+  ended heap versions at a non-pruning observation of the checkpoint-capped recyclable horizon.
+  The report distinguishes horizon-eligible from retained ended lifetimes, states its
+  byte-accounting limits and never presents the observation as authorization to vacuum.
 - Added durable equality-only custom indexes through transactional `CREATE INDEX` and
   `Database.create_index()`. Ordered compound keys, explicit bucket counts and deterministic
   expected-cardinality sizing share one planner and one catalog-v2 shadow-build protocol. The

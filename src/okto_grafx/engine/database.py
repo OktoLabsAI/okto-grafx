@@ -89,6 +89,7 @@ from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore, _HeapScanPosition
 from okto_grafx.engine.metrics_catalog import metric
 from okto_grafx.engine.public_views import (
+    BloatReport,
     BufferPoolView,
     CatalogStoreView,
     ClockView,
@@ -105,6 +106,7 @@ from okto_grafx.engine.public_views import (
     QuarantineView,
     QueryEngineView,
     StorageView,
+    TableBloatReport,
     TransactionManagerView,
     VectorEngineView,
     VectorIndexView,
@@ -1342,6 +1344,10 @@ class Maintenance:
             heap_bloat_bytes=None,
             oldest_reader_age=None,
         )
+
+    def bloat(self, table: str | None = None) -> BloatReport:
+        """Return a conservative read-only heap-bloat census."""
+        return self._database._bloat(table)
 
     def checkpoint(self) -> RecycleReport:
         """Delegate checkpointing to :meth:`Database.checkpoint`."""
@@ -2826,6 +2832,108 @@ class Database:
                 verifier = factory()  # type: ignore[operator]
                 report = verifier.verify(wanted_scope)  # type: ignore[attr-defined]
                 return _verification_report_view(report, requested_scope=wanted_scope)
+
+    def _bloat(self, table: str | None = None) -> BloatReport:
+        """Measure heap bloat at the existing recyclable horizon without changing state.
+
+        The public door lives on :class:`Maintenance`; this private database operation supplies
+        the same lifecycle containment and current-page boundary as verification without adding
+        a second top-level API. The transaction manager observes the checkpoint-capped WAL horizon
+        without pruning TTL-stalled reader records; until mutating vacuum has a stronger
+        reader-lifecycle contract, a more aggressive estimate would advertise bytes beyond even
+        the existing WAL-retention boundary. The returned eligibility counts still state
+        explicitly that vacuum safety is not established.
+        """
+        with self._public_operation("measure heap bloat"):
+            self._require_open()
+            wanted_table = None if table is None else _require_text("table", table)
+            with self._transactions.page_access_section(
+                fresh_read_view=True,
+                allow_writeback=False,
+            ):
+                catalog = self._catalog.catalog
+                tables = (
+                    catalog.tables()
+                    if wanted_table is None
+                    else (catalog.table(wanted_table),)
+                )
+                horizon = self._transactions.observational_recyclable_horizon()
+                samples = tuple(
+                    (table_def, self._heap._measure_bloat(table_def, horizon))
+                    for table_def in tables
+                )
+
+            table_reports = tuple(
+                TableBloatReport(
+                    table=_builtin_text(table_def.name, field="table", empty=False),
+                    table_id=_builtin_int(sample.table_id, field="table_id"),
+                    data_pages=_builtin_int(sample.data_pages, field="data_pages"),
+                    slot_directory_entries=_builtin_int(
+                        sample.slot_directory_entries,
+                        field="slot_directory_entries",
+                    ),
+                    free_slots=_builtin_int(sample.free_slots, field="free_slots"),
+                    stored_versions=_builtin_int(
+                        sample.stored_versions, field="stored_versions"
+                    ),
+                    ended_versions=_builtin_int(
+                        sample.ended_versions, field="ended_versions"
+                    ),
+                    horizon_eligible_versions=_builtin_int(
+                        sample.horizon_eligible_versions,
+                        field="horizon_eligible_versions",
+                    ),
+                    horizon_retained_versions=_builtin_int(
+                        sample.horizon_retained_versions,
+                        field="horizon_retained_versions",
+                    ),
+                    horizon_eligible_slot_bytes=_builtin_int(
+                        sample.horizon_eligible_slot_bytes,
+                        field="horizon_eligible_slot_bytes",
+                    ),
+                    horizon_retained_slot_bytes=_builtin_int(
+                        sample.horizon_retained_slot_bytes,
+                        field="horizon_retained_slot_bytes",
+                    ),
+                    overflow_versions=_builtin_int(
+                        sample.overflow_versions,
+                        field="overflow_versions",
+                    ),
+                    horizon_eligible_overflow_versions=_builtin_int(
+                        sample.horizon_eligible_overflow_versions,
+                        field="horizon_eligible_overflow_versions",
+                    ),
+                )
+                for table_def, sample in samples
+            )
+
+            def total(field: str) -> int:
+                """Sum one exact integer field from the detached per-table reports."""
+                return sum(
+                    _builtin_int(getattr(report, field), field=field)
+                    for report in table_reports
+                )
+
+            return BloatReport(
+                recyclable_horizon_lsn=_builtin_int(
+                    horizon, field="recyclable_horizon_lsn"
+                ),
+                vacuum_safety_established=False,
+                tables=table_reports,
+                data_pages=total("data_pages"),
+                slot_directory_entries=total("slot_directory_entries"),
+                free_slots=total("free_slots"),
+                stored_versions=total("stored_versions"),
+                ended_versions=total("ended_versions"),
+                horizon_eligible_versions=total("horizon_eligible_versions"),
+                horizon_retained_versions=total("horizon_retained_versions"),
+                horizon_eligible_slot_bytes=total("horizon_eligible_slot_bytes"),
+                horizon_retained_slot_bytes=total("horizon_retained_slot_bytes"),
+                overflow_versions=total("overflow_versions"),
+                horizon_eligible_overflow_versions=total(
+                    "horizon_eligible_overflow_versions"
+                ),
+            )
 
     def ensure_identity_indexes(self) -> None:
         """Persist and activate every exact access path required by endpoint identities.

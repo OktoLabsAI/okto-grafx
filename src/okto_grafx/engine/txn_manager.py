@@ -2192,7 +2192,13 @@ class TransactionManager:
             # full refresh remains authoritative; process-control failures still propagate.
             return None
 
-    def _establish_read_view(self, state: CommitState, *, own: bool) -> bool:
+    def _establish_read_view(
+        self,
+        state: CommitState,
+        *,
+        own: bool,
+        allow_writeback: bool = True,
+    ) -> bool:
         """Attach the pool and report whether foreign index authority may have changed.
 
         A proved CE-3 interval distinguishes ordinary heap/index DML from a catalog write.  If
@@ -2224,14 +2230,27 @@ class TransactionManager:
             ):
                 changes = self._read_view_changes(previous, token)
                 catalog_may_have_changed = changes is None or changes.catalog_changed
-            self._pool.begin_read_view(
-                token,
-                own=effective_own,
-                unfenced_file=self._file_ids.catalog_file,
-                changed_pages=None if changes is None else changes.pages,
-                changed_files=() if changes is None else changes.files,
-                expected_previous=previous,
-            )
+            if allow_writeback:
+                # Preserve the established call shape for deliberately narrow BufferPool test
+                # doubles and custom compositions.
+                self._pool.begin_read_view(
+                    token,
+                    own=effective_own,
+                    unfenced_file=self._file_ids.catalog_file,
+                    changed_pages=None if changes is None else changes.pages,
+                    changed_files=() if changes is None else changes.files,
+                    expected_previous=previous,
+                )
+            else:
+                self._pool.begin_read_view(
+                    token,
+                    own=effective_own,
+                    allow_writeback=False,
+                    unfenced_file=self._file_ids.catalog_file,
+                    changed_pages=None if changes is None else changes.pages,
+                    changed_files=() if changes is None else changes.files,
+                    expected_previous=previous,
+                )
         if not effective_own:
             # A foreign view consumes any previous own-publication provenance. A later numeric
             # coincidence is not proof that the resident frames came from this participant.
@@ -2405,6 +2424,26 @@ class TransactionManager:
             self._require_not_closed("read the recyclable horizon")
             return self._recyclable_horizon_in_section()
 
+    def observational_recyclable_horizon(self) -> Lsn:
+        """Return a checkpoint-capped horizon without pruning reader registrations.
+
+        The frozen coordinator port's ordinary ``reader_horizon`` may prune stale records,
+        which is correct for WAL lifecycle but not for a zero-write census. The local adapter
+        offers a narrower optional observation capability. A custom coordinator without it
+        falls back to ``NO_LSN``: less bloat may be reported, but the diagnostic never mutates or
+        overstates what an unknown participant set permits.
+        """
+        self._require_not_closed("observe the recyclable horizon")
+        with self._participant_section():
+            self._require_not_closed("observe the recyclable horizon")
+            observe = getattr(self._coordinator, "observe_reader_horizon", None)
+            with self._close_wait_hazard():
+                reader_horizon = observe() if callable(observe) else NO_LSN
+            return recyclable_horizon(
+                reader_horizon,
+                self._published_state_in_section().checkpoint_lsn,
+            )
+
     def _recyclable_horizon_in_section(self) -> Lsn:
         """Compute the horizon for an operation that already owns lifecycle serialisation."""
         return recyclable_horizon(
@@ -2428,7 +2467,12 @@ class TransactionManager:
         self._require_recovery_complete()
 
     @contextmanager
-    def page_access_section(self, *, fresh_read_view: bool = False) -> Iterator[None]:
+    def page_access_section(
+        self,
+        *,
+        fresh_read_view: bool = False,
+        allow_writeback: bool = True,
+    ) -> Iterator[None]:
         """Keep the recovery latch stable for one page-touching public operation.
 
         A check performed immediately before a flush, query or verification still leaves a
@@ -2445,6 +2489,8 @@ class TransactionManager:
         report damage that disappears on reopen. Ordinary transaction reads establish the same
         view in :meth:`begin`; this option gives non-transactional verification that guarantee
         without opening a synthetic transaction or changing reader/writer concurrency.
+        ``allow_writeback=False`` is for observational maintenance: an unproved refresh refuses
+        dirty resident state instead of implicitly publishing it.
         """
         page_access = getattr(self._metrics, "page_access", None)
         boundary = page_access() if callable(page_access) else nullcontext()
@@ -2461,6 +2507,7 @@ class TransactionManager:
                     catalog_may_have_changed = self._establish_read_view(
                         published,
                         own=published.last_committed_lsn == self._own_published_lsn,
+                        allow_writeback=allow_writeback,
                     )
                     if catalog_may_have_changed:
                         self._synchronize_read_index_authority(

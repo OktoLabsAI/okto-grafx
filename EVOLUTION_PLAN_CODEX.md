@@ -294,6 +294,24 @@
   Assim, o próximo item autorizado é exatamente o **11 — vacuum/compaction MVCC**; itens 12--13 e
   sharding não entram nele.
 
+  **Item 11 / P2-VAC iniciou pelo marco read-only de medição.**
+  `db.maintenance.bloat(table=None)` faz um censo header-only numa observação sem pruning do
+  horizonte reciclável limitado pelo checkpoint; reader records parados por TTL continuam pins.
+  A porta retorna DTOs imutáveis por tabela e agregados. A nomenclatura ficou fechada:
+  `horizon_eligible + horizon_retained == ended`; versões vivas/provisórias são
+  `stored - ended`, e bytes de overflow/diretório não são atribuídos ao potencial reclaim. O
+  relatório mantém `vacuum_safety_established=False`, não escreve WAL/páginas, recusa estado dirty
+  em vez de fazer flush e não constitui permissão para exclusão. O gate focal passou 196 testes,
+  somado aos testes de buffer/read-view/coordenação, Ruff, `compileall` e diff-check.
+
+  A análise adversarial do protocolo mutante encontrou uma fronteira real, não um novo alvo: o
+  TTL do registry não prova quiescência de um processo antigo já dentro de um statement, e
+  `RecordRef(page, slot)` sem incarnation impede reuso durável seguro por ABA. O menor contrato
+  proposto para v1 é manual/foreground, process-quiescent, com floor global monotônico no header do
+  heap e capability obrigatória de catálogo v2; sem vacuum online, truncagem nem reuso de
+  `RecordRef` nesta etapa. Como isso reduz temporariamente a disponibilidade multireader, a parte
+  destrutiva aguarda autorização explícita específica antes do ADR e do código.
+
 - **Run real do Pulse 0.3.3 na pasta padrão — reconstrução Grafx em andamento, SQLite preservado.**
   Antes da troca foi criado backup consistente do SQLite (`quick_check=ok`, zero violações de FK)
   e os artefatos Ladybug foram movidos, sem exclusão, para quarentena operacional. Os bindings de

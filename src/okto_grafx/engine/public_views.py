@@ -181,6 +181,7 @@ _PEP604_UNION_TYPE = type(str | None)
 """Runtime origin returned by ``typing.get_origin`` for a PEP 604 union."""
 
 __all__ = [
+    "BloatReport",
     "PUBLIC_DATABASE_VIEW_ALLOWLIST",
     "BufferPoolView",
     "CatalogStoreView",
@@ -202,6 +203,7 @@ __all__ = [
     "QueryEngineView",
     "StorageFileView",
     "StorageView",
+    "TableBloatReport",
     "TransactionManagerView",
     "VectorEngineView",
     "VectorIndexView",
@@ -298,6 +300,62 @@ class MaintenanceStatus:
     stale_indexes: tuple[str, ...]
     heap_bloat_bytes: int | None
     oldest_reader_age: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class TableBloatReport:
+    """Conservative heap-bloat census for one table at one recyclable horizon.
+
+    Byte counts cover the complete bytes stored in record slots: header plus inline payload, or
+    header plus overflow pointer.  They deliberately exclude slot-directory entries and overflow
+    pages.  ``horizon_eligible`` means only that an ended lifetime falls at or below the
+    WAL-recycling horizon; it is not authorization for physical vacuum.  ``horizon_retained``
+    counts the other ended lifetimes, so eligible plus retained equals ``ended_versions``.  Live
+    and provisional lifetimes remain visible through ``stored_versions - ended_versions`` and are
+    never presented as bloat.
+    """
+
+    table: str
+    table_id: int
+    data_pages: int
+    slot_directory_entries: int
+    free_slots: int
+    stored_versions: int
+    ended_versions: int
+    horizon_eligible_versions: int
+    horizon_retained_versions: int
+    horizon_eligible_slot_bytes: int
+    horizon_retained_slot_bytes: int
+    overflow_versions: int
+    horizon_eligible_overflow_versions: int
+
+
+@dataclass(frozen=True, slots=True)
+class BloatReport:
+    """Detached aggregate of a read-only, header-only heap-bloat census.
+
+    ``recyclable_horizon_lsn`` is a non-pruning observation of the checkpoint-capped WAL horizon:
+    TTL-stalled reader records remain pins for this diagnostic. A version is horizon-eligible only
+    when it has a committed birth and a committed end at or below that horizon.
+    ``horizon_retained`` counts ended versions that fail that eligibility test; it excludes live
+    and provisional versions. ``vacuum_safety_established`` remains false until reader continuity
+    and the mutating protocol are separately proved; this report never authorizes deletion.
+    """
+
+    recyclable_horizon_lsn: int
+    vacuum_safety_established: bool
+    tables: tuple[TableBloatReport, ...]
+    data_pages: int
+    slot_directory_entries: int
+    free_slots: int
+    stored_versions: int
+    ended_versions: int
+    horizon_eligible_versions: int
+    horizon_retained_versions: int
+    horizon_eligible_slot_bytes: int
+    horizon_retained_slot_bytes: int
+    overflow_versions: int
+    horizon_eligible_overflow_versions: int
 
 
 @dataclass(frozen=True, slots=True, eq=False)

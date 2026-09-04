@@ -428,3 +428,31 @@ Reproducible 163-test invocation:
 ```text
 python -m pytest tests/index/test_identity_activation_domain.py tests/txn/test_bounded_read_view.py tests/txn/test_index_rehash_preparation.py tests/api/test_index_rehash.py tests/api/test_index_rehash_recovery.py tests/api/test_index_rehash_multiprocess.py tests/api/test_maintenance_facade.py tests/api/test_cross_process_visibility.py tests/api/test_read_view_own_exemption_multiprocess.py tests/storage_core/test_catalog_store.py -q
 ```
+
+## Item 11 / P2-VAC — MVCC bloat and vacuum
+
+Status: **measurement slice implemented; destructive protocol not yet authorized**.
+
+`db.maintenance.bloat(table=None)` now performs a deterministic, header-only census at a
+non-pruning observation of the checkpoint-capped recyclable horizon. TTL-stalled reader records
+remain conservative pins. It reports per-table and aggregate page, slot,
+stored/ended-version, overflow-reference and record-slot-byte counts. Eligible plus retained is
+an exact partition of ended versions; live and provisional versions remain only in
+`stored_versions - ended_versions`. Overflow-page bytes and slot-directory bytes are explicitly
+outside the byte estimate. The immutable report keeps `vacuum_safety_established=False`, so no
+caller can mistake the WAL-recycling horizon for proof that physical deletion is safe.
+
+The slice adds no WAL record, capability, page-format mutation, slot reuse or background work.
+It is available on read-only handles and follows a fresh-view/recovery latch that refuses dirty
+state instead of flushing it. The non-pruning horizon leaves stale, empty and temporary reader
+artifacts unchanged. The affected gates passed 196 focused API/lifecycle/hostile-boundary tests,
+plus buffer/read-view/coordination tests, scoped Ruff, `compileall` and `git diff --check`. This is
+observability, not a throughput claim.
+
+The destructive half remains deliberately gated. The reader TTL registry cannot prove that an
+older process is not already inside a statement, and `RecordRef(page, slot)` has no incarnation,
+so durable slot/page reuse would create an ABA risk. The smallest reviewed v1 contract therefore
+requires explicit process quiescence plus a durable monotonic snapshot floor before bytes can be
+made physically absent. That narrows multi-reader availability during maintenance and is not
+inferred from the general authorization of item 11; implementation waits for the separate product
+authorization required by the concurrency guardrail.

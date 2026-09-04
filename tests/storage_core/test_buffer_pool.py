@@ -2516,6 +2516,27 @@ def test_foreign_full_refresh_advances_generation_before_legacy_dirty_publicatio
     assert device.trace == ["identity:None", f"write:{FILE}:0"]
 
 
+def test_observational_full_refresh_refuses_dirty_state_without_writeback() -> None:
+    device = DescriptorIdentityRecordingDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    pool.begin_read_view("old")
+    dirty = pool.pin(FILE, 0)
+    dirty.update_slot(0, b"legitimate-local-work")
+    pool.unpin(FILE, 0, dirty=True, page=dirty)
+    device.identity_invalidations.clear()
+    device.trace.clear()
+
+    with pytest.raises(GrafxUnsupportedOperation) as refused:
+        pool.begin_read_view("foreign", allow_writeback=False)
+
+    assert refused.value.details["field"] == "dirty"
+    assert device.identity_invalidations == []
+    assert device.trace == []
+    assert pool.read_view_token() == "old"
+    assert pool.is_resident(FILE, 0)
+
+
 def test_read_fresh_page_revalidates_its_name_before_the_device_read() -> None:
     device = DescriptorIdentityRecordingDevice()
     pool = make_pool(device, RecordingMetrics())

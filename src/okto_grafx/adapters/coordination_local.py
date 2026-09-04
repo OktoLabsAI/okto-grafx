@@ -1360,6 +1360,26 @@ class LocalProcessCoordinator:
                     self._reader_samples.pop(reader_id, None)
         return horizon
 
+    def observe_reader_horizon(self) -> Lsn | None:
+        """Return a conservative reader horizon without pruning or publishing anything.
+
+        This optional capability exists for read-only diagnostics. Unlike
+        :meth:`reader_horizon`, it makes no liveness inference: every decodable active final
+        registration remains a pin even when its heartbeat would be TTL-stalled. Empty,
+        inactive and temporary records are ignored but deliberately left untouched. Corrupt
+        final records still fail closed because their snapshot is unknowable.
+        """
+        horizon: Lsn | None = None
+        for name in self._list_files(self._readers_prefix):
+            if name.endswith(TEMPORARY_SUFFIX) or not name.endswith(READER_FILE_SUFFIX):
+                continue
+            record = self._read_reader_record(name)
+            if record is None or not record.active:
+                continue
+            if horizon is None or record.snapshot_lsn < horizon:
+                horizon = record.snapshot_lsn
+        return horizon
+
     # --- critical sections ---------------------------------------------------------------------
 
     def exclusive(self, name: str, *, timeout: float) -> AbstractContextManager[None]:

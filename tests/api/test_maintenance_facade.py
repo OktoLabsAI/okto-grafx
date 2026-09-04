@@ -13,7 +13,12 @@ from okto_grafx.domain.recovery.report import RecoveryReport
 from okto_grafx.domain.verify.findings import VerificationReport
 from okto_grafx.domain.wal.replay import RecycleReport
 from okto_grafx.engine.database import Maintenance
-from okto_grafx.engine.public_views import IndexView, MaintenanceStatus, VectorIndexView
+from okto_grafx.engine.public_views import (
+    BloatReport,
+    IndexView,
+    MaintenanceStatus,
+    VectorIndexView,
+)
 
 
 def test_maintenance_surface_and_annotations_are_exact() -> None:
@@ -26,6 +31,7 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
     assert public_methods == frozenset(
         {
             "status",
+            "bloat",
             "checkpoint",
             "verify",
             "recover",
@@ -41,6 +47,7 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
     assert maintenance_getter is not None
     assert get_type_hints(maintenance_getter)["return"] is Maintenance
     assert get_type_hints(Maintenance.status)["return"] is MaintenanceStatus
+    assert get_type_hints(Maintenance.bloat)["return"] is BloatReport
     assert get_type_hints(Maintenance.checkpoint)["return"] is RecycleReport
     assert get_type_hints(Maintenance.verify)["return"] is VerificationReport
     assert get_type_hints(Maintenance.recover)["return"] is RecoveryReport
@@ -89,6 +96,11 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
     verification_result = object()
     recovery_result = object()
     index_result = object()
+    bloat_result = object()
+
+    def bloat(_database: Database, table: str | None = None) -> object:
+        calls.append(("bloat", table))
+        return bloat_result
 
     def checkpoint(_database: Database) -> object:
         calls.append(("checkpoint", None))
@@ -151,12 +163,14 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
             )
             boundary.setattr(Database, "create_index", create_index)
             boundary.setattr(Database, "rehash_index", rehash_index)
+            boundary.setattr(Database, "_bloat", bloat)
 
             assert maintenance.checkpoint() is checkpoint_result
             assert maintenance.verify("indexes") is verification_result
             assert maintenance.recover() is recovery_result
             assert maintenance.publish_metrics() is None
             assert maintenance.ensure_identity_indexes() is None
+            assert maintenance.bloat("Person") is bloat_result
             assert maintenance.create_index(
                 "by_name",
                 "Person",
@@ -179,6 +193,7 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
         ("recover", None),
         ("publish_metrics", None),
         ("ensure_identity_indexes", None),
+        ("bloat", "Person"),
         (
             "create_index",
             ("by_name", "Person", ("name",), None, 1_000),
@@ -195,6 +210,7 @@ def test_a_retained_maintenance_facade_obeys_database_lifecycle() -> None:
 
     calls = (
         maintenance.status,
+        maintenance.bloat,
         maintenance.checkpoint,
         maintenance.verify,
         maintenance.recover,
@@ -227,6 +243,7 @@ def test_read_only_maintenance_refuses_only_its_writing_operations(
     with connect(root, read_only=True) as reader:
         maintenance = reader.maintenance
         assert maintenance.status().recovery_required is False
+        assert maintenance.bloat().tables == ()
         assert maintenance.verify().findings == ()
         assert maintenance.publish_metrics() is None
 
