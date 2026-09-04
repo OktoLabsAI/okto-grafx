@@ -22,7 +22,7 @@ from okto_grafx.domain.txn.context import RowOperation
 from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.query_engine import RowBinding, _Context, _direct_vector_search
-from okto_grafx.engine.vector_engine import VectorEngine
+from okto_grafx.engine.vector_engine import VectorEngine, VectorHnswIndex
 
 from .stack import (
     FIXTURE_READ_LSN,
@@ -39,6 +39,7 @@ DIRECT = (
 )
 FILTERED = DIRECT.replace("WHERE similarity", "WHERE n.layer >= 0 AND similarity")
 SELECTIVE = DIRECT.replace("WHERE similarity", "WHERE n.layer = 1 AND similarity")
+ONE_CANDIDATE = DIRECT.replace("WHERE similarity", "WHERE n.layer = 63 AND similarity")
 
 
 def _seed(stack: QueryStack, count: int = 8) -> None:
@@ -62,6 +63,59 @@ def _transaction(
     transaction = stack.transaction(read_lsn)
     transaction.snapshot = Snapshot(read_lsn)  # type: ignore[assignment]
     return transaction
+
+
+def test_materialised_filter_seals_refs_for_selective_exact_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real query route avoids a second N-row vector pass for one proven candidate."""
+    stack = build_query_stack(
+        vector_nullable=False,
+        vector_exact_scan_threshold=128,
+    )
+    for offset in range(64):
+        record_id = offset + 1
+        components = (1.0, offset / 64.0, (64 - offset) / 64.0, 0.0)
+        ref = stack.insert(
+            "Chunk", record_id, (record_id, offset, vector(components)), csn=1
+        )
+        stack.add_vector(record_id, ref, components, csn=1)
+    arguments = {"q": [1.0, 0.0, 0.0, 0.0]}
+    with monkeypatch.context() as canonical_patch:
+        canonical_patch.setattr(
+            VectorEngine,
+            "_seal_materialized_candidates",
+            lambda _self, _witnesses, **_metadata: None,
+        )
+        canonical = stack.engine.execute(ONE_CANDIDATE, _transaction(stack), arguments)
+
+    index = stack.vectors.index("minilm_v2")
+    index.live_count()
+    walks = 0
+    point_reads = 0
+    original_walk = VectorHnswIndex.walk
+    original_read_if = HeapStore.read_if
+
+    def counted_walk(self: VectorHnswIndex) -> tuple[object, ...]:
+        nonlocal walks
+        if self is index:
+            walks += 1
+        return original_walk(self)
+
+    def counted_read_if(self: HeapStore, ref: RecordRef, accept: object) -> object:
+        nonlocal point_reads
+        if self is stack.heap:
+            point_reads += 1
+        return original_read_if(self, ref, accept)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(VectorHnswIndex, "walk", counted_walk)
+    monkeypatch.setattr(HeapStore, "read_if", counted_read_if)
+    targeted = stack.engine.execute(ONE_CANDIDATE, _transaction(stack), arguments)
+
+    assert targeted.rows == canonical.rows
+    assert targeted.statistics == canonical.statistics
+    assert walks == 0
+    assert point_reads == 1
 
 
 def _count_point_materialisations(
@@ -471,7 +525,9 @@ def test_a_mutable_direct_hit_cannot_switch_the_validated_read_binding(
     planned = stack.engine.planned(
         stack.engine.parse(DIRECT.replace("LIMIT 3", "LIMIT 1"))
     )
-    search = next(node for node in planned.root.walk() if isinstance(node, VectorSearch))
+    search = next(
+        node for node in planned.root.walk() if isinstance(node, VectorSearch)
+    )
     context = _Context(
         engine=stack.engine,
         txn=_transaction(stack),

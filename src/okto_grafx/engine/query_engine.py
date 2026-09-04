@@ -220,7 +220,7 @@ from okto_grafx.domain.query.tokens import (
     STRING_SPLIT_FUNCTION,
     TIMESTAMP_FUNCTION,
 )
-from okto_grafx.domain.vector.filter import RecordIdFilter
+from okto_grafx.domain.vector.filter import CandidateFilter, RecordIdFilter
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
@@ -2614,9 +2614,7 @@ class QueryEngine:
             plan = build_plan(
                 statement,
                 catalog=catalog,
-                indexes=self._index_definitions(
-                    catalog=catalog, authority=authority
-                ),
+                indexes=self._index_definitions(catalog=catalog, authority=authority),
                 analysis=analysis,
             )
         except GrafxError as failure:
@@ -2632,9 +2630,7 @@ class QueryEngine:
         parameters: Mapping[str, object] | None = None,
     ) -> QueryResult:
         """Run one statement inside a transaction and return its rows."""
-        return self._execute_parsed(
-            self.parse(text), txn, parameters, cache_text=text
-        )
+        return self._execute_parsed(self.parse(text), txn, parameters, cache_text=text)
 
     def create_index(
         self,
@@ -3693,7 +3689,10 @@ class QueryEngine:
             return True
         for current in listing():
             current_definition = getattr(current, "definition", None)
-            if getattr(current_definition, "registry_key", None) != definition.registry_key:
+            if (
+                getattr(current_definition, "registry_key", None)
+                != definition.registry_key
+            ):
                 continue
             return (
                 getattr(current_definition, "table_id", None) == definition.table_id
@@ -3959,7 +3958,10 @@ class QueryEngine:
                 # interest set if any later definition or artifact refuses.
                 self._declare_complete_table_read(txn, committed)
                 visible_rows = sum(
-                    1 for _ref, _version in self._heap.scan(committed, Snapshot(published))
+                    1
+                    for _ref, _version in self._heap.scan(
+                        committed, Snapshot(published)
+                    )
                 )
             expected, sized_bucket_count = identity_index_sizing(visible_rows)
             bucket_count = (
@@ -4035,9 +4037,7 @@ class QueryEngine:
                 if self._automatic_index_namespace_available(definition, catalog)
             )
             if len(accepted) != 1:
-                statistics["indexes_skipped"] = (
-                    statistics.get("indexes_skipped", 0) + 1
-                )
+                statistics["indexes_skipped"] = statistics.get("indexes_skipped", 0) + 1
                 self._record_skipped_index(table.name, undo)
             if not accepted:
                 return
@@ -4060,8 +4060,8 @@ class QueryEngine:
                     txn,
                     undo,
                 )
-            statistics["indexes_created"] = (
-                statistics.get("indexes_created", 0) + len(planned)
+            statistics["indexes_created"] = statistics.get("indexes_created", 0) + len(
+                planned
             )
             return
         if self._indexes is None:
@@ -4165,9 +4165,7 @@ class QueryEngine:
                     statistics.get("indexes_created", 0) + created
                 )
             if len(accepted_endpoint_definitions) < 2:
-                statistics["indexes_skipped"] = (
-                    statistics.get("indexes_skipped", 0) + 1
-                )
+                statistics["indexes_skipped"] = statistics.get("indexes_skipped", 0) + 1
                 self._record_skipped_index(table.name, undo)
             return
         if self._indexes is None:
@@ -4690,9 +4688,7 @@ def _index_seek(
         and node.index == primary_key_index_name(node.table.name)
     )
     ended = _ended_by_this_transaction(context)
-    changed, inserted = _transaction_row_view(
-        context, node.table, include_held=False
-    )
+    changed, inserted = _transaction_row_view(context, node.table, include_held=False)
     single_source = isinstance(node.child, SingleRow)
     selected_index: object | None = None
     index_resolved = False
@@ -5669,9 +5665,16 @@ def _direct_vector_search(
 def _materialised_vector_search(
     engine: QueryEngine, vectors: object, node: VectorSearch, context: _Context
 ) -> Iterator[_Row]:
-    """Execute the canonical child-materialising vector path without semantic shortcuts."""
+    """Execute a child-materialising vector search, optionally sealing its physical refs.
+
+    The immutable ``RowBinding`` objects are the only internal source allowed to carry point-read
+    witnesses. A foreign vector subsystem or any ambiguous table/column/ref shape keeps the
+    public ``RecordIdFilter`` and therefore the canonical exact scan.
+    """
     candidates = tuple(engine._rows(node.child, context))
     by_record: dict[int, list[_Row]] = {}
+    physical_pair: tuple[int, int | None] | None = None
+    physical_pair_ambiguous = False
     for row in candidates:
         binding = row.bindings.get(node.variable)
         if not isinstance(binding, RowBinding):
@@ -5681,18 +5684,55 @@ def _materialised_vector_search(
                 field="variable",
                 value=node.variable,
             )
+        current_pair = (
+            binding.table.table_id,
+            binding.table.column_positions.get(node.property_key),
+        )
+        if physical_pair is None:
+            physical_pair = current_pair
+        elif current_pair != physical_pair:
+            physical_pair_ambiguous = True
         by_record.setdefault(binding.record_id, []).append(row)
     if not by_record:
         return
     space = _space_name(node, candidates, context)
     query_vector = _query_vector(node, candidates, context)
     wanted = _neighbour_count(node, candidates, context, len(by_record))
+    candidate_filter: CandidateFilter = RecordIdFilter(frozenset(by_record))
+
+    def materialized_witnesses() -> Iterator[tuple[int, object]]:
+        """Yield refs lazily only if the vector engine's cheap pre-gate accepts this filter."""
+        for row in candidates:
+            binding = row.bindings.get(node.variable)
+            if not isinstance(binding, RowBinding):
+                return
+            yield binding.record_id, binding.ref
+
+    try:
+        sealer = getattr(vectors, "_seal_materialized_candidates", None)
+    except Exception:  # noqa: BLE001 - an optional private capability may only decline
+        sealer = None
+    if callable(sealer) and physical_pair is not None and not physical_pair_ambiguous:
+        table_id, position = physical_pair
+        try:
+            sealed = sealer(
+                materialized_witnesses(),
+                space=space,
+                table_id=table_id,
+                position=position,
+                snapshot=context.snapshot,
+                candidate_count=len(by_record),
+            )
+        except Exception:  # noqa: BLE001 - retain the pre-existing canonical integration path
+            sealed = None
+        if sealed is not None:
+            candidate_filter = sealed
     result = vectors.search(  # type: ignore[attr-defined]
         space=space,
         query=query_vector,
         k=wanted,
         snapshot=context.snapshot,
-        candidate_filter=RecordIdFilter(frozenset(by_record)),
+        candidate_filter=candidate_filter,
     )
     _record_vector_search_statistics(context, result, len(by_record))
     threshold = _threshold_value(node, candidates, context)
@@ -8987,9 +9027,7 @@ def _primary_key_identity(value: Value) -> object | None:
     return ("value", _freeze(value))
 
 
-def _primary_key_table_identity(
-    table: TableDef, position: int
-) -> tuple[object, ...]:
+def _primary_key_table_identity(table: TableDef, position: int) -> tuple[object, ...]:
     """Name the complete table/key shape so speculative schemas cannot share a memo."""
     return (
         table.table_id,
@@ -9103,7 +9141,10 @@ def _fold_primary_key_intent(
 
     previous = state.outcomes.get(reference)
     if previous is None:
-        if isinstance(reference, PendingRowRef) and intent.operation is not RowOperation.INSERT:
+        if (
+            isinstance(reference, PendingRowRef)
+            and intent.operation is not RowOperation.INSERT
+        ):
             raise GrafxTransactionStateError(
                 "A pending row identity must begin with an insert before it can be updated or "
                 "deleted by its owner.",
@@ -9217,9 +9258,8 @@ def _transaction_primary_key_state(
             state, memo.intents, context, table, memo.intents.rewrite_revision
         )
         return state
-    if (
-        state.rewrite_revision != memo.intents.rewrite_revision
-        or state.cursor > len(memo.intents)
+    if state.rewrite_revision != memo.intents.rewrite_revision or state.cursor > len(
+        memo.intents
     ):
         _canonical_primary_key_rebuild(
             state, memo.intents, context, table, memo.intents.rewrite_revision
@@ -9425,9 +9465,7 @@ def _rows_carrying_key(
     lookup = getattr(manager, "lookup", None)
     active_index = getattr(manager, "active_index", None)
     legacy_index = getattr(manager, "index", None)
-    if not callable(lookup) or not (
-        callable(active_index) or callable(legacy_index)
-    ):
+    if not callable(lookup) or not (callable(active_index) or callable(legacy_index)):
         return None
     name = primary_key_index_name(table.name)
     try:
