@@ -69,14 +69,15 @@ MAX_PARTITIONS_PER_TABLE: int = 65535
 MAX_VECTOR_EF_SEARCH: int = MAX_EF_SEARCH
 """Largest HNSW base beam accepted from public database configuration."""
 
-DEFAULT_MAX_OPEN_FILES: int = 128
+DEFAULT_MAX_OPEN_FILES: int = 256
 """Default descriptor-cache budget for a composed local database.
 
-The Windows UCRT available to the supported interpreter starts with 512 stdio descriptors.
-Keeping at most one quarter for each Grafx storage cache lets two databases coexist while still
-leaving half for WAL, coordination, Pulse and the host process.  It also doubles the former
-64-entry cache, avoiding its worst churn on index-heavy databases.  Callers that own the process
-may raise the per-database budget explicitly.
+Descriptors are admitted lazily, so 256 is a bound rather than an up-front reservation.  It
+covers the measured 141-file Pulse working set and a synthetic 64-table/192-artifact set without
+the former 64-entry thrash.  The supported Windows UCRT starts with a 512-entry stdio limit, so
+one full cache leaves half that allowance to Pulse and the host.  Several large databases in one
+process may need a lower per-instance ``max_open_files`` override; retaining that explicit knob
+is safer than guessing from the host at import time.
 """
 
 MINIMUM_STORE_FRAMES: int = max(CATALOG_FRAMES, HEAP_FRAMES)

@@ -143,8 +143,15 @@ MAX_LOGICAL_NAME_LENGTH: int = 255
 MAX_NAME_SEGMENT_LENGTH: int = 128
 """Longest single segment of a logical name, well inside the limit of every common file system."""
 
-MAX_OPEN_FILES: int = 64
-"""How many descriptors one device keeps cached before it evicts the least recently used one."""
+MAX_OPEN_FILES: int = 256
+"""Default per-device descriptor-cache budget before least-recently-used eviction.
+
+The cache opens files lazily, so this is a ceiling rather than an up-front reservation.  It
+covers the measured 141-file Pulse working set, plus a synthetic 64-table/192-artifact set,
+without restoring the old 64-entry churn.  On the supported Windows runtime, whose UCRT stdio
+limit starts at 512, it leaves half that allowance to the host.  Processes with several large
+database instances can lower ``max_open_files`` independently on each device.
+"""
 
 MAX_ALLOCATION_PAGES: int = 1 << 20
 """Most pages one allocate call may add, so a wrong number cannot ask for an endless file."""
