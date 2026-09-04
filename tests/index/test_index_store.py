@@ -8,6 +8,8 @@ each other untestable unless one is disabled to see the other fire (amendments A
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -20,9 +22,11 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.ids import NO_PAGE, RecordRef
 from okto_grafx.domain.index import (
     INDEX_HEADER_SLOT,
+    IndexChange,
     IndexDefinition,
     IndexEntry,
     IndexHeader,
+    IndexOperation,
     IndexVisibility,
     bucket_of,
 )
@@ -31,6 +35,7 @@ from okto_grafx.domain.page import (
     FileHeader,
     FileHeaderPage,
     FileKind,
+    Page,
     PageType,
 )
 from okto_grafx.domain.model.schema import TableDef
@@ -378,7 +383,9 @@ def test_candidate_and_exact_entry_search_materialize_only_matching_entries(
     wanted = in_bucket[-1]
     pages = database.exact._bucket_pages(crowded)
     calls = 0
+    bucket_pins: list[int] = []
     original = IndexEntry.located_at
+    original_pinned = BufferPool.pinned
 
     def counted(self: IndexEntry, page: int, slot: int) -> IndexEntry:
         nonlocal calls
@@ -387,8 +394,37 @@ def test_candidate_and_exact_entry_search_materialize_only_matching_entries(
 
     monkeypatch.setattr(IndexEntry, "located_at", counted)
 
+    @contextmanager
+    def counted_pin(
+        pool: BufferPool, file: str, page_index: int
+    ) -> Iterator[Page]:
+        if pool is database.pool and file == database.exact.file:
+            bucket_pins.append(page_index)
+        with original_pinned(pool, file, page_index) as page:
+            yield page
+
+    monkeypatch.setattr(BufferPool, "pinned", counted_pin)
+
     assert database.exact._candidates_unchecked(wanted.key) == (wanted,)
     assert calls == 1
+    assert bucket_pins == list(pages), "candidate lookup must pin each chain page once"
+
+    calls = 0
+    bucket_pins.clear()
+    early = in_bucket[0]
+    assert not database.exact._apply_change(
+        IndexChange(
+            index=database.exact.name,
+            operation=IndexOperation.INSERT,
+            key=early.key,
+            ref=early.ref,
+            versioned=False,
+        ),
+        BORN,
+    )
+    assert calls == 1
+    assert bucket_pins == list(pages), "duplicate insert must probe each chain page once"
+
     calls = 0
     assert database.exact._find_entry(pages, wanted.key, wanted.ref) == (
         wanted.page,

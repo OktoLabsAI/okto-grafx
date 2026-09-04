@@ -2471,12 +2471,10 @@ class IndexStore:
 
     def _candidates_unchecked(self, wanted: bytes) -> tuple[IndexEntry, ...]:
         """Walk one already-validated key; the manager surrounds this with its view fence."""
-        found: list[IndexEntry] = []
-        for page_index in self._bucket_pages(
-            bucket_of(wanted, self._definition.bucket_count)
-        ):
-            found.extend(self._matching_entries_on(page_index, wanted))
-        return tuple(found)
+        _pages, found = self._scan_bucket(
+            bucket_of(wanted, self._definition.bucket_count), wanted
+        )
+        return found
 
     def walk(self) -> tuple[IndexEntry, ...]:
         """Return every stored entry of this index, bucket by bucket.
@@ -3114,8 +3112,14 @@ class IndexStore:
                 self._tombstone_backlog_count = 0
             return moved
         bucket = bucket_of(change.key, self._definition.bucket_count)
-        pages = self._bucket_pages(bucket)
-        located = self._find_entry(pages, change.key, change.ref)
+        pages, matches = self._scan_bucket(
+            bucket, change.key, change.ref, first_matching_page=True
+        )
+        located = (
+            None
+            if not matches
+            else (matches[0].page, matches[0].slot, matches[0])
+        )
         if change.operation is IndexOperation.INSERT:
             # The redo path never went through staging, so the key it carries is checked here as
             # well. Both sites call the same helper: a size rule written twice is a size rule
@@ -3315,6 +3319,25 @@ class IndexStore:
         merely unusual -- and it is what turns a damaged link into a located failure rather than
         into a process that never returns (amendments A34, A42).
         """
+        pages, _matches = self._scan_bucket(bucket)
+        return pages
+
+    def _scan_bucket(
+        self,
+        bucket: int,
+        key: bytes | None = None,
+        ref: RecordRef | None = None,
+        *,
+        first_matching_page: bool = False,
+    ) -> tuple[tuple[PageIndex, ...], tuple[IndexEntry, ...]]:
+        """Validate one chain and optionally collect matches during that same page pass.
+
+        ``_bucket_pages`` remains the structure-only door used by full walks. Point reads and
+        scalar writes already know their key, so paying a second pin pass over every page cannot
+        reveal a fresher authority: their surrounding exact-view/commit fences decide freshness.
+        This fused pass retains chain order, slot order, both termination guards and full
+        per-slot validation whenever matching was requested.
+        """
         if isinstance(bucket, bool) or not isinstance(bucket, int):
             raise GrafxIndexError(
                 f"A bucket must be named by an integer; got {type(bucket).__name__}.",
@@ -3331,6 +3354,8 @@ class IndexStore:
                 index=self.name,
             )
         pages: list[PageIndex] = []
+        matches: list[IndexEntry] = []
+        matching_complete = False
         seen: set[PageIndex] = visited_pages()
         # Almost every bucket is one or two pages long. Asking the device for the file size on
         # every such walk is pure fixed cost; defer that second, independent termination guard
@@ -3355,10 +3380,22 @@ class IndexStore:
             seen.add(index)
             with self._pool.pinned(self.file, index) as page:
                 self._require_index_page(page, index)
+                if key is not None and not matching_complete:
+                    for slot in page.live_slots():
+                        entry = IndexEntry.decode_if_matches(
+                            page.slot_view(slot), key, ref
+                        )
+                        if entry is not None:
+                            matches.append(entry.located_at(index, slot))
+                    if first_matching_page and matches:
+                        # Scalar mutation historically stopped decoding after the first page
+                        # with a match, while its preceding chain walk still validated every
+                        # page type/link. Preserve that bounded work and error surface exactly.
+                        matching_complete = True
                 following = page.next_page
             pages.append(index)
             index = following
-        return tuple(pages)
+        return tuple(pages), tuple(matches)
 
     def _find_entry(
         self, pages: Sequence[PageIndex], key: bytes, ref: RecordRef
