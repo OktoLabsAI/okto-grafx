@@ -55,6 +55,56 @@ def test_a_warm_extent_slot_avoids_the_directory_walk(
     heap_store._write_extent(replace(expected, next_record_id=expected.next_record_id + 1))
 
 
+def test_hot_extent_read_and_write_each_validate_and_use_one_header_pin(
+    pool: BufferPool,
+    heap_store: HeapStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = _populate(heap_store, 1)[0]
+    expected = heap_store._find_extent(table.table_id)
+    assert expected is not None
+    header_pins = 0
+    original = BufferPool.pin
+
+    def counted(self: BufferPool, file: str, page_index: int) -> Page:
+        nonlocal header_pins
+        if file == heap_store.file and page_index == HEADER_PAGE_INDEX:
+            header_pins += 1
+        return original(self, file, page_index)
+
+    monkeypatch.setattr(BufferPool, "pin", counted)
+
+    assert heap_store._find_extent(table.table_id) == expected
+    heap_store._write_extent(expected)
+
+    assert header_pins == 2
+
+
+def test_cold_header_access_revalidates_the_operational_pin_after_bootstrap_probe(
+    pool: BufferPool,
+    heap_store: HeapStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = _populate(heap_store, 1)[0]
+    pool.flush()
+    pool.invalidate(heap_store.file)
+    original = HeapStore.is_bootstrapped
+
+    def probe_then_damage(store: HeapStore) -> bool:
+        bootstrapped = original(store)
+        with pool.pinned(store.file, HEADER_PAGE_INDEX) as page:
+            page.page_type = int(PageType.HEAP)
+        return bootstrapped
+
+    monkeypatch.setattr(HeapStore, "is_bootstrapped", probe_then_damage)
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        heap_store._find_extent(table.table_id)
+
+    assert raised.value.details["page"] == HEADER_PAGE_INDEX
+    assert raised.value.details["page_type"] == int(PageType.HEAP)
+
+
 def test_reserved_insert_reuses_its_just_validated_extent_once(
     heap_store: HeapStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol
 
@@ -1038,10 +1039,8 @@ class HeapStore:
         the catalog capability makes that interpretation unambiguous across binary versions.
         """
 
-        self._require_bootstrapped()
-        with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
-            header = self._require_header_page(page)
-        return self._decode_reclaim_floor(header)
+        with self._pinned_validated_header() as (_page, header):
+            return self._decode_reclaim_floor(header)
 
     def plan_reclaim_floor(self, floor: Lsn) -> HeapReclaimFloorPlan:
         """Plan a monotonic durable floor advance without changing resident or durable pages."""
@@ -2481,9 +2480,8 @@ class HeapStore:
 
     def _find_extent(self, table_id: int) -> TableExtent | None:
         """Return the directory entry of the table, or None when the table has no page yet."""
-        self._require_bootstrapped()
-        self._sync_extent_slots_epoch()
-        with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as header_page:
+        with self._pinned_validated_header() as (header_page, _header):
+            self._sync_extent_slots_epoch()
             cached = self._extent_slots.get(table_id)
             if cached is not None:
                 payload = self._extent_payload_at(header_page, cached, table_id)
@@ -2578,9 +2576,8 @@ class HeapStore:
 
     def _write_extent(self, extent: TableExtent) -> None:
         """Replace the directory entry of a table on the header page."""
-        self._require_bootstrapped()
-        self._sync_extent_slots_epoch()
-        with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as header_page:
+        with self._pinned_validated_header() as (header_page, _header):
+            self._sync_extent_slots_epoch()
             cached = self._extent_slots.get(extent.table_id)
             if cached is not None:
                 payload = self._extent_payload_at(header_page, cached, extent.table_id)
@@ -2604,6 +2601,29 @@ class HeapStore:
                 file=self._file,
                 table_id=extent.table_id,
             )
+
+    @contextmanager
+    def _pinned_validated_header(self) -> Iterator[tuple[Page, FileHeader]]:
+        """Yield page 0 after the bootstrap and page-integrity checks, pinning it once hot.
+
+        A moved derived epoch retains the canonical ``is_bootstrapped`` probe and its cache
+        invalidation before the caller acquires the operational pin. Under a stable epoch the
+        operational pin itself performs the required resident header check, so a directory
+        lookup or rewrite need not acquire the same page once merely to validate it and again to
+        use it. The yielded pin is never storage authority beyond this context. Detached planners
+        that require the current device image keep the separate ``_require_bootstrapped`` plus
+        ``read_fresh_page`` protocol; this resident helper must not replace that authority path.
+        """
+        if self._bootstrapped_epoch != self._pool.derived_epoch(self._file):
+            self._invalidate_extent_slots()
+            if not self.is_bootstrapped():
+                raise GrafxCorruptionDetected(
+                    f"The heap file {self._file!r} has no header page; call bootstrap() first.",
+                    file=self._file,
+                )
+        with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
+            header = self._require_header_page(page)
+            yield page, header
 
     def _require_bootstrapped(self) -> None:
         """Refuse to work against a heap file that has not been created yet."""

@@ -2409,7 +2409,7 @@ def pinned_frame_count(pool: BufferPool) -> int:
     return sum(1 for frame in pool._frames.values() if frame.pins > 0)
 
 
-PINS_ONE_UPDATE_TAKES: int = 10
+PINS_ONE_UPDATE_TAKES: int = 8
 """How many pins one update of a row off the tail takes, over a hint that needs repair.
 
 Written down in the test, not read off the code, so that a change in what an update touches is a
@@ -2847,7 +2847,7 @@ def test_ending_a_version_refuses_the_page_descriptor_slot(
 BIG_VALUE: str = "L" * 400
 """A value that will not share a page with much: the update carrying it has to grow the chain."""
 
-PINS_ONE_GROWING_UPDATE_TAKES: int = 10
+PINS_ONE_GROWING_UPDATE_TAKES: int = 8
 """Pins taken by an update whose new version does not fit on the tail. See the sweep below."""
 
 
