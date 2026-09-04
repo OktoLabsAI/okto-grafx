@@ -596,3 +596,79 @@ passed, alongside 247 heap, about 293 catalog/storage/index, 378 query/public, 7
 reader/cross-process focused cases. Ruff lint, compileall and diff-check passed. Whole-repository
 `ruff format --check` still reports 29 historically unformatted tracked files; no unrelated bulk
 format was performed.
+
+## Scale-removal batch 1 — recovery, resident state, schema growth and index commits
+
+Status: **completed through `592fd22` on `feature/v0.0.2`; further scale work continues in
+separate milestones**.
+
+This batch was ordered by implementation precedence: remove cheap fixed and linear work first so
+later validation also becomes cheaper. It preserves the existing page/WAL formats, first and
+second OCC rules, durability publication, and multiwriter/multireader model.
+
+- `c1d537e` coalesces safe repeated page effects only in originally page-only replay and places
+  data-file barriers before commit-state publication. `2afd876` reuses one passage-bound,
+  content-checked preflight so the accepted page image is decoded once; a mixed replay projected
+  into a page subplan remains sequential.
+- `9ee51f3` fuses local exact-name observation and the bounded two-slot control read without
+  changing the frozen storage port or weakening strict identity checks.
+- `2be59c9` replaces full resident-frame scans with revalidated dirty candidates. At 8,192 clean
+  frames, an empty flush fell from `3.99–5.24 ms` to `3.21–7.00 us`; the representative 600-row
+  query moved by a noisy `+0.668 ms` (`+1.93%`), an accepted bounded bookkeeping cost.
+- `210b685` retains a defensive heap directory `table_id -> slot` hint. A 200-table
+  `find + write + find` sample measured `663.21 -> 107.22 us` (`6.19x`). Every hit rechecks the
+  current table-id; stale hints use the canonical zero-copy scan and can never overwrite another
+  table's extent.
+- `c12e67c` raises the lazy per-database descriptor ceiling to 256 while retaining the explicit
+  override. In a 192-artifact sample, cap 64 produced 384 misses/320 evictions; cap 256 produced
+  192 misses/zero evictions/192 hits (`1.97 -> 0.96 s`, directional only). Several large databases
+  in one process may lower the ceiling for descriptor headroom.
+- `8604661` makes tombstone-backlog metrics one exact seed walk followed by O(1) deltas, with
+  conservative invalidation on rebase/reopen/failure. It also replaces quadratic multiset
+  comparison by `Counter`; a 1,000-change sample measured `291.53 -> 8.77 ms` (`~33x`) while
+  preserving duplicate and missing-effect refusals.
+- `592fd22` avoids the unconditional `list_files("index/")` inventory when every relevant ACTIVE
+  definition already has its exact registered object. Any unresolved generation still performs
+  one canonical inventory and the final fresh physical certificate remains mandatory before WAL.
+
+Validation was deliberately grouped rather than rerunning the hours-long global suite after each
+patch: 195 focused recovery/transaction cases, 536 heap/storage/configuration cases, 73 index
+metric/multiset cases plus 9 authoritative-facade inventory cases, discriminating mutation/failure
+tests, Ruff, compile checks and diff checks passed. These
+component measurements are receipts, not throughput gates.
+
+## Scale-removal batch 2 — accumulated writes and repeated query boundaries
+
+Status: **completed through `82bd176` on `feature/v0.0.2`; index-build and commit-stamping work
+continues in later isolated milestones**.
+
+This batch removes work that grew with transaction length, schema size or relationship-table size
+without changing WAL/OCC, page format or the multiwriter/multireader contract.
+
+- `02e6f41` incrementally folds only new primary-key row intents. Rewrites/truncation rebuild from
+  the canonical reducer, and statement-held changes overlay the transaction fold without sharing
+  state across tables or transactions. At 1,000 accumulated inserts the measured hot path moved
+  from `1,225.93 ms` to `18.25 ms` (`67.16x`); the 250-row sample moved `70.33 -> 4.57 ms`
+  (`15.38x`). A 320-operation seeded differential found and corrected one first-seen-order drift
+  before integration.
+- `e0e18f8` removes Python `Catalog` object identity from the prepared-plan key while retaining the
+  exact immutable catalog bytes, index definition/freshness picture and transaction dirty-table
+  set. The motivating 20-transaction sample rebuilt analysis/plan 19 times before the correction;
+  the focused regression now proves one build across an equivalent adoption. Survey estimates are
+  `1.11x–1.35x` for point queries, not a promotion gate.
+- `855c9cf` memoizes the complete ACTIVE index projection on its owning catalog value and
+  invalidates it on every table, space, capability or index-authority mutation. `3b72d4a` keeps
+  that object resident only across a same token, a proven own publication or a complete CE-3
+  interval without catalog pages. Twenty steady-state statements perform zero catalog
+  serialize/deserialize, cache-drop or plan rebuild after baseline. A 64-table prototype measured
+  the CAT-1 component `31.43 -> 10.40 ms`; CAT-2 added a directional `1.24x` over that result.
+- `82bd176` lets a fresh endpoint index serve an exact one-hop traversal below a streaming
+  `LIMIT`, including forward and reverse direction. It preserves the canonical prefix in focused
+  equivalence tests and touches fewer than all six candidates for `LIMIT 1`; blocking `ORDER BY`
+  and `DISTINCT`, wider shapes and stale authority remain on the grouped scan. The discovery
+  sample at 2,000 edges measured `2.56x`, with no claim beyond this bounded plan shape.
+
+Focused validation was accumulated: 58 PK/regression cases, 75 catalog projection/store cases,
+34 read-view/cross-process/plan cases and 155 traversal/limit/optional/overlay cases passed, plus
+scoped Ruff and diff checks. These are structural/component receipts; marginal timing variance is
+not used as a gate.

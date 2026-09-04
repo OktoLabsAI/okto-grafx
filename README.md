@@ -684,7 +684,7 @@ refused with the field name the caller actually wrote.
 | `partitions_per_table` | `64` | Conflict granularity — more partitions, fewer false conflicts |
 | `identity_lease_size` | `64` | Burn-only row-id range reserved durably per refill; larger values reduce heap page-0 metadata commits at the cost of wider harmless gaps after close/crash |
 | `buffer_budget_bytes` | `64 MiB` | Per database, never shared; must hold at least two configured pages |
-| `max_open_files` | `128` | Local descriptor-cache budget; tune down for descriptor-constrained hosts |
+| `max_open_files` | `256` | Lazy per-database descriptor-cache ceiling; tune down for descriptor-constrained or multi-database hosts |
 | `descriptor_revalidation` | `"strict"` | `"strict"` proves every cached descriptor hit; `"generation"` amortizes proofs for a closed canonical-file whitelist and requires an exclusively Grafx/Pulse-managed directory |
 | `recovery_policy` | `"replay"` | What the pass at open is allowed to do |
 | `lease_ttl_seconds` | `5.0` | How long a writer's lease stays valid without renewal |

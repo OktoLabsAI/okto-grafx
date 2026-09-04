@@ -83,6 +83,14 @@ sentinel. Only the write-side `append_log`/`truncate_log` operations impose appe
 semantics. A custom storage adapter must preserve this fill-until-EOF behaviour even when it
 internally distinguishes file kinds.
 
+`LocalStorageDevice` additionally declares the adapter-only
+`read_log_if_exists(file, offset, length) -> bytes | None` fast path used by two-slot control
+records. It combines the existence and bounded read under one exact-case namespace observation,
+then compares the observed `(device, inode)` with the warm descriptor. It is intentionally absent
+from the frozen `StorageDevice` signatures. Wrappers opt in only by declaring the method directly;
+otherwise the engine preserves `exists -> read_log`, including a typed failure if the file vanishes
+between those two doors. This optimization does not apply generation stamps to `control/**`.
+
 **`durable_barrier`** must not return until what was written is on the platter. A failure must be
 raised as `GrafxDurabilityBarrierFailed` — never swallowed — because a failed barrier means nothing
 may be acknowledged as durable.

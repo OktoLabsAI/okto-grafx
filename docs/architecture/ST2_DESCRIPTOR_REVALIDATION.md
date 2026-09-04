@@ -56,9 +56,17 @@ even when the selected mode is `generation`. A caller cannot extend this set by 
 Control records never use generation-amortized identity stamps. In both modes, every actual storage
 operation on `control/**` proves that the cached descriptor still belongs to the logical name. A
 v2 two-slot record has one immutable header page and two independently checksummed slot pages. Its
-read path fetches that fixed three-page image through one bounded `read_log` call instead of opening
-the same descriptor separately for three `read_page` calls. This is one descriptor hit and therefore
-one strict physical-identity proof; it is not three logical operations whose checks were skipped.
+read path fetches that fixed three-page image through one adapter-only fused read instead of an
+independent `exists` followed by `read_log`, or three separate `read_page` calls. The local adapter
+walks the exact-case namespace once, retains the final no-follow `stat` observation and compares its
+`(st_dev, st_ino)` with `fstat` of the warm descriptor. A miss/stale handle still enters the ordinary
+open/reprove loop. This is one strict physical-identity proof; it is not a skipped proof.
+
+The fused `read_log_if_exists` capability is deliberately not part of the frozen `StorageDevice`
+port. Control records and the read-only wrapper use it only when the concrete adapter type declares
+the method itself; a wrapper that merely forwards unknown attributes through `__getattr__` keeps the
+literal `exists` then `read_log` sequence and propagates a disappearance after `exists=True`.
+Absence is `None`, while an empty present file is `b""` and remains a present legacy/corrupt image.
 
 The bounded read asks for the format-derived image size plus one byte and relies on the port's
 fill-until-EOF rule: a conforming adapter returns the sentinel byte when it exists rather than an
@@ -74,7 +82,7 @@ retry requires the exact three-page length and refuses a short or oversized repl
 an oversized image with a valid-looking v2 prefix. Header/database binding, slot CRC, generation
 monotonicity and the rule that two populated slots cannot claim the same generation are unchanged.
 
-A warm publication remains three independent storage operations: one bounded image read, one slot
+A warm publication remains three independent storage operations: one fused bounded image read, one slot
 page write and one durability barrier. Each operation receives its own strict descriptor proof in
 both modes. The batching does not combine a read with a write or barrier, does not cache control
 bytes across calls and does not acknowledge a generation before the existing write-plus-barrier

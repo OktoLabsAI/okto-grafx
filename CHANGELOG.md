@@ -56,6 +56,46 @@ including the on-disk format.
 
 ### Changed
 
+- Primary-key uniqueness now folds transaction and statement intent suffixes incrementally rather
+  than reducing the complete accumulated list for every row. Public list rewrites and rollbacks
+  force a canonical rebuild; a seeded differential covers numeric equality, NaN, mutable keys,
+  table/transaction isolation and exact refusal parity.
+- Prepared plans now use the immutable serialized catalog image, ACTIVE index picture and dirty
+  table set as their authority key without also requiring Python object identity. Byte-identical
+  catalog adoption across transaction boundaries therefore reuses the same bounded plan entry,
+  while any schema, generation freshness or owner-overlay change still splits it.
+- WAL-only read boundaries retain the resident catalog for a same token, a proven own publication
+  or a complete catalog-free CE-3 interval. Initial views, foreign DDL, checkpoint movement,
+  declined proofs and direct/legacy compositions keep the conservative refresh; the complete
+  ACTIVE index projection is memoized only for the lifetime of that catalog authority.
+- Exact one-hop traversals directly below a streaming `LIMIT` may use fresh endpoint indexes even
+  with a scan frontier, allowing the consumer to stop before grouping the complete relationship
+  table. Blocking operators, ranges, optional/union/write shapes and unavailable or stale indexes
+  retain the canonical grouped scan.
+- Recovery now coalesces repeated full-page effects only for page-only WAL replays whose embedded
+  page LSN sequence is unambiguous. Full preflight still validates every superseded image, mixed
+  page/index effects keep their original order, and recovery establishes per-file data durability
+  after index completion and before publishing `commit.state`.
+- Local two-slot control reads fuse the exact-name existence observation with their bounded read.
+  Warm descriptors are still matched by physical identity, case-only aliases still fail closed,
+  and custom/fault wrappers retain the original two-door behavior unless their concrete type
+  explicitly opts in. The frozen `StorageDevice` port is unchanged.
+- Recovery reuses its passage-bound, content-checked page preflight instead of decoding each page
+  image repeatedly. A proof cannot cross replay objects, modes or recovery passages; a changed
+  record is revalidated before mutation, and a page projection from a mixed replay remains
+  sequential rather than becoming accidentally coalescible.
+- Buffer-pool dirty work is selected from a per-file candidate set and revalidated at use time,
+  avoiding full resident-frame scans in `flush`, `modified_pages`, `has_dirty_pages` and fresh
+  read-view checks. The candidate index covers pinned, doomed, evicted and directly applied pages;
+  it does not change write-back or WAL authority.
+- Heap extent-directory lookups retain a defensive `table_id -> slot` hint. Every hit verifies the
+  current slot's table-id before decode or overwrite, stale hints fall back to the canonical scan,
+  and replay/epoch movement invalidates the memo. Cold scans use zero-copy slot views and decode
+  only the matching extent.
+- Raised the lazy, per-database descriptor-cache default from 128 to 256 (and the direct local
+  adapter default from 64 to 256) to avoid LRU churn for the measured 141-file Pulse working set.
+  `max_open_files` remains configurable per instance and should be lowered when several large
+  databases share a descriptor-constrained process.
 - Bumped the development version to `0.0.2` and started the bounded performance round governed by
   `GRAFX_PERFORMANCE_ROUND_FINAL.md`.
 - Added a separate, versioned `python-v2` estimate of Python memory retained by the buffer pool

@@ -401,7 +401,7 @@ class DatabaseConfig:
     partitions_per_table: int = 64         # calibrated by FR-15, frozen in calibration.json
     identity_lease_size: int = 64          # local burn-only slice; not a format field
     buffer_budget_bytes: int = 64 * 1024 * 1024
-    max_open_files: int = 128              # local descriptor-cache budget; not a format field
+    max_open_files: int = 256              # lazy local descriptor-cache ceiling; not a format field
     recovery_policy: str = "replay"        # "replay" (DEFAULT) | "refuse"
     lease_ttl_seconds: float = 5.0
     lease_timeout_seconds: float = 10.0
@@ -970,7 +970,14 @@ Algorithm (FROZEN):
    * CRC valid but not usable (stale epoch, post-truncation) → **REAPPLICABLE** (decoded operation).
    * CRC invalid / undecodable → **FORENSIC** (raw bytes + offset + expected LSN + reason + sha256).
    Every discarded record produces exactly one entry (G8/BR-3).
-5. Redo committed transactions in LSN order, idempotent via `page_lsn`.
+5. Redo committed transactions in LSN order, idempotent via `page_lsn`. A replay containing only
+   `WRITE_PAGE` effects may reduce repeated writes to the same `(file, page)` after every original
+   image has passed full preflight. Reduction is allowed only for strictly increasing embedded
+   `page_lsn` (or equal LSN with identical bytes), applies the final image at the first occurrence,
+   and falls back to the original sequence for an ambiguous location. Mixed page/index replays are
+   never coalesced. Before recovery publishes a newer `commit.state`, every touched page/index file
+   and every ACTIVE index file is flushed and receives its own data durability barrier; a failed or
+   interrupted barrier forbids publication.
 6. Uncommitted transactions require **no undo** — pages are only written at commit.
 7. `recovery_policy="refuse"` raises `GrafxRecoveryRefused` **instead of step 3** and leaves
    everything on disk untouched.
