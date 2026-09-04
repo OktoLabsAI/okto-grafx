@@ -27,6 +27,7 @@ quietly lower the precision of the whole computation.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from math import isfinite
 
 import numpy
 
@@ -98,7 +99,9 @@ def _require_finite(value: float, operation: str) -> float:
     same states with the same error and the same details.
     """
     result = float(value)
-    if not numpy.isfinite(result):
+    # Conversion above deliberately collapses NumPy scalars to a Python float. Calling the
+    # standard-library scalar predicate avoids re-entering NumPy for every result in a ranking.
+    if not isfinite(result):
         raise GrafxVectorValidationError(
             f"The {operation} of these vectors is {result!r}, which is not a finite number; a "
             f"non-finite score has no place in a ranking.",

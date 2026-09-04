@@ -82,3 +82,17 @@ def test_each_prepared_cosine_candidate_uses_one_numpy_warning_scope(
     scopes.clear()
     assert scorer((0.0, 1.0)) == 0.0
     assert scopes == ["enter", "exit"]
+
+
+def test_finite_result_guard_does_not_redispatch_a_python_float_to_numpy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scalar result check stays outside NumPy after its explicit float conversion."""
+
+    def unexpected_numpy_isfinite(_value: object) -> bool:
+        raise AssertionError("a Python float was dispatched back through numpy.isfinite")
+
+    monkeypatch.setattr(numpy_module.numpy, "isfinite", unexpected_numpy_isfinite)
+    scorer = NumpyVectorMath().prepare((1.0, 0.0), DistanceMetric.COSINE)
+
+    assert scorer((1.0, 0.0)) == 1.0
