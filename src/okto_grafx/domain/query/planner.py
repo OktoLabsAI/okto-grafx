@@ -511,6 +511,7 @@ class _Planner:
     pulse_expression_types: dict[int, tuple[Expression, ValueType | None]] = field(
         default_factory=dict
     )
+    seek_rechecks: list[Expression] = field(default_factory=list)
     anonymous: int = 0
 
     # --- entry -------------------------------------------------------------------------------
@@ -2186,11 +2187,30 @@ class _Planner:
         self, pipeline: PlanNode, clause: MatchClause
     ) -> tuple[PlanNode, list[Expression]]:
         """Plan the patterns of one MATCH clause and place its residual predicate."""
-        terms = list(conjuncts_of(clause.predicate))
+        original = list(conjuncts_of(clause.predicate))
+        terms = list(original)
+        self.seek_rechecks.clear()
         for pattern in clause.patterns:
             pipeline, terms = self._pattern(pipeline, pattern, terms)
-        residual = [term for term in terms if not self._reads_similarity(term)]
-        deferred = [term for term in terms if self._reads_similarity(term)]
+        # A seek is only the access path that found a candidate.  When another term remains,
+        # reconstruct the original conjunction around every equality the seek consumed.  A
+        # residual such as ``p.name`` is UNKNOWN inside ``p.k = 1 AND p.name`` but is a refused
+        # non-boolean predicate on its own; promoting it therefore changes the query.  Terms
+        # introduced by inline property maps follow the written WHERE terms, matching the
+        # ordering this planner already gives the scan path.
+        retained = {id(term) for term in terms}
+        if terms:
+            retained.update(id(term) for term in self.seek_rechecks)
+        ordered = list(original)
+        known = {id(term) for term in ordered}
+        for term in (*terms, *self.seek_rechecks):
+            if id(term) not in known:
+                ordered.append(term)
+                known.add(id(term))
+        active = [term for term in ordered if id(term) in retained]
+        self.seek_rechecks.clear()
+        residual = [term for term in active if not self._reads_similarity(term)]
+        deferred = [term for term in active if self._reads_similarity(term)]
         predicate = _conjoin(residual)
         if predicate is not None:
             pipeline = FilterRows(child=pipeline, predicate=predicate)
@@ -2496,14 +2516,7 @@ class _Planner:
         terms: list[Expression],
     ) -> tuple[PlanNode | None, list[Expression]]:
         """Return an index seek for this variable when an index answers the predicate exactly."""
-        constrained: dict[str, tuple[Expression, Expression]] = {}
-        for term in terms:
-            binding = self._equality_on(term, variable, table)
-            if binding is None:
-                continue
-            column, value = binding
-            if column not in constrained:
-                constrained[column] = (term, value)
+        constrained = self._leading_equality_constraints(variable, table, terms)
         if not constrained:
             return None, terms
         found = self._index_for(table, tuple(constrained))
@@ -2511,6 +2524,7 @@ class _Planner:
             return None, terms
         definition, columns = found
         used = [constrained[column][0] for column in columns]
+        self.seek_rechecks.extend(used)
         remaining = [term for term in terms if term not in used]
         return (
             IndexSeek(
@@ -2524,6 +2538,27 @@ class _Planner:
             ),
             remaining,
         )
+
+    def _leading_equality_constraints(
+        self, variable: str, table: TableDef, terms: Sequence[Expression]
+    ) -> dict[str, tuple[Expression, Expression]]:
+        """Return the safe leading local equalities an index may use for this binding.
+
+        Seeking on a later conjunct evaluates it before earlier terms and can suppress an
+        observable refusal on every row the seek eliminates.  A leading run of local equality
+        terms is total once its row is decoded, so using any index covered by that run preserves
+        the predicate's written expression order.  The complete conjunction is still replayed
+        over hits by ``_match_clause`` whenever a residual remains.
+        """
+        constrained: dict[str, tuple[Expression, Expression]] = {}
+        for term in terms:
+            binding = self._equality_on(term, variable, table)
+            if binding is None:
+                break
+            column, value = binding
+            if column not in constrained:
+                constrained[column] = (term, value)
+        return constrained
 
     def _equality_on(
         self, term: Expression, variable: str, table: TableDef
@@ -2812,11 +2847,9 @@ class _Planner:
             candidates += list(
                 self._property_terms(node_pattern.variable, node_pattern.properties)
             )
-        constrained: list[str] = []
-        for term in candidates:
-            binding = self._equality_on(term, node_pattern.variable, table)
-            if binding is not None and binding[0] not in constrained:
-                constrained.append(binding[0])
+        constrained = self._leading_equality_constraints(
+            node_pattern.variable, table, candidates
+        )
         if not constrained:
             return False
         return self._index_for(table, tuple(constrained)) is not None

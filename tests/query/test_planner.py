@@ -151,11 +151,11 @@ def test_the_conjunct_a_seek_consumed_does_not_stay_as_a_filter() -> None:
     assert "FilterRows" not in operators(planned.root)
 
 
-def test_a_conjunct_the_seek_did_not_consume_stays_as_a_filter() -> None:
+def test_a_seek_rechecks_the_original_conjunction_when_a_filter_remains() -> None:
     planned = plan_text("MATCH (p:Person) WHERE p.id = 7 AND p.age > 3 RETURN p.name")
     predicate = find_operator(planned.root, "FilterRows")
     assert isinstance(predicate, FilterRows)
-    assert predicate.predicate.describe() == "(p.age > 3)"
+    assert predicate.predicate.describe() == "((p.id = 7) AND (p.age > 3))"
 
 
 def test_a_composite_index_is_keyed_in_the_order_it_declared() -> None:
