@@ -846,6 +846,138 @@ class _HeldRow:
     token: int | None = None
 
 
+class _RevisionList(list[object]):
+    """A list that distinguishes suffix appends from edits requiring a memo rebuild."""
+
+    __slots__ = ("revision", "rewrite_revision")
+
+    def __init__(self, values: Sequence[object] = ()) -> None:
+        super().__init__(values)
+        self.revision = 0
+        self.rewrite_revision = 0
+
+    def _appended(self) -> None:
+        self.revision += 1
+
+    def _rewritten(self) -> None:
+        self.revision += 1
+        self.rewrite_revision += 1
+
+    def append(self, value: object) -> None:
+        super().append(value)
+        self._appended()
+
+    def extend(self, values: object) -> None:
+        before = len(self)
+        try:
+            super().extend(values)  # type: ignore[arg-type]
+        finally:
+            if len(self) != before:
+                self._appended()
+
+    def insert(self, index: int, value: object) -> None:
+        super().insert(index, value)
+        self._rewritten()
+
+    def __setitem__(self, index: object, value: object) -> None:
+        super().__setitem__(index, value)  # type: ignore[index,assignment]
+        self._rewritten()
+
+    def __delitem__(self, index: object) -> None:
+        super().__delitem__(index)  # type: ignore[arg-type]
+        self._rewritten()
+
+    def __iadd__(self, values: object) -> _RevisionList:
+        self.extend(values)
+        return self
+
+    def __imul__(self, count: int) -> _RevisionList:
+        super().__imul__(count)
+        self._rewritten()
+        return self
+
+    def pop(self, index: int = -1) -> object:
+        value = super().pop(index)
+        self._rewritten()
+        return value
+
+    def remove(self, value: object) -> None:
+        super().remove(value)
+        self._rewritten()
+
+    def clear(self) -> None:
+        if self:
+            super().clear()
+            self._rewritten()
+
+    def reverse(self) -> None:
+        super().reverse()
+        self._rewritten()
+
+    def sort(self, *args: object, **kwargs: object) -> None:
+        try:
+            super().sort(*args, **kwargs)  # type: ignore[arg-type]
+        finally:
+            self._rewritten()
+
+
+@dataclass(frozen=True, slots=True)
+class _PrimaryKeyOutcome:
+    """Latest reduced operation and values for one referenced transaction row."""
+
+    operation: RowOperation
+    values: tuple[Value, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PrimaryKeyLegacyOwner:
+    """Identity of one independent legacy insert that carries no pending reference."""
+
+    position: int
+
+
+@dataclass(slots=True)
+class _PrimaryKeyFoldState:
+    """Incremental row reduction and key occupancy for one table view."""
+
+    position: int
+    cursor: int = 0
+    rewrite_revision: int = 0
+    generation: int = 0
+    fold_count: int = 0
+    outcomes: dict[object, _PrimaryKeyOutcome] = field(default_factory=dict)
+    cancelled: set[object] = field(default_factory=set)
+    key_owners: dict[object, dict[object, Value]] = field(default_factory=dict)
+    mutable_key_owners: dict[object, Value] = field(default_factory=dict)
+
+    def reset(self, rewrite_revision: int) -> None:
+        self.cursor = 0
+        self.rewrite_revision = rewrite_revision
+        self.generation += 1
+        self.outcomes.clear()
+        self.cancelled.clear()
+        self.key_owners.clear()
+        self.mutable_key_owners.clear()
+
+
+@dataclass(slots=True)
+class _PrimaryKeyTxnMemo:
+    """All primary-key folds owned by one exact transaction and intent list."""
+
+    txn: object
+    intents: _RevisionList
+    tables: dict[tuple[object, ...], _PrimaryKeyFoldState] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _PrimaryKeyStatementMemo:
+    """Incremental overlay of held rows over one transaction table fold."""
+
+    base_generation: int
+    state: _PrimaryKeyFoldState
+    changed_refs: set[object] = field(default_factory=set)
+
+
 @dataclass(slots=True)
 class _Context:
     """What every operator of one running statement needs."""
@@ -871,7 +1003,7 @@ class _Context:
     intermediate_rows: dict[int, int] = field(default_factory=dict)
     traversal_expansions: int = 0
     traversal_paths: int = 0
-    staged_rows: list[_HeldRow] = field(default_factory=list)
+    staged_rows: list[_HeldRow] = field(default_factory=_RevisionList)  # type: ignore[arg-type]
     staged_partitions: list[tuple[int, bytes]] = field(default_factory=list)
     staged_reads: list[tuple[int, bytes]] = field(default_factory=list)
     tokens_issued: int = 0
@@ -891,6 +1023,9 @@ class _Context:
     # exact catalog picture used for planning. Runtime operators resolve names from this same
     # projection instead of asking the catalog and registry to prove authority again.
     index_authority: _IndexAuthorityProjection | None = None
+    primary_key_memos: dict[tuple[object, ...], _PrimaryKeyStatementMemo] = field(
+        default_factory=dict
+    )
 
     def already_ended(self, reference: object) -> bool:
         """Answer whether this exact version has already been told to stop.
@@ -2216,6 +2351,7 @@ class QueryEngine:
         "_endpoint_memo",
         "_endpoint_budget",
         "_endpoint_guard",
+        "_primary_key_memos",
         "_txn_effects",
         "_skip_claims",
         "_durable_skips",
@@ -2296,6 +2432,7 @@ class QueryEngine:
             max_entries=_ENDPOINT_LOCATOR_MAX_ENTRIES,
             guard=self._endpoint_guard,
         )
+        self._primary_key_memos: dict[int, _PrimaryKeyTxnMemo] = {}
         # Every out-of-transaction effect each open schema transaction has made -- indexes
         # registered, spaces attached, skip-report entries, index files created -- in the order
         # it made them. The rollback undo. Pruning by table id against the live catalog was
@@ -3416,6 +3553,7 @@ class QueryEngine:
             self._working.pop(txn_id, None)
             self._settle_owner_memo(txn_id)
             self._settle_endpoint_memo(txn_id)
+            self._primary_key_memos.pop(txn_id, None)
             self._txn_effects.pop(txn_id, None)
             return
         # The transaction's own journal, replayed in reverse -- never a prune against a catalog.
@@ -3429,6 +3567,7 @@ class QueryEngine:
         self._working.pop(txn_id, None)
         self._settle_owner_memo(txn_id)
         self._settle_endpoint_memo(txn_id)
+        self._primary_key_memos.pop(txn_id, None)
         self._txn_effects.pop(txn_id, None)
 
     def _settle_owner_memo(self, txn_id: int) -> None:
@@ -8800,6 +8939,372 @@ def _transaction_row_view(
     return state, inserted
 
 
+def _primary_key_identity(value: Value) -> object | None:
+    """Return a hashable identity with exactly the equality used by primary-key checks."""
+    if isinstance(value, (bytearray, list, dict)) or (
+        isinstance(value, tuple)
+        and any(_primary_key_identity(item) is None for item in value)
+    ):
+        # Public values may retain caller-owned mutable containers. Keep those few keys on a
+        # linear defensive side path so an in-place parameter mutation cannot stale the hash.
+        return None
+    if _numbers(value, value):
+        numeric = float(value)  # _equal intentionally joins integer and double values
+        if isnan(numeric):
+            return ("nan", id(value))  # _equal still rejects even the same NaN object
+        return ("number", numeric)
+    return ("value", _freeze(value))
+
+
+def _primary_key_table_identity(
+    table: TableDef, position: int
+) -> tuple[object, ...]:
+    """Name the complete table/key shape so speculative schemas cannot share a memo."""
+    return (
+        table.table_id,
+        table.name,
+        table.schema_version,
+        table.primary_key,
+        position,
+    )
+
+
+def _primary_key_remove_owner(
+    state: _PrimaryKeyFoldState, owner: object, values: tuple[Value, ...]
+) -> None:
+    state.mutable_key_owners.pop(owner, None)
+    if len(values) <= state.position:
+        return
+    identity = _primary_key_identity(values[state.position])
+    if identity is None:
+        return
+    bucket = state.key_owners.get(identity)
+    if bucket is None:
+        return
+    bucket.pop(owner, None)
+    if not bucket:
+        state.key_owners.pop(identity, None)
+
+
+def _primary_key_add_owner(
+    state: _PrimaryKeyFoldState, owner: object, values: tuple[Value, ...]
+) -> None:
+    if len(values) <= state.position:
+        return
+    key = values[state.position]
+    identity = _primary_key_identity(key)
+    if identity is None:
+        state.mutable_key_owners[owner] = key
+        return
+    state.key_owners.setdefault(identity, {})[owner] = key
+
+
+def _validate_primary_key_pending_ref(
+    context: _Context, table: TableDef, intent: RowIntent
+) -> None:
+    reference = intent.reference
+    if not isinstance(reference, PendingRowRef):
+        return
+    owns = getattr(context.txn, "owns_pending_row_ref", None)
+    table_id = getattr(intent.table, "table_id", None)
+    if (
+        reference.txn_id != getattr(context.txn, "txn_id", None)
+        or reference.table_id != table_id
+        or not callable(owns)
+        or not owns(reference)
+    ):
+        raise GrafxTransactionStateError(
+            "A node overlay may read only a pending row identity issued by its owner "
+            "for this exact table.",
+            field="pending_row_reference",
+            value=repr(reference),
+            txn_id=getattr(context.txn, "txn_id", None),
+            table_id=table.table_id,
+        )
+
+
+def _primary_key_set_outcome(
+    state: _PrimaryKeyFoldState,
+    reference: object,
+    outcome: _PrimaryKeyOutcome | None,
+) -> None:
+    previous = state.outcomes.get(reference)
+    if previous is not None and previous.operation is not RowOperation.DELETE:
+        _primary_key_remove_owner(state, reference, previous.values)
+    if outcome is None:
+        state.outcomes.pop(reference, None)
+        return
+    state.outcomes[reference] = outcome
+    if outcome.operation is not RowOperation.DELETE:
+        _primary_key_add_owner(state, reference, outcome.values)
+
+
+def _fold_primary_key_intent(
+    state: _PrimaryKeyFoldState,
+    intent: RowIntent,
+    intent_position: int,
+    context: _Context,
+    table: TableDef,
+    *,
+    base: _PrimaryKeyFoldState | None = None,
+    changed_refs: set[object] | None = None,
+) -> None:
+    """Fold one suffix intent with the same last-intent-wins rules as the canonical reducer."""
+    _validate_primary_key_pending_ref(context, table, intent)
+    state.fold_count += 1
+    reference = intent.reference
+    values = tuple(intent.values)  # type: ignore[arg-type]
+    if reference is None:
+        owner = _PrimaryKeyLegacyOwner(intent_position)
+        _primary_key_add_owner(state, owner, values)
+        return
+
+    if changed_refs is not None and reference not in changed_refs:
+        changed_refs.add(reference)
+        if base is not None:
+            inherited = base.outcomes.get(reference)
+            if inherited is not None:
+                _primary_key_set_outcome(state, reference, inherited)
+            if reference in base.cancelled:
+                state.cancelled.add(reference)
+    if reference in state.cancelled:
+        return
+
+    previous = state.outcomes.get(reference)
+    if previous is None:
+        if isinstance(reference, PendingRowRef) and intent.operation is not RowOperation.INSERT:
+            raise GrafxTransactionStateError(
+                "A pending row identity must begin with an insert before it can be updated or "
+                "deleted by its owner.",
+                field="pending_row_reference",
+                value=repr(reference),
+                txn_id=getattr(context.txn, "txn_id", None),
+                table_id=table.table_id,
+                operation=intent.operation.value,
+            )
+        _primary_key_set_outcome(
+            state, reference, _PrimaryKeyOutcome(intent.operation, values)
+        )
+        return
+    if previous.operation is RowOperation.DELETE:
+        return
+    if previous.operation is RowOperation.INSERT:
+        if intent.operation is RowOperation.UPDATE:
+            _primary_key_set_outcome(
+                state, reference, _PrimaryKeyOutcome(RowOperation.INSERT, values)
+            )
+            return
+        if intent.operation is RowOperation.DELETE:
+            _primary_key_set_outcome(state, reference, None)
+            state.cancelled.add(reference)
+            return
+        raise GrafxTransactionStateError(
+            "One pending row reference cannot name two inserts in the same transaction.",
+            field="reference",
+            value=repr(reference),
+        )
+    if intent.operation is RowOperation.INSERT:
+        raise GrafxTransactionStateError(
+            "A stored row reference cannot become a new insert inside the same transaction.",
+            field="reference",
+            value=repr(reference),
+        )
+    _primary_key_set_outcome(
+        state, reference, _PrimaryKeyOutcome(intent.operation, values)
+    )
+
+
+def _revisioned_row_intents(
+    engine: QueryEngine, context: _Context
+) -> tuple[int, _PrimaryKeyTxnMemo] | None:
+    txn_id = getattr(context.txn, "txn_id", None)
+    if isinstance(txn_id, bool) or not isinstance(txn_id, int):
+        return None
+    raw = getattr(context.txn, "row_intents", None)
+    memo = engine._primary_key_memos.get(txn_id)
+    if memo is not None and memo.txn is context.txn and memo.intents is raw:
+        return txn_id, memo
+    if isinstance(raw, _RevisionList):
+        tracked = raw
+    elif isinstance(raw, list):
+        tracked = _RevisionList(raw)
+        try:
+            setattr(context.txn, "row_intents", tracked)
+        except (AttributeError, TypeError):
+            return None
+        if getattr(context.txn, "row_intents", None) is not tracked:
+            return None
+    else:
+        return None
+    memo = _PrimaryKeyTxnMemo(context.txn, tracked)
+    engine._primary_key_memos[txn_id] = memo
+    return txn_id, memo
+
+
+def _canonical_primary_key_rebuild(
+    state: _PrimaryKeyFoldState,
+    intents: Sequence[object],
+    context: _Context,
+    table: TableDef,
+    rewrite_revision: int,
+) -> None:
+    logical = tuple(
+        intent
+        for intent in intents
+        if isinstance(intent, RowIntent)
+        and getattr(intent.table, "table_id", None) == table.table_id
+    )
+    for intent in logical:
+        _validate_primary_key_pending_ref(context, table, intent)
+    reduce_row_intents(logical)
+    state.reset(rewrite_revision)
+    for intent_position, raw in enumerate(intents):
+        if not isinstance(raw, RowIntent):
+            continue
+        if getattr(raw.table, "table_id", None) != table.table_id:
+            continue
+        _fold_primary_key_intent(state, raw, intent_position, context, table)
+    state.cursor = len(intents)
+
+
+def _transaction_primary_key_state(
+    engine: QueryEngine, context: _Context, table: TableDef, position: int
+) -> _PrimaryKeyFoldState:
+    identified = _revisioned_row_intents(engine, context)
+    if identified is None:
+        raw = tuple(getattr(context.txn, "row_intents", ()))
+        state = _PrimaryKeyFoldState(position=position)
+        _canonical_primary_key_rebuild(state, raw, context, table, 0)
+        return state
+    _txn_id, memo = identified
+    key = _primary_key_table_identity(table, position)
+    state = memo.tables.get(key)
+    if state is None:
+        state = _PrimaryKeyFoldState(position=position)
+        memo.tables[key] = state
+        _canonical_primary_key_rebuild(
+            state, memo.intents, context, table, memo.intents.rewrite_revision
+        )
+        return state
+    if (
+        state.rewrite_revision != memo.intents.rewrite_revision
+        or state.cursor > len(memo.intents)
+    ):
+        _canonical_primary_key_rebuild(
+            state, memo.intents, context, table, memo.intents.rewrite_revision
+        )
+        return state
+    changed = False
+    for intent_position in range(state.cursor, len(memo.intents)):
+        raw = memo.intents[intent_position]
+        if not isinstance(raw, RowIntent):
+            continue
+        if getattr(raw.table, "table_id", None) != table.table_id:
+            continue
+        _fold_primary_key_intent(state, raw, intent_position, context, table)
+        changed = True
+    state.cursor = len(memo.intents)
+    if changed:
+        state.generation += 1
+    return state
+
+
+def _statement_primary_key_state(
+    context: _Context,
+    table: TableDef,
+    position: int,
+    base: _PrimaryKeyFoldState,
+) -> _PrimaryKeyStatementMemo:
+    key = _primary_key_table_identity(table, position)
+    held = context.staged_rows
+    if not isinstance(held, _RevisionList):
+        held = _RevisionList(held)
+        context.staged_rows = held  # type: ignore[assignment]
+    memo = context.primary_key_memos.get(key)
+    rewrite_revision = held.rewrite_revision
+    if memo is None:
+        memo = _PrimaryKeyStatementMemo(
+            base_generation=base.generation,
+            state=_PrimaryKeyFoldState(
+                position=position, rewrite_revision=rewrite_revision
+            ),
+        )
+        context.primary_key_memos[key] = memo
+    if (
+        memo.base_generation != base.generation
+        or memo.state.rewrite_revision != rewrite_revision
+        or memo.state.cursor > len(held)
+    ):
+        memo.base_generation = base.generation
+        memo.changed_refs.clear()
+        memo.state.reset(rewrite_revision)
+    for held_position in range(memo.state.cursor, len(held)):
+        raw = held[held_position]
+        if not isinstance(raw, _HeldRow) or raw.table.table_id != table.table_id:
+            continue
+        operation = {
+            _HELD_INSERT: RowOperation.INSERT,
+            _HELD_UPDATE: RowOperation.UPDATE,
+            _HELD_DELETE: RowOperation.DELETE,
+        }[raw.operation]
+        intent = RowIntent(
+            table=raw.table,
+            values=() if raw.values is None else tuple(raw.values),
+            record_id=raw.identity,
+            operation=operation,
+            reference=raw.reference,
+        )
+        _fold_primary_key_intent(
+            memo.state,
+            intent,
+            held_position,
+            context,
+            table,
+            base=base,
+            changed_refs=memo.changed_refs,
+        )
+    memo.state.cursor = len(held)
+    return memo
+
+
+def _primary_key_conflicts(
+    state: _PrimaryKeyFoldState,
+    key: Value,
+    *,
+    replacing: object,
+    excluded: set[object] | None = None,
+) -> bool:
+    identity = _primary_key_identity(key)
+    for owner, observed in state.mutable_key_owners.items():
+        if replacing is not None and owner == replacing:
+            continue
+        if excluded is not None and owner in excluded:
+            continue
+        if _equal(observed, key):
+            return True
+    lookup_identity = ("value", _freeze(key)) if identity is None else identity
+    for owner, observed in state.key_owners.get(lookup_identity, {}).items():
+        if replacing is not None and owner == replacing:
+            continue
+        if excluded is not None and owner in excluded:
+            continue
+        if _equal(observed, key):
+            return True
+    return False
+
+
+def _primary_key_replaces(
+    base: _PrimaryKeyFoldState,
+    statement: _PrimaryKeyStatementMemo,
+    reference: object,
+) -> bool:
+    if reference in statement.changed_refs:
+        outcome = statement.state.outcomes.get(reference)
+    else:
+        outcome = base.outcomes.get(reference)
+    return outcome is not None and outcome.operation is not RowOperation.INSERT
+
+
 def _require_unique_primary_key(
     engine: QueryEngine,
     table: TableDef,
@@ -8834,22 +9339,24 @@ def _require_unique_primary_key(
     for other in also:
         if _equal(other[position], key):
             raise _duplicate_key(table, key)
-    state, inserted = _transaction_row_view(context, table)
-    for reference, pending in inserted:
-        if replacing is not None and reference == replacing:
-            continue
-        if len(pending) > position and _equal(pending[position], key):
-            raise _duplicate_key(table, key)
-    for reference, latest in state.items():
-        if latest is None or (replacing is not None and reference == replacing):
-            continue  # ended, or this very row being updated again
-        if len(latest) > position and _equal(latest[position], key):
-            raise _duplicate_key(table, key)
+    base = _transaction_primary_key_state(engine, context, table, position)
+    statement = _statement_primary_key_state(context, table, position, base)
+    if _primary_key_conflicts(
+        statement.state, key, replacing=replacing
+    ) or _primary_key_conflicts(
+        base,
+        key,
+        replacing=replacing,
+        excluded=statement.changed_refs,
+    ):
+        raise _duplicate_key(table, key)
     stored = _rows_carrying_key(engine, table, key, position, context)
     if stored is None:
         stored = engine.heap.scan(table, context.snapshot)
     for ref, version in stored:
-        if ref in state or (replacing is not None and ref == replacing):
+        if _primary_key_replaces(base, statement, ref) or (
+            replacing is not None and ref == replacing
+        ):
             continue  # replaced or ended by this transaction: the view above is its truth
         if _equal(version.values[position], key):
             raise _duplicate_key(table, key)
