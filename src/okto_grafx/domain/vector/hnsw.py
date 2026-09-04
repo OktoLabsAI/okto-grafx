@@ -39,6 +39,7 @@ from array import array
 from bisect import insort
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from heapq import heappop, heappush
 from math import log
 
 from okto_grafx.domain.errors import GrafxConfigurationError
@@ -93,6 +94,13 @@ on the configured baseline, not on the result cardinality API.
 MAX_LEVEL: int = 32
 """The tallest tower a node may be given, which bounds the per-node cost of a graph."""
 
+_HEAP_FRONTIER_MIN_NODES: int = 4096
+"""Smallest graph where selective or exhaustive traversal uses a heap frontier.
+
+This private algorithm threshold is independent of the public exact-scan threshold, even when
+their defaults happen to have the same numeric value.
+"""
+
 
 def _require_positive(field: str, value: int) -> int:
     """Return a positive integer parameter, refusing anything that could not build a graph."""
@@ -139,14 +147,16 @@ def _insert_ranked(
 
     Ordering is descending by score and ascending by node id, which is the tie rule of the
     ``VectorMath`` port (CONTRACT.md section 4.6). The position is found by binary search on
-    exactly that key rather than by a heap, which keeps the order total and observable: a heap
-    would leave equal scores in whatever order the sift happened to produce, whereas this list
-    reads as the ranking it is. An entry equal to one already present goes after it, where the
-    linear scan this replaces put it (VEC-5); a test holds the two to the same list.
+    exactly that key, which keeps this materialized ranking total and observable. The wide
+    traversal frontier may use a heap carrying both score and node id as its total-order key, but
+    its bounded result ranking still passes through this helper. An entry equal to one already
+    present goes after it, where the linear scan this replaces put it (VEC-5); a test holds the
+    two to the same list.
 
-    ``limit`` of None means the list is not truncated. The beam of a traversal uses that,
-    because a node dropped from the beam is a node that was marked visited and will never be
-    expanded -- which would silently break the exhaustiveness the wide-beam case depends on.
+    ``limit`` of None means the list is not truncated. The ordinary traversal beam uses that;
+    the separate wide-frontier heap has the same no-drop property. A node dropped from either
+    frontier was already marked visited and would never be expanded, silently breaking the
+    exhaustiveness the wide-beam case depends on.
     """
     insort(ranked, (score, node), key=_rank_key)
     if limit is not None and len(ranked) > limit:
@@ -504,10 +514,12 @@ class HnswGraph:
         if peers is None or len(peers) <= capacity:
             return
         scorer = self._scorer(self._components(node))
-        ranked: list[tuple[float, int]] = []
-        for peer in peers:
-            _insert_ranked(ranked, scorer(peer), peer, capacity)
-        kept = [peer for _score, peer in ranked]
+        # Score in the established adjacency order, then let CPython's sort select the same
+        # total order in C. The previous repeated insort maintained this exact prefix after each
+        # peer; sorting once yields the same final prefix without O(M²) Python list shifts.
+        ranked = [(scorer(peer), peer) for peer in peers]
+        ranked.sort(key=_rank_key)
+        kept = [peer for _score, peer in ranked[:capacity]]
         adjacency[node] = kept
         retained = set(kept)
         for peer in peers:
@@ -646,6 +658,14 @@ class HnswGraph:
         The behaviour is therefore left as it is and recorded, so the trade is made deliberately
         by whoever calibrates it rather than accidentally here.
         """
+        node_count = len(self._values)
+        if node_count >= _HEAP_FRONTIER_MIN_NODES and (
+            admits is not None or ef >= node_count
+        ):
+            return self._search_layer_counted_heap(
+                scorer, entry_points, ef, layer, admits
+            )
+
         visited: set[int] = set()
         beam: list[tuple[float, int]] = []
         results: list[tuple[float, int]] = []
@@ -673,6 +693,64 @@ class HnswGraph:
                 neighbour_score = scorer(neighbour)
                 if len(results) < ef or neighbour_score > results[-1][0]:
                     _insert_ranked(beam, neighbour_score, neighbour)
+                    if admits is None or admits(neighbour):
+                        _insert_ranked(results, neighbour_score, neighbour, ef)
+                    else:
+                        bridges += 1
+        return tuple(results), TraversalStats(
+            visited=len(visited),
+            bridges=bridges,
+            admitted=len(results),
+            hops=hops,
+            exhaustive=len(visited) >= len(self._values),
+        )
+
+    def _search_layer_counted_heap(
+        self,
+        scorer: Callable[[int], float],
+        entry_points: Iterable[int],
+        ef: int,
+        layer: int,
+        admits: Callable[[int], bool] | None,
+    ) -> tuple[tuple[tuple[float, int], ...], TraversalStats]:
+        """Run the same beam search with a heap only for predictably wide frontiers.
+
+        The ordinary approximate path above intentionally remains the established sorted-list
+        implementation: its list shifts happen in C and win for the usual bounded beam. Large
+        selective searches can fail to fill the result beam, while a beam at least as wide as the
+        graph cannot prune early. In either case the frontier can grow towards N; choosing this
+        helper up front removes quadratic list shifts without adding a per-visit mode branch to
+        the common path.
+        """
+        visited: set[int] = set()
+        # ``(-score, node, score)`` pops score descending and node ascending while retaining the
+        # original score value (including signed zero) for the unchanged strict pruning checks.
+        beam: list[tuple[float, int, float]] = []
+        results: list[tuple[float, int]] = []
+        bridges = 0
+        hops = 0
+        for node in sorted(entry_points):
+            if node in visited or node not in self._values:
+                continue
+            visited.add(node)
+            score = scorer(node)
+            heappush(beam, (-score, node, score))
+            if admits is None or admits(node):
+                _insert_ranked(results, score, node, ef)
+            else:
+                bridges += 1
+        while beam:
+            _priority, node, score = heappop(beam)
+            if len(results) >= ef and score < results[-1][0]:
+                break
+            hops += 1
+            for neighbour in sorted(self.neighbours_of(node, layer)):
+                if neighbour in visited:
+                    continue
+                visited.add(neighbour)
+                neighbour_score = scorer(neighbour)
+                if len(results) < ef or neighbour_score > results[-1][0]:
+                    heappush(beam, (-neighbour_score, neighbour, neighbour_score))
                     if admits is None or admits(neighbour):
                         _insert_ranked(results, neighbour_score, neighbour, ef)
                     else:

@@ -40,30 +40,29 @@ def _instrument(
 ) -> _Work:
     """Count only work performed by the selected fixture's index and heap."""
     work = _Work()
-    original_walk = VectorHnswIndex.walk
+    original_entry_refs = VectorHnswIndex._entry_refs_from_headers
     original_read_if = HeapStore.read_if
-    original_entries_on = VectorHnswIndex._entries_on
+    original_bucket_pages = VectorHnswIndex._bucket_pages
 
-    def counted_walk(self: VectorHnswIndex) -> tuple[object, ...]:
+    def counted_entry_refs(self: VectorHnswIndex) -> tuple[RecordRef, ...]:
         if self is index:
             work.walks += 1
-        return original_walk(self)
+        return original_entry_refs(self)
 
     def counted_read_if(self: HeapStore, ref: RecordRef, accept: object) -> object:
         if self is heap:
             work.heap_reads += 1
         return original_read_if(self, ref, accept)  # type: ignore[arg-type]
 
-    def counted_entries_on(
-        self: VectorHnswIndex, page_index: int
-    ) -> tuple[object, ...]:
+    def counted_bucket_pages(self: VectorHnswIndex, bucket: int) -> tuple[int, ...]:
+        pages = original_bucket_pages(self, bucket)
         if self is index:
-            work.bucket_pages += 1
-        return original_entries_on(self, page_index)
+            work.bucket_pages += len(pages)
+        return pages
 
-    monkeypatch.setattr(VectorHnswIndex, "walk", counted_walk)
+    monkeypatch.setattr(VectorHnswIndex, "_entry_refs_from_headers", counted_entry_refs)
     monkeypatch.setattr(HeapStore, "read_if", counted_read_if)
-    monkeypatch.setattr(VectorHnswIndex, "_entries_on", counted_entries_on)
+    monkeypatch.setattr(VectorHnswIndex, "_bucket_pages", counted_bucket_pages)
     return work
 
 
