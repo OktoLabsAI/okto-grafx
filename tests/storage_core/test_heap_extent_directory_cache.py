@@ -10,7 +10,7 @@ from okto_grafx.domain.errors import GrafxCorruptionDetected
 from okto_grafx.domain.ids import NO_PAGE
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
-from okto_grafx.domain.model.value import ValueType
+from okto_grafx.domain.model.value import Value, ValueType
 from okto_grafx.domain.page import HEADER_PAGE_INDEX, Page, PageType
 from okto_grafx.engine import heap_store as heap_module
 from okto_grafx.engine.buffer_pool import BufferPool, apply_page_image
@@ -53,6 +53,65 @@ def test_a_warm_extent_slot_avoids_the_directory_walk(
     monkeypatch.setattr(Page, "iter_slot_views", unexpected_walk)
     assert heap_store._find_extent(table.table_id) == expected
     heap_store._write_extent(replace(expected, next_record_id=expected.next_record_id + 1))
+
+
+def test_reserved_insert_reuses_its_just_validated_extent_once(
+    heap_store: HeapStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    table = _populate(heap_store, 1)[0]
+    heap_store.observe_record_id(table, 9)
+    original_find = HeapStore._find_extent
+    calls = 0
+
+    def counted_find(store: HeapStore, table_id: int) -> TableExtent | None:
+        nonlocal calls
+        calls += 1
+        return original_find(store, table_id)
+
+    monkeypatch.setattr(HeapStore, "_find_extent", counted_find)
+
+    reference = heap_store.insert_reserved(table, 3, (3,), xmin=20)
+
+    assert calls == 1
+    assert any(
+        found == reference and version.record_id == 3
+        for found, version in heap_store.scan_all(table)
+    )
+    assert heap_store.next_record_id(table) == 10
+
+
+def test_reserved_insert_rechecks_extent_after_derived_epoch_change(
+    pool: BufferPool, heap_store: HeapStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    table = _populate(heap_store, 1)[0]
+    heap_store.observe_record_id(table, 9)
+    pool.flush()
+    original_find = HeapStore._find_extent
+    original_encode = heap_module.encode_tuple
+    calls = 0
+
+    def counted_find(store: HeapStore, table_id: int) -> TableExtent | None:
+        nonlocal calls
+        calls += 1
+        return original_find(store, table_id)
+
+    def encode_after_foreign_view(
+        encoded_table: TableDef, values: tuple[Value, ...]
+    ) -> bytes:
+        pool.begin_read_view(object(), allow_writeback=False)
+        return original_encode(encoded_table, values)
+
+    monkeypatch.setattr(HeapStore, "_find_extent", counted_find)
+    monkeypatch.setattr(heap_module, "encode_tuple", encode_after_foreign_view)
+
+    reference = heap_store.insert_reserved(table, 3, (3,), xmin=20)
+
+    assert calls == 2
+    assert any(
+        found == reference and version.record_id == 3
+        for found, version in heap_store.scan_all(table)
+    )
+    assert heap_store.next_record_id(table) == 10
 
 
 def test_a_stale_slot_hint_falls_back_without_touching_the_wrong_table(

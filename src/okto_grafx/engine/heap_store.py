@@ -507,6 +507,14 @@ class TableExtent:
 
 
 @dataclass(frozen=True, slots=True)
+class _ExtentProof:
+    """One extent read and the process-local page-view generation that proved it."""
+
+    extent: TableExtent
+    derived_epoch: int
+
+
+@dataclass(frozen=True, slots=True)
 class RecordIdFloorAdvance:
     """One table's durable identity floor before and after a staged reservation."""
 
@@ -1454,6 +1462,7 @@ class HeapStore:
                 field="record_id",
                 value=record_id,
             )
+        extent_epoch = self._derived_read_epoch()
         extent = self._find_extent(table.table_id)
         if extent is None:
             raise GrafxTransactionStateError(
@@ -1476,6 +1485,7 @@ class HeapStore:
                 record_id=record_id,
                 durable_floor=extent.next_record_id,
             )
+        extent_proof = _ExtentProof(extent, extent_epoch)
         payload = encode_tuple(table, values)
         header = RecordHeader(
             record_id=record_id,
@@ -1485,7 +1495,7 @@ class HeapStore:
             payload_len=len(payload),
             schema_version=table.schema_version,
         )
-        return self._store_version(table, header, payload)
+        return self._store_version(table, header, payload, extent_proof=extent_proof)
 
     def update(
         self,
@@ -2169,7 +2179,12 @@ class HeapStore:
     # --- internals ---------------------------------------------------------------------------
 
     def _store_version(
-        self, table: TableDef, header: RecordHeader, payload: bytes
+        self,
+        table: TableDef,
+        header: RecordHeader,
+        payload: bytes,
+        *,
+        extent_proof: _ExtentProof | None = None,
     ) -> RecordRef:
         """Place one encoded version, using an overflow chain when it does not fit inline.
 
@@ -2184,7 +2199,13 @@ class HeapStore:
         instead is the property that actually matters to a caller: no version becomes reachable
         until every remaining step has succeeded, so a refusal leaves nothing to meet twice.
         """
-        extent = self._extent_for(table)
+        extent = (
+            extent_proof.extent
+            if extent_proof is not None
+            and extent_proof.extent.table_id == table.table_id
+            and extent_proof.derived_epoch == self._derived_read_epoch()
+            else self._extent_for(table)
+        )
         tail, length = self._resolve_tail(table, extent)
         if RECORD_HEADER_SIZE + len(payload) <= self.inline_capacity:
             content = header.encode() + payload
