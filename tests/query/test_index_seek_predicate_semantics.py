@@ -79,3 +79,33 @@ def test_a_valid_leading_equality_still_uses_the_index(database) -> None:
     assert result.rows == ((2,),)
     assert result.statistics["rows_seeked"] == 1
     assert any(isinstance(node, IndexSeek) for node in _operators(database, statement))
+
+
+def test_seek_crosses_a_total_equality_on_an_already_bound_scan(database) -> None:
+    statement = "MATCH (p:WithoutIndex {k: $p}), (q:WithPk {k: $q}) RETURN p.k, q.k"
+
+    plan = _operators(database, statement)
+    p_scan = next(
+        node for node in plan if isinstance(node, NodeScan) and node.variable == "p"
+    )
+    q_seek = next(
+        node for node in plan if isinstance(node, IndexSeek) and node.variable == "q"
+    )
+    predicate = next(node for node in plan if isinstance(node, FilterRows))
+
+    assert q_seek.child is p_scan
+    assert predicate.predicate.describe() == "((p.k = $p) AND (q.k = $q))"
+    assert database.execute(statement, {"p": 1, "q": 2}).rows == ((1, 2),)
+
+
+def test_seek_does_not_cross_a_partial_term_on_an_already_bound_scan(database) -> None:
+    statement = (
+        "MATCH (p:WithoutIndex), (q:WithPk) "
+        "WHERE (1 / (p.k - 2)) = 0 AND q.k = 9 "
+        "RETURN p.k, q.k"
+    )
+
+    plan = _operators(database, statement)
+    assert not any(isinstance(node, IndexSeek) for node in plan)
+    with pytest.raises(GrafxPlanError):
+        database.execute(statement)

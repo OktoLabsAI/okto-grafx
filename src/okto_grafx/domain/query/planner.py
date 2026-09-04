@@ -2553,12 +2553,27 @@ class _Planner:
         constrained: dict[str, tuple[Expression, Expression]] = {}
         for term in terms:
             binding = self._equality_on(term, variable, table)
+            if binding is None and self._bound_local_equality(term, variable):
+                # A prior scan has already bound this owner.  Its local equality is total and
+                # remains in ``terms`` for the final filter, so it is safe to look past without
+                # pretending this seek consumed it.  This preserves the nested P-scan -> Q-seek
+                # shape for ``p.id = $p AND q.id = $q``.
+                continue
             if binding is None:
                 break
             column, value = binding
             if column not in constrained:
                 constrained[column] = (term, value)
         return constrained
+
+    def _bound_local_equality(self, term: Expression, variable: str) -> bool:
+        """Whether ``term`` is a total equality on another already-bound table row."""
+        for owner, owner_table in self.tables.items():
+            if owner == variable:
+                continue
+            if self._equality_on(term, owner, owner_table) is not None:
+                return True
+        return False
 
     def _equality_on(
         self, term: Expression, variable: str, table: TableDef
