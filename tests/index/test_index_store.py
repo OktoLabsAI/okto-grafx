@@ -20,6 +20,7 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.ids import NO_PAGE, RecordRef
 from okto_grafx.domain.index import (
     INDEX_HEADER_SLOT,
+    IndexDefinition,
     IndexEntry,
     IndexHeader,
     IndexVisibility,
@@ -32,6 +33,8 @@ from okto_grafx.domain.page import (
     FileKind,
     PageType,
 )
+from okto_grafx.domain.model.schema import TableDef
+from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine import index_manager as index_module
 from okto_grafx.engine.index_manager import HashIndex
 
@@ -56,6 +59,31 @@ MAX_SETUP_ROWS: int = 400
 Amendment A92: a setup loop is bounded by a count and gates on something the code under test does
 not compute, so a regression in the walk cannot turn setup into a run that never ends.
 """
+
+
+def test_definition_digest_is_derived_once_per_store(
+    monkeypatch: pytest.MonkeyPatch,
+    person_table: TableDef,
+    pool: BufferPool,
+    metrics: RecordingMetrics,
+) -> None:
+    """Frozen definition derivatives need not be rebuilt on each header validation."""
+    definition = exact_definition(person_table)
+    original = IndexDefinition.digest
+    calls = 0
+
+    def counted(candidate: IndexDefinition) -> bytes:
+        nonlocal calls
+        calls += 1
+        return original(candidate)
+
+    monkeypatch.setattr(IndexDefinition, "digest", counted)
+    index = HashIndex(definition, pool, metrics)
+
+    index.create()
+    index.open()
+
+    assert calls == 1
 
 
 class ForgetfulSet(set):

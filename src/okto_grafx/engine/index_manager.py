@@ -452,6 +452,9 @@ class IndexStore:
 
     __slots__ = (
         "_definition",
+        "_definition_digest",
+        "_file",
+        "_page_type",
         "_creation_nonce",
         "_pool",
         "_metrics",
@@ -481,6 +484,13 @@ class IndexStore:
                 value=type(definition).__name__,
             )
         self._definition: IndexDefinition = definition
+        # IndexDefinition is frozen.  These values sit on every lookup/header-validation path
+        # and deriving them again cannot observe catalog or cross-process state.
+        self._definition_digest: bytes = definition.digest()
+        self._file: str = definition.file
+        self._page_type: int = int(
+            PageType.INDEX_HNSW if definition.versioned else PageType.INDEX_HASH
+        )
         self._creation_nonce: int = 0
         self._pool: BufferPool = pool
         self._metrics: MetricsSink = metrics
@@ -603,7 +613,7 @@ class IndexStore:
     @property
     def file(self) -> str:
         """Return the paged file this index is stored in."""
-        return self._definition.file
+        return self._file
 
     @property
     def page_type(self) -> int:
@@ -613,9 +623,7 @@ class IndexStore:
         which contract wrote it and a verifier reading raw pages needs nothing else to tell them
         apart.
         """
-        if self._definition.versioned:
-            return int(PageType.INDEX_HNSW)
-        return int(PageType.INDEX_HASH)
+        return self._page_type
 
     @property
     def stale_reason(self) -> str | None:
@@ -733,7 +741,7 @@ class IndexStore:
             visibility=self._definition.visibility,
             table_id=self._definition.table_id,
             bucket_count=self._definition.bucket_count,
-            digest=self._definition.digest(),
+            digest=self._definition_digest,
             artifact_nonce=self._creation_nonce,
         )
         if storage.page_count(self.file) == 0:
@@ -792,7 +800,7 @@ class IndexStore:
         self._invalidate_tombstone_backlog()
         header = self._read_header(proved_present=proved_present)
         definition = self._definition
-        if header.digest != definition.digest():
+        if header.digest != self._definition_digest:
             raise GrafxIndexError(
                 f"The file {self.file!r} was written under a different definition of index "
                 f"{definition.name!r}, so its entries do not answer this index's question.",
@@ -896,7 +904,7 @@ class IndexStore:
             )
         header = IndexHeader.decode(page.read_slot(INDEX_HEADER_SLOT))
         definition = self._definition
-        if header.digest != definition.digest():
+        if header.digest != self._definition_digest:
             raise GrafxIndexError(
                 f"The file {self.file!r} was written under a different definition of index "
                 f"{definition.name!r}.",
