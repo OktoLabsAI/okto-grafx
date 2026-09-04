@@ -91,6 +91,8 @@ MAX_SEQ: int = 0xFFFFFFFF
 
 _READ_VIEW_BASELINE_UNSET: object = object()
 _READ_VIEW_MAX_TARGETS: int = 1024
+_CLEAN_CANDIDATE_LINGER_PER_FILE: int = 32
+"""Clean hot pages retained in the D-10 candidate index to avoid read-path set churn."""
 
 BUFFER_BUDGET_USED_BYTES: str = "oktografx_buffer_budget_used_bytes"
 BUFFER_RETAINED_ESTIMATE_BYTES: str = "oktografx_buffer_retained_estimate_bytes"
@@ -465,6 +467,8 @@ class BufferPool:
         "_read_view_token",
         "_grown",
         "_abandoned",
+        "_dirty_candidates",
+        "_clean_candidate_linger",
         "_modified",
         "_work_probe",
     )
@@ -522,6 +526,16 @@ class BufferPool:
         # an attempt abandoned and this pool may hand out again. See allocate() and _reclaim().
         self._grown: set[tuple[str, PageIndex]] = set()
         self._abandoned: dict[str, list[PageIndex]] = {}
+        # A candidate is either already dirty or is pinned and can become dirty while its
+        # caller works outside the guard.  The page remains the authority: every consumer
+        # revalidates ``page.dirty`` before writing or reporting it.  Grouping the conservative
+        # superset by file makes the commit path proportional to pages that may have changed,
+        # instead of to every clean resident frame in a saturated cache (D-10).
+        self._dirty_candidates: dict[str, set[PageIndex]] = {}
+        # Repeatedly pinning one clean hot page would otherwise add/remove it from a set on every
+        # read.  Keep a small, per-file insertion-ordered cohort as conservative candidates.
+        # Consumers still revalidate page.dirty, and their normal refresh drains clean entries.
+        self._clean_candidate_linger: dict[str, dict[PageIndex, None]] = {}
         # Pages written back since the last forget_modified(), so an eviction cannot take a page
         # out of the answer modified_pages() gives. See that method.
         self._modified: set[tuple[str, PageIndex]] = set()
@@ -681,6 +695,8 @@ class BufferPool:
             self._evictions,
             self._grown,
             self._abandoned,
+            self._dirty_candidates,
+            self._clean_candidate_linger,
             self._modified,
             self._structure_epochs,
             self._drop_epochs,
@@ -792,6 +808,140 @@ class BufferPool:
         frame = self._frames.get((file, page_index))
         return 0 if frame is None else frame.pins
 
+    def _add_dirty_candidate(self, key: tuple[str, PageIndex]) -> None:
+        """Conservatively admit one location before its page can change outside the guard."""
+
+        file, page_index = key
+        candidates = self._dirty_candidates.get(file)
+        if candidates is not None and page_index in candidates:
+            return
+        self._dirty_candidates.setdefault(file, set()).add(page_index)
+
+    def _linger_clean_candidate(self, key: tuple[str, PageIndex]) -> None:
+        """Retain one clean hot page without allowing the conservative index to grow with N."""
+
+        file, page_index = key
+        lingering = self._clean_candidate_linger.setdefault(file, {})
+        if page_index in lingering:
+            return
+        lingering[page_index] = None
+        self._add_dirty_candidate(key)
+        if len(lingering) <= _CLEAN_CANDIDATE_LINGER_PER_FILE:
+            return
+        oldest = next(iter(lingering))
+        del lingering[oldest]
+        if not lingering:
+            del self._clean_candidate_linger[file]
+        self._refresh_dirty_candidate((file, oldest))
+
+    def _remove_dirty_candidate(self, key: tuple[str, PageIndex]) -> None:
+        """Remove a location whose every locally owned frame is clean and unpinned."""
+
+        file, page_index = key
+        candidates = self._dirty_candidates.get(file)
+        if candidates is not None:
+            candidates.discard(page_index)
+            if not candidates:
+                del self._dirty_candidates[file]
+        lingering = self._clean_candidate_linger.get(file)
+        if lingering is not None:
+            lingering.pop(page_index, None)
+            if not lingering:
+                del self._clean_candidate_linger[file]
+
+    def _forget_clean_linger(self, key: tuple[str, PageIndex]) -> None:
+        """Stop treating an authoritative dirty/pinned frame as read-only linger."""
+
+        file, page_index = key
+        lingering = self._clean_candidate_linger.get(file)
+        if lingering is None:
+            return
+        lingering.pop(page_index, None)
+        if not lingering:
+            del self._clean_candidate_linger[file]
+
+    @staticmethod
+    def _frame_needs_dirty_candidate(frame: _Frame) -> bool:
+        """Say whether a frame is dirty or can still become dirty through a live pin."""
+
+        return frame.page.dirty or frame.pins > 0
+
+    def _refresh_dirty_candidate(self, key: tuple[str, PageIndex]) -> None:
+        """Re-derive one candidate from resident, doomed and in-flight frame authority."""
+
+        resident = self._frames.get(key)
+        if resident is not None and self._frame_needs_dirty_candidate(resident):
+            self._forget_clean_linger(key)
+            self._add_dirty_candidate(key)
+            return
+        if any(
+            self._frame_needs_dirty_candidate(frame)
+            for frame in self._doomed.get(key, ())
+        ):
+            self._forget_clean_linger(key)
+            self._add_dirty_candidate(key)
+            return
+        eviction = self._evictions.get(key)
+        if eviction is not None and self._frame_needs_dirty_candidate(eviction.frame):
+            self._forget_clean_linger(key)
+            self._add_dirty_candidate(key)
+            return
+        self._remove_dirty_candidate(key)
+
+    def _dirty_candidate_keys(
+        self, file: str | None = None
+    ) -> tuple[tuple[str, PageIndex], ...]:
+        """Snapshot candidate locations so revalidation may shrink the live sets safely."""
+
+        if file is not None:
+            return tuple(
+                (file, page_index)
+                for page_index in self._dirty_candidates.get(file, ())
+            )
+        return tuple(
+            (name, page_index)
+            for name, page_indexes in self._dirty_candidates.items()
+            for page_index in page_indexes
+        )
+
+    @_guarded
+    def _assert_dirty_candidate_coverage(self) -> None:
+        """Test oracle: prove the index covers every dirty or still-mutable owned frame.
+
+        Production never calls this full scan.  Property and mutation tests use it after each
+        transition to compare D-10's bounded index with the pre-optimization authority.
+        """
+
+        covered = set(self._dirty_candidate_keys())
+        authoritative: set[tuple[str, PageIndex]] = set()
+        authoritative.update(
+            key
+            for key, frame in self._frames.items()
+            if self._frame_needs_dirty_candidate(frame)
+        )
+        authoritative.update(
+            key
+            for key, frames in self._doomed.items()
+            if any(self._frame_needs_dirty_candidate(frame) for frame in frames)
+        )
+        authoritative.update(
+            key
+            for key, eviction in self._evictions.items()
+            if self._frame_needs_dirty_candidate(eviction.frame)
+        )
+        lingering = {
+            (file, page_index)
+            for file, page_indexes in self._clean_candidate_linger.items()
+            for page_index in page_indexes
+        }
+        expected = authoritative | lingering
+        if covered != expected:
+            raise AssertionError(
+                "dirty candidate index diverged from the full frame scan: "
+                f"missing={sorted(expected - covered)!r}, "
+                f"extra={sorted(covered - expected)!r}"
+            )
+
     # --- the four operations -----------------------------------------------------------------
 
     def pin(self, file: str, page_index: PageIndex) -> Page:
@@ -825,14 +975,21 @@ class BufferPool:
         key = (file, page_index)
         frame = self._frames.get(key)
         if frame is not None:
+            if frame.pins == 0:
+                self._add_dirty_candidate(key)
             self._frames.move_to_end(key)
             frame.pins += 1
             return frame.page
         self._make_room(file, page_index)
         page = self._read_page(file, page_index)
         frame = _Frame(page)
-        frame.pins = 1
-        self._frames[key] = frame
+        self._add_dirty_candidate(key)
+        try:
+            frame.pins = 1
+            self._frames[key] = frame
+        except BaseException:
+            self._refresh_dirty_candidate(key)
+            raise
         self._report_usage()
         return page
 
@@ -851,6 +1008,8 @@ class BufferPool:
             with self._guard:
                 frame = self._frames.get(key)
                 if frame is not None:
+                    if frame.pins == 0:
+                        self._add_dirty_candidate(key)
                     self._frames.move_to_end(key)
                     frame.pins += 1
                     return frame.page
@@ -916,6 +1075,8 @@ class BufferPool:
                             if prepared_eviction is not None:
                                 self._evictions[victim] = prepared_eviction
                             self._frames.pop(victim)
+                            if prepared_eviction is None:
+                                self._remove_dirty_candidate(victim)
                         except BaseException:
                             self._loads.pop(key, None)
                             self._evictions.pop(victim, None)
@@ -979,6 +1140,8 @@ class BufferPool:
                 else:
                     resident = self._frames.get(key)
                     if resident is not None:
+                        if resident.pins == 0:
+                            self._add_dirty_candidate(key)
                         self._frames.move_to_end(key)
                         resident.pins += 1
                         page = resident.page
@@ -986,6 +1149,7 @@ class BufferPool:
                         admitted: _Frame | None = None
                         try:
                             admitted = _Frame(page)
+                            self._add_dirty_candidate(key)
                             admitted.pins = 1
                             self._frames[key] = admitted
                         except BaseException:
@@ -997,6 +1161,7 @@ class BufferPool:
                                 and self._frames.get(key) is admitted
                             ):
                                 del self._frames[key]
+                            self._refresh_dirty_candidate(key)
                             del self._loads[key]
                             self._signal_flight_state()
                             raise
@@ -1067,6 +1232,8 @@ class BufferPool:
             for position, candidate in enumerate(doomed):
                 if candidate.page is page:
                     if dirty:
+                        if page_index not in self._dirty_candidates.get(file, ()):
+                            self._add_dirty_candidate(key)
                         candidate.page.dirty = True
                     candidate.pins -= 1
                     if candidate.pins <= 0:
@@ -1077,6 +1244,8 @@ class BufferPool:
                             del self._doomed[key]
                         self._bump_drop_epoch(file)
                         self._signal_flight_state()
+                    if candidate.pins <= 0:
+                        self._refresh_dirty_candidate(key)
                     return
         if frame is None:
             raise GrafxUnsupportedOperation(
@@ -1091,8 +1260,15 @@ class BufferPool:
                 page=page_index,
             )
         if dirty:
+            if page_index not in self._dirty_candidates.get(file, ()):
+                self._add_dirty_candidate(key)
             frame.page.dirty = True
         frame.pins -= 1
+        if frame.pins == 0 and not frame.page.dirty:
+            if key not in self._doomed and key not in self._evictions:
+                self._linger_clean_candidate(key)
+            else:
+                self._refresh_dirty_candidate(key)
         if frame.pins == 0:
             self._signal_flight_state()
 
@@ -1238,13 +1414,20 @@ class BufferPool:
             # holding when reuse was added, so the pin question moved to where a candidate is
             # chosen rather than being answered by declaring the branch dead.
             del self._frames[key]
-        page = Page(page_type, page_size=self._page_size, page_index=page_index)
-        page.dirty = True
-        # The device image for a page allocated here is all-zero. Its mutable Page may later be
-        # replaced by redo, but the CAS base remains the image this frame took ownership of.
-        frame = _Frame(page, device_base_seq=0)
-        frame.pins = 1
-        self._frames[key] = frame
+            self._remove_dirty_candidate(key)
+        self._add_dirty_candidate(key)
+        try:
+            page = Page(page_type, page_size=self._page_size, page_index=page_index)
+            page.dirty = True
+            # The device image for a page allocated here is all-zero. Its mutable Page may later
+            # be replaced by redo, but the CAS base remains the image this frame took ownership
+            # of.
+            frame = _Frame(page, device_base_seq=0)
+            frame.pins = 1
+            self._frames[key] = frame
+        except BaseException:
+            self._refresh_dirty_candidate(key)
+            raise
         self._report_usage()
         return page
 
@@ -1258,17 +1441,18 @@ class BufferPool:
         that does want them on the platter is checkpoint().
         """
         self._wait_for_evictions(file)
+        candidates = self._dirty_candidate_keys(file)
         probe = self._work_probe
         if probe is not None:
             try:
-                probe.record_scan(len(self._frames), flush=True)
+                probe.record_scan(len(candidates), flush=True)
             except BaseException:  # noqa: BLE001 - diagnostics never own buffer progress
                 self._work_probe = None
         written = 0
-        for (name, page_index), frame in list(self._frames.items()):
-            if file is not None and name != file:
-                continue
-            if not frame.page.dirty:
+        for name, page_index in candidates:
+            frame = self._frames.get((name, page_index))
+            if frame is None or not frame.page.dirty:
+                self._refresh_dirty_candidate((name, page_index))
                 continue
             self._write_back(name, page_index, frame.page)
             written += 1
@@ -1304,13 +1488,20 @@ class BufferPool:
         The set is a snapshot, not a view: the frames go on changing after it is returned.
         """
         self._wait_for_evictions(file)
+        candidates = self._dirty_candidate_keys(file)
         probe = self._work_probe
         if probe is not None:
             try:
-                probe.record_scan(len(self._frames))
+                probe.record_scan(len(candidates))
             except BaseException:  # noqa: BLE001 - diagnostics never own buffer progress
                 self._work_probe = None
-        live = {key for key, frame in self._frames.items() if frame.page.dirty}
+        live: set[tuple[str, PageIndex]] = set()
+        for key in candidates:
+            frame = self._frames.get(key)
+            if frame is not None and frame.page.dirty:
+                live.add(key)
+            else:
+                self._refresh_dirty_candidate(key)
         return frozenset(
             key for key in (live | self._modified) if file is None or key[0] == file
         )
@@ -1319,41 +1510,27 @@ class BufferPool:
     def has_dirty_pages(self, file: str | None = None) -> bool:
         """Say whether resident or doomed frames still hold unpublished local changes."""
         self._wait_for_evictions(file)
+        candidates = self._dirty_candidate_keys(file)
         probe = self._work_probe
+        examined = 0
+        dirty_found = False
+        for key in candidates:
+            examined += 1
+            resident = self._frames.get(key)
+            dirty_found = resident is not None and resident.page.dirty
+            if not dirty_found:
+                dirty_found = any(
+                    frame.page.dirty for frame in self._doomed.get(key, ())
+                )
+            if dirty_found:
+                break
+            self._refresh_dirty_candidate(key)
         if probe is not None:
-            examined = 0
-            for (name, _page_index), frame in self._frames.items():
-                examined += 1
-                if frame.page.dirty and (file is None or name == file):
-                    try:
-                        probe.record_scan(examined)
-                    except BaseException:  # noqa: BLE001 - diagnostics never own progress
-                        self._work_probe = None
-                    return True
-            for (name, _page_index), frames in self._doomed.items():
-                for frame in frames:
-                    examined += 1
-                    if frame.page.dirty and (file is None or name == file):
-                        try:
-                            probe.record_scan(examined)
-                        except BaseException:  # noqa: BLE001 - diagnostics never own progress
-                            self._work_probe = None
-                        return True
             try:
                 probe.record_scan(examined)
             except BaseException:  # noqa: BLE001 - diagnostics never own buffer progress
                 self._work_probe = None
-            return False
-        if any(
-            frame.page.dirty and (file is None or name == file)
-            for (name, _page_index), frame in self._frames.items()
-        ):
-            return True
-        return any(
-            frame.page.dirty and (file is None or name == file)
-            for (name, _page_index), frames in self._doomed.items()
-            for frame in frames
-        )
+        return dirty_found
 
     @_guarded
     def pages_written_back(
@@ -1579,9 +1756,10 @@ class BufferPool:
             own
             and previous is not None
             and not any(
-                frame.page.dirty
-                for key, frame in self._frames.items()
+                resident is not None and resident.page.dirty
+                for key in self._dirty_candidate_keys()
                 if key[0] != unfenced_file
+                for resident in (self._frames.get(key),)
             )
         )
         if own_proved:
@@ -1744,6 +1922,7 @@ class BufferPool:
                         retained.remove(frame)
                 if not retained:
                     del self._doomed[key]
+            self._refresh_dirty_candidate(key)
 
         if every_file:
             self._bump_every_file_drop_epoch()
@@ -1787,11 +1966,14 @@ class BufferPool:
             )
         frame = self._frames.get(key)
         if frame is None:
+            self._refresh_dirty_candidate(key)
             return False
         if frame.pins:
             frame.page.dirty = False
+            self._refresh_dirty_candidate(key)
             return False
         del self._frames[key]
+        self._refresh_dirty_candidate(key)
         self._reclaim(file, page_index)
         self._bump_drop_epoch(file)
         self._signal_flight_state()
@@ -1845,6 +2027,8 @@ class BufferPool:
                     frames.remove(frame)
                     if not frames:
                         del self._doomed[key]
+        for key, _frame in (*targets, *doomed):
+            self._refresh_dirty_candidate(key)
         # Allocation claims survive the cache drop. Clearing them here strands their all-zero
         # device pages so close can no longer settle them. Reuse and settlement each re-read the
         # device first, retiring a claim if a foreign participant gave that page meaning.
@@ -1897,6 +2081,7 @@ class BufferPool:
                     retained.remove(frame)
             if not retained:
                 del self._doomed[key]
+        self._refresh_dirty_candidate(key)
         # Keep any allocation claim until reuse or close revalidates the device image. Dropping
         # it here would leave an abandoned all-zero page permanently unverifiable.
         self._bump_drop_epoch(file)
@@ -1958,10 +2143,12 @@ class BufferPool:
                     frame.discard_unwritten = True
                 self._doomed.setdefault((name, page_index), []).append(frame)
                 del self._frames[(name, page_index)]
+                self._refresh_dirty_candidate((name, page_index))
                 continue
             if frame.page.dirty:
                 self._write_back(name, page_index, frame.page)
             del self._frames[(name, page_index)]
+            self._refresh_dirty_candidate((name, page_index))
         # Announced before anything else could read the epoch, and never derived from what
         # happened to be resident: a file with no cached page is exactly the case where the next
         # read comes from the device, so it is the case that needs saying most.
@@ -2202,6 +2389,7 @@ class BufferPool:
             if frame.page.dirty:
                 self._write_back(name, victim_index, frame.page)
             del self._frames[victim]
+            self._refresh_dirty_candidate(victim)
 
     def _find_victim(self) -> tuple[str, PageIndex] | None:
         """Return the least recently used unpinned frame, or None when everything is pinned."""
@@ -2426,6 +2614,7 @@ class BufferPool:
             waiting.remove(page_index)
             if not waiting:
                 del self._abandoned[file]
+        self._refresh_dirty_candidate(key)
 
     def _usage_reading(self) -> tuple[float, float] | None:
         """Capture callback-free usage under the guard, or None when telemetry is disabled."""

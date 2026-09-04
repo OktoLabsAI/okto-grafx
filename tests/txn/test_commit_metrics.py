@@ -28,8 +28,14 @@ from okto_grafx.engine.txn_manager import (
 )
 from okto_grafx.domain.errors import GrafxLeaseTimeout
 from okto_grafx.domain.ids import RecordRef
-from okto_grafx.domain.index.definition import IndexDefinition
+from okto_grafx.domain.index.catalog import (
+    CatalogIndexDefinition,
+    IndexGenerationDescriptor,
+    IndexGenerationState,
+)
 from okto_grafx.domain.index.visibility import IndexVisibility
+from okto_grafx.domain.model.schema import ColumnDef, TableDef
+from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.txn import WalRecord, WalRecordType
 from okto_grafx.domain.wal.commit import CommitPayload
 from okto_grafx.engine.buffer_pool import BufferPool, _BufferWorkProbe
@@ -808,24 +814,38 @@ def test_foreign_commit_completion_is_counted_once(
     assert observed_phases[0] == "other"
 
 
-def test_real_index_commit_reports_the_actual_buffer_scans(
+def test_real_index_commit_reports_the_actual_dirty_candidate_scans(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     metrics = RecordingMetricsSink()
     stack = build_stack(tmp_path, metrics=metrics, clock=StepClock())
     indexes = IndexManager(stack.pool, stack.heap, metrics)
-    index = indexes.register(
-        HashIndex(
-            IndexDefinition(
-                name="by_name",
-                table_id=1,
-                table_name="person",
-                positions=(0,),
-                visibility=IndexVisibility.EXACT,
-            ),
-            stack.pool,
-            metrics,
+    generation = IndexGenerationDescriptor(
+        artifact_nonce=0xD10,
+        bucket_count=64,
+        state=IndexGenerationState.ACTIVE,
+    )
+    stack.catalog.catalog.add_table(
+        TableDef(
+            table_id=1,
+            name="person",
+            kind="node",
+            columns=(ColumnDef("value", ValueType.STRING, False),),
         )
+    )
+    logical = CatalogIndexDefinition(
+        name="by_name",
+        table_id=1,
+        table_name="person",
+        positions=(0,),
+        visibility=IndexVisibility.EXACT,
+        generations=(generation,),
+    )
+    stack.catalog.catalog.upgrade_index_catalog((logical,))
+    stack.catalog.save()
+    stack.pool.flush(stack.catalog.file)
+    index = indexes.register(
+        HashIndex(logical.runtime_definition(generation), stack.pool, metrics)
     )
     manager = TransactionManager(
         stack.wal,
@@ -843,23 +863,25 @@ def test_real_index_commit_reports_the_actual_buffer_scans(
     index.stage_insert(txn, b"ada", RecordRef(page=3, slot=1), 0)
 
     actual_flushes = 0
-    actual_frames = 0
+    actual_candidates = 0
     original_flush = BufferPool.flush
     original_modified = BufferPool.modified_pages
 
     def count_flush(pool: BufferPool, file: str | None = None) -> int:
-        nonlocal actual_flushes, actual_frames
+        nonlocal actual_flushes, actual_candidates
         if pool is stack.pool:
             actual_flushes += 1
-            actual_frames += pool.used_bytes() // pool.page_size
+            actual_candidates += len(pool._dirty_candidate_keys(file))  # noqa: SLF001
         return original_flush(pool, file)
 
     def count_modified(
         pool: BufferPool, file: str | None = None
     ) -> frozenset[tuple[str, int]]:
-        nonlocal actual_frames
+        nonlocal actual_candidates
         if pool is stack.pool:
-            actual_frames += pool.used_bytes() // pool.page_size
+            actual_candidates += len(  # noqa: SLF001
+                pool._dirty_candidate_keys(file)  # noqa: SLF001
+            )
         return original_modified(pool, file)
 
     monkeypatch.setattr(BufferPool, "flush", count_flush)
@@ -869,7 +891,7 @@ def test_real_index_commit_reports_the_actual_buffer_scans(
 
     assert actual_flushes == 3
     assert metrics.total(COMMIT_FLUSHES_TOTAL) == float(actual_flushes)
-    assert metrics.total(COMMIT_FRAMES_EXAMINED_TOTAL) == float(actual_frames)
+    assert metrics.total(COMMIT_FRAMES_EXAMINED_TOTAL) == float(actual_candidates)
 
 
 def test_dirty_page_probe_counts_early_exit_and_retired_pinned_frames(
@@ -884,25 +906,12 @@ def test_dirty_page_probe_counts_early_exit_and_retired_pinned_frames(
     try:
         held.dirty = True
         before_match = probe.frames_examined
-        expected_match = len(stack.pool._frames)  # noqa: SLF001 - exact scan oracle
-        found = False
-        for frames in stack.pool._doomed.values():  # noqa: SLF001 - exact scan oracle
-            for frame in frames:
-                expected_match += 1
-                if frame.page is held:
-                    found = True
-                    break
-            if found:
-                break
-        assert found
+        expected_match = 1
         assert stack.pool.has_dirty_pages(HEAP)
         assert probe.frames_examined - before_match == expected_match
 
         before_miss = probe.frames_examined
-        expected_miss = len(stack.pool._frames) + sum(  # noqa: SLF001
-            len(frames)
-            for frames in stack.pool._doomed.values()  # noqa: SLF001
-        )
+        expected_miss = 0
         assert not stack.pool.has_dirty_pages("another.dat")
         assert probe.frames_examined - before_miss == expected_miss
     finally:
