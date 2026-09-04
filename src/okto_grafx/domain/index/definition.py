@@ -16,8 +16,10 @@ answers.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import cast
 
 from okto_grafx.domain.errors import GrafxIndexError
 from okto_grafx.domain.index.keys import (
@@ -407,17 +409,23 @@ class IndexDefinition:
         ).digest()
 
 
-def automatic_index_definitions(table: TableDef) -> tuple[IndexDefinition, ...]:
-    """Return the exact automatic definitions this table's committed schema declares.
+def _automatic_index_projection(
+    table: TableDef,
+) -> tuple[tuple[IndexDefinition, ...], Mapping[str, IndexDefinition]]:
+    """Normalize one immutable table instance without retaining catalog authority.
 
-    Concurrent speculative catalogs may reuse both a numeric id and a table name.  Positions,
-    visibility and key derivation are therefore part of provenance too; returning value objects
-    here lets planning, DML staging, public inventory and verification share that complete test.
-    Each accelerator is optional independently: an inexpressible derived name may decline that
-    one path, but can never hide a valid sibling or make the committed table unusable.
+    DDL validation asks the same question repeatedly while a transaction grows its speculative
+    catalog.  ``TableDef`` is an immutable value and automatic definitions depend only on that
+    complete value, never on a catalog generation, registered store or physical nonce.  The
+    immutable derived projection can therefore live with that table instance without carrying
+    authority across DDL replacements, commits or processes.
     """
-    if not isinstance(table, TableDef):
-        return ()
+    cached = table._automatic_index_projection
+    if cached is not None:
+        return cast(
+            tuple[tuple[IndexDefinition, ...], Mapping[str, IndexDefinition]], cached
+        )
+
     definitions: list[IndexDefinition] = []
     if table.kind == "rel":
         candidates = (
@@ -468,7 +476,29 @@ def automatic_index_definitions(table: TableDef) -> tuple[IndexDefinition, ...]:
             )
         except GrafxIndexError:
             continue
-    return tuple(definitions)
+    normalized = tuple(definitions)
+    projection: tuple[tuple[IndexDefinition, ...], Mapping[str, IndexDefinition]] = (
+        normalized,
+        MappingProxyType(
+            {definition.registry_key: definition for definition in normalized}
+        ),
+    )
+    object.__setattr__(table, "_automatic_index_projection", projection)
+    return projection
+
+
+def automatic_index_definitions(table: TableDef) -> tuple[IndexDefinition, ...]:
+    """Return the exact automatic definitions this table's committed schema declares.
+
+    Concurrent speculative catalogs may reuse both a numeric id and a table name.  Positions,
+    visibility and key derivation are therefore part of provenance too; returning value objects
+    here lets planning, DML staging, public inventory and verification share that complete test.
+    Each accelerator is optional independently: an inexpressible derived name may decline that
+    one path, but can never hide a valid sibling or make the committed table unusable.
+    """
+    if not isinstance(table, TableDef):
+        return ()
+    return _automatic_index_projection(table)[0]
 
 
 def index_definition_matches_table(
@@ -482,10 +512,7 @@ def index_definition_matches_table(
         or definition.table_name != table.name
     ):
         return False
-    automatic = {
-        candidate.registry_key: candidate
-        for candidate in automatic_index_definitions(table)
-    }
+    automatic = _automatic_index_projection(table)[1]
     expected = automatic.get(definition.registry_key)
     if expected is not None:
         # Bucket count and artifact nonce describe one physical generation, not the logical

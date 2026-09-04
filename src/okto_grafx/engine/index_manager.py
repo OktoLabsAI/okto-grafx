@@ -55,6 +55,7 @@ import hashlib
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from typing import NamedTuple, TypeVar
 
 from okto_grafx.domain.errors import (
@@ -175,6 +176,9 @@ INDEX_READ_RETRY_BUDGET: int = 2
 
 _DETACHED_GENERATION_NONCE_ATTEMPTS: int = 64
 """Bounded provider draws used to find one unowned physical-generation name."""
+
+_DEFINITION_MATCH_MEMO_LIMIT: int = 1024
+"""Per-manager ceiling for immutable schema-provenance comparisons."""
 
 TOMBSTONE_BACKLOG: str = "oktografx_vector_tombstone_backlog"
 RECONCILIATION_TOTAL: str = "oktografx_vector_reconciliation_total"
@@ -3498,6 +3502,7 @@ class IndexManager:
         "_detached_speculative_indexes",
         "_schema_observed",
         "_schema_new_table_observed",
+        "_definition_match",
     )
 
     def __init__(
@@ -3527,6 +3532,14 @@ class IndexManager:
         self._detached_speculative_indexes: set[IndexStore] = set()
         self._schema_observed: dict[int, dict[IndexStore, int]] = {}
         self._schema_new_table_observed: dict[int, set[IndexStore]] = {}
+        # This is schema normalization, not index authority.  The complete immutable physical
+        # definition (including generation nonce/bucket count) and complete immutable TableDef
+        # form the key, so DDL or rehash cannot inherit a prior answer.  The manager lifetime and
+        # finite ceiling avoid process-global retention while a large schema transaction asks the
+        # same comparison quadratically often.
+        self._definition_match = lru_cache(
+            maxsize=_DEFINITION_MATCH_MEMO_LIMIT, typed=True
+        )(index_definition_matches_table)
 
     # --- registry ---------------------------------------------------------------------------
 
@@ -4405,6 +4418,8 @@ class IndexManager:
         ) or definition.table_name != getattr(table, "name", None):
             return False
         try:
+            if isinstance(table, TableDef):
+                return self._definition_match(definition, table)
             return index_definition_matches_table(  # type: ignore[arg-type]
                 definition, table
             )

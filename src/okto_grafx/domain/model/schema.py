@@ -172,7 +172,8 @@ class ColumnDef:
 class _TableDefColumnCache:
     """Reserve non-domain slots for immutable, derived column plans."""
 
-    __slots__ = ("_column_positions", "_decode_plan")
+    __slots__ = ("_automatic_index_projection", "_column_positions", "_decode_plan")
+    _automatic_index_projection: object | None
     _column_positions: Mapping[str, int]
     _decode_plan: tuple[tuple[int, ValueType, bool, ColumnDef], ...]
 
@@ -203,6 +204,7 @@ class TableDef(_TableDefColumnCache):
         It is idempotent, so a table read back out of the catalog -- which already carries the
         columns -- comes back unchanged.
         """
+        object.__setattr__(self, "_automatic_index_projection", None)
         if self.kind == "rel" and isinstance(self.columns, tuple):
             object.__setattr__(self, "columns", relationship_columns(self.columns))
         if isinstance(self.table_id, bool) or not isinstance(self.table_id, int):

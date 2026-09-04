@@ -81,3 +81,53 @@ def test_rehashed_automatic_exact_definition_keeps_logical_schema_provenance(
     generation = replace(canonical, bucket_count=256, artifact_nonce=91)
 
     assert index_definition_matches_table(generation, database.table)
+
+
+def test_automatic_definition_normalization_is_bounded_to_the_table_value(
+    database: Database,
+) -> None:
+    original = automatic_index_definitions(database.table)
+    repeated = automatic_index_definitions(database.table)
+
+    changed = replace(database.table, primary_key="name")
+    changed_definitions = automatic_index_definitions(changed)
+
+    assert repeated is original
+    assert changed_definitions is not original
+    assert original[0].positions == (0,)
+    assert changed_definitions[0].positions == (1,)
+    assert not index_definition_matches_table(original[0], changed)
+    assert index_definition_matches_table(exact_definition(database.table), database.table)
+
+
+def test_manager_definition_match_memo_does_not_cross_ddl_or_generation(
+    database: Database,
+) -> None:
+    canonical = automatic_index_definitions(database.table)[0]
+
+    assert database.manager._definition_matches_table_tolerantly(
+        canonical, database.table
+    )
+    assert database.manager._definition_matches_table_tolerantly(
+        canonical, database.table
+    )
+    after_repeat = database.manager._definition_match.cache_info()
+    assert after_repeat.hits == 1
+    assert after_repeat.misses == 1
+    assert after_repeat.maxsize == 1024
+
+    generation = replace(canonical, bucket_count=256, artifact_nonce=91)
+    assert database.manager._definition_matches_table_tolerantly(
+        generation, database.table
+    )
+    assert database.manager._definition_match.cache_info().misses == 2
+
+    changed = replace(database.table, primary_key="name")
+    assert not database.manager._definition_matches_table_tolerantly(generation, changed)
+    assert database.manager._definition_match.cache_info().misses == 3
+
+    custom = exact_definition(database.table)
+    assert database.manager._definition_matches_table_tolerantly(
+        custom, database.table
+    )
+    assert database.manager._definition_match.cache_info().misses == 4
