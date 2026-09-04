@@ -114,7 +114,7 @@ from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FORMAT_VERSION, Comm
 from okto_grafx.domain.txn.records import decode_page_write_location
 from okto_grafx.domain.wal.record import WalRecordType
 from okto_grafx.engine.buffer_pool import BufferPool
-from okto_grafx.engine.commit_redo import CommitRedo, is_redoable_page_file
+from okto_grafx.engine.commit_redo import CommitRedo
 from okto_grafx.engine.commit_state_store import CommitStateStore
 from okto_grafx.engine.coordination import COMMIT_SECTION
 from okto_grafx.engine.ledger_store import LedgerStore
@@ -713,7 +713,9 @@ class RecoveryManager:
         # a conservative stale bit into an index header. A bad effect late in the committed plan
         # must not leave either an applied page prefix or unrelated control/index publication
         # behind merely because static validation used to live inside the later redo step.
-        self._preflight_committed_replay(replay)
+        preflighted, preflight_touched_catalog = self._preflight_committed_replay(
+            replay, permit
+        )
         if manager is not None and not state_was_damaged:
             # The checkpoint is the replay floor. An index already behind it cannot be completed
             # from the retained WAL suffix and must be marked stale BEFORE replay; otherwise the
@@ -763,6 +765,8 @@ class RecoveryManager:
             state=state,
             state_was_damaged=state_was_damaged,
             permit=permit,
+            preflighted=preflighted,
+            preflight_touched_catalog=preflight_touched_catalog,
         )
         self._count_outcome(outcome)
         report = RecoveryReport(
@@ -1354,7 +1358,9 @@ class RecoveryManager:
                 deferred_segments=tuple(report.deferred_segments),
             )
 
-    def _preflight_committed_replay(self, replay: CommittedReplay) -> None:
+    def _preflight_committed_replay(
+        self, replay: CommittedReplay, permit: _RecoveryPermit
+    ) -> tuple[object, bool]:
         """Validate every committed effect before recovery performs its first mutation.
 
         Startup intentionally delays catalog interpretation until recovery owns the commit
@@ -1363,6 +1369,7 @@ class RecoveryManager:
         names introduced by those pages are deferred; payload/image validation still runs now,
         and the index-only subplan is preflighted strictly after adoption inside :meth:`_redo`.
         """
+        self._require_permit(permit)
         touched_catalog = any(
             decode_page_write_location(record.payload).file == _CATALOG_FILE
             for record in replay.effects
@@ -1370,10 +1377,12 @@ class RecoveryManager:
         )
         if not touched_catalog and self._index_sync is not None:
             self._index_sync()
-        self._redo_engine.preflight(
+        proof = self._redo_engine.preflight(
             replay,
             allow_unregistered_indexes=touched_catalog,
+            _passage=permit,
         )
+        return proof, touched_catalog
 
     def _redo(
         self,
@@ -1384,6 +1393,8 @@ class RecoveryManager:
         state: CommitState,
         state_was_damaged: bool,
         permit: _RecoveryPermit,
+        preflighted: object | None = None,
+        preflight_touched_catalog: bool | None = None,
     ) -> int:
         """Complete committed WAL work and publish it as one fail-closed unit.
 
@@ -1407,29 +1418,11 @@ class RecoveryManager:
             if record.record_type
             in (int(WalRecordType.INDEX_WRITE), int(WalRecordType.INDEX_RECONCILE))
         )
-        touched_catalog = False
-        for record in page_records:
-            write = decode_page_write_location(record.payload)
-            if not is_redoable_page_file(write.file):
-                findings.append(
-                    RecoveryFinding(
-                        kind=FindingKind.REDO_REFUSED,
-                        detail=(
-                            f"Record {record.lsn} names {write.file!r}, which is not a paged "
-                            "file of this database; commit completion was refused."
-                        ),
-                        file=write.file,
-                        lsn=record.lsn,
-                    )
-                )
-                raise GrafxRecoveryRefused(
-                    f"Committed page record {record.lsn} names non-data file "
-                    f"{write.file!r}; commit-state publication was refused.",
-                    field="file",
-                    file=write.file,
-                    lsn=record.lsn,
-                )
-            touched_catalog = touched_catalog or write.file == _CATALOG_FILE
+        if preflight_touched_catalog is None:
+            preflight_touched_catalog = any(
+                decode_page_write_location(record.payload).file == _CATALOG_FILE
+                for record in page_records
+            )
 
         page_replay = CommittedReplay(
             effects=page_records, last_committed_lsn=replay.last_committed_lsn
@@ -1438,7 +1431,7 @@ class RecoveryManager:
             effects=index_records, last_committed_lsn=replay.last_committed_lsn
         )
         manager = self._index_manager
-        if not touched_catalog and self._index_sync is not None:
+        if not preflight_touched_catalog and self._index_sync is not None:
             # Startup deliberately postpones interpreting catalog bytes until recovery owns the
             # commit section. When this WAL range does not replace catalog pages, the existing
             # catalog is already the authority, so adopt its existing indexes now. This turns
@@ -1448,10 +1441,25 @@ class RecoveryManager:
         # changes. A catalog effect may be the authority that introduces an index to this
         # participant, so only that registry lookup is deferred; after catalog adoption the
         # index-only apply below performs its ordinary strict preflight before dispatch.
-        self._redo_engine.preflight(
+        full_preflight = self._redo_engine._ensure_preflight(
             replay,
-            allow_unregistered_indexes=touched_catalog,
+            preflighted,
+            allow_unregistered_indexes=preflight_touched_catalog,
+            passage=permit,
         )
+        touched_catalog = preflight_touched_catalog
+        page_preflight = self._redo_engine._project_page_preflight(
+            replay,
+            page_replay,
+            full_preflight,
+            allow_unregistered_indexes=touched_catalog,
+            passage=permit,
+        )
+        if page_preflight is None:
+            raise GrafxRecoveryRefused(
+                "The recovery page subplan no longer matches its complete preflight.",
+                field="preflighted_replay",
+            )
         target = max(state.last_committed_lsn, replay.last_committed_lsn)
         # The scan proves that the bytes form complete records; it does not prove that the process
         # which appended them forced them to stable storage. Recovery must establish that proof
@@ -1461,7 +1469,11 @@ class RecoveryManager:
         if target > state.checkpoint_lsn:
             first = NO_LSN + 1 if state_was_damaged else state.checkpoint_lsn + 1
             self._wal.force_barrier_range(first, target)
-        page_result = self._redo_engine.apply(page_replay)
+        page_result = self._redo_engine.apply(
+            page_replay,
+            _preflighted=page_preflight,
+            _passage=permit,
+        )
         if touched_catalog:
             self._adopt_catalog(findings)
         if touched_catalog and self._index_sync is not None:

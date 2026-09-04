@@ -76,6 +76,27 @@ class _PreparedPageEffect:
     page_lsn: Lsn
 
 
+@dataclass(frozen=True, slots=True)
+class _PreflightedReplay:
+    """One internal, passage-bound proof of an exact immutable replay shape."""
+
+    seal: object
+    owner: object
+    passage: object
+    replay: CommittedReplay
+    effects: tuple[WalRecord, ...]
+    incomplete_effects: tuple[WalRecord, ...]
+    last_committed_lsn: Lsn
+    allow_unregistered_indexes: bool
+    allow_page_coalescing: bool
+    record_signature: tuple[tuple[object, ...], ...]
+    signature_verified: bool
+    prepared_pages: tuple[tuple[int, _PreparedPageEffect], ...]
+
+
+_PREFLIGHT_SEAL: object = object()
+
+
 class CommitRedo:
     """Replay committed page and logical-index effects through their idempotent doors."""
 
@@ -92,7 +113,13 @@ class CommitRedo:
         """Select committed effects from WAL-order ``records`` and apply them without flushing."""
         return self.apply(committed_replay(records))
 
-    def apply(self, replay: CommittedReplay) -> CommitRedoResult:
+    def apply(
+        self,
+        replay: CommittedReplay,
+        *,
+        _preflighted: object | None = None,
+        _passage: object | None = None,
+    ) -> CommitRedoResult:
         """Apply ``replay.effects`` in order, leaving durability publication to the caller.
 
         The shape is checked before the first effect is applied.  A logical record with no index
@@ -107,10 +134,19 @@ class CommitRedo:
                 field="replay",
                 value=type(replay).__name__,
             )
-        prepared_pages = self._preflight(
-            replay.effects,
+        proof = self._compatible_preflight(
+            replay,
+            _preflighted,
             allow_unregistered_indexes=False,
+            passage=_passage,
         )
+        if proof is not None:
+            prepared_pages = proof.prepared_pages
+        else:
+            prepared_pages, _signature = self._preflight(
+                replay.effects,
+                allow_unregistered_indexes=False,
+            )
 
         pages_applied = 0
         index_effects = 0
@@ -124,9 +160,13 @@ class CommitRedo:
                 touched_set.add(file)
                 touched.append(file)
 
+        page_only = len(prepared_pages) == len(replay.effects)
+        may_coalesce = (
+            proof.allow_page_coalescing if proof is not None else page_only
+        )
         page_plan = (
             self._coalesce_page_plan(prepared_pages)
-            if len(prepared_pages) == len(replay.effects)
+            if page_only and may_coalesce
             else None
         )
         prepared_by_position = {
@@ -198,7 +238,8 @@ class CommitRedo:
         replay: CommittedReplay,
         *,
         allow_unregistered_indexes: bool = False,
-    ) -> None:
+        _passage: object | None = None,
+    ) -> object:
         """Validate a complete dispatch plan without applying any of its effects.
 
         ``allow_unregistered_indexes`` is the narrow catalog-replay dependency: a long-lived
@@ -219,9 +260,169 @@ class CommitRedo:
                 field="allow_unregistered_indexes",
                 value=type(allow_unregistered_indexes).__name__,
             )
-        self._preflight(
+        prepared_pages, signature = self._preflight(
             replay.effects,
             allow_unregistered_indexes=allow_unregistered_indexes,
+        )
+        return _PreflightedReplay(
+            seal=_PREFLIGHT_SEAL,
+            owner=self,
+            passage=_passage,
+            replay=replay,
+            effects=replay.effects,
+            incomplete_effects=replay.incomplete_effects,
+            last_committed_lsn=replay.last_committed_lsn,
+            allow_unregistered_indexes=allow_unregistered_indexes,
+            allow_page_coalescing=len(prepared_pages) == len(replay.effects),
+            record_signature=signature,
+            signature_verified=False,
+            prepared_pages=prepared_pages,
+        )
+
+    def _ensure_preflight(
+        self,
+        replay: CommittedReplay,
+        preflighted: object | None,
+        *,
+        allow_unregistered_indexes: bool,
+        passage: object,
+    ) -> object:
+        """Return a compatible proof, performing the full preflight when necessary."""
+        compatible = self._compatible_preflight(
+            replay,
+            preflighted,
+            allow_unregistered_indexes=allow_unregistered_indexes,
+            passage=passage,
+        )
+        if compatible is not None:
+            return self._verified_preflight(compatible)
+        fresh = self.preflight(
+            replay,
+            allow_unregistered_indexes=allow_unregistered_indexes,
+            _passage=passage,
+        )
+        assert isinstance(fresh, _PreflightedReplay)
+        return self._verified_preflight(fresh)
+
+    def _project_page_preflight(
+        self,
+        source_replay: CommittedReplay,
+        page_replay: CommittedReplay,
+        preflighted: object,
+        *,
+        allow_unregistered_indexes: bool,
+        passage: object,
+    ) -> object | None:
+        """Project a valid full proof onto its exact all-page subplan without decoding again."""
+        source = self._compatible_preflight(
+            source_replay,
+            preflighted,
+            allow_unregistered_indexes=allow_unregistered_indexes,
+            passage=passage,
+        )
+        if source is None:
+            return None
+        if (
+            page_replay.last_committed_lsn != source_replay.last_committed_lsn
+            or page_replay.incomplete_effects
+            or len(page_replay.effects) != len(source.prepared_pages)
+        ):
+            return None
+        projected: list[tuple[int, _PreparedPageEffect]] = []
+        for position, actual in enumerate(page_replay.effects):
+            prepared = source.prepared_pages[position][1]
+            if actual is not prepared.record:
+                return None
+            projected.append((position, prepared))
+        prepared_pages = tuple(projected)
+        return _PreflightedReplay(
+            seal=_PREFLIGHT_SEAL,
+            owner=self,
+            passage=passage,
+            replay=page_replay,
+            effects=page_replay.effects,
+            incomplete_effects=page_replay.incomplete_effects,
+            last_committed_lsn=page_replay.last_committed_lsn,
+            allow_unregistered_indexes=False,
+            allow_page_coalescing=source.allow_page_coalescing,
+            record_signature=tuple(
+                source.record_signature[source_position]
+                for source_position, _prepared in source.prepared_pages
+            ),
+            signature_verified=True,
+            prepared_pages=prepared_pages,
+        )
+
+    def _compatible_preflight(
+        self,
+        replay: CommittedReplay,
+        preflighted: object | None,
+        *,
+        allow_unregistered_indexes: bool,
+        passage: object | None,
+    ) -> _PreflightedReplay | None:
+        """Return a genuine exact proof or None so the caller revalidates normally."""
+        if (
+            not isinstance(replay, CommittedReplay)
+            or passage is None
+            or not isinstance(preflighted, _PreflightedReplay)
+            or preflighted.seal is not _PREFLIGHT_SEAL
+            or preflighted.owner is not self
+            or preflighted.passage is not passage
+            or preflighted.allow_unregistered_indexes
+            is not allow_unregistered_indexes
+            or preflighted.replay is not replay
+            or preflighted.effects is not replay.effects
+            or preflighted.incomplete_effects is not replay.incomplete_effects
+            or preflighted.last_committed_lsn != replay.last_committed_lsn
+        ):
+            return None
+        if (
+            not preflighted.signature_verified
+            and preflighted.record_signature != self._record_signature(replay.effects)
+        ):
+            return None
+        return preflighted
+
+    @staticmethod
+    def _verified_preflight(proof: _PreflightedReplay) -> _PreflightedReplay:
+        """Mark a just-compared or just-created proof trusted inside its private passage."""
+        if proof.signature_verified:
+            return proof
+        return _PreflightedReplay(
+            seal=proof.seal,
+            owner=proof.owner,
+            passage=proof.passage,
+            replay=proof.replay,
+            effects=proof.effects,
+            incomplete_effects=proof.incomplete_effects,
+            last_committed_lsn=proof.last_committed_lsn,
+            allow_unregistered_indexes=proof.allow_unregistered_indexes,
+            allow_page_coalescing=proof.allow_page_coalescing,
+            record_signature=proof.record_signature,
+            signature_verified=True,
+            prepared_pages=proof.prepared_pages,
+        )
+
+    @staticmethod
+    def _record_signature(
+        effects: tuple[WalRecord, ...],
+    ) -> tuple[tuple[object, ...], ...]:
+        """Snapshot immutable payload identity and every dispatch-relevant scalar field."""
+        return tuple(
+            (
+                id(record),
+                record.record_type,
+                id(record.payload),
+                len(record.payload),
+                record.descriptor,
+                record.lsn,
+                record.epoch,
+                record.txn_id,
+                record.flags,
+                record.format_version,
+            )
+            for record in effects
         )
 
     def flush(self, result: CommitRedoResult) -> int:
@@ -245,11 +446,15 @@ class CommitRedo:
         effects: tuple[WalRecord, ...],
         *,
         allow_unregistered_indexes: bool,
-    ) -> tuple[tuple[int, _PreparedPageEffect], ...]:
+    ) -> tuple[
+        tuple[tuple[int, _PreparedPageEffect], ...],
+        tuple[tuple[object, ...], ...],
+    ]:
         """Refuse an incomplete or malformed dispatch plan before the first mutation."""
         missing_manager_lsn: Lsn | None = None
         simulated_page_counts: dict[str, int] = {}
         prepared_pages: list[tuple[int, _PreparedPageEffect]] = []
+        signature: list[tuple[object, ...]] = []
         for position, record in enumerate(effects):
             if not isinstance(record, WalRecord):
                 raise GrafxRecoveryRefused(
@@ -258,6 +463,20 @@ class CommitRedo:
                     field="effects",
                     value=type(record).__name__,
                 )
+            signature.append(
+                (
+                    id(record),
+                    record.record_type,
+                    id(record.payload),
+                    len(record.payload),
+                    record.descriptor,
+                    record.lsn,
+                    record.epoch,
+                    record.txn_id,
+                    record.flags,
+                    record.format_version,
+                )
+            )
             if record.record_type not in _EFFECT_TYPES:
                 raise GrafxRecoveryRefused(
                     f"Record {record.lsn} has type {record.record_type}, which is not a durable "
@@ -378,7 +597,7 @@ class CommitRedo:
                 field="index_manager",
                 lsn=missing_manager_lsn,
             )
-        return tuple(prepared_pages)
+        return tuple(prepared_pages), tuple(signature)
 
     @staticmethod
     def _coalesce_page_plan(

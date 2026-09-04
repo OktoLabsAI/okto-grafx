@@ -3910,11 +3910,29 @@ class TransactionManager:
             == self._file_ids.catalog_file
             for record in page_records
         )
-        self._commit_redo.preflight(
+        redo_passage = object()
+        full_preflight = self._commit_redo.preflight(
             replay,
             allow_unregistered_indexes=touched_catalog,
+            _passage=redo_passage,
         )
-        page_result = self._commit_redo.apply(page_replay)
+        page_preflight = self._commit_redo._project_page_preflight(
+            replay,
+            page_replay,
+            full_preflight,
+            allow_unregistered_indexes=touched_catalog,
+            passage=redo_passage,
+        )
+        if page_preflight is None:
+            raise GrafxRecoveryRefused(
+                "The checkpoint page subplan no longer matches its complete preflight.",
+                field="preflighted_replay",
+            )
+        page_result = self._commit_redo.apply(
+            page_replay,
+            _preflighted=page_preflight,
+            _passage=redo_passage,
+        )
         if touched_catalog:
             self._catalog.adopt(self._catalog.read_from_pages())
         if self._index_sync is not None:

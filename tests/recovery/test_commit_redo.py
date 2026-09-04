@@ -65,7 +65,11 @@ class _PoolDouble:
 class _CodecDouble:
     """Recognise the one synthetic page image used by the dispatcher-order tests."""
 
+    def __init__(self) -> None:
+        self.decode_calls = 0
+
     def decode_page(self, image: bytes, *, verify: bool = True) -> Page:
+        self.decode_calls += 1
         assert verify is True
         if image != b"page-image":
             raise GrafxCorruptionDetected(
@@ -549,6 +553,101 @@ def test_page_only_redo_coalesces_repeated_locations_at_their_first_position(
     assert report.page_effects_replayed == 3
     assert report.page_images_applied == 2
     assert report.touched_files == ("heap.dat",)
+
+
+def test_a_passage_bound_preflight_reuses_the_prepared_page_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _PoolDouble()
+    redo = CommitRedo(pool)  # type: ignore[arg-type]
+    replay = CommittedReplay(effects=(_page_record(),), last_committed_lsn=1)
+    passage = object()
+    proof = redo.preflight(replay, _passage=passage)
+    calls: list[int] = []
+    monkeypatch.setattr(
+        commit_redo_module,
+        "apply_page_image",
+        lambda _pool, _file, page, _image: calls.append(page) or True,
+    )
+
+    result = redo.apply(replay, _preflighted=proof, _passage=passage)
+
+    assert pool.codec.decode_calls == 1
+    assert calls == [0]
+    assert result.page_images_applied == 1
+
+
+@pytest.mark.parametrize(
+    "mismatch", ["replay", "passage", "mode", "forged", "mutated"]
+)
+def test_an_incompatible_or_forged_preflight_revalidates_normally(
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    pool = _PoolDouble()
+    redo = CommitRedo(pool)  # type: ignore[arg-type]
+    first = CommittedReplay(effects=(_page_record(1),), last_committed_lsn=1)
+    second = CommittedReplay(effects=(_page_record(2),), last_committed_lsn=2)
+    passage = object()
+    proof = redo.preflight(
+        first,
+        allow_unregistered_indexes=mismatch == "mode",
+        _passage=passage,
+    )
+    monkeypatch.setattr(commit_redo_module, "apply_page_image", lambda *_args: True)
+    replay = second if mismatch == "replay" else first
+    offered_passage = object() if mismatch == "passage" else passage
+    offered_proof = object() if mismatch == "forged" else proof
+    if mismatch == "mutated":
+        object.__setattr__(
+            first.effects[0],
+            "payload",
+            encode_page_write("heap.dat", 0, bytes(bytearray(b"page-image"))),
+        )
+
+    redo.apply(
+        replay,
+        _preflighted=offered_proof,
+        _passage=offered_passage,
+    )
+
+    assert pool.codec.decode_calls == 2
+
+
+def test_a_page_projection_from_a_mixed_replay_preserves_sequential_application(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _PoolDouble()
+    manager = _IndexManagerDouble([])
+    redo = CommitRedo(pool, manager)  # type: ignore[arg-type]
+    first = _page_record(1)
+    final = _page_record(3)
+    mixed = CommittedReplay(
+        effects=(first, _index_record(IndexOperation.INSERT, 2), final),
+        last_committed_lsn=3,
+    )
+    pages = CommittedReplay(effects=(first, final), last_committed_lsn=3)
+    passage = object()
+    full = redo.preflight(mixed, _passage=passage)
+    projected = redo._project_page_preflight(
+        mixed,
+        pages,
+        full,
+        allow_unregistered_indexes=False,
+        passage=passage,
+    )
+    calls: list[int] = []
+    monkeypatch.setattr(
+        commit_redo_module,
+        "apply_page_image",
+        lambda _pool, _file, page, _image: calls.append(page) or True,
+    )
+
+    assert projected is not None
+    redo.apply(pages, _preflighted=projected, _passage=passage)
+
+    assert pool.codec.decode_calls == 2
+    assert calls == [0, 0]
 
 
 @pytest.mark.parametrize(

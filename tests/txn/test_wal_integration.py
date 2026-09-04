@@ -11,6 +11,7 @@ back.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -22,8 +23,10 @@ from okto_grafx.domain.errors import (
     GrafxRecoveryRefused,
     GrafxWriteConflict,
 )
-from okto_grafx.domain.ids import PageIndex
+from okto_grafx.domain.ids import PageIndex, RecordRef
+from okto_grafx.domain.index import IndexChange, IndexOperation, wal_record_for
 from okto_grafx.domain.ports.storage import StorageDevice
+from okto_grafx.domain.recovery.decision import committed_replay
 from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE
 from okto_grafx.domain.txn import (
     CommitPayload,
@@ -35,6 +38,8 @@ from okto_grafx.domain.txn import (
     page_partition,
 )
 from okto_grafx.engine.wal_manager import WalManager
+from okto_grafx.engine import commit_redo as commit_redo_module
+from okto_grafx.engine.commit_redo import CommitRedo
 from shared_device import SharedDirectoryDevice
 from txn_support import (
     DEFAULT_PAGE_SIZE,
@@ -69,6 +74,35 @@ class _PersistentPageFullDevice(FaultInjectingStorageDevice):
                 page=page_index,
             )
         super().write_page(file, page_index, data)
+
+
+class _GapIndexManager:
+    """Minimal logical-index authority needed by mixed committed-gap replay."""
+
+    def __init__(self) -> None:
+        self.named = SimpleNamespace(
+            file="index/by_name.idx",
+            definition=SimpleNamespace(versioned=False),
+            max_key_bytes=400,
+        )
+
+    def index(self, name: str) -> object:
+        assert name == "by_name"
+        return self.named
+
+    active_index = index
+
+    def apply(self, _record: WalRecord) -> bool:
+        return True
+
+    def table_watermark_photo(self) -> dict[str, int]:
+        return {}
+
+    def check_replay_floor(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def mark_built_through(self, _lsn: int, **_kwargs: object) -> None:
+        return None
 
 
 class _PostWriteWalFailureDevice:
@@ -313,6 +347,88 @@ def test_the_stamp_is_above_every_number_the_log_had_assigned_before_the_batch(
 
 
 # --- the checkpoint redoes the log onto the device before it reclaims anything (BR-10, CF-11) ----
+
+
+def test_mixed_committed_gap_keeps_repeated_page_effects_sequential(
+    database_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Splitting a mixed replay must not accidentally make its page subplan coalescible."""
+    stack = build_stack(
+        database_root, wal_factory=_real_wal, owner_id="mixed-gap"
+    )
+    manager = _GapIndexManager()
+    stack.manager._index_manager = manager
+    stack.manager._commit_redo = CommitRedo(stack.pool, manager)  # type: ignore[arg-type]
+    first = make_page_image(
+        stack.codec, [b"first"], page_index=4, page_lsn=1
+    )
+    final = make_page_image(
+        stack.codec, [b"final"], page_index=4, page_lsn=3
+    )
+    logical = wal_record_for(
+        IndexChange(
+            index="by_name",
+            operation=IndexOperation.INSERT,
+            key=b"ada",
+            ref=RecordRef(4, 0),
+        ),
+        epoch=1,
+        txn_id=77,
+        descriptor="hash-v1;partitions_per_table=8",
+    )
+    stack.wal.append_many(
+        (
+            WalRecord(
+                record_type=int(WalRecordType.BEGIN),
+                epoch=1,
+                txn_id=77,
+                descriptor="hash-v1;partitions_per_table=8",
+            ),
+            WalRecord(
+                record_type=int(WalRecordType.WRITE_PAGE),
+                payload=encode_page_write(HEAP, 4, first),
+                epoch=1,
+                txn_id=77,
+                descriptor="hash-v1;partitions_per_table=8",
+            ),
+            logical,
+            WalRecord(
+                record_type=int(WalRecordType.WRITE_PAGE),
+                payload=encode_page_write(HEAP, 4, final),
+                epoch=1,
+                txn_id=77,
+                descriptor="hash-v1;partitions_per_table=8",
+            ),
+            WalRecord(
+                record_type=int(WalRecordType.COMMIT),
+                payload=CommitPayload.build(
+                    snapshot_lsn=0,
+                    read_partitions=(),
+                    write_partitions=(7,),
+                ).encode(),
+                epoch=1,
+                txn_id=77,
+                descriptor="hash-v1;partitions_per_table=8",
+            ),
+        )
+    )
+    stack.wal.barrier()
+    retained = tuple(stack.wal.read_from(1))
+    assert [record.lsn for record in retained] == [1, 2, 3, 4, 5, 6]
+    assert committed_replay(retained).last_committed_lsn == 6
+    applied: list[int] = []
+    real_apply = commit_redo_module.apply_page_image
+
+    def observe_apply(pool: object, file: str, page: int, image: bytes) -> bool:
+        applied.append(page)
+        return real_apply(pool, file, page, image)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(commit_redo_module, "apply_page_image", observe_apply)
+
+    assert stack.manager._redo_onto_device_unchecked(0, 6) == 3
+
+    assert applied == [4, 4]
 
 
 def test_a_checkpoint_installs_a_durable_commit_whose_pages_never_reached_the_device(

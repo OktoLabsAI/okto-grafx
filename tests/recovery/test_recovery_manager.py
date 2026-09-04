@@ -15,6 +15,8 @@ from okto_grafx.domain.errors import (
     GrafxRecoveryRefused,
     GrafxSchemaVersionMismatch,
 )
+from okto_grafx.domain.ids import RecordRef
+from okto_grafx.domain.index import IndexChange, IndexOperation, wal_record_for
 from okto_grafx.domain.ledger.entry import LedgerOriginClass, LedgerReason
 from okto_grafx.domain.recovery.retry import is_retryable
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
@@ -32,6 +34,8 @@ from okto_grafx.domain.recovery.report import (
 from okto_grafx.domain.wal.record import WalRecord, WalRecordType
 from okto_grafx.domain.wal.replay import TruncationReport
 from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE, CommitState
+from okto_grafx.domain.txn.records import encode_page_write
+from okto_grafx.engine import commit_redo as commit_redo_module
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.commit_state_store import CommitStateStore
 from okto_grafx.engine.ledger_store import LEDGER_FILE, LedgerStore
@@ -65,8 +69,15 @@ CATALOG_FILE = "catalog.dat"
 
 
 @dataclass(frozen=True)
+class _RecoveryIndexDefinition:
+    versioned: bool = False
+
+
+@dataclass(frozen=True)
 class _RecoveryIndexDouble:
     file: str
+    definition: _RecoveryIndexDefinition = _RecoveryIndexDefinition()
+    max_key_bytes: int = 400
 
 
 class _RecoveryIndexManagerDouble:
@@ -90,6 +101,16 @@ class _RecoveryIndexManagerDouble:
 
     def active_indexes(self) -> tuple[_RecoveryIndexDouble, ...]:
         return self._indexes
+
+    def index(self, name: str) -> _RecoveryIndexDouble:
+        assert name == "by_name"
+        return self._indexes[0]
+
+    active_index = index
+
+    def apply(self, _record: WalRecord) -> bool:
+        self.events.append("index")
+        return True
 
 
 def _commit(stack: Stack, page_index: int, payload: bytes, *, txn_id: int = 1) -> int:
@@ -193,6 +214,73 @@ def test_an_undamaged_log_recovers_clean_and_discards_nothing(stack: Stack) -> N
 def test_an_empty_database_recovers_clean(stack: Stack) -> None:
     report = stack.recovery().run()
     assert report.outcome == OUTCOME_CLEAN and report.last_good_lsn == 0
+
+
+def test_mixed_recovery_keeps_repeated_page_effects_sequential(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The page split retains the original mixed replay's no-coalescing provenance."""
+    events: list[str] = []
+    manager = _RecoveryIndexManagerDouble(events)
+    for index in manager.active_indexes():
+        stack.storage.create(index.file)  # type: ignore[attr-defined]
+    first = make_page_image(
+        stack.codec, [b"first"], page_index=4, page_lsn=1
+    )
+    final = make_page_image(
+        stack.codec, [b"final"], page_index=4, page_lsn=3
+    )
+    logical = wal_record_for(
+        IndexChange(
+            index="by_name",
+            operation=IndexOperation.INSERT,
+            key=b"ada",
+            ref=RecordRef(4, 0),
+        ),
+        epoch=1,
+        txn_id=77,
+        descriptor=DESCRIPTOR,
+    )
+    stack.wal.append_many(
+        (
+            WalRecord(
+                record_type=int(WalRecordType.WRITE_PAGE),
+                payload=encode_page_write(HEAP_FILE, 4, first),
+                epoch=1,
+                txn_id=77,
+                descriptor=DESCRIPTOR,
+            ),
+            logical,
+            WalRecord(
+                record_type=int(WalRecordType.WRITE_PAGE),
+                payload=encode_page_write(HEAP_FILE, 4, final),
+                epoch=1,
+                txn_id=77,
+                descriptor=DESCRIPTOR,
+            ),
+            WalRecord(
+                record_type=int(WalRecordType.COMMIT),
+                epoch=1,
+                txn_id=77,
+                descriptor=DESCRIPTOR,
+            ),
+        )
+    )
+    stack.wal.barrier()
+    applied: list[int] = []
+    real_apply = commit_redo_module.apply_page_image
+
+    def observe_apply(pool: object, file: str, page: int, image: bytes) -> bool:
+        applied.append(page)
+        return real_apply(pool, file, page, image)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(commit_redo_module, "apply_page_image", observe_apply)
+
+    report = stack.recovery(index_manager=manager).run()
+
+    assert report.records_replayed == 3
+    assert applied == [4, 4]
 
 
 def test_writable_recovery_barriers_a_clean_foreign_tail_before_publication(
