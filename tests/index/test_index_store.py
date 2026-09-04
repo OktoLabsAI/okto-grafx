@@ -427,22 +427,31 @@ def test_header_only_index_paths_match_the_full_walk_without_entry_dtos(
     "reader",
     ["_entry_counts_from_headers", "_entry_refs_from_headers"],
 )
+@pytest.mark.parametrize("damage", ["flags", "encoded_ref"])
 def test_header_only_index_paths_refuse_damage_in_any_slot(
-    database: Database, reader: str
+    database: Database, reader: str, damage: str
 ) -> None:
     """Skipping DTO construction never turns an unneeded corrupt entry into invisible data."""
     _fill_bucket(database, 60)
     damaged = database.exact.walk()[-1]
     with database.pool.pinned(database.exact.file, damaged.page) as page:
         image = bytearray(page.read_slot(damaged.slot))
-        image[0] |= 0x80
+        if damage == "flags":
+            image[0] |= 0x80
+        else:
+            # The encoded u64 reference starts at byte 3; any non-zero high 16 bits exceed
+            # RecordRef's 48-bit page/slot representation while remaining a valid u64 image.
+            image[9] |= 0x01
         page.update_slot(damaged.slot, image)
 
     with pytest.raises(GrafxCorruptionDetected) as refused:
         getattr(database.exact, reader)()
 
-    assert refused.value.details["field"] == "flags"
-    assert refused.value.details["value"] == 0x80
+    if damage == "flags":
+        assert refused.value.details["field"] == "flags"
+        assert refused.value.details["value"] == 0x80
+    else:
+        assert refused.value.details["raw"] > 0xFFFFFFFFFFFF
 
 
 def test_a_live_entry_is_the_one_no_commit_has_ended(database: Database) -> None:

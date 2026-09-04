@@ -74,6 +74,7 @@ from okto_grafx.domain.ids import (
     PageIndex,
     RecordRef,
     SlotId,
+    _require_decodable_ref,
     is_committed_csn,
     is_open_end_csn,
     is_provisional_csn,
@@ -2445,6 +2446,7 @@ class IndexStore:
                         _image, _ref, _born_csn, dead_csn, _versioned = (
                             _validated_image(image)
                         )
+                        _require_decodable_ref(_ref)
                         stored += 1
                         if dead_csn == NO_CSN:
                             live += 1
