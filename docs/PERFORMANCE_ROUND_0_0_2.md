@@ -653,9 +653,10 @@ without changing WAL/OCC, page format or the multiwriter/multireader contract.
   before integration.
 - `e0e18f8` removes Python `Catalog` object identity from the prepared-plan key while retaining the
   exact immutable catalog bytes, index definition/freshness picture and transaction dirty-table
-  set. The motivating 20-transaction sample rebuilt analysis/plan 19 times before the correction;
-  the focused regression now proves one build across an equivalent adoption. Survey estimates are
-  `1.11x–1.35x` for point queries, not a promotion gate.
+  set. This is structural hardening, not an independently measured speedup: after `3b72d4a`, the
+  old identity-based key already hit 19 of 20 times because the same catalog object remained
+  resident. The earlier `1.11x–1.35x` estimate belonged to the CAT-1 adoption-churn problem solved
+  by `3b72d4a`, and must not be attributed to `e0e18f8`.
 - `855c9cf` memoizes the complete ACTIVE index projection on its owning catalog value and
   invalidates it on every table, space, capability or index-authority mutation. `3b72d4a` keeps
   that object resident only across a same token, a proven own publication or a complete CE-3
@@ -672,3 +673,41 @@ Focused validation was accumulated: 58 PK/regression cases, 75 catalog projectio
 34 read-view/cross-process/plan cases and 155 traversal/limit/optional/overlay cases passed, plus
 scoped Ruff and diff checks. These are structural/component receipts; marginal timing variance is
 not used as a gate.
+
+## Scale-removal batch 3 — generation build, recovery, commit and checkpoint
+
+Status: **completed through `aaf72f2` on `feature/v0.0.2`; the next milestone targets bounded
+vector filtering and the diagnosed relationship-query scale cliff**.
+
+This batch removes repeated work from foundational write/recovery paths first, so later integration
+and regression runs exercise the cheaper implementation. It does not change page/WAL format,
+multiwriter/multireader, OCC, visibility or durability rules.
+
+- `c1f1a1f` gives a new empty exact-index generation an ephemeral first-fit directory while it is
+  being materialized. RESET and detached shadow builds no longer rescan the growing physical image
+  to locate space, but the final pages remain byte-identical to the canonical path, including
+  tombstones and removals. Measured build time changed from `27.68 -> 13.48 ms` at 64 entries
+  (`2.05x`), `77.98 -> 17.54 ms` at 128 (`4.45x`) and `323.00 -> 34.24 ms` at 256 (`9.43x`).
+- `b8eff8a` makes concrete recovery-port discovery inspect attributes statically before invoking a
+  dynamic fallback. A native cold recovery now performs exactly one authoritative WAL walk rather
+  than an eager damage scan plus replay walk; proxy/custom wrappers retain dynamic `__getattr__`
+  behavior and missing ports retain the typed refusal.
+- `26baa86` groups immutable page-local MVCC stamps once per materialized attempt. The previous
+  `O(P x R)` page-by-row inspection becomes `O(R + A)`, and publication retargeting becomes `O(A)`,
+  where `A <= 2R`. At 128 pages/intents this removes 16,384 inspections in favor of at most 256
+  grouping/retarget operations. Byte/WAL equivalence covers insert, delete, same-page and
+  cross-page update, file collision and retargeting; the original sorted page order is preserved.
+- `46fa9fe` classifies same-handle heap changes by an ephemeral structural signature. Payload,
+  MVCC, LSN and durable allocation-hint changes no longer evict extent/tail/endpoint locators;
+  growth, relink, owner/topology changes and foreign read views still do. After warming, sixteen
+  one-row commits caused zero directory walks, tail walks or false structural-epoch increments.
+- `aaf72f2` samples `reader_horizon()` once in both checkpoint protocols and reuses that exact
+  observation for reader presence and the recyclable horizon. The coordinator scan falls from two
+  to one per checkpoint while the known freshly published checkpoint LSN replaces a redundant
+  state reread.
+
+Validation remained grouped and risk-proportional: 27 independent index-build cases, focused cold
+recovery/refusal cases, 70 transaction materialization cases, 117 heap/commit/redo cases and 11
+checkpoint/recycling cases passed, with scoped Ruff and diff checks green. A pre-existing catalog
+page-type failure in `test_three_participants_writing_one_catalog_page_cannot_all_commit` remains
+explicitly outside these deltas and is not presented as passing.

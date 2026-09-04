@@ -56,6 +56,21 @@ including the on-disk format.
 
 ### Changed
 
+- Empty exact-index generations now use an ephemeral first-fit directory while they are built.
+  The durable index pages remain byte-identical to the canonical allocator, including removes and
+  tombstones, while reset/detached builds avoid repeatedly walking empty buckets and data pages.
+- Recovery port discovery no longer eagerly invokes dynamic attribute fallback for concrete
+  implementations. Native cold recovery therefore performs one authoritative WAL walk; proxy and
+  custom wrappers retain the existing dynamic fallback and typed refusal behavior.
+- Transaction materialization groups immutable MVCC page stamps once per physical page and retargets
+  those groups after publication. This removes repeated page-by-intent inspection without changing
+  row order, WAL effects, OCC validation or conflict semantics.
+- Same-handle content-only heap commits retain extent-directory, tail and endpoint-locator caches.
+  Structural topology changes and foreign read views still invalidate them using an ephemeral
+  structural signature that is never a durability authority.
+- Split and monolithic checkpoints now reuse one exact reader-horizon observation for both reader
+  presence and recycling decisions, avoiding a duplicate coordinator scan without weakening the
+  conservative recycling horizon.
 - Primary-key uniqueness now folds transaction and statement intent suffixes incrementally rather
   than reducing the complete accumulated list for every row. Public list rewrites and rollbacks
   force a canonical rebuild; a seeded differential covers numeric equality, NaN, mutable keys,
