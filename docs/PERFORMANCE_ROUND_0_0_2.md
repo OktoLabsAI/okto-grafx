@@ -1083,3 +1083,22 @@ recovery/index cases, 90 index-fence/recovery-section/multiprocess cases, 182 bu
 286 heap/identity cases. The production redo call chain was traced through the participant
 section, writer lease and cross-process `COMMIT_SECTION`; the ephemeral proof never outlives that
 fence. Format, WAL records, OCC, durability and the multiwriter/multireader model are unchanged.
+
+## Scale-removal batch 16 — target-only materialization in replay preflight
+
+Status: **completed in `28dd5d4`; independent adversarial review PASS**.
+
+The replay-hot bucket preflight still validates every physical slot in canonical chain order, but
+now materializes a full `IndexEntry` only when the slot's exact `(key, ref)` is a target of the
+batch. Target selection is a two-level `encoded_ref -> key` lookup: unrelated refs allocate
+nothing, while a key is copied only after its encoded ref matches a target. This avoids both the
+old DTO allocation for every non-target and an adversarial `O(targets-per-ref)` scan when distinct
+keys share one reference. Structural image and `RecordRef` validation remain fail-closed before
+the target filter, duplicate physical targets still decline the optimization, and no page-backed
+view escapes its pin.
+
+A 4,000-entry/400-page preparation with eight targets measured `42.092 -> 15.227 ms` (`2.76x`)
+in the isolated scanner component. Twenty-four focused discriminants and 125 grouped index/WAL/
+recovery cases passed, as did Ruff and diff-check. The adversarial review explicitly covered
+same-ref/different-key entries, validation order, duplicate detection, memory ownership and the
+absence of an `O(K)` inner lookup. No format, WAL, OCC, durability or concurrency rule changed.
