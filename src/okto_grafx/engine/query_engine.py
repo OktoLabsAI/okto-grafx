@@ -967,6 +967,10 @@ class _PrimaryKeyTxnMemo:
     txn: object
     intents: _RevisionList
     tables: dict[tuple[object, ...], _PrimaryKeyFoldState] = field(default_factory=dict)
+    dirty_cursor: int = 0
+    dirty_rewrite_revision: int = 0
+    dirty_table_ids: set[int] = field(default_factory=set)
+    dirty_snapshot: frozenset[int] = frozenset()
 
 
 @dataclass(slots=True)
@@ -1293,7 +1297,7 @@ class _Context:
         self.count("traversal_paths")
 
 
-def _intent_table_ids(txn: object) -> frozenset[int]:
+def _intent_table_ids(engine: QueryEngine, txn: object) -> frozenset[int]:
     """Return the tables whose indexes do not yet describe their owner's row view.
 
     Row intents are private to the transaction passed to :meth:`QueryEngine.execute`, so this
@@ -1301,16 +1305,47 @@ def _intent_table_ids(txn: object) -> frozenset[int]:
     table dirty until commit: planning from the raw intents preserves transaction budgets and
     avoids making plan safety depend on a second, planner-local reduction rule.
     """
-    table_ids: set[int] = set()
-    for intent in getattr(txn, "row_intents", ()):
+    identified = _revisioned_txn_memo(engine, txn)
+    if identified is None:
+        table_ids: set[int] = set()
+        for intent in getattr(txn, "row_intents", ()):
+            table_id = getattr(getattr(intent, "table", None), "table_id", None)
+            if (
+                isinstance(table_id, int)
+                and not isinstance(table_id, bool)
+                and table_id > 0
+            ):
+                table_ids.add(table_id)
+        return frozenset(table_ids)
+
+    _txn_id, memo = identified
+    intents = memo.intents
+    if (
+        memo.dirty_rewrite_revision != intents.rewrite_revision
+        or memo.dirty_cursor > len(intents)
+    ):
+        memo.dirty_table_ids.clear()
+        memo.dirty_cursor = 0
+        memo.dirty_rewrite_revision = intents.rewrite_revision
+        memo.dirty_snapshot = frozenset()
+    table_ids = memo.dirty_table_ids
+    start = memo.dirty_cursor
+    changed = False
+    for position in range(start, len(intents)):
+        intent = intents[position]
         table_id = getattr(getattr(intent, "table", None), "table_id", None)
         if (
             isinstance(table_id, int)
             and not isinstance(table_id, bool)
             and table_id > 0
         ):
+            before = len(table_ids)
             table_ids.add(table_id)
-    return frozenset(table_ids)
+            changed = changed or len(table_ids) != before
+    memo.dirty_cursor = len(intents)
+    if changed or memo.dirty_snapshot != table_ids:
+        memo.dirty_snapshot = frozenset(table_ids)
+    return memo.dirty_snapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -2569,7 +2604,7 @@ class QueryEngine:
         one declared. A table this transaction has already changed also withholds its indexes:
         only a scan can be safely combined with pending inserts and changed primary keys.
         """
-        dirty_tables = _intent_table_ids(txn)
+        dirty_tables = _intent_table_ids(self, txn)
         catalog = working if working is not None else self._catalog.catalog
         if authority is None:
             authority = self._statement_index_authority(catalog, txn=txn)
@@ -5104,7 +5139,7 @@ def _traverse(
             )
     catalog = context.schema()
     relationship = node.table
-    dirty_tables = _intent_table_ids(context.txn)
+    dirty_tables = _intent_table_ids(engine, context.txn)
     # The owner reads its own staged work. Everything this transaction has done to the three
     # tables a hop touches -- a committed edge whose properties it replaced, an edge it created,
     # a node it created, updated or ended -- folds into one view here, and a reader outside the
@@ -5248,7 +5283,7 @@ def _traverse_any(
     charge_expansions = engine._max_traversal_expansions is not None
     charge_paths = engine._max_traversal_paths is not None
     ended = _ended_by_this_transaction(context)
-    dirty_tables = _intent_table_ids(context.txn)
+    dirty_tables = _intent_table_ids(engine, context.txn)
     landing_views: dict[int, _OwnerLandingView] = {}
 
     def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
@@ -5337,7 +5372,7 @@ def _relationship_scan(
     relationship = node.table
     charge_expansions = engine._max_traversal_expansions is not None
     charge_paths = engine._max_traversal_paths is not None
-    dirty_tables = _intent_table_ids(context.txn)
+    dirty_tables = _intent_table_ids(engine, context.txn)
     changed: Mapping[object, tuple[Value, ...] | None] = {}
     pending: tuple[tuple[object, HeapVersion], ...] = ()
     if relationship.table_id in dirty_tables:
@@ -5503,7 +5538,7 @@ def _vector_search(
     canonical child path; none guesses eligibility.
     """
     table = _planned_table_for_variable(node.child, node.variable)
-    if table is not None and table.table_id in _intent_table_ids(context.txn):
+    if table is not None and table.table_id in _intent_table_ids(engine, context.txn):
         raise GrafxUnsupportedOperation(
             f"A similarity search over {table.name!r} cannot include rows this transaction has "
             "staged: its vector index describes only committed rows. Commit or roll back first; "
@@ -9192,31 +9227,38 @@ def _fold_primary_key_intent(
     )
 
 
-def _revisioned_row_intents(
-    engine: QueryEngine, context: _Context
+def _revisioned_txn_memo(
+    engine: QueryEngine, txn: object
 ) -> tuple[int, _PrimaryKeyTxnMemo] | None:
-    txn_id = getattr(context.txn, "txn_id", None)
+    """Return revisioned owner state for one exact mutable transaction intent list."""
+    txn_id = getattr(txn, "txn_id", None)
     if isinstance(txn_id, bool) or not isinstance(txn_id, int):
         return None
-    raw = getattr(context.txn, "row_intents", None)
+    raw = getattr(txn, "row_intents", None)
     memo = engine._primary_key_memos.get(txn_id)
-    if memo is not None and memo.txn is context.txn and memo.intents is raw:
+    if memo is not None and memo.txn is txn and memo.intents is raw:
         return txn_id, memo
     if isinstance(raw, _RevisionList):
         tracked = raw
     elif isinstance(raw, list):
         tracked = _RevisionList(raw)
         try:
-            setattr(context.txn, "row_intents", tracked)
+            setattr(txn, "row_intents", tracked)
         except (AttributeError, TypeError):
             return None
-        if getattr(context.txn, "row_intents", None) is not tracked:
+        if getattr(txn, "row_intents", None) is not tracked:
             return None
     else:
         return None
-    memo = _PrimaryKeyTxnMemo(context.txn, tracked)
+    memo = _PrimaryKeyTxnMemo(txn, tracked)
     engine._primary_key_memos[txn_id] = memo
     return txn_id, memo
+
+
+def _revisioned_row_intents(
+    engine: QueryEngine, context: _Context
+) -> tuple[int, _PrimaryKeyTxnMemo] | None:
+    return _revisioned_txn_memo(engine, context.txn)
 
 
 def _canonical_primary_key_rebuild(
