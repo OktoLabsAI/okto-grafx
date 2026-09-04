@@ -2248,7 +2248,6 @@ class _PreparedPlanKey:
     """A collaborator-free proof that one immutable plan still describes this statement."""
 
     text: str
-    catalog_identity: int
     catalog_image: bytes
     index_picture: tuple[tuple[IndexDefinition, bool], ...]
     dirty_tables: frozenset[int]
@@ -2908,7 +2907,6 @@ class QueryEngine:
         )
         return _PreparedPlanKey(
             text=text,
-            catalog_identity=id(catalog),
             catalog_image=catalog_image,
             index_picture=tuple(picture),
             dirty_tables=dirty_tables,

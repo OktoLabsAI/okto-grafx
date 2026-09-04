@@ -44,6 +44,38 @@ def test_repeated_exact_text_reuses_parse_analysis_and_plan(
     assert first.rows == second.rows == ((1,),)
 
 
+def test_equivalent_committed_catalog_objects_reuse_the_prepared_plan(
+    monkeypatch,
+) -> None:
+    stack = build_query_stack()
+    counts = {"analyze": 0, "plan": 0}
+    original_analyze = query_module.analyze
+    original_plan = query_module.build_plan
+
+    def counted_analyze(statement):
+        counts["analyze"] += 1
+        return original_analyze(statement)
+
+    def counted_plan(*args, **kwargs):
+        counts["plan"] += 1
+        return original_plan(*args, **kwargs)
+
+    monkeypatch.setattr(query_module, "analyze", counted_analyze)
+    monkeypatch.setattr(query_module, "build_plan", counted_plan)
+    text = "MATCH (n:Person) WHERE n.id = 7 RETURN n.id"
+
+    first_catalog = stack.catalog_store.catalog
+    first = stack.engine.execute(text, stack.transaction())
+    stack.catalog_store.adopt(stack.catalog_store.read_from_pages())
+    second_catalog = stack.catalog_store.catalog
+    second = stack.engine.execute(text, stack.transaction())
+
+    assert second_catalog is not first_catalog
+    assert stack.catalog_store.persisted_image() == first_catalog.serialize()
+    assert counts == {"analyze": 1, "plan": 1}
+    assert second.plan is first.plan
+
+
 def test_exact_text_catalog_stale_and_dirty_pictures_split_entries(
     monkeypatch,
 ) -> None:
@@ -108,7 +140,6 @@ def test_cache_is_bounded_and_keys_retain_no_runtime_store_or_projection() -> No
             isinstance(part, query_module._IndexAuthorityProjection)
             for part in (
                 key.text,
-                key.catalog_identity,
                 key.catalog_image,
                 key.index_picture,
                 key.dirty_tables,
