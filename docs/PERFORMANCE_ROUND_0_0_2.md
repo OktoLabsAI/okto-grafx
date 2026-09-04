@@ -1146,3 +1146,48 @@ shared mutable authority object revoked before the context reset. Nineteen focus
 590 grouped index/transaction/recovery/vector cases and 15 multiprocess writer/fence cases passed,
 as did Ruff, compile and diff checks. No page/WAL/catalog format, OCC rule, durability order, writer
 lease or multiwriter/multireader premise changed.
+
+## Scale-removal batch 18 — incremental dirty tables and exact float inputs
+
+Status: **completed in `3c847ea`, `00299ed`, `787a464` and `3888830`; reviews
+`hof_a2d2ceffff124c77a48fa9e5c9287cfa` and `hof_c1cfada9144b44d7a7d764fe2482b131`
+verified PASS**.
+
+- Dirty-table discovery now shares the transaction's existing revisioned intent memo. Append-only
+  growth scans only the new suffix, while any structural rewrite, rollback shrink or replacement of
+  the exact transaction/list forces the conservative full rebuild. Untrackable foreign iterables
+  retain the complete scan. The memo holds only immutable table identifiers, is retired with the
+  transaction and never becomes cross-process storage authority.
+- Public query projection recognizes only exact built-in `tuple`/`list` sequences containing only
+  exact built-in `float` values. An exact tuple is already an immutable capability-free snapshot;
+  an exact list is detached once before inspection and its bound is checked both before and after
+  the copy. Subclasses, mixed components, excessive depth/length and hostile containers retain the
+  recursive canonicalizer and its established refusals.
+- The pre-existing `inspect_index` failure-contract test was also repaired in `ea11621` to intercept
+  `IndexManager.active_index`, the collaborator used by the public operation since active-generation
+  routing was introduced. The same three cases failed at the preceding `62bc86f` baseline; this is
+  test drift, not a production behavior change.
+
+In a public in-memory 500-item `executemany` comparison, incremental dirty-table discovery moved the
+median from `0.597128 -> 0.400460 s` (`1.49x`). This is deliberately not presented as a local-storage
+throughput claim: in the independent 1,500-row storage profile, the old function represented only
+`0.481 s` of `21.39 s` (`~2.2%` of writing), so its isolated aggregate ceiling there is about
+`1.02x`. For 1,500 sequences of 128 floats, the public snapshot component measured
+`0.205698 -> 0.011455 s` for tuples (`17.96x`) and `0.234223 -> 0.024445 s` for lists (`9.58x`);
+the broader projection family accounted for roughly `7%` of the measured writing profile, so these
+component ratios are likewise not universal end-to-end claims.
+
+The accumulated regression passed 371 public/query cases, followed by 81 focal cases after the
+adversarial depth-bound correction, plus Ruff, compile and diff checks. The dirty-table differential
+made 173 public-path observations with zero divergence and observed at most one live transaction
+memo. The float-sequence differential found and then proved closed the exact depth-64 bypass,
+including the public parameter path and empty-sequence control. No page/WAL/catalog format, OCC
+rule, writer lease, publication order, durability guarantee or multiwriter/multireader premise
+changed.
+
+The next storage-identity candidate was explicitly deferred rather than turned into a moving gate.
+A real-storage profile attributes about 24.1% of writing time to root/directory/descriptor identity
+checks, but a safe reduction requires a new per-fenced-interval identity proof and carries high
+TOCTOU/security risk for only an estimated `~1.12x` aggregate gain. No authority cache or bundle is
+being added in this round; a future design must retain complete pre-validation, the real operation
+window and fail-closed post-validation before it can be reconsidered.
