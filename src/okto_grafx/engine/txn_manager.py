@@ -3547,11 +3547,13 @@ class TransactionManager:
                     # otherwise this manager would hold its own recycling hostage forever.
                     # The floor handed over is the number this checkpoint just published.
                     self._advance_participant_pin(floor=published.last_committed_lsn)
-                    reader_present = self._reader_horizon() is not None
+                    reader_horizon = self._reader_horizon()
                     with self._close_wait_hazard():
                         state["recycled"] = self._wal.recycle(
-                            self._recyclable_horizon_in_section(),
-                            reader_present=reader_present,
+                            recyclable_horizon(
+                                reader_horizon, published.last_committed_lsn
+                            ),
+                            reader_present=reader_horizon is not None,
                         )
                     if transition is not None:
                         # Inside the section, after redo, publication and recycle: the
@@ -3728,11 +3730,11 @@ class TransactionManager:
                     previous=current,
                 )
                 self._advance_participant_pin(floor=checkpoint_lsn)
-                reader_present = self._reader_horizon() is not None
+                reader_horizon = self._reader_horizon()
                 with self._close_wait_hazard():
                     state["recycled"] = self._wal.recycle(
-                        self._recyclable_horizon_in_section(),
-                        reader_present=reader_present,
+                        recyclable_horizon(reader_horizon, checkpoint_lsn),
+                        reader_present=reader_horizon is not None,
                     )
                 if transition is not None:
                     state["outcome"] = transition(current.last_committed_lsn)

@@ -19,9 +19,23 @@ import pytest
 from okto_grafx.domain.errors import GrafxConfigurationError
 from okto_grafx.engine.coordination import DEFAULT_RENEWAL_FRACTION, recyclable_horizon
 from okto_grafx.engine.txn_manager import TransactionManager
+from okto_grafx.engine.wal_manager import WalManager
 from txn_support import Stack, TracingCoordinator, build_stack, make_page_image
 
 HEAP = "heap.dat"
+
+
+def _real_wal(device: object, clock: object, metrics: object) -> WalManager:
+    """Build the segmented WAL whose checkpoint door includes recycling."""
+    wal = WalManager(
+        device,  # type: ignore[arg-type]
+        clock,  # type: ignore[arg-type]
+        metrics,  # type: ignore[arg-type]
+        segment_bytes=1 << 20,
+        descriptor="hash-v1;partitions_per_table=8",
+    )
+    wal.open()
+    return wal
 
 
 def _commit_one(stack: Stack, page_index: int, payload: bytes = b"row") -> int:
@@ -269,6 +283,27 @@ def test_the_recyclable_horizon_is_the_checkpoint_when_no_reader_is_live(
     """BR-10: the absence of readers is not a licence to recycle everything, only the checkpoint."""
     assert stack.coordinator.reader_horizon() is None
     assert stack.manager.recyclable_horizon() == stack.manager.published_state().checkpoint_lsn
+
+
+@pytest.mark.parametrize("with_open_reader", [False, True])
+def test_checkpoint_scans_the_reader_registry_once(
+    make_stack: object,
+    monkeypatch: pytest.MonkeyPatch,
+    with_open_reader: bool,
+) -> None:
+    """Split and monolithic checkpoint reuse one exact reader-horizon observation."""
+    stack = make_stack(wal_factory=_real_wal)  # type: ignore[operator]
+    trail: list[str] = []
+    traced = TracingCoordinator(stack.coordinator, trail)
+    monkeypatch.setattr(stack.manager, "_coordinator", traced)
+    transaction = stack.manager.begin("read") if with_open_reader else None
+    trail.clear()
+
+    stack.manager.checkpoint()
+
+    assert trail.count("reader_horizon") == 1
+    if transaction is not None:
+        stack.manager.rollback(transaction)
 
 
 def test_a_live_reader_holds_the_recyclable_horizon_down(make_stack) -> None:
