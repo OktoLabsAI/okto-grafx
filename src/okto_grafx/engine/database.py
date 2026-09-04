@@ -1381,6 +1381,20 @@ class Maintenance:
             expected_cardinality=expected_cardinality,
         )
 
+    def rehash_index(
+        self,
+        name: str,
+        *,
+        bucket_count: int | None = None,
+        expected_cardinality: int | None = None,
+    ) -> IndexView:
+        """Delegate growth-only exact-index rehash to the database."""
+        return self._database.rehash_index(
+            name,
+            bucket_count=bucket_count,
+            expected_cardinality=expected_cardinality,
+        )
+
     def publish_metrics(self) -> None:
         """Delegate explicit metric publication to :meth:`Database.publish_metrics`."""
         self._database.publish_metrics()
@@ -2726,6 +2740,61 @@ class Database:
                         expected_cardinality=wanted_expected_cardinality,
                         txn=transaction._context,
                     )
+                transaction.commit()
+            except BaseException as failure:
+                if transaction.active:
+                    try:
+                        transaction.rollback()
+                    except BaseException as cleanup_failure:
+                        _note_cleanup_failure(failure, cleanup_failure)
+                raise
+
+            self._refresh_index_inventory()
+            return self._committed_index_receipt(wanted_name)
+
+    def rehash_index(
+        self,
+        name: str,
+        *,
+        bucket_count: int | None = None,
+        expected_cardinality: int | None = None,
+    ) -> IndexView:
+        """Grow one exact index through an immutable foreground shadow generation.
+
+        Exactly one sizing hint is required.  The resolved directory must be larger than the
+        current ACTIVE generation; equal-size re-creation and shrinking are deliberately not
+        supported.  The old file remains catalogued as STALE after the new, fully built file and
+        its catalog publication are durable.
+        """
+
+        with self._public_operation("rehash_index"):
+            self._require_open()
+            self._require_writable("rehash an exact index")
+            self._require_component(
+                "indexes", self._indexes, "the index framework (C7)"
+            )
+            wanted_name = _require_text("name", name)
+            wanted_bucket_count = (
+                None
+                if bucket_count is None
+                else _require_positive_integer("bucket_count", bucket_count)
+            )
+            wanted_expected_cardinality = (
+                None
+                if expected_cardinality is None
+                else _require_positive_integer(
+                    "expected_cardinality", expected_cardinality
+                )
+            )
+
+            transaction = self.begin("write")
+            try:
+                self._transactions.prepare_index_rehash(
+                    transaction._context,
+                    name=wanted_name,
+                    bucket_count=wanted_bucket_count,
+                    expected_cardinality=wanted_expected_cardinality,
+                )
                 transaction.commit()
             except BaseException as failure:
                 if transaction.active:

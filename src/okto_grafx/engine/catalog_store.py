@@ -87,6 +87,16 @@ class CatalogStore:
         """
         return self._catalog.serialize() != self._persisted_image
 
+    def persisted_image(self) -> bytes:
+        """Return the immutable catalog image last adopted from the current page view.
+
+        This does not refresh or serialize the mutable catalog object.  Transaction boundaries
+        use the value on both sides of :meth:`refresh` to distinguish a cache/view invalidation
+        from a real catalog-authority change without rescanning every index artifact.
+        """
+
+        return self._persisted_image
+
     def refresh(self) -> bool:
         """Re-read the catalog when the pages under it may have moved, and say whether it did.
 

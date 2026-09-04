@@ -110,7 +110,7 @@ from okto_grafx.domain.index.definition import (
     IndexDefinition,
     automatic_index_definitions,
 )
-from okto_grafx.domain.index.keys import identity_index_sizing
+from okto_grafx.domain.index.keys import identity_index_sizing, rehash_index_sizing
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.coordination import ProcessCoordinator
@@ -324,6 +324,7 @@ class _ReadViewChanges:
 
     pages: frozenset[tuple[str, PageIndex]]
     files: frozenset[str]
+    catalog_changed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -649,6 +650,7 @@ class TransactionManager:
         "_active_commit_trace",
         "_index_manager",
         "_index_sync",
+        "_index_authority_sync_required",
         "_partitions_per_table",
         "_identity_lease_size",
         "_identity_leases",
@@ -764,6 +766,7 @@ class TransactionManager:
         self._active_commit_trace: _CommitTrace | None = None
         self._index_manager: Any = index_manager
         self._index_sync: Callable[[], object] | None = index_sync
+        self._index_authority_sync_required: bool = False
         self._partitions_per_table: int = validate_partitions_per_table(
             partitions_per_table
         )
@@ -1261,6 +1264,236 @@ class TransactionManager:
                     operation=operation,
                 )
                 return logical
+
+    def prepare_index_rehash(
+        self,
+        txn: TransactionContext,
+        *,
+        name: str,
+        bucket_count: int | None = None,
+        expected_cardinality: int | None = None,
+    ) -> CatalogIndexDefinition:
+        """Seal one growth-only foreground rehash into a dedicated transaction.
+
+        The detached generation is built later by the ordinary commit path, after the first
+        OCC pass and while the writer lease plus ``COMMIT_SECTION`` are held.  Catalog v2 keeps
+        the former ACTIVE generation as STALE.  A v1 automatic exact index is coactivated with
+        catalog v2 in the same commit, replacing its not-yet-built migration generation so the
+        target is scanned exactly once.
+        """
+
+        operation = "prepare exact-index rehash"
+        self._require_fresh_index_catalog_transaction(
+            txn,
+            operation=operation,
+            purpose="Exact-index rehash",
+        )
+
+        with self._participant_section():
+            self._require_not_closed(operation)
+            self._require_current_active(txn)
+            self._require_recovery_complete()
+            with self.schema_artifact_section(sync_if=lambda: True):
+                source = getattr(self._catalog, "catalog", None)
+                if not isinstance(source, Catalog):
+                    raise GrafxUnsupportedOperation(
+                        "Exact-index rehash needs the concrete persistent catalog.",
+                        operation=operation,
+                        field="catalog",
+                        value=type(source).__name__,
+                    )
+                manager = self._index_manager
+                if manager is None:
+                    raise GrafxUnsupportedOperation(
+                        "Exact-index rehash needs the exact index manager.",
+                        operation=operation,
+                        field="indexes",
+                    )
+
+                published = self._published_state_in_section().last_committed_lsn
+                if source.format_version == CATALOG_LEGACY_FORMAT_VERSION:
+                    return self._prepare_legacy_index_rehash(
+                        txn,
+                        source,
+                        manager=manager,
+                        published_lsn=published,
+                        name=name,
+                        bucket_count=bucket_count,
+                        expected_cardinality=expected_cardinality,
+                        operation=operation,
+                    )
+                if source.format_version != CATALOG_FORMAT_VERSION:
+                    raise GrafxSchemaVersionMismatch(
+                        f"Catalog format {source.format_version} cannot rehash indexes.",
+                        field="format_version",
+                        value=source.format_version,
+                        supported=CATALOG_FORMAT_VERSION,
+                    )
+
+                logical = source.index_definition(name)
+                active = logical.active_generation()
+                if active is None:
+                    raise GrafxIndexError(
+                        f"Index {logical.name!r} has no ACTIVE generation to rehash.",
+                        operation=operation,
+                        field="generation_state",
+                        value=None,
+                        index=logical.name,
+                    )
+                # Resolve and open the exact catalog-selected store before allocating a nonce.
+                # This proves that the descriptor names a complete physical definition; a stale
+                # freshness flag is deliberately repairable by the full shadow build.
+                selected = manager.active_index(logical.name, catalog=source)
+                selected.open()
+                resolved_count, resolved_expected = rehash_index_sizing(
+                    active.bucket_count,
+                    bucket_count=bucket_count,
+                    expected_cardinality=expected_cardinality,
+                )
+
+                candidate = Catalog.deserialize(source.serialize())
+                candidate_logical = candidate.index_definition(logical.name)
+                occupied = self._index_generation_nonces(candidate)
+                nonce = manager._allocate_detached_generation_nonce(occupied)
+                shadow = IndexGenerationDescriptor(
+                    artifact_nonce=nonce,
+                    bucket_count=resolved_count,
+                    state=IndexGenerationState.BUILDING,
+                )
+                replacement = (
+                    replace(
+                        candidate_logical,
+                        expected_cardinality=resolved_expected,
+                    )
+                    .with_generation(shadow)
+                    .activate_generation(nonce)
+                )
+                # Keep the immediately retired generation as the rollback/audit descriptor,
+                # but do not grow the catalog with every historical rehash.  Older files remain
+                # untouched on storage and become ordinary retained orphans; nonce allocation
+                # also inventories physical files, so their identities are never reused.
+                replacement = replace(
+                    replacement,
+                    generations=tuple(
+                        sorted(
+                            (
+                                replacement.generation(active.artifact_nonce),
+                                replacement.generation(nonce),
+                            ),
+                            key=lambda generation: generation.artifact_nonce,
+                        )
+                    ),
+                )
+                candidate.replace_index_definition(replacement)
+                table = candidate.table_by_id(replacement.table_id)
+                self._declare_complete_table_reads(txn, {table.table_id: table})
+                candidate.serialize()
+                self._stage_index_catalog_activation_plan(
+                    txn,
+                    candidate,
+                    (replacement.runtime_definition(replacement.generation(nonce)),),
+                    published,
+                    operation=operation,
+                )
+                return replacement
+
+    def _prepare_legacy_index_rehash(
+        self,
+        txn: TransactionContext,
+        source: Catalog,
+        *,
+        manager: object,
+        published_lsn: Lsn,
+        name: str,
+        bucket_count: int | None,
+        expected_cardinality: int | None,
+        operation: str,
+    ) -> CatalogIndexDefinition:
+        """Compose one v1 automatic exact rehash with the one-way v2 activation."""
+
+        key = name.lower() if isinstance(name, str) else ""
+        legacy = next(
+            (
+                definition
+                for definition in self._automatic_exact_activation_definitions(source)
+                if definition.registry_key == key
+            ),
+            None,
+        )
+        if legacy is None:
+            raise GrafxIndexError(
+                f"Catalog v1 has no automatic exact index named {name!r} to rehash.",
+                operation=operation,
+                field="index_authority",
+                value=repr(name),
+                index=repr(name),
+            )
+        # v1 has no durable logical custom-index authority.  Only a schema-derived automatic
+        # definition selected above can cross the compatibility fence through this operation.
+        selected = manager.active_index(legacy.name, catalog=source)
+        selected.open()
+        resolved_count, resolved_expected = rehash_index_sizing(
+            legacy.bucket_count,
+            bucket_count=bucket_count,
+            expected_cardinality=expected_cardinality,
+        )
+
+        activation = self._plan_identity_index_activation(
+            txn,
+            source,
+            published_lsn,
+            retain_noop_candidate=True,
+        )
+        assert activation is not None
+        candidate, runtime_definitions = activation
+        planned = candidate.index_definition(legacy.name)
+        planned_generation = planned.active_generation()
+        if planned_generation is None:
+            raise GrafxCorruptionDetected(
+                f"Catalog-v2 activation did not plan an ACTIVE generation for {legacy.name!r}.",
+                operation=operation,
+                field="generation_state",
+                index=legacy.name,
+            )
+        resized_generation = replace(
+            planned_generation,
+            bucket_count=resolved_count,
+        )
+        replacement = replace(
+            planned,
+            expected_cardinality=resolved_expected,
+            generations=(resized_generation,),
+        )
+        candidate.replace_index_definition(replacement)
+        resized_runtime = replacement.runtime_definition(resized_generation)
+        complete_runtime = tuple(
+            resized_runtime
+            if definition.registry_key == legacy.registry_key
+            else definition
+            for definition in runtime_definitions
+        )
+        if (
+            sum(
+                definition.registry_key == legacy.registry_key
+                for definition in runtime_definitions
+            )
+            != 1
+        ):
+            raise GrafxCorruptionDetected(
+                f"Catalog-v2 activation planned an ambiguous target for {legacy.name!r}.",
+                operation=operation,
+                field="index_authority",
+                index=legacy.name,
+            )
+        candidate.serialize()
+        self._stage_index_catalog_activation_plan(
+            txn,
+            candidate,
+            complete_runtime,
+            published_lsn,
+            operation=operation,
+        )
+        return replacement
 
     @staticmethod
     def _validate_custom_exact_index_request(
@@ -1873,6 +2106,7 @@ class TransactionManager:
             pages: set[tuple[str, PageIndex]] = set()
             files: set[str] = set()
             heap_changed = False
+            catalog_changed = False
             for record in replay.effects:
                 if record.record_type == int(WalRecordType.WRITE_PAGE):
                     write = decode_page_write(record.payload)
@@ -1884,6 +2118,9 @@ class TransactionManager:
                         return None
                     pages.add((write.file, write.page_index))
                     heap_changed = heap_changed or write.file == self._heap_file
+                    catalog_changed = (
+                        catalog_changed or write.file == self._file_ids.catalog_file
+                    )
                     continue
                 if record.record_type not in (
                     int(WalRecordType.INDEX_WRITE),
@@ -1944,20 +2181,37 @@ class TransactionManager:
             pages = {key for key in pages if key[0] not in budget_files}
             if len(budget_files) + len(pages) > _READ_VIEW_MAX_TARGETS:
                 return None
-            return _ReadViewChanges(pages=frozenset(pages), files=frozenset(files))
+            return _ReadViewChanges(
+                pages=frozenset(pages),
+                files=frozenset(files),
+                catalog_changed=catalog_changed,
+            )
         except (AttributeError, GrafxError, KeyError, OSError, TypeError, ValueError):
             # A stale/shape-incompatible optional collaborator, recycled interval, malformed
             # payload, storage race or WAL damage can only disable the optimisation. The existing
             # full refresh remains authoritative; process-control failures still propagate.
             return None
 
-    def _establish_read_view(self, state: CommitState, *, own: bool) -> None:
-        """Attach the pool to ``state``, using CE-3 only for a proved foreign delta."""
+    def _establish_read_view(self, state: CommitState, *, own: bool) -> bool:
+        """Attach the pool and report whether foreign index authority may have changed.
+
+        A proved CE-3 interval distinguishes ordinary heap/index DML from a catalog write.  If
+        the interval cannot be proved, a moved foreign token or the first unbased view is
+        conservatively treated as a possible catalog change.  The caller uses this one-bit
+        answer to refresh the process-local index registry only at an authority boundary, never
+        after every provable foreign DML.
+        """
 
         token = self._read_view_token_of(state)
         changes: _ReadViewChanges | None = None
+        catalog_may_have_changed = False
         with self._close_wait_hazard():
             previous = self._pool.read_view_token()
+            # Composition attaches the initial registry before a BufferPool read-view token
+            # exists.  A foreign publication may land between those two events, so the first
+            # transactional/non-transactional view has no baseline from which it can prove that
+            # catalog authority stayed put and must take the conservative one-time sync.
+            catalog_may_have_changed = not isinstance(previous, _ReadViewToken)
             effective_own = (
                 own
                 and isinstance(previous, _ReadViewToken)
@@ -1969,6 +2223,7 @@ class TransactionManager:
                 and previous != token
             ):
                 changes = self._read_view_changes(previous, token)
+                catalog_may_have_changed = changes is None or changes.catalog_changed
             self._pool.begin_read_view(
                 token,
                 own=effective_own,
@@ -1981,6 +2236,44 @@ class TransactionManager:
             # A foreign view consumes any previous own-publication provenance. A later numeric
             # coincidence is not proof that the resident frames came from this participant.
             self._own_published_lsn = None
+        return catalog_may_have_changed or self._index_authority_sync_required
+
+    def _synchronize_read_index_authority(self, published_lsn: Lsn) -> None:
+        """Adopt exact-index authority changed by a foreign catalog publication.
+
+        Catalog pages are already attached to the selected read view.  Refreshing their derived
+        object before the existing-only callback makes a long-lived handle replace a retired
+        physical generation before its next statement is planned.  The callback never creates
+        an artifact; a missing or malformed catalog-selected file therefore remains fail-closed.
+        """
+
+        retry_required = self._index_authority_sync_required
+        self._index_authority_sync_required = True
+        with self._close_wait_hazard():
+            image_of = getattr(self._catalog, "persisted_image", None)
+            before = image_of() if callable(image_of) else None
+            refresh = getattr(self._catalog, "refresh", None)
+            if callable(refresh):
+                refresh()
+            after = image_of() if callable(image_of) else None
+            observe = getattr(self._index_manager, "observe_published_lsn", None)
+            if callable(observe):
+                observe(published_lsn)
+
+            # A recycled/oversized WAL interval or checkpoint movement makes CE-3 decline even
+            # when catalog.dat did not change.  Its immutable before/after bytes are then a
+            # cheaper complete authority proof than listing index/ and reopening every header.
+            # A prior failed sync is never skipped by equality: it remains latched until the
+            # existing-only callback has successfully adopted every selected generation.
+            authority_unchanged = (
+                not retry_required
+                and before is not None
+                and after is not None
+                and before == after
+            )
+            if self._index_sync is not None and not authority_unchanged:
+                self._index_sync()
+        self._index_authority_sync_required = False
 
     def _synchronize_committed_indexes(
         self, txn: TransactionContext, published_lsn: Lsn
@@ -2165,10 +2458,14 @@ class TransactionManager:
                 self._require_recovery_complete()
                 if fresh_read_view:
                     published = self._published_state_in_section()
-                    self._establish_read_view(
+                    catalog_may_have_changed = self._establish_read_view(
                         published,
                         own=published.last_committed_lsn == self._own_published_lsn,
                     )
+                    if catalog_may_have_changed:
+                        self._synchronize_read_index_authority(
+                            published.last_committed_lsn
+                        )
                 yield
 
     @contextmanager
@@ -2326,7 +2623,9 @@ class TransactionManager:
             # participant that had already read a table answers from frames cached before
             # somebody else committed: no error, no missing file, just fewer rows than exist.
             own_view = read_lsn == self._own_published_lsn
-            self._establish_read_view(view, own=own_view)
+            catalog_may_have_changed = self._establish_read_view(view, own=own_view)
+            if catalog_may_have_changed:
+                self._synchronize_read_index_authority(read_lsn)
             self._require_not_closed("begin a transaction")
             transaction = TransactionContext(
                 txn_id=self._next_txn_id,

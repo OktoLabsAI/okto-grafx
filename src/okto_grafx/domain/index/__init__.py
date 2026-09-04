@@ -54,6 +54,7 @@ from okto_grafx.domain.index.keys import (
     identity_index_sizing,
     index_key,
     record_id_key,
+    rehash_index_sizing,
     validate_bucket_count,
 )
 from okto_grafx.domain.index.records import (
@@ -118,6 +119,7 @@ __all__ = [
     "identity_index_sizing",
     "index_key",
     "record_id_key",
+    "rehash_index_sizing",
     "is_reclaimable",
     "lsn_of",
     "require_index_name",

@@ -9,6 +9,7 @@ from okto_grafx.domain.index import (
     custom_index_sizing,
     identity_index_name,
     identity_index_sizing,
+    rehash_index_sizing,
 )
 
 
@@ -101,6 +102,74 @@ def test_custom_sizing_refuses_ambiguous_or_out_of_domain_hints(
         custom_index_sizing(**kwargs)
 
     assert raised.value.details["field"] == field
+
+
+@pytest.mark.parametrize(
+    ("current_bucket_count", "kwargs", "expected"),
+    [
+        (1, {"bucket_count": 2}, (2, None)),
+        (64, {"bucket_count": 65}, (65, None)),
+        (4095, {"bucket_count": 4096}, (4096, None)),
+        (1, {"expected_cardinality": 65}, (2, 65)),
+        (64, {"expected_cardinality": 4097}, (128, 4097)),
+        (
+            2048,
+            {"expected_cardinality": MAX_EXPECTED_CARDINALITY},
+            (4096, MAX_EXPECTED_CARDINALITY),
+        ),
+    ],
+)
+def test_rehash_sizing_accepts_every_kind_of_strict_growth_boundary(
+    current_bucket_count: int,
+    kwargs: dict[str, object],
+    expected: tuple[int, int | None],
+) -> None:
+    assert rehash_index_sizing(current_bucket_count, **kwargs) == expected
+
+
+@pytest.mark.parametrize(
+    ("current_bucket_count", "kwargs", "field"),
+    [
+        (64, {}, "sizing"),
+        (
+            64,
+            {"bucket_count": 128, "expected_cardinality": 4097},
+            "sizing",
+        ),
+        (64, {"bucket_count": 64}, "bucket_count"),
+        (64, {"bucket_count": 63}, "bucket_count"),
+        (64, {"expected_cardinality": 4096}, "bucket_count"),
+        (64, {"expected_cardinality": 1}, "bucket_count"),
+        (4096, {"expected_cardinality": MAX_EXPECTED_CARDINALITY}, "bucket_count"),
+        (64, {"bucket_count": 4097}, "bucket_count"),
+        (
+            64,
+            {"expected_cardinality": MAX_EXPECTED_CARDINALITY + 1},
+            "expected_cardinality",
+        ),
+        (64, {"bucket_count": True}, "bucket_count"),
+        (64, {"expected_cardinality": True}, "expected_cardinality"),
+    ],
+)
+def test_rehash_sizing_refuses_missing_ambiguous_non_growing_or_invalid_hints(
+    current_bucket_count: int,
+    kwargs: dict[str, object],
+    field: str,
+) -> None:
+    with pytest.raises(GrafxIndexError) as raised:
+        rehash_index_sizing(current_bucket_count, **kwargs)
+
+    assert raised.value.details["field"] == field
+
+
+@pytest.mark.parametrize("current_bucket_count", [0, 4097, True, 1.5, None])
+def test_rehash_sizing_refuses_an_invalid_active_directory(
+    current_bucket_count: object,
+) -> None:
+    with pytest.raises(GrafxIndexError) as raised:
+        rehash_index_sizing(current_bucket_count, bucket_count=128)
+
+    assert raised.value.details["field"] == "current_bucket_count"
 
 
 @pytest.mark.parametrize(

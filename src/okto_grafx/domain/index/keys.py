@@ -37,6 +37,7 @@ __all__ = [
     "identity_index_sizing",
     "index_key",
     "record_id_key",
+    "rehash_index_sizing",
     "validate_bucket_count",
 ]
 
@@ -140,6 +141,59 @@ def custom_index_sizing(
             max_expected_cardinality=MAX_EXPECTED_CARDINALITY,
         )
     return _bucket_count_for_expected(expected_cardinality), expected_cardinality
+
+
+def rehash_index_sizing(
+    current_bucket_count: object,
+    *,
+    bucket_count: object | None = None,
+    expected_cardinality: object | None = None,
+) -> tuple[int, int | None]:
+    """Resolve one strictly growing exact-index directory request.
+
+    Rehash has no implicit default: exactly one physical count or cardinality hint is required.
+    The selected hint is resolved by :func:`custom_index_sizing`, so creation and maintenance
+    share the same bounds and power-of-two formula.  An explicit bucket count has no persisted
+    cardinality hint, while a derived count retains the caller's cardinality intent.
+    """
+
+    if (
+        isinstance(current_bucket_count, bool)
+        or not isinstance(current_bucket_count, int)
+        or not MIN_BUCKET_COUNT <= current_bucket_count <= MAX_BUCKET_COUNT
+    ):
+        raise GrafxIndexError(
+            "Rehash needs the active generation's legal bucket count; "
+            f"got {current_bucket_count!r}.",
+            field="current_bucket_count",
+            value=repr(current_bucket_count),
+            min_bucket_count=MIN_BUCKET_COUNT,
+            max_bucket_count=MAX_BUCKET_COUNT,
+        )
+
+    supplied = int(bucket_count is not None) + int(expected_cardinality is not None)
+    if supplied != 1:
+        raise GrafxIndexError(
+            "Rehash sizing requires exactly one of bucket_count or expected_cardinality.",
+            field="sizing",
+            bucket_count=repr(bucket_count),
+            expected_cardinality=repr(expected_cardinality),
+        )
+
+    resolved, retained_expected = custom_index_sizing(
+        bucket_count=bucket_count,
+        expected_cardinality=expected_cardinality,
+    )
+    if resolved <= current_bucket_count:
+        raise GrafxIndexError(
+            "Rehash is growth-only: the resolved bucket count must be strictly greater than "
+            f"the active generation's {current_bucket_count}; got {resolved}.",
+            field="bucket_count",
+            value=resolved,
+            current_bucket_count=current_bucket_count,
+            expected_cardinality=retained_expected,
+        )
+    return resolved, retained_expected
 
 
 def identity_index_sizing(visible_rows: object) -> tuple[int, int]:

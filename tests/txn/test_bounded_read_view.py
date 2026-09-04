@@ -96,6 +96,7 @@ def test_committed_page_and_index_effects_become_exact_physical_targets() -> Non
     assert changes is not None
     assert changes.pages == frozenset({("heap.dat", 17)})
     assert changes.files == frozenset({"indexes/by_name.idx"})
+    assert changes.catalog_changed is False
     assert registry.names == ["by_name"]
     assert wal.calls == [(1, 3, 512, 2 * 1024 * 1024)]
 
@@ -138,6 +139,40 @@ def test_heap_effect_targets_sparse_index_headers_without_an_index_record() -> N
         }
     )
     assert changes.files == frozenset()
+    assert changes.catalog_changed is False
+
+
+def test_catalog_page_effect_flags_process_local_index_authority_refresh() -> None:
+    stack = build_stack()
+    stack.manager._wal = _BoundedWal(
+        (
+            WalRecord(
+                record_type=int(WalRecordType.WRITE_PAGE),
+                payload=encode_page_write("catalog.dat", 1, b"catalog-image"),
+                lsn=1,
+                epoch=7,
+                txn_id=9,
+            ),
+            WalRecord(
+                record_type=int(WalRecordType.COMMIT),
+                lsn=2,
+                epoch=7,
+                txn_id=9,
+            ),
+        )
+    )
+
+    changes = stack.manager._read_view_changes(
+        _ReadViewToken(last_committed_lsn=0, checkpoint_lsn=0),
+        _ReadViewToken(last_committed_lsn=2, checkpoint_lsn=0),
+    )
+
+    assert changes is not None
+    # catalog.dat is deliberately a whole-file BufferPool target supplied separately by the
+    # transaction manager.  The flag carries the distinct process-local registry consequence.
+    assert changes.pages == frozenset()
+    assert changes.files == frozenset()
+    assert changes.catalog_changed is True
 
 
 def test_unknown_record_checkpoint_movement_and_unregistered_index_decline_ce3() -> (

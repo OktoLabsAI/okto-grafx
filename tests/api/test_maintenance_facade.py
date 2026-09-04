@@ -33,6 +33,7 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
             "rebuild_vector_index",
             "ensure_identity_indexes",
             "create_index",
+            "rehash_index",
         }
     )
 
@@ -47,6 +48,7 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
     assert get_type_hints(Maintenance.rebuild_vector_index)["return"] is VectorIndexView
     assert get_type_hints(Maintenance.ensure_identity_indexes)["return"] is type(None)
     assert get_type_hints(Maintenance.create_index)["return"] is IndexView
+    assert get_type_hints(Maintenance.rehash_index)["return"] is IndexView
 
 
 def test_status_reports_only_last_observed_available_values() -> None:
@@ -123,6 +125,21 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
         )
         return index_result
 
+    def rehash_index(
+        _database: Database,
+        name: str,
+        *,
+        bucket_count: int | None = None,
+        expected_cardinality: int | None = None,
+    ) -> object:
+        calls.append(
+            (
+                "rehash_index",
+                (name, bucket_count, expected_cardinality),
+            )
+        )
+        return index_result
+
     try:
         with monkeypatch.context() as boundary:
             boundary.setattr(Database, "checkpoint", checkpoint)
@@ -133,6 +150,7 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
                 Database, "ensure_identity_indexes", ensure_identity_indexes
             )
             boundary.setattr(Database, "create_index", create_index)
+            boundary.setattr(Database, "rehash_index", rehash_index)
 
             assert maintenance.checkpoint() is checkpoint_result
             assert maintenance.verify("indexes") is verification_result
@@ -145,6 +163,13 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
                 ("name",),
                 expected_cardinality=1_000,
             ) is index_result
+            assert (
+                maintenance.rehash_index(
+                    "by_name",
+                    bucket_count=128,
+                )
+                is index_result
+            )
     finally:
         database.close()
 
@@ -158,6 +183,7 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
             "create_index",
             ("by_name", "Person", ("name",), None, 1_000),
         ),
+        ("rehash_index", ("by_name", 128, None)),
     ]
 
 
@@ -182,6 +208,9 @@ def test_a_retained_maintenance_facade_obeys_database_lifecycle() -> None:
 
     with pytest.raises(GrafxUnsupportedOperation):
         maintenance.create_index("by_name", "Person", ("name",))
+
+    with pytest.raises(GrafxUnsupportedOperation):
+        maintenance.rehash_index("by_name", bucket_count=128)
 
     with pytest.raises(GrafxUnsupportedOperation):
         _ = database.maintenance
