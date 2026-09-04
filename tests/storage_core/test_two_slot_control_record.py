@@ -90,6 +90,51 @@ class _FirstImageTinyDevice(_FirstImageShortDevice):
         return b"legacy"
 
 
+class _FusedRecordingDevice:
+    """A concrete adapter that records whether control reads select its fused door."""
+
+    def __init__(self, inner: MemoryStorageDevice) -> None:
+        self._inner = inner
+        self.calls: list[str] = []
+
+    @property
+    def page_size(self) -> int:
+        return self._inner.page_size
+
+    def exists(self, file: str) -> bool:
+        self.calls.append("exists")
+        return self._inner.exists(file)
+
+    def read_log(self, file: str, offset: int, length: int) -> bytes:
+        self.calls.append("read_log")
+        return self._inner.read_log(file, offset, length)
+
+    def read_log_if_exists(
+        self, file: str, offset: int, length: int
+    ) -> bytes | None:
+        self.calls.append("read_log_if_exists")
+        if not self._inner.exists(file):
+            return None
+        return self._inner.read_log(file, offset, length)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+class _GetattrOnlyDevice:
+    """A transparent-looking wrapper that deliberately declares no fused capability."""
+
+    def __init__(self, inner: _FusedRecordingDevice) -> None:
+        self._inner = inner
+
+    @property
+    def page_size(self) -> int:
+        return self._inner.page_size
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
 def _store(
     storage: object,
     *,
@@ -124,6 +169,26 @@ def test_bootstrap_installs_three_complete_pages_and_a_canonical_empty_slot() ->
         2,
         1,
     )
+
+
+def test_control_reads_use_only_a_capability_declared_by_the_concrete_type() -> None:
+    inner = MemoryStorageDevice()
+    _store(inner).publish(b"first")
+    direct = _FusedRecordingDevice(inner)
+
+    observed = _store(direct).read()
+
+    assert observed is not None
+    assert observed.payload == b"first"
+    assert direct.calls == ["read_log_if_exists"]
+
+    direct.calls.clear()
+    wrapped = _GetattrOnlyDevice(direct)
+    observed = _store(wrapped).read()
+
+    assert observed is not None
+    assert observed.payload == b"first"
+    assert direct.calls == ["exists", "read_log"]
 
 
 def test_a_warm_publication_is_exactly_one_page_write_and_one_barrier() -> None:

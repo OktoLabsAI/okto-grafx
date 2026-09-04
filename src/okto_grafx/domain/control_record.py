@@ -82,6 +82,29 @@ class _Slot:
     payload: bytes = b""
 
 
+def _read_log_if_exists(
+    storage: StorageDevice, file: str, offset: int, length: int
+) -> bytes | None:
+    """Use an explicitly declared fused read, or preserve the literal port fallback.
+
+    Adapter-only capabilities are opt-in by concrete type. Looking in the type dictionary is
+    deliberate: a generic wrapper that forwards unknown attributes through ``__getattr__`` has
+    not proved that it preserves the fused operation's identity semantics. Such a wrapper keeps
+    the ordinary ``exists`` then ``read_log`` sequence, including any missing-file refusal from
+    the second door.
+    """
+    implementation = vars(type(storage)).get("read_log_if_exists")
+    if callable(implementation):
+        # Resolve the now-proved method through the instance so adapter-local instrumentation
+        # wrappers remain effective. The type-dictionary gate above is what prevents an
+        # unrelated ``__getattr__`` from advertising the capability.
+        fused_read = getattr(storage, "read_log_if_exists")
+        return fused_read(file, offset, length)
+    if not storage.exists(file):
+        return None
+    return storage.read_log(file, offset, length)
+
+
 def _require_database_uuid(value: bytes) -> bytes:
     """Return an exact database UUID suitable for binding a control page."""
     if type(value) is not bytes or len(value) != 16:
@@ -655,10 +678,11 @@ class TwoSlotControlRecordStore:
         it will replace immediately.
         """
         storage = self._storage
-        if not storage.exists(self._file):
-            return None
         expected_size = CONTROL_FILE_PAGES * storage.page_size
-        image = bytes(storage.read_log(self._file, 0, expected_size + 1))
+        observed = _read_log_if_exists(storage, self._file, 0, expected_size + 1)
+        if observed is None:
+            return None
+        image = bytes(observed)
         if len(image) == expected_size:
             return image
         observed_size = storage.file_size(self._file)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import inspect
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ import pytest
 from okto_grafx.adapters import storage_local
 from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.adapters.storage_read_only import ReadOnlyStorageDevice
-from okto_grafx.domain.errors import GrafxUnsupportedOperation
+from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxUnsupportedOperation
 from okto_grafx.domain.ports import StorageDevice
 
 PAGE: bytes = bytes(range(256)) * 2
@@ -109,6 +110,30 @@ class _RecordingIdentityDevice(_RecordingDevice):
         self.calls.append(("invalidate_descriptor_identity", file))
 
 
+class _RecordingFusedDevice(_RecordingDevice):
+    """A concrete type that explicitly opts into the adapter-only fused read."""
+
+    def __init__(self, answer: bytes | None) -> None:
+        super().__init__()
+        self.answer = answer
+
+    def read_log_if_exists(
+        self, file: str, offset: int, length: int
+    ) -> bytes | None:
+        self.calls.append(("read_log_if_exists", file, offset, length))
+        return self.answer
+
+
+class _AttributeForwardingDevice:
+    """A wrapper whose ``__getattr__`` must not implicitly opt into fusion."""
+
+    def __init__(self, inner: _RecordingDevice) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
 READ_CASES: tuple[
     tuple[str, Callable[[ReadOnlyStorageDevice], object], object, tuple[object, ...]], ...
 ] = (
@@ -200,6 +225,72 @@ def test_missing_descriptor_identity_capability_is_a_no_op() -> None:
     device.invalidate_descriptor_identity()
 
     assert inner.calls == []
+
+
+@pytest.mark.parametrize("answer", [None, b"", LOG_SLICE])
+def test_read_only_forwards_a_fused_read_only_when_the_wrapped_type_declares_it(
+    answer: bytes | None,
+) -> None:
+    inner = _RecordingFusedDevice(answer)
+    device = ReadOnlyStorageDevice(inner)
+
+    observed = device.read_log_if_exists("control/state", 2, 31)
+
+    assert observed is answer
+    assert inner.calls == [("read_log_if_exists", "control/state", 2, 31)]
+
+
+def test_getattr_forwarding_does_not_implicitly_opt_a_wrapper_into_fusion() -> None:
+    inner = _RecordingFusedDevice(LOG_SLICE)
+    wrapped = _AttributeForwardingDevice(inner)
+    device = ReadOnlyStorageDevice(wrapped)  # type: ignore[arg-type]
+
+    assert device.read_log_if_exists("control/state", 2, 31) is LOG_SLICE
+    assert inner.calls == [
+        ("exists", "control/state"),
+        ("read_log", "control/state", 2, 31),
+    ]
+
+
+def test_read_only_fallback_returns_none_without_reading_an_absent_name() -> None:
+    class _AbsentDevice(_RecordingDevice):
+        def exists(self, file: str) -> bool:
+            self.calls.append(("exists", file))
+            return False
+
+    inner = _AbsentDevice()
+    device = ReadOnlyStorageDevice(inner)
+
+    assert device.read_log_if_exists("control/absent", 0, 1) is None
+    assert inner.calls == [("exists", "control/absent")]
+
+
+def test_read_only_fallback_propagates_a_missing_file_after_a_present_probe() -> None:
+    class _DisappearingDevice(_RecordingDevice):
+        def read_log(self, file: str, offset: int, length: int) -> bytes:
+            self.calls.append(("read_log", file, offset, length))
+            raise GrafxCorruptionDetected(
+                "removed between fallback doors",
+                reason="missing_file",
+                file=file,
+            )
+
+    inner = _DisappearingDevice()
+    device = ReadOnlyStorageDevice(inner)
+
+    with pytest.raises(GrafxCorruptionDetected, match="removed between"):
+        device.read_log_if_exists("control/state", 0, 1)
+    assert inner.calls == [
+        ("exists", "control/state"),
+        ("read_log", "control/state", 0, 1),
+    ]
+
+
+def test_fused_read_is_adapter_only_and_both_adapters_expose_the_same_signature() -> None:
+    assert not hasattr(StorageDevice, "read_log_if_exists")
+    assert inspect.signature(LocalStorageDevice.read_log_if_exists) == inspect.signature(
+        ReadOnlyStorageDevice.read_log_if_exists
+    )
 
 
 @pytest.mark.parametrize("failure_type", (RuntimeError, KeyboardInterrupt, SystemExit))

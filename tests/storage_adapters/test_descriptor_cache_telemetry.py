@@ -140,6 +140,23 @@ def test_descriptor_cache_counter_lifecycle_resets_with_the_device(
         second.close()
 
 
+def test_fused_read_publishes_its_cache_hit_only_after_releasing_the_guard(
+    tmp_path: Path,
+) -> None:
+    device = LocalStorageDevice(tmp_path / "db", page_size=PAGE_SIZE)
+    metrics = _GuardCheckingMetrics(device)
+    try:
+        device.create("control/state")
+        device.bind_metrics(metrics)
+
+        assert device.read_log_if_exists("control/state", 0, 0) == b""
+
+        assert metrics.total(DESCRIPTOR_CACHE_HITS_TOTAL) == 1.0
+        assert metrics.total(DESCRIPTOR_CACHE_MISSES_TOTAL) == 0.0
+    finally:
+        device.close()
+
+
 def test_disabled_metrics_add_no_adapter_callbacks(tmp_path: Path) -> None:
     device = LocalStorageDevice(tmp_path / "db", page_size=PAGE_SIZE, max_open_files=2)
     try:

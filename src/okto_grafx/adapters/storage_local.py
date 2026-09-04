@@ -898,6 +898,7 @@ class LocalStorageDevice:
             "write_page",
             "append_log",
             "read_log",
+            "read_log_if_exists",
             "log_size",
             "truncate_log",
             "durable_barrier",
@@ -924,7 +925,7 @@ class LocalStorageDevice:
         name = normalize_logical_name(file)
         with self._lock:
             self._require_open()
-            return self._resolve_identity(name)
+            return self._resolve_identity(name) is not None
 
     def create(self, file: str, *, exclusive: bool = True) -> None:
         """Create an empty file. With exclusive set, an already existing file is refused."""
@@ -1301,6 +1302,34 @@ class LocalStorageDevice:
             except OSError as failure:
                 raise self._device_failure(
                     "read_log", name, failure, offset=offset
+                ) from failure
+
+    def read_log_if_exists(self, file: str, offset: int, length: int) -> bytes | None:
+        """Read one log range when its exact logical name exists, with one namespace proof.
+
+        This is an adapter-only fused observation, deliberately absent from ``StorageDevice``.
+        A warm descriptor is accepted only when its ``fstat`` identity matches the exact-case,
+        no-follow final observation returned by ``_resolve_identity``. A miss or stale handle is
+        reopened through the ordinary bounded open/reprove loop, so fusion removes only the
+        duplicate warm-path proof and does not weaken admission. Empty present files return
+        ``b""`` while an absent file returns ``None``.
+        """
+        name = normalize_logical_name(file)
+        validate_read_range(name, offset, length)
+        with self._lock:
+            self._require_open()
+            observed = self._resolve_identity(name)
+            if observed is None:
+                return None
+            descriptor = self._descriptor_after_observation(name, observed)
+            if length == 0:
+                return b""
+            try:
+                os.lseek(descriptor, offset, os.SEEK_SET)
+                return _read_exactly(descriptor, length)
+            except OSError as failure:
+                raise self._device_failure(
+                    "read_log_if_exists", name, failure, offset=offset
                 ) from failure
 
     def log_size(self, file: str) -> int:
@@ -1721,12 +1750,14 @@ class LocalStorageDevice:
             return None
         return candidate, information
 
-    def _resolve_identity(self, name: str) -> bool:
-        """Return True when the exact name exists; refuse a stored name that differs only by case.
+    def _resolve_identity(self, name: str) -> os.stat_result | None:
+        """Return the final exact-name observation, or None when that name is absent.
 
         Every segment is matched against the real directory entry, so a case insensitive volume
         cannot make ``Wal/x.wal`` resolve to ``wal/x.wal`` behind the back of the engine. The
-        answer is True only for a regular file: a directory is not part of the namespace.
+        answer carries the no-follow stat of the final regular file so a caller that immediately
+        consumes the observation can compare it with an already-open descriptor without walking
+        the namespace a second time. A directory is not part of the namespace.
         """
         self._require_root_identity(name, prove_real_path=False)
         directory = self._root
@@ -1736,16 +1767,16 @@ class LocalStorageDevice:
         for index, segment in enumerate(segments):
             resolved = self._resolved_child(directory, identity, prefix, segment, name)
             if resolved is None:
-                return False
+                return None
             candidate, information = resolved
             if index == len(segments) - 1:
-                return stat.S_ISREG(information.st_mode)
+                return information if stat.S_ISREG(information.st_mode) else None
             if not stat.S_ISDIR(information.st_mode):
-                return False
+                return None
             directory = candidate
             identity = (information.st_dev, information.st_ino)
             prefix += segment + "/"
-        return False  # pragma: no cover - normalize_logical_name rejects an empty name
+        return None  # pragma: no cover - normalize_logical_name rejects an empty name
 
     def _walk(self, *, include_pending: bool = False, below: str = "") -> Iterable[str]:
         """Yield regular files without ever following or ignoring a redirected component.
@@ -1970,6 +2001,46 @@ class LocalStorageDevice:
             self._acknowledge(name)
         return descriptor
 
+    def _descriptor_after_observation(
+        self, name: str, observed: os.stat_result
+    ) -> int:
+        """Return a read descriptor using one preceding exact-name observation.
+
+        The fused read door has already proved every namespace component and retained the final
+        no-follow identity. On a warm hit only ``fstat`` is needed to establish that the cached
+        handle is that observed file. A stale or missing cached handle still enters the normal
+        open/admission proof, including its bounded exact-name reprobe after ``open``.
+        """
+        self._require_open()
+        cached = self._handles.pop(name, None)
+        if cached is not None:
+            try:
+                held = os.fstat(cached)
+                still_current = (observed.st_dev, observed.st_ino) == (
+                    held.st_dev,
+                    held.st_ino,
+                )
+            except OSError:
+                still_current = False
+            if still_current:
+                if name in self._generation_revalidated_handles:
+                    self._descriptor_identity_generation[name] = (
+                        self._descriptor_generation
+                    )
+                self._handles[name] = cached
+                self._descriptor_cache_hits += 1
+                return cached
+            with contextlib.suppress(OSError):
+                os.close(cached)
+            self._paths.pop(name, None)
+            self._descriptor_identity_generation.pop(name, None)
+            self._generation_revalidated_handles.discard(name)
+        self._descriptor_cache_misses += 1
+        path = self._joined_path(name)
+        descriptor = self._open_named_descriptor(name, path, create_new=False)
+        self._admit(name, descriptor, path)
+        return descriptor
+
     def _open_named_descriptor(self, name: str, path: str, *, create_new: bool) -> int:
         """Open a proved name and accept only a descriptor that still names its exact file.
 
@@ -2011,11 +2082,8 @@ class LocalStorageDevice:
             held = os.fstat(descriptor)
         except OSError:
             return False
-        if not self._resolve_identity(name):
-            return False
-        try:
-            current = os.stat(path)
-        except OSError:
+        current = self._resolve_identity(name)
+        if current is None:
             return False
         if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
             return False
