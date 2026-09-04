@@ -749,8 +749,8 @@ prototypes were rejected and reverted**.
   access path therefore remains available without making query semantics depend on index presence.
 
 Focused evidence was grouped: VEC-4 passed its 28-case final/query slice plus 57 adjacent cases and
-an independent adversarial review; CAT-5 passed 20 allocator cases plus 15 schema/index cases; the
-The final EDGE corrective slice passed 16 dedicated cases including the later-pass A63 refusal.
+an independent adversarial review; CAT-5 passed 20 allocator cases plus 15 schema/index cases. The
+final EDGE corrective slice passed 16 dedicated cases including the later-pass A63 refusal.
 The index-seek correction passed 135 focused cases. A broader run found the cross-pattern seek
 regression after 405 prior passes; after `5938a03`, the corrected combined focal set and the
 remaining `tests/query` file slice both completed with exit code zero. Ruff lint and diff checks
@@ -765,3 +765,31 @@ contract, which promises reproducibility only for the same seed and insertion se
 `ef_construction`/neighbour-count knobs are deliberately deferred until a full 8,192 x 384 profile
 and a recall harness that does not visit nearly the entire graph establish a material gain. They
 are not a gate for the current scale-removal work.
+
+## Scale-removal batch 5 — WAL observation and cold inventory decisions
+
+Status: **no production change selected after bounded prototypes and adversarial review**.
+
+- A TXN-1 prototype retained at most 512 records / 2 MiB decoded by the incremental refresh of an
+  outer `hold_tail`, then offered the raw records to later read-view and OCC consumers. Each
+  consumer still ran its own COMMIT/replay rules. In a nine-run component sample it reduced 754 to
+  250 record decodes and moved the median from `30.211 ms` to `11.156 ms` (`2.71x`). This is not a
+  delivered gain.
+- Nexus review `hof_0dc74badf8504e09af643bd9ae4357bd` produced NO-GO. The foreign-tail
+  observation authenticated only newly appended bytes, while a strict sparse-mark read could
+  require an older physical prefix. It could consequently hide pre-existing or warm corruption.
+  The prototype also substituted logical encoded bytes for `read_bounded`'s frozen physical-plan
+  budget and initially let a lazy iterator outlive its hold. Correcting the iterator alone did not
+  close the first two blockers; re-reading/re-authenticating the physical plan would consume the
+  intended saving. The complete code and test delta was therefore removed before commit.
+- CAT-4 considered memoizing `LocalStorageDevice.list_files()` inventory. A device/lifetime cache
+  was rejected because another process can publish, remove or corrupt namespace entries without
+  changing that Python object's state. A safe version is limited to one `COMMIT_SECTION`, must be
+  invalidated around recovery/catalog apply and still retains the first `O(N)` walk. The measured
+  directional saving for the two reusable writable-open pairs was about `4 ms` at 16 entries and
+  `73 ms` at 4,096 entries; the Pulse-sized case is expected to save only a few milliseconds, while
+  `592fd22` already removed steady-state resolved inventory. No CAT-4 code was introduced.
+
+These decisions apply the agreed precedence rule: a locally fast prototype is not promoted when
+its authority is narrower than the canonical read or when the safe repair removes most of the
+gain. Multiwriter/multireader, WAL/OCC, durability and fail-closed behavior remain unchanged.
