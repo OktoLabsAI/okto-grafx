@@ -621,6 +621,12 @@ class HeapStore:
         # Internal operations may reuse a successful header proof only while the exact page
         # view it proved remains current. The public predicate never trusts this memo.
         self._bootstrapped_epoch: int | None = None
+        # TransactionManager and recovery use the shared page-image door directly. Registering
+        # the heap format classifier here lets those paths make the same structural distinction
+        # as HeapStore.apply_page_image without teaching either component the heap layout.
+        self._pool._register_structure_signature(
+            self._file, HeapStore._page_structure_signature
+        )
 
     @property
     def catalog(self) -> CatalogStore:
@@ -757,19 +763,90 @@ class HeapStore:
         pages included, because recovery replays what the log recorded and the log records page
         images without caring what the page is for.
 
-        Whatever this store walked to and remembered stops being trusted here, though not by
-        this method: the image carries its own next_page, so a redo can take pages out of a chain
-        without touching the page a walk stopped at, and the pool records that by advancing the
-        structure epoch of the file. Every holder of a derived walk reads that epoch before it
-        trusts what it derived. Clearing the cache here as well would answer the same question a
-        second time and make the first answer impossible to test (A34).
+        The heap supplies its structural signature to the shared redo door.  Page type, flags,
+        chain links, data-page ownership and page-zero directory authority move the structure
+        epoch; record payload, MVCC fields, durable hints and LSN/sequence stamps do not.  This
+        keeps a same-handle commit from discarding the tail, extent-slot and locator work it just
+        established while retaining the conservative epoch boundary for every relink or change
+        of ownership.
         """
-        applied = apply_page_image(self._pool, self._file, page_index, image)
-        if applied:
-            # Even a non-header image moves derived_epoch.  Drop the slot hints eagerly so a
-            # replay can never leave a memo carrying an older epoch until the next lookup.
+        before = (
+            self._pool.structure_epoch(self._file),
+            self._pool.cache_drop_epoch(self._file),
+        )
+        applied = apply_page_image(
+            self._pool,
+            self._file,
+            page_index,
+            image,
+            structure_signature=self._page_structure_signature,
+        )
+        after = (
+            self._pool.structure_epoch(self._file),
+            self._pool.cache_drop_epoch(self._file),
+        )
+        if applied and before != after:
+            # Structural images and concurrent cache/view drops revoke the slot proof eagerly.
+            # Pure content images preserve it; its epoch is still revalidated on every use.
             self._invalidate_extent_slots()
         return applied
+
+    @staticmethod
+    def _page_structure_signature(page: Page) -> object:
+        """Return only the heap page fields that authorize derived physical locations.
+
+        Data-page rows are intentionally absent.  A record append or MVCC stamp cannot change
+        the chain or page owner, and an older snapshot cannot observe a version appended after
+        its horizon.  Reclamation likewise cannot remove a version admitted by a live snapshot.
+        The record slot directory is therefore content for this purpose, while slot zero is the
+        page-owner authority and remains structural.
+
+        Page zero is narrower than a byte-for-byte signature.  The file header, directory slot
+        topology, table id and first page are authority.  ``last_page``, ``page_count`` and
+        ``next_record_id`` are durable hints/counters updated by ordinary DML and are verified or
+        repaired by their existing readers.  A malformed entry is represented by its complete
+        payload, making the classifier conservative without moving validation out of the
+        canonical heap doors.
+        """
+
+        common = (
+            page.page_type,
+            page.flags,
+            page.header().reserved,
+            page.next_page,
+        )
+        if page.page_type == int(PageType.HEAP):
+            return (*common, "heap", HeapStore._slot_authority(page, DESCRIPTOR_SLOT))
+        if page.page_type != int(PageType.META) or page.page_index != HEADER_PAGE_INDEX:
+            return common
+
+        entries: list[object] = []
+        for slot in range(EXTENT_FIRST_SLOT, page.slot_count):
+            if page.is_slot_free(slot):
+                entries.append((slot, "free"))
+                continue
+            payload = page.slot_view(slot)
+            if len(payload) != DIRECTORY_ENTRY_SIZE:
+                entries.append((slot, "malformed", bytes(payload)))
+                continue
+            table_id, first_page = struct.unpack_from("<II", payload)
+            entries.append((slot, "extent", table_id, first_page))
+        return (
+            *common,
+            "meta",
+            page.slot_count,
+            HeapStore._slot_authority(page, 0),
+            tuple(entries),
+        )
+
+    @staticmethod
+    def _slot_authority(page: Page, slot: SlotId) -> object:
+        """Return a total signature for one authoritative slot, including absence/free state."""
+        if slot >= page.slot_count:
+            return ("missing",)
+        if page.is_slot_free(slot):
+            return ("free",)
+        return ("value", bytes(page.slot_view(slot)))
 
     # --- writing ---------------------------------------------------------------------------
 

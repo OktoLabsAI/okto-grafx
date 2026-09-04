@@ -462,6 +462,7 @@ class BufferPool:
         "_page_labels",
         "_data_labels",
         "_structure_epochs",
+        "_structure_signatures",
         "_drop_epochs",
         "_every_file_drop",
         "_read_view_token",
@@ -552,11 +553,16 @@ class BufferPool:
         }
         self._page_labels: dict[str, str] = {"kind": "page"}
         self._data_labels: dict[str, str] = {"target": "data"}
-        # Bumped whenever a page of a file is replaced wholesale, or the cache of that
-        # file is dropped. Anything a component derived by walking the pages of that
-        # file -- a chain length, a tail -- was derived before the bump and cannot be
-        # trusted after it.
+        # Bumped whenever a page replacement changes format-owned structure. Files without a
+        # registered classifier retain the conservative wholesale-replacement rule. Anything a
+        # component derived by walking links -- a chain length, a tail -- predates the bump and
+        # cannot be trusted after it.
         self._structure_epochs: dict[str, int] = {}
+        # Optional format-owned classifiers used by the ordinary transaction/recovery apply
+        # door.  They are immutable code, not cached page authority: a store registers the
+        # signature for its file once, and every apply still compares the resident page with
+        # the checksum-verified incoming page under the existing redo rule.
+        self._structure_signatures: dict[str, Callable[[Page], object]] = {}
         self._drop_epochs: dict[str, int] = {}
         self._every_file_drop: int = 0
         self._read_view_token: object = None
@@ -618,6 +624,32 @@ class BufferPool:
     def _bump_structure_epoch(self, file: str) -> None:
         """Record that the page structure of this file may no longer be what a walk found."""
         self._structure_epochs[file] = self._structure_epochs.get(file, 0) + 1
+
+    @_guarded
+    def _register_structure_signature(
+        self, file: str, signature: Callable[[Page], object]
+    ) -> None:
+        """Attach one deterministic format classifier to a file in this pool.
+
+        This is deliberately an engine-internal registration rather than a storage/WAL port.
+        The classifier neither persists nor crosses a process boundary, and absence retains the
+        historical conservative rule that every applied image may be structural.
+        """
+        previous = self._structure_signatures.get(file)
+        if previous is not None and previous is not signature:
+            raise GrafxConfigurationError(
+                f"File {file!r} already has a different structural page classifier.",
+                file=file,
+                field="structure_signature",
+            )
+        self._structure_signatures[file] = signature
+
+    @_guarded
+    def _registered_structure_signature(
+        self, file: str
+    ) -> Callable[[Page], object] | None:
+        """Return the immutable format classifier registered for one file, if any."""
+        return self._structure_signatures.get(file)
 
     def _bump_drop_epoch(self, file: str) -> None:
         """Record that cached frames covering this one file were dropped."""
@@ -699,6 +731,7 @@ class BufferPool:
             self._clean_candidate_linger,
             self._modified,
             self._structure_epochs,
+            self._structure_signatures,
             self._drop_epochs,
             self._labels,
             self._retained_labels,
@@ -2924,7 +2957,12 @@ def grow_to(pool: BufferPool, file: str, page_index: PageIndex) -> int:
 
 
 def apply_page_image(
-    pool: BufferPool, file: str, page_index: PageIndex, image: bytes
+    pool: BufferPool,
+    file: str,
+    page_index: PageIndex,
+    image: bytes,
+    *,
+    structure_signature: Callable[[Page], object] | None = None,
 ) -> bool:
     """Install a page image if it is newer than the page, and say whether it was applied.
 
@@ -2938,6 +2976,11 @@ def apply_page_image(
       replaying the same log twice produce the same file;
     * the installed image always carries an even sequence counter (A21), because an odd one
       would make the page unreadable for good.
+
+    A store that can distinguish its structural page authority from ordinary payload may pass
+    ``structure_signature`` or register the same immutable classifier with its pool for shared
+    transaction/recovery callers.  The epoch then moves only when that signature changes.  A
+    file with neither remains deliberately conservative: every applied image moves its epoch.
     """
     # The page index is checked by grow_to below, which every path through here reaches.
     # Checking it twice with the same predicate and the same message made neither check
@@ -2980,16 +3023,25 @@ def apply_page_image(
     decoded.page_index = page_index
     if decoded.seq % 2:
         decoded.seq = next_seq(decoded.seq)
+    effective_signature = (
+        structure_signature
+        if structure_signature is not None
+        else pool._registered_structure_signature(file)
+    )
     grow_to(pool, file, page_index)
     with pool.pinned(file, page_index) as page:
         if page.page_type != int(PageType.FREE) and page.page_lsn >= decoded.page_lsn:
             return False
+        structure_changed = (
+            effective_signature is None
+            or effective_signature(page) != effective_signature(decoded)
+        )
         page.replace_with(decoded)
-        # The image carries its own next_page, so applying it can lengthen, shorten or
-        # re-route any chain that runs through this page -- including one whose tail a
-        # store has walked to and remembered. That tail keeps every property it had;
-        # what it loses is reachability, which A40 says only a walk can establish.
-        pool._bump_structure_epoch(file)
+        # A structural image can lengthen, shorten or re-route a chain without touching the
+        # remembered tail.  The format classifier is the proof that this image did not; without
+        # one the historical conservative bump remains the only safe answer.
+        if structure_changed:
+            pool._bump_structure_epoch(file)
         return True
 
 
