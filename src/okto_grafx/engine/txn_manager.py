@@ -5478,7 +5478,12 @@ class TransactionManager:
         manager = self._index_manager
         if manager is None:
             return 0
-        applied = int(manager.commit(txn, csn))
+        fenced_commit = getattr(manager, "_commit_under_write_authority", None)
+        applied = int(
+            fenced_commit(txn, csn)
+            if callable(fenced_commit)
+            else manager.commit(txn, csn)
+        )
         return applied
 
     def _drop_index_changes(self, txn: TransactionContext) -> int:

@@ -101,29 +101,34 @@ def test_empty_build_bucket_walks_are_constant_instead_of_per_insert(
     monkeypatch: Any,
 ) -> None:
     """After RESET, one bucket directory replaces the quadratic chain walk for every row."""
-    original_pages = IndexStore._bucket_pages
-    original_matches = IndexStore._matching_entries_on
+    original_scan = IndexStore._scan_bucket
 
-    def measured(count: int, *, canonical: bool) -> tuple[int, int]:
+    def measured(count: int, *, canonical: bool) -> int:
         database = Database(budget_pages=256)
         keys = _colliding_keys(database, count)
-        calls = {"pages": 0, "matches": 0}
+        calls = 0
 
-        def counted_pages(store: IndexStore, bucket: int) -> tuple[int, ...]:
+        def counted_scan(
+            store: IndexStore,
+            bucket: int,
+            key: bytes | None = None,
+            ref: RecordRef | None = None,
+            *,
+            first_matching_page: bool = False,
+        ) -> tuple[tuple[int, ...], tuple[object, ...]]:
+            nonlocal calls
             if store is database.exact and bucket == 0:
-                calls["pages"] += 1
-            return original_pages(store, bucket)
-
-        def counted_matches(
-            store: IndexStore, page: int, key: bytes, ref: RecordRef | None = None
-        ) -> tuple[object, ...]:
-            if store is database.exact:
-                calls["matches"] += 1
-            return original_matches(store, page, key, ref)
+                calls += 1
+            return original_scan(
+                store,
+                bucket,
+                key,
+                ref,
+                first_matching_page=first_matching_page,
+            )
 
         with monkeypatch.context() as measurement:
-            measurement.setattr(IndexStore, "_bucket_pages", counted_pages)
-            measurement.setattr(IndexStore, "_matching_entries_on", counted_matches)
+            measurement.setattr(IndexStore, "_scan_bucket", counted_scan)
             if canonical:
                 measurement.setattr(
                     IndexStore,
@@ -131,14 +136,13 @@ def test_empty_build_bucket_walks_are_constant_instead_of_per_insert(
                     lambda *_args, **_kwargs: None,
                 )
             _commit_empty_rebuild(database, keys)
-        return calls["pages"], calls["matches"]
+        return calls
 
     fast_curve = [measured(count, canonical=False) for count in (32, 64, 128)]
     canonical = measured(128, canonical=True)
 
-    assert fast_curve == [(2, 0), (2, 0), (2, 0)]
-    assert canonical[0] == 129
-    assert canonical[1] > 500
+    assert fast_curve == [2, 2, 2]
+    assert canonical == 129
 
 
 def test_empty_build_declines_to_canonical_path_if_a_bucket_is_not_empty() -> None:

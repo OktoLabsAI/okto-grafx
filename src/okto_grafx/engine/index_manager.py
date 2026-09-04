@@ -54,6 +54,7 @@ from __future__ import annotations
 import hashlib
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import NamedTuple, TypeVar
@@ -192,6 +193,30 @@ _COMMON_REPLAY_HOT_PAGE_LIMIT: int = 16_384
 _COMMON_REPLAY_HOT_BUCKET_LIMIT: int = 16_384
 """Hard ceiling on distinct bucket identities considered by the replay accelerator."""
 
+_LIVE_COMMIT_HOT_BUCKET_MIN_EFFECTS: int = 2
+"""Smallest fenced live-commit run that saves a second bucket scan."""
+
+_LIVE_COMMIT_AUTHORITY_SEAL: object = object()
+"""Module-private proof installed only by the transaction manager's fenced commit door."""
+
+_LIVE_COMMIT_AUTHORITY: ContextVar[object | None] = ContextVar(
+    "okto_grafx_live_commit_authority", default=None
+)
+"""Call-local authority whose mutable scope is revoked before its context is reset."""
+
+_LIVE_HOT_HOOK_NAMES: tuple[str, ...] = (
+    "_apply_change",
+    "_bucket_pages",
+    "_find_entry",
+    "_place",
+    "_rewrite",
+    "_erase",
+)
+"""Physical hooks a live batch replaces and therefore requires in canonical form."""
+
+_CANONICAL_LIVE_HOT_HOOKS: tuple[object, ...]
+"""Original hook objects, bound after ``IndexStore`` is fully defined."""
+
 TOMBSTONE_BACKLOG: str = "oktografx_vector_tombstone_backlog"
 RECONCILIATION_TOTAL: str = "oktografx_vector_reconciliation_total"
 
@@ -271,6 +296,17 @@ class _Staged:
     database already ends stale without being told. A durable flag would change a frozen record
     to express something the recovery path never has to read.
     """
+
+
+@dataclass(slots=True)
+class _LiveCommitAuthority:
+    """Revocable scope for one manager/transaction/store inside the fenced commit call."""
+
+    seal: object
+    manager: IndexManager
+    txn: object
+    store: IndexStore | None = None
+    active: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1751,15 +1787,27 @@ class IndexStore:
                 value=len(resets),
             )
         reset = resets[0] if resets else None
+        authority = _LIVE_COMMIT_AUTHORITY.get()
+        live_hot = bool(
+            isinstance(authority, _LiveCommitAuthority)
+            and authority.active
+            and authority.seal is _LIVE_COMMIT_AUTHORITY_SEAL
+            and authority.txn is txn
+            and authority.store is self
+        )
         if reset is None:
-            applied = self._commit_staged(txn_id, staged, stamp, reset=None)
+            applied = self._commit_staged(
+                txn_id, staged, stamp, reset=None, live_hot=live_hot
+            )
             self._remember_local_certificate()
             return applied
         # The same cross-process section that serialises page-0 CAS covers the dangerous
         # interval from RESET's generation proof through bucket publication and the final
         # healthy certificate. Readers remain optimistic and never acquire it.
         with self._pool.page_write_fence(self.file, HEADER_PAGE_INDEX):
-            applied = self._commit_staged(txn_id, staged, stamp, reset=reset)
+            applied = self._commit_staged(
+                txn_id, staged, stamp, reset=reset, live_hot=live_hot
+            )
             self._remember_local_certificate()
             return applied
 
@@ -1770,25 +1818,45 @@ class IndexStore:
         stamp: Csn,
         *,
         reset: IndexChange | None,
+        live_hot: bool,
     ) -> int:
         """Apply one staged batch; a RESET caller already holds the whole-file fence."""
         applied = 0
         moved_any = False
         empty_build: _EmptyIndexBuild | None = None
+        try:
+            hot_buckets = (
+                self._prepare_live_hot_buckets(staged)
+                if live_hot and reset is None
+                else {}
+            )
+        except GrafxError as failure:
+            self._note_commit_failure(txn_id, staged, applied, failure)
+            raise
         for change in staged.changes:
             try:
                 moved: bool
-                accelerated = (
-                    None
-                    if empty_build is None
-                    else self._apply_empty_build_change(empty_build, change, stamp)
+                hot_bucket = hot_buckets.get(
+                    bucket_of(change.key, self._definition.bucket_count)
                 )
-                if accelerated is None:
-                    moved = self._apply_change(change, stamp)
-                    if empty_build is not None:
-                        empty_build = None
+                if hot_bucket is not None:
+                    moved = self._apply_common_replay_hot_change(
+                        hot_bucket, change, stamp
+                    )
                 else:
-                    moved = accelerated
+                    accelerated = (
+                        None
+                        if empty_build is None
+                        else self._apply_empty_build_change(
+                            empty_build, change, stamp
+                        )
+                    )
+                    if accelerated is None:
+                        moved = self._apply_change(change, stamp)
+                        if empty_build is not None:
+                            empty_build = None
+                    else:
+                        moved = accelerated
                 moved_any = moved or moved_any
                 if change.operation is IndexOperation.RESET and moved and applied == 0:
                     # RESET just validated and cleared every reachable bucket page while this
@@ -1796,25 +1864,7 @@ class IndexStore:
                     # use an ephemeral directory without trusting state from another generation.
                     empty_build = _EmptyIndexBuild()
             except GrafxError as failure:
-                if applied == 0 and failure.details.get("field") in {
-                    "rebuild_superseded",
-                    "reset_requires_stale",
-                }:
-                    # A generation proof refused before the first bucket moved. The durable
-                    # header already belongs to the winning rebuild; poisoning it would turn a
-                    # clean arbitration result into needless global unavailability.
-                    raise
-                if self._stale_reason is None:
-                    # Only a commit that found the index HEALTHY may claim to be the reason it is
-                    # stale, because only then is a completed retry proof that nothing else is
-                    # wrong. Failing while the index was already stale leaves that older verdict
-                    # owning the mark, and it needs a rebuild rather than a retry.
-                    self._short_commit = txn_id
-                self._mark_stale_after_failure(
-                    f"Applying a commit to index {self.name!r} failed after {applied} of "
-                    f"{len(staged.changes)} changes, so it is missing entries the heap holds: "
-                    f"{failure.message}"
-                )
+                self._note_commit_failure(txn_id, staged, applied, failure)
                 raise
             applied += 1
         self._staged.pop(txn_id, None)
@@ -1883,6 +1933,32 @@ class IndexStore:
                 self._completed_rebuild_through = None
         self._publish_tombstone_backlog()
         return applied
+
+    def _note_commit_failure(
+        self,
+        txn_id: int,
+        staged: _Staged,
+        applied: int,
+        failure: GrafxError,
+    ) -> None:
+        """Preserve the live commit's durable stale/retry protocol after one refusal."""
+        if applied == 0 and failure.details.get("field") in {
+            "rebuild_superseded",
+            "reset_requires_stale",
+        }:
+            # A generation proof refused before the first bucket moved. The durable header
+            # already belongs to the winning rebuild; poisoning it would turn a clean
+            # arbitration result into needless global unavailability.
+            return
+        if self._stale_reason is None:
+            # Only a commit that found the index HEALTHY may claim to be the reason it is stale,
+            # because only then is a completed retry proof that nothing else is wrong.
+            self._short_commit = txn_id
+        self._mark_stale_after_failure(
+            f"Applying a commit to index {self.name!r} failed after {applied} of "
+            f"{len(staged.changes)} changes, so it is missing entries the heap holds: "
+            f"{failure.message}"
+        )
 
     def advance_built_through(self, lsn: Lsn) -> None:
         """Raise the position this index claims to cover, unless it is known to be stale.
@@ -2725,6 +2801,82 @@ class IndexStore:
         # Re-seeding on the next gauge is safer than publishing an invented correction.
         self._tombstone_backlog_count = adjusted if adjusted >= 0 else None
 
+    def _prepare_live_hot_buckets(
+        self, staged: _Staged
+    ) -> dict[int, _CommonReplayHotBucket]:
+        """Build bounded call-local directories for one fully fenced live commit.
+
+        This door is reached only through ``IndexManager._commit_under_write_authority``.  It
+        deliberately declines stale/rebuild/retry state and non-canonical physical hooks; those
+        cases retain the scalar protocol that established their recovery semantics.  Every
+        accepted bucket is completely validated before this store's first mutation, and every
+        page acquisition still passes through the ordinary buffer budget.
+        """
+        if (
+            self._stale_reason is not None
+            or self._rebuild_authority is not None
+            or self._short_commit is not None
+            or staged.defer_clear
+            or any(
+                change.operation is IndexOperation.RESET for change in staged.changes
+            )
+            or not self._uses_canonical_live_hot_hooks()
+        ):
+            return {}
+
+        counts: dict[int, int] = {}
+        for change in staged.changes:
+            bucket = bucket_of(change.key, self._definition.bucket_count)
+            if bucket not in counts and len(counts) >= _COMMON_REPLAY_HOT_BUCKET_LIMIT:
+                return {}
+            counts[bucket] = counts.get(bucket, 0) + 1
+
+        targets_by_bucket: dict[int, set[tuple[bytes, RecordRef]]] = {
+            bucket: set()
+            for bucket, count in counts.items()
+            if count >= _LIVE_COMMIT_HOT_BUCKET_MIN_EFFECTS
+        }
+        if not targets_by_bucket:
+            return {}
+        retained_targets = 0
+        for change in staged.changes:
+            bucket = bucket_of(change.key, self._definition.bucket_count)
+            targets = targets_by_bucket.get(bucket)
+            if targets is None:
+                continue
+            identity = (change.key, change.ref)
+            if identity in targets:
+                continue
+            retained_targets += 1
+            if retained_targets > _COMMON_REPLAY_HOT_TARGET_LIMIT:
+                return {}
+            targets.add(identity)
+
+        prepared: dict[int, _CommonReplayHotBucket] = {}
+        remaining_pages = _COMMON_REPLAY_HOT_PAGE_LIMIT
+        for bucket, targets in targets_by_bucket.items():
+            hot = self._prepare_common_replay_hot_bucket(
+                bucket, targets, page_limit=remaining_pages
+            )
+            if hot is None:
+                continue
+            prepared[bucket] = hot
+            remaining_pages -= len(hot.pages.pages)
+        return prepared
+
+    def _uses_canonical_live_hot_hooks(self) -> bool:
+        """Return whether this store retains every physical hook the fast path replaces.
+
+        Unlike replay, this path does not replace ``apply`` or ``commit``.  A vector
+        store may therefore keep its outer commit semantics while reusing these
+        inherited canonical physical hooks.
+        """
+        resolved: list[object] = []
+        for name in _LIVE_HOT_HOOK_NAMES:
+            hook = getattr(self, name)
+            resolved.append(getattr(hook, "__func__", hook))
+        return tuple(resolved) == _CANONICAL_LIVE_HOT_HOOKS
+
     @staticmethod
     def _page_insert_capacity(page: Page) -> int:
         """Return the largest payload one additional slot can hold after compaction."""
@@ -3335,8 +3487,11 @@ class IndexStore:
         ``_bucket_pages`` remains the structure-only door used by full walks. Point reads and
         scalar writes already know their key, so paying a second pin pass over every page cannot
         reveal a fresher authority: their surrounding exact-view/commit fences decide freshness.
-        This fused pass retains chain order, slot order, both termination guards and full
-        per-slot validation whenever matching was requested.
+        This fused pass retains chain order, slot order and both termination guards.  Validation
+        is deliberately interleaved: if an early entry and a later page structure are both
+        corrupt, the entry is reported first instead of the later structure; both outcomes remain
+        fail-closed and precede mutation.  ``first_matching_page`` then keeps later pages
+        structure-only, matching the former ``_find_entry`` decode boundary.
         """
         if isinstance(bucket, bool) or not isinstance(bucket, int):
             raise GrafxIndexError(
@@ -3625,6 +3780,11 @@ class ProximityIndex(IndexStore):
             for entry in self._stable_entries(read_lsn)
             if entry_visible(entry, snapshot)
         )
+
+
+_CANONICAL_LIVE_HOT_HOOKS = tuple(
+    getattr(IndexStore, name) for name in _LIVE_HOT_HOOK_NAMES
+)
 
 
 _TableIdentity = tuple[int, str]
@@ -5699,6 +5859,31 @@ class IndexManager:
                 )
         return tuple(records)
 
+    def _commit_under_write_authority(
+        self, txn: StagingTransaction, csn: Csn
+    ) -> int:
+        """Commit through the private door owned by the fully fenced transaction path.
+
+        The surrounding transaction manager already holds its participant section, writer lease
+        and cross-process ``COMMIT_SECTION``. A context-local seal carries only that authority
+        through ordinary/custom ``commit`` overrides; it cannot leak to a direct low-level call
+        in another thread or survive success/failure.
+        """
+        authority = _LiveCommitAuthority(
+            seal=_LIVE_COMMIT_AUTHORITY_SEAL,
+            manager=self,
+            txn=txn,
+        )
+        token = _LIVE_COMMIT_AUTHORITY.set(authority)
+        try:
+            return self.commit(txn, csn)
+        finally:
+            # Context copies retain this same scope object. Revoke it before resetting the
+            # current context so no delayed task can inherit a still-valid capability.
+            authority.active = False
+            authority.store = None
+            _LIVE_COMMIT_AUTHORITY.reset(token)
+
     def commit(self, txn: StagingTransaction, csn: Csn) -> int:
         """Apply, on every index, what this transaction staged, and return how many changes moved.
 
@@ -5722,9 +5907,23 @@ class IndexManager:
         staged_tables = {
             index.definition.table_id for index in indexes if observations[index]
         }
+        authority = _LIVE_COMMIT_AUTHORITY.get()
+        authorised_scope = authority if (
+            isinstance(authority, _LiveCommitAuthority)
+            and authority.active
+            and authority.seal is _LIVE_COMMIT_AUTHORITY_SEAL
+            and authority.manager is self
+            and authority.txn is txn
+        ) else None
         for index in indexes:
             observed = observations[index]
-            moved = index.commit(txn, csn)
+            if authorised_scope is not None:
+                authorised_scope.store = index
+            try:
+                moved = index.commit(txn, csn)
+            finally:
+                if authorised_scope is not None:
+                    authorised_scope.store = None
             identity = (
                 index.definition.table_id,
                 index.definition.table_name,
