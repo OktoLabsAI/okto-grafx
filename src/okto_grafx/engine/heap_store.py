@@ -474,7 +474,7 @@ class TableExtent:
         )
 
     @classmethod
-    def decode(cls, raw: bytes) -> TableExtent:
+    def decode(cls, raw: bytes | memoryview) -> TableExtent:
         """Parse a directory entry from the header page of the heap."""
         if len(raw) != DIRECTORY_ENTRY_SIZE:
             raise GrafxCorruptionDetected(
@@ -588,6 +588,8 @@ class HeapStore:
         "_catalog",
         "_file",
         "_tail_cache",
+        "_extent_slots",
+        "_extent_slots_epoch",
         "_bootstrapped_epoch",
     )
 
@@ -610,6 +612,12 @@ class HeapStore:
         # cache of this instance and of nothing else: the durable hint on page 0 is what a cold
         # start and another process read (A40.3).
         self._tail_cache: dict[int, tuple[PageIndex, int, int]] = {}
+        # Directory slots are stable within one header image.  Remembering the slot removes
+        # the three page-zero directory walks an inserted row otherwise pays (find, identity
+        # update and tail-hint update).  The entry remains only a hint: every use reads the
+        # current slot view and verifies its table-id prefix before decoding it.
+        self._extent_slots: dict[int, SlotId] = {}
+        self._extent_slots_epoch: tuple[int | None, int] | None = None
         # Internal operations may reuse a successful header proof only while the exact page
         # view it proved remains current. The public predicate never trusts this memo.
         self._bootstrapped_epoch: int | None = None
@@ -659,15 +667,21 @@ class HeapStore:
         """
         storage = self._pool.storage
         if not storage.exists(self._file) or storage.page_count(self._file) == 0:
-            self._bootstrapped_epoch = None
+            self._set_bootstrapped_epoch(None)
             return False
         with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
             if page.is_pristine():
-                self._bootstrapped_epoch = None
+                self._set_bootstrapped_epoch(None)
                 return False
             self._require_header_page(page)
-        self._bootstrapped_epoch = self._pool.derived_epoch(self._file)
+        self._set_bootstrapped_epoch(self._pool.derived_epoch(self._file))
         return True
+
+    def _set_bootstrapped_epoch(self, epoch: int | None) -> None:
+        """Move the header proof and invalidate hints derived under another proof."""
+        if self._bootstrapped_epoch != epoch:
+            self._invalidate_extent_slots()
+        self._bootstrapped_epoch = epoch
 
     def bootstrap(self) -> None:
         """Create the heap file and reserve its header page if that has not happened yet."""
@@ -750,7 +764,12 @@ class HeapStore:
         trusts what it derived. Clearing the cache here as well would answer the same question a
         second time and make the first answer impossible to test (A34).
         """
-        return apply_page_image(self._pool, self._file, page_index, image)
+        applied = apply_page_image(self._pool, self._file, page_index, image)
+        if applied:
+            # Even a non-header image moves derived_epoch.  Drop the slot hints eagerly so a
+            # replay can never leave a memo carrying an older epoch until the next lookup.
+            self._invalidate_extent_slots()
+        return applied
 
     # --- writing ---------------------------------------------------------------------------
 
@@ -2348,19 +2367,72 @@ class HeapStore:
         # skip. And the caller has already settled the room with the identical can_fit predicate
         # this insert uses, on a page that never accumulates compactable gaps, so PageFullError
         # cannot come back from here either.
-        header_page.insert_slot(extent.encode())
+        slot = header_page.insert_slot(extent.encode())
+        self._sync_extent_slots_epoch()
+        self._extent_slots[extent.table_id] = slot
 
     def _find_extent(self, table_id: int) -> TableExtent | None:
         """Return the directory entry of the table, or None when the table has no page yet."""
         self._require_bootstrapped()
+        self._sync_extent_slots_epoch()
         with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as header_page:
-            for slot, payload in header_page.iter_slots():
+            cached = self._extent_slots.get(table_id)
+            if cached is not None:
+                payload = self._extent_payload_at(header_page, cached, table_id)
+                if payload is not None:
+                    return self._require_first_page(TableExtent.decode(payload))
+                self._extent_slots.pop(table_id, None)
+            for slot, payload in header_page.iter_slot_views():
                 if slot < EXTENT_FIRST_SLOT:
                     continue
-                extent = TableExtent.decode(payload)
-                if extent.table_id == table_id:
-                    return self._require_first_page(extent)
+                if self._extent_table_id(payload) != table_id:
+                    continue
+                extent = self._require_first_page(TableExtent.decode(payload))
+                self._extent_slots[table_id] = slot
+                return extent
         return None
+
+    @staticmethod
+    def _extent_table_id(payload: bytes | memoryview) -> int:
+        """Read only an extent's table-id prefix, while retaining the format length guard."""
+        if len(payload) != DIRECTORY_ENTRY_SIZE:
+            raise GrafxCorruptionDetected(
+                f"A heap directory entry is {DIRECTORY_ENTRY_SIZE} bytes; got {len(payload)}.",
+                field="directory_entry",
+                value=len(payload),
+            )
+        return _DESCRIPTOR.unpack_from(payload)[0]
+
+    @classmethod
+    def _extent_payload_at(
+        cls, header_page: Page, slot: SlotId, table_id: int
+    ) -> memoryview | None:
+        """Return a verified cached slot view, or None when the hint became stale."""
+        if (
+            slot < EXTENT_FIRST_SLOT
+            or slot >= header_page.slot_count
+            or header_page.is_slot_free(slot)
+        ):
+            return None
+        payload = header_page.slot_view(slot)
+        if cls._extent_table_id(payload) != table_id:
+            return None
+        return payload
+
+    def _sync_extent_slots_epoch(self) -> None:
+        """Invalidate directory hints whenever their page view generation changes."""
+        identity = (
+            self._bootstrapped_epoch,
+            self._pool.derived_epoch(self._file),
+        )
+        if self._extent_slots_epoch != identity:
+            self._extent_slots.clear()
+            self._extent_slots_epoch = identity
+
+    def _invalidate_extent_slots(self) -> None:
+        """Forget every directory hint and its page-view identity."""
+        self._extent_slots.clear()
+        self._extent_slots_epoch = None
 
     def _require_first_page(self, extent: TableExtent) -> TableExtent:
         """Refuse a directory entry whose chain would end before it starts.
@@ -2399,13 +2471,25 @@ class HeapStore:
     def _write_extent(self, extent: TableExtent) -> None:
         """Replace the directory entry of a table on the header page."""
         self._require_bootstrapped()
+        self._sync_extent_slots_epoch()
         with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as header_page:
-            for slot, payload in header_page.iter_slots():
+            cached = self._extent_slots.get(extent.table_id)
+            if cached is not None:
+                payload = self._extent_payload_at(header_page, cached, extent.table_id)
+                if payload is not None:
+                    TableExtent.decode(payload)
+                    header_page.update_slot(cached, extent.encode())
+                    return
+                self._extent_slots.pop(extent.table_id, None)
+            for slot, payload in header_page.iter_slot_views():
                 if slot < EXTENT_FIRST_SLOT:
                     continue
-                if TableExtent.decode(payload).table_id == extent.table_id:
-                    header_page.update_slot(slot, extent.encode())
-                    return
+                if self._extent_table_id(payload) != extent.table_id:
+                    continue
+                TableExtent.decode(payload)
+                header_page.update_slot(slot, extent.encode())
+                self._extent_slots[extent.table_id] = slot
+                return
             raise GrafxCorruptionDetected(
                 f"Table {extent.table_id} has no directory entry on the header page of "
                 f"{self._file!r}, so its extent cannot be updated.",
@@ -2424,6 +2508,7 @@ class HeapStore:
             with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
                 self._require_header_page(page)
             return
+        self._invalidate_extent_slots()
         if not self.is_bootstrapped():
             raise GrafxCorruptionDetected(
                 f"The heap file {self._file!r} has no header page; call bootstrap() first.",
