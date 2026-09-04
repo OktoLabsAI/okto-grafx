@@ -1303,7 +1303,10 @@ def _intent_table_ids(engine: QueryEngine, txn: object) -> frozenset[int]:
     Row intents are private to the transaction passed to :meth:`QueryEngine.execute`, so this
     set is owner-only by construction. Even an insert later cancelled by a delete keeps the
     table dirty until commit: planning from the raw intents preserves transaction budgets and
-    avoids making plan safety depend on a second, planner-local reduction rule.
+    avoids making plan safety depend on a second, planner-local reduction rule. The engine may
+    replace the transaction's plain intent list with its revision-tracking subtype; existing
+    intents are immutable, structural rewrites force a full rebuild, and append-only growth is
+    scanned once. Repeated calls may therefore return the same immutable snapshot object.
     """
     identified = _revisioned_txn_memo(engine, txn)
     if identified is None:
@@ -1330,7 +1333,6 @@ def _intent_table_ids(engine: QueryEngine, txn: object) -> frozenset[int]:
         memo.dirty_snapshot = frozenset()
     table_ids = memo.dirty_table_ids
     start = memo.dirty_cursor
-    changed = False
     for position in range(start, len(intents)):
         intent = intents[position]
         table_id = getattr(getattr(intent, "table", None), "table_id", None)
@@ -1339,11 +1341,9 @@ def _intent_table_ids(engine: QueryEngine, txn: object) -> frozenset[int]:
             and not isinstance(table_id, bool)
             and table_id > 0
         ):
-            before = len(table_ids)
             table_ids.add(table_id)
-            changed = changed or len(table_ids) != before
     memo.dirty_cursor = len(intents)
-    if changed or memo.dirty_snapshot != table_ids:
+    if memo.dirty_snapshot != table_ids:
         memo.dirty_snapshot = frozenset(table_ids)
     return memo.dirty_snapshot
 
