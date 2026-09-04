@@ -143,6 +143,7 @@ class Catalog:
         "_indexes",
         "_indexes_by_key",
         "_index_definitions_by_table",
+        "_active_index_definitions_memo",
     )
 
     def __init__(self) -> None:
@@ -158,6 +159,7 @@ class Catalog:
         self._index_definitions_by_table: dict[
             tuple[int, str], tuple[CatalogIndexDefinition, ...]
         ] = {}
+        self._active_index_definitions_memo: tuple[IndexDefinition, ...] | None = None
 
     # --- reading ---------------------------------------------------------------------------
 
@@ -204,6 +206,9 @@ class Catalog:
         can install the same authority deterministically.
         """
 
+        memo = self._active_index_definitions_memo
+        if memo is not None:
+            return memo
         definitions = (
             definition
             for table in self.tables()
@@ -211,12 +216,14 @@ class Catalog:
                 table.table_id, table_name=table.name
             )
         )
-        return tuple(
+        projected = tuple(
             sorted(
                 definitions,
                 key=lambda definition: definition.registry_key,
             )
         )
+        self._active_index_definitions_memo = projected
+        return projected
 
     def active_index_definitions_for(
         self, table_id: int, *, table_name: str | None = None
@@ -424,6 +431,7 @@ class Catalog:
         self._required_capabilities = frozenset(
             (*self._required_capabilities, HEAP_RECLAIM_V1_CAPABILITY)
         )
+        self._active_index_definitions_memo = None
         return self
 
     def enable_wal_record_v2(self) -> Catalog:
@@ -433,6 +441,7 @@ class Catalog:
         self._required_capabilities = frozenset(
             (*self._required_capabilities, WAL_RECORD_V2_CAPABILITY)
         )
+        self._active_index_definitions_memo = None
         return self
 
     def replace_index_definition(
@@ -806,6 +815,7 @@ class Catalog:
         self._indexes_by_key = by_key
         self._indexes = by_name
         self._index_definitions_by_table = by_table
+        self._active_index_definitions_memo = None
 
     def _validated_index_authority(
         self,
@@ -945,10 +955,12 @@ class Catalog:
     def _install_table(self, table: TableDef) -> None:
         self._tables[table.name] = table
         self._tables_by_id[table.table_id] = table
+        self._active_index_definitions_memo = None
 
     def _install_space(self, space: EmbeddingSpaceDef) -> None:
         self._spaces[space.name] = space
         self._spaces_by_id[space.space_id] = space
+        self._active_index_definitions_memo = None
 
     def _install_loaded(
         self, tables: list[TableDef], spaces: list[EmbeddingSpaceDef]

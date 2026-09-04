@@ -92,6 +92,32 @@ def test_v1_projects_every_schema_derived_automatic_index() -> None:
     assert all(definition.artifact_nonce == 0 for definition in definitions)
 
 
+def test_complete_active_projection_is_memoized_until_authority_changes() -> None:
+    catalog = _catalog_with_vector_schema()
+
+    before = catalog.active_index_definitions()
+    assert catalog.active_index_definitions() is before
+
+    catalog.add_table(
+        TableDef(
+            table_id=2,
+            name="Project",
+            kind="node",
+            columns=(ColumnDef(name="id", type=ValueType.INT64, nullable=False),),
+            primary_key="id",
+        )
+    )
+    after_table = catalog.active_index_definitions()
+
+    assert after_table is not before
+    assert {definition.name for definition in after_table} == {
+        "pk_Person",
+        "pk_Project",
+        "vector_Person_minilm",
+    }
+    assert catalog.active_index_definitions() is after_table
+
+
 def test_v2_projects_only_active_persisted_exact_indexes_and_schema_vectors() -> None:
     catalog = _catalog_with_vector_schema()
     catalog.upgrade_index_catalog(
@@ -115,6 +141,24 @@ def test_v2_projects_only_active_persisted_exact_indexes_and_schema_vectors() ->
     assert active.file == "index/g_000000000000000b.idx"
     assert isinstance(definitions[1], VectorIndexDefinition)
     assert "pk_Person" not in {definition.name for definition in definitions}
+
+
+def test_v2_projection_memo_is_invalidated_by_generation_replacement() -> None:
+    catalog = _catalog_with_vector_schema()
+    catalog.upgrade_index_catalog((_exact("by_email", 1, 11, "active", buckets=128),))
+    before = catalog.active_index_definitions()
+    assert catalog.active_index_definitions() is before
+
+    catalog.replace_index_definition(
+        _exact("by_email", 1, 11, "stale", buckets=128)
+    )
+    after = catalog.active_index_definitions()
+
+    assert after is not before
+    assert tuple(definition.name for definition in after) == (
+        "vector_Person_minilm",
+    )
+    assert catalog.active_index_definitions() is after
 
 
 def test_v2_does_not_construct_an_inexpressible_legacy_exact_name() -> None:
