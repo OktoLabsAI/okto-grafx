@@ -1475,6 +1475,19 @@ class BufferPool:
         """
         self._wait_for_evictions(file)
         candidates = self._dirty_candidate_keys(file)
+        if len(candidates) > 1:
+            headers = tuple(key for key in candidates if key[1] == HEADER_PAGE_INDEX)
+            if headers:
+                # The former full-frame walk inherited LRU order, and callers deliberately
+                # touched publication headers last so readers could never observe a certificate
+                # before the pages it describes. D-10's candidate set removed that incidental
+                # ordering. Restore the explicit invariant in O(dirty candidates), without
+                # scanning the clean resident population the index exists to avoid. This also
+                # covers a database-wide flush: every file's page 0 follows all data pages.
+                candidates = (
+                    tuple(key for key in candidates if key[1] != HEADER_PAGE_INDEX)
+                    + headers
+                )
         probe = self._work_probe
         if probe is not None:
             try:

@@ -84,6 +84,30 @@ def test_multi_pin_candidate_survives_flush_and_a_late_second_mutation() -> None
     assert not any(pool._dirty_candidates.values())  # noqa: SLF001
 
 
+def test_file_flush_publishes_the_header_after_the_pages_it_describes() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics(), budget_pages=4)
+    _seed(pool, 3)
+    device.write_calls.clear()
+
+    with pool.pinned(FILE, 2) as data:
+        data.update_slot(0, b"data-before-certificate")
+    with pool.pinned(FILE, 0) as header:
+        header.update_slot(0, b"header-certificate")
+
+    assert pool.flush(FILE) == 2
+    assert device.write_calls[-1] == (FILE, 0)
+
+    device.write_calls.clear()
+    with pool.pinned(FILE, 2) as data:
+        data.update_slot(0, b"second-data-image")
+    with pool.pinned(FILE, 0) as header:
+        header.update_slot(0, b"second-certificate")
+
+    assert pool.flush() == 2
+    assert device.write_calls[-1] == (FILE, 0)
+
+
 def test_doomed_dirty_holder_is_indexed_until_discard_only_release() -> None:
     pool = make_pool(MemoryDevice(), RecordingMetrics(), budget_pages=2)
     _seed(pool, 1)
