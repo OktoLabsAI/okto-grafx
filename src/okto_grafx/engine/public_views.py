@@ -2162,6 +2162,9 @@ def _query_value_snapshot(
         return Uuid(raw=_builtin_bytes(_domain_field(source, Uuid, "raw"), field=field))
     if issubclass(value_type, VectorValue):
         return _vector_query_snapshot(value, reuse_exact_values=True)
+    exact_float_sequence = _exact_float_sequence_snapshot(value)
+    if exact_float_sequence is not None:
+        return exact_float_sequence
     # This is a result-only marker, not a storable Value. It is recognized nominally and
     # rebuilt here, outside page access, before a private engine object can reach the caller.
     from okto_grafx.engine.query_engine import _PathValue
@@ -2197,6 +2200,32 @@ def _query_value_snapshot(
         value=observed,
         reason="unsupported_value",
     )
+
+
+def _exact_float_sequence_snapshot(value: object) -> tuple[Value, ...] | None:
+    """Return a capability-free float sequence, or decline to the recursive copier.
+
+    Exact tuples are already immutable.  Exact lists are copied once before inspection so the
+    result never retains caller-owned mutable storage.  Length is checked on that owned copy as
+    well as before it, preventing a concurrent list growth from crossing the public list bound.
+    Every subclass and every non-float component keeps the established recursive path.
+    """
+    value_type = type(value)
+    if value_type is tuple:
+        if len(value) > MAX_LIST_ELEMENTS:
+            return None
+        detached = value
+    elif value_type is list:
+        if len(value) > MAX_LIST_ELEMENTS:
+            return None
+        detached = tuple(value)
+        if len(detached) > MAX_LIST_ELEMENTS:
+            return None
+    else:
+        return None
+    if all(type(item) is float for item in detached):
+        return cast(tuple[Value, ...], detached)
+    return None
 
 
 def _query_mapping_snapshot(
