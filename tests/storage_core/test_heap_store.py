@@ -2433,6 +2433,34 @@ def count_pins(pool: BufferPool, operation: Callable[[], object]) -> int:
     return taken["n"]
 
 
+def test_a_settled_inline_append_reuses_its_capacity_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The common append inserts through the pin that proved the tail had room."""
+    pool, store, table = build_store_under_budget(20)
+    store.insert(table, 1, (1, "first"), xmin=5)
+    store.observe_record_id(table, 3)
+    extent = store.extent_of(table)
+    assert extent is not None
+    tail = store._resolve_tail(table, extent)[0]
+    tail_pins = 0
+    original = BufferPool.pin
+
+    def counting(self: BufferPool, file: str, page_index: PageIndex) -> Page:
+        nonlocal tail_pins
+        if file == store.file and page_index == tail:
+            tail_pins += 1
+        return original(self, file, page_index)
+
+    monkeypatch.setattr(BufferPool, "pin", counting)
+
+    reference = store.insert_reserved(table, 2, (2, "second"), xmin=6)
+
+    assert reference.page == tail
+    assert tail_pins == 3
+    assert store.lookup(table, 2, at(100)).values == (2, "second")
+
+
 def refuse_pin_number(
     monkeypatch: pytest.MonkeyPatch, number: int, error: GrafxError
 ) -> dict[str, bool]:

@@ -2348,8 +2348,9 @@ class HeapStore:
         the hint was not where the count said. A count that is never right is worse than no count,
         because the next append walks zero hops and never revisits it (A40.2).
 
-        The frame cost of this method is proven by
-        test_the_extent_hint_is_written_with_the_tail_released and its consequence by
+        The common settled-hint cost is proven by
+        test_a_settled_inline_append_reuses_its_capacity_pin. The drift path's frame cost is
+        proven by test_the_extent_hint_is_written_with_the_tail_released and its consequence by
         test_a_retryable_refusal_never_multiplies_a_row, which reaches the three-frame shape the
         way a caller does: an update whose old version is not on the tail, over a hint an
         ordinary redo has left behind its chain (A85).
@@ -2371,16 +2372,25 @@ class HeapStore:
         fits = False
         with self._pool.pinned(self._file, tail) as page:
             fits = page.can_fit(len(content))
+            if (
+                fits
+                and extent.last_page == tail
+                and extent.page_count == length
+            ):
+                # The capacity decision and insertion concern the same validated resident page.
+                # With no directory hint to repair, retaining this pin removes a second page
+                # acquisition and also removes its otherwise unnecessary refusal window.
+                return RecordRef(page=tail, slot=page.insert_slot(content))
         if fits:
             if extent.last_page != tail or extent.page_count != length:
                 # The length the walk counted, never the stored count plus the distance
                 # travelled: adding to a count that describes wherever the hint happened to be
                 # is permanently wrong the moment the hint was not where the count said (A40.2).
                 self._write_extent(replace(extent, last_page=tail, page_count=length))
-            # Re-taken with the hint settled. This pin can still refuse -- it can evict a dirty
-            # page, and the write-back is where the device speaks -- and it refuses with nothing
-            # of this row on any page. Once it is held, insert_slot touches only the pinned
-            # frame, so the row cannot half-arrive.
+            # Re-taken only after repairing a stale hint. This pin can still refuse -- it can
+            # evict a dirty page, and the write-back is where the device speaks -- and it refuses
+            # with nothing of this row on any page. Once held, insert_slot touches only the
+            # pinned frame, so the row cannot half-arrive.
             with self._pool.pinned(self._file, tail) as page:
                 return RecordRef(page=tail, slot=page.insert_slot(content))
         fresh = self._pool.allocate(self._file, int(PageType.HEAP))
