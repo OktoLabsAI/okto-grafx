@@ -555,6 +555,7 @@ class VectorHnswIndex(ProximityIndex):
         "_neighbours",
         "_ef_construction",
         "_ef_search",
+        "_compact_vectors",
         "_guard",
         "_refresh",
         "_snapshot",
@@ -584,6 +585,7 @@ class VectorHnswIndex(ProximityIndex):
         neighbours: int = DEFAULT_NEIGHBOURS,
         ef_construction: int = DEFAULT_EF_CONSTRUCTION,
         ef_search: int = DEFAULT_EF_SEARCH,
+        _compact_vectors: bool = False,
         guard: GraphGuard | None = None,
         refresh: Callable[[str, object], None] | None = None,
     ) -> None:
@@ -606,6 +608,7 @@ class VectorHnswIndex(ProximityIndex):
         self._neighbours = neighbours
         self._ef_construction = ef_construction
         self._ef_search = search_width
+        self._compact_vectors = _compact_vectors
         self._guard: GraphGuard = _UnguardedBuild() if guard is None else guard
         self._refresh = refresh
         # The published picture, or None while there is none. Replaced by ONE assignment under
@@ -1053,6 +1056,13 @@ class VectorHnswIndex(ProximityIndex):
                 seed=self._seed ^ self._space_id,
                 neighbours=self._neighbours,
                 ef_construction=self._ef_construction,
+                _component_typecode=(
+                    "f"
+                    if self._compact_vectors and self._storage_dtype == "float32"
+                    else "d"
+                    if self._compact_vectors
+                    else None
+                ),
             ),
             node_of_entry={},
             entry_of_node={},
@@ -1686,6 +1696,11 @@ class VectorEngine:
             neighbours=self._neighbours,
             ef_construction=self._ef_construction,
             ef_search=self._ef_search,
+            # D-13H is intentionally selected only by the already-explicit NumPy adapter.
+            # The pure oracle keeps tuple iteration because the immutable-buffer view cost is a
+            # material regression there.  This changes derived residency only; space bytes and
+            # every durable/index identity remain exactly the same.
+            _compact_vectors=self._math.name == "numpy",
             guard=self._guard,
             refresh=self._refresh_heap_view,
         )

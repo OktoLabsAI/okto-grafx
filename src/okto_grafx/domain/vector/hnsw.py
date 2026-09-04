@@ -35,6 +35,7 @@ id, so no result depends on the iteration order of a set or a dictionary.
 
 from __future__ import annotations
 
+from array import array
 from bisect import insort
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -167,6 +168,7 @@ class HnswGraph:
         "_neighbours",
         "_neighbours_zero",
         "_ef_construction",
+        "_component_typecode",
         "_random",
         "_level_scale",
         "_values",
@@ -188,17 +190,33 @@ class HnswGraph:
         seed: int,
         neighbours: int = DEFAULT_NEIGHBOURS,
         ef_construction: int = DEFAULT_EF_CONSTRUCTION,
+        _component_typecode: str | None = None,
     ) -> None:
-        """Build an empty graph whose shape is decided by the seed and the neighbour count."""
+        """Build an empty graph whose shape is decided by the seed and the neighbour count.
+
+        ``_component_typecode`` is an engine-only residency optimization.  The ordinary public
+        construction keeps tuples exactly as before; an engine that already selected the NumPy
+        vector adapter may ask for ``f`` or ``d`` storage.  Compact components are owned as
+        immutable bytes, and every call into host ``VectorMath`` receives a fresh read-only view,
+        so releasing that view cannot poison the graph retained for a later search.
+        """
         self._math = math
         self._prepare = math.prepare if isinstance(math, PreparedVectorMath) else None
         self._metric = metric
         self._neighbours = _require_positive("neighbours", neighbours)
         self._neighbours_zero = self._neighbours * 2
         self._ef_construction = _require_positive("ef_construction", ef_construction)
+        if _component_typecode not in (None, "f", "d"):
+            raise GrafxConfigurationError(
+                "A compact vector graph stores either float32 ('f') or float64 ('d') "
+                f"components; got {_component_typecode!r}.",
+                field="component_typecode",
+                value=repr(_component_typecode),
+            )
+        self._component_typecode = _component_typecode
         self._random = SplitMix64(seed)
         self._level_scale = 1.0 / log(self._neighbours) if self._neighbours > 1 else 1.0
-        self._values: dict[int, tuple[float, ...]] = {}
+        self._values: dict[int, tuple[float, ...] | bytes] = {}
         self._levels: dict[int, int] = {}
         self._links: list[dict[int, list[int]]] = [{}]
         self._chain_next: dict[int, int] = {}
@@ -248,15 +266,18 @@ class HnswGraph:
             ) from failure
 
     def values_of(self, node: int) -> tuple[float, ...]:
-        """Return the components stored for one node."""
+        """Return the components stored for one node as the established public tuple."""
         try:
-            return self._values[node]
+            stored = self._values[node]
         except KeyError as failure:
             raise GrafxConfigurationError(
                 f"The vector graph holds no node {node!r}.",
                 field="node",
                 value=repr(node),
             ) from failure
+        if isinstance(stored, tuple):
+            return stored
+        return tuple(self._view(stored))
 
     def neighbours_of(self, node: int, layer: int) -> tuple[int, ...]:
         """Return the neighbours of a node at one layer, chain edges included at layer zero.
@@ -300,8 +321,13 @@ class HnswGraph:
                 value=repr(node),
             )
         components = tuple(float(component) for component in values)
+        stored: tuple[float, ...] | bytes = components
+        if self._component_typecode is not None:
+            # ``array`` is only the transient packer.  Keeping its bytes, rather than the mutable
+            # array or a releasable memoryview, makes the resident component storage immutable.
+            stored = array(self._component_typecode, components).tobytes()
         level = self._draw_level()
-        self._values[node] = components
+        self._values[node] = stored
         self._levels[node] = level
         self._append_to_chain(node)
         while len(self._links) <= level:
@@ -310,7 +336,7 @@ class HnswGraph:
             self._entry_point = node
             self._top_level = level
             return
-        scorer = self._scorer(components)
+        scorer = self._scorer(self._components(node))
         current = self._entry_point
         for layer in range(self._top_level, level, -1):
             current = self._descend(scorer, current, layer)
@@ -420,7 +446,21 @@ class HnswGraph:
         level = int(-log(draw) * self._level_scale)
         return level if level < MAX_LEVEL else MAX_LEVEL
 
-    def _scorer(self, query: tuple[float, ...]) -> Callable[[int], float]:
+    def _view(self, stored: bytes) -> memoryview:
+        """Return an ephemeral read-only numeric view over one immutable component body."""
+        typecode = self._component_typecode
+        if (
+            typecode is None
+        ):  # pragma: no cover - guarded by the bytes-only compact invariant
+            raise AssertionError("compact HNSW bytes require a component typecode")
+        return memoryview(stored).cast(typecode)
+
+    def _components(self, node: int) -> Sequence[float]:
+        """Return one node's tuple or a fresh compact view safe for a host to release."""
+        stored = self._values[node]
+        return stored if isinstance(stored, tuple) else self._view(stored)
+
+    def _scorer(self, query: Sequence[float]) -> Callable[[int], float]:
         """Return a function scoring stored nodes against one query, prepared once (VEC-4).
 
         A traversal scores one query against every node it visits, so whatever depends on the
@@ -429,13 +469,12 @@ class HnswGraph:
         scored through ``score`` exactly as before. Both paths answer the same number for the
         same pair, and a test holds them to identical graphs, rankings and traversal counts.
         """
-        values = self._values
         if self._prepare is not None:
             prepared = self._prepare(query, self._metric)
-            return lambda node: prepared(values[node])
+            return lambda node: prepared(self._components(node))
         math = self._math
         metric = self._metric
-        return lambda node: math.score(query, values[node], metric)
+        return lambda node: math.score(query, self._components(node), metric)
 
     def _link(self, left: int, right: int, layer: int) -> None:
         """Connect two nodes at one layer and trim both neighbourhoods back to capacity."""
@@ -464,7 +503,7 @@ class HnswGraph:
         capacity = self._capacity(layer)
         if peers is None or len(peers) <= capacity:
             return
-        scorer = self._scorer(self._values[node])
+        scorer = self._scorer(self._components(node))
         ranked: list[tuple[float, int]] = []
         for peer in peers:
             _insert_ranked(ranked, scorer(peer), peer, capacity)
