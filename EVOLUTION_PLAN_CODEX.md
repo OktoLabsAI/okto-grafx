@@ -327,6 +327,36 @@
   O ganho é remover payload inline morto e evitar seu decode futuro; páginas históricas, diretórios
   de slot e tamanho do arquivo permanecem, portanto ainda existem percursos `O(history pages)`.
 
+  **Item 12 / WAL — recorte definitivo concluído e publicado.** O commit `24f2f63` implementa o
+  contrato convergido na revisão adversarial: compressão zlib nível 1 da imagem completa de
+  `WRITE_PAGE`, sob `format_version=2` e capability persistente `wal_record_v2`. A ativação é
+  explícita, one-way e
+  ocorre em transação anterior inteiramente v1; somente commits posteriores podem emitir v2, e
+  apenas quando a codificação completa fica estritamente menor. O prefixo `(file, page_index)`
+  permanece legível sem inflate, a descompressão é limitada a `MAX_PAGE_SIZE`, o CRC do record
+  cobre bytes comprimidos e o page codec valida a imagem expandida antes de mutação.
+  `max_wal_batch_bytes` cobra os records finais comprimidos. Para eliminar feedback entre tamanho,
+  roll, `SEGMENT_HEADER` e CSN materializado, todo lote raw que já exigiria roll permanece v1;
+  compressão só encurta lotes cujo terminal já foi provado no segmento atual. Tipos/flags v2
+  obrigatórios desconhecidos recusam read/append/recycle/recovery sem alterar o WAL, enquanto
+  capability de catálogo mantém o downgrade fechado mesmo depois de reciclar os records v2.
+
+  O escopo não se move: block-delta fica futuro e exige pre-image/base LSN, FPW pós-checkpoint e
+  redo de quatro vias; chunk físico é **NO-GO** neste protocolo porque kill entre `append_log`s
+  deixa effects completos sem COMMIT, estado que recovery corretamente trata como ambíguo;
+  WAL fisiológico também é **NO-GO** por duplicar semântica de mutação no redo. O contrato e seus
+  prós/contras estão em
+  [`WAL_PAGE_COMPRESSION_V1.md`](docs/architecture/WAL_PAGE_COMPRESSION_V1.md). O parecer Nexus
+  `hof_44e3743219b2476a95ecc02d00ac0eb6` foi corrigido duas vezes no contraditório e verificado
+  PASS na revisão 3. A revisão da implementação
+  `hof_b192c61ffcea4297852c7b2b8f00064b` também foi verificada PASS depois de fechar a gramática
+  explícita de records desconhecidos `SKIPPABLE`; não há gate de performance nem etapa de
+  pre-image adicionada a este marco. O gate agrupado terminou em 1.496/1.496 casos verdes após
+  excluir nominalmente quatro falhas históricas reproduzidas fora do caminho alterado; os gates
+  focais, Ruff, `compileall` e `git diff --check` também ficaram verdes. Uma
+  amostra indicativa de uma transação de 50 linhas/3 páginas de 8 KiB mediu 31.510 bytes v1 contra
+  7.966 bytes finais (`-74,72%`, razão `3,96x`), sem elevar esse número a SLO ou critério de aceite.
+
 - **Run real do Pulse 0.3.3 na pasta padrão — reconstrução Grafx em andamento, SQLite preservado.**
   Antes da troca foi criado backup consistente do SQLite (`quick_check=ok`, zero violações de FK)
   e os artefatos Ladybug foram movidos, sem exclusão, para quarentena operacional. Os bindings de

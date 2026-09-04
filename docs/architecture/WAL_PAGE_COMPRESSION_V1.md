@@ -1,7 +1,7 @@
 # WAL page-image compression v1
 
-**Status:** accepted for `0.0.2`  
-**Scope:** full-page `WRITE_PAGE` records only  
+**Status:** accepted for `0.0.2`
+**Scope:** full-page `WRITE_PAGE` records only
 **Activation:** explicit, persistent and one way
 
 ## Decision

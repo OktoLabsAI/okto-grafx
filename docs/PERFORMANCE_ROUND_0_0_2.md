@@ -477,3 +477,43 @@ The expected gain is bounded and honest: dead tuple payload bytes disappear from
 pages, and future walks skip freed slots before header/tuple decoding. File length, historical page
 chains and slot directories remain, so this milestone reduces constants and resident payload but
 does not yet remove every `O(history pages)` path.
+
+## Item 12 / D-34 — full-page WAL compression v1
+
+Status: **completed and published on `feature/v0.0.2` as `24f2f63`**.
+
+The finite milestone is full-post-image compression, not delta or physiological redo. After an
+explicit v1-only transaction publishes catalog capability `wal_record_v2`, a later no-roll commit
+may encode a `WRITE_PAGE` as WAL v2 with REQUIRED + PAGE_IMAGE_ZLIB1 flags when zlib level 1 is
+strictly smaller. The file/page prefix stays clear for bounded CE-3 target extraction; full preflight
+uses bounded exact inflation and the ordinary page checksum before mutation. The final compressed
+record lengths are authoritative for `max_wal_batch_bytes`.
+
+Raw batches that require `SEGMENT_HEADER` remain v1. This avoids a size/roll/retarget feedback loop
+and preserves the exact terminal commit CSN without a new append protocol. Incompressible pages also
+fall back byte-exactly to v1. Unknown required v2 semantics refuse strict read, append, recycle and
+recovery as schema mismatch without changing WAL bytes. The catalog capability remains a downgrade
+fence after record recycling.
+
+The adversarial review retracted physical chunking: a real kill between multiple appends leaves
+complete effects without COMMIT, which current recovery intentionally refuses as ambiguous because
+effects may already have reached data pages. `_undo_append` covers returned exceptions, not process
+death. Chunking and physiological WAL are therefore NO-GO in this milestone. Block-delta is deferred
+until a separate ADR supplies pre-image/base-LSN authority, full-page-write checkpoint rules and the
+four-way idempotent redo decision. This decision is recorded in
+`docs/architecture/WAL_PAGE_COMPRESSION_V1.md` and verified Nexus handoff
+`hof_44e3743219b2476a95ecc02d00ac0eb6` revision 3. Performance ratios are evidence only, never an
+acceptance gate.
+
+An in-memory indicative sample with 8 KiB pages and one 50-row transaction produced three
+compressible page records: the final batch occupied 7,966 bytes versus 31,510 bytes for the same
+records with v1 full images, a 74.72% reduction (`3.96x` byte ratio). This sample is intentionally
+not a throughput claim or SLO; page occupancy and payload entropy determine the result, and segment
+roll batches keep the v1 size by contract.
+
+The grouped quality gate passed 1,496/1,496 selected cases after nominally deselecting four
+historical failures reproduced outside the changed path. Focused tests, Ruff, `compileall` and
+`git diff --check` also passed. Design handoff `hof_44e3743219b2476a95ecc02d00ac0eb6`
+revision 3 and implementation review `hof_b192c61ffcea4297852c7b2b8f00064b` were both verified
+PASS; the latter's final recommendation made unknown v2 records skippable only under the exact
+explicit `SKIPPABLE` grammar.
