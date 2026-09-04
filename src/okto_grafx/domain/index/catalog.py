@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
-import re
 
 from okto_grafx.domain.errors import GrafxIndexError
 from okto_grafx.domain.index.definition import (
@@ -46,7 +45,17 @@ IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY: str = "identity_secondary_indexes_v1"
 _MAX_U32: int = 0xFFFFFFFF
 _MAX_U64: int = 0xFFFFFFFFFFFFFFFF
 _IDENTITY_INDEX_PREFIX: str = "rid_t_"
-_GENERATION_LOGICAL_NAME = re.compile(r"g_[0-9a-f]{16}", re.IGNORECASE)
+_HEX_DIGITS: frozenset[str] = frozenset("0123456789abcdefABCDEF")
+
+
+def _is_generation_logical_name(name: str) -> bool:
+    """Return whether a logical name is reserved for a physical generation artifact."""
+
+    return (
+        len(name) == 18
+        and name[:2] in ("g_", "G_")
+        and all(character in _HEX_DIGITS for character in name[2:])
+    )
 
 
 def identity_index_name(table_id: object) -> str:
@@ -173,7 +182,7 @@ class CatalogIndexDefinition:
         """Validate the complete, canonically ordered logical authority."""
 
         require_index_name(self.name)
-        if _GENERATION_LOGICAL_NAME.fullmatch(self.name):
+        if _is_generation_logical_name(self.name):
             raise GrafxIndexError(
                 "Logical index names matching g_<16 hex digits> are reserved for physical "
                 "generation artifacts.",

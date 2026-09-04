@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Iterable
+from types import MappingProxyType
 from typing import NoReturn
 
 from okto_grafx.domain.errors import (
@@ -97,21 +98,31 @@ _WAL_RECORD_V2_BIT = 1 << 2
 _KNOWN_CAPABILITY_BITS = (
     _IDENTITY_SECONDARY_INDEXES_V1_BIT | _HEAP_RECLAIM_V1_BIT | _WAL_RECORD_V2_BIT
 )
-_CAPABILITY_TO_BIT = {
-    IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY: _IDENTITY_SECONDARY_INDEXES_V1_BIT,
-    HEAP_RECLAIM_V1_CAPABILITY: _HEAP_RECLAIM_V1_BIT,
-    WAL_RECORD_V2_CAPABILITY: _WAL_RECORD_V2_BIT,
-}
-_VISIBILITY_TO_TAG = {IndexVisibility.EXACT: 1}
-_TAG_TO_VISIBILITY = {value: key for key, value in _VISIBILITY_TO_TAG.items()}
-_DERIVATION_TO_TAG = {COLUMN_KEY_DERIVATION: 1, RECORD_ID_KEY_DERIVATION: 2}
-_TAG_TO_DERIVATION = {value: key for key, value in _DERIVATION_TO_TAG.items()}
-_STATE_TO_TAG = {
-    IndexGenerationState.BUILDING: 1,
-    IndexGenerationState.ACTIVE: 2,
-    IndexGenerationState.STALE: 3,
-}
-_TAG_TO_STATE = {value: key for key, value in _STATE_TO_TAG.items()}
+_CAPABILITY_TO_BIT = MappingProxyType(
+    {
+        IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY: _IDENTITY_SECONDARY_INDEXES_V1_BIT,
+        HEAP_RECLAIM_V1_CAPABILITY: _HEAP_RECLAIM_V1_BIT,
+        WAL_RECORD_V2_CAPABILITY: _WAL_RECORD_V2_BIT,
+    }
+)
+_VISIBILITY_TO_TAG = MappingProxyType({IndexVisibility.EXACT: 1})
+_TAG_TO_VISIBILITY = MappingProxyType(
+    {value: key for key, value in _VISIBILITY_TO_TAG.items()}
+)
+_DERIVATION_TO_TAG = MappingProxyType(
+    {COLUMN_KEY_DERIVATION: 1, RECORD_ID_KEY_DERIVATION: 2}
+)
+_TAG_TO_DERIVATION = MappingProxyType(
+    {value: key for key, value in _DERIVATION_TO_TAG.items()}
+)
+_STATE_TO_TAG = MappingProxyType(
+    {
+        IndexGenerationState.BUILDING: 1,
+        IndexGenerationState.ACTIVE: 2,
+        IndexGenerationState.STALE: 3,
+    }
+)
+_TAG_TO_STATE = MappingProxyType({value: key for key, value in _STATE_TO_TAG.items()})
 
 
 class Catalog:

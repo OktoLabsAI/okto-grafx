@@ -62,6 +62,7 @@ ALLOWED_STDLIB_MODULES: frozenset[str] = frozenset(
         "struct",
         "types",
         "typing",
+        "zlib",
     }
 )
 """The only modules the pure core may import. Anything else is mechanism or a dependency.
@@ -73,6 +74,10 @@ exactly the sense ``math`` and ``itertools`` are.
 ``types.MappingProxyType`` gives derived domain lookup tables an immutable, O(1) view without
 introducing I/O, time, randomness or a dependency on a mechanism layer.  The module is therefore
 pure under the same criterion as ``dataclasses`` and ``collections``.
+
+``zlib`` is the deterministic algorithm that defines the durable WRITE_PAGE v2 grammar. It has
+no I/O, time, randomness or platform decision, and keeping bounded inflate beside that grammar
+prevents an adapter from acquiring authority over WAL interpretation.
 
 ``uuid`` is deliberately absent: ``uuid4`` is unseeded randomness and ``uuid1`` reads the wall
 clock, both of which G2b and amendment A5 keep out of the domain. The identifier type is still
@@ -591,6 +596,7 @@ ACCEPTED_SOURCES: tuple[tuple[str, str, str], ...] = (
     ("collections submodule", DOMAIN_MODULE, "from collections import abc\n"),
     ("dataclasses", DOMAIN_MODULE, "from dataclasses import dataclass\n"),
     ("struct", DOMAIN_MODULE, "import struct\n"),
+    ("zlib", DOMAIN_MODULE, "import zlib\n"),
     ("hashlib", DOMAIN_MODULE, "from hashlib import sha256\n"),
     ("math", DOMAIN_MODULE, "from math import isfinite\n"),
     (
