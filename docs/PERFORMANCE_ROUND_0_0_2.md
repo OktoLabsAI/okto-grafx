@@ -982,3 +982,34 @@ component classes, unchanged caller-query validation, public scan/collaborator b
 vector-value ownership, NumPy parity and ranking invariants. The combined affected slices passed
 (`223` public/view cases and `31` NumPy cases), as did Ruff and diff-check. This batch changes no
 page, catalog or WAL format and no OCC, lock, publication, multiwriter or multireader rule.
+
+## Scale-removal batch 13 — compounding immutable hot paths
+
+Status: **completed in `69f9cea`, `40e7514`, `60850b5` and `0fa3406` after focused
+validation and adversarial concurrency review**.
+
+- NumPy scalar results are converted to a built-in `float` and checked by `math.isfinite`, avoiding
+  a redundant NumPy scalar dispatch. The alternating 256 x 64 HNSW build probe measured
+  `2.717 -> 2.274 s` (`1.195x`) with identical graph and search result.
+- Cold vector build now walks validated index headers and constructs each final located
+  `IndexEntry` once. Public `walk()`, verifier and reconciliation retain their complete DTO path.
+  At 2,048 entries over 231 pages, the header build input measured
+  `46.525 -> 18.589 ms` (`2.503x`).
+- Automatic index definitions are retained on their immutable `TableDef`, while each
+  `IndexManager` has a bounded 1,024-entry memo for complete definition/table provenance. The key
+  includes bucket count and artifact nonce, so DDL and rehash cannot inherit an answer. In a
+  public 50-table CREATE profile, automatic normalization calls fell `2,600 -> 50`, matcher calls
+  `2,550 -> 1,275`, and matcher cumulative time fell `0.170 -> 0.095 s` (`~44%` in that component).
+  No noisy end-to-end wall-clock claim is made.
+- NumPy cosine HNSW keeps an exact process-local norm per immutable stored-vector generation.
+  The first observation atomically returns the legacy score and the exact norm used; refusals
+  cache nothing. Hits validate backing identity, REMOVE invalidates, and a post-publication check
+  prevents a concurrent remove/reuse from retaining an orphan. Adapters without the optional
+  capability remain unchanged. Alternating probes measured `1.15–1.19x` on build and
+  `1.350x` on repeated 512 x 64 searches at `ef=320`, with identical topology, ranking and stats.
+
+Focused suites covered index corruption/provenance/DDL/rehash, cold graph ordering, NumPy parity,
+mutable queries, adapter fallback, compact views, deterministic remove/reuse re-entry and the
+exact check-to-publish thread race. Ruff and diff-check passed. All caches are bounded by their
+owner or by live graph nodes and carry only immutable process-local derivatives; no page, catalog
+or WAL format, OCC, lock publication, durability, multiwriter or multireader rule changed.
