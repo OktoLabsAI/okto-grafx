@@ -1102,3 +1102,47 @@ in the isolated scanner component. Twenty-four focused discriminants and 125 gro
 recovery cases passed, as did Ruff and diff-check. The adversarial review explicitly covered
 same-ref/different-key entries, validation order, duplicate detection, memory ownership and the
 absence of an `O(K)` inner lookup. No format, WAL, OCC, durability or concurrency rule changed.
+
+## Scale-removal batch 17 — immutable index metadata and live hot buckets
+
+Status: **completed in `d47eaec`, `3657c47` and `5fc25f0`; focused, grouped and
+multiprocess quality gates passed**.
+
+This batch was deliberately ordered from the cheapest reusable work to the structural hot-path
+change, so every later test and profile also benefits:
+
+- `IndexStore` now retains the immutable file name, definition digest and page type instead of
+  rebuilding them at each operation. In a 1,000-negative-lookup component profile, file-name and
+  digest recomputation accounted for about `0.076 s` of `0.929 s`, an estimated `8–11%` ceiling
+  for that lookup shape. This is a bounded per-store derivative, not storage authority.
+- Bucket lookup and scalar mutation now use one fused physical traversal. Lookup pins each bucket
+  page once. Mutation decodes entries only through the first matching page, as before, while still
+  walking every remaining page structurally before it mutates; cycle, page-type and page-count
+  checks therefore remain fail-closed. The focused negative-lookup probe moved
+  `1.454 -> 1.292 s` (`~1.13x`).
+- The ordinary transaction pipeline may now authorize a live common-index commit to prepare a
+  bounded ephemeral directory for buckets with at least two effects. It replaces repeated
+  `O(E*P)` bucket walks by `O(E+P)` preparation plus bounded target/first-fit operations, while
+  retaining global staged order. The capability is private, revocable and bound to the exact
+  manager, transaction object and store. Direct manager/store calls, copied expired contexts,
+  custom instance/class hooks, RESET, rebuild, stale and retry state all use the scalar path.
+  Vector HNSW retains its outer `commit` semantics and may reuse only the inherited canonical
+  physical hooks. The existing limits of 65,536 target identities, 16,384 pages and 16,384 buckets
+  cause a mutation-free decline; every page acquisition still passes through `BufferPool` and
+  `Page.insert_slot` remains the placement authority.
+
+Component estimates for the live directory are workload-sensitive: about `1.70x` for a mature
+5,000-entry index with a 1,000-effect/64-bucket batch, and about `9.16x`/`21.04x` for 250/1,000
+effects concentrated in one collision chain. They are not release gates or universal throughput
+claims. A separate public-path comparison from `c47117a` to `26df492` — therefore excluding all
+three commits in this batch — measured a `26.81 -> 17.50 s` phase sum (`1.53x`) over five
+alternating single-process rounds. Populate, full scan, key lookup, cold open/search and vector
+search improved; schema, reopen and checkpoint differences remained within noise.
+
+The live-path adversarial review first found two concrete blockers: instance-level hook overrides
+were not detected, and an immutable `ContextVar` tuple could remain authorized in a copied
+context. The promoted implementation resolves hooks on the instance through `__func__` and uses a
+shared mutable authority object revoked before the context reset. Nineteen focused discriminants,
+590 grouped index/transaction/recovery/vector cases and 15 multiprocess writer/fence cases passed,
+as did Ruff, compile and diff checks. No page/WAL/catalog format, OCC rule, durability order, writer
+lease or multiwriter/multireader premise changed.
