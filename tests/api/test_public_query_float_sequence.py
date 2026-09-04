@@ -20,7 +20,7 @@ def _snapshot(value: object, *, depth: int = 0):
 
 
 @pytest.mark.parametrize("values", [(0.0, -0.0, 1.25), ()])
-def test_exact_float_tuple_is_already_an_owned_capability_free_snapshot(
+def test_exact_float_tuple_is_already_a_capability_free_snapshot(
     values: tuple[float, ...],
 ) -> None:
     observed = _snapshot(values)
@@ -64,6 +64,16 @@ def test_exact_float_sequence_does_not_bypass_length_or_depth_bounds() -> None:
         "field": "parameters.vector",
         "value": MAX_LIST_ELEMENTS + 1,
         "limit": MAX_LIST_ELEMENTS,
+    }
+
+    assert _snapshot((0.0,), depth=MAX_VALUE_DEPTH - 1) == (0.0,)
+    assert _snapshot((), depth=MAX_VALUE_DEPTH) == ()
+    with pytest.raises(GrafxConfigurationError) as nested_child_error:
+        _snapshot((0.0,), depth=MAX_VALUE_DEPTH)
+    assert nested_child_error.value.details == {
+        "field": "parameters.vector[0]",
+        "value": MAX_VALUE_DEPTH + 1,
+        "limit": MAX_VALUE_DEPTH,
     }
 
     with pytest.raises(GrafxConfigurationError) as depth_error:
