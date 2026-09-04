@@ -820,3 +820,26 @@ the next isolated milestone**.
 Focused validation covered index storage, vector planner regimes, first-use concurrency and warm
 cross-process graph adoption, plus Ruff and diff checks. No page/WAL/catalog format, OCC,
 durability or multiwriter/multireader rule changed.
+
+## Scale-removal batch 7 — compact resident HNSW components
+
+Status: **the narrowed D-13H completed in `eebc497`; batch scoring remains a separate design**.
+
+- Engine-built HNSW graphs selected through the explicit NumPy adapter now retain each vector as
+  immutable native f32/f64 bytes instead of a tuple of boxed Python floats. Every math callback
+  receives a fresh read-only view, so a host releasing its borrowed view cannot poison later
+  searches. Public/default `HnswGraph`, the pure adapter, `VectorValue.values` and
+  `HnswGraph.values_of()` retain their tuple contract.
+- The pure engine deliberately does not compact: a short 64 x 128 comparison showed about 8.3%
+  slower build and 1.8% slower search. With NumPy at 128 x 384, compact residency reduced the
+  component/dict footprint from 1.513 to 0.199 MiB (`7.59x`), build from 0.934 to 0.629 s (`1.48x`)
+  and median search from 7.764 to 6.368 ms (`1.22x`), with identical graph shape and answers.
+- Tombstones keep their immutable body as traversal/snapshot bridges; physical removal and rebuild
+  release it under the existing graph lifecycle. Native-endian packing is process-local derived
+  state and never enters pages, WAL, catalog or cross-process identity.
+
+Independent focused validation passed 121 HNSW/prepared-scoring/visibility/concurrency/
+cross-process cases plus all 18 compact tests with real NumPy, Ruff, format and diff checks. An
+adversarial review additionally exercised warm-versus-rebuild f32 values, a prepared custom
+adapter and complete physical removal, finding no blocker. Full 8,192 x 384 evidence remains
+grouped with the following vector work rather than gating this component gain.
