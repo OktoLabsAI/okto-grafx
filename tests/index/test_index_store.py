@@ -412,6 +412,18 @@ def test_header_only_index_paths_match_the_full_walk_without_entry_dtos(
         sum(1 for entry in entries if entry.live),
     )
     expected_refs = tuple(entry.ref for entry in entries)
+    expected_headers = tuple(
+        (
+            entry.page,
+            entry.slot,
+            entry.ref.encode(),
+            entry.born_csn,
+            entry.dead_csn,
+            entry.versioned,
+            entry.key,
+        )
+        for entry in entries
+    )
 
     def forbidden(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("a header-only path constructed an IndexEntry DTO")
@@ -421,11 +433,12 @@ def test_header_only_index_paths_match_the_full_walk_without_entry_dtos(
 
     assert database.exact._entry_counts_from_headers() == expected_counts
     assert database.exact._entry_refs_from_headers() == expected_refs
+    assert database.exact._entry_headers() == expected_headers
 
 
 @pytest.mark.parametrize(
     "reader",
-    ["_entry_counts_from_headers", "_entry_refs_from_headers"],
+    ["_entry_counts_from_headers", "_entry_refs_from_headers", "_entry_headers"],
 )
 @pytest.mark.parametrize("damage", ["flags", "encoded_ref"])
 def test_header_only_index_paths_refuse_damage_in_any_slot(

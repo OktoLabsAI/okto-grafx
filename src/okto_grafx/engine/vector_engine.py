@@ -1069,10 +1069,25 @@ class VectorHnswIndex(ProximityIndex):
             record_of_node={},
             mark=mark,
         )
-        for entry in sorted(
-            self.walk(), key=lambda item: (item.born_csn, item.ref.encode())
+        for header in sorted(
+            self._entry_headers(),
+            key=lambda item: (item.born_csn, item.encoded_ref),
         ):
-            self._install(picture, entry)
+            # The header walk has already validated every persisted image before this first
+            # fallible heap/vector operation.  Construct the final graph-owned DTO once, with
+            # its physical location, instead of decode + ``located_at`` constructing it twice.
+            self._install(
+                picture,
+                IndexEntry(
+                    key=header.key,
+                    ref=RecordRef.decode(header.encoded_ref),
+                    versioned=header.versioned,
+                    born_csn=header.born_csn,
+                    dead_csn=header.dead_csn,
+                    page=header.page,
+                    slot=header.slot,
+                ),
+            )
         return picture
 
     def _retire(self, picture: _GraphSnapshot) -> None:

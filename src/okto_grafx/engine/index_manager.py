@@ -55,7 +55,7 @@ import hashlib
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TypeVar
+from typing import NamedTuple, TypeVar
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -221,6 +221,18 @@ class IndexFinding:
             "lsn": self.lsn,
             "index": self.index,
         }
+
+
+class _IndexEntryHeader(NamedTuple):
+    """Validated index metadata materialised without constructing an ``IndexEntry``."""
+
+    page: PageIndex
+    slot: SlotId
+    encoded_ref: int
+    born_csn: Csn
+    dead_csn: Csn
+    versioned: bool
+    key: bytes
 
 
 @dataclass(slots=True)
@@ -2427,6 +2439,43 @@ class IndexStore:
                 IndexEntry.decode(payload).located_at(page_index, slot)
                 for slot, payload in page.iter_slot_views()
             )
+
+    def _entry_headers(self) -> tuple[_IndexEntryHeader, ...]:
+        """Materialise every validated entry header in canonical walk order.
+
+        This is the build-only middle ground between scalar/ref-only scans and the public full
+        :meth:`walk`.  It validates the same page and entry images in bucket/chain/slot order,
+        copies only the key which must outlive the page pin, and retains the encoded reference
+        until the consumer actually needs an ``IndexEntry``.  Returning a tuple keeps every pin
+        inside this method and preserves the full-walk rule that all index images are validated
+        before a caller starts fallible heap or vector work.
+        """
+        headers: list[_IndexEntryHeader] = []
+        for bucket in range(self._definition.bucket_count):
+            for page_index in self._bucket_pages(bucket):
+                with self._pool.pinned(self.file, page_index) as page:
+                    self._require_index_page(page, page_index)
+                    for slot, image in page.iter_slot_views():
+                        (
+                            validated,
+                            encoded_ref,
+                            born_csn,
+                            dead_csn,
+                            versioned,
+                        ) = _validated_image(image)
+                        _require_decodable_ref(encoded_ref)
+                        headers.append(
+                            _IndexEntryHeader(
+                                page=page_index,
+                                slot=slot,
+                                encoded_ref=encoded_ref,
+                                born_csn=born_csn,
+                                dead_csn=dead_csn,
+                                versioned=versioned,
+                                key=bytes(validated[INDEX_ENTRY_HEADER_SIZE:]),
+                            )
+                        )
+        return tuple(headers)
 
     def _entry_counts_from_headers(self) -> tuple[int, int]:
         """Return ``(stored, live)`` after validating every entry without DTOs.

@@ -261,6 +261,29 @@ def test_exact_scan_and_space_metrics_use_header_only_index_paths(
     )
 
 
+def test_cold_graph_build_uses_headers_and_preserves_entry_order(
+    metrics: RecordingMetrics, clock: StepClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-17: a build validates headers first and constructs each final entry only once."""
+    database, _corpus = _corpus_database(metrics, clock, threshold=0)
+    index = database.engine.index("space")
+    expected = tuple(
+        sorted(index.walk(), key=lambda entry: (entry.born_csn, entry.ref.encode()))
+    )
+    index.invalidate_graph()
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("the header build used decode + located_at")
+
+    monkeypatch.setattr(IndexEntry, "decode", classmethod(forbidden))
+    monkeypatch.setattr(IndexEntry, "located_at", forbidden)
+
+    picture = index.snapshot()
+
+    assert tuple(picture.entry_of_node.values()) == expected
+    assert picture.graph.is_connected_at_layer_zero()
+
+
 def test_the_two_regime_labels_are_the_bounded_domain_of_the_metric_label() -> None:
     """The label domain is closed, so a third regime would have to be declared before it exists."""
     assert REGIMES == {"exact", "approximate"} == {REGIME_EXACT, REGIME_APPROXIMATE}
