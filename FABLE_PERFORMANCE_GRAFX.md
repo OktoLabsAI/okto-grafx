@@ -1046,3 +1046,86 @@ Ordenado por dependência. Cada item diz o instrumento **real** (CLI verificada 
 | `phase2\p1_edge_vs_n.json` | `645603d237cfb15ed885b278f145e15a5e8e2c15bb76dbf7515e3de09e8567f7` |
 | `phase2\p1_lookup_proto_8000.json` | `98495050bc655fd488912318df5886bdc40282a0bb7cbe40877d5a18dc25a39a` |
 | `phase2\p1_micro.out` | `9b9c78ce6090308c3109d71af776dae8cf94b509a06c15fbc671ff2838940e77` |
+
+---
+
+## 15. Rodada de escala (2026-09-04) — parâmetros do HNSW e determinismo da figura
+
+Registro pedido pelo usuário. Base do levantamento: `de24b7b`; o repositório se moveu durante a
+rodada (até `dbdc07b`), e onde a premissa venceu isso está dito. Método: workflow de 12 agentes
+(6 descoberta + 6 refutação adversarial cruzada) para a varredura de escala, mais 8 agentes
+(4 desenhos + 4 adversários) para a questão dos parâmetros, mais 5 lentes semânticas para o
+pushdown de arestas. Repositório somente leitura para todos; scripts no scratchpad.
+
+### 15.1 Estado atual: três constantes inalcançáveis
+
+| Parâmetro | Valor | Onde | Configurável |
+|---|---|---|---|
+| `ef_construction` | 200 | `domain/vector/hnsw.py` | **Não** |
+| `neighbours` | 16 | `domain/vector/hnsw.py` | **Não** |
+| semente do índice | `DEFAULT_INDEX_SEED` | `engine/vector_engine.py:152` | **Não** |
+| `ef_search` | 320 | idem | Sim, `vector_ef_search` |
+| limiar exato/aproximado | 4096 | `runtime/config.py:290` | Sim |
+| buckets de índice | 64 (máx. 4096) | `domain/index/keys.py:44-56` | Sim, no `CREATE INDEX` |
+
+`api/assembly.py` nunca passa os três primeiros ao `VectorEngine`; eles são alcançados por
+omissão. Os índices **automáticos** nunca consultam cardinalidade e nascem sempre com 64 buckets.
+
+### 15.2 O achado que muda a pergunta: a figura fria e a quente divergem
+
+`ProximityIndex._build(mark)` insere em ordem canônica (`sorted(walk(), key=(born_csn,
+ref.encode()))`, vector_engine.py:1038-1064). Mas o caminho quente não reconstrói: `commit`
+(:1240-1256) e `apply` (:1258-1276) chamam `_note` por mudança encenada, inserindo na figura
+**viva em ordem de encenação**, e depois `_certify` avança a marca. Como o HNSW é sensível à
+ordem de inserção, **dois handles na mesma marca certificada podem ter grafos diferentes** e
+responder rankings diferentes para a mesma consulta no mesmo snapshot. Isso já é verdade hoje,
+sem parametrizar nada.
+
+Não é necessariamente defeito: `CONTRACT.md:576-580` diz que o recall não tem campo de
+configuração em tempo de execução e que **não é honesto prometer recall para uma consulta
+individual**, e nomeia `vector_ef_search` como o controle de esforço — que já é por processo.
+O docstring de `HnswGraph` promete determinismo para "a mesma semente e as mesmas inserções", e
+"as mesmas inserções" inclui a ordem, portanto é literalmente correto. **A lacuna está no nível
+do engine**, e é ali que ela precisa ser escrita: mesma marca e mesmo conjunto NÃO implicam
+mesma figura. O Codex assumiu essa documentação.
+
+### 15.3 Quatro desenhos avaliados, quatro mortos
+
+| Opção | Veredito do adversário | Por quê |
+|---|---|---|
+| A — campo no catálogo, imutável, com bit de capacidade | morre | O default de compatibilidade referencia a própria constante, então todo espaço existente continua preso a ela; e o bit só existe em catálogo v2, enquanto um banco nasce em v1. Só se justifica como **pré-requisito de persistir o grafo**, não como botão. |
+| B — derivar de campos já presentes no catálogo | morre | Não dá alavanca nenhuma ao usuário, e a fórmula vira parte do build: duas versões do Grafx divergiriam sobre o mesmo banco sem bit de capacidade para detectar. |
+| C — configuração por processo com prova de acordo | morre | O conjunto de entradas **não é função** de `built_through_lsn`, então a "prova" certificaria a proposição errada. Nenhum dos três mecanismos de prova existentes (registro de leitores, lease de escritor, digest de cabeçalho) serve. |
+| D — heurística na criação, gravada uma vez | morre | No `CREATE` a cardinalidade é zero e o espaço existe antes de qualquer tabela declarar coluna nele. A metade que resolve é a opção A; a metade exclusiva de D quebra a compatibilidade preguiçosa. |
+
+### 15.4 As duas posições, para decisão do usuário
+
+- **Fable:** expor `ef_construction` e `neighbours` como controle local do processo, do mesmo
+  jeito que `vector_ef_search` já é exposto, com teto superior (hoje `_require_positive` só
+  exige >= 1) e com o `HNSW_FROZEN` do arnês independente. Custo zero de formato. Fundamento:
+  o contrato já recusa prometer recall por consulta, e a concordância entre processos já não
+  existe na forma que se supunha (15.2).
+- **Codex:** não adicionar parâmetro sem perfil válido em 8.192 × 384, porque um botão exposto
+  sem evidência convida a girá-lo e o custo cai em recall, que é o que menos se percebe quando
+  degrada. Primeiro o perfil e a recalibração deliberada; só então decidir entre política local
+  limitada e identidade persistida.
+
+A diferença é de **sequência**, não de mérito. Condição de entrada acordada: perfil completo
+8.192 × 384 medido nos dois valores e recongelamento deliberado do `HNSW_FROZEN`.
+
+### 15.5 Nota de calibração (VEC-2 retirado)
+
+A medição que sugeria `ef_construction=64` equivalente a 200 (recall@10 0,915 contra 0,910) foi
+feita com 2.000 vetores uniformes em dimensão 64 — faixa em que a travessia visita 97,6% do
+grafo. Com a busca praticamente exaustiva, a qualidade das vizinhanças não influencia o recall,
+então o experimento está **cego para o efeito que deveria medir**. Retirado da lista de ações.
+`bench/harness/recall_worker.py:96` congela o valor e `recall.py:861-863` exige igualdade do
+bloco, então mexer nele invalida a evidência C13 inteira (perfil completo ~53 min por família).
+
+### 15.6 Item relacionado, sem custo de formato
+
+`CREATE INDEX` já aceita `bucket_count` e `expected_cardinality` (parser.py:384-413) e o valor
+é persistido no cabeçalho. O que falta é os índices **automáticos** consultarem alguma
+cardinalidade em vez de nascerem sempre com 64. Ressalva medida: `walk()` é O(buckets + entradas)
+e **piora** com diretório esparso (73,5 ms com 1.024 buckets e só 1.000 entradas), e `walk()` é o
+caminho de `verify('indexes')`, de `reconcile` e da reconstrução.
