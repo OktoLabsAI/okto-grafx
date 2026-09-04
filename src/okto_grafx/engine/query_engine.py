@@ -296,20 +296,6 @@ _OWNER_LANDING_RESULT_BASE_BYTES: int = 512
 _OWNER_LANDING_MISS_BYTES: int = 192
 _OWNER_LANDING_PAYLOAD_MULTIPLIER: int = 16
 
-# A nested NodeScan replays one statement-local, fully validated logical table view rather than
-# decoding the same snapshot pages once per outer row.  This cache never changes logical work:
-# every replayed row is still emitted, counted and filtered at its original operator.  Both caps
-# are deliberately internal cost bounds; exhaustion drops the partial cache and resumes the
-# canonical physical scan without refusing the query.  A statement with an explicit query-memory
-# budget does not use this separate acceleration budget at all.
-# Like every snapshot cache, a failure introduced into physical storage only after the first
-# complete scan may therefore remain unobserved until the next statement; every failure the
-# establishing scan actually reads still propagates before the cache can become replayable.
-_NODE_SCAN_REPLAY_MAX_BYTES: int = 16 * 1024 * 1024
-_NODE_SCAN_REPLAY_MAX_ENTRIES: int = 32_768
-_NODE_SCAN_REPLAY_ENTRY_BYTES: int = 512
-_NODE_SCAN_REPLAY_PAYLOAD_MULTIPLIER: int = 16
-
 QUERY_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
     for name in (
@@ -1044,8 +1030,6 @@ class _Context:
     # their source is a NodeScan. The set is derived once from the immutable physical plan; every
     # blocking or semantically wider shape is absent and keeps the canonical grouped scan.
     short_circuit_traversals: frozenset[int] = frozenset()
-    node_scan_replay_bytes: int = 0
-    node_scan_replay_entries: int = 0
 
     def already_ended(self, reference: object) -> bool:
         """Answer whether this exact version has already been told to stop.
@@ -1274,26 +1258,6 @@ class _Context:
                 operator=node.label,
             )
         self.intermediate_rows[identity] = observed
-
-    def try_reserve_node_scan_replay(self, bytes_: int) -> bool:
-        """Reserve bounded statement-local replay memory without refusing the query."""
-
-        next_bytes = self.node_scan_replay_bytes + bytes_
-        next_entries = self.node_scan_replay_entries + 1
-        if (
-            next_bytes > _NODE_SCAN_REPLAY_MAX_BYTES
-            or next_entries > _NODE_SCAN_REPLAY_MAX_ENTRIES
-        ):
-            return False
-        self.node_scan_replay_bytes = next_bytes
-        self.node_scan_replay_entries = next_entries
-        return True
-
-    def release_node_scan_replay(self, *, bytes_: int, entries: int) -> None:
-        """Release a partial replay after optional cache admission was abandoned."""
-
-        self.node_scan_replay_bytes -= bytes_
-        self.node_scan_replay_entries -= entries
 
     def admit_traversal_expansion(self) -> None:
         """Charge one candidate edge before traversal performs work derived from it."""
@@ -4545,20 +4509,8 @@ def _node_scan(
     snapshot = context.snapshot
     changed, inserted = _transaction_row_view(context, node.table, include_held=False)
     single_source = isinstance(node.child, SingleRow)
-    replay_enabled = not single_source and engine._query_memory_budget_bytes is None
-    replay_complete = False
-    replay: list[tuple[object, HeapVersion]] = []
-    replay_bytes = 0
     for row in engine._rows(node.child, context):
-        if replay_complete:
-            yield from _replay_node_rows_for_input(
-                node=node,
-                input_row=row,
-                context=context,
-                replay=replay,
-            )
-            continue
-        for produced in _logical_node_rows_for_input(
+        yield from _logical_node_rows_for_input(
             engine,
             table=node.table,
             variable=node.variable,
@@ -4568,68 +4520,7 @@ def _node_scan(
             changed=changed,
             inserted=inserted,
             single_source=single_source,
-        ):
-            if replay_enabled:
-                binding = produced.bindings[node.variable]
-                assert isinstance(binding, RowBinding)
-                charge = _node_scan_replay_charge(node.table, binding.version)
-                if charge is None or not context.try_reserve_node_scan_replay(charge):
-                    context.release_node_scan_replay(
-                        bytes_=replay_bytes, entries=len(replay)
-                    )
-                    replay.clear()
-                    replay_bytes = 0
-                    replay_enabled = False
-                else:
-                    try:
-                        replay.append((binding.ref, binding.version))
-                    except MemoryError:
-                        context.release_node_scan_replay(bytes_=charge, entries=1)
-                        context.release_node_scan_replay(
-                            bytes_=replay_bytes, entries=len(replay)
-                        )
-                        replay.clear()
-                        replay_bytes = 0
-                        replay_enabled = False
-                    else:
-                        replay_bytes += charge
-            yield produced
-        if replay_enabled:
-            replay_complete = True
-
-
-def _node_scan_replay_charge(table: TableDef, version: HeapVersion) -> int | None:
-    """Return a conservative decoded-row charge, or decline optional retention."""
-
-    try:
-        payload_bytes = len(encode_tuple(table, version.values))
-    except (GrafxError, MemoryError):
-        return None
-    return (
-        _NODE_SCAN_REPLAY_ENTRY_BYTES
-        + payload_bytes * _NODE_SCAN_REPLAY_PAYLOAD_MULTIPLIER
-    )
-
-
-def _replay_node_rows_for_input(
-    *,
-    node: NodeScan,
-    input_row: _Row,
-    context: _Context,
-    replay: Sequence[tuple[object, HeapVersion]],
-) -> Iterator[_Row]:
-    """Bind one completed logical scan view to a later outer row in canonical order."""
-
-    for reference, version in replay:
-        bindings = dict(input_row.bindings)
-        bindings[node.variable] = RowBinding(
-            variable=node.variable,
-            table=node.table,
-            ref=reference,
-            version=version,
         )
-        context.count("rows_scanned")
-        yield _Row(bindings=bindings)
 
 
 def _logical_node_rows_for_input(
