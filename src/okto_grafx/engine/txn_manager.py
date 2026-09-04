@@ -2435,16 +2435,19 @@ class TransactionManager:
             ):
                 changes = self._read_view_changes(previous, token)
                 catalog_may_have_changed = changes is None or changes.catalog_changed
-            # A complete CE-3 interval that contains no catalog page is sufficient only for a
-            # composition that has closed every non-WAL catalog mutation door.  Legacy/direct
-            # compositions keep catalog.dat unfenced on every view, preserving their historical
-            # visibility rule.  First/own/same-token views and every declined CE-3 proof likewise
+            # A WAL-only composition may retain a resident catalog when its concrete base did
+            # not move, when this manager demonstrably published the new view, or when a complete
+            # CE-3 interval proves that no catalog page changed.  Legacy/direct compositions
+            # keep catalog.dat unfenced on every view, preserving their historical visibility
+            # rule.  A first view and every moved foreign view whose CE-3 proof declines likewise
             # retain the conservative whole-file refresh.
+            catalog_view_is_proved = (
+                isinstance(previous, _ReadViewToken)
+                and (previous == token or effective_own)
+            ) or (changes is not None and not changes.catalog_changed)
             unfenced_catalog = (
                 None
-                if self._catalog_changes_are_wal_logged
-                and changes is not None
-                and not changes.catalog_changed
+                if self._catalog_changes_are_wal_logged and catalog_view_is_proved
                 else self._file_ids.catalog_file
             )
             if allow_writeback:

@@ -209,6 +209,58 @@ def test_wal_only_catalog_composition_retains_catalog_for_proved_dml_delta() -> 
     assert stack.pool.cache_drop_epoch(stack.catalog.file) == drop_epoch
 
 
+def test_wal_only_catalog_composition_retains_catalog_for_same_token() -> None:
+    stack = build_stack(catalog_changes_are_wal_logged=True)
+    token = _ReadViewToken(last_committed_lsn=0, checkpoint_lsn=0)
+    stack.pool.begin_read_view(token, unfenced_file=stack.catalog.file)
+    resident = stack.catalog.catalog
+    drop_epoch = stack.pool.cache_drop_epoch(stack.catalog.file)
+
+    may_have_changed = stack.manager._establish_read_view(
+        CommitState(last_committed_lsn=0, last_csn=0, checkpoint_lsn=0),
+        own=False,
+    )
+
+    assert may_have_changed is False
+    assert stack.pool.cache_drop_epoch(stack.catalog.file) == drop_epoch
+    assert stack.catalog.catalog is resident
+
+
+def test_wal_only_catalog_composition_retains_catalog_for_effective_own_view() -> None:
+    stack = build_stack(catalog_changes_are_wal_logged=True)
+    previous = _ReadViewToken(last_committed_lsn=0, checkpoint_lsn=0)
+    stack.pool.begin_read_view(previous, unfenced_file=stack.catalog.file)
+    resident = stack.catalog.catalog
+    drop_epoch = stack.pool.cache_drop_epoch(stack.catalog.file)
+
+    class _ForbiddenWal:
+        def read_bounded(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("an effective own read view scanned WAL")
+
+    stack.manager._wal = _ForbiddenWal()
+    may_have_changed = stack.manager._establish_read_view(
+        CommitState(last_committed_lsn=2, last_csn=2, checkpoint_lsn=0),
+        own=True,
+    )
+
+    assert may_have_changed is False
+    assert stack.pool.cache_drop_epoch(stack.catalog.file) == drop_epoch
+    assert stack.catalog.catalog is resident
+
+
+def test_wal_only_catalog_composition_refreshes_its_unbased_first_view() -> None:
+    stack = build_stack(catalog_changes_are_wal_logged=True)
+    drop_epoch = stack.pool.cache_drop_epoch(stack.catalog.file)
+
+    may_have_changed = stack.manager._establish_read_view(
+        CommitState(last_committed_lsn=0, last_csn=0, checkpoint_lsn=0),
+        own=False,
+    )
+
+    assert may_have_changed is True
+    assert stack.pool.cache_drop_epoch(stack.catalog.file) > drop_epoch
+
+
 def test_legacy_catalog_composition_keeps_the_conservative_unfenced_refresh() -> None:
     stack = build_stack()
     previous = _ReadViewToken(last_committed_lsn=0, checkpoint_lsn=0)
@@ -235,6 +287,20 @@ def test_legacy_catalog_composition_keeps_the_conservative_unfenced_refresh() ->
 
     stack.manager._establish_read_view(
         CommitState(last_committed_lsn=2, last_csn=2, checkpoint_lsn=0),
+        own=False,
+    )
+
+    assert stack.pool.cache_drop_epoch(stack.catalog.file) > drop_epoch
+
+
+def test_legacy_catalog_composition_refreshes_even_for_the_same_token() -> None:
+    stack = build_stack()
+    token = _ReadViewToken(last_committed_lsn=0, checkpoint_lsn=0)
+    stack.pool.begin_read_view(token, unfenced_file=stack.catalog.file)
+    drop_epoch = stack.pool.cache_drop_epoch(stack.catalog.file)
+
+    stack.manager._establish_read_view(
+        CommitState(last_committed_lsn=0, last_csn=0, checkpoint_lsn=0),
         own=False,
     )
 
@@ -333,6 +399,42 @@ def test_unknown_record_checkpoint_movement_and_unregistered_index_decline_ce3()
         )
         is None
     )
+
+
+def test_wal_only_catalog_composition_refreshes_when_ce3_declines() -> None:
+    stack = build_stack(catalog_changes_are_wal_logged=True)
+    previous = _ReadViewToken(last_committed_lsn=0, checkpoint_lsn=0)
+    stack.pool.begin_read_view(previous, unfenced_file=stack.catalog.file)
+    drop_epoch = stack.pool.cache_drop_epoch(stack.catalog.file)
+    stack.manager._wal = _BoundedWal(
+        (
+            WalRecord(record_type=int(WalRecordType.BEGIN), lsn=1, epoch=1, txn_id=1),
+            WalRecord(record_type=int(WalRecordType.COMMIT), lsn=2, epoch=1, txn_id=1),
+        )
+    )
+
+    may_have_changed = stack.manager._establish_read_view(
+        CommitState(last_committed_lsn=2, last_csn=2, checkpoint_lsn=0),
+        own=False,
+    )
+
+    assert may_have_changed is True
+    assert stack.pool.cache_drop_epoch(stack.catalog.file) > drop_epoch
+
+
+def test_wal_only_catalog_composition_refreshes_after_checkpoint_movement() -> None:
+    stack = build_stack(catalog_changes_are_wal_logged=True)
+    previous = _ReadViewToken(last_committed_lsn=2, checkpoint_lsn=0)
+    stack.pool.begin_read_view(previous, unfenced_file=stack.catalog.file)
+    drop_epoch = stack.pool.cache_drop_epoch(stack.catalog.file)
+
+    may_have_changed = stack.manager._establish_read_view(
+        CommitState(last_committed_lsn=2, last_csn=2, checkpoint_lsn=2),
+        own=False,
+    )
+
+    assert may_have_changed is True
+    assert stack.pool.cache_drop_epoch(stack.catalog.file) > drop_epoch
 
 
 def test_malformed_bounded_wal_collaborator_declines_ce3() -> None:
