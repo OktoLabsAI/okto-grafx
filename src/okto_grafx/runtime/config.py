@@ -40,6 +40,7 @@ __all__ = [
     "DESCRIPTOR_REVALIDATION_MODES",
     "RECOVERY_POLICIES",
     "METRICS_SINKS",
+    "PAGE_CODEC_SELECTORS",
     "VECTOR_MATH_SELECTORS",
     "MEMORY_PATH",
     "DEFAULT_OPENMETRICS_DESTINATION",
@@ -86,6 +87,9 @@ RECOVERY_POLICIES: frozenset[str] = frozenset({"replay", "refuse"})
 
 METRICS_SINKS: frozenset[str] = frozenset({"noop", "openmetrics", "json"})
 """The metrics adapters the composition root knows how to build."""
+
+PAGE_CODEC_SELECTORS: frozenset[str] = frozenset({"pure", "numpy"})
+"""Which byte-identical page codec to bind for this database instance."""
 
 VECTOR_MATH_SELECTORS: frozenset[str] = frozenset({"auto", "pure", "numpy"})
 """Which vector math adapter to bind: detect, force the pure oracle, or force the accelerator."""
@@ -279,6 +283,7 @@ class DatabaseConfig:
     metrics: str = "noop"
     metrics_destination: str | None = None
     allow_remote_metrics: bool = False
+    codec: str = dataclass_field(default="pure", kw_only=True)
     vector_math: str = "auto"
     checksum: str = "auto"
     vector_exact_scan_threshold: int = 4096
@@ -402,6 +407,7 @@ class DatabaseConfig:
         for field, choices in (
             ("recovery_policy", RECOVERY_POLICIES),
             ("metrics", METRICS_SINKS),
+            ("codec", PAGE_CODEC_SELECTORS),
             ("vector_math", VECTOR_MATH_SELECTORS),
             ("checksum", CHECKSUM_SELECTORS),
             ("descriptor_revalidation", DESCRIPTOR_REVALIDATION_MODES),

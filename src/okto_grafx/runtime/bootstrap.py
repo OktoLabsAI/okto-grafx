@@ -397,8 +397,21 @@ def build_clock(context: PortContext) -> object:
 
 
 def build_codec(context: PortContext) -> object:
-    """Build the page codec (C1) at the page size this database is configured for."""
-    return PageCodecV1(context.config.page_size)
+    """Build the selected byte-identical page codec at this database's page size."""
+
+    selector = context.config.codec
+    if selector == "pure":
+        return PageCodecV1(context.config.page_size)
+    try:
+        from okto_grafx.adapters.codec_numpy import NumpyPageCodecV1
+    except ImportError as failure:
+        raise GrafxConfigurationError(
+            "The NumPy page codec needs the optional 'accel' extra; install "
+            "okto-grafx[accel] or configure codec='pure'.",
+            field="codec",
+            value=selector,
+        ) from failure
+    return NumpyPageCodecV1(context.config.page_size)
 
 
 def build_metrics(context: PortContext) -> object:

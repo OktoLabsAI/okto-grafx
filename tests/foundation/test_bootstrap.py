@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import sys
 from pathlib import Path
 from types import MappingProxyType
 
@@ -49,6 +50,16 @@ def test_building_the_default_registry_fills_every_required_slot() -> None:
             )
     finally:
         bootstrap.release_ports(registry)
+
+
+def test_an_explicit_numpy_page_codec_never_silently_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "okto_grafx.adapters.codec_numpy", None)
+    with pytest.raises(GrafxConfigurationError) as raised:
+        bootstrap.build_default_registry(DatabaseConfig(path=":memory:", codec="numpy"))
+    assert raised.value.details == {"field": "codec", "value": "numpy"}
+    assert "accel" in raised.value.message
 
 
 def test_the_local_storage_descriptor_budget_comes_from_database_config(

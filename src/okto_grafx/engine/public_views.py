@@ -67,6 +67,7 @@ from okto_grafx.domain.model.value import (
     VectorValue,
 )
 from okto_grafx.domain.page.layout import MAX_U32, MAX_U64
+from okto_grafx.domain.page.checksum import crc32c_implementation
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.query.analysis import Aggregation
 from okto_grafx.domain.query.ast import (
@@ -279,10 +280,12 @@ class ClockView:
 
 @dataclass(frozen=True, slots=True)
 class CodecView:
-    """Immutable public identity of the configured page codec."""
+    """Page codec per instance and the effective process-wide checksum provider."""
 
     format_version: int
     page_size: int
+    implementation: str = "PageCodecV1"
+    process_checksum_implementation: str = "pure"
 
 
 @dataclass(frozen=True, slots=True)
@@ -3648,7 +3651,16 @@ def _clock_view(clock: Any) -> ClockView:
 
 def _codec_view(codec: Any, page_size: int) -> CodecView:
     """Snapshot codec identity without exposing encode or decode capabilities."""
-    return CodecView(_builtin_int(codec.format_version), _builtin_int(page_size))
+    return CodecView(
+        _builtin_int(codec.format_version),
+        _builtin_int(page_size),
+        _builtin_type_name(codec),
+        _builtin_text(
+            crc32c_implementation(),
+            field="process_checksum_implementation",
+            empty=False,
+        ),
+    )
 
 
 def _component_view(role: str, component: object) -> ComponentView:

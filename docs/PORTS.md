@@ -180,6 +180,12 @@ a best-effort page would turn detected damage into a wrong answer.
 | Adapter | Module | Use |
 |---|---|---|
 | **`PageCodecV1`** *(default)* | `adapters/codec_v1.py` | Format version 1: a CRC-32C in the first four bytes, an even sequence counter in a durable image, the page type, and the slot directory |
+| `NumpyPageCodecV1` | `adapters/codec_numpy.py` | Explicit `codec="numpy"`; same format-v1 bytes, with hybrid vectorized slot-directory packing and validation; requires `[accel]` |
+
+The selector is per database and defaults to `"pure"`. There is no automatic selection. A native
+request without NumPy refuses rather than silently measuring the pure adapter. The immutable
+`database.codec` receipt reports both the concrete page codec and the effective process-wide
+process-wide checksum implementation (`process_checksum_implementation`).
 
 ---
 

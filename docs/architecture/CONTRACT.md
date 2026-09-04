@@ -16,7 +16,7 @@ this contract is the single agreed realization of them.
 | G1 | **All product surfaces are en-US**: class names, function names, exception messages, metric names & descriptions, CLI help, docstrings. | Code review + `tests/test_language_surface.py` |
 | G2 | **Hexagonal**: `okto_grafx/domain/**` and `okto_grafx/engine/**` contain NO mechanism. Forbidden: `open()`, `os`, `pathlib` I/O, `mmap`, `socket`, `sys.platform`, `os.name`, `threading`, `time.time`, `time.monotonic`, `random` (unseeded), any third-party import. **D-26 diagnostic exception:** only the exact, unaliased import `okto_grafx.engine.txn_manager <- time.perf_counter_ns` is allowed, solely for outcome-neutral commit timings; it never supplies lease/liveness, storage, WAL or visibility decisions. This avoids invoking the host `Clock` under an exclusive window. | `tests/test_import_boundary.py`, budget **ZERO**, fails closed |
 | G2b | **No `random` in the domain.** Anything needing randomness (HNSW level assignment, sampling) uses `okto_grafx.domain.rand.SplitMix64` — an explicitly seeded, deterministic, reproducible PRNG owned by C1. Reproducibility is a spec requirement (seeded interleavings, seeded corpora), not a preference. | `tests/test_import_boundary.py` |
-| G3 | **Pure-Python core, single universal wheel.** Runtime deps: stdlib only. `numpy` only under extra `[accel]`, imported only in `adapters/vectormath_numpy.py`. `google-crc32c` only under extra `[accel]`, imported only in `adapters/checksum_native.py`, and admitted only after the acceptance corpus proves it byte-identical to the pure reference (its successful proof is memoized per process under the provider's strong identity, strictly bounded per closed slot and serialized in the adapter, D-29). `ladybug` only under extra `[bench]`. | `pyproject.toml` + import-boundary test |
+| G3 | **Pure-Python core, single universal wheel.** Runtime deps: stdlib only. `numpy` only under extra `[accel]`, imported only in the closed adapter set `adapters/vectormath_numpy.py` and `adapters/codec_numpy.py`. `google-crc32c` only under extra `[accel]`, imported only in `adapters/checksum_native.py`, and admitted only after the acceptance corpus proves it byte-identical to the pure reference (its successful proof is memoized per process under the provider's strong identity, strictly bounded per closed slot and serialized in the adapter, D-29). `ladybug` only under extra `[bench]`. | `pyproject.toml` + import-boundary test |
 | G4 | **Windows and POSIX are equal citizens.** No test may be silently skipped on a family; a family-specific test must be explicitly marked `@pytest.mark.platform_specific` and have a counterpart. **Extended by A32 (runtime observation, not static prediction) and REPLACED in its attribution rule by A54 (three registered markers: `platform_specific` with a family condition + counterpart, `optional_dependency("<module>")`, `pending`/`xfail`).** | `tests/test_platform_parity.py` |
 | G5 | **Fail-closed ports**: an unfilled port slot refuses startup with `GrafxPortNotConfigured`. No silent default, no no-op fallback (except the explicitly selected `NoOpMetricsSink`). | `runtime/registry.py` + tests |
 | G6 | **No sanctioned operation destroys the main data file.** Recovery, quarantine, recycling and purge never move/rename/delete `heap.dat`, `catalog.dat` or `index/*`. | `tests/test_main_file_untouched.py` |
@@ -77,6 +77,7 @@ okto_grafx/
 │   │   ├── coordination_local.py   # C3
 │   │   ├── clock_system.py         # C3
 │   │   ├── codec_v1.py             # C1
+│   │   ├── codec_numpy.py          # C1 [accel], byte-identical v1
 │   │   ├── metrics_noop.py         # C8
 │   │   ├── metrics_openmetrics.py  # C8 (+ tiny stdlib http publisher)
 │   │   ├── metrics_json.py         # C8
@@ -421,6 +422,7 @@ class DatabaseConfig:
     metrics: str = "noop"                  # "noop" | "openmetrics" | "json"
     metrics_destination: str | None = None
     allow_remote_metrics: bool = False
+    codec: str = dataclass_field(default="pure", kw_only=True)  # "pure" | "numpy"
     vector_math: str = "auto"              # "auto" | "pure" | "numpy"
     vector_exact_scan_threshold: int = 4096   # calibrated (SPEC-VEC FR-5/FR-8)
     vector_ef_search: int = 320                # calibrated HNSW beam, 1..1_048_576
@@ -1908,7 +1910,7 @@ runtime result shape.
   **`MetricsSink.register`** (C8, duplicate/conflict detection at registration). G7 is read as naming
   both.
 * **A52** numpy's home is **`[accel]`** (G3 / SPEC-VEC TR-6 / IR-2 -- the optional accelerator behind
-  the `VectorMath` port). Its additional presence in `[bench]` satisfies SPEC-M1 TR-9 because the
+  the `VectorMath` and byte-identical `PageCodec` ports). Its additional presence in `[bench]` satisfies SPEC-M1 TR-9 because the
   harness needs it too, and is a convenience rather than a second home. No contradiction exists in
   `pyproject.toml`; this records which clause is authoritative if they ever diverge.
   `google-crc32c` shares that home: it is the optional accelerator behind the checksum slot

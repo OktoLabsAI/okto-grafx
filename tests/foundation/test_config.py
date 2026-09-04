@@ -25,6 +25,7 @@ from okto_grafx.runtime.config import (
     METRICS_SINKS,
     MIN_PAGE_SIZE,
     MINIMUM_STORE_FRAMES,
+    PAGE_CODEC_SELECTORS,
     RECOVERY_POLICIES,
     VECTOR_MATH_SELECTORS,
     DatabaseConfig,
@@ -61,6 +62,7 @@ def test_defaults_match_the_contract() -> None:
     assert config.metrics == "noop"
     assert config.metrics_destination is None
     assert config.allow_remote_metrics is False
+    assert config.codec == "pure"
     assert config.vector_math == "auto"
     assert config.vector_exact_scan_threshold == 4096
     assert config.vector_ef_search == 320
@@ -396,6 +398,11 @@ def test_every_vector_math_selector_is_accepted(selector: str) -> None:
     assert DatabaseConfig(path=":memory:", vector_math=selector).vector_math == selector
 
 
+@pytest.mark.parametrize("selector", sorted(PAGE_CODEC_SELECTORS))
+def test_every_page_codec_selector_is_accepted(selector: str) -> None:
+    assert DatabaseConfig(path=":memory:", codec=selector).codec == selector
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -406,6 +413,9 @@ def test_every_vector_math_selector_is_accepted(selector: str) -> None:
         ("metrics", "prometheus"),
         ("metrics", ""),
         ("metrics", 1),
+        ("codec", "auto"),
+        ("codec", "native"),
+        ("codec", None),
         ("vector_math", "torch"),
         ("vector_math", None),
         ("descriptor_revalidation", "always"),
@@ -842,6 +852,7 @@ def test_configuration_canonicalizes_every_text_leaf_before_using_it() -> None:
         recovery_policy=_HostileStr("replay"),
         metrics=_HostileStr("json"),
         metrics_destination=_HostileStr("./metrics.json"),
+        codec=_HostileStr("numpy"),
         vector_math=_HostileStr("pure"),
         checksum=_HostileStr("pure"),
         descriptor_revalidation=_HostileStr("generation"),
@@ -852,6 +863,7 @@ def test_configuration_canonicalizes_every_text_leaf_before_using_it() -> None:
         "recovery_policy",
         "metrics",
         "metrics_destination",
+        "codec",
         "vector_math",
         "checksum",
         "descriptor_revalidation",

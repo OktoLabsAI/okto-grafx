@@ -570,9 +570,36 @@ class Page:
                     computed_checksum=expected,
                     **located,
                 )
+        entries = _decode_directory(raw, header, size, page_index)
+        return cls._from_decoded(
+            header,
+            entries,
+            raw,
+            page_size=size,
+            page_index=page_index,
+        )
+
+    @classmethod
+    def _from_decoded(
+        cls,
+        header: PageHeader,
+        entries: list[tuple[int, int]],
+        raw: bytes,
+        *,
+        page_size: int,
+        page_index: PageIndex | None,
+    ) -> Page:
+        """Build one clean page after a codec has completely validated its byte image.
+
+        Both the pure oracle and byte-compatible accelerated adapters use this sole assembly
+        path, so the in-memory representation cannot drift when fields are added to ``Page``.
+        Validation deliberately remains with the calling codec; this helper only installs an
+        already-proved header, directory and payload into the canonical domain value.
+        """
+
         page = cls(
             page_type=header.page_type,
-            page_size=size,
+            page_size=page_size,
             page_index=0 if page_index is None else page_index,
             page_lsn=header.page_lsn,
             seq=header.seq,
@@ -580,7 +607,7 @@ class Page:
             next_page=header.next_page,
         )
         page._reserved = header.reserved
-        page._slots = _decode_directory(raw, header, size, page_index)
+        page._slots = entries
         page._free_start = header.free_start
         page._data[PAGE_HEADER_SIZE : header.free_start] = raw[
             PAGE_HEADER_SIZE : header.free_start

@@ -9,6 +9,10 @@ including the on-disk format.
 
 ### Added
 
+- Added an explicitly selected, per-database `codec="numpy"` page adapter backed by NumPy from
+  `[accel]`. It preserves page format v1 byte-for-byte, uses the pure codec for small directories
+  and as the sole authority for invalid-image refusals, and reports both page-codec and effective
+  CRC-32C implementation through `database.codec`.
 - Added explicit, one-way `db.maintenance.enable_wal_page_compression()` activation. A catalog-v2
   required capability is published in a v1-only transaction before later commits may store
   strictly-smaller zlib level-1 full-page images in `WRITE_PAGE` v2. Bounded inflation, closed

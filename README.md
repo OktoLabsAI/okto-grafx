@@ -199,11 +199,11 @@ reads identically in the other. It is worth installing: on Linux the durable-com
 the reference engine falls from ~17× to **~5×** with it, which is inside the ceiling that binding
 decision D5 sets.
 
-**`numpy`** — accelerated vector math. Selected only by `vector_math="numpy"`, never automatically.
-The pure and accelerated adapters agree to a *stated tolerance* rather than exactly, so a selector
-that silently bound whichever adapter happened to be installed would make the ranking of a query
-depend on the machine it ran on. `auto` therefore binds the pure oracle deliberately, and `"numpy"`
-refuses when the extra is absent rather than falling back to something the caller did not ask for.
+**`numpy`** — accelerated vector math and an optional byte-identical page codec. Vector math is
+selected only by `vector_math="numpy"`; it agrees to a stated tolerance, so `auto` deliberately
+binds the pure vector oracle. The page codec is independently selected with `codec="numpy"`; it
+keeps page format v1 byte-for-byte, accelerates dense slot-directory packing/validation and uses
+the pure codec for small directories. Both explicit selectors refuse when the extra is absent.
 
 ### From source
 
@@ -610,7 +610,7 @@ and never degrades into a no-op — opening a database with an incomplete regist
 | `storage` | `StorageDevice` | Files, pages, growth, durability barriers, directory listing | `LocalStorageDevice` — a directory on the real filesystem | `MemoryStorageDevice` (`:memory:`), `FaultInjectingStorageDevice` (tests) |
 | `clock` | `Clock` | Monotonic time for liveness, wall time for human-facing stamps only | `SystemClock` | — |
 | `coordinator` | `ProcessCoordinator` | Leases, epochs, exclusive sections, reader registration, dead-owner takeover | `LocalProcessCoordinator` — lock files under `<db>/control` | same class, `lock_directory=None` for in-memory process-wide sections |
-| `codec` | `PageCodec` | Encoding and decoding a page image, checksum included | `PageCodecV1` | — |
+| `codec` | `PageCodec` | Encoding and decoding a page image, checksum included | `PageCodecV1` | `NumpyPageCodecV1` with `codec="numpy"` (needs `[accel]`) |
 | `metrics` | `MetricsSink` | Counters, gauges, histograms, timers | `NoOpMetricsSink` | `OpenMetricsSink`, `JsonMetricsSink` |
 | `events` | `EventSink` | Structured, sanitised, bounded event records | `LoggingEventSink` — standard-library `logging` | — |
 | `vector_math` | `VectorMath` | Distance and similarity kernels | `PureVectorMath` | `NumpyVectorMath` (needs `[accel]`) |
@@ -708,6 +708,7 @@ refused with the field name the caller actually wrote.
 | `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
 | `metrics_destination` | `None` | Required file path for `"json"`; for `"openmetrics"`, `None` means `127.0.0.1:0` and an explicit IPv6 destination uses `[address]:port` |
 | `allow_remote_metrics` | `False` | Exact boolean, valid only for `"openmetrics"`; permits a hostname or non-loopback address when explicitly `True` |
+| `codec` | `"pure"` | `"pure"` binds the byte-contract oracle; `"numpy"` explicitly selects the NumPy-backed, byte-identical dense-directory codec and requires `[accel]` |
 | `vector_math` | `"auto"` | `"auto"` and `"pure"` both bind the pure oracle; `"numpy"` requires `[accel]` |
 | `checksum` | `"auto"` | `"auto"` accelerates when available; `"pure"` pins the reference |
 | `vector_exact_scan_threshold` | `4096` | Below this many candidates, search is exhaustive |
