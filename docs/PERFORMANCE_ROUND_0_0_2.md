@@ -900,3 +900,58 @@ therefore a finite NO-GO for the current mutable HNSW architecture, not an unfin
 be reconsidered only with a safely copyable immutable graph representation and an explicit
 cross-process topology/re-entry contract. No format, WAL/OCC, durability or
 multiwriter/multireader rule changed.
+
+## Scale-removal batch 10 — bounded HNSW frontier complexity
+
+Status: **completed in `f1d1a75` after focused differential validation and independent adversarial
+review `hof_cad8d1a0ae734da19db0903334cc5c3c` (verified PASS)**.
+
+- `_trim` scores peers in the established order and performs one total-order sort plus a bounded
+  slice. This preserves the former descending-score/ascending-node result while removing repeated
+  Python list shifts.
+- `_search_layer_counted` keeps the legacy sorted-list frontier for graphs below 4,096 nodes and
+  for ordinary unfiltered approximate searches. At or above 4,096 nodes it selects a separate heap
+  frontier only for filtered or exhaustive searches, the regimes in which the frontier can grow
+  towards `N`. Dispatch happens once before traversal, so the common path pays no per-visit mode
+  branch.
+- The heap key `(-score, node, score)` preserves the exact score-descending/node-ascending pop
+  order. Retaining the original score separately also preserves signed zero in public results.
+  Result admission, strict pruning, callback order and `TraversalStats` remain unchanged.
+
+With explicit local-source imports against baseline `8baa858`, a selective synthetic frontier
+measured `82.668 -> 13.916 ms` median at `N=4,096` (`5.94x`) and
+`5,792.201 -> 175.065 ms` at `N=50,000` (`33.09x`, three runs). On the ordinary NumPy HNSW build
+at 512 x 64, the single-sort trim reduced the median from `12.194 -> 11.350 s` (`1.074x`); the
+ordinary search path remains the legacy implementation. These numbers are component evidence: the
+large gain applies to a genuinely wide selective/exhaustive frontier, not every vector query.
+
+The differential oracle covers the complete graph shape, ties, initial frontiers larger than
+`ef`, the 4,095/4,096 dispatch boundary, a two-hop heap expansion, ranking, stats and exact
+`score`/`admit` callback order. The grouped affected suite, Ruff and diff-check passed. This is
+process-local derived state only; no page format, WAL, OCC, lock, publication or
+multiwriter/multireader rule changed.
+
+The D-17 exact-candidate tests were also repaired to instrument the header-only reader introduced
+by `b7fb52d` instead of the obsolete DTO walk. This is test instrumentation only: the production
+result path was already correct, while the old counter had become vacuous.
+
+## Scale-removal batch 11 — D-30 vector body decode decision
+
+Status: **finite NO-GO for the current row/cursor representation; no production change selected**.
+
+- A component prototype accelerated only the vector body decode/repack by about `20.98x`, but the
+  real `scan_rows_v1` endpoint at 2,048 x 384 spent only `6.4–7.4%` there
+  (`647.0/422.7/403.4 ms` total versus `41.1/28.5/29.9 ms` decode). Its optimistic end-to-end
+  ceiling is therefore about `1.07x`.
+- A cold exact query at 1,024 x 384 spent `8.6–12.1%` in the same body decode
+  (`331.3/379.4/336.7 ms` total versus `40.0/32.8/35.0 ms`), for an optimistic ceiling around
+  `1.11x`. HNSW build spent roughly `0.07%` there in the measured 4,096 x 384 shape.
+- Removing that cost materially requires a different contiguous row/cursor ownership model; a
+  decoder-only patch adds complexity while leaving the dominant tuple/row materialization intact.
+  D-30 is therefore closed rather than turned into a marginal gate. The decoder's ability to read
+  a structurally valid dimension above the write limit is not a regression: SPEC-VEC BR-5 applies
+  domain limits at writes, while reads still enforce exact buffer bounds and reject truncation.
+
+The outcome preserves the existing API and all integrity checks. A future contiguous exact-search
+representation may revisit the whole materialization boundary, but this round does not ship the
+isolated decoder optimization.
