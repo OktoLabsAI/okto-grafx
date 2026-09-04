@@ -1049,3 +1049,37 @@ across `executemany` items requires read-ahead or keeping a view across callback
 consumption, error order or cross-process freshness. An intentionally unsafe bypass measured a
 `26.6%` ceiling over 500 CREATEs, but no code was selected without an explicit eager/replayable
 API contract.
+
+## Scale-removal batch 15 — reserved extent and replay-hot bucket directory
+
+Status: **completed in `da58471`, `d50eab2` and `90f0560`; independent Nexus review
+`hof_0b518924b36444a595988f6e0151a117` verified PASS**.
+
+- `insert_reserved` now carries the extent it has just validated into `_store_version`. The proof
+  is private to that call and bound to the buffer pool's derived epoch; any read-view or structural
+  change falls back to the canonical directory lookup. Other insert/update/recovery callers are
+  unchanged. The 500-insert component probe measured `84.807 -> 62.279 ms` (`1.362x`).
+- A common logical replay with at least eight effects in one `(store, bucket)` validates that
+  bucket once, retains locations only for the batch's exact `(key, ref)` targets and applies the
+  effects in original global WAL order. This replaces repeated bucket walks `O(K*N)` with one
+  `O(N)` preparation plus bounded lookups/first-fit updates. Three hard ceilings — 16,384 bucket
+  identities, 65,536 targets and 16,384 pages — cause a mutation-free decline to the canonical
+  path. `Page.insert_slot` remains the capacity authority; no scalar fallback occurs after a hot
+  prefix has moved, and an ordinary failure marks touched stores stale.
+- Same-bucket component probes measured `348.964 -> 44.289 ms` for 250 effects (`7.88x`) and
+  `5,049.328 -> 130.296 ms` for 1,000 effects (`38.75x`). These deliberately expose the removed
+  asymptote and are not claims for every checkpoint. One public 500-CREATE profile moved
+  directionally from the prior `2.602–2.623 s` to `2.478 s`; checkpoint cumulative time moved
+  from `0.617–0.665 s` to `0.477 s`, and `CommitRedo.apply` from about `0.357 s` to `0.228 s`.
+- The grouped regression exposed a pre-existing D-10 ordering regression: replacing the full LRU
+  walk with an unordered dirty-candidate set could write index page 0 before a bucket page. File
+  and database-wide flushes now partition only the bounded candidate snapshot so every data page
+  precedes every publication header, still `O(D)` and without scanning clean frames. A failure on
+  data therefore cannot leave a certificate ahead of its contents.
+
+Validation included 23 hot-bucket discriminants, a 100 x 60 randomized byte/header/counter
+differential against the legacy manager, injected allocation and tail-link failures, 106 grouped
+recovery/index cases, 90 index-fence/recovery-section/multiprocess cases, 182 buffer/fence cases and
+286 heap/identity cases. The production redo call chain was traced through the participant
+section, writer lease and cross-process `COMMIT_SECTION`; the ephemeral proof never outlives that
+fence. Format, WAL records, OCC, durability and the multiwriter/multireader model are unchanged.
