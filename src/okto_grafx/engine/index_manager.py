@@ -2745,6 +2745,12 @@ class IndexStore:
             tuple[bytes, RecordRef],
             tuple[PageIndex, SlotId, IndexEntry] | None,
         ] = dict.fromkeys(targets)
+        targets_by_ref: dict[
+            int,
+            dict[bytes, tuple[bytes, RecordRef]],
+        ] = {}
+        for target in targets:
+            targets_by_ref.setdefault(target[1].encode(), {})[target[0]] = target
         capacities: list[int] = []
         duplicate_target = False
         seen: set[PageIndex] = visited_pages()
@@ -2773,17 +2779,43 @@ class IndexStore:
                 self._require_index_page(page, page_index)
                 capacities.append(self._page_insert_capacity(page))
                 for slot, image in page.iter_slot_views():
-                    entry = IndexEntry.decode(image)
-                    identity = (entry.key, entry.ref)
-                    if identity not in entries:
+                    (
+                        validated,
+                        encoded_ref,
+                        born_csn,
+                        dead_csn,
+                        versioned,
+                    ) = _validated_image(image)
+                    _require_decodable_ref(encoded_ref)
+                    candidates = targets_by_ref.get(encoded_ref)
+                    if candidates is None:
+                        continue
+                    key_view = validated[INDEX_ENTRY_HEADER_SIZE:]
+                    # ``key_view`` is backed by the mutable page image and is
+                    # therefore not hashable, even when exposed read-only.  Copy
+                    # only slots whose encoded ref matches a target; this keeps
+                    # the common non-target path allocation-free while avoiding
+                    # an O(targets-per-ref) identity scan.
+                    identity = candidates.get(bytes(key_view))
+                    if identity is None:
                         continue
                     if entries[identity] is not None:
                         duplicate_target = True
                         continue
+                    key, ref = identity
+                    entry = IndexEntry(
+                        key=key,
+                        ref=ref,
+                        versioned=versioned,
+                        born_csn=born_csn,
+                        dead_csn=dead_csn,
+                        page=page_index,
+                        slot=slot,
+                    )
                     entries[identity] = (
                         page_index,
                         slot,
-                        entry.located_at(page_index, slot),
+                        entry,
                     )
                 following = page.next_page
             pages.append(page_index)

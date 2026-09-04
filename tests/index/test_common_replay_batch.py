@@ -636,6 +636,51 @@ def test_duplicate_physical_target_declines_the_hot_bucket(
     assert sum(entry.live for entry in matching) == 1
 
 
+def test_hot_preparation_materializes_entries_only_for_target_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = build_database(budget_pages=64)
+    keys = _keys_in_bucket(database.exact, 0, 21, prefix=b"scan-target-")
+    refs = tuple(RecordRef(100 + ordinal, 1) for ordinal in range(len(keys)))
+    for ordinal in range(20):
+        ref = refs[7] if ordinal == 0 else refs[ordinal]
+        assert database.exact._apply_change(  # noqa: SLF001
+            IndexChange(
+                index=database.exact.name,
+                operation=IndexOperation.INSERT,
+                key=keys[ordinal],
+                ref=ref,
+                versioned=False,
+            ),
+            1 + ordinal,
+        )
+    original_init = IndexEntry.__init__
+    materialized: list[tuple[bytes, RecordRef]] = []
+
+    def counted_init(self: IndexEntry, *args: object, **kwargs: object) -> None:
+        key = kwargs.get("key")
+        ref = kwargs.get("ref")
+        assert isinstance(key, bytes)
+        assert isinstance(ref, RecordRef)
+        materialized.append((key, ref))
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(IndexEntry, "__init__", counted_init)
+    target = (keys[7], refs[7])
+    missing = (keys[20], refs[20])
+
+    prepared = database.exact._prepare_common_replay_hot_bucket(  # noqa: SLF001
+        0,
+        {target, missing},
+        page_limit=100,
+    )
+
+    assert prepared is not None
+    assert materialized == [target]
+    assert prepared.entries[target] is not None
+    assert prepared.entries[missing] is None
+
+
 def test_late_hot_bucket_corruption_refuses_before_an_earlier_bucket_mutates() -> None:
     database = build_database()
     first_keys = _keys_in_bucket(database.exact, 0, 8, prefix=b"first-hot-")
