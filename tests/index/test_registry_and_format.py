@@ -647,6 +647,153 @@ def test_a_proximity_index_reports_its_backlog_and_its_passes(
     assert database.metrics.values_of(RECONCILIATION_TOTAL) == [1.0]
 
 
+def test_a_seeded_backlog_tracks_changes_without_another_metric_walk(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gauge walks once, then uses proved deltas until its paged view is rebased."""
+    walks: dict[int, int] = {}
+    original_walk = IndexStore.walk
+
+    def counted_walk(index: IndexStore):
+        walks[id(index)] = walks.get(id(index), 0) + 1
+        return original_walk(index)
+
+    monkeypatch.setattr(IndexStore, "walk", counted_walk)
+    index = database.proximity
+    ref = RecordRef(1, 1)
+
+    inserting = TransactionDouble(txn_id=101)
+    index.stage_insert(inserting, b"ada", ref, BORN)
+    index.commit(inserting, BORN)
+    assert walks[id(index)] == 1
+
+    ending = TransactionDouble(txn_id=102)
+    index.stage_delete(ending, b"ada", ref, ENDED)
+    index.commit(ending, ENDED)
+    repeated = TransactionDouble(txn_id=103)
+    index.stage_delete(repeated, b"ada", ref, ENDED + 1)
+    index.commit(repeated, ENDED + 1)
+
+    assert walks[id(index)] == 1
+    assert database.metrics.values_of(TOMBSTONE_BACKLOG)[-2:] == [1.0, 1.0]
+
+    # A foreign-generation rebase invalidates only the derived process-local count. The next
+    # gauge pays one exact walk, then becomes incremental again.
+    index._cache_rebased()  # noqa: SLF001 - discriminates the foreign-adoption invalidator
+    index.note_reconciled(ENDED + 1)
+    index.note_reconciled(ENDED + 1)
+    assert walks[id(index)] == 2
+
+    sweeping = TransactionDouble(txn_id=104)
+    index.reconcile(ENDED + 1, sweeping)
+    semantic_walks = walks[id(index)]
+    index.commit(sweeping, ENDED + 2)
+    index.note_reconciled(ENDED + 1)
+
+    assert walks[id(index)] == semantic_walks
+    assert database.metrics.values_of(TOMBSTONE_BACKLOG)[-1] == 0.0
+
+
+def test_reset_and_reopen_reaffirm_the_backlog_per_store(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RESET proves zero; a different handle seeds its own count instead of sharing it."""
+    walks: dict[int, int] = {}
+    original_walk = IndexStore.walk
+
+    def counted_walk(index: IndexStore):
+        walks[id(index)] = walks.get(id(index), 0) + 1
+        return original_walk(index)
+
+    monkeypatch.setattr(IndexStore, "walk", counted_walk)
+    index = database.proximity
+    ref = RecordRef(2, 1)
+    changing = TransactionDouble(txn_id=111)
+    index.stage_insert(changing, b"grace", ref, BORN)
+    index.stage_delete(changing, b"grace", ref, ENDED)
+    index.commit(changing, ENDED)
+    assert walks[id(index)] == 1
+
+    index.mark_stale("metric reset proof")
+    rebuilding = TransactionDouble(txn_id=112)
+    index.stage_reset(rebuilding, index.built_through_lsn)
+    index.commit(rebuilding, ENDED + 1)
+    assert walks[id(index)] == 1
+    assert index._tombstone_backlog_count == 0  # noqa: SLF001 - derived-state invariant
+
+    isolated_metrics = RecordingMetrics()
+    isolated = ProximityIndex(
+        proximity_definition(database.table, name="person_near_alias"),
+        database.pool,
+        isolated_metrics,
+    )
+    isolated.create()
+    isolated.note_reconciled(ENDED + 1)
+    changing_again = TransactionDouble(txn_id=113)
+    index.stage_insert(changing_again, b"hopper", RecordRef(3, 1), ENDED + 2)
+    index.stage_delete(changing_again, b"hopper", RecordRef(3, 1), ENDED + 3)
+    index.commit(changing_again, ENDED + 3)
+
+    assert isolated._tombstone_backlog_count == 0  # noqa: SLF001 - separate file, separate count
+    assert index._tombstone_backlog_count == 1  # noqa: SLF001 - separate file, separate count
+
+    reopened_metrics = RecordingMetrics()
+    reopened_pool = make_pool(database.device, reopened_metrics)
+    reopened = ProximityIndex(index.definition, reopened_pool, reopened_metrics)
+    reopened.open()
+    reopened.note_reconciled(ENDED + 3)
+    reopened.note_reconciled(ENDED + 3)
+
+    assert walks[id(reopened)] == 1
+    assert reopened._tombstone_backlog_count == 1  # noqa: SLF001 - reopened store seeds itself
+    assert index._tombstone_backlog_count == 1  # noqa: SLF001 - stores stay isolated
+
+
+@pytest.mark.parametrize(
+    ("operation", "method"),
+    (
+        (IndexOperation.TOMBSTONE, "_rewrite"),
+        (IndexOperation.REMOVE, "_erase"),
+        (IndexOperation.RESET, "_reset"),
+    ),
+)
+def test_an_interrupted_backlog_transition_becomes_unknown(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: IndexOperation,
+    method: str,
+) -> None:
+    """A possibly part-applied rewrite, erase, or reset is never reflected by a guessed count."""
+    index = database.proximity
+    ref = RecordRef(4, 1)
+    seeding = TransactionDouble(txn_id=121)
+    index.stage_insert(seeding, b"lovelace", ref, BORN)
+    if operation is IndexOperation.REMOVE:
+        index.stage_delete(seeding, b"lovelace", ref, ENDED)
+    index.commit(seeding, ENDED)
+    assert index._tombstone_backlog_count is not None  # noqa: SLF001 - precondition
+
+    change = IndexChange(
+        index=index.name,
+        operation=operation,
+        key=b"" if operation is IndexOperation.RESET else b"lovelace",
+        ref=RecordRef(0, 0) if operation is IndexOperation.RESET else ref,
+        csn=ENDED,
+        versioned=True,
+    )
+    if operation is IndexOperation.RESET:
+        index.mark_stale("interrupted reset")
+
+    def interrupted(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("completed then interrupted")
+
+    monkeypatch.setattr(IndexStore, method, interrupted)
+    with pytest.raises(RuntimeError, match="completed then interrupted"):
+        index._apply_change(change, ENDED)  # noqa: SLF001 - exact transition under test
+
+    assert index._tombstone_backlog_count is None  # noqa: SLF001 - fail-closed metric state
+
+
 def test_an_exact_index_reports_no_vector_metric(
     person_table: TableDef, pool: object, device: MemoryDevice
 ) -> None:
@@ -661,7 +808,7 @@ def test_an_exact_index_reports_no_vector_metric(
 
 
 def test_a_disabled_sink_is_never_asked_to_record_anything(
-    person_table: TableDef,
+    person_table: TableDef, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """DoD item 6: the hot path pays nothing when metrics are off."""
     device = MemoryDevice()
@@ -669,6 +816,11 @@ def test_a_disabled_sink_is_never_asked_to_record_anything(
     pool = make_pool(device, metrics)
     index = ProximityIndex(proximity_definition(person_table), pool, metrics)
     index.create()
+    monkeypatch.setattr(
+        IndexStore,
+        "walk",
+        lambda _index: pytest.fail("disabled metrics must not seed the backlog"),
+    )
     txn = TransactionDouble(txn_id=1)
     index.stage_insert(txn, b"k", RecordRef(1, 1), BORN)
     index.commit(txn, BORN)

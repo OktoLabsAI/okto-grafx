@@ -180,6 +180,28 @@ def test_retarget_staged_refuses_the_sentinel_before_mutating_any_list(
     )
 
 
+def test_staged_record_multiset_accepts_order_and_preserves_duplicate_counts(
+    database: Database,
+) -> None:
+    """Registry validation is order-independent but exact about each change's multiplicity."""
+    txn = PendingTransaction(9)
+    first = database.exact.stage_insert(txn, b"ada", RecordRef(1, 1), 0)
+    second = database.exact.stage_insert(txn, b"grace", RecordRef(1, 2), 0)
+
+    database.manager.validate_staged_records(txn, (second, first))
+
+    with pytest.raises(GrafxIndexError) as duplicated:
+        database.manager.validate_staged_records(txn, (first, first))
+    assert duplicated.value.details["field"] == "pending_records"
+
+    with pytest.raises(GrafxIndexError) as missing:
+        database.manager.validate_staged_records(txn, (first,))
+    assert missing.value.details["field"] == "pending_records"
+    assert missing.value.details["expected"] == 2
+    assert missing.value.details["actual"] == 1
+    assert missing.value.details["missing"] == 1
+
+
 def test_persisted_index_entries_refuse_the_provisional_stamp_as_corruption() -> None:
     entry = IndexEntry(key=b"k", ref=RecordRef(2, 1), versioned=True, born_csn=BORN)
     image = bytearray(entry.encode())

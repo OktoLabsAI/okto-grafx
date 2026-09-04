@@ -52,6 +52,7 @@ with a located error instead of hanging (amendment A42).
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TypeVar
@@ -315,6 +316,7 @@ class IndexStore:
         "_completed_rebuild_through",
         "_replaying",
         "_table_high_water",
+        "_tombstone_backlog_count",
     )
 
     def __init__(
@@ -368,6 +370,11 @@ class IndexStore:
         # Bound by IndexManager after a table-aware open and advanced by local commits. ``None``
         # preserves the standalone IndexStore contract, whose caller supplies the whole floor.
         self._table_high_water: Lsn | None = None
+        # Derived process-local metric state only. ``None`` means that no exact count is proved
+        # for the current paged generation; the next gauge emission seeds it with one verified
+        # walk. Thereafter successful logical changes maintain it in O(1), without adding a byte
+        # to the index format or making this diagnostic state an authority for reads.
+        self._tombstone_backlog_count: int | None = None
         if metrics.enabled:
             for descriptor in INDEX_METRICS:
                 metrics.register(descriptor)
@@ -628,6 +635,10 @@ class IndexStore:
         written under a different definition answers a different question, and the honest reply
         is to refuse to open it.
         """
+        # Opening is also a sanctioned re-adoption door for a handle that may have been retained
+        # while another participant replaced its durable generation. Never carry a derived
+        # diagnostic count across that boundary.
+        self._invalidate_tombstone_backlog()
         header = self._read_header(proved_present=proved_present)
         definition = self._definition
         if header.digest != definition.digest():
@@ -897,6 +908,7 @@ class IndexStore:
 
     def _cache_rebased(self) -> None:
         """Notify derived in-memory structures that their paged source was discarded."""
+        self._invalidate_tombstone_backlog()
 
     def _required_table_position(self, requested_lsn: Lsn) -> Lsn:
         """Restrict a database snapshot to the covered table's committed history."""
@@ -1154,6 +1166,7 @@ class IndexStore:
         the case where the position happens to agree -- a commit at a position the index already
         claimed -- and that is worth attempting even though it cannot be guaranteed here.
         """
+        self._invalidate_tombstone_backlog()
         try:
             self.mark_stale(reason)
         except GrafxError:
@@ -1667,6 +1680,7 @@ class IndexStore:
                     # Only page 0, and only when clean: this commit's dirty buckets stay, and
                     # a dirty page 0 keeps meeting the fence, which is the refusal this must
                     # not relax.
+                    self._invalidate_tombstone_backlog()
                     dirty = {
                         page_index
                         for file, page_index in self._pool.modified_pages(self.file)
@@ -1690,8 +1704,7 @@ class IndexStore:
                 # took, so the rebuild fence no longer describes what it can answer. Releasing
                 # it before the flush would let any failure along the way lift the fence too.
                 self._completed_rebuild_through = None
-        if self._metrics.enabled and self._definition.versioned:
-            self._metrics.set_gauge(TOMBSTONE_BACKLOG, float(self._tombstone_backlog()))
+        self._publish_tombstone_backlog()
         return applied
 
     def advance_built_through(self, lsn: Lsn) -> None:
@@ -2182,6 +2195,7 @@ class IndexStore:
     def _discard_replay_frames(self, failure: BaseException) -> None:
         """Drop every local frame a refused rebuild replay could otherwise write later."""
         self._carried_certificate = None
+        self._invalidate_tombstone_backlog()
         for file, page_index in self._pool.modified_pages(self.file):
             if file != self.file:
                 continue
@@ -2412,8 +2426,12 @@ class IndexStore:
         # different door, and it teaches an operator to ignore the verifier.
         self._pool.flush(self.file)
         if self._metrics.enabled and self._definition.versioned:
+            # Bind the derived count to this handle's own page-0 publication. Otherwise the next
+            # commit mistakes this unlogged local horizon advance for a foreign generation and
+            # pays a needless full backlog walk. Disabled/exact metrics keep their former path.
+            self._remember_local_certificate()
             self._metrics.increment(RECONCILIATION_TOTAL)
-            self._metrics.set_gauge(TOMBSTONE_BACKLOG, float(self._tombstone_backlog()))
+            self._publish_tombstone_backlog()
 
     def _record_reconciled(self, horizon: Lsn) -> None:
         """Advance the reconciliation watermark without choosing a flush boundary."""
@@ -2424,14 +2442,46 @@ class IndexStore:
 
     def _tombstone_backlog(self) -> int:
         """Return how many entries carry a tombstone that has not been reclaimed yet."""
-        return sum(1 for entry in self.walk() if not entry.live)
+        count = self._tombstone_backlog_count
+        if count is None:
+            count = sum(1 for entry in self.walk() if not entry.live)
+            self._tombstone_backlog_count = count
+        return count
+
+    def _publish_tombstone_backlog(self) -> None:
+        """Publish the derived backlog, seeding it once when its generation is unknown."""
+        if self._metrics.enabled and self._definition.versioned:
+            self._metrics.set_gauge(TOMBSTONE_BACKLOG, float(self._tombstone_backlog()))
+
+    def _invalidate_tombstone_backlog(self) -> None:
+        """Forget the derived count when this handle cannot prove the paged generation."""
+        self._tombstone_backlog_count = None
+
+    def _adjust_tombstone_backlog(self, delta: int) -> None:
+        """Apply a proved live/dead transition to an already-seeded derived count."""
+        if not self._metrics.enabled or not self._definition.versioned:
+            return
+        count = self._tombstone_backlog_count
+        if count is None:
+            return
+        adjusted = count + delta
+        # A negative diagnostic count proves that some state transition escaped this handle.
+        # Re-seeding on the next gauge is safer than publishing an invented correction.
+        self._tombstone_backlog_count = adjusted if adjusted >= 0 else None
 
     # --- applying -----------------------------------------------------------------------------
 
     def _apply_change(self, change: IndexChange, lsn: Lsn) -> bool:
         """Apply one change to the pages and say whether anything moved."""
         if change.operation is IndexOperation.RESET:
-            return self._reset(change, lsn)
+            try:
+                moved = self._reset(change, lsn)
+            except BaseException:
+                self._invalidate_tombstone_backlog()
+                raise
+            if moved and self._metrics.enabled and self._definition.versioned:
+                self._tombstone_backlog_count = 0
+            return moved
         bucket = bucket_of(change.key, self._definition.bucket_count)
         pages = self._bucket_pages(bucket)
         located = self._find_entry(pages, change.key, change.ref)
@@ -2468,8 +2518,24 @@ class IndexStore:
         if change.operation is IndexOperation.TOMBSTONE:
             if not entry.live:
                 return False
-            return self._rewrite(page_index, slot, entry.ended_at(change.csn), lsn)
-        return self._erase(page_index, slot, lsn)
+            try:
+                moved = self._rewrite(page_index, slot, entry.ended_at(change.csn), lsn)
+            except BaseException:
+                # A storage/page implementation may mutate before reporting interruption. The
+                # diagnostic count cannot decide which side landed, so it becomes unknown.
+                self._invalidate_tombstone_backlog()
+                raise
+            if moved:
+                self._adjust_tombstone_backlog(1)
+            return moved
+        try:
+            moved = self._erase(page_index, slot, lsn)
+        except BaseException:
+            self._invalidate_tombstone_backlog()
+            raise
+        if moved and not entry.live:
+            self._adjust_tombstone_backlog(-1)
+        return moved
 
     def _reset(self, change: IndexChange, lsn: Lsn) -> bool:
         """Clear every entry of every bucket, keeping the pages and the chains they form."""
@@ -4672,24 +4738,25 @@ class IndexManager:
             for index in self._transaction_indexes(txn)
             for change in index.pending(txn)
         ]
-        remaining = list(expected)
-        for change in actual:
-            try:
-                remaining.remove(change)
-            except ValueError as failure:
-                raise GrafxIndexError(
-                    "A staged WAL effect has no matching change in the index registry.",
-                    field="pending_records",
-                    index=change.index,
-                    operation=change.operation.name,
-                ) from failure
-        if remaining or len(actual) != len(expected):
+        expected_counts = Counter(expected)
+        actual_counts = Counter(actual)
+        unexpected = actual_counts - expected_counts
+        if unexpected:
+            change = next(iter(unexpected))
+            raise GrafxIndexError(
+                "A staged WAL effect has no matching change in the index registry.",
+                field="pending_records",
+                index=change.index,
+                operation=change.operation.name,
+            )
+        missing = expected_counts - actual_counts
+        if missing:
             raise GrafxIndexError(
                 "The transaction's staged WAL effects do not exactly match the index registry.",
                 field="pending_records",
                 expected=len(expected),
                 actual=len(actual),
-                missing=len(remaining),
+                missing=missing.total(),
             )
 
     def retarget_staged(
@@ -4750,22 +4817,9 @@ class IndexManager:
                 else replace(record, payload=change.encode())
             )
 
-        remaining = list(expected)
-        for change in actual:
-            try:
-                remaining.remove(change)
-            except (
-                ValueError
-            ) as failure:  # pragma: no cover - guarded before transformation
-                raise GrafxIndexError(
-                    "Retargeting changed the transaction and registry into different effects.",
-                    field="pending_records",
-                ) from failure
-        if remaining or len(actual) != len(
-            expected
-        ):  # pragma: no cover - guarded above
+        if Counter(actual) != Counter(expected):  # pragma: no cover - guarded above
             raise GrafxIndexError(
-                "Retargeting changed the cardinality of the transaction's staged effects.",
+                "Retargeting changed the transaction and registry into different effects.",
                 field="pending_records",
                 expected=len(expected),
                 actual=len(actual),
