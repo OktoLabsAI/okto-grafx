@@ -258,6 +258,7 @@ def test_the_retryable_classes_are_exactly_the_ones_the_contract_marks() -> None
         "GrafxDeviceFull",
         "GrafxStorageError",
         "GrafxBufferBudgetExceeded",
+        "GrafxSnapshotReclaimed",
     }
     for name in retryable:
         assert getattr(domain_errors, name).retryable is True
