@@ -714,8 +714,8 @@ explicitly outside these deltas and is not presented as passing.
 
 ## Scale-removal batch 4 — selective vectors and registered identities
 
-Status: **VEC-4 and CAT-5 completed; the first EDGE prototype was rejected and reverted before the
-milestone could be closed**.
+Status: **VEC-4, CAT-5 and index-seek stability completed through `5938a03`; both transparent EDGE
+prototypes were rejected and reverted**.
 
 - `c77d414` lets an exact vector query pass an immutable, engine-sealed candidate certificate into
   the vector engine only when it belongs to the same owner, space, table, column and `read_lsn`.
@@ -734,13 +734,27 @@ milestone could be closed**.
   validation. It changed the observable error channel, could hide an inner scan failure and could
   turn `GrafxQueryBudgetExceeded` into a committed relationship write. `030b39d` removes the
   transformation and freezes those cases in regression tests. The measured cliff remains real:
-  two unindexed endpoints cause repeated inner scans and `N + N²` logical rows. Its replacement
-  must reduce physical work without changing predicate order, logical `rows_scanned`, budget
-  refusal or statement atomicity.
+  two unindexed endpoints produce `N + N²` logical rows.
+- `bf8ed4e` then tried to preserve logical work while replaying a completed inner snapshot. The
+  component sample was promising (`0.160 -> 0.044 s`, physical inner scans 80 -> 1 at the same
+  6,480 logical rows), but the optimization violated CONTRACT A63 under buffer pressure: a page
+  corrupted after the first pass was refused by the canonical later scan, while replay could
+  return rows or commit writes without rereading it. `4bcdad0` removes the cache byte-for-byte from
+  production and adds a regression in which the second inner pass must fail before any edge can
+  persist. The timing is retained only as evidence of the physical cost, not as a delivered gain.
+- `f5152de` fixes a separate, pre-existing plan-dependent error channel in exact seeks. A residual now
+  rechecks the original conjunction over index hits, while a potentially observable term before
+  the indexed equality declines to `NodeScan`. `5938a03` preserves a later pattern's safe seek
+  across total equalities on already-bound rows without crossing partial terms. The point-lookup
+  access path therefore remains available without making query semantics depend on index presence.
 
 Focused evidence was grouped: VEC-4 passed its 28-case final/query slice plus 57 adjacent cases and
 an independent adversarial review; CAT-5 passed 20 allocator cases plus 15 schema/index cases; the
-EDGE corrective slice passed 15 dedicated and 95 planner cases. Ruff lint and diff checks passed.
+The final EDGE corrective slice passed 16 dedicated cases including the later-pass A63 refusal.
+The index-seek correction passed 135 focused cases. A broader run found the cross-pattern seek
+regression after 405 prior passes; after `5938a03`, the corrected combined focal set and the
+remaining `tests/query` file slice both completed with exit code zero. Ruff lint and diff checks
+passed.
 
 ### Deferred HNSW construction tuning
 

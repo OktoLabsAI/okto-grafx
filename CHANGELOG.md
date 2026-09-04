@@ -68,9 +68,14 @@ including the on-disk format.
   from roughly `352 ms` to `61 ms`; end-to-end DDL moved from `1,085 ms` to `789 ms`.
 - A local-equality Cartesian pushdown prototype was removed after adversarial tests proved that it
   could suppress predicate errors, persistent inner-scan failures and query-budget refusals, in
-  the latter case allowing a write that the canonical plan refused. The regressions now freeze
-  predicate order, logical row accounting and statement atomicity while a dedicated operator is
-  designed.
+  the latter case allowing a write that the canonical plan refused. A subsequent bounded replay
+  prototype was also removed: under buffer pressure it could hide corruption introduced before a
+  later physical pass and commit writes that A63 requires to fail closed. Regressions now freeze
+  both refusal surfaces while the canonical nested scans remain in force.
+- Exact index seeks no longer change conjunction semantics by promoting a residual term into a
+  standalone predicate. The planner rechecks the original conjunction over hits and declines a
+  seek when an observable term precedes its equality; safe leading equalities, including a later
+  pattern following total equalities on already-bound rows, keep the indexed path.
 - Empty exact-index generations now use an ephemeral first-fit directory while they are built.
   The durable index pages remain byte-identical to the canonical allocator, including removes and
   tombstones, while reset/detached builds avoid repeatedly walking empty buckets and data pages.
