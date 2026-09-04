@@ -431,7 +431,7 @@ python -m pytest tests/index/test_identity_activation_domain.py tests/txn/test_b
 
 ## Item 11 / P2-VAC — MVCC bloat and vacuum
 
-Status: **measurement slice implemented; destructive protocol not yet authorized**.
+Status: **complete on `feature/v0.0.2` as `6d3e62c` + `75e799f`**.
 
 `db.maintenance.bloat(table=None)` now performs a deterministic, header-only census at a
 non-pruning observation of the checkpoint-capped recyclable horizon. TTL-stalled reader records
@@ -449,10 +449,31 @@ artifacts unchanged. The affected gates passed 196 focused API/lifecycle/hostile
 plus buffer/read-view/coordination tests, scoped Ruff, `compileall` and `git diff --check`. This is
 observability, not a throughput claim.
 
-The destructive half remains deliberately gated. The reader TTL registry cannot prove that an
-older process is not already inside a statement, and `RecordRef(page, slot)` has no incarnation,
-so durable slot/page reuse would create an ABA risk. The smallest reviewed v1 contract therefore
-requires explicit process quiescence plus a durable monotonic snapshot floor before bytes can be
-made physically absent. That narrows multi-reader availability during maintenance and is not
-inferred from the general authorization of item 11; implementation waits for the separate product
-authorization required by the concurrency guardrail.
+The destructive half was subsequently authorized under that exact restricted contract and is now
+`db.maintenance.vacuum(table=None, *, confirm_quiescent=False, max_versions=None)`. The exact
+`confirm_quiescent=True` assertion means every other Grafx process/handle, including pre-fence
+binaries, is stopped for the whole call. Catalog v2 must already be active. A first metadata
+transaction publishes required capability `heap_reclaim_v1`; older builds then reject the unknown
+bit. One ordinary WAL-before-data transaction advances a monotonic heap-global snapshot floor,
+relinks retained chains, frees and compacts eligible inline slots, and reconciles every ACTIVE
+index of the selected tables at the same horizon. New transactions below the floor fail retryably
+with `GrafxSnapshotReclaimed`.
+
+The implementation deliberately does not infer safety from reader TTL, run online/background,
+truncate the heap, reclaim overflow chains or reuse durable page/slot/`RecordRef` identities.
+`max_versions` bounds only deterministic heap candidates; index reconciliation remains complete
+before any selected ref disappears. Crash injection covered the WAL barrier, heap page images,
+index application and commit-state publication. Live/cold query, vector search, verifier,
+capability downgrade fence, zero-write repeat, quota drain, read-only refusal and rehash-shadow
+lifecycle all passed. The grouped result was 490/490 directly affected tests plus 736/736
+transaction/public-boundary tests, Ruff, format, `compileall` and diff-check. Four failures in the
+unfiltered transaction command were reproduced unchanged on baseline `6d3e62c` and excluded by
+exact node id from the delta gate; they are not attributed to this milestone. Nexus handoff
+`hof_df837d11c96a430786856895c7f7c744` was corrected after adversarial challenge and then verified
+PASS: chain relinking and overflow retention are covered, ACTIVE reconcile shares the reclaim
+commit, and an interrupted rehash artifact is never resumed or promoted.
+
+The expected gain is bounded and honest: dead tuple payload bytes disappear from churned inline
+pages, and future walks skip freed slots before header/tuple decoding. File length, historical page
+chains and slot directories remain, so this milestone reduces constants and resident payload but
+does not yet remove every `O(history pages)` path.
