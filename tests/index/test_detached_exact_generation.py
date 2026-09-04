@@ -223,22 +223,25 @@ def test_failed_build_leaves_only_an_unregistered_orphan_and_drops_dirty_frames(
     heap_store.insert(person_table, 1, (1, "Ada"), xmin=3)
     pool.flush(heap_store.file)
     definition = _identity_definition(person_table)
-    original = HashIndex._apply_change
+    original = HashIndex._apply_empty_build_change
     calls = 0
 
     def fail_after_first_write(
         index: HashIndex,
+        build: object,
         change: object,
         lsn: int,
-    ) -> bool:
+    ) -> bool | None:
         nonlocal calls
-        moved = original(index, change, lsn)  # type: ignore[arg-type]
+        moved = original(index, build, change, lsn)  # type: ignore[arg-type]
         calls += 1
         if calls == 1:
             raise GrafxIndexError("injected detached-build failure", field="injected")
         return moved
 
-    monkeypatch.setattr(HashIndex, "_apply_change", fail_after_first_write)
+    monkeypatch.setattr(
+        HashIndex, "_apply_empty_build_change", fail_after_first_write
+    )
 
     with pytest.raises(GrafxIndexError, match="injected detached-build failure"):
         manager._build_detached_exact_generation(definition, HORIZON)

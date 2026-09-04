@@ -272,6 +272,83 @@ class _RebuildAuthority:
     through_lsn: Lsn
 
 
+class _FirstFitPages:
+    """Ephemeral first-fit directory for pages proved empty at the start of one build.
+
+    The tree stores the greatest payload capacity below each node, so choosing the leftmost page
+    that can hold an entry is logarithmic and byte-for-byte equivalent to ``_place`` walking the
+    chain from its head.  It is never retained across a commit, recovery call or certificate.
+    """
+
+    __slots__ = ("pages", "_capacities", "_leaf_count", "_tree")
+
+    def __init__(self, pages: Sequence[PageIndex], capacities: Sequence[int]) -> None:
+        self.pages: list[PageIndex] = list(pages)
+        self._capacities: list[int] = list(capacities)
+        self._leaf_count = 1
+        while self._leaf_count < len(self.pages):
+            self._leaf_count *= 2
+        self._tree: list[int] = [-1] * (2 * self._leaf_count)
+        self._rebuild_tree()
+
+    def first_fit(self, payload_size: int) -> int | None:
+        """Return the first chain position that can hold ``payload_size``, if one exists."""
+        if not self.pages or self._tree[1] < payload_size:
+            return None
+        node = 1
+        while node < self._leaf_count:
+            left = node * 2
+            node = left if self._tree[left] >= payload_size else left + 1
+        position = node - self._leaf_count
+        return position if position < len(self.pages) else None
+
+    def update(self, position: int, capacity: int) -> None:
+        """Replace one page's capacity after a successful mutation."""
+        self._capacities[position] = capacity
+        node = self._leaf_count + position
+        self._tree[node] = capacity
+        node //= 2
+        while node:
+            self._tree[node] = max(self._tree[node * 2], self._tree[node * 2 + 1])
+            node //= 2
+
+    def append(self, page: PageIndex, capacity: int) -> None:
+        """Add a new tail page, growing the tree geometrically."""
+        self.pages.append(page)
+        self._capacities.append(capacity)
+        if len(self.pages) > self._leaf_count:
+            self._leaf_count *= 2
+            self._tree = [-1] * (2 * self._leaf_count)
+            self._rebuild_tree()
+            return
+        self.update(len(self.pages) - 1, capacity)
+
+    def position(self, page: PageIndex) -> int | None:
+        """Return one page's chain position; build chains are intentionally short metadata."""
+        try:
+            return self.pages.index(page)
+        except ValueError:
+            return None
+
+    def _rebuild_tree(self) -> None:
+        """Recreate the max tree after geometric growth."""
+        start = self._leaf_count
+        self._tree[start : start + len(self._capacities)] = self._capacities
+        for node in range(self._leaf_count - 1, 0, -1):
+            self._tree[node] = max(self._tree[node * 2], self._tree[node * 2 + 1])
+
+
+@dataclass(slots=True)
+class _EmptyIndexBuild:
+    """State derived only after every bucket page was proved empty for this one batch."""
+
+    buckets: dict[int, _FirstFitPages] = field(default_factory=dict)
+    entries: dict[
+        tuple[bytes, RecordRef], tuple[PageIndex, SlotId, IndexEntry]
+    ] = field(default_factory=dict)
+    valid: bool = True
+
+
 _ReadResult = TypeVar("_ReadResult")
 
 
@@ -1615,9 +1692,31 @@ class IndexStore:
         """Apply one staged batch; a RESET caller already holds the whole-file fence."""
         applied = 0
         moved_any = False
+        empty_build: _EmptyIndexBuild | None = None
         for change in staged.changes:
             try:
-                moved_any = self._apply_change(change, stamp) or moved_any
+                moved: bool
+                accelerated = (
+                    None
+                    if empty_build is None
+                    else self._apply_empty_build_change(empty_build, change, stamp)
+                )
+                if accelerated is None:
+                    moved = self._apply_change(change, stamp)
+                    if empty_build is not None:
+                        empty_build = None
+                else:
+                    moved = accelerated
+                moved_any = moved or moved_any
+                if (
+                    change.operation is IndexOperation.RESET
+                    and moved
+                    and applied == 0
+                ):
+                    # RESET just validated and cleared every reachable bucket page while this
+                    # rebuild holds the whole-file fence.  The remaining changes may therefore
+                    # use an ephemeral directory without trusting state from another generation.
+                    empty_build = _EmptyIndexBuild()
             except GrafxError as failure:
                 if applied == 0 and failure.details.get("field") in {
                     "rebuild_superseded",
@@ -2468,6 +2567,146 @@ class IndexStore:
         # A negative diagnostic count proves that some state transition escaped this handle.
         # Re-seeding on the next gauge is safer than publishing an invented correction.
         self._tombstone_backlog_count = adjusted if adjusted >= 0 else None
+
+    @staticmethod
+    def _page_insert_capacity(page: Page) -> int:
+        """Return the largest payload one additional slot can hold after compaction."""
+        return page.compactable_space() - SLOT_ENTRY_SIZE
+
+    def _empty_build_bucket(
+        self, build: _EmptyIndexBuild, bucket: int
+    ) -> _FirstFitPages | None:
+        """Return one batch-local bucket directory after proving every page is still empty."""
+        known = build.buckets.get(bucket)
+        if known is not None:
+            return known
+        pages = self._bucket_pages(bucket)
+        capacities: list[int] = []
+        for page_index in pages:
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                if page.live_slots():
+                    build.valid = False
+                    return None
+                capacities.append(self._page_insert_capacity(page))
+        state = _FirstFitPages(pages, capacities)
+        build.buckets[bucket] = state
+        return state
+
+    def _place_during_empty_build(
+        self,
+        build: _EmptyIndexBuild,
+        bucket: int,
+        entry: IndexEntry,
+        lsn: Lsn,
+    ) -> tuple[PageIndex, SlotId, IndexEntry] | None:
+        """Place one entry through the batch first-fit directory, or decline conservatively."""
+        pages = self._empty_build_bucket(build, bucket)
+        if pages is None:
+            return None
+        payload = entry.encode()
+        position = pages.first_fit(len(payload))
+        if position is not None:
+            page_index = pages.pages[position]
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                try:
+                    slot = page.insert_slot(payload)
+                except PageFullError:
+                    # A cooperating build owns the surrounding publication fence, so this can
+                    # only mean the ephemeral view no longer describes the page.  The canonical
+                    # walk re-establishes truth; no page was changed by the refused insertion.
+                    build.valid = False
+                    return None
+                self._stamp(page, lsn)
+                pages.update(position, self._page_insert_capacity(page))
+            return page_index, slot, entry.located_at(page_index, slot)
+
+        if not pages.pages:
+            build.valid = False
+            return None
+        fresh = self._pool.allocate(self.file, self.page_type)
+        page_index = fresh.page_index
+        try:
+            slot = fresh.insert_slot(payload)
+            self._stamp(fresh, lsn)
+            capacity = self._page_insert_capacity(fresh)
+        finally:
+            self._pool.unpin(self.file, page_index, dirty=True)
+        # Match _place_on_new_page's failure ordering: the new page is complete before the old
+        # tail links it, so an interrupted link leaves unreachable space rather than a bad chain.
+        tail_index = pages.pages[-1]
+        with self._pool.pinned(self.file, tail_index) as tail:
+            self._require_index_page(tail, tail_index)
+            tail.next_page = page_index
+            tail.dirty = True
+        pages.append(page_index, capacity)
+        return page_index, slot, entry.located_at(page_index, slot)
+
+    def _apply_empty_build_change(
+        self, build: _EmptyIndexBuild, change: IndexChange, lsn: Lsn
+    ) -> bool | None:
+        """Apply against a batch proved empty, returning None when canonical fallback is needed."""
+        if not build.valid or change.operation is IndexOperation.RESET:
+            return None
+        bucket = bucket_of(change.key, self._definition.bucket_count)
+        identity = (change.key, change.ref)
+        located = build.entries.get(identity)
+        if change.operation is IndexOperation.INSERT:
+            self._require_key(change.key)
+            if located is not None:
+                return False
+            entry = IndexEntry(
+                key=change.key,
+                ref=change.ref,
+                versioned=change.versioned,
+                born_csn=change.csn if change.versioned else NO_CSN,
+            )
+            placed = self._place_during_empty_build(build, bucket, entry, lsn)
+            if placed is None:
+                return None
+            build.entries[identity] = placed
+            return True
+        if located is None:
+            self._missing_targets += 1
+            return False
+        page_index, slot, entry = located
+        if change.operation is IndexOperation.TOMBSTONE:
+            if not entry.live:
+                return False
+            ended = entry.ended_at(change.csn)
+            try:
+                moved = self._rewrite(page_index, slot, ended, lsn)
+            except BaseException:
+                build.valid = False
+                self._invalidate_tombstone_backlog()
+                raise
+            if moved:
+                build.entries[identity] = (page_index, slot, ended.located_at(page_index, slot))
+                self._adjust_tombstone_backlog(1)
+            return moved
+        try:
+            moved = self._erase(page_index, slot, lsn)
+        except BaseException:
+            build.valid = False
+            self._invalidate_tombstone_backlog()
+            raise
+        if moved:
+            build.entries.pop(identity, None)
+            pages = build.buckets.get(bucket)
+            if pages is None:
+                build.valid = False
+                return moved
+            position = pages.position(page_index)
+            if position is None:
+                build.valid = False
+                return moved
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                pages.update(position, self._page_insert_capacity(page))
+            if not entry.live:
+                self._adjust_tombstone_backlog(-1)
+        return moved
 
     # --- applying -----------------------------------------------------------------------------
 
@@ -5593,29 +5832,34 @@ class IndexManager:
             created = True
             index.create(proved_present=True)
 
+            empty_build = _EmptyIndexBuild()
             for ref, key, ended_at in self._detached_exact_generation_entries(
                 definition, position, table
             ):
-                index._apply_change(
-                    IndexChange(
+                insert = IndexChange(
+                    index=definition.name,
+                    operation=IndexOperation.INSERT,
+                    key=key,
+                    ref=ref,
+                )
+                accelerated = index._apply_empty_build_change(
+                    empty_build, insert, position
+                )
+                if accelerated is None:
+                    index._apply_change(insert, position)
+                if ended_at is not None:
+                    tombstone = IndexChange(
                         index=definition.name,
-                        operation=IndexOperation.INSERT,
+                        operation=IndexOperation.TOMBSTONE,
                         key=key,
                         ref=ref,
-                    ),
-                    position,
-                )
-                if ended_at is not None:
-                    index._apply_change(
-                        IndexChange(
-                            index=definition.name,
-                            operation=IndexOperation.TOMBSTONE,
-                            key=key,
-                            ref=ref,
-                            csn=ended_at,
-                        ),
-                        position,
+                        csn=ended_at,
                     )
+                    accelerated = index._apply_empty_build_change(
+                        empty_build, tombstone, position
+                    )
+                    if accelerated is None:
+                        index._apply_change(tombstone, position)
 
             # The header claim is flushed before verification, and the final checkpoint below
             # then barriers the complete verified generation as one unreachable shadow.
