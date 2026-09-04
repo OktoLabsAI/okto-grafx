@@ -11,7 +11,7 @@
 
 - **Linha `0.0.2` iniciada sob o plano de performance congelado.** A branch canônica de trabalho é
   `feature/v0.0.2`; o bump de versão, o ambiente P0.0 e o diagnóstico/correção multiprocesso P0.1
-  estão publicados, e o marco de código integrado mais recente é `2fa81b1`. A auditoria do Pulse Community pinado em `d50c034`
+  estão publicados, e o marco de código integrado mais recente é `72694bd`. A auditoria do Pulse Community pinado em `d50c034`
   (Core `f602c7c`) confirmou que o backfill
   não chama `rebuild_vector_index`, portanto a cerca process-local de um rebuild manual não é um
   blocker do fluxo real. D-26, D-01 e D-04 foram promovidos depois dos testes focados: D-26 mede
@@ -273,9 +273,26 @@
   concorrência de fronteira, activation/v2/reopen; `verify("all")` live e cold passou, além de
   Ruff, `compileall` e `diff --check`. A revisão adversarial encontrou quatro blockers reais
   (callback lógico hostil, perda de vector no inventário v2, receipt sem horizons e coleções não
-  ordenadas) e confirmou todos fechados, sem blocker residual. O próximo e último submilestone
-  do item 10 permanece exatamente o rehash foreground growth-only. Itens 11--13 e sharding não
-  entram nesse passo.
+  ordenadas) e confirmou todos fechados, sem blocker residual.
+
+  **Item 10 / P2-ID concluído em `72694bd`.** `Database.rehash_index()` e a facade de manutenção
+  exigem exatamente um hint e crescimento estrito, constroem uma geração shadow imutável sob o
+  writer lease + `COMMIT_SECTION`, preservam as duas OCC e só publicam o novo ACTIVE após a
+  barreira física. No catálogo v1, a coativação v2 redimensiona a geração planejada e constrói o
+  alvo uma única vez; custom v1 sem autoridade durável é recusado. No v2, somente o predecessor
+  imediato fica descrito como STALE; arquivos históricos permanecem órfãos não reutilizáveis até
+  existir reclamador seguro. O WAL continua lógico por nome e recovery converge para autoridade
+  antiga completa ou nova completa. Handles long-lived adotam mudança de catálogo antes do próximo
+  statement/`verify()`, sem rescan de inventário para DML comum, checkpoint ou delta CE-3 grande
+  quando os bytes persistidos do catálogo não mudaram. Geração ACTIVE ausente/malformada mantém um
+  latch e faz toda nova fronteira falhar fechada até reparo. O gate focal integrado passou 163/163,
+  com recovery/fault injection, multiprocesso `strict`/`generation`, read-only, cold reopen e
+  `verify("all")`; Ruff, `compileall`, diff-check e duas revisões adversariais ficaram verdes.
+  O gate adjacente também revelou um drift test-only anterior: a métrica
+  `oktografx_buffer_retained_estimate_bytes` era emitida e constava do contrato desde `283cffa`,
+  mas não do roster executável do storage-core; `0374dc9` alinhou o teste e o lote focal passou.
+  Assim, o próximo item autorizado é exatamente o **11 — vacuum/compaction MVCC**; itens 12--13 e
+  sharding não entram nele.
 
 - **Run real do Pulse 0.3.3 na pasta padrão — reconstrução Grafx em andamento, SQLite preservado.**
   Antes da troca foi criado backup consistente do SQLite (`quick_check=ok`, zero violações de FK)

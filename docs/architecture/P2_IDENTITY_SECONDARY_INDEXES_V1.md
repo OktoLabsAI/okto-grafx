@@ -1,7 +1,9 @@
 # P2-ID v1 — identity access path, persistent secondary indexes and growth-only rehash
 
-**Status:** accepted for implementation in `0.0.2`  
-**Decision date:** 2026-09-03  
+**Status:** implemented and accepted in `0.0.2`
+
+**Decision date:** 2026-09-03
+
 **Scope:** item 10 of the post-P1 performance queue
 
 This ADR is the finite implementation contract for P2-ID. It supersedes the original D-08
@@ -172,8 +174,10 @@ of the following against the catalog and heap authority:
 Index header format 2 is retained unchanged. A rehash writes a new file and a new nonce; it never
 renames or replaces the active index file. This preserves the premise of
 `ST2_DESCRIPTOR_REVALIDATION.md`, especially in `descriptor_revalidation="generation"` mode.
-Old and orphan generations are retained until a separate safe cleanup operation; their existence
-does not make them eligible.
+The catalog retains at most the ACTIVE generation and its immediately retired STALE predecessor
+after a rehash. Older generation files are not deleted: they become ordinary retained orphans
+until a separate safe cleanup operation. This bounds catalog growth without making any retired or
+orphan artifact eligible, and physical nonce discovery prevents their identities from being reused.
 
 ## 4. Canonical identity key
 
@@ -259,23 +263,51 @@ the same fenced durable view used to build the shadow.
 same validation and formula. The resolved bucket count must be strictly greater than the active
 generation's count. Equal or smaller values are typed refusals; P2-ID v1 never shrinks.
 
-Rehash is explicit, foreground maintenance:
+Rehash is explicit, foreground maintenance using the existing detached-build protocol:
 
-1. enter the normal writable/recovery-complete door and acquire `COMMIT_SECTION`;
-2. refresh and validate catalog, publication state and the table's page-0/high-water authority;
-3. allocate a distinct non-zero nonce and a never-before-active physical file;
-4. scan the fenced heap view and build the complete `building` shadow with the new count;
-5. verify the shadow, set its header horizons to the exact fenced durable position, flush it and
-   establish the storage durability barrier;
-6. run the unchanged first/second OCC and pre-WAL authority checks;
-7. publish the catalog v2 image that marks the new generation `active` and the former generation
-   `stale`, through the normal WAL-before-data transaction;
-8. release `COMMIT_SECTION`; only later writers can target the new active generation.
+1. a fresh dedicated write transaction enters the normal writable/recovery-complete door and a
+   schema-artifact section, refreshes catalog/index/publication authority and resolves the exact
+   ACTIVE generation;
+2. validate growth, discover a distinct non-zero nonce, declare every partition of the target
+   table as an OCC read, preflight `max_index_build_entries` to N+1 and stage only the future
+   catalog page images; nonce discovery is not ownership and creates no file;
+3. commit acquires the ordinary writer lease and `COMMIT_SECTION`, refreshes foreign authority and
+   runs the unchanged first OCC validation **before** any physical shadow is created;
+4. exclusive-create the never-before-active file, scan the heap view fenced at the preparation
+   position P and build the complete shadow with the new count;
+5. verify the shadow, set its header horizons to exactly P (never the rehash commit's own LSN C),
+   flush it and establish the storage durability barrier;
+6. run the unchanged second OCC and pre-WAL authority checks;
+7. publish the catalog v2 image that marks the new generation ACTIVE and the former generation
+   STALE through the normal WAL-before-data transaction, then release `COMMIT_SECTION` and the
+   writer lease; only later writers can target the new ACTIVE generation.
 
-No writer can interleave between steps 2 and 8, so there is no dual-write or catch-up interval.
+Catalog v1 accepts this door only for an already-active schema-derived automatic exact index. Its
+v2 coactivation and requested growth are one plan and one commit: the not-yet-built migration
+generation of the target is resized in place and built once. A process-local custom v1 index has no
+durable logical authority and is refused. In catalog v2, rehash preserves logical identity and
+retains only the immediately previous ACTIVE descriptor as STALE; older immutable files remain on
+disk as unreachable orphans.
+
+The fenced position matters to logical WAL replay. `COMMIT_SECTION` excludes target writers between
+the successful first OCC and publication, so there is no logical index effect in `(P, C]`. Recovery
+resolving an effect through the new ACTIVE generation skips effects at or below its exact
+`built_through_lsn = P`, applies later effects to it, and never targets the STALE predecessor.
+
+No writer can interleave between the successful first OCC in step 3 and publication in step 7, so
+there is no dual-write or catch-up interval.
 Readers that began before activation may finish using their already-certified view; a new statement
 refreshes the catalog/read view and resolves the active generation again. The longer writer pause is
 an explicit cost of this finite protocol, not a change to the multiwriter/multireader premise.
+
+A long-lived handle classifies a bounded foreign WAL delta at each fresh read boundary. Ordinary
+heap/index DML does not rescan the process-local index inventory. A catalog write refreshes and
+adopts the newly selected ACTIVE generation before planning; an unprovable interval (for example,
+checkpoint movement or a delta above the CE-3 cap) first compares the immutable catalog image and
+skips the inventory/header pass when those bytes are unchanged. Read-only handles use the same
+existing-only adoption and create no artifact. If a catalog-selected generation is absent or
+malformed, the authority-sync requirement stays latched: this and every later fresh `begin()` or
+`verify()` fails closed until the selected artifact becomes valid or catalog authority changes.
 
 There is no automatic background rehash in this version. Inventory/metrics expose active bucket
 count and the configured/derived expected cardinality so operators can schedule foreground growth
@@ -325,10 +357,10 @@ be stated in release notes and Pulse deployment documentation before activation.
 | `0.0.2` writable, catalog v2 | Uses persisted definitions, stages every active-index effect in the existing transaction/WAL protocol and may run explicit foreground rehash. |
 | `0.0.1`, cold open of catalog v2 | Refuses the coactivated commit-state/catalog future version with `GrafxSchemaVersionMismatch`; it must not bootstrap, quarantine, downgrade or mutate the database. |
 | `0.0.1` already open when v2 activates | A pinned read may finish. Its next begin, row write, DDL, checkpoint/recycle or recovery mutation reads commit-state v2 first and refuses **before** read-view invalidation/write-back, WAL append, page materialization or publication. |
-| crash while building a shadow | Catalog v1 or the former v2 active generation remains authoritative. The incomplete/unreferenced file is ignored and retained as an orphan. |
-| crash after shadow barrier, before catalog WAL commit | The complete shadow is still unreachable. Reopen uses the old authority; later maintenance may identify the orphan by nonce. |
-| crash during catalog activation | Existing WAL recovery converges to the complete old catalog or the complete committed v2 catalog. It never publishes a prefix of its index-definition set. |
-| crash after committed activation | Reopen sees the complete v2 authority and requires its referenced generation/header certificate. Missing, mismatched or partial referenced bytes fail closed. |
+| crash while building an activation/rehash shadow | Catalog v1 or the former v2 ACTIVE generation remains authoritative. The incomplete/unreferenced file is ignored and retained as an orphan. |
+| crash after rehash shadow barrier, before catalog WAL commit | The complete shadow is still unreachable. Reopen uses the old authority; retry chooses a new nonce and later maintenance may identify the orphan. |
+| crash during catalog activation/rehash publication | Existing WAL recovery converges to the complete old catalog or the complete committed v2 catalog. It never publishes a prefix of its index-definition set or two ACTIVE generations. |
+| crash after committed rehash | Reopen sees the new ACTIVE plus its immediate STALE predecessor and requires the ACTIVE header certificate. Missing, mismatched or partial referenced bytes fail closed; logical redo resolves only the new ACTIVE. |
 | catalog v2 with a persisted `stale` generation | Planner does not use it. A correct canonical heap fallback is allowed; writable maintenance may rebuild it. |
 | restore/logical import | Logical rows/schema are authoritative; generation files are rebuilt and newly nonced. A copied generation is never trusted without matching database/catalog/header authority. |
 
@@ -402,8 +434,9 @@ Database.rehash_index(
 Database.ensure_identity_indexes()
 ```
 
-`create_index` and `rehash_index` accept exactly one sizing hint at most and return a detached
-public index view only after the catalog commit is durable. The public view reports logical
+`create_index` accepts at most one sizing hint and retains its 64-bucket default when neither is
+given. `rehash_index` requires exactly one hint. Both return a detached public index view only after
+the catalog commit is durable. The public view reports logical
 name/table/positions/derivation, automatic flag, state, active nonce, bucket count, sizing hint and
 freshness horizons; it exposes no writable store or raw storage capability.
 
@@ -556,7 +589,7 @@ The implementation is intentionally split at reviewable durability boundaries:
 | Statement-stable endpoint routing | complete | `01c496d`; ACTIVE identity lookup is `O(K_t)` to select and hash-directed thereafter; miss is definitive and post-selection failures never fall back |
 | Activation and automatic DDL scope | complete | `ba8ca9a`; explicit/idempotent `ensure_identity_indexes`, automatic v2 generations for later NODE/REL DDL, endpoint identity scope, bounded build admission and pre-publication durability barriers |
 | Custom secondary indexes | complete | `2fa81b1`; transactional `CREATE INDEX` and Python/maintenance doors, ordered compound keys, deterministic sizing, detached committed receipt and query-equality-safe execution |
-| Growth-only rehash | next | foreground ACTIVE-to-STALE generation rotation with the recovery matrix in section 12 |
+| Growth-only rehash | complete | `72694bd`; foreground ACTIVE-to-STALE immutable generation rotation, v1 coactivation, bounded catalog history, long-lived reader adoption and crash/recovery matrix |
 
 The ACTIVE projection uses a structural catalog map and a structural raw-registry map keyed by
 `(table_id, table_name)`. Per-row count/staging is therefore `O(K_t + S_txn)`, where `K_t` is the
@@ -610,6 +643,17 @@ language's wider equality relation. The public inventory strips hostile descript
 continues to expose schema-derived vector/proximity indexes under catalog v2. Focused composed
 gates passed 394/394 and 281/281 tests with live/cold `verify("all")`, Ruff, compile and diff checks;
 the final adversarial review reported no remaining blocker.
+
+Quality evidence for `72694bd`: `Database.rehash_index()` and its maintenance facade require
+exactly one sizing hint and strict growth, build a distinct immutable shadow under the existing
+writer/commit fences and publish only after both OCC checks plus its durability barrier. Catalog v1
+coactivates v2 and builds the resized target once; catalog v2 retains only the immediate STALE
+descriptor while older files remain non-reused orphans. Fault injection proves recovery to either
+the old complete authority or the new complete authority, and multiprocess tests prove writer
+serialization plus statement-stable old-reader completion followed by new-ACTIVE adoption. The
+focused ten-module gate passed 163/163 tests; Ruff, `compileall` and diff checks were green. Two
+independent adversarial reviews reported no blocker after the persisted-catalog image gate and the
+persistent fail-closed authority-sync latch were added.
 
 The WAL is intentionally **not** qualified by physical generation. A logical name cannot be
 rebound to different table/positions/visibility/derivation, a rehash shadow is complete through

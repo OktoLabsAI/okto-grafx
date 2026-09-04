@@ -111,7 +111,7 @@ connect(path, **options)
   └─ PortRegistry.require      fail closed: name EVERY missing slot in one error
   └─ open the device, the identity file, the catalog, the heap, the log
   └─ RecoveryManager.recover   replay the log idempotently; truncate a torn tail; preserve evidence
-  └─ re-adopt the indexes      primary-key indexes, then declared vector indexes
+  └─ re-adopt the indexes      catalog-selected exact generations, then declared vector indexes
   └─ IndexManager.open         compare each index's claimed position against the published one
   └─ Database                  ready
 ```
@@ -217,9 +217,9 @@ cannot disagree about one invariant.
 ```
 mydb/
   identity.dat     one page: what this database is. A mismatched open is refused, not adapted.
-  catalog.dat      the schema: tables, columns, primary keys, vector spaces
+  catalog.dat      schema plus catalog-v2 logical exact-index/generation authority
   heap.dat         page 0 is the table directory; every other page is a slotted data page
-  index/           one file per secondary index (pk_<Table>.idx, vector_<Table>_<space>.idx)
+  index/           immutable exact generations plus schema-derived vector index files
   wal/             000000000001.wal, … — segments with an LSN mark index
   control/         lease, commit state, reader registrations — published atomically
   ledger/          forensic entries: what was found, where, and what was done
@@ -353,6 +353,13 @@ a primary key be indexed without the index having to understand visibility.
 
 **PROXIMITY** (vector). Entries are versioned with tombstones and a horizon, and they are already the
 answer — the heap is deliberately not consulted.
+
+Catalog v2 is durable authority for exact logical definitions and their immutable physical
+generations. `CREATE INDEX` can add ordered equality keys, endpoint tables can receive an automatic
+unsigned `RecordId -> RecordRef` access path, and `rehash_index()` grows one ACTIVE directory by
+building a distinct foreground shadow before rotating the predecessor to STALE. A statement that
+selected a healthy generation never changes route mid-flight; a later read boundary adopts a
+foreign catalog generation, while a missing/malformed selected file fails closed.
 
 Vector indexes are **sparse for nullable embeddings**. A row whose vector is `NULL` remains a normal
 heap row but has no vector entry, cannot enter either search regime and is omitted by rebuild and

@@ -1547,10 +1547,12 @@ The traversal expands a frontier node through them, with two deliberate qualific
 1834 ms before, **221 ms** after; forward hop from one node 29 ms; two hops out and back 56 ms.
 Index-vs-scan equality asserted by test on every shape.
 
-**What remains, recorded not hidden:** the landing of a traversal with a FREE target is resolved by
-one scan of the landing table per traversal (edges store record identities, and no identity index
-exists); and the planner does not reorder a pattern to start from its seekable side, so
-`MATCH (c)-[:M]->(e {id: k})` still walks from `c`. Both in PUNCHLIST as the next levers.
+**What remained at CF-17, recorded not hidden:** the landing of a traversal with a FREE target was
+resolved by one scan of the landing table per traversal because edges store record identities and
+no identity index existed. P2-ID in `0.0.2` closes that first lever for activated catalog-v2
+endpoint tables with an unsigned `RecordId -> RecordRef` exact access path and heap validation;
+legacy/ineligible cases preserve the scan fallback. The planner still does not reorder a pattern to
+start from its seekable side, so `MATCH (c)-[:M]->(e {id: k})` still walks from `c`.
 
 ### CF-18 — round-6 reviews: the schema statement did not hold until complete, and a hostile
 ### metrics sink could turn a durable commit into a reported failure (C10/C5/C8; CLOSED)

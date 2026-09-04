@@ -129,6 +129,14 @@ transactions like any other.
   Choose either `bucket_count=` or `expected_cardinality=`; with neither, the default is 64
   buckets. The Python door owns a dedicated write transaction and returns an immutable
   `IndexView` only after the shadow generation and catalog commit are durable.
+- **Exact indexes can grow explicitly without replacing a live file.** Call
+  `db.rehash_index("by_email", bucket_count=256)` or supply `expected_cardinality=` instead —
+  exactly one hint is required, and the resolved count must be strictly larger than the current
+  ACTIVE generation. This is foreground maintenance: writers wait during the complete shadow
+  scan/build, while readers with an established snapshot may finish. The immediate predecessor is
+  retained as STALE; older immutable files remain retained orphans until safe reclamation exists.
+  A catalog-v1 automatic index activates v2 and grows in one build, so every process using the
+  directory must satisfy the compatibility fence below.
 - **Catalog-v2 activation is a one-way compatibility fence.** `db.create_index(...)` and the
   explicit idempotent `db.ensure_identity_indexes()` may activate it. Every process that can open
   that database must therefore run a Grafx build that understands catalog v2; rollback uses a
@@ -408,9 +416,9 @@ streaming the terminal does not by itself make an unbounded sort, distinct or gr
 Properties such as `db.catalog`, `db.indexes`, `db.wal`, `db.storage` and `db.metrics` are frozen
 snapshots for schema, inventory and diagnostics. They never retain the storage device, page pool,
 WAL, transaction manager or adapter callbacks. Writes go through transactions or explicit gated
-database methods (`create_index`, `ensure_identity_indexes`, `checkpoint`, `recover`, `flush`,
-`publish_metrics`); there is no `unsafe=True` escape. `Transaction` exposes `snapshot`, `mode`,
-`txn_id`, `active` and `report`, but never its mutable engine context.
+database methods (`create_index`, `rehash_index`, `ensure_identity_indexes`, `checkpoint`,
+`recover`, `flush`, `publish_metrics`); there is no `unsafe=True` escape. `Transaction` exposes
+`snapshot`, `mode`, `txn_id`, `active` and `report`, but never its mutable engine context.
 
 ### In memory
 
@@ -530,9 +538,9 @@ invisible to every other process.
 ```
 mydb/
   identity.dat        # what this database is; refuses a mismatched open
-  catalog.dat         # the schema
+  catalog.dat         # schema plus catalog-v2 exact-index authority
   heap.dat            # rows, in slotted pages chained per table
-  index/              # one file per secondary index
+  index/              # immutable index generations; catalog v2 selects each ACTIVE file
   wal/                # segmented write-ahead log
   control/            # lease, commit state, reader registrations
   ledger/             # forensic evidence
@@ -803,10 +811,10 @@ practice:
   reference engine; they are met on POSIX with `[accel]` and missed on Windows, where control-file
   publication costs ~16.5 ms against ~0.13 ms on Linux. The measurements and the analysis are in
   `docs/architecture/COMPONENTS.md`.
-- **Traversal with an unbound target resolves landings by scanning the landing table** (edges
-  store record identities, and identities carry no index yet). Endpoint indexes cover the edges
-  themselves, so the old every-edge-per-node scan is gone, but a hop that lands on a large free
-  table still pays one scan of it per traversal.
+- **Catalog-v1 traversal can still scan an unbound landing table.** Catalog-v2 activation adds an
+  automatic unsigned `RecordId -> RecordRef` exact index for relationship endpoint tables, so
+  eligible landings use one hash-directed lookup plus heap validation. Legacy/unactivated catalogs,
+  absent eligibility and deliberately scan-only collisions retain the canonical scan fallback.
 - **A plain `DELETE` of a node ends the node, not its relationships.** They stay on the pages
   as rows no traversal will follow — a landing whose snapshot cannot see the node is not
   reached — so the absence an ordinary `DELETE` promises is a logical one. `DETACH DELETE` is
@@ -837,6 +845,7 @@ the default `"strict"` mode.
 | `docs/architecture/CONTRACT.md` | The frozen coordination substrate: error taxonomy, on-disk formats, the commit protocol, the metric catalogue, and the Definition of Done every component is reviewed against |
 | `docs/architecture/COMPONENTS.md` | The component register, the sign-off record, and every carried finding with the measurement behind it |
 | [`docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md`](docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md) | The strict/default and generation/opt-in descriptor identity policies, exact whitelist, risks and deployment guidance |
+| [`docs/architecture/P2_IDENTITY_SECONDARY_INDEXES_V1.md`](docs/architecture/P2_IDENTITY_SECONDARY_INDEXES_V1.md) | Catalog-v2 identity/custom exact indexes, immutable generations, sizing, foreground rehash, compatibility and recovery contract |
 | `docs/architecture/LESSONS.md` | What went wrong while building this and what it taught |
 | `docs/architecture/PUNCHLIST.md` | Known gaps, written down rather than hidden |
 | [`CHANGELOG.md`](CHANGELOG.md) | What changed, per release |

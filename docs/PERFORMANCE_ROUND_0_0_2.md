@@ -361,6 +361,8 @@ commit/WAL integration batch, Ruff and diff-check passed; no Pulse data was acce
 | 2026-09-03 | Multiprocess quality gate | 500/500 operations acknowledged in 46.6 s, 510 stored rows including ten contention seeds, 44 retryable conflicts absorbed, zero loss/duplicate/phantom/torn read, and clean live/reopen `verify("all")` |
 | 2026-09-03 | Finite P2 selection | `none`; P2-ID, P2-DIRTY and P2-VAC did not meet their frozen post-P1 evidence triggers, so no structural change was implemented by hypothesis |
 | 2026-09-03 | P2-ID custom exact indexes | `2fa81b1`; transactional `CREATE INDEX`, `Database.create_index()` and maintenance delegation add ordered compound keys and deterministic sizing. The ACTIVE receipt includes certified nonce/metadata/horizons; query equality retains NULL/numeric semantics, hostile logical descriptors cannot execute through inventory, and schema-derived vector/proximity indexes remain visible in v2. Composed gates passed 394/394 + 281/281 with live/cold verification, Ruff, compile, diff-check and no adversarial blocker remaining |
+| 2026-09-03 | P2-ID growth-only foreground rehash | `72694bd`; exact indexes rotate through a distinct durable shadow, retaining one STALE descriptor; v1 coactivation builds once, recovery converges old-or-new, long-lived/read-only handles adopt foreign ACTIVE authority, and unchanged catalog bytes avoid full inventory/header scans. Focused gate 163/163 plus two adversarial reviews passed |
+| 2026-09-03 | Storage metric-contract drift | `0374dc9`; the retained-memory estimate already emitted and documented since `283cffa` is now present in the storage-core executable roster. Test-only correction; the focused contract/catalog batch and Ruff passed |
 | 2026-09-03 | Post-round D-29(c/d): closed-provider corpus proof memoized | `NativeCrc32c` proved the corpus (108 inputs, 169,529 bytes, 8 published vectors) against the pure reference on every construction, ~34 ms per `connect()` on the 3.13.1 box `[MEDIDO-micro]`; and `install()` replayed it again in the domain door (another ~30 ms); the successful proof of a `load_provider` result is now memoized per process under the provider's strong identity in BOTH doors, so a repeat `connect()` cycle costs ~0.05 ms for both. Each closed module/attribute slot retains only its current wrapper/proofs, raw functions match strictly by `is`, and one adapter lock makes concurrent first opens run each independent corpus once. Refusals are never memoized, a replaced function proves again, and injected providers and `verify_runtime=True` keep their per-construction/per-call semantics |
 
 ## Post-P1 bounded queue — items 1–9 checkpoint
@@ -400,3 +402,29 @@ sizing/rehash and identity/secondary indexes, MVCC vacuum/compaction, delta/chun
 WAL, and a native codec beyond CRC. That authorization does not waive each item's ADR,
 migration/compatibility contract or recovery and concurrency quality gates; it only removes the
 need to repeat the prior performance-selection gate.
+
+## Item 10 / P2-ID — identity and exact-index lifecycle
+
+Status: **complete on `feature/v0.0.2` through `72694bd`**.
+
+The milestone now covers catalog-v2 ACTIVE projection, unsigned record-identity lifecycle,
+statement-stable endpoint routing, explicit automatic activation, transactional custom exact
+indexes and foreground growth-only rehash. Rehash uses a distinct immutable shadow, retains the
+immediate predecessor as STALE, leaves older files as non-reused orphans and publishes only after
+the normal first/second OCC plus a physical durability barrier. Catalog-v1 automatic indexes are
+coactivated and resized in one build; process-local custom v1 definitions are refused.
+
+The read boundary also adopts foreign catalog authority without turning ordinary DML into an
+`O(total_indexes)` inventory scan. A bounded WAL delta identifies catalog writes; conservative
+checkpoint/large-delta paths compare the immutable persisted catalog image and skip header opens
+when it is unchanged. Missing or malformed selected generations remain latched fail-closed across
+later begins. The focused ten-module gate passed 163/163 tests, including crash recovery,
+multiprocess `strict`/`generation`, read-only adoption, cold reopen and verification; Ruff,
+`compileall`, diff-check and two independent adversarial reviews passed. These are quality results,
+not a new throughput claim. Item 11 (MVCC vacuum/compaction) is the next authorized boundary.
+
+Reproducible 163-test invocation:
+
+```text
+python -m pytest tests/index/test_identity_activation_domain.py tests/txn/test_bounded_read_view.py tests/txn/test_index_rehash_preparation.py tests/api/test_index_rehash.py tests/api/test_index_rehash_recovery.py tests/api/test_index_rehash_multiprocess.py tests/api/test_maintenance_facade.py tests/api/test_cross_process_visibility.py tests/api/test_read_view_own_exemption_multiprocess.py tests/storage_core/test_catalog_store.py -q
+```

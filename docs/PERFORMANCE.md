@@ -171,10 +171,12 @@ The distinction avoids speculative probes on a scan-shaped plan, which previousl
 `edge_lookups` and `edge_scans`, and the instrument proves **index-vs-scan equality** by staling the
 indexes and comparing answers.
 
-**Known ceiling, recorded:** a traversal whose target is *unbound* resolves landings by one scan of
-the landing table per traversal (edges store record identities; identities carry no index yet) —
-that is most of the 192.9 ms above, and the next structural lever. See PUNCHLIST, *"Traversal after
-CF-17: the two levers left"*.
+**Historical ceiling, now structurally addressed in 0.0.2:** the measurements above predate P2-ID,
+when a traversal whose target was *unbound* resolved landings by one scan of the landing table
+because edges store record identities. Activated catalog-v2 endpoint tables now receive an
+unsigned `RecordId -> RecordRef` exact access path and use one hash-directed lookup plus heap
+validation; legacy/ineligible cases keep the canonical scan. No post-P2 wall-time result is claimed
+here. See PUNCHLIST, *"Traversal after CF-17: the two levers left"*.
 
 ### Vector top-k as an end-to-end access path (0.0.2)
 

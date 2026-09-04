@@ -14,6 +14,10 @@ including the on-disk format.
   expected-cardinality sizing share one planner and one catalog-v2 shadow-build protocol. The
   Python door returns a detached ACTIVE `IndexView` with a certified nonce and freshness
   horizons only after durable publication.
+- Added explicit growth-only `Database.rehash_index()` and maintenance delegation for exact
+  indexes. A complete immutable shadow becomes ACTIVE only after OCC and its durability barrier;
+  the immediate predecessor becomes STALE, recovery converges to one complete authority, and
+  long-lived/read-only handles adopt foreign generation changes at their next fresh read boundary.
 - Added explicit, idempotent `Database.ensure_identity_indexes()` activation for catalog-v2
   primary-key, relationship-endpoint and unsigned record-identity access paths. Catalog v2 is a
   one-way mixed-fleet fence; vector/proximity indexes remain schema-derived.
