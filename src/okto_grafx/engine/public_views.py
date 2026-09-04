@@ -204,11 +204,13 @@ __all__ = [
     "StorageFileView",
     "StorageView",
     "TableBloatReport",
+    "TableVacuumReport",
     "TransactionManagerView",
     "VectorEngineView",
     "VectorIndexView",
     "VectorMathView",
     "WalView",
+    "VacuumReport",
 ]
 
 
@@ -356,6 +358,40 @@ class BloatReport:
     horizon_retained_slot_bytes: int
     overflow_versions: int
     horizon_eligible_overflow_versions: int
+
+
+@dataclass(frozen=True, slots=True)
+class TableVacuumReport:
+    """Detached physical effects of one quiescent vacuum pass over one table."""
+
+    table: str
+    table_id: int
+    pages_scanned: int
+    eligible_inline_versions: int
+    reclaimed_versions: int
+    reclaimed_slot_bytes: int
+    relinked_versions: int
+    skipped_overflow_versions: int
+
+
+@dataclass(frozen=True, slots=True)
+class VacuumReport:
+    """Outcome of one manual, process-quiescent MVCC vacuum operation."""
+
+    horizon_lsn: int
+    reclaim_floor_before: int
+    reclaim_floor_after: int
+    capability_activated: bool
+    wrote: bool
+    complete: bool
+    tables: tuple[TableVacuumReport, ...]
+    pages_rewritten: int
+    reclaimed_versions: int
+    reclaimed_slot_bytes: int
+    relinked_versions: int
+    skipped_overflow_versions: int
+    indexes_reconciled: int
+    index_entries_removed: int
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -3831,19 +3867,13 @@ def _index_view(
             if definition.artifact_nonce == 0
             else _builtin_int(definition.artifact_nonce)
         ),
-        (
-            None
-            if expected_cardinality is None
-            else _builtin_int(expected_cardinality)
-        ),
+        (None if expected_cardinality is None else _builtin_int(expected_cardinality)),
     )
 
 
 def _index_generation_descriptor(value: Any) -> IndexGenerationDescriptor:
     """Rebuild one catalog generation without dispatching through a subclass."""
-    value = _domain_value(
-        value, IndexGenerationDescriptor, field="index.generation"
-    )
+    value = _domain_value(value, IndexGenerationDescriptor, field="index.generation")
     return IndexGenerationDescriptor(
         artifact_nonce=_builtin_int(
             _domain_field(value, IndexGenerationDescriptor, "artifact_nonce")
@@ -3864,18 +3894,14 @@ def _catalog_index_definition(value: Any) -> CatalogIndexDefinition:
     value = _domain_value(
         value, CatalogIndexDefinition, field="catalog.index_definition"
     )
-    raw_expected = _domain_field(
-        value, CatalogIndexDefinition, "expected_cardinality"
-    )
+    raw_expected = _domain_field(value, CatalogIndexDefinition, "expected_cardinality")
     return CatalogIndexDefinition(
         name=_builtin_text(
             _domain_field(value, CatalogIndexDefinition, "name"),
             field="index.name",
             empty=False,
         ),
-        table_id=_builtin_int(
-            _domain_field(value, CatalogIndexDefinition, "table_id")
-        ),
+        table_id=_builtin_int(_domain_field(value, CatalogIndexDefinition, "table_id")),
         table_name=_builtin_text(
             _domain_field(value, CatalogIndexDefinition, "table_name"),
             field="index.table_name",

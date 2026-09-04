@@ -18,6 +18,7 @@ from okto_grafx.engine.public_views import (
     IndexView,
     MaintenanceStatus,
     VectorIndexView,
+    VacuumReport,
 )
 
 
@@ -32,6 +33,7 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
         {
             "status",
             "bloat",
+            "vacuum",
             "checkpoint",
             "verify",
             "recover",
@@ -48,6 +50,7 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
     assert get_type_hints(maintenance_getter)["return"] is Maintenance
     assert get_type_hints(Maintenance.status)["return"] is MaintenanceStatus
     assert get_type_hints(Maintenance.bloat)["return"] is BloatReport
+    assert get_type_hints(Maintenance.vacuum)["return"] is VacuumReport
     assert get_type_hints(Maintenance.checkpoint)["return"] is RecycleReport
     assert get_type_hints(Maintenance.verify)["return"] is VerificationReport
     assert get_type_hints(Maintenance.recover)["return"] is RecoveryReport
@@ -171,12 +174,15 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
             assert maintenance.publish_metrics() is None
             assert maintenance.ensure_identity_indexes() is None
             assert maintenance.bloat("Person") is bloat_result
-            assert maintenance.create_index(
-                "by_name",
-                "Person",
-                ("name",),
-                expected_cardinality=1_000,
-            ) is index_result
+            assert (
+                maintenance.create_index(
+                    "by_name",
+                    "Person",
+                    ("name",),
+                    expected_cardinality=1_000,
+                )
+                is index_result
+            )
             assert (
                 maintenance.rehash_index(
                     "by_name",

@@ -47,6 +47,10 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.index.entry import IndexEntry
+from okto_grafx.domain.model.catalog import (
+    CATALOG_FORMAT_VERSION,
+    HEAP_RECLAIM_V1_CAPABILITY,
+)
 from okto_grafx.domain.model.value import Value, VectorValue
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.page.file_header import (
@@ -107,10 +111,12 @@ from okto_grafx.engine.public_views import (
     QueryEngineView,
     StorageView,
     TableBloatReport,
+    TableVacuumReport,
     TransactionManagerView,
     VectorEngineView,
     VectorIndexView,
     VectorMathView,
+    VacuumReport,
     WalView,
     _builtin_bool,
     _builtin_bytes,
@@ -1349,6 +1355,21 @@ class Maintenance:
         """Return a conservative read-only heap-bloat census."""
         return self._database._bloat(table)
 
+    def vacuum(
+        self,
+        table: str | None = None,
+        *,
+        confirm_quiescent: bool = False,
+        max_versions: int | None = None,
+    ) -> VacuumReport:
+        """Run explicit foreground MVCC reclamation under the v1 quiescence contract."""
+
+        return self._database._vacuum(
+            table,
+            confirm_quiescent=confirm_quiescent,
+            max_versions=max_versions,
+        )
+
     def checkpoint(self) -> RecycleReport:
         """Delegate checkpointing to :meth:`Database.checkpoint`."""
         return self._database.checkpoint()
@@ -2078,9 +2099,7 @@ class Database:
         txn.commit()
         return result
 
-    def query(
-        self, text: str, parameters: Mapping[str, object] | None = None
-    ) -> Query:
+    def query(self, text: str, parameters: Mapping[str, object] | None = None) -> Query:
         """Return a reusable canonical read query whose cursors own their snapshots.
 
         ``execute`` remains the materialised convenience and the only autocommit door for
@@ -2935,6 +2954,174 @@ class Database:
                 ),
             )
 
+    def _vacuum(
+        self,
+        table: str | None = None,
+        *,
+        confirm_quiescent: bool,
+        max_versions: int | None,
+    ) -> VacuumReport:
+        """Execute the guarded two-transaction vacuum v1 protocol."""
+
+        with self._public_operation("vacuum MVCC history"):
+            self._require_open()
+            self._require_writable("vacuum MVCC history")
+            wanted_table = None if table is None else _require_text("table", table)
+            wanted_limit = (
+                None
+                if max_versions is None
+                else _require_positive_integer("max_versions", max_versions)
+            )
+            with self._transactions.quiescent_maintenance_section(
+                confirm_quiescent=confirm_quiescent
+            ):
+                with self._transactions.page_access_section(fresh_read_view=True):
+                    source = self._catalog.catalog
+                    if source.format_version != CATALOG_FORMAT_VERSION:
+                        raise GrafxUnsupportedOperation(
+                            "MVCC vacuum requires catalog v2; run "
+                            "maintenance.ensure_identity_indexes() first.",
+                            operation="vacuum",
+                            field="format_version",
+                            value=source.format_version,
+                            required=CATALOG_FORMAT_VERSION,
+                            remedy="maintenance.ensure_identity_indexes",
+                        )
+                    selected = (
+                        source.tables()
+                        if wanted_table is None
+                        else (source.table(wanted_table),)
+                    )
+                    floor_before = self._heap.reclaim_floor()
+                    capability_active = (
+                        HEAP_RECLAIM_V1_CAPABILITY in source.required_capabilities()
+                    )
+
+                capability_activated = False
+                capability_wrote = False
+                if not capability_active:
+                    activation = self.begin("write")
+                    try:
+                        capability_activated = (
+                            self._transactions.prepare_heap_reclaim_activation(
+                                activation._context
+                            )
+                        )
+                        activation_report = activation.commit()
+                        capability_wrote = bool(activation_report.wrote)
+                    except BaseException as failure:
+                        if activation.active:
+                            try:
+                                activation.rollback()
+                            except BaseException as cleanup_failure:
+                                _note_cleanup_failure(failure, cleanup_failure)
+                        raise
+                    self._refresh_index_inventory()
+
+                # Re-resolve table objects and the horizon after capability publication.  The
+                # selected LSN is the newest globally published state inside the operator's
+                # quiescent window; no TTL inference participates in it.
+                with self._transactions.page_access_section(fresh_read_view=True):
+                    current = self._catalog.catalog
+                    selected = (
+                        current.tables()
+                        if wanted_table is None
+                        else (current.table(wanted_table),)
+                    )
+                    horizon = self._transactions.published_state().last_committed_lsn
+
+                transaction = self.begin("write")
+                try:
+                    plan, index_reports, planned_floor_before, planned_floor_after = (
+                        self._transactions.prepare_vacuum(
+                            transaction._context,
+                            selected,
+                            horizon,
+                            max_versions=wanted_limit,
+                        )
+                    )
+                    if planned_floor_before != floor_before:
+                        raise GrafxTransactionStateError(
+                            "The heap reclaim floor changed inside an asserted quiescent "
+                            "vacuum window.",
+                            operation="vacuum",
+                            field="reclaim_floor_lsn",
+                            expected=floor_before,
+                            observed=planned_floor_before,
+                        )
+                    commit_report = transaction.commit()
+                except BaseException as failure:
+                    if transaction.active:
+                        try:
+                            transaction.rollback()
+                        except BaseException as cleanup_failure:
+                            _note_cleanup_failure(failure, cleanup_failure)
+                    raise
+
+                tables_by_id = {table_def.table_id: table_def for table_def in selected}
+                table_reports = tuple(
+                    TableVacuumReport(
+                        table=_builtin_text(
+                            tables_by_id[item.table_id].name,
+                            field="table",
+                            empty=False,
+                        ),
+                        table_id=_builtin_int(item.table_id, field="table_id"),
+                        pages_scanned=_builtin_int(
+                            item.pages_scanned, field="pages_scanned"
+                        ),
+                        eligible_inline_versions=_builtin_int(
+                            item.eligible_inline_versions,
+                            field="eligible_inline_versions",
+                        ),
+                        reclaimed_versions=_builtin_int(
+                            item.reclaimed_versions, field="reclaimed_versions"
+                        ),
+                        reclaimed_slot_bytes=_builtin_int(
+                            item.reclaimed_slot_bytes,
+                            field="reclaimed_slot_bytes",
+                        ),
+                        relinked_versions=_builtin_int(
+                            item.relinked_versions, field="relinked_versions"
+                        ),
+                        skipped_overflow_versions=_builtin_int(
+                            item.skipped_overflow_versions,
+                            field="skipped_overflow_versions",
+                        ),
+                    )
+                    for item in plan.tables
+                )
+
+                def total(field: str) -> int:
+                    return sum(
+                        _builtin_int(getattr(item, field), field=field)
+                        for item in table_reports
+                    )
+
+                return VacuumReport(
+                    horizon_lsn=_builtin_int(horizon, field="horizon_lsn"),
+                    reclaim_floor_before=_builtin_int(
+                        floor_before, field="reclaim_floor_before"
+                    ),
+                    reclaim_floor_after=_builtin_int(
+                        planned_floor_after, field="reclaim_floor_after"
+                    ),
+                    capability_activated=_builtin_bool(capability_activated),
+                    wrote=_builtin_bool(capability_wrote or commit_report.wrote),
+                    complete=_builtin_bool(plan.complete),
+                    tables=table_reports,
+                    pages_rewritten=len(plan.page_images),
+                    reclaimed_versions=total("reclaimed_versions"),
+                    reclaimed_slot_bytes=total("reclaimed_slot_bytes"),
+                    relinked_versions=total("relinked_versions"),
+                    skipped_overflow_versions=total("skipped_overflow_versions"),
+                    indexes_reconciled=len(index_reports),
+                    index_entries_removed=sum(
+                        _builtin_int(report.removed, field="index_entries_removed")
+                        for report in index_reports
+                    ),
+                )
+
     def ensure_identity_indexes(self) -> None:
         """Persist and activate every exact access path required by endpoint identities.
 
@@ -2981,6 +3168,13 @@ class Database:
                 for index in active
                 if index.stale
             )
+        refresh_reclaim = getattr(
+            self._transactions,
+            "_refresh_heap_reclaim_capability",
+            None,
+        )
+        if callable(refresh_reclaim):
+            refresh_reclaim()
 
     def _committed_index_receipt(self, name: str) -> IndexView:
         """Return one ACTIVE view with page-zero horizons certified after its commit."""

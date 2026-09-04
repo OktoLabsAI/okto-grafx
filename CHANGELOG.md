@@ -9,6 +9,13 @@ including the on-disk format.
 
 ### Added
 
+- Added manual, foreground `db.maintenance.vacuum(...)` for process-quiescent MVCC reclamation.
+  A one-way catalog-v2 capability guards a durable monotonic snapshot floor; one ordinary
+  WAL-before-data commit relinks retained chains, removes eligible inline version slots and
+  reconciles ACTIVE indexes at the same horizon. The operation requires the exact
+  `confirm_quiescent=True` operator assertion, supports a deterministic `max_versions` bound,
+  rejects stale snapshots with retryable `GrafxSnapshotReclaimed`, and deliberately excludes
+  overflow reclamation, file truncation and durable page/slot/`RecordRef` reuse.
 - Added `db.maintenance.bloat(table=None)`, an immutable, read-only and header-only census of
   ended heap versions at a non-pruning observation of the checkpoint-capped recyclable horizon.
   The report distinguishes horizon-eligible from retained ended lifetimes, states its

@@ -269,6 +269,9 @@ with db.begin("write") as txn:
 db.verify("all")     # walks pages, records and indexes; a clean database reports nothing
 db.checkpoint()      # puts committed state on the platter and reclaims the log
 db.maintenance.bloat()  # read-only header census; it does not authorize or run vacuum
+# Maintenance window only: stop every other Grafx process first.
+db.ensure_identity_indexes()  # one-way catalog-v2 activation, if not already active
+db.maintenance.vacuum(confirm_quiescent=True, max_versions=10_000)
 db.close()
 ```
 
@@ -427,6 +430,26 @@ pins. It reports ended versions and record-slot bytes that are eligible or retai
 horizon, but deliberately excludes overflow-page bytes and keeps
 `vacuum_safety_established=False`: observing potential bloat neither mutates the database nor
 certifies that physical reclamation is safe.
+
+`db.maintenance.vacuum(table=None, *, confirm_quiescent=False, max_versions=None)` is the
+separate mutating operation. Vacuum v1 is manual and foreground. It refuses catalog v1,
+read-only handles, an open local transaction and every call that does not pass the exact
+`confirm_quiescent=True` assertion. That assertion means the operator has stopped **every other
+Grafx process and handle**, including an older binary, for the whole call; reader TTL is never
+treated as proof of safety. The first call publishes the required `heap_reclaim_v1` capability,
+so older builds fail closed, then one WAL-before-data commit atomically advances a durable global
+snapshot floor, reconciles ACTIVE indexes, relinks retained chains and removes eligible inline
+versions. Use `max_versions` to bound removed heap versions per pass; index reconciliation is not
+part of that quota. A table filter still advances a heap-global floor and is therefore an
+availability choice for the whole database.
+
+The immutable `VacuumReport` distinguishes heap data pages rewritten, tuple-slot bytes removed,
+chain relinks, index entries removed and overflow versions skipped. `complete` means all eligible
+**inline** versions in the selected tables were handled by that pass; overflow history remains.
+Vacuum v1 does not truncate files, reclaim overflow pages or reuse page, slot or `RecordRef`
+identities. Restart application processes after the maintenance window so their first transaction
+adopts the new capability, floor and index authority. See
+[`docs/architecture/MVCC_VACUUM_V1.md`](docs/architecture/MVCC_VACUUM_V1.md).
 
 ### In memory
 

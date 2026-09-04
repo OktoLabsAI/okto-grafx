@@ -31,6 +31,7 @@ from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
     CATALOG_LEGACY_FORMAT_VERSION,
     CATALOG_MAGIC,
+    HEAP_RECLAIM_V1_CAPABILITY,
     Catalog,
 )
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
@@ -48,6 +49,7 @@ _U32 = struct.Struct("<I")
 _CHECKSUM = struct.Struct("<I")
 
 _CAPABILITY_IDENTITY = 1 << 0
+_CAPABILITY_HEAP_RECLAIM = 1 << 1
 _VISIBILITY_EXACT = 1
 _DERIVATION_COLUMNS = 1
 _DERIVATION_RECORD_ID = 2
@@ -350,6 +352,42 @@ def test_v2_round_trip_preserves_capability_definitions_and_generations() -> Non
     )
     assert restored.has_index_definition("BY_EMAIL")
     assert restored.index_definition("By_Email") == custom
+
+
+def test_heap_reclaim_capability_is_one_way_deterministic_and_required() -> None:
+    catalog = _schema_catalog()
+    catalog.upgrade_index_catalog((_identity(),))
+    before = catalog.serialize()
+
+    assert catalog.enable_heap_reclaim() is catalog
+    first = catalog.serialize()
+    assert catalog.enable_heap_reclaim().serialize() == first
+    assert first != before
+    assert Catalog.deserialize(first).required_capabilities() == (
+        HEAP_RECLAIM_V1_CAPABILITY,
+        IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY,
+    )
+    assert _V2_EXTENSION.unpack_from(first, _PREAMBLE.size)[0] == (
+        _CAPABILITY_IDENTITY | _CAPABILITY_HEAP_RECLAIM
+    )
+
+
+def test_a_pre_reclaim_v2_build_refuses_the_new_required_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = _schema_catalog()
+    catalog.upgrade_index_catalog((_identity(),))
+    catalog.enable_heap_reclaim()
+    raw = catalog.serialize()
+
+    monkeypatch.setattr(
+        catalog_module,
+        "_KNOWN_CAPABILITY_BITS",
+        _CAPABILITY_IDENTITY,
+    )
+    with pytest.raises(GrafxSchemaVersionMismatch) as raised:
+        Catalog.deserialize(raw)
+    assert raised.value.details["unsupported"] == _CAPABILITY_HEAP_RECLAIM
 
 
 def test_v2_layout_and_numeric_tags_are_pinned_independently() -> None:

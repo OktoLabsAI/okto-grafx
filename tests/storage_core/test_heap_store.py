@@ -36,6 +36,7 @@ from okto_grafx.domain.model.record import (
     RECORD_HEADER_SIZE,
     RecordHeader,
 )
+from okto_grafx.domain.model.catalog import HEAP_RECLAIM_V1_CAPABILITY
 from okto_grafx.domain.model.schema import ColumnDef, TableDef, relationship_row
 from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.page import (
@@ -58,6 +59,7 @@ from okto_grafx.engine.heap_store import (
     EXTENT_FIRST_SLOT,
     MAX_DIRECTORY_FIELD,
     HeapStore,
+    HeapReclaimFloorPlan,
     RecordIdFloorAdvance,
     RecordIdFloorPlan,
     TableExtent,
@@ -118,7 +120,12 @@ def grow_by_one_page(
 
 
 def grow_to_pages(
-    pool: BufferPool, store: HeapStore, table: TableDef, pages: int, *, record_id: int = 1
+    pool: BufferPool,
+    store: HeapStore,
+    table: TableDef,
+    pages: int,
+    *,
+    record_id: int = 1,
 ) -> None:
     """Insert filler until the file holds at least that many pages."""
     for _step in range(pages + 1):
@@ -126,8 +133,6 @@ def grow_to_pages(
             return
         grow_by_one_page(pool, store, table, record_id=record_id)
     raise AssertionError(f"{store.file!r} never reached {pages} pages")
-
-
 
 
 @contextlib.contextmanager
@@ -222,7 +227,9 @@ def test_records_spill_onto_new_pages_that_stay_chained(
     heap_store: HeapStore, person_table: TableDef
 ) -> None:
     refs = [
-        heap_store.insert(person_table, index, (index, f"name-{index}"), xmin=10 + index)
+        heap_store.insert(
+            person_table, index, (index, f"name-{index}"), xmin=10 + index
+        )
         for index in range(40)
     ]
     pages = heap_store.pages_of(person_table)
@@ -305,7 +312,9 @@ def test_a_scan_shows_a_version_only_to_a_snapshot_that_can_see_it(
     heap_store: HeapStore, person_table: TableDef
 ) -> None:
     for index in range(5):
-        heap_store.insert(person_table, index, (index, f"n{index}"), xmin=10 * (index + 1))
+        heap_store.insert(
+            person_table, index, (index, f"n{index}"), xmin=10 * (index + 1)
+        )
     assert len(list(heap_store.scan(person_table, at(0)))) == 0
     assert len(list(heap_store.scan(person_table, at(10)))) == 1
     assert len(list(heap_store.scan(person_table, at(35)))) == 3
@@ -318,7 +327,9 @@ def test_predicated_reads_materialize_only_the_headers_they_accept(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for index in range(5):
-        heap_store.insert(person_table, index, (index, f"n{index}"), xmin=10 * (index + 1))
+        heap_store.insert(
+            person_table, index, (index, f"n{index}"), xmin=10 * (index + 1)
+        )
     constructions: list[int] = []
     original = RecordHeader.__init__
     unpack = HeaderUnpackCounter(record_module._HEADER_STRUCT)
@@ -331,7 +342,9 @@ def test_predicated_reads_materialize_only_the_headers_they_accept(
     monkeypatch.setattr(record_module, "_HEADER_STRUCT", unpack)
 
     assert list(heap_store.scan(person_table, at(0))) == []
-    assert constructions == [], "a rejected header must remain unpacked fields, not a dataclass"
+    assert constructions == [], (
+        "a rejected header must remain unpacked fields, not a dataclass"
+    )
     assert unpack.calls == 5
 
     visible = list(heap_store.scan(person_table, at(35)))
@@ -340,7 +353,9 @@ def test_predicated_reads_materialize_only_the_headers_they_accept(
         (1, 20),
         (2, 30),
     ]
-    assert constructions == [0, 1, 2], "each accepted version materializes its complete header"
+    assert constructions == [0, 1, 2], (
+        "each accepted version materializes its complete header"
+    )
     assert unpack.calls == 10, "each inspected slot must use exactly one struct unpack"
 
     constructions.clear()
@@ -386,7 +401,9 @@ def test_record_header_decode_unpacks_once_without_delegating_to_peek(
     unpack = HeaderUnpackCounter(record_module._HEADER_STRUCT)
 
     def forbidden_peek_helper(*_args: object, **_kwargs: object) -> None:
-        pytest.fail("RecordHeader.decode must not delegate to predicated-read peek helpers")
+        pytest.fail(
+            "RecordHeader.decode must not delegate to predicated-read peek helpers"
+        )
 
     monkeypatch.setattr(record_module, "_HEADER_STRUCT", unpack)
     monkeypatch.setattr(RecordHeader, "peek", forbidden_peek_helper)
@@ -411,7 +428,9 @@ def test_a_bounded_scan_materializes_every_header_accepted_by_visibility(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for index in range(5):
-        heap_store.insert(person_table, index, (index, f"n{index}"), xmin=10 * (index + 1))
+        heap_store.insert(
+            person_table, index, (index, f"n{index}"), xmin=10 * (index + 1)
+        )
     constructions = 0
     original = RecordHeader.__init__
 
@@ -432,14 +451,20 @@ def test_a_bounded_scan_materializes_every_header_accepted_by_visibility(
         (0, 10),
         (1, 20),
     ]
-    assert constructions == 3, "the visible continuation marker is also an accepted header"
+    assert constructions == 3, (
+        "the visible continuation marker is also an accepted header"
+    )
 
     remaining, final_position = heap_store.scan_page(
         person_table, at(35), limit=2, position=position
     )
     assert final_position is None
-    assert [(version.record_id, version.xmin) for _ref, version in remaining] == [(2, 30)]
-    assert constructions == 4, "continuation reinspects and accepts its first visible header"
+    assert [(version.record_id, version.xmin) for _ref, version in remaining] == [
+        (2, 30)
+    ]
+    assert constructions == 4, (
+        "continuation reinspects and accepts its first visible header"
+    )
 
 
 def test_committed_high_water_still_reads_complete_headers(
@@ -543,7 +568,9 @@ def test_a_chain_of_updates_is_walkable_backwards(
     ref = heap_store.insert(person_table, 1, (1, "v0"), xmin=10)
     chain = [ref]
     for step in range(1, 6):
-        ref = heap_store.update(person_table, ref, (1, f"v{step}"), xmin=10 * (step + 1))
+        ref = heap_store.update(
+            person_table, ref, (1, f"v{step}"), xmin=10 * (step + 1)
+        )
         chain.append(ref)
     assert heap_store.version_chain(ref) == tuple(reversed(chain))
     for step, link in enumerate(reversed(chain)):
@@ -568,7 +595,9 @@ def test_every_snapshot_along_a_chain_sees_exactly_one_version(
 ) -> None:
     ref = heap_store.insert(person_table, 1, (1, "v0"), xmin=10)
     for step in range(1, 5):
-        ref = heap_store.update(person_table, ref, (1, f"v{step}"), xmin=10 * (step + 1))
+        ref = heap_store.update(
+            person_table, ref, (1, f"v{step}"), xmin=10 * (step + 1)
+        )
     for read_lsn in range(10, 60):
         visible = [
             version for _ref, version in heap_store.scan(person_table, at(read_lsn))
@@ -600,7 +629,9 @@ def test_a_delete_ends_the_version_and_marks_it(
     assert heap_store.lookup(person_table, 1, at(25)) is None
 
 
-def test_deleting_twice_is_refused(heap_store: HeapStore, person_table: TableDef) -> None:
+def test_deleting_twice_is_refused(
+    heap_store: HeapStore, person_table: TableDef
+) -> None:
     ref = heap_store.insert(person_table, 1, (1, "Ada"), xmin=10)
     heap_store.delete(person_table, ref, xmax=20)
     with pytest.raises(GrafxTransactionStateError):
@@ -661,7 +692,9 @@ def test_a_version_chain_that_loops_is_reported(
             schema_version=header.schema_version,
             flags=header.flags,
         )
-        page.update_slot(first.slot, looped.encode() + bytes(content[RECORD_HEADER_SIZE:]))
+        page.update_slot(
+            first.slot, looped.encode() + bytes(content[RECORD_HEADER_SIZE:])
+        )
     with pytest.raises(GrafxCorruptionDetected):
         heap_store.version_chain(second)
 
@@ -678,7 +711,9 @@ def test_a_payload_larger_than_a_page_is_stored_in_a_chain(
     header = RecordHeader.decode(content)
     assert header.has_overflow
     assert header.flags & RECORD_FLAG_HAS_OVERFLOW
-    assert len(content) == RECORD_HEADER_SIZE + 4, "only the first chain page stays inline"
+    assert len(content) == RECORD_HEADER_SIZE + 4, (
+        "only the first chain page stays inline"
+    )
     assert header.payload_len > heap_store.inline_capacity
     assert heap_store.read(ref).values == (1, long_name)
 
@@ -746,7 +781,9 @@ def test_the_heap_survives_a_pool_that_can_hold_only_two_pages(
     catalog.save()
     store = HeapStore(tight, catalog)
     store.bootstrap()
-    refs = [store.insert(table, index, (index, f"n{index}"), xmin=10) for index in range(30)]
+    refs = [
+        store.insert(table, index, (index, f"n{index}"), xmin=10) for index in range(30)
+    ]
     assert len({ref.page for ref in refs}) > 1
     assert len(list(store.scan(table, at(100)))) == 30
     long_ref = store.insert(table, 99, (99, "L" * 3000), xmin=11)
@@ -854,8 +891,12 @@ def test_the_heap_exposes_the_same_redo_rule_as_the_catalog(
         image = pool.codec.encode_page(page)
     replayed = Page.from_bytes(image, page_size=pool.page_size)
     replayed.page_lsn = 200
-    assert heap_store.apply_page_image(ref.page, pool.codec.encode_page(replayed)) is True
-    assert heap_store.apply_page_image(ref.page, pool.codec.encode_page(replayed)) is False
+    assert (
+        heap_store.apply_page_image(ref.page, pool.codec.encode_page(replayed)) is True
+    )
+    assert (
+        heap_store.apply_page_image(ref.page, pool.codec.encode_page(replayed)) is False
+    )
     with pool.pinned(heap_store.file, ref.page) as page:
         assert page.page_lsn == 200
     assert heap_store.read(ref).values == (1, "Ada")
@@ -895,10 +936,15 @@ def test_the_heap_redo_reaches_a_page_the_file_does_not_have(
 
 
 def test_a_replayed_heap_file_serves_the_same_rows(
-    pool: BufferPool, heap_store: HeapStore, catalog_store: CatalogStore, person_table: TableDef
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+    person_table: TableDef,
 ) -> None:
     for record_id in range(12):
-        heap_store.insert(person_table, record_id, (record_id, f"n{record_id}"), xmin=10)
+        heap_store.insert(
+            person_table, record_id, (record_id, f"n{record_id}"), xmin=10
+        )
     pool.flush()
     images = {
         index: pool.codec.encode_page(pool.pin(heap_store.file, index))
@@ -917,7 +963,10 @@ def test_a_replayed_heap_file_serves_the_same_rows(
     for index, image in sorted(images.items()):
         page = Page.from_bytes(image, page_size=replica_pool.page_size)
         page.page_lsn = 9000
-        assert replica.apply_page_image(index, replica_pool.codec.encode_page(page)) is True
+        assert (
+            replica.apply_page_image(index, replica_pool.codec.encode_page(page))
+            is True
+        )
     rows = {
         version.record_id: version.values
         for _ref, version in replica.scan(person_table, at(100))
@@ -969,9 +1018,14 @@ def test_a_heap_grown_by_redo_before_bootstrap_loses_no_record(
         assert page.page_type == int(PageType.META)
         assert FileHeaderPage.read(page).kind is FileKind.HEAP
 
-    refs = [heap.insert(table, 100 + number, (number,), xmin=10 + number) for number in range(4)]
+    refs = [
+        heap.insert(table, 100 + number, (number,), xmin=10 + number)
+        for number in range(4)
+    ]
     expected = {100, 101, 102, 103}
-    assert {version.record_id for _ref, version in heap.scan(table, at(100))} == expected
+    assert {
+        version.record_id for _ref, version in heap.scan(table, at(100))
+    } == expected
     assert {version.record_id for _ref, version in heap.scan_all(table)} == expected
     assert {heap.read(ref).record_id for ref in refs} == expected
     for record_id in expected:
@@ -982,7 +1036,10 @@ def test_a_heap_grown_by_redo_before_bootstrap_loses_no_record(
 
 
 def test_a_zeroed_header_page_is_reported_rather_than_read_as_an_empty_table(
-    pool: BufferPool, device: MemoryDevice, heap_store: HeapStore, person_table: TableDef
+    pool: BufferPool,
+    device: MemoryDevice,
+    heap_store: HeapStore,
+    person_table: TableDef,
 ) -> None:
     heap_store.insert(person_table, 1, (1, "Ada"), xmin=5)
     pool.flush()
@@ -1019,7 +1076,9 @@ def test_a_header_page_of_another_kind_of_file_is_reported(
 ) -> None:
     heap_store.insert(person_table, 1, (1, "Ada"), xmin=5)
     with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
-        FileHeaderPage.write(page, FileHeader(kind=FileKind.CATALOG, page_size=pool.page_size))
+        FileHeaderPage.write(
+            page, FileHeader(kind=FileKind.CATALOG, page_size=pool.page_size)
+        )
     with pytest.raises(GrafxCorruptionDetected) as raised:
         list(heap_store.scan(person_table, at(100)))
     assert raised.value.details["kind"] == "CATALOG"
@@ -1036,7 +1095,9 @@ def test_bootstrap_never_overwrites_a_header_page_it_cannot_understand(
     with pytest.raises(GrafxCorruptionDetected):
         heap_store.bootstrap()
     with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
-        assert page.page_type == int(PageType.HEAP), "the damaged page was left as it was"
+        assert page.page_type == int(PageType.HEAP), (
+            "the damaged page was left as it was"
+        )
         assert page.slot_count >= 2, "and so were the extents on it"
 
 
@@ -1213,7 +1274,8 @@ def test_a_chain_that_leads_out_of_the_table_refuses_the_write(
     # a payload that was readable and no longer is.
     targets = foreign_pages(pool, heap_store, catalog_store, person_table)
     before = {
-        version.record_id for _reference, version in heap_store.scan(person_table, at(1000))
+        version.record_id
+        for _reference, version in heap_store.scan(person_table, at(1000))
     }
     original = heap_store.extent_of(person_table)
     assert original is not None
@@ -1224,7 +1286,8 @@ def test_a_chain_that_leads_out_of_the_table_refuses_the_write(
         pool, heap_store, person_table.table_id, first_page=original.first_page
     )
     assert {
-        version.record_id for _reference, version in heap_store.scan(person_table, at(1000))
+        version.record_id
+        for _reference, version in heap_store.scan(person_table, at(1000))
     } == before
 
 
@@ -1319,7 +1382,10 @@ def test_one_page_of_drift_on_a_one_page_table_is_tolerated(
 
     for number in range(3):
         heap_store.insert(person_table, 200 + number, (number, "small"), xmin=6)
-    visible = {version.record_id for _reference, version in heap_store.scan(person_table, at(1000))}
+    visible = {
+        version.record_id
+        for _reference, version in heap_store.scan(person_table, at(1000))
+    }
     assert {200, 201, 202} <= visible
     repaired = heap_store.extent_of(person_table)
     assert repaired is not None
@@ -1347,10 +1413,13 @@ def test_a_hint_that_is_unreachable_from_the_first_page_is_repaired(
     heap_store._tail_cache.clear()
 
     reference = heap_store.insert(person_table, 777, (777, "not an orphan"), xmin=6)
-    assert reference.page in heap_store.pages_of(person_table), "the row landed in the chain"
+    assert reference.page in heap_store.pages_of(person_table), (
+        "the row landed in the chain"
+    )
     assert heap_store.read(reference).record_id == 777
     assert 777 in {
-        version.record_id for _reference, version in heap_store.scan(person_table, at(1000))
+        version.record_id
+        for _reference, version in heap_store.scan(person_table, at(1000))
     }
     assert heap_store.lookup(person_table, 777, at(1000)) is not None
     repaired = heap_store.extent_of(person_table)
@@ -1420,7 +1489,10 @@ def test_an_overflow_record_still_lands_when_the_directory_has_room(
 
 
 def test_delete_refuses_a_file_whose_header_page_is_gone(
-    pool: BufferPool, device: MemoryDevice, heap_store: HeapStore, person_table: TableDef
+    pool: BufferPool,
+    device: MemoryDevice,
+    heap_store: HeapStore,
+    person_table: TableDef,
 ) -> None:
     # Every other path refuses this file; delete must not go on writing to it.
     ref = heap_store.insert(person_table, 1, (1, "Ada"), xmin=5)
@@ -1438,7 +1510,9 @@ def test_delete_refuses_a_reference_to_the_reserved_header_page(
 ) -> None:
     heap_store.insert(person_table, 1, (1, "Ada"), xmin=5)
     with pytest.raises(GrafxCorruptionDetected):
-        heap_store.delete(person_table, RecordRef(page=HEADER_PAGE_INDEX, slot=1), xmax=9)
+        heap_store.delete(
+            person_table, RecordRef(page=HEADER_PAGE_INDEX, slot=1), xmax=9
+        )
 
 
 def test_a_page_zero_that_was_written_to_is_never_re_initialised(
@@ -1513,14 +1587,14 @@ def test_a_commit_number_that_no_snapshot_could_see_is_refused_before_anything_i
     assert pool.storage.page_count(heap_store.file) == pages
 
 
-
-
 def test_the_delete_door_names_the_reserved_page_for_what_it_is(
     heap_store: HeapStore, person_table: TableDef
 ) -> None:
     heap_store.insert(person_table, 1, (1, "Ada"), xmin=5)
     with pytest.raises(GrafxCorruptionDetected) as raised:
-        heap_store.delete(person_table, RecordRef(page=HEADER_PAGE_INDEX, slot=1), xmax=9)
+        heap_store.delete(
+            person_table, RecordRef(page=HEADER_PAGE_INDEX, slot=1), xmax=9
+        )
     assert "reserved header page" in raised.value.message
     with pytest.raises(GrafxCorruptionDetected) as read_raised:
         heap_store.read(RecordRef(page=HEADER_PAGE_INDEX, slot=1))
@@ -1575,9 +1649,12 @@ def test_a_directory_entry_of_the_wrong_length_is_refused() -> None:
     with pytest.raises(GrafxCorruptionDetected) as counter:
         TableExtent.decode(bytes(DIRECTORY_ENTRY_SIZE))
     assert counter.value.details["field"] == "next_record_id"
-    assert TableExtent.decode(
-        TableExtent(table_id=0, first_page=0, last_page=0, page_count=0).encode()
-    ).table_id == 0
+    assert (
+        TableExtent.decode(
+            TableExtent(table_id=0, first_page=0, last_page=0, page_count=0).encode()
+        ).table_id
+        == 0
+    )
 
 
 @pytest.mark.parametrize("field", ["table_id", "first_page", "last_page", "page_count"])
@@ -1625,7 +1702,9 @@ def test_a_damaged_page_count_never_escapes_as_a_raw_struct_error(
 # head -- against each walker in turn.
 
 
-def plant_cycle(pool: BufferPool, store: HeapStore, table: TableDef, shape: str) -> None:
+def plant_cycle(
+    pool: BufferPool, store: HeapStore, table: TableDef, shape: str
+) -> None:
     """Close the page chain of a table into the requested shape."""
     grow_to_pages(pool, store, table, 4)
     chain = store.pages_of(table)
@@ -1764,7 +1843,10 @@ def test_a_remembered_tail_that_is_no_longer_the_tail_is_not_trusted(
 
 
 def test_a_remembered_tail_that_became_a_foreign_page_is_not_trusted(
-    pool: BufferPool, heap_store: HeapStore, catalog_store: CatalogStore, person_table: TableDef
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+    person_table: TableDef,
 ) -> None:
     # The cheap revalidation asks the same two questions the walk asks, so a remembered page that
     # changed owner is dropped rather than appended to.
@@ -1932,7 +2014,9 @@ def test_a_page_descriptor_of_the_wrong_width_is_named_rather_than_unpacked(
     check on the encode side; this is the same invariant on the decode side.
     """
     reference = heap_store.insert(person_table, 1, (1, "Ada"), xmin=10)
-    forged = Page(int(PageType.HEAP), page_size=pool.page_size, page_index=reference.page)
+    forged = Page(
+        int(PageType.HEAP), page_size=pool.page_size, page_index=reference.page
+    )
     forged.page_lsn = 99
     forged.insert_slot(b"12345678")
     forged.insert_slot(bytes(48))
@@ -1982,7 +2066,10 @@ def test_an_append_after_a_redo_lands_inside_the_chain(
 
 
 def test_a_warm_cache_still_refuses_a_chain_that_leads_out_of_the_table(
-    pool: BufferPool, heap_store: HeapStore, catalog_store: CatalogStore, person_table: TableDef
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+    person_table: TableDef,
 ) -> None:
     """The cached path needs its own adversarial tests, or it answers where the walk refuses.
 
@@ -2041,7 +2128,10 @@ def test_delete_refuses_a_commit_number_as_a_caller_error(
 
 
 def test_a_cache_is_not_trusted_across_a_pool_invalidation(
-    pool: BufferPool, device: MemoryDevice, heap_store: HeapStore, person_table: TableDef
+    pool: BufferPool,
+    device: MemoryDevice,
+    heap_store: HeapStore,
+    person_table: TableDef,
 ) -> None:
     """Dropping the page cache is the other door that makes a derived walk stale.
 
@@ -2061,7 +2151,9 @@ def test_a_cache_is_not_trusted_across_a_pool_invalidation(
     device.poke_page(heap_store.file, chain[0], pool.codec.encode_page(truncated))
     pool.invalidate()
 
-    reference = heap_store.insert(person_table, 999, (999, "after the truncation"), xmin=6)
+    reference = heap_store.insert(
+        person_table, 999, (999, "after the truncation"), xmin=6
+    )
     assert reference.page in heap_store.pages_of(person_table)
     assert 999 in {
         version.record_id for _ref, version in heap_store.scan(person_table, at(1000))
@@ -2071,7 +2163,9 @@ def test_a_cache_is_not_trusted_across_a_pool_invalidation(
 # --- DEF-2: a refused update leaves exactly one live version ------------------------------------
 
 
-def live_versions(store: HeapStore, table: TableDef, record_id: int) -> list[tuple[int, int]]:
+def live_versions(
+    store: HeapStore, table: TableDef, record_id: int
+) -> list[tuple[int, int]]:
     """Return every stored version of a record that nothing has ended."""
     return [
         (version.xmin, version.xmax)
@@ -2205,7 +2299,9 @@ def test_a_table_whose_chain_starts_at_the_reserved_page_is_refused(
     pool: BufferPool, heap_store: HeapStore, person_table: TableDef
 ) -> None:
     heap_store.insert(person_table, 1, (1, "Ada"), xmin=5)
-    point_extent_at(pool, heap_store, person_table.table_id, first_page=HEADER_PAGE_INDEX)
+    point_extent_at(
+        pool, heap_store, person_table.table_id, first_page=HEADER_PAGE_INDEX
+    )
     with pytest.raises(GrafxCorruptionDetected) as raised:
         list(heap_store.scan_all(person_table))
     assert raised.value.details["field"] == "first_page"
@@ -2254,7 +2350,9 @@ def test_a_record_slot_too_short_for_its_header_is_refused(
     is shorter than the header it is asked for.
     """
     reference = heap_store.insert(person_table, 1, (1, "Ada"), xmin=10)
-    forged = Page(int(PageType.HEAP), page_size=pool.page_size, page_index=reference.page)
+    forged = Page(
+        int(PageType.HEAP), page_size=pool.page_size, page_index=reference.page
+    )
     forged.page_lsn = 99
     forged.insert_slot(struct.pack("<I", person_table.table_id))
     forged.insert_slot(bytes(10))
@@ -2327,7 +2425,9 @@ def refuse_pin_number(
     return state
 
 
-def build_store_under_budget(budget_pages: int) -> tuple[BufferPool, HeapStore, TableDef]:
+def build_store_under_budget(
+    budget_pages: int,
+) -> tuple[BufferPool, HeapStore, TableDef]:
     """Return a heap on a pool with room for exactly that many frames.
 
     The budget lives in the test, not in the store: the number of frames one append needs is a
@@ -2398,12 +2498,18 @@ def retryable_device_failures() -> tuple[GrafxError, ...]:
     row already made reachable is written a second time by a caller doing what it was told.
     """
     return (
-        GrafxDeviceFull("The volume filled between two pages of one operation.", file="heap.dat"),
-        GrafxStorageError("Another process held the file open for the length of one write."),
+        GrafxDeviceFull(
+            "The volume filled between two pages of one operation.", file="heap.dat"
+        ),
+        GrafxStorageError(
+            "Another process held the file open for the length of one write."
+        ),
     )
 
 
-@pytest.mark.parametrize("failure_index", [0, 1], ids=["device_full", "sharing_violation"])
+@pytest.mark.parametrize(
+    "failure_index", [0, 1], ids=["device_full", "sharing_violation"]
+)
 @pytest.mark.parametrize("step", list(range(1, 13)))
 def test_no_version_becomes_reachable_before_the_last_step_that_can_refuse(
     failure_index: int, step: int, monkeypatch: pytest.MonkeyPatch
@@ -2435,13 +2541,17 @@ def test_no_version_becomes_reachable_before_the_last_step_that_can_refuse(
     monkeypatch.undo()
 
     live = live_versions(store, table, 9)
-    assert len(live) == 1, f"a refusal at step {step} left {len(live)} live versions: {live}"
+    assert len(live) == 1, (
+        f"a refusal at step {step} left {len(live)} live versions: {live}"
+    )
     seen = [
         version.record_id
         for _reference, version in store.scan(table, at(1000))
         if version.record_id == 9
     ]
-    assert seen == [9], f"scan() yielded record 9 {len(seen)} times after a refusal at {step}"
+    assert seen == [9], (
+        f"scan() yielded record 9 {len(seen)} times after a refusal at {step}"
+    )
     if step <= PINS_ONE_UPDATE_TAKES:
         assert refused_here["raised"], (
             f"step {step} never refused, so this parametrisation proves nothing (A83.1)"
@@ -2458,14 +2568,18 @@ def test_the_sweep_covers_every_step_the_update_actually_takes() -> None:
     pool, store, table = build_store_under_budget(2)
     store, _planted = stale_hint_with_the_row_off_the_tail(pool, store, table)
     reference = only_live_reference(store, table, 9)
-    taken = count_pins(pool, lambda: store.update(table, reference, (9, "new"), xmin=11))
+    taken = count_pins(
+        pool, lambda: store.update(table, reference, (9, "new"), xmin=11)
+    )
     assert taken == PINS_ONE_UPDATE_TAKES, (
         f"an update now takes {taken} pins, not {PINS_ONE_UPDATE_TAKES}; the sweep bound and "
         f"this number are one statement and must move together"
     )
 
 
-@pytest.mark.parametrize("failure_index", [0, 1], ids=["device_full", "sharing_violation"])
+@pytest.mark.parametrize(
+    "failure_index", [0, 1], ids=["device_full", "sharing_violation"]
+)
 def test_a_retryable_refusal_survives_a_cold_reopen_with_one_live_version(
     failure_index: int,
 ) -> None:
@@ -2493,13 +2607,17 @@ def test_a_retryable_refusal_survives_a_cold_reopen_with_one_live_version(
     reopened = HeapStore(pool, reopened_catalog)
     cold = [
         version
-        for _reference, version in reopened.scan_all(reopened_catalog.catalog.table("Person"))
+        for _reference, version in reopened.scan_all(
+            reopened_catalog.catalog.table("Person")
+        )
         if version.record_id == 9 and version.xmax == 0
     ]
     assert len(cold) == 1, f"a cold reopen found {len(cold)} live versions of one row"
 
 
-@pytest.mark.parametrize("failure_index", [0, 1], ids=["device_full", "sharing_violation"])
+@pytest.mark.parametrize(
+    "failure_index", [0, 1], ids=["device_full", "sharing_violation"]
+)
 def test_a_retryable_refusal_never_multiplies_a_row(failure_index: int) -> None:
     """A refusal that says try again must not have written anything the retry writes twice.
 
@@ -2519,7 +2637,9 @@ def test_a_retryable_refusal_never_multiplies_a_row(failure_index: int) -> None:
     while True:
         attempts += 1
         try:
-            store.update(table, only_live_reference(store, table, 9), (9, "new"), xmin=11)
+            store.update(
+                table, only_live_reference(store, table, 9), (9, "new"), xmin=11
+            )
         except GrafxError as refused:
             assert refused.retryable
             device.disarm()
@@ -2528,7 +2648,9 @@ def test_a_retryable_refusal_never_multiplies_a_row(failure_index: int) -> None:
             continue
         break
 
-    assert device.refused_writes, "the device never refused, so nothing was counterfactual"
+    assert device.refused_writes, (
+        "the device never refused, so nothing was counterfactual"
+    )
     assert attempts > 1, "the retry loop never retried"
     assert live_versions(store, table, 9) == [(11, 0)]
     assert store.lookup(table, 9, at(1000)).values == (9, "new")
@@ -2568,7 +2690,10 @@ def test_the_directory_entry_is_settled_before_the_row_can_be_read(
 
 
 def test_listing_the_pages_refuses_a_hop_into_another_tables_page(
-    pool: BufferPool, heap_store: HeapStore, catalog_store: CatalogStore, person_table: TableDef
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+    person_table: TableDef,
 ) -> None:
     """pages_of is one half of the A33 drift comparison C6 runs, so it must not agree blindly.
 
@@ -2611,7 +2736,10 @@ def test_listing_the_pages_refuses_a_hop_into_the_reserved_header_page(
 
 
 def test_the_two_halves_of_the_drift_comparison_do_not_agree_on_a_damaged_chain(
-    pool: BufferPool, heap_store: HeapStore, catalog_store: CatalogStore, person_table: TableDef
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+    person_table: TableDef,
 ) -> None:
     """The failure this fix is really about: a check that certifies damage as clean.
 
@@ -2668,7 +2796,9 @@ PINS_ONE_GROWING_UPDATE_TAKES: int = 10
 """Pins taken by an update whose new version does not fit on the tail. See the sweep below."""
 
 
-def a_tail_too_full_for(pool: BufferPool, store: HeapStore, table: TableDef, size: int) -> None:
+def a_tail_too_full_for(
+    pool: BufferPool, store: HeapStore, table: TableDef, size: int
+) -> None:
     """Fill the tail until a row of that size cannot fit on it, so the next append must grow.
 
     Bounded by a count, and the question it asks is asked of the PAGE -- can_fit on the pinned
@@ -2703,7 +2833,9 @@ def a_growing_update_is_next(
     return HeapStore(pool, store.catalog), reference
 
 
-@pytest.mark.parametrize("failure_index", [0, 1], ids=["device_full", "sharing_violation"])
+@pytest.mark.parametrize(
+    "failure_index", [0, 1], ids=["device_full", "sharing_violation"]
+)
 @pytest.mark.parametrize("step", list(range(1, 15)))
 def test_the_growing_branch_makes_nothing_reachable_before_its_last_refusal(
     failure_index: int, step: int, monkeypatch: pytest.MonkeyPatch
@@ -2728,13 +2860,17 @@ def test_the_growing_branch_makes_nothing_reachable_before_its_last_refusal(
     monkeypatch.undo()
 
     live = live_versions(store, table, 9)
-    assert len(live) == 1, f"a refusal at step {step} left {len(live)} live versions: {live}"
+    assert len(live) == 1, (
+        f"a refusal at step {step} left {len(live)} live versions: {live}"
+    )
     seen = [
         version.record_id
         for _reference, version in store.scan(table, at(1000))
         if version.record_id == 9
     ]
-    assert seen == [9], f"scan() yielded record 9 {len(seen)} times after a refusal at {step}"
+    assert seen == [9], (
+        f"scan() yielded record 9 {len(seen)} times after a refusal at {step}"
+    )
     if step <= PINS_ONE_GROWING_UPDATE_TAKES:
         assert refused_here["raised"], (
             f"step {step} never refused, so this parametrisation proves nothing (A83.1)"
@@ -2746,7 +2882,9 @@ def test_the_growing_sweep_covers_every_step_that_update_actually_takes() -> Non
     pool, store, table = build_store_under_budget(2)
     store, _planted = a_growing_update_is_next(pool, store, table)
     reference = only_live_reference(store, table, 9)
-    taken = count_pins(pool, lambda: store.update(table, reference, (9, BIG_VALUE), xmin=11))
+    taken = count_pins(
+        pool, lambda: store.update(table, reference, (9, BIG_VALUE), xmin=11)
+    )
     assert taken == PINS_ONE_GROWING_UPDATE_TAKES, (
         f"a growing update now takes {taken} pins, not {PINS_ONE_GROWING_UPDATE_TAKES}"
     )
@@ -2758,7 +2896,9 @@ def test_the_growing_branch_really_is_the_one_under_test() -> None:
     store, _planted = a_growing_update_is_next(pool, store, table)
     before = pool.storage.page_count(store.file)
     store.update(table, only_live_reference(store, table, 9), (9, BIG_VALUE), xmin=11)
-    assert pool.storage.page_count(store.file) > before, "the update never grew the chain"
+    assert pool.storage.page_count(store.file) > before, (
+        "the update never grew the chain"
+    )
 
 
 # --- D3: the repaired count is the length walked, never the stored count plus one ---------------
@@ -2848,7 +2988,10 @@ def test_the_reserved_header_page_refusal_is_not_the_page_type_refusal(
 
 
 def test_a_page_of_the_wrong_type_says_page_type_and_not_reserved_header_page(
-    pool: BufferPool, heap_store: HeapStore, catalog_store: CatalogStore, person_table: TableDef
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+    person_table: TableDef,
 ) -> None:
     """The distinguishing assertion needs both sides, or it distinguishes nothing."""
     other = second_table(catalog_store)
@@ -2941,7 +3084,9 @@ def test_a_written_page_of_the_wrong_type_is_not_called_unwritten(
     """The other side of the distinction, without which the field says nothing."""
     heap_store.insert(person_table, 1, (1, "Ada"), xmin=5)
     tail = heap_store.pages_of(person_table)[-1]
-    overflow = write_chain(pool, heap_store.file, b"z" * 900, page_type=int(PageType.OVERFLOW))
+    overflow = write_chain(
+        pool, heap_store.file, b"z" * 900, page_type=int(PageType.OVERFLOW)
+    )
     with pool.pinned(heap_store.file, tail) as page:
         page.next_page = overflow[0]
 
@@ -2965,7 +3110,9 @@ def test_a_heap_page_with_no_descriptor_says_which_state_it_is_in(
     incomplete: a verifier and a quarantine, never a redo.
     """
     reference = heap_store.insert(person_table, 1, (1, "Ada"), xmin=5)
-    forged = Page(int(PageType.HEAP), page_size=pool.page_size, page_index=reference.page)
+    forged = Page(
+        int(PageType.HEAP), page_size=pool.page_size, page_index=reference.page
+    )
     forged.page_lsn = 99
     assert heap_store.apply_page_image(reference.page, pool.codec.encode_page(forged))
 
@@ -3017,7 +3164,9 @@ def test_the_three_page_states_are_told_apart_by_their_field(
         heap_store.pages_of(person_table)
     seen.append(raised.value.details["field"])
 
-    overflow = write_chain(pool, heap_store.file, b"z" * 900, page_type=int(PageType.OVERFLOW))
+    overflow = write_chain(
+        pool, heap_store.file, b"z" * 900, page_type=int(PageType.OVERFLOW)
+    )
     with pool.pinned(heap_store.file, tail) as page:
         page.next_page = overflow[0]
     with pytest.raises(GrafxCorruptionDetected) as raised:
@@ -3052,6 +3201,186 @@ def image_extents(pool: BufferPool, image: bytes) -> dict[int, TableExtent]:
         if slot >= EXTENT_FIRST_SLOT
         for extent in (TableExtent.decode(payload),)
     }
+
+
+def enable_heap_reclaim(catalog_store: CatalogStore) -> None:
+    """Activate the guarded catalog capability in this storage-level fixture."""
+
+    catalog_store.catalog.upgrade_index_catalog()
+    catalog_store.catalog.enable_heap_reclaim()
+    catalog_store.save()
+
+
+def test_legacy_heap_has_no_reclaim_floor_and_cannot_plan_one(
+    heap_store: HeapStore,
+) -> None:
+    assert heap_store.reclaim_floor() == 0
+    with pytest.raises(GrafxSchemaVersionMismatch) as raised:
+        heap_store.plan_reclaim_floor(5)
+    assert raised.value.details["value"] == HEAP_RECLAIM_V1_CAPABILITY
+
+
+def test_reclaim_floor_plan_is_monotonic_copy_on_write(
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+) -> None:
+    enable_heap_reclaim(catalog_store)
+    pool.flush()
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        before = pool.codec.encode_page(page)
+
+    plan = heap_store.plan_reclaim_floor(17)
+
+    assert plan == HeapReclaimFloorPlan(
+        page_index=HEADER_PAGE_INDEX,
+        image=plan.image,
+        old_floor=0,
+        new_floor=17,
+    )
+    planned = pool.codec.decode_page(plan.image, verify=True)
+    planned_header = FileHeaderPage.read(planned)
+    assert planned_header.root_page == HEADER_PAGE_INDEX
+    assert planned_header.payload_length == 17
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        assert pool.codec.encode_page(page) == before
+        assert page.dirty is False
+    assert heap_store.reclaim_floor() == 0
+
+
+def test_reclaim_floor_never_moves_backward(
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+) -> None:
+    enable_heap_reclaim(catalog_store)
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        header = FileHeaderPage.read(page)
+        FileHeaderPage.write(
+            page,
+            replace(header, root_page=HEADER_PAGE_INDEX, payload_length=17),
+        )
+    pool.flush(heap_store.file)
+
+    assert heap_store.reclaim_floor() == 17
+    with pytest.raises(GrafxTransactionStateError) as raised:
+        heap_store.plan_reclaim_floor(16)
+    assert raised.value.details["old_floor"] == 17
+
+
+def test_a_heap_floor_without_catalog_capability_is_cross_file_damage(
+    pool: BufferPool,
+    heap_store: HeapStore,
+) -> None:
+    with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
+        header = FileHeaderPage.read(page)
+        FileHeaderPage.write(
+            page,
+            replace(header, root_page=HEADER_PAGE_INDEX, payload_length=5),
+        )
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        heap_store.reclaim_floor()
+    assert raised.value.details["field"] == "required_capabilities"
+
+
+def apply_vacuum_images(heap_store: HeapStore, plan: object, *, lsn: int = 100) -> None:
+    """Install detached vacuum page images through the store's idempotent redo door."""
+
+    assert isinstance(plan, heap_module.HeapVacuumPlan)
+    for page_index, image in plan.page_images:
+        page = heap_store._pool.codec.decode_page(image, verify=True)
+        page.page_lsn = lsn
+        assert heap_store.apply_page_image(
+            page_index, heap_store._pool.codec.encode_page(page)
+        )
+
+
+def test_vacuum_plan_frees_inline_history_and_relinks_the_retained_chain(
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+    person_table: TableDef,
+) -> None:
+    enable_heap_reclaim(catalog_store)
+    oldest = heap_store.insert(person_table, 1, (1, "old"), xmin=1)
+    middle = heap_store.update(person_table, oldest, (1, "middle"), xmin=3)
+    newest = heap_store.update(person_table, middle, (1, "new"), xmin=5)
+    pool.flush()
+
+    plan = heap_store.plan_vacuum((person_table,), 3)
+
+    assert plan.horizon_lsn == 3
+    assert plan.complete is True
+    assert len(plan.page_images) == 1
+    assert plan.tables == (
+        heap_module.HeapVacuumTablePlan(
+            table_id=person_table.table_id,
+            pages_scanned=1,
+            eligible_inline_versions=1,
+            reclaimed_versions=1,
+            reclaimed_slot_bytes=heap_store._read_slot(oldest)[1].__len__(),
+            relinked_versions=1,
+            skipped_overflow_versions=0,
+        ),
+    )
+    apply_vacuum_images(heap_store, plan)
+    assert heap_store.version_chain(newest) == (newest, middle)
+    with pool.pinned(heap_store.file, oldest.page) as page:
+        assert page.is_slot_free(oldest.slot)
+    assert [
+        version.values for _ref, version in heap_store.scan(person_table, at(100))
+    ] == [(1, "new")]
+
+
+def test_vacuum_limit_is_deterministic_and_reports_an_incomplete_pass(
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+    person_table: TableDef,
+) -> None:
+    enable_heap_reclaim(catalog_store)
+    oldest = heap_store.insert(person_table, 1, (1, "old"), xmin=1)
+    middle = heap_store.update(person_table, oldest, (1, "middle"), xmin=3)
+    newest = heap_store.update(person_table, middle, (1, "new"), xmin=5)
+    pool.flush()
+
+    plan = heap_store.plan_vacuum((person_table,), 5, max_versions=1)
+
+    assert plan.complete is False
+    assert plan.tables[0].eligible_inline_versions == 2
+    assert plan.tables[0].reclaimed_versions == 1
+    apply_vacuum_images(heap_store, plan)
+    assert heap_store.version_chain(newest) == (newest, middle)
+    with pool.pinned(heap_store.file, oldest.page) as page:
+        assert page.is_slot_free(oldest.slot)
+        assert not page.is_slot_free(middle.slot)
+
+
+def test_vacuum_v1_reports_but_does_not_reclaim_overflow_history(
+    pool: BufferPool,
+    heap_store: HeapStore,
+    catalog_store: CatalogStore,
+    person_table: TableDef,
+) -> None:
+    enable_heap_reclaim(catalog_store)
+    old = heap_store.insert(
+        person_table,
+        1,
+        (1, "x" * (heap_store.inline_capacity + 1)),
+        xmin=1,
+    )
+    heap_store.update(person_table, old, (1, "current"), xmin=3)
+    pool.flush()
+
+    plan = heap_store.plan_vacuum((person_table,), 3)
+
+    assert plan.complete is True
+    assert plan.page_images == ()
+    assert plan.tables[0].eligible_inline_versions == 0
+    assert plan.tables[0].reclaimed_versions == 0
+    assert plan.tables[0].skipped_overflow_versions == 1
+    assert heap_store.read(old).values[1].startswith("x")
 
 
 def test_one_cow_floor_plan_advances_multiple_extents_without_touching_page_zero(
@@ -3299,7 +3628,9 @@ def test_an_identity_survives_a_crash_that_never_flushed(
             if slot >= EXTENT_FIRST_SLOT
         ]
     entry = next(item for item in stored if item.table_id == person_table.table_id)
-    assert entry.next_record_id > handed[-1], "the page does not cover the ids handed out"
+    assert entry.next_record_id > handed[-1], (
+        "the page does not cover the ids handed out"
+    )
 
 
 def test_the_identity_of_a_row_does_not_change_when_it_is_updated(
@@ -3313,9 +3644,7 @@ def test_the_identity_of_a_row_does_not_change_when_it_is_updated(
     second = heap_store.update(person_table, reference, (1, "v2"), xmin=6)
     heap_store.update(person_table, second, (1, "v3"), xmin=7)
 
-    versions = [
-        version for _reference, version in heap_store.scan_all(person_table)
-    ]
+    versions = [version for _reference, version in heap_store.scan_all(person_table)]
     assert {version.record_id for version in versions} == {identity}
     assert heap_store.next_record_id(person_table) == counter_after_insert, (
         "an update spent a new identity"
@@ -3353,7 +3682,9 @@ def test_replaying_an_insert_uses_the_logged_identity_and_does_not_allocate(
     heap_store.insert(person_table, logged, (1, "replayed"), xmin=5)
 
     assert heap_store.next_record_id(person_table) == logged + 1
-    stored = [version.record_id for _reference, version in heap_store.scan_all(person_table)]
+    stored = [
+        version.record_id for _reference, version in heap_store.scan_all(person_table)
+    ]
     assert stored == [logged], "replaying the logged id allocated a different one"
 
 
@@ -3403,7 +3734,9 @@ def test_an_allocation_that_refuses_spends_no_identity(
 
     assert refused["raised"], "the counterfactual never fired"
     assert raised.value.retryable
-    assert store.next_record_id(table) == before, "a refused allocation spent an identity"
+    assert store.next_record_id(table) == before, (
+        "a refused allocation spent an identity"
+    )
 
 
 @pytest.mark.parametrize("step", list(range(1, 6)))
@@ -3524,7 +3857,11 @@ def test_an_edge_naming_a_row_that_does_not_exist_is_refused_before_anything_is_
     """Before, not after: no identity spent, no page pinned, no row written."""
     heap_store.insert(person_table, 1, (1, "Ada"), xmin=5)
     edges = knows_table(catalog_store)
-    row = relationship_row(1, 404, (2020,)) if end == "target" else relationship_row(404, 1, (2020,))
+    row = (
+        relationship_row(1, 404, (2020,))
+        if end == "target"
+        else relationship_row(404, 1, (2020,))
+    )
     counter_before = heap_store.next_record_id(edges)
     rows_before = len(list(heap_store.scan_all(person_table)))
 
@@ -3534,7 +3871,9 @@ def test_an_edge_naming_a_row_that_does_not_exist_is_refused_before_anything_is_
     assert raised.value.details["value"] == 404
     assert raised.value.details["endpoint_table"] == "Person"
     assert not isinstance(raised.value, GrafxCorruptionDetected)
-    assert heap_store.next_record_id(edges) == counter_before, "a refused edge spent an identity"
+    assert heap_store.next_record_id(edges) == counter_before, (
+        "a refused edge spent an identity"
+    )
     assert len(list(heap_store.scan_all(person_table))) == rows_before
 
 
@@ -3564,7 +3903,9 @@ def test_an_edge_pointing_at_a_deleted_row_is_refused(
 
     with pytest.raises(GrafxConfigurationError):
         heap_store.require_endpoints(edges, relationship_row(1, 2, (2020,)), at(1000))
-    assert heap_store.require_endpoints(edges, relationship_row(1, 2, (2020,)), at(7)) == (1, 2)
+    assert heap_store.require_endpoints(
+        edges, relationship_row(1, 2, (2020,)), at(7)
+    ) == (1, 2)
 
 
 def test_an_edge_survives_its_endpoint_being_updated(
@@ -3579,7 +3920,9 @@ def test_an_edge_survives_its_endpoint_being_updated(
     heap_store.insert(person_table, 2, (2, "Grace"), xmin=5)
     edges = knows_table(catalog_store)
     row = relationship_row(1, 2, (2020,))
-    reference = heap_store.insert(edges, heap_store.allocate_record_id(edges), row, xmin=6)
+    reference = heap_store.insert(
+        edges, heap_store.allocate_record_id(edges), row, xmin=6
+    )
 
     moved = heap_store.update(person_table, first, (1, "Ada Lovelace"), xmin=7)
     assert moved != first

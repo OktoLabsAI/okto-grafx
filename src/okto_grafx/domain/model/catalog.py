@@ -59,6 +59,7 @@ __all__ = [
     "CATALOG_LEGACY_FORMAT_VERSION",
     "CATALOG_MAGIC",
     "CATALOG_FORMAT_VERSION",
+    "HEAP_RECLAIM_V1_CAPABILITY",
     "Catalog",
 ]
 
@@ -70,6 +71,9 @@ CATALOG_LEGACY_FORMAT_VERSION: int = 1
 
 CATALOG_FORMAT_VERSION: int = 2
 """The newest catalog format this build can read and write."""
+
+HEAP_RECLAIM_V1_CAPABILITY: str = "heap_reclaim_v1"
+"""Required capability guarding the durable heap snapshot floor and physical reclamation."""
 
 _PREAMBLE = struct.Struct("<8sHHIIII")
 _V2_EXTENSION = struct.Struct("<QII")
@@ -84,9 +88,11 @@ _CHECKSUM = struct.Struct("<I")
 _MAX_TEXT = 0xFFFF
 
 _IDENTITY_SECONDARY_INDEXES_V1_BIT = 1 << 0
-_KNOWN_CAPABILITY_BITS = _IDENTITY_SECONDARY_INDEXES_V1_BIT
+_HEAP_RECLAIM_V1_BIT = 1 << 1
+_KNOWN_CAPABILITY_BITS = _IDENTITY_SECONDARY_INDEXES_V1_BIT | _HEAP_RECLAIM_V1_BIT
 _CAPABILITY_TO_BIT = {
-    IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY: _IDENTITY_SECONDARY_INDEXES_V1_BIT
+    IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY: _IDENTITY_SECONDARY_INDEXES_V1_BIT,
+    HEAP_RECLAIM_V1_CAPABILITY: _HEAP_RECLAIM_V1_BIT,
 }
 _VISIBILITY_TO_TAG = {IndexVisibility.EXACT: 1}
 _TAG_TO_VISIBILITY = {value: key for key, value in _VISIBILITY_TO_TAG.items()}
@@ -154,6 +160,11 @@ class Catalog:
         """Return required feature capabilities in deterministic spelling order."""
 
         return tuple(sorted(self._required_capabilities))
+
+    def requires_capability(self, capability: str) -> bool:
+        """Test one required capability without allocating the public ordered snapshot."""
+
+        return capability in self._required_capabilities
 
     def index_definitions(self) -> tuple[CatalogIndexDefinition, ...]:
         """Return catalog-managed exact indexes in canonical registry order."""
@@ -381,6 +392,20 @@ class Catalog:
         validated = self._validated_index_authority(proposed, stored=False)
         self._install_indexes(validated)
         return definition
+
+    def enable_heap_reclaim(self) -> Catalog:
+        """Add the one-way heap-reclaim capability to an already-active v2 catalog.
+
+        The capability is published before any heap floor or reclaimed slot.  Older builds then
+        reject the catalog's unknown required bit instead of opening bytes whose MVCC history
+        they do not understand.  Repeating the activation is an in-memory no-op.
+        """
+
+        self._require_index_catalog()
+        self._required_capabilities = frozenset(
+            (*self._required_capabilities, HEAP_RECLAIM_V1_CAPABILITY)
+        )
+        return self
 
     def replace_index_definition(
         self, definition: CatalogIndexDefinition

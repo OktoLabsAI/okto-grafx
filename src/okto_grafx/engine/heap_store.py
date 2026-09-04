@@ -63,6 +63,7 @@ from okto_grafx.domain.model.schema import (
     decode_tuple,
     encode_tuple,
 )
+from okto_grafx.domain.model.catalog import HEAP_RECLAIM_V1_CAPABILITY
 from okto_grafx.domain.model.value import Value
 from okto_grafx.domain.page import (
     FILE_HEADER_SIZE,
@@ -102,6 +103,9 @@ __all__ = [
     "TableExtent",
     "RecordIdFloorAdvance",
     "RecordIdFloorPlan",
+    "HeapReclaimFloorPlan",
+    "HeapVacuumPlan",
+    "HeapVacuumTablePlan",
     "HeapVersion",
     "HeapStore",
 ]
@@ -526,6 +530,39 @@ class RecordIdFloorPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class HeapReclaimFloorPlan:
+    """Detached heap page-zero image advancing the global retained-snapshot floor."""
+
+    page_index: PageIndex
+    image: bytes
+    old_floor: Lsn
+    new_floor: Lsn
+
+
+@dataclass(frozen=True, slots=True)
+class HeapVacuumTablePlan:
+    """Deterministic physical effects selected for one table."""
+
+    table_id: int
+    pages_scanned: int
+    eligible_inline_versions: int
+    reclaimed_versions: int
+    reclaimed_slot_bytes: int
+    relinked_versions: int
+    skipped_overflow_versions: int
+
+
+@dataclass(frozen=True, slots=True)
+class HeapVacuumPlan:
+    """Detached data-page images and accounting for one bounded heap reclaim pass."""
+
+    horizon_lsn: Lsn
+    page_images: tuple[tuple[PageIndex, bytes], ...]
+    tables: tuple[HeapVacuumTablePlan, ...]
+    complete: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _HeapBloatSample:
     """Header-only physical counts for one table at one conservative horizon."""
 
@@ -875,6 +912,308 @@ class HeapStore:
             page_index=HEADER_PAGE_INDEX,
             image=self._pool.codec.encode_page(image),
             advances=tuple(advances),
+        )
+
+    def reclaim_floor(self) -> Lsn:
+        """Return and validate the global minimum snapshot retained by this heap.
+
+        Heap files predating vacuum use ``(root_page=NO_PAGE, payload_length=0)``.  Vacuum v1
+        reuses these otherwise-unused heap-header fields as ``(HEADER_PAGE_INDEX, floor_lsn)``;
+        the catalog capability makes that interpretation unambiguous across binary versions.
+        """
+
+        self._require_bootstrapped()
+        with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
+            header = self._require_header_page(page)
+        return self._decode_reclaim_floor(header)
+
+    def plan_reclaim_floor(self, floor: Lsn) -> HeapReclaimFloorPlan:
+        """Plan a monotonic durable floor advance without changing resident or durable pages."""
+
+        if (
+            isinstance(floor, bool)
+            or not isinstance(floor, int)
+            or not 1 <= floor < PROVISIONAL_CSN
+        ):
+            raise GrafxConfigurationError(
+                "A heap reclaim floor must be a positive committed LSN.",
+                field="reclaim_floor_lsn",
+                value=repr(floor),
+            )
+        capabilities = self._catalog.catalog.required_capabilities()
+        if HEAP_RECLAIM_V1_CAPABILITY not in capabilities:
+            raise GrafxSchemaVersionMismatch(
+                "A heap reclaim floor requires catalog capability heap_reclaim_v1 to be "
+                "published first.",
+                field="required_capabilities",
+                value=HEAP_RECLAIM_V1_CAPABILITY,
+            )
+
+        self._require_bootstrapped()
+        page = self._pool.read_fresh_page(self._file, HEADER_PAGE_INDEX)
+        header = self._require_header_page(page)
+        old_floor = self._decode_reclaim_floor(header)
+        if floor < old_floor:
+            raise GrafxTransactionStateError(
+                f"The heap reclaim floor is already {old_floor}; it cannot move backward to "
+                f"{floor}.",
+                file=self._file,
+                field="reclaim_floor_lsn",
+                old_floor=old_floor,
+                value=floor,
+            )
+        FileHeaderPage.write(
+            page,
+            replace(
+                header,
+                root_page=HEADER_PAGE_INDEX,
+                payload_length=floor,
+            ),
+        )
+        return HeapReclaimFloorPlan(
+            page_index=HEADER_PAGE_INDEX,
+            image=self._pool.codec.encode_page(page),
+            old_floor=old_floor,
+            new_floor=floor,
+        )
+
+    def _decode_reclaim_floor(self, header: FileHeader) -> Lsn:
+        """Interpret the guarded heap-header floor and reject cross-file disagreement."""
+
+        capabilities = self._catalog.catalog.required_capabilities()
+        capable = HEAP_RECLAIM_V1_CAPABILITY in capabilities
+        if header.root_page == NO_PAGE and header.payload_length == 0:
+            return NO_LSN
+        if header.root_page == HEADER_PAGE_INDEX and header.payload_length > 0:
+            if capable:
+                return header.payload_length
+            raise GrafxCorruptionDetected(
+                f"Heap {self._file!r} declares a reclaim floor without the required catalog "
+                "capability.",
+                file=self._file,
+                page=HEADER_PAGE_INDEX,
+                field="required_capabilities",
+                value=HEAP_RECLAIM_V1_CAPABILITY,
+            )
+        raise GrafxCorruptionDetected(
+            f"Heap {self._file!r} carries an invalid reclaim-floor marker.",
+            file=self._file,
+            page=HEADER_PAGE_INDEX,
+            field="reclaim_floor",
+            root_page=header.root_page,
+            payload_length=header.payload_length,
+        )
+
+    def plan_vacuum(
+        self,
+        tables: Sequence[TableDef],
+        horizon: Lsn,
+        *,
+        max_versions: int | None = None,
+    ) -> HeapVacuumPlan:
+        """Build copy-on-write images that reclaim eligible inline MVCC versions.
+
+        The plan never mutates a resident frame.  Candidate discovery is header-only; a second
+        deterministic pass rewrites retained chain links, frees selected slots, compacts each
+        touched page, and emits full page images for the ordinary WAL path.  Overflow versions
+        are counted but retained by vacuum v1.
+        """
+
+        if (
+            isinstance(horizon, bool)
+            or not isinstance(horizon, int)
+            or not 1 <= horizon < PROVISIONAL_CSN
+        ):
+            raise GrafxConfigurationError(
+                "A heap vacuum horizon must be a positive committed LSN.",
+                field="horizon_lsn",
+                value=repr(horizon),
+            )
+        if max_versions is not None and (
+            isinstance(max_versions, bool)
+            or not isinstance(max_versions, int)
+            or max_versions <= 0
+        ):
+            raise GrafxConfigurationError(
+                "A heap vacuum max_versions limit must be a positive integer or None.",
+                field="max_versions",
+                value=repr(max_versions),
+            )
+        requested = tuple(tables)
+        if any(not isinstance(table, TableDef) for table in requested):
+            raise GrafxConfigurationError(
+                "A heap vacuum plan requires TableDef values.",
+                field="tables",
+            )
+        ordered = tuple(sorted(requested, key=lambda table: table.table_id))
+        if len({table.table_id for table in ordered}) != len(ordered):
+            raise GrafxConfigurationError(
+                "A heap vacuum plan cannot name one table id more than once.",
+                field="tables",
+            )
+        if (
+            HEAP_RECLAIM_V1_CAPABILITY
+            not in self._catalog.catalog.required_capabilities()
+        ):
+            raise GrafxSchemaVersionMismatch(
+                "Physical heap reclaim requires catalog capability heap_reclaim_v1.",
+                field="required_capabilities",
+                value=HEAP_RECLAIM_V1_CAPABILITY,
+            )
+
+        selected: dict[RecordRef, RecordHeader] = {}
+        selected_table: dict[RecordRef, int] = {}
+        selected_by_page: dict[PageIndex, list[RecordRef]] = {}
+        eligible_by_table: dict[int, int] = {}
+        skipped_by_table: dict[int, int] = {}
+        pages_by_table: dict[int, tuple[PageIndex, ...]] = {}
+        reclaimed_bytes_by_table: dict[int, int] = {}
+        selected_by_table: dict[int, int] = {}
+        remaining = max_versions
+        for table in ordered:
+            pages = self.pages_of(table)
+            pages_by_table[table.table_id] = pages
+            eligible = 0
+            skipped = 0
+            for ref, header, _content in self._walk(table, copy_content=False):
+                if not (
+                    is_committed_csn(header.xmin)
+                    and is_committed_csn(header.xmax)
+                    and header.xmin <= header.xmax <= horizon
+                ):
+                    continue
+                if header.has_overflow:
+                    skipped += 1
+                    continue
+                eligible += 1
+                if remaining is None or remaining > 0:
+                    selected[ref] = header
+                    selected_table[ref] = table.table_id
+                    selected_by_page.setdefault(ref.page, []).append(ref)
+                    selected_by_table[table.table_id] = (
+                        selected_by_table.get(table.table_id, 0) + 1
+                    )
+                    if remaining is not None:
+                        remaining -= 1
+            eligible_by_table[table.table_id] = eligible
+            skipped_by_table[table.table_id] = skipped
+
+        relinked_by_table: dict[int, int] = {}
+        page_images: list[tuple[PageIndex, bytes]] = []
+        found: set[RecordRef] = set()
+        for table in ordered:
+            for page_index in pages_by_table[table.table_id]:
+                page = self._pool.read_fresh_page(self._file, page_index)
+                self._require_table_page(page, table)
+                changed = False
+                for slot in page.live_slots():
+                    if slot < FIRST_RECORD_SLOT:
+                        continue
+                    ref = RecordRef(page=page_index, slot=slot)
+                    content = page.read_slot(slot)
+                    header = RecordHeader.decode(content)
+                    candidate = selected.get(ref)
+                    if candidate is not None:
+                        if header != candidate:
+                            raise GrafxTransactionStateError(
+                                "A heap vacuum candidate changed while its detached plan was "
+                                "being built.",
+                                file=self._file,
+                                table=table.name,
+                                page=page_index,
+                                slot=slot,
+                                field="vacuum_candidate",
+                            )
+                        found.add(ref)
+                        continue
+                    previous = header.previous
+                    seen: set[RecordRef] = set()
+                    while previous in selected:
+                        if previous in seen:
+                            raise GrafxCorruptionDetected(
+                                f"The selected version chain of record {header.record_id} in "
+                                f"table {table.name!r} is cyclic.",
+                                file=self._file,
+                                table=table.name,
+                                record_id=header.record_id,
+                                field="cycle",
+                            )
+                        seen.add(previous)
+                        prior = selected[previous]
+                        if (
+                            selected_table[previous] != table.table_id
+                            or prior.record_id != header.record_id
+                        ):
+                            raise GrafxCorruptionDetected(
+                                f"Version {page_index}:{slot} of table {table.name!r} record "
+                                f"{header.record_id} points into unrelated reclaimed history.",
+                                file=self._file,
+                                table=table.name,
+                                page=page_index,
+                                slot=slot,
+                                field="record_id",
+                                expected_record_id=header.record_id,
+                                observed_record_id=prior.record_id,
+                                expected_table_id=table.table_id,
+                                observed_table_id=selected_table[previous],
+                            )
+                        previous = prior.previous
+                    encoded_previous = (
+                        NO_PREVIOUS_VERSION if previous is None else previous.encode()
+                    )
+                    if encoded_previous != header.prev_version:
+                        page.update_slot(
+                            slot,
+                            replace(header, prev_version=encoded_previous).encode()
+                            + content[RECORD_HEADER_SIZE:],
+                        )
+                        relinked_by_table[table.table_id] = (
+                            relinked_by_table.get(table.table_id, 0) + 1
+                        )
+                        changed = True
+
+                for ref in sorted(
+                    selected_by_page.get(page_index, ()),
+                    key=lambda candidate: candidate.slot,
+                ):
+                    reclaimed_bytes_by_table[table.table_id] = (
+                        reclaimed_bytes_by_table.get(table.table_id, 0)
+                        + page.free_slot(ref.slot)
+                    )
+                    changed = True
+                if changed:
+                    page.compact()
+                    page_images.append((page_index, self._pool.codec.encode_page(page)))
+
+        if found != set(selected):
+            missing = tuple(
+                (ref.page, ref.slot)
+                for ref in sorted(set(selected) - found, key=lambda ref: ref.encode())
+            )
+            raise GrafxTransactionStateError(
+                "Heap vacuum candidates disappeared while their detached plan was built.",
+                file=self._file,
+                field="vacuum_candidate",
+                missing=missing,
+            )
+        table_plans = tuple(
+            HeapVacuumTablePlan(
+                table_id=table.table_id,
+                pages_scanned=len(pages_by_table[table.table_id]),
+                eligible_inline_versions=eligible_by_table[table.table_id],
+                reclaimed_versions=selected_by_table.get(table.table_id, 0),
+                reclaimed_slot_bytes=reclaimed_bytes_by_table.get(table.table_id, 0),
+                relinked_versions=relinked_by_table.get(table.table_id, 0),
+                skipped_overflow_versions=skipped_by_table[table.table_id],
+            )
+            for table in ordered
+        )
+        return HeapVacuumPlan(
+            horizon_lsn=horizon,
+            page_images=tuple(sorted(page_images)),
+            tables=table_plans,
+            complete=sum(plan.reclaimed_versions for plan in table_plans)
+            == sum(plan.eligible_inline_versions for plan in table_plans),
         )
 
     def allocate_record_id(self, table: TableDef) -> RecordId:
@@ -1269,6 +1608,7 @@ class HeapStore:
         self, table: TableDef, snapshot: SnapshotLike
     ) -> Iterator[tuple[RecordRef, HeapVersion]]:
         """Yield every version of the table the snapshot can see, in storage order."""
+
         def visible(_record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
             """Return whether this snapshot may observe the record header."""
             return snapshot.visible(xmin, xmax)
@@ -1412,7 +1752,9 @@ class HeapStore:
                             chain_limit=chain_limit,
                         )
                         break
-                    selected.append((RecordRef(page=index, slot=slot), header, bytes(view)))
+                    selected.append(
+                        (RecordRef(page=index, slot=slot), header, bytes(view))
+                    )
 
             if next_position is not None:
                 break
@@ -1475,6 +1817,7 @@ class HeapStore:
         reusable by any executor path that already needs an identity and cannot afford to throw
         away the reference; it neither changes scan order nor adds a second visibility rule.
         """
+
         def wanted(candidate: RecordId, xmin: Csn, xmax: Csn) -> bool:
             """Return whether this version is the requested row visible to the snapshot."""
             return candidate == record_id and snapshot.visible(xmin, xmax)
@@ -1654,9 +1997,7 @@ class HeapStore:
                         continue
                     ended_versions += 1
                     horizon_eligible = (
-                        is_committed_csn(xmin)
-                        and xmin <= xmax
-                        and xmax <= horizon
+                        is_committed_csn(xmin) and xmin <= xmax and xmax <= horizon
                     )
                     if horizon_eligible:
                         eligible_versions += 1
@@ -2320,7 +2661,9 @@ class HeapStore:
 
     def _decode_version(self, table: TableDef, content: bytes) -> HeapVersion:
         """Turn the raw content of a slot into a decoded version of the table."""
-        return self._decode_version_with_header(table, RecordHeader.decode(content), content)
+        return self._decode_version_with_header(
+            table, RecordHeader.decode(content), content
+        )
 
     def _decode_version_with_header(
         self, table: TableDef, header: RecordHeader, content: bytes

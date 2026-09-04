@@ -68,6 +68,7 @@ from okto_grafx.domain.ids import (
 from okto_grafx.domain.index.definition import index_definition_matches_table
 from okto_grafx.domain.index.keys import index_key
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
+from okto_grafx.domain.model.catalog import HEAP_RECLAIM_V1_CAPABILITY
 from okto_grafx.domain.model.schema import TableDef
 from okto_grafx.domain.page.file_header import (
     HEADER_PAGE_INDEX,
@@ -626,6 +627,32 @@ class Verifier:
                 f"{self._pool.page_size}-byte pages.",
             )
             return [], None
+        legacy_floor = header.root_page == NO_PAGE and header.payload_length == 0
+        guarded_floor = (
+            header.root_page == HEADER_PAGE_INDEX and header.payload_length > 0
+        )
+        reclaim_capable = False
+        if self._catalog is not None:
+            try:
+                reclaim_capable = (
+                    HEAP_RECLAIM_V1_CAPABILITY
+                    in self._catalog.read_from_pages().required_capabilities()
+                )
+            except GrafxError:
+                # The catalog walk owns its own located finding.  It cannot authorize a heap
+                # marker when it is unreadable, so this remains conservatively false.
+                reclaim_capable = False
+        if not legacy_floor and not (guarded_floor and reclaim_capable):
+            self._report_page(
+                findings,
+                reported,
+                heap_file,
+                HEADER_PAGE_INDEX,
+                FindingKind.FILE_HEADER,
+                "The heap reclaim-floor marker is invalid or lacks catalog capability "
+                "heap_reclaim_v1.",
+            )
+            return [], None
 
         found: list[VerificationFinding] = []
         extents: dict[int, list[tuple[int, TableExtent]]] = {}
@@ -751,7 +778,9 @@ class Verifier:
                         ),
                     )
                 )
-            for page_index in sorted(owners.get(table_id, ()) if owners is not None else ()):
+            for page_index in sorted(
+                owners.get(table_id, ()) if owners is not None else ()
+            ):
                 self._report_page(
                     found,
                     reported,

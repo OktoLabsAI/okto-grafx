@@ -76,6 +76,7 @@ from okto_grafx.domain.errors import (
     GrafxLeaseStolen,
     GrafxLeaseTimeout,
     GrafxRecoveryRefused,
+    GrafxSnapshotReclaimed,
     GrafxSchemaVersionMismatch,
     GrafxTransactionBudgetExceeded,
     GrafxTransactionStateError,
@@ -85,6 +86,7 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
     CATALOG_LEGACY_FORMAT_VERSION,
+    HEAP_RECLAIM_V1_CAPABILITY,
     Catalog,
 )
 from okto_grafx.domain.ids import (
@@ -112,6 +114,7 @@ from okto_grafx.domain.index.definition import (
 )
 from okto_grafx.domain.index.keys import identity_index_sizing, rehash_index_sizing
 from okto_grafx.domain.index.visibility import IndexVisibility
+from okto_grafx.domain.index.visibility import ReconcileReport
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.coordination import ProcessCoordinator
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
@@ -158,7 +161,7 @@ from okto_grafx.engine.commit_state_store import (
     CommitStateStore,
 )
 from okto_grafx.engine.commit_redo import CommitRedo
-from okto_grafx.engine.heap_store import FIRST_RECORD_ID
+from okto_grafx.engine.heap_store import FIRST_RECORD_ID, HeapVacuumPlan
 from okto_grafx.engine.wal_manager import WalManager
 from okto_grafx.engine.coordination import (
     COMMIT_SECTION,
@@ -651,6 +654,7 @@ class TransactionManager:
         "_index_manager",
         "_index_sync",
         "_index_authority_sync_required",
+        "_heap_reclaim_capable",
         "_partitions_per_table",
         "_identity_lease_size",
         "_identity_leases",
@@ -767,6 +771,8 @@ class TransactionManager:
         self._index_manager: Any = index_manager
         self._index_sync: Callable[[], object] | None = index_sync
         self._index_authority_sync_required: bool = False
+        self._heap_reclaim_capable: bool = False
+        self._refresh_heap_reclaim_capability()
         self._partitions_per_table: int = validate_partitions_per_table(
             partitions_per_table
         )
@@ -1162,6 +1168,144 @@ class TransactionManager:
                     operation=operation,
                 )
                 return True
+
+    def prepare_heap_reclaim_activation(self, txn: TransactionContext) -> bool:
+        """Stage the one-way catalog capability required before physical heap reclaim.
+
+        Catalog v2 must already be active.  This keeps its potentially expensive detached index
+        build in the explicit identity-activation phase and makes the vacuum capability commit a
+        small, independently recoverable metadata boundary.  ``False`` is the durable no-op when
+        this build's required bit is already present.
+        """
+
+        operation = "prepare heap-reclaim activation"
+        self._require_fresh_index_catalog_transaction(
+            txn,
+            operation=operation,
+            purpose="Heap-reclaim activation",
+        )
+        with self._participant_section():
+            self._require_not_closed(operation)
+            self._require_current_active(txn)
+            self._require_recovery_complete()
+            with self.schema_artifact_section(sync_if=lambda: True):
+                source = getattr(self._catalog, "catalog", None)
+                if not isinstance(source, Catalog):
+                    raise GrafxUnsupportedOperation(
+                        "Heap-reclaim activation needs the concrete persistent catalog.",
+                        operation=operation,
+                        field="catalog",
+                        value=type(source).__name__,
+                    )
+                if source.format_version != CATALOG_FORMAT_VERSION:
+                    raise GrafxUnsupportedOperation(
+                        "Heap-reclaim activation requires catalog v2; run "
+                        "maintenance.ensure_identity_indexes() first.",
+                        operation=operation,
+                        field="format_version",
+                        value=source.format_version,
+                        required=CATALOG_FORMAT_VERSION,
+                        remedy="maintenance.ensure_identity_indexes",
+                    )
+                if HEAP_RECLAIM_V1_CAPABILITY in source.required_capabilities():
+                    return False
+                candidate = Catalog.deserialize(source.serialize())
+                candidate.enable_heap_reclaim()
+                for page_index, image in self._catalog.stage(candidate):
+                    self._stage_page_image(
+                        txn,
+                        self._file_ids.catalog_file,
+                        page_index,
+                        image,
+                    )
+                return True
+
+    def prepare_vacuum(
+        self,
+        txn: TransactionContext,
+        tables: Sequence[TableDef],
+        horizon: Lsn,
+        *,
+        max_versions: int | None = None,
+    ) -> tuple[HeapVacuumPlan, tuple[ReconcileReport, ...], Lsn, Lsn]:
+        """Stage one atomic heap/index reclaim pass and its monotonic snapshot floor."""
+
+        operation = "prepare MVCC vacuum"
+        self._require_fresh_index_catalog_transaction(
+            txn,
+            operation=operation,
+            purpose="MVCC vacuum",
+        )
+        with self._participant_section():
+            self._require_not_closed(operation)
+            self._require_current_active(txn)
+            self._require_recovery_complete()
+            with self.schema_artifact_section(sync_if=lambda: True):
+                source = getattr(self._catalog, "catalog", None)
+                if not isinstance(source, Catalog):
+                    raise GrafxUnsupportedOperation(
+                        "MVCC vacuum needs the concrete persistent catalog.",
+                        operation=operation,
+                        field="catalog",
+                        value=type(source).__name__,
+                    )
+                if HEAP_RECLAIM_V1_CAPABILITY not in source.required_capabilities():
+                    raise GrafxUnsupportedOperation(
+                        "MVCC vacuum requires the published heap_reclaim_v1 capability.",
+                        operation=operation,
+                        field="required_capabilities",
+                        value=HEAP_RECLAIM_V1_CAPABILITY,
+                    )
+                selected_tables = tuple(tables)
+                table_ids = {table.table_id for table in selected_tables}
+                plan = self._heap.plan_vacuum(
+                    selected_tables,
+                    horizon,
+                    max_versions=max_versions,
+                )
+                manager = self._index_manager
+                active_indexes = getattr(manager, "active_indexes", None)
+                if not callable(active_indexes):
+                    raise GrafxUnsupportedOperation(
+                        "MVCC vacuum needs the catalog-authoritative index manager.",
+                        operation=operation,
+                        field="indexes",
+                    )
+                indexes = tuple(active_indexes(catalog=source))
+                reports = tuple(
+                    index.reconcile(horizon, txn)
+                    for index in indexes
+                    if index.definition.table_id in table_ids
+                )
+                removed_indexes = sum(report.removed for report in reports)
+                reclaimed_versions = sum(
+                    table.reclaimed_versions for table in plan.tables
+                )
+                old_floor = self._heap.reclaim_floor()
+                if reclaimed_versions == 0 and removed_indexes == 0:
+                    return plan, reports, old_floor, old_floor
+
+                for page_index, image in plan.page_images:
+                    self._stage_page_image(
+                        txn,
+                        self._heap_file,
+                        page_index,
+                        image,
+                    )
+                floor = self._heap.plan_reclaim_floor(horizon)
+                self._stage_page_image(
+                    txn,
+                    self._heap_file,
+                    floor.page_index,
+                    floor.image,
+                )
+                self._declare_complete_table_reads(
+                    txn, {table.table_id: table for table in selected_tables}
+                )
+                txn.note_read(
+                    page_partition(self._file_ids.catalog_file, HEADER_PAGE_INDEX)
+                )
+                return plan, reports, floor.old_floor, floor.new_floor
 
     def prepare_custom_exact_index(
         self,
@@ -1622,13 +1766,11 @@ class TransactionManager:
                 page_index,
                 image,
             )
-        self._index_catalog_activation_plans[txn.txn_id] = (
-            _IndexCatalogActivationPlan(
-                runtime_definitions,
-                tuple(sorted(txn.page_images.items())),
-                frozenset(txn.read_partitions),
-                frozenset(txn.write_partitions),
-            )
+        self._index_catalog_activation_plans[txn.txn_id] = _IndexCatalogActivationPlan(
+            runtime_definitions,
+            tuple(sorted(txn.page_images.items())),
+            frozenset(txn.read_partitions),
+            frozenset(txn.write_partitions),
         )
 
     def _validate_index_build_entry_budget(
@@ -1722,7 +1864,9 @@ class TransactionManager:
 
             snapshot = Snapshot(published_lsn)
             for table in endpoint_tables:
-                visible_rows = sum(1 for _ref, _version in self._heap.scan(table, snapshot))
+                visible_rows = sum(
+                    1 for _ref, _version in self._heap.scan(table, snapshot)
+                )
                 expected, bucket_count = identity_index_sizing(visible_rows)
                 nonce = allocate()
                 generation = IndexGenerationDescriptor(
@@ -1798,8 +1942,7 @@ class TransactionManager:
                     active.bucket_count
                     if active is not None
                     else max(
-                        generation.bucket_count
-                        for generation in logical.generations
+                        generation.bucket_count for generation in logical.generations
                     )
                     if logical.generations
                     else sized_bucket_count
@@ -2292,7 +2435,18 @@ class TransactionManager:
             )
             if self._index_sync is not None and not authority_unchanged:
                 self._index_sync()
+            self._refresh_heap_reclaim_capability()
         self._index_authority_sync_required = False
+
+    def _refresh_heap_reclaim_capability(self) -> None:
+        """Cache the one-way catalog fence so legacy begins retain their zero-I/O hot path."""
+
+        source = getattr(self._catalog, "catalog", None)
+        self._heap_reclaim_capable = bool(
+            isinstance(source, Catalog)
+            and source.format_version == CATALOG_FORMAT_VERSION
+            and source.requires_capability(HEAP_RECLAIM_V1_CAPABILITY)
+        )
 
     def _synchronize_committed_indexes(
         self, txn: TransactionContext, published_lsn: Lsn
@@ -2516,6 +2670,41 @@ class TransactionManager:
                 yield
 
     @contextmanager
+    def quiescent_maintenance_section(
+        self, *, confirm_quiescent: bool
+    ) -> Iterator[None]:
+        """Serialize this process and enforce vacuum v1's explicit operator assertion.
+
+        The participant section excludes concurrent threads of this handle for the complete
+        foreground operation.  It intentionally does not translate an expired reader TTL into
+        proof about another process; only the caller can assert that every other Grafx process,
+        including older binaries, has been stopped.
+        """
+
+        if confirm_quiescent is not True:
+            raise GrafxUnsupportedOperation(
+                "MVCC vacuum v1 requires confirm_quiescent=True after every other Grafx "
+                "process has been stopped.",
+                operation="vacuum",
+                field="confirm_quiescent",
+                value=repr(confirm_quiescent),
+                required=True,
+            )
+        self._require_not_closed("enter quiescent maintenance")
+        self._require_writable("vacuum MVCC history")
+        with self._participant_section():
+            self._require_not_closed("enter quiescent maintenance")
+            self._require_recovery_complete()
+            if self._open:
+                raise GrafxTransactionStateError(
+                    "MVCC vacuum v1 requires this process to have no open user transaction.",
+                    operation="vacuum",
+                    field="open_transactions",
+                    value=len(self._open),
+                )
+            yield
+
+    @contextmanager
     def schema_artifact_section(
         self, *, sync_if: Callable[[], bool] | None = None
     ) -> Iterator[None]:
@@ -2673,6 +2862,8 @@ class TransactionManager:
             catalog_may_have_changed = self._establish_read_view(view, own=own_view)
             if catalog_may_have_changed:
                 self._synchronize_read_index_authority(read_lsn)
+            if self._heap_reclaim_capable:
+                self._require_snapshot_retained(read_lsn)
             self._require_not_closed("begin a transaction")
             transaction = TransactionContext(
                 txn_id=self._next_txn_id,
@@ -2700,6 +2891,20 @@ class TransactionManager:
             # withdrawal. There is deliberately no per-transaction cleanup left to do here.
             del failure
             raise
+
+    def _require_snapshot_retained(self, snapshot_lsn: Lsn) -> None:
+        """Refuse a logical view older than the heap history retained on disk."""
+
+        floor = self._heap.reclaim_floor()
+        if floor > snapshot_lsn:
+            raise GrafxSnapshotReclaimed(
+                f"Snapshot {snapshot_lsn} predates heap reclaim floor {floor}; reopen the "
+                "transaction or cursor against the current publication.",
+                snapshot_lsn=snapshot_lsn,
+                reclaim_floor_lsn=floor,
+                file=self._heap.file,
+                remedy="reopen",
+            )
 
     def _ensure_begin_publishable(self, txn: TransactionContext) -> None:
         """Never return a live context after close won during a deferred/host callback."""
@@ -3091,9 +3296,7 @@ class TransactionManager:
                         )
                     )
                 except TypeError:
-                    stale = tuple(
-                        manager.open(published, persist_stale=persist_stale)
-                    )
+                    stale = tuple(manager.open(published, persist_stale=persist_stale))
         return registered, stale
 
     def checkpoint_and_claim_index_rebuild(self, index: Any, reason: str) -> int:
@@ -4141,9 +4344,7 @@ class TransactionManager:
                                 # fence; a referenced shadow that cannot be reopened is a
                                 # post-barrier failure and follows the ordinary redo path.
                                 with self._close_wait_hazard():
-                                    self._catalog.adopt(
-                                        self._catalog.read_from_pages()
-                                    )
+                                    self._catalog.adopt(self._catalog.read_from_pages())
                                     observe = getattr(
                                         self._index_manager,
                                         "observe_published_lsn",
