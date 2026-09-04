@@ -183,6 +183,41 @@ def test_pushdown_reads_pending_nodes_owned_by_the_transaction(database) -> None
     ).rows == (("pending-p", "pending-q"),)
 
 
+def test_pushdown_filters_the_complete_owner_overlay_after_update_and_delete(
+    database,
+) -> None:
+    """A local filter sees updated values and omits rows deleted by its own transaction."""
+
+    _create_schema(database)
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:P {id: 1, ordinal: 'before'})")
+        txn.execute("CREATE (:Q {id: 9, ordinal: 'target'})")
+
+    with database.begin("write") as txn:
+        txn.execute("MATCH (p:P {id: 1}) SET p.id = 2, p.ordinal = 'after'")
+        assert txn.execute("MATCH (p:P {id: 2}) RETURN p.ordinal").rows == (("after",),)
+        assert txn.execute("MATCH (p:P {id: 1}) RETURN p.ordinal").rows == ()
+        txn.execute("MATCH (q:Q {id: 9}) DELETE q")
+        assert (
+            txn.execute(
+                "MATCH (p:P {id: 2}), (q:Q {id: 9}) RETURN p.ordinal, q.ordinal"
+            ).rows
+            == ()
+        )
+
+
+def test_optional_local_equality_keeps_one_null_extended_row_on_a_miss(
+    database,
+) -> None:
+    _create_schema(database)
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:P {id: 1, ordinal: 'one'})")
+
+    statement = "OPTIONAL MATCH (p:P) WHERE p.id = $key RETURN p.ordinal"
+    assert database.execute(statement, {"key": 1}).rows == (("one",),)
+    assert database.execute(statement, {"key": 99}).rows == ((None,),)
+
+
 def test_selective_endpoints_fit_the_scan_sized_intermediate_budget(
     tmp_path: Path,
 ) -> None:
