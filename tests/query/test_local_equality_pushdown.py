@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
+import okto_grafx.engine.query_engine as query_engine_module
 from okto_grafx.domain.errors import (
     GrafxCorruptionDetected,
     GrafxPlanError,
@@ -101,7 +102,7 @@ def test_unique_endpoint_equalities_keep_the_canonical_cartesian_plan(
     monkeypatch.setattr(HeapStore, "scan", counted)
     with database.begin("write") as txn:
         result = txn.execute(statement, {"p": 3, "q": 7})
-        assert scans == {"P": 1, "Q": size}
+        assert scans == {"P": 1, "Q": 1}
         assert result.statistics["rows_scanned"] == size + size * size
         assert result.statistics["relationships_created"] == 1
 
@@ -309,6 +310,201 @@ def test_an_outer_miss_does_not_suppress_a_persistent_inner_scan_failure(
     assert raised.value is expected
 
 
+def test_inner_scan_replay_is_owned_by_one_statement(
+    database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_schema(database)
+    _insert_nodes(database, 3)
+    scans: Counter[str] = Counter()
+    original = HeapStore.scan
+
+    def counted(self, table, snapshot):
+        if table.name in {"P", "Q"}:
+            scans[table.name] += 1
+        return original(self, table, snapshot)
+
+    monkeypatch.setattr(HeapStore, "scan", counted)
+    statement = "MATCH (p:P), (q:Q) RETURN p.id, q.id"
+
+    assert len(database.execute(statement).rows) == 9
+    assert len(database.execute(statement).rows) == 9
+    assert scans == {"P": 2, "Q": 2}
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit"),
+    (
+        ("_NODE_SCAN_REPLAY_MAX_ENTRIES", 1),
+        ("_NODE_SCAN_REPLAY_MAX_BYTES", 1),
+    ),
+    ids=("entry-cap", "byte-cap"),
+)
+def test_replay_capacity_exhaustion_returns_to_canonical_scans(
+    database,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit: int,
+) -> None:
+    _create_schema(database)
+    _insert_nodes(database, 3)
+    scans: Counter[str] = Counter()
+    original = HeapStore.scan
+
+    def counted(self, table, snapshot):
+        if table.name in {"P", "Q"}:
+            scans[table.name] += 1
+        return original(self, table, snapshot)
+
+    monkeypatch.setattr(HeapStore, "scan", counted)
+    monkeypatch.setattr(query_engine_module, limit_name, limit)
+
+    result = database.execute("MATCH (p:P), (q:Q) RETURN p.id, q.id")
+
+    assert len(result.rows) == 9
+    assert result.statistics["rows_scanned"] == 12
+    assert scans == {"P": 1, "Q": 3}
+
+
+def test_first_inner_scan_corruption_is_not_hidden_by_replay(
+    database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_schema(database)
+    _insert_nodes(database, 3)
+    original = HeapStore.scan
+    expected = GrafxCorruptionDetected("injected mid-scan refusal", table="Q")
+
+    def refusing(self, table, snapshot):
+        rows = original(self, table, snapshot)
+        if table.name != "Q":
+            return rows
+
+        def partial():
+            yield next(rows)
+            yield next(rows)
+            raise expected
+
+        return partial()
+
+    monkeypatch.setattr(HeapStore, "scan", refusing)
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        database.execute("MATCH (p:P), (q:Q) RETURN p.id, q.id")
+    assert raised.value is expected
+
+
+def test_limit_does_not_eagerly_complete_the_inner_replay(
+    database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_schema(database)
+    _insert_nodes(database, 3)
+    original = HeapStore.scan
+    expected = GrafxCorruptionDetected("must remain unread", table="Q")
+
+    def refusing(self, table, snapshot):
+        rows = original(self, table, snapshot)
+        if table.name != "Q":
+            return rows
+
+        def partial():
+            yield next(rows)
+            # LIMIT's canonical iterator reads one row beyond its result before stopping.  A
+            # replay cache must not widen that established lookahead into a full table read.
+            yield next(rows)
+            raise expected
+
+        return partial()
+
+    monkeypatch.setattr(HeapStore, "scan", refusing)
+
+    assert database.execute("MATCH (p:P), (q:Q) RETURN p.id, q.id LIMIT 1").rows == (
+        (0, 0),
+    )
+
+
+def test_replay_preserves_pending_owner_rows_and_order(database) -> None:
+    _create_schema(database)
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:P {id: 1, ordinal: 'p1'})")
+        txn.execute("CREATE (:P {id: 2, ordinal: 'p2'})")
+        txn.execute("CREATE (:Q {id: 8, ordinal: 'q1'})")
+        txn.execute("CREATE (:Q {id: 9, ordinal: 'q2'})")
+
+        result = txn.execute("MATCH (p:P), (q:Q) RETURN p.ordinal, q.ordinal")
+
+    assert result.rows == (
+        ("p1", "q1"),
+        ("p1", "q2"),
+        ("p2", "q1"),
+        ("p2", "q2"),
+    )
+    assert result.statistics["rows_scanned"] == 6
+
+
+def test_replay_preserves_owner_updates_and_deletes(
+    database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_schema(database)
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:P {id: 1, ordinal: 'p1'})")
+        txn.execute("CREATE (:P {id: 2, ordinal: 'p2'})")
+        txn.execute("CREATE (:Q {id: 8, ordinal: 'before'})")
+        txn.execute("CREATE (:Q {id: 9, ordinal: 'deleted'})")
+
+    with database.begin("write") as txn:
+        txn.execute("MATCH (q:Q {id: 8}) SET q.ordinal = 'after'")
+        txn.execute("MATCH (q:Q {id: 9}) DELETE q")
+        scans: Counter[str] = Counter()
+        original = HeapStore.scan
+
+        def counted(self, table, snapshot):
+            if table.name in {"P", "Q"}:
+                scans[table.name] += 1
+            return original(self, table, snapshot)
+
+        monkeypatch.setattr(HeapStore, "scan", counted)
+        result = txn.execute("MATCH (p:P), (q:Q) RETURN p.ordinal, q.ordinal")
+
+    assert result.rows == (("p1", "after"), ("p2", "after"))
+    assert result.statistics["rows_scanned"] == 4
+    assert scans == {"P": 1, "Q": 1}
+
+
+def test_explicit_query_memory_budget_keeps_canonical_scans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "memory-budget"
+    setup = okto_grafx.connect(root, page_size=512)
+    try:
+        _create_schema(setup)
+        _insert_nodes(setup, 3)
+    finally:
+        setup.close()
+
+    database = okto_grafx.connect(root, page_size=512, query_memory_budget_bytes=1_024)
+    scans: Counter[str] = Counter()
+    original = HeapStore.scan
+
+    def counted(self, table, snapshot):
+        if table.name in {"P", "Q"}:
+            scans[table.name] += 1
+        return original(self, table, snapshot)
+
+    monkeypatch.setattr(HeapStore, "scan", counted)
+    try:
+        result = database.execute("MATCH (p:P), (q:Q) RETURN p.id, q.id")
+    finally:
+        database.close()
+
+    assert len(result.rows) == 9
+    assert result.statistics["rows_scanned"] == 12
+    assert scans == {"P": 1, "Q": 3}
+
+
 def test_canonical_cartesian_work_exceeds_a_scan_sized_intermediate_budget(
     tmp_path: Path,
 ) -> None:
@@ -329,5 +525,9 @@ def test_canonical_cartesian_work_exceeds_a_scan_sized_intermediate_budget(
                     "MATCH (p:P {id: 2}), (q:Q {id: 4}) CREATE (p)-[:E {w: 1}]->(q)"
                 )
         assert raised.value.details["field"] == "max_intermediate_rows"
+        assert raised.value.details["limit"] == size
+        assert raised.value.details["observed"] == size + 1
+        assert raised.value.details["operator"] == "NodeScan"
+        assert database.execute("MATCH (p:P)-[e:E]->(q:Q) RETURN e.w").rows == ()
     finally:
         database.close()
