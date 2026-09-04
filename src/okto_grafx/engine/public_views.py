@@ -2161,7 +2161,7 @@ def _query_value_snapshot(
         source = _domain_value(value, Uuid, field=field)
         return Uuid(raw=_builtin_bytes(_domain_field(source, Uuid, "raw"), field=field))
     if issubclass(value_type, VectorValue):
-        return _vector_query_snapshot(value)
+        return _vector_query_snapshot(value, reuse_exact_values=True)
     # This is a result-only marker, not a storable Value. It is recognized nominally and
     # rebuilt here, outside page access, before a private engine object can reach the caller.
     from okto_grafx.engine.query_engine import _PathValue
@@ -3326,17 +3326,34 @@ def _vector_component(value: object) -> float:
         ) from failure
 
 
-def _vector_query_snapshot(value: object) -> tuple[float, ...] | VectorValue:
-    """Detach a query into an exact tuple or an identity-preserving exact VectorValue."""
+def _vector_query_snapshot(
+    value: object, *, reuse_exact_values: bool = False
+) -> tuple[float, ...] | VectorValue:
+    """Detach a query into an exact tuple or an identity-preserving exact VectorValue.
+
+    Public result projection may set ``reuse_exact_values`` after it has received a VectorValue
+    from the decoder. An exact tuple containing only exact floats is already immutable and
+    capability-free, so returning that tuple avoids revalidating every component in Python.
+    Caller-controlled query input keeps the component path below, including its original refusal
+    and callback order.
+    """
     if issubclass(type(value), VectorValue):
         source = _domain_value(value, VectorValue, field="vector.query")
-        values = tuple(
-            _vector_component(component)
-            for component in _tuple_items(
-                _domain_field(source, VectorValue, "values"),
-                field="vector.query.values",
+        raw_values = _domain_field(source, VectorValue, "values")
+        if (
+            reuse_exact_values
+            and type(raw_values) is tuple
+            and set(map(type, raw_values)) <= {float}
+        ):
+            values = raw_values
+        else:
+            values = tuple(
+                _vector_component(component)
+                for component in _tuple_items(
+                    raw_values,
+                    field="vector.query.values",
+                )
             )
-        )
         space_ref = _builtin_int(
             _domain_field(source, VectorValue, "space_ref"),
             field="vector.query.space_ref",
@@ -3365,7 +3382,10 @@ def _vector_query_snapshot(value: object) -> tuple[float, ...] | VectorValue:
                 reason="dimension_too_large",
                 value=len(values),
             )
-        return VectorValue(values=values, space_ref=space_ref, dtype=dtype)
+        # Every field above is now an exact built-in and has passed the public-query bounds. The
+        # ordinary constructor would map ``float`` across the tuple a second time; the decoded
+        # constructor is the existing no-revalidation door for precisely this trusted shape.
+        return VectorValue._from_decoded(values, space_ref, dtype)
 
     if issubclass(type(value), (str, bytes, bytearray)):
         raise GrafxVectorValidationError(

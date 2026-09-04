@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
+from decimal import Decimal
 from typing import get_type_hints
 
 import pytest
@@ -27,6 +28,7 @@ from okto_grafx.domain.verify.findings import (
     VerificationReport,
 )
 from okto_grafx.domain.wal.replay import RecycleReport
+from okto_grafx.engine import public_views as public_views_module
 from okto_grafx.engine.index_manager import IndexManager, IndexStore
 from okto_grafx.engine.public_views import MetricsSnapshotView
 from okto_grafx.engine.txn_manager import TransactionManager
@@ -504,6 +506,85 @@ def test_search_vectors_detaches_vector_value_and_filter_before_search(
 
     assert observed.hits[0].record_id == 7
     assert calls == _calls()
+
+
+@pytest.mark.parametrize("values", [(0.0, -0.0, 1.25), ()])
+def test_vector_result_snapshot_reuses_only_an_exact_float_tuple(
+    monkeypatch: pytest.MonkeyPatch, values: tuple[float, ...]
+) -> None:
+    """Decoded vector leaves are already immutable and need no Python call per component."""
+    vector = VectorValue._from_decoded(values, 7, "float32")
+
+    def unexpected_component(_value: object) -> float:
+        raise AssertionError(
+            "an exact decoded float tuple was revalidated by component"
+        )
+
+    monkeypatch.setattr(public_views_module, "_vector_component", unexpected_component)
+    observed = public_views_module._query_value_snapshot(
+        vector,
+        field="result.vector",
+        depth=0,
+        active=set(),
+    )
+
+    assert type(observed) is VectorValue
+    assert observed.values is values
+    assert observed.space_ref == 7
+    assert observed.dtype == "float32"
+
+
+@pytest.mark.parametrize(
+    "foreign_kind",
+    ["bool", "int", "decimal", "float_subclass"],
+)
+@pytest.mark.parametrize("position", [0, 1, 2])
+def test_vector_result_snapshot_falls_back_for_each_nonexact_component(
+    foreign_kind: str, position: int
+) -> None:
+    """A bool, int, Decimal or float subclass still takes the established coercion path."""
+    foreign: object
+    if foreign_kind == "bool":
+        foreign = True
+    elif foreign_kind == "int":
+        foreign = 1
+    elif foreign_kind == "decimal":
+        foreign = Decimal("1.25")
+    else:
+        foreign = _HostileFloat(1.5, _calls())
+    items: list[object] = [0.25, 0.5, 0.75]
+    items[position] = foreign
+    vector = VectorValue._from_decoded(tuple(items), 7, "float64")  # type: ignore[arg-type]
+
+    expected = public_views_module._vector_query_snapshot(vector)
+    observed = public_views_module._vector_query_snapshot(
+        vector, reuse_exact_values=True
+    )
+
+    assert observed == expected
+    assert type(observed) is VectorValue
+    assert type(observed.values) is tuple
+    assert all(type(component) is float for component in observed.values)
+
+
+def test_caller_vector_query_keeps_component_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The result-only shortcut never changes the untrusted public query boundary."""
+    vector = VectorValue._from_decoded((0.25, 0.5, 0.75), 7, "float64")
+    original = public_views_module._vector_component
+    visited: list[float] = []
+
+    def counted_component(value: object) -> float:
+        component = original(value)
+        visited.append(component)
+        return component
+
+    monkeypatch.setattr(public_views_module, "_vector_component", counted_component)
+    observed = public_views_module._vector_query_snapshot(vector)
+
+    assert observed == vector
+    assert visited == [0.25, 0.5, 0.75]
 
 
 def test_query_callback_that_rolls_back_runs_before_page_access_and_search(

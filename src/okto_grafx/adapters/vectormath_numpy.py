@@ -152,11 +152,12 @@ class NumpyVectorMath:
         once instead of once per candidate (VEC-1). The steps kept here run in the order they
         always ran: the right norm, the zero-length rule, then the guarded division.
         """
+        # Both operations need the same warning policy. One scope preserves their order and
+        # refusals while avoiding a second NumPy context enter/exit for every scored candidate.
         with _quiet():
             length_b = _require_finite(numpy.sqrt(numpy.dot(right, right)), "norm")
-        if length_a == 0.0 or length_b == 0.0:
-            return 0.0
-        with _quiet():
+            if length_a == 0.0 or length_b == 0.0:
+                return 0.0
             return _require_finite(
                 numpy.dot(left, right) / (length_a * length_b), "cosine similarity"
             )
