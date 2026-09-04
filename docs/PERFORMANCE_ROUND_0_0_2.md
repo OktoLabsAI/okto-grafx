@@ -1013,3 +1013,39 @@ mutable queries, adapter fallback, compact views, deterministic remove/reuse re-
 exact check-to-publish thread race. Ruff and diff-check passed. All caches are bounded by their
 owner or by live graph nodes and carry only immutable process-local derivatives; no page, catalog
 or WAL format, OCC, lock publication, durability, multiwriter or multireader rule changed.
+
+## Scale-removal batch 14 — common logical replay headers
+
+Status: **completed in `ae8d01e`; independent Nexus review
+`hof_e04db78c505a4ea0922fc19e8b278d5b` verified PASS**.
+
+An index-only recovery/checkpoint pass now fully decodes and resolves its common logical records
+before mutation, then reads and publishes page 0 at most once per affected ordinary index. Bucket
+effects still execute in original WAL order and use the existing idempotent `_apply_change` door;
+the final `built_through_lsn` and `reconciled_through_lsn` are composed with the same monotonic
+value objects as the per-record path. Mixed page/index replay, RESET, active rebuild generations,
+locally stale stores, unknown indexes and every subclass with its own `apply` semantics — notably
+`VectorHnswIndex` — decline the whole optimization and retain the legacy dispatcher.
+
+The first adversarial review reproduced a real stale-generation defect in the initial draft: a
+caller could retain and reapply a prepared object after a later durable STALE mark. The promoted
+form exposes only one atomic capability from records to application; its preparation is private,
+per-store state is immutable and movement state is local to that invocation. A regression proves
+that repeating the replay after `mark_stale()` preserves the durable STALE bit. Ordinary failures
+mark every already-touched store stale without masking the root exception; `KeyboardInterrupt`
+and `SystemExit` preserve the legacy control-signal behavior. Flush and commit-state publication
+remain solely at the existing recovery/checkpoint boundary under `COMMIT_SECTION`.
+
+The focused 500-effect micro measured `105.734 -> 49.465 ms` (`2.14x`). In the public 500-CREATE
+profile, checkpoint cumulative time moved directionally from `1.125 s` to `0.617–0.665 s`
+(`~1.69–1.82x`) and `CommitRedo.apply` from `0.916 s` to about `0.357 s` (`~2.57x`); these are
+profiler observations, not release gates. Thirteen discriminant tests, 136 grouped recovery/index/
+checkpoint regressions and 14 multiprocess exact-index/transaction cases passed, as did Ruff and
+diff-check. Format, WAL records, OCC, durability and multiwriter/multireader rules are unchanged.
+
+The next measured primary-key candidate was closed as a finite NO-GO for the current API. The
+carried exact view already leaves one fresh post-certificate per key. Sharing that certificate
+across `executemany` items requires read-ahead or keeping a view across callbacks, changing lazy
+consumption, error order or cross-process freshness. An intentionally unsafe bypass measured a
+`26.6%` ceiling over 500 CREATEs, but no code was selected without an explicit eager/replayable
+API contract.
