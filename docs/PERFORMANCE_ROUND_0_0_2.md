@@ -823,7 +823,8 @@ durability or multiwriter/multireader rule changed.
 
 ## Scale-removal batch 7 — compact resident HNSW components
 
-Status: **the narrowed D-13H completed in `eebc497`; batch scoring remains a separate design**.
+Status: **the narrowed D-13H completed in `eebc497`; batch scoring was evaluated separately in
+batch 8**.
 
 - Engine-built HNSW graphs selected through the explicit NumPy adapter now retain each vector as
   immutable native f32/f64 bytes instead of a tuple of boxed Python floats. Every math callback
@@ -843,3 +844,33 @@ cross-process cases plus all 18 compact tests with real NumPy, Ruff, format and 
 adversarial review additionally exercised warm-versus-rebuild f32 values, a prepared custom
 adapter and complete physical removal, finding no blocker. Full 8,192 x 384 evidence remains
 grouped with the following vector work rather than gating this component gain.
+
+## Scale-removal batch 8 — D-14 batch scoring decision
+
+Status: **no production change selected after measuring the reachable paths and the certified
+HNSW expansion**.
+
+- Exact scan still owns tuples at its real input. Paying tuple-to-matrix materialization on every
+  call reduced the current NumPy path by only `1.26x` to `2.04x`, with the gain shrinking at the
+  relevant larger dimensions. The previously observed `282x` measured only matrix multiplication
+  after assuming a resident matrix that the engine does not have; matrix materialization was
+  `99.5%` of the reachable batched path at 4,096 x 384. This B1 path is therefore NO-GO.
+- HNSW expansion cannot put batched floating-point scores directly in `beam` or `results`: their
+  ordering decides the next expanded node, the visited set and the break condition. None of
+  `matmul`, `dot`, `inner`, `einsum` or row-wise sum reproduced the scalar NumPy score bit for bit
+  across the measured 4,096-candidate corpora. The only semantics-preserving design found was to
+  use a bounded batch result solely to prove rejection, then recompute every admitted or uncertain
+  candidate with the scalar scorer before it can influence traversal.
+- On the real compact f32 HNSW shape at 4,096 x 384, 20 searches inserted `26.7%` of 74,398 scored
+  neighbours at `ef=320`, and `15.9%` of 32,975 at `ef=64`. Even before charging interval
+  comparisons and small-batch overhead, the resulting optimistic end-to-end ceilings were only
+  `1.70x` and `2.18x`. The available conservative error bound covers DOT only; cosine and
+  Euclidean need different proofs. Shipping a DOT-only capability with new interval machinery for
+  this ceiling is not proportionate to its semantic surface and would not help the Pulse cosine
+  workload.
+
+The adversarial design handoff `hof_1b20013e41154a00b21d65af4153af42` was closed and verified
+after two corrections to the original proposal. D-14 is a finite NO-GO for this representation,
+not an open gate. A future exact-search storage redesign may revisit contiguous residency as its
+own initiative; it is not smuggled into this batch. No format, WAL/OCC, durability or
+multiwriter/multireader rule changed.
