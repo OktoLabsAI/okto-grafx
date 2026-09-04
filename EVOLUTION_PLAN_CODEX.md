@@ -9,6 +9,18 @@
 
 ## Estado de execução — 2026-09-03
 
+- **Milestone de hot paths publicado em `9603115` (2026-09-04).** Foram concluídos os recortes
+  limitados de heap/catalog bootstrap, projeção e sincronização de índices, segunda leitura de
+  controle sob pin válido, caches de query por `Database`, packing/decode de slots, retenção de
+  catalog read view somente na composição WAL-only e a lane vetorial VEC-1..VEC-5. Não houve
+  mudança de formato, WAL, OCC, multiwriter ou multireader. Os ganhos vetoriais medidos variam de
+  `1,47x` a `3,19x` conforme o componente/workload; os ganhos de query continuam estimativas, não
+  números end-to-end. A busca vetorial exata header-first valida integralmente toda linha admitida,
+  mas deixa a corrupção de payload invisível/filtrado para `verify`/scan, registrando honestamente
+  a mudança de momento de detecção. Evidências completas estão em
+  `docs/PERFORMANCE_ROUND_0_0_2.md` e no handoff Nexus
+  `hof_47afe28f5f004696a473718eeca9d980`.
+
 - **Linha `0.0.2` iniciada sob o plano de performance congelado.** A branch canônica de trabalho é
   `feature/v0.0.2`; o bump de versão, o ambiente P0.0 e o diagnóstico/correção multiprocesso P0.1
   estão publicados, e o marco de código integrado mais recente é `72694bd`. A auditoria do Pulse Community pinado em `d50c034`
@@ -3405,6 +3417,7 @@ começar sob seus roadmaps versionados; a matriz CE-3 temporal tornou-se evidên
 | 0.0.2 / item 11 — vacuum MVCC v1 | concluído, auditado e publicado na branch | `75e799f`; ADR `docs/architecture/MVCC_VACUUM_V1.md`; revisão Nexus `hof_df837d11c96a430786856895c7f7c744` corrigida e verificada PASS | Vacuum manual/foreground/process-quiescent com capability requerida, floor heap-global monotônico, recusa retryable de snapshot reclamado, relink de cadeia e reconcile ACTIVE atômicos. Remove somente versões inline; overflow, truncagem e reuso físico continuam fora. Fault injection e 1.226 testes agrupados verdes no delta; quatro falhas históricas foram reproduzidas no baseline e nominadamente excluídas |
 | 0.0.2 / item 12 — full-page WAL zlib v2 | concluído, auditado e publicado na branch | `24f2f63` + `d806652`; ADR `docs/architecture/WAL_PAGE_COMPRESSION_V1.md`; revisões `hof_44e3743219b2476a95ecc02d00ac0eb6` e `hof_b192c61ffcea4297852c7b2b8f00064b` verificadas PASS | Ativação explícita/one-way por capability `wal_record_v2`, transação de ativação integralmente v1, inflate limitado e semântica unknown-v2 fail-closed. Lotes com segment roll e imagens incompressíveis preservam v1. Amostra 50 linhas/3 páginas reduziu `31.510→7.966` bytes (`-74,72%`); gate agrupado 1.496/1.496 no delta |
 | 0.0.2 / item 13 — codec NumPy byte-idêntico | concluído, auditado e publicado na branch | `b720f7e` + `d644dc3`; ADR `docs/architecture/NATIVE_PAGE_CODEC_V1.md`; parecer inicial `hof_fd26b1d96ce74dac80c9671e00a55999` e validação final `hof_19b2cca000214564832d7ff15cf77618` verificados PASS | Selector explícito `codec="numpy"`, por banco, sem `auto`; page format v1, WAL e concorrência inalterados. Caminho híbrido 16/96 slots, montagem canônica de `Page`, oracle único de recusa, paridade `u16` em NumPy 1.x/2.x, 3.000 mutações diferenciais e receipt processo/instância. Micro final: encode `3,06x`, decode `1,83x` em 200 slots/8 KiB; sem alegação end-to-end. Focado 556/556; gate ampliado fechou uma dívida imutável via 661/661 e reteve as mesmas quatro falhas transacionais históricas fora do delta |
+| 0.0.2 / item 14 — hot paths limitados de query/heap/txn/vetor | concluído, auditado e publicado na branch | `9603115`; revisão Nexus `hof_47afe28f5f004696a473718eeca9d980` verificada PASS | Caches por `Database` limitados a 256/128/128 e sem autoridade de storage; bootstrap elimina device probes redundantes mas continua validando o header; CE-3 evita sync sem mudança; uma projeção ACTIVE por statement; retenção de catálogo só sob composição WAL-only; packing/decode e VEC-1..VEC-5. Sem mudança de formato/WAL/OCC/concorrência. Evidência vetorial: `1,47–3,19x` conforme componente/workload e ranking idêntico; ganhos de query permanecem estimados. Payload vetorial invisível/filtrado passa a ser auditado por verifier/scan, mantendo fail-closed para linhas admitidas. 21/21 mutantes, gates focais e checks estáticos verdes; 29 arquivos históricos seguem fora do baseline de formatação, sem reformat amplo |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um

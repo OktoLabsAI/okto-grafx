@@ -551,3 +551,48 @@ On the recorded Windows/Python 3.13 host with native CRC, the final 200-slot/8 K
 measured encode `164.85 -> 53.87 us` (`3.06x`) and decode `150.48 -> 82.12 us` (`1.83x`). These are
 component ratios only; end-to-end commit latency still includes unchanged WAL, durability,
 coordination and index work.
+
+## Item 14 — bounded query, heap, transaction and vector hot paths
+
+Status: **completed and published on `feature/v0.0.2` as `9603115`**.
+
+This milestone removes repeated fixed work without changing page/WAL formats, OCC, durability or
+multiwriter/multireader semantics. Heap and catalog bootstrap now avoid repeated device
+`exists/page_count` calls, but still pin and validate the resident header on every fast-path entry;
+catalog/index synchronization runs only when CE-3 proves an authority change. A statement builds
+one ACTIVE-index projection, and the second control-record read is skipped only while the standing
+pin still proves the same observation. Catalog read views are retained only in the production
+composition where every catalog mutation is WAL-logged; direct non-WAL VectorEngine lifecycle
+operations remain refused there.
+
+Query parsing and prepared-plan views use per-`Database`, strongly owned and bounded LRUs (256
+parse entries, 128 plan entries and 128 public memo entries). Cached values contain structural
+plans only, never storage or transaction authority, and hostile/unowned plans still cross full
+validation. Batch slots use direct struct pack/unpack, index bucket page counts are lazy, scalar
+decoding is preplanned, and high-water inspection reuses an already accepted header.
+
+The vector lane adds header-first exact search, block validation/decode, optional
+`PreparedVectorMath` and less allocation in distance/beam processing. The optional math protocol
+preserves the host-adapter fallback. Header-first exact search deliberately does not decode payloads
+of rows already excluded by snapshot visibility or filters; corruption in those unreachable
+payloads is still found by verifier/scan, while every admitted row remains fail-closed. This is a
+change in detection timing/read surface, not a relaxation of durable verification.
+
+Measured component evidence from the reviewed Nexus handoff
+`hof_47afe28f5f004696a473718eeca9d980`:
+
+- vector component validation: `2.59x` to `3.19x`, depending on dimension and f32/f64;
+- HNSW N=500/d=64/cosine: build `1.77x`, search `1.93x` at ef64 and `2.09x` at ef320, with
+  identical ranking;
+- exact vector search, 800 rows/d=128: `2.99x` with 10% visible (800 -> 80 tuple decodes) and
+  `1.47x` with 100% visible; sample insert path `1.20x`.
+
+The query-cache gains remain estimates from the design survey (roughly 19--28% for prepared work,
+plus about 12.9% for the public-view component), not fresh end-to-end claims. Quality evidence:
+3,459 tests passed in Python 3.13 with NumPy before two historical contract-roster mismatches were
+corrected; 897 passed and 3 skipped in Python 3.11 without NumPy before the same roster correction;
+21/21 mutants were killed. The two historical mismatches were then fixed and their 29-case slice
+passed, alongside 247 heap, about 293 catalog/storage/index, 378 query/public, 74 vector and 29
+reader/cross-process focused cases. Ruff lint, compileall and diff-check passed. Whole-repository
+`ruff format --check` still reports 29 historically unformatted tracked files; no unrelated bulk
+format was performed.
