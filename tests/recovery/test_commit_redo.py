@@ -97,6 +97,37 @@ def _page_record(lsn: int = 1) -> WalRecord:
     )
 
 
+def _encoded_page_record(
+    stack: object,
+    *,
+    record_lsn: int,
+    page_index: int,
+    page_lsn: int,
+    payload: bytes,
+    compress: bool = False,
+) -> WalRecord:
+    codec = stack.codec  # type: ignore[attr-defined]
+    image = make_page_image(
+        codec,
+        (payload,),
+        page_index=page_index,
+        page_lsn=page_lsn,
+    )
+    encoded = encode_page_write_record(
+        "heap.dat", page_index, image, compress=compress
+    )
+    return WalRecord(
+        record_type=int(WalRecordType.WRITE_PAGE),
+        payload=encoded.payload,
+        descriptor=DESCRIPTOR,
+        epoch=1,
+        txn_id=7,
+        lsn=record_lsn,
+        format_version=encoded.format_version,
+        flags=encoded.flags,
+    )
+
+
 def _index_record(
     operation: IndexOperation,
     lsn: int,
@@ -476,6 +507,166 @@ def test_reapplying_a_compressed_page_effect_is_an_idempotent_no_op(
     )
     assert persisted.page_lsn == 7
     assert persisted.read_slot(0) == b"compressed"
+
+
+def test_page_only_redo_coalesces_repeated_locations_at_their_first_position(
+    memory_device: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = build_stack(memory_device)
+    first_a = _encoded_page_record(
+        stack, record_lsn=1, page_index=0, page_lsn=4, payload=b"old-a"
+    )
+    only_b = _encoded_page_record(
+        stack, record_lsn=2, page_index=1, page_lsn=5, payload=b"only-b"
+    )
+    final_a = _encoded_page_record(
+        stack,
+        record_lsn=3,
+        page_index=0,
+        page_lsn=6,
+        payload=b"final-a",
+        compress=True,
+    )
+    calls: list[tuple[int, bytes]] = []
+
+    def apply_page(_pool: object, _file: str, page: int, image: bytes) -> bool:
+        decoded = stack.codec.decode_page(image, verify=True)
+        calls.append((page, decoded.read_slot(0)))
+        return True
+
+    monkeypatch.setattr(commit_redo_module, "apply_page_image", apply_page)
+
+    report = CommitRedo(stack.pool).apply(
+        CommittedReplay(
+            effects=(first_a, only_b, final_a),
+            last_committed_lsn=7,
+        )
+    )
+
+    assert calls == [(0, b"final-a"), (1, b"only-b")]
+    assert report.effects_replayed == 3
+    assert report.page_effects_replayed == 3
+    assert report.page_images_applied == 2
+    assert report.touched_files == ("heap.dat",)
+
+
+@pytest.mark.parametrize(
+    ("first_lsn", "second_lsn", "first_payload", "second_payload"),
+    (
+        (9, 8, b"newer", b"regressed"),
+        (9, 9, b"first-bytes", b"different-bytes"),
+    ),
+    ids=("page-lsn-regression", "equal-lsn-different-image"),
+)
+def test_page_only_redo_keeps_an_ambiguous_location_sequential(
+    memory_device: object,
+    monkeypatch: pytest.MonkeyPatch,
+    first_lsn: int,
+    second_lsn: int,
+    first_payload: bytes,
+    second_payload: bytes,
+) -> None:
+    stack = build_stack(memory_device)
+    first = _encoded_page_record(
+        stack,
+        record_lsn=1,
+        page_index=0,
+        page_lsn=first_lsn,
+        payload=first_payload,
+    )
+    second = _encoded_page_record(
+        stack,
+        record_lsn=2,
+        page_index=0,
+        page_lsn=second_lsn,
+        payload=second_payload,
+    )
+    calls: list[bytes] = []
+
+    def apply_page(_pool: object, _file: str, _page: int, image: bytes) -> bool:
+        calls.append(stack.codec.decode_page(image, verify=True).read_slot(0))
+        return True
+
+    monkeypatch.setattr(commit_redo_module, "apply_page_image", apply_page)
+
+    report = CommitRedo(stack.pool).apply(
+        CommittedReplay(effects=(first, second), last_committed_lsn=3)
+    )
+
+    assert calls == [first_payload, second_payload]
+    assert report.page_images_applied == 2
+
+
+def test_mixed_page_and_index_redo_does_not_coalesce_page_effects(
+    memory_device: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = build_stack(memory_device)
+    first = _encoded_page_record(
+        stack, record_lsn=1, page_index=0, page_lsn=4, payload=b"first"
+    )
+    final = _encoded_page_record(
+        stack, record_lsn=3, page_index=0, page_lsn=6, payload=b"final"
+    )
+    events: list[tuple[str, object]] = []
+    manager = _IndexManagerDouble(events)  # type: ignore[arg-type]
+
+    def apply_page(_pool: object, _file: str, _page: int, image: bytes) -> bool:
+        events.append(("page", stack.codec.decode_page(image).read_slot(0)))
+        return True
+
+    monkeypatch.setattr(commit_redo_module, "apply_page_image", apply_page)
+
+    report = CommitRedo(stack.pool, manager).apply(
+        CommittedReplay(
+            effects=(first, _index_record(IndexOperation.INSERT, 2), final),
+            last_committed_lsn=4,
+        )
+    )
+
+    assert events == [
+        ("page", b"first"),
+        ("index", int(WalRecordType.INDEX_WRITE)),
+        ("page", b"final"),
+    ]
+    assert report.page_images_applied == 2
+    assert report.index_effects_dispatched == 1
+
+
+def test_a_corrupt_superseded_image_still_refuses_before_coalesced_redo_mutates(
+    memory_device: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = build_stack(memory_device)
+    first = _encoded_page_record(
+        stack, record_lsn=1, page_index=0, page_lsn=4, payload=b"first"
+    )
+    damaged = WalRecord(
+        record_type=int(WalRecordType.WRITE_PAGE),
+        payload=encode_page_write("heap.dat", 0, b"damaged-superseded-image"),
+        descriptor=DESCRIPTOR,
+        epoch=1,
+        txn_id=7,
+        lsn=2,
+    )
+    final = _encoded_page_record(
+        stack, record_lsn=3, page_index=0, page_lsn=6, payload=b"final"
+    )
+    calls: list[int] = []
+
+    def apply_page(_pool: object, _file: str, page: int, _image: bytes) -> bool:
+        calls.append(page)
+        return True
+
+    monkeypatch.setattr(commit_redo_module, "apply_page_image", apply_page)
+
+    with pytest.raises(GrafxCorruptionDetected):
+        CommitRedo(stack.pool).apply(
+            CommittedReplay(effects=(first, damaged, final), last_committed_lsn=4)
+        )
+
+    assert calls == []
 
 
 def test_corrupted_compressed_body_refuses_before_any_page_mutation(

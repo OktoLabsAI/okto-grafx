@@ -65,6 +65,17 @@ class CommitRedoResult:
     touched_files: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedPageEffect:
+    """One page effect decoded and verified by the mandatory full preflight."""
+
+    record: WalRecord
+    file: str
+    page_index: int
+    image: bytes
+    page_lsn: Lsn
+
+
 class CommitRedo:
     """Replay committed page and logical-index effects through their idempotent doors."""
 
@@ -90,9 +101,17 @@ class CommitRedo:
         refuse before touching a page.  Payload corruption is not caught or downgraded: the
         typed damage raised by the decoder stops the pass immediately.
         """
-        self.preflight(replay)
+        if not isinstance(replay, CommittedReplay):
+            raise GrafxRecoveryRefused(
+                f"Committed redo needs a CommittedReplay; got {type(replay).__name__}.",
+                field="replay",
+                value=type(replay).__name__,
+            )
+        prepared_pages = self._preflight(
+            replay.effects,
+            allow_unregistered_indexes=False,
+        )
 
-        page_effects = 0
         pages_applied = 0
         index_effects = 0
         indexes_dispatched = 0
@@ -105,21 +124,39 @@ class CommitRedo:
                 touched_set.add(file)
                 touched.append(file)
 
-        for record in replay.effects:
+        page_plan = (
+            self._coalesce_page_plan(prepared_pages)
+            if len(prepared_pages) == len(replay.effects)
+            else None
+        )
+        prepared_by_position = {
+            position: prepared for position, prepared in prepared_pages
+        }
+        effects: Iterable[tuple[int, WalRecord, _PreparedPageEffect | None]]
+        if page_plan is not None:
+            effects = (
+                (position, prepared.record, prepared)
+                for position, prepared in page_plan
+            )
+        else:
+            effects = (
+                (position, record, prepared_by_position.get(position))
+                for position, record in enumerate(replay.effects)
+            )
+
+        for _position, record, prepared in effects:
             if record.record_type == _PAGE_EFFECT:
-                page_effects += 1
-                write = decode_page_write(
-                    record.payload,
-                    format_version=record.format_version,
-                    flags=record.flags,
-                )
+                assert prepared is not None  # every page effect was prepared by preflight
                 # Offered files are flushed even when their image is already current.  A prior
                 # attempt may have installed the image into this same pool and failed before
                 # flushing; page_lsn then makes this attempt a no-op, but publication still owes
                 # the dirty frame a flush.
-                remember(write.file)
+                remember(prepared.file)
                 if apply_page_image(
-                    self._pool, write.file, write.page_index, write.image
+                    self._pool,
+                    prepared.file,
+                    prepared.page_index,
+                    prepared.image,
                 ):
                     pages_applied += 1
                 continue
@@ -148,7 +185,7 @@ class CommitRedo:
 
         return CommitRedoResult(
             effects_replayed=len(replay.effects),
-            page_effects_replayed=page_effects,
+            page_effects_replayed=len(prepared_pages),
             page_images_applied=pages_applied,
             index_effects_replayed=index_effects,
             index_effects_dispatched=indexes_dispatched,
@@ -208,11 +245,12 @@ class CommitRedo:
         effects: tuple[WalRecord, ...],
         *,
         allow_unregistered_indexes: bool,
-    ) -> None:
+    ) -> tuple[tuple[int, _PreparedPageEffect], ...]:
         """Refuse an incomplete or malformed dispatch plan before the first mutation."""
         missing_manager_lsn: Lsn | None = None
         simulated_page_counts: dict[str, int] = {}
-        for record in effects:
+        prepared_pages: list[tuple[int, _PreparedPageEffect]] = []
+        for position, record in enumerate(effects):
             if not isinstance(record, WalRecord):
                 raise GrafxRecoveryRefused(
                     f"A committed replay effect must be a WalRecord; got "
@@ -244,10 +282,22 @@ class CommitRedo:
                         file=write.file,
                         lsn=record.lsn,
                     )
-                self._validate_page_image(
+                decoded = self._validate_page_image(
                     write.file,
                     write.page_index,
                     write.image,
+                )
+                prepared_pages.append(
+                    (
+                        position,
+                        _PreparedPageEffect(
+                            record=record,
+                            file=write.file,
+                            page_index=write.page_index,
+                            image=write.image,
+                            page_lsn=decoded.page_lsn,
+                        ),
+                    )
                 )
                 present = simulated_page_counts.get(write.file)
                 if present is None:
@@ -328,8 +378,54 @@ class CommitRedo:
                 field="index_manager",
                 lsn=missing_manager_lsn,
             )
+        return tuple(prepared_pages)
 
-    def _validate_page_image(self, file: str, page_index: int, image: bytes) -> None:
+    @staticmethod
+    def _coalesce_page_plan(
+        prepared_pages: tuple[tuple[int, _PreparedPageEffect], ...],
+    ) -> tuple[tuple[int, _PreparedPageEffect], ...]:
+        """Return a page-only plan with safe repeated locations reduced to their final image.
+
+        A location is reduced only when its embedded page LSN never regresses and equal LSNs
+        carry identical bytes.  The final image occupies the first occurrence's position, which
+        preserves the validated redo-gap growth order between distinct physical pages.  Any
+        ambiguous location retains every original occurrence in order.
+        """
+        by_location: dict[tuple[str, int], list[tuple[int, _PreparedPageEffect]]] = {}
+        for item in prepared_pages:
+            prepared = item[1]
+            by_location.setdefault((prepared.file, prepared.page_index), []).append(item)
+
+        replacements: dict[int, _PreparedPageEffect] = {}
+        skipped: set[int] = set()
+        for occurrences in by_location.values():
+            if len(occurrences) < 2:
+                continue
+            safe = True
+            previous = occurrences[0][1]
+            for _position, current in occurrences[1:]:
+                if current.page_lsn < previous.page_lsn or (
+                    current.page_lsn == previous.page_lsn
+                    and current.image != previous.image
+                ):
+                    safe = False
+                    break
+                previous = current
+            if not safe:
+                continue
+            first_position = occurrences[0][0]
+            replacements[first_position] = occurrences[-1][1]
+            skipped.update(position for position, _prepared in occurrences[1:])
+
+        return tuple(
+            (position, replacements.get(position, prepared))
+            for position, prepared in prepared_pages
+            if position not in skipped
+        )
+
+    def _validate_page_image(
+        self, file: str, page_index: int, image: bytes
+    ) -> Page:
         """Decode one WAL page image and attach its known location to any damage."""
         try:
             decoded = self._pool.codec.decode_page(image, verify=True)
@@ -352,3 +448,4 @@ class CommitRedo:
                 file=file,
                 page=page_index,
             )
+        return decoded

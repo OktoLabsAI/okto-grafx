@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+from dataclasses import dataclass
 
 import pytest
 
@@ -31,6 +32,7 @@ from okto_grafx.domain.recovery.report import (
 from okto_grafx.domain.wal.record import WalRecord, WalRecordType
 from okto_grafx.domain.wal.replay import TruncationReport
 from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE, CommitState
+from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.commit_state_store import CommitStateStore
 from okto_grafx.engine.ledger_store import LEDGER_FILE, LedgerStore
 from okto_grafx.engine.recovery_manager import (
@@ -60,6 +62,34 @@ from .conftest import (
 )
 
 CATALOG_FILE = "catalog.dat"
+
+
+@dataclass(frozen=True)
+class _RecoveryIndexDouble:
+    file: str
+
+
+class _RecoveryIndexManagerDouble:
+    """Expose marker/header files while recording recovery's durability order."""
+
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self._indexes = (
+            _RecoveryIndexDouble("index/zeta.idx"),
+            _RecoveryIndexDouble("index/alpha.idx"),
+        )
+
+    def table_watermark_photo(self) -> dict[str, int]:
+        return {}
+
+    def check_replay_floor(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def mark_built_through(self, _lsn: int, **_kwargs: object) -> None:
+        self.events.append("mark")
+
+    def active_indexes(self) -> tuple[_RecoveryIndexDouble, ...]:
+        return self._indexes
 
 
 def _commit(stack: Stack, page_index: int, payload: bytes, *, txn_id: int = 1) -> int:
@@ -203,6 +233,88 @@ def test_writable_recovery_barriers_a_clean_foreign_tail_before_publication(
 
     assert "publish" in events
     assert events.index("barrier") < events.index("publish")
+
+
+def test_recovery_barriers_each_replayed_and_marked_file_before_publication(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _commit(stack, 3, b"durable-shape")
+    stack.storage.truncate_log(COMMIT_STATE_FILE, 0)  # type: ignore[attr-defined]
+    reopened = _reopened(stack)
+    events: list[str] = []
+    manager = _RecoveryIndexManagerDouble(events)
+    original_publish = CommitStateStore.publish
+
+    def barrier(_pool: BufferPool, file: str | None = None) -> None:
+        assert file is not None
+        events.append(f"data:{file}")
+
+    def publish(
+        store: CommitStateStore,
+        state: CommitState,
+        *,
+        previous: CommitState,
+        previous_was_damaged: bool = False,
+    ) -> None:
+        events.append("publish")
+        original_publish(
+            store,
+            state,
+            previous=previous,
+            previous_was_damaged=previous_was_damaged,
+        )
+
+    monkeypatch.setattr(BufferPool, "durability_barrier", barrier)
+    monkeypatch.setattr(CommitStateStore, "publish", publish)
+
+    reopened.recovery(index_manager=manager).run()
+
+    assert events == [
+        "mark",
+        "data:heap.dat",
+        "data:index/alpha.idx",
+        "data:index/zeta.idx",
+        "publish",
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (RuntimeError("recovery data barrier failed"), KeyboardInterrupt()),
+    ids=("runtime-error", "keyboard-interrupt"),
+)
+def test_recovery_never_publishes_when_a_data_barrier_escapes(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    _commit(stack, 3, b"unpublished")
+    stack.storage.truncate_log(COMMIT_STATE_FILE, 0)  # type: ignore[attr-defined]
+    reopened = _reopened(stack)
+    published = False
+
+    def fail_barrier(_pool: BufferPool, _file: str | None = None) -> None:
+        raise failure
+
+    def forbidden_publish(
+        _store: CommitStateStore,
+        _state: CommitState,
+        *,
+        previous: CommitState,
+        previous_was_damaged: bool = False,
+    ) -> None:
+        nonlocal published
+        del previous, previous_was_damaged
+        published = True
+
+    monkeypatch.setattr(BufferPool, "durability_barrier", fail_barrier)
+    monkeypatch.setattr(CommitStateStore, "publish", forbidden_publish)
+
+    with pytest.raises(type(failure)) as escaped:
+        reopened.recovery().run()
+
+    assert escaped.value is failure
+    assert published is False
 
 
 @pytest.mark.parametrize(

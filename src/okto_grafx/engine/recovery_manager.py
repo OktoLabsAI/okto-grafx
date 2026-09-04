@@ -1519,6 +1519,17 @@ class RecoveryManager:
             else state
         )
         if needs_publication:
+            # Recovery publication must not outrun the physical files it certifies.  Flush only
+            # makes dirty frames visible to the device; establish per-file durability after the
+            # index completion marker (which may dirty headers without a logical index record)
+            # and before commit.state becomes the visible authority.  A deterministic, explicit
+            # file set avoids the broader and adapter-dependent ``barrier(None)`` door.
+            durable_files = set(page_result.touched_files)
+            durable_files.update(index_result.touched_files)
+            if manager is not None:
+                durable_files.update(index.file for index in manager.active_indexes())
+            for file in sorted(durable_files):
+                self._pool.durability_barrier(file)
             self._state_store.publish(
                 published_state,
                 previous=state,
