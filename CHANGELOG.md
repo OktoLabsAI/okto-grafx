@@ -70,6 +70,12 @@ including the on-disk format.
   a late stale result from being published. Dirty eviction follows the same callback-free phase
   boundary without changing on-disk bytes, WAL, nominal LRU admission or concurrency guarantees.
 
+### Fixed
+
+- Made catalog capability/tag lookup tables immutable and restored the pure-core import gate:
+  physical generation-name validation no longer needs `re`, while deterministic bounded `zlib`
+  remains explicitly admitted as part of the durable WRITE_PAGE-v2 grammar.
+
 ## [0.0.1] — 2026-09-01
 
 First public release. **Pre-alpha**: the on-disk format, the public API and the query surface may

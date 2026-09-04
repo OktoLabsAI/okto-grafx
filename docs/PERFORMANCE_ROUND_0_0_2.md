@@ -517,3 +517,37 @@ historical failures reproduced outside the changed path. Focused tests, Ruff, `c
 revision 3 and implementation review `hof_b192c61ffcea4297852c7b2b8f00064b` were both verified
 PASS; the latter's final recommendation made unknown v2 records skippable only under the exact
 explicit `SKIPPABLE` grammar.
+
+## Item 13 / D-19 — byte-identical NumPy page codec
+
+Status: **completed on `feature/v0.0.2` as `b720f7e` + `d644dc3`**.
+
+`DatabaseConfig(codec="numpy")` explicitly binds `NumpyPageCodecV1` per database. The default
+remains `"pure"`; there is no automatic selection, and an unavailable optional dependency refuses
+instead of falling back. Both implementations emit and consume exactly page format v1, so this
+item adds no durable capability, migration, WAL grammar, cache authority or concurrency state.
+The NumPy adapter packs directories from 16 slots and validates them from 96 slots. Smaller pages,
+invalid geometry, checksum failures and provider exceptions return to the pure codec, which remains
+the sole authority for public refusals. `Page._from_decoded` is the canonical post-validation
+assembly path for both codecs.
+
+The differential contract covers exact bytes, freed/compacted slots, hostile/out-of-range u16
+entries across NumPy 1.x/2.x behavior, 1,000 seeded mutations at each of 4, 8 and 32 KiB, persistent
+write/reopen through the other codec and two simultaneous in-process receipts. The receipt names
+the per-instance `implementation` separately from the effective process-wide
+`process_checksum_implementation`. A compiled C/Rust extension remains NO-GO without a toolchain
+and wheel matrix; a future scan kernel must be injected per instance, never installed globally.
+
+The focused set collected and passed 556/556. The broader storage/recovery run collected 1,531 and
+first exposed one module-level mutable catalog mapping; `b720f7e` made all capability/tag tables
+immutable and the affected 661/661 correction slice passed. The 1,293-case transaction/API
+partition passed 1,289 and retained exactly the four historical failures already reproduced and
+excluded by the previous milestone; no new failure remained in the codec path. Ruff, scoped
+format, `compileall` and diff-check passed. Initial adversarial review
+`hof_fd26b1d96ce74dac80c9671e00a55999` and final six-blocker review
+`hof_19b2cca000214564832d7ff15cf77618` were verified PASS.
+
+On the recorded Windows/Python 3.13 host with native CRC, the final 200-slot/8 KiB microbenchmark
+measured encode `164.85 -> 53.87 us` (`3.06x`) and decode `150.48 -> 82.12 us` (`1.83x`). These are
+component ratios only; end-to-end commit latency still includes unchanged WAL, durability,
+coordination and index work.
