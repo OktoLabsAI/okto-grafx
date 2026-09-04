@@ -141,14 +141,21 @@ def _old_generator(stack: Stack, page: Page, csn: int, rows: list[_RowWrite]) ->
     """encode -> decode(verify) -> stamp -> encode: exactly what _committed_image used to do."""
     image = stack.codec.encode_page(page)
     decoded = stack.codec.decode_page(image, verify=True)
-    stack.manager._stamp_page(decoded, HEAP, page.page_index, csn, rows)
+    if decoded.page_lsn < csn:
+        decoded.page_lsn = csn
+    for item in rows:
+        if item.born is not None and item.born.page == page.page_index:
+            stack.manager._restamp_page(decoded, item.born, xmin=csn)
+        if item.ended is not None and item.ended.page == page.page_index:
+            stack.manager._restamp_page(decoded, item.ended, xmax=csn)
     return stack.codec.encode_page(decoded)
 
 
 def _new_generator(stack: Stack, page: Page, csn: int, rows: list[_RowWrite]) -> bytes:
     """copy -> stamp -> encode: what _local_image does on the resident frame."""
     clone = page.copy()
-    stack.manager._stamp_page(clone, HEAP, page.page_index, csn, rows)
+    stamps = stack.manager._group_page_stamps(rows).get(page.page_index, ())
+    stack.manager._stamp_page(clone, HEAP, page.page_index, csn, stamps)
     return stack.codec.encode_page(clone)
 
 
@@ -174,8 +181,9 @@ def test_the_single_encode_image_is_byte_identical_to_the_old_generator(
                 assert new == old, (label, page_size, csn)
                 # A second stamp to a later number (the retarget) agrees as well.
                 clone = page.copy()
-                stack.manager._stamp_page(clone, HEAP, page.page_index, csn, rows)
-                stack.manager._stamp_page(clone, HEAP, page.page_index, csn + 3, rows)
+                stamps = stack.manager._group_page_stamps(rows).get(page.page_index, ())
+                stack.manager._stamp_page(clone, HEAP, page.page_index, csn, stamps)
+                stack.manager._stamp_page(clone, HEAP, page.page_index, csn + 3, stamps)
                 assert stack.codec.encode_page(clone) == _old_generator(
                     stack, page, csn + 3, rows
                 ), label

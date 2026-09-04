@@ -255,13 +255,22 @@ _LIVE_FLAGS: int = ~1
 """Mask that clears the deleted bit of a record header, from CONTRACT.md section 6.4."""
 
 
+@dataclass(frozen=True, slots=True)
+class _HeapVersionStamp:
+    """One version-header field a commit must stamp on one exact heap page."""
+
+    reference: RecordRef
+    is_birth: bool
+
+
 @dataclass(slots=True)
 class _MaterializedAttempt:
-    """The stamped page values of one commit attempt, bound to its txn id and CSN."""
+    """The stamped page values and header plan of one commit attempt."""
 
     txn_id: int
     csn: Csn
     pages: dict[tuple[str, PageIndex], Page]
+    page_stamps: dict[PageIndex, tuple[_HeapVersionStamp, ...]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -5036,8 +5045,10 @@ class TransactionManager:
         CSN, while the live frames stay provisional until durability is established.
         """
         base = _require_lsn("last_lsn", self._wal.last_lsn)
+        page_stamps = self._group_page_stamps(rows)
         staged = list(txn.staged_pages())
-        for page_index in self._pages_touched_by(rows):
+        # Preserve the pre-TXN-4 deterministic page order; the grouping map follows row order.
+        for page_index in sorted(page_stamps):
             if (self._heap_file, page_index) not in txn.page_images:
                 staged.append((self._heap_file, page_index))
         # The measured set, so a page this attempt changed without a row landing on it is
@@ -5081,14 +5092,18 @@ class TransactionManager:
         images: list[tuple[str, PageIndex, bytes]] = []
         records: list[WalRecordLike] = []
         self._materialized = _MaterializedAttempt(
-            txn_id=int(txn.txn_id), csn=predicted, pages={}
+            txn_id=int(txn.txn_id),
+            csn=predicted,
+            pages={},
+            page_stamps=page_stamps,
         )
         for file, page_index in staged:
             image = txn.page_images.get((file, page_index))
+            stamps = page_stamps.get(page_index, ()) if file == self._heap_file else ()
             if image is None:
                 # Materialised in this process: the resident frame is the authority and was
                 # verified when it entered the pool. Copy it, stamp the copy, encode ONCE.
-                stamped = self._local_image(file, page_index, predicted, rows)
+                stamped = self._local_image(file, page_index, predicted, stamps)
             else:
                 # Staged by a collaborator as bytes: the bytes are the authority and are
                 # decoded with verification before anything is stamped into them.
@@ -5097,7 +5112,7 @@ class TransactionManager:
                     page_index,
                     image,
                     predicted,
-                    rows,
+                    stamps,
                 )
             images.append((file, page_index, stamped))
             records.append(
@@ -5191,16 +5206,23 @@ class TransactionManager:
         # Only the pages THIS attempt materialised at old_csn may be re-stamped: a page value
         # left by another transaction or by an earlier materialisation of this one would
         # carry bytes the log never saw, so any mismatch takes the verifying path.
-        reusable = (
-            attempt.pages
+        reusable_attempt = (
+            attempt
             if attempt is not None
             and attempt.txn_id == int(txn.txn_id)
             and attempt.csn == old_csn
-            else {}
+            else None
+        )
+        reusable = {} if reusable_attempt is None else reusable_attempt.pages
+        page_stamps = (
+            reusable_attempt.page_stamps
+            if reusable_attempt is not None and reusable_attempt.page_stamps is not None
+            else self._group_page_stamps(rows)
         )
         self._materialized = None
         for file, page_index, image in images:
             page = reusable.get((file, page_index))
+            stamps = page_stamps.get(page_index, ()) if file == self._heap_file else ()
             if page is None:
                 # Not produced by _build_records in this attempt (a caller-built batch):
                 # the bytes are all there is, so they are verified before being re-stamped.
@@ -5209,13 +5231,13 @@ class TransactionManager:
                     page_index,
                     image,
                     new_csn,
-                    rows,
+                    stamps,
                 )
             else:
                 # The page value was already validated (decoded with verification, or
                 # copied from a verified frame) and stamped with old_csn: re-stamp it to
                 # the terminal LSN and encode once more, without decoding the bytes again.
-                self._stamp_page(page, file, page_index, new_csn, rows)
+                self._stamp_page(page, file, page_index, new_csn, stamps)
                 corrected = self._pool.codec.encode_page(page)
             corrected_images.append((file, page_index, corrected))
             corrected_records.append(
@@ -6553,13 +6575,37 @@ class TransactionManager:
                 touched.add(item.ended.page)
         return tuple(sorted(touched))
 
+    def _group_page_stamps(
+        self, rows: Sequence[_RowWrite]
+    ) -> dict[PageIndex, tuple[_HeapVersionStamp, ...]]:
+        """Classify each materialized row once into its page-local header effects.
+
+        A commit may stage many physical pages for a row batch.  Walking the complete batch for
+        every page makes stamping O(P*R), even though one page can use only references that name
+        that page.  This transient index preserves the original row order and the original
+        birth-before-ending order within an update; each page then pays only for its own effects.
+        It is neither persisted nor shared, and a retarget reuses the exact plan retained by the
+        materialized attempt.
+        """
+        grouped: dict[PageIndex, list[_HeapVersionStamp]] = {}
+        for item in rows:
+            if item.born is not None:
+                grouped.setdefault(item.born.page, []).append(
+                    _HeapVersionStamp(reference=item.born, is_birth=True)
+                )
+            if item.ended is not None:
+                grouped.setdefault(item.ended.page, []).append(
+                    _HeapVersionStamp(reference=item.ended, is_birth=False)
+                )
+        return {page_index: tuple(stamps) for page_index, stamps in grouped.items()}
+
     def _stamp_page(
         self,
         page: Page,
         file: str,
         page_index: PageIndex,
         csn: Csn,
-        rows: Sequence[_RowWrite],
+        stamps: Sequence[_HeapVersionStamp],
     ) -> None:
         """Stamp the commit number into a page VALUE: page_lsn and the heap headers this commit owns.
 
@@ -6572,11 +6618,11 @@ class TransactionManager:
         if page.page_lsn < csn:
             page.page_lsn = csn
         if file == self._heap_file:
-            for item in rows:
-                if item.born is not None and item.born.page == page_index:
-                    self._restamp_page(page, item.born, xmin=csn)
-                if item.ended is not None and item.ended.page == page_index:
-                    self._restamp_page(page, item.ended, xmax=csn)
+            for stamp in stamps:
+                if stamp.is_birth:
+                    self._restamp_page(page, stamp.reference, xmin=csn)
+                else:
+                    self._restamp_page(page, stamp.reference, xmax=csn)
 
     def _committed_image(
         self,
@@ -6584,7 +6630,7 @@ class TransactionManager:
         page_index: PageIndex,
         image: bytes,
         csn: Csn,
-        rows: Sequence[_RowWrite],
+        stamps: Sequence[_HeapVersionStamp],
     ) -> bytes:
         """Return the post-commit image of BYTES a collaborator staged, after verifying them.
 
@@ -6593,7 +6639,7 @@ class TransactionManager:
         commit number is stamped into it. The decoded value is kept for a retarget.
         """
         page = self._pool.codec.decode_page(image, verify=True)
-        self._stamp_page(page, file, page_index, csn, rows)
+        self._stamp_page(page, file, page_index, csn, stamps)
         self._remember_materialized(file, page_index, page)
         return self._pool.codec.encode_page(page)
 
@@ -6602,7 +6648,7 @@ class TransactionManager:
         file: str,
         page_index: PageIndex,
         csn: Csn,
-        rows: Sequence[_RowWrite],
+        stamps: Sequence[_HeapVersionStamp],
     ) -> bytes:
         """Return the post-commit image of a page THIS process materialised, encoded once.
 
@@ -6614,7 +6660,7 @@ class TransactionManager:
         """
         with self._pool.pinned(file, page_index) as resident:
             page = resident.copy()
-        self._stamp_page(page, file, page_index, csn, rows)
+        self._stamp_page(page, file, page_index, csn, stamps)
         self._remember_materialized(file, page_index, page)
         return self._pool.codec.encode_page(page)
 
