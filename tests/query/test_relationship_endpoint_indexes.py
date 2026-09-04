@@ -96,6 +96,86 @@ def test_seek_frontier_uses_endpoint_lookup_but_scan_frontier_does_not(database)
     assert scan.statistics.get("edge_scans") == 1
 
 
+@pytest.mark.parametrize(
+    ("query", "limit"),
+    (
+        ("MATCH (a:A)-[:E]->(b:B) RETURN a.id, b.id", 3),
+        ("MATCH (b:B)<-[:E]-(a:A) RETURN b.id, a.id", 2),
+    ),
+)
+def test_one_hop_limit_preserves_the_canonical_prefix_by_endpoint_index(
+    database, query: str, limit: int
+) -> None:
+    """Forward and reverse LIMIT retain exact scan order while avoiding its eager grouping."""
+    _small_graph(database)
+    complete = database.execute(query)
+    bounded = database.execute(f"{query} LIMIT {limit}")
+
+    assert bounded.rows == complete.rows[:limit]
+    assert bounded.statistics.get("edge_lookups", 0) > 0
+    assert bounded.statistics.get("edge_scans", 0) == 0
+
+
+def test_one_hop_limit_touches_only_the_endpoint_candidates_it_consumes(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first result does not validate all edges merely to build an endpoint map."""
+    _small_graph(database)
+    touched: list[object] = []
+    original = IndexManager.validated
+
+    def recording(self, index, key, snapshot):
+        refs = original(self, index, key, snapshot)
+        if index.name in {edge_from_index_name("E"), edge_to_index_name("E")}:
+            touched.extend(refs)
+        return refs
+
+    monkeypatch.setattr(IndexManager, "validated", recording)
+    result = database.execute(
+        "MATCH (a:A)-[:E]->(b:B) RETURN a.id, b.id LIMIT 1"
+    )
+
+    assert result.rows == ((1, 1),)
+    assert 0 < len(touched) < 6
+    assert result.statistics.get("edge_scans", 0) == 0
+
+
+def test_one_hop_limit_keeps_the_grouped_scan_when_endpoint_authority_is_unusable(
+    database,
+) -> None:
+    """A stale accelerator changes only the access path, never the bounded row prefix."""
+    _small_graph(database)
+    database._indexes.index(edge_from_index_name("E")).mark_stale("forced fallback")
+    database._indexes.index(edge_to_index_name("E")).mark_stale("forced fallback")
+    query = "MATCH (a:A)-[:E]->(b:B) RETURN a.id, b.id"
+    complete = database.execute(query)
+    bounded = database.execute(f"{query} LIMIT 2")
+
+    assert bounded.rows == complete.rows[:2]
+    assert bounded.statistics.get("edge_lookups", 0) == 0
+    assert bounded.statistics.get("edge_scans") == 1
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "MATCH (a:A)-[:E]->(b:B) RETURN a.id, b.id ORDER BY b.id LIMIT 1",
+        "MATCH (a:A)-[:E]->(b:B) RETURN DISTINCT b.id LIMIT 1",
+    ),
+)
+def test_limit_does_not_enable_short_circuit_below_a_blocking_operator(
+    database, query: str
+) -> None:
+    """ORDER BY and DISTINCT need the complete input and retain the canonical grouped scan."""
+    _small_graph(database)
+
+    result = database.execute(query)
+
+    assert len(result.rows) == 1
+    assert result.statistics.get("edge_lookups", 0) == 0
+    assert result.statistics.get("edge_scans") == 1
+
+
 def test_endpoint_acceleration_crosses_the_central_exact_view_fence(
     database, monkeypatch: pytest.MonkeyPatch
 ) -> None:

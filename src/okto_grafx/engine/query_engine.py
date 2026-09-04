@@ -1026,6 +1026,10 @@ class _Context:
     primary_key_memos: dict[tuple[object, ...], _PrimaryKeyStatementMemo] = field(
         default_factory=dict
     )
+    # Exact one-hop traversals beneath a streaming LIMIT may use their endpoint index even when
+    # their source is a NodeScan. The set is derived once from the immutable physical plan; every
+    # blocking or semantically wider shape is absent and keeps the canonical grouped scan.
+    short_circuit_traversals: frozenset[int] = frozenset()
 
     def already_ended(self, reference: object) -> bool:
         """Answer whether this exact version has already been told to stop.
@@ -3025,6 +3029,7 @@ class QueryEngine:
             result_node=root.child if root.columns else None,
             union_coercions=_bound_union_columns(plan, parameters),
             index_authority=index_authority,
+            short_circuit_traversals=_short_circuit_traversals(root.child),
         )
         _bind_timestamp_values(plan, context)
         _validate_bound_subscript_types(plan, parameters)
@@ -4774,6 +4779,31 @@ NodeScan and AllNodesScan frontiers bypass this limit and scan immediately becau
 already promises a whole-table walk. Unknown producers retain the conservative hybrid fallback."""
 
 
+def _short_circuit_traversals(root: PlanNode) -> frozenset[int]:
+    """Identify exact one-hop traversals whose consumer can stop them at LIMIT.
+
+    This deliberately recognizes only the narrow linear pipeline whose operators are row-local:
+    LIMIT, optional SKIP, projection, and filters. Sort, aggregation, DISTINCT, OPTIONAL, UNION,
+    writes, ranges, and every other shape keep the grouped relationship scan. The identity is
+    statement-local because plan nodes are immutable and the resulting set never escapes the
+    execution context.
+    """
+    selected: set[int] = set()
+    for planned in root.walk():
+        if not isinstance(planned, LimitRows):
+            continue
+        child = planned.child
+        while isinstance(child, (SkipRows, ProjectRows, FilterRows)):
+            child = child.child
+        if (
+            isinstance(child, TraverseRelationship)
+            and child.min_hops == 1
+            and child.max_hops == 1
+        ):
+            selected.add(id(child))
+    return frozenset(selected)
+
+
 def _edge_steps(
     engine: QueryEngine,
     context: _Context,
@@ -5108,7 +5138,10 @@ def _traverse(
         ended,
         relationship_changes,
         pending_edges,
-        bounded_frontier=_frontier_is_bounded(node.child, node.source),
+        bounded_frontier=(
+            _frontier_is_bounded(node.child, node.source)
+            or id(node) in context.short_circuit_traversals
+        ),
     )
 
     for row in engine._rows(node.child, context):
