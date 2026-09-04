@@ -44,8 +44,9 @@ deterministic across runs.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from math import fsum, isfinite, sqrt
+from operator import mul
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxVectorValidationError
 from okto_grafx.domain.ports.vectormath import DistanceMetric
@@ -195,7 +196,7 @@ class PureVectorMath:
         """Return the dot product of two vectors of equal length."""
         require_same_length(a, b)
         return _require_finite(
-            _accumulate((x * y for x, y in zip(a, b)), "dot product"), "dot product"
+            _accumulate(map(mul, a, b), "dot product"), "dot product"
         )
 
     def cosine(self, a: Sequence[float], b: Sequence[float]) -> float:
@@ -207,12 +208,26 @@ class PureVectorMath:
         adapter. A test pins it, because the obvious floating point expression would produce a
         NaN here and NaN is the one value this component may never hand back.
         """
-        length_a = _require_finite(self.norm(a), "norm")
+        return self._cosine_from_length(a, _require_finite(self.norm(a), "norm"), b)
+
+    def _cosine_from_length(
+        self, a: Sequence[float], length_a: float, b: Sequence[float]
+    ) -> float:
+        """Return the cosine similarity of ``a`` to ``b``, given the length of ``a``.
+
+        This is the body of :meth:`cosine` with the left norm supplied by the caller, so that
+        a ranking can measure its query once instead of once per candidate (VEC-1). Everything
+        after that norm -- the candidate norm, the zero-length rule, the length check, the dot
+        product and the finite guard -- runs here in the order it always ran, so a refusal
+        surfaces for the same candidate with the same reason whichever door measured ``a``.
+        """
         length_b = _require_finite(self.norm(b), "norm")
         if length_a == 0.0 or length_b == 0.0:
             require_same_length(a, b)
             return 0.0
-        return _require_finite(self.dot(a, b) / (length_a * length_b), "cosine similarity")
+        return _require_finite(
+            self.dot(a, b) / (length_a * length_b), "cosine similarity"
+        )
 
     def euclidean(self, a: Sequence[float], b: Sequence[float]) -> float:
         """Return the Euclidean distance between two vectors of equal length."""
@@ -224,7 +239,7 @@ class PureVectorMath:
 
     def norm(self, a: Sequence[float]) -> float:
         """Return the Euclidean length of one vector."""
-        return _require_finite(sqrt(_accumulate((x * x for x in a), "norm")), "norm")
+        return _require_finite(sqrt(_accumulate(map(mul, a, a), "norm")), "norm")
 
     def normalize(self, a: Sequence[float]) -> tuple[float, ...]:
         """Return the vector scaled to unit length.
@@ -265,11 +280,40 @@ class PureVectorMath:
         """
         require_positive_k(k)
         require_metric(metric)
-        scored = [
-            (identifier, self.score(query, values, metric)) for identifier, values in candidates
-        ]
+        score = self.prepare(query, metric)
+        scored = [(identifier, score(values)) for identifier, values in candidates]
         scored.sort(key=lambda item: (-item[1], item[0]))
         return scored[:k]
+
+    def prepare(
+        self, query: Sequence[float], metric: DistanceMetric
+    ) -> Callable[[Sequence[float]], float]:
+        """Return a scorer of stored vectors against one query, its norm measured once.
+
+        Under cosine the norm of the query is the one term that is the same for every vector,
+        and measuring it once per pair was the largest single cost of a ranking or a traversal
+        (VEC-1, VEC-4). The scorer measures it at its FIRST call, never here, and a test pins
+        both consequences: preparing a query that nothing is scored against refuses nothing --
+        so a ranking with no candidates never examines the query, exactly as before -- and a
+        query that cannot be measured is refused where the pairwise door refuses it, once there
+        is a vector to compare with, with the same reason. Everything after that norm runs in
+        :meth:`_cosine_from_length` in the order it always ran. Under dot and Euclidean there is
+        no query-only term to keep, so the scorer is the pairwise door itself.
+        """
+        require_metric(metric)
+        if metric is DistanceMetric.DOT:
+            return lambda values: self.dot(query, values)
+        if metric is DistanceMetric.EUCLIDEAN:
+            return lambda values: -self.euclidean(query, values)
+        length_query: float | None = None
+
+        def cosine(values: Sequence[float]) -> float:
+            nonlocal length_query
+            if length_query is None:
+                length_query = _require_finite(self.norm(query), "norm")
+            return self._cosine_from_length(query, length_query, values)
+
+        return cosine
 
     def __repr__(self) -> str:
         return f"PureVectorMath(name={PURE_ADAPTER_NAME!r})"

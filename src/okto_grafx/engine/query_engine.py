@@ -52,6 +52,7 @@ its chain, which is exactly what section 8.5 step 4 needs in order to log the wr
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
@@ -255,6 +256,14 @@ PHASE_EXECUTE: str = "execute"
 _PHASE_DURATION = metric("oktografx_query_phase_duration_seconds").name
 _ROWS_RETURNED = metric("oktografx_query_rows_returned_count").name
 _ERRORS_TOTAL = metric("oktografx_query_errors_total").name
+
+# Parsed statements and prepared plans are immutable value graphs. These deliberately modest,
+# process-local bounds make repeated statements cheap without letting caller-controlled query
+# text become an unbounded retention surface. Bump the version after a planner/key semantic
+# change so an older shape can never survive inside a long-lived engine.
+_PARSE_CACHE_MAX_ENTRIES: int = 256
+_PLAN_CACHE_MAX_ENTRIES: int = 128
+_PREPARED_PLAN_VERSION: int = 1
 
 # An endpoint locator is derived, transaction-local acceleration.  These two ceilings are its
 # complete memory contract: identifiers and the exact page-chain proof share one budget, and a
@@ -878,6 +887,10 @@ class _Context:
     endpoint_identity_indexes: dict[tuple[int, str], object | None] = field(
         default_factory=dict
     )
+    # One immutable statement-local selection of the process-local stores authorized by the
+    # exact catalog picture used for planning. Runtime operators resolve names from this same
+    # projection instead of asking the catalog and registry to prove authority again.
+    index_authority: _IndexAuthorityProjection | None = None
 
     def already_ended(self, reference: object) -> bool:
         """Answer whether this exact version has already been told to stop.
@@ -2048,14 +2061,89 @@ def _catalog_active_indexes(manager: object, catalog: Catalog) -> tuple[object, 
     return tuple(listing()) if callable(listing) else ()
 
 
+@dataclass(slots=True, frozen=True)
+class _IndexAuthorityProjection:
+    """The exact index stores selected once for one statement's catalog picture."""
+
+    planning_indexes: tuple[object, ...]
+    indexes: tuple[object, ...]
+    by_name: dict[str, tuple[object, ...]]
+
+    @classmethod
+    def build(
+        cls,
+        indexes: tuple[object, ...],
+        *,
+        planning_indexes: tuple[object, ...] | None = None,
+    ) -> _IndexAuthorityProjection:
+        grouped: dict[str, list[object]] = {}
+        for index in indexes:
+            definition = getattr(index, "definition", None)
+            key = getattr(definition, "registry_key", None)
+            if not isinstance(key, str):
+                name = getattr(index, "name", None)
+                if not isinstance(name, str):
+                    continue
+                key = name.lower()
+            grouped.setdefault(key, []).append(index)
+        return cls(
+            planning_indexes=indexes if planning_indexes is None else planning_indexes,
+            indexes=indexes,
+            by_name={key: tuple(values) for key, values in grouped.items()},
+        )
+
+    def named(self, name: str) -> object | None:
+        """Resolve one name while retaining the previous duplicate-authority refusal."""
+        matches = self.by_name.get(name.lower(), ())
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise GrafxIndexError(
+                f"Statement catalog authority resolved {len(matches)} stores for index "
+                f"{name!r}.",
+                field="index_authority",
+                index=name,
+                count=len(matches),
+            )
+        return None
+
+
+@dataclass(slots=True, frozen=True)
+class _PreparedPlanKey:
+    """A collaborator-free proof that one immutable plan still describes this statement."""
+
+    text: str
+    catalog_identity: int
+    catalog_image: bytes
+    index_picture: tuple[tuple[IndexDefinition, bool], ...]
+    dirty_tables: frozenset[int]
+    version: int = _PREPARED_PLAN_VERSION
+
+
 def _catalog_active_index(
     manager: object,
     name: str,
     catalog: Catalog,
     *,
     txn: object | None = None,
+    projection: _IndexAuthorityProjection | None = None,
 ) -> object | None:
     """Return one catalog-authorized registered index, with a legacy-double fallback."""
+
+    if projection is not None:
+        selected = projection.named(name)
+        if selected is not None:
+            return selected
+        if callable(getattr(manager, "active_index", None)):
+            raise GrafxIndexError(
+                f"No catalog-selected ACTIVE index named {name!r} is present in this "
+                "statement's authority projection.",
+                field="index_authority",
+                value=name,
+                index=name,
+                registered=False,
+            )
+        return None
 
     scoped = getattr(manager, "active_indexes_for", None)
     if txn is not None and callable(scoped):
@@ -2142,6 +2230,10 @@ class QueryEngine:
         "_max_traversal_expansions",
         "_max_traversal_paths",
         "_max_index_build_entries",
+        "_prepared_guard",
+        "_parse_cache",
+        "_plan_cache",
+        "_owned_prepared_plans",
     )
 
     def __init__(
@@ -2250,6 +2342,15 @@ class QueryEngine:
         self._max_index_build_entries = _require_optional_positive_limit(
             "max_index_build_entries", max_index_build_entries
         )
+        # The composition root supplies one re-entrant process-local guard. Reusing that port
+        # keeps the pure engine free of threading mechanism while protecting both bounded memo
+        # families under the same deliberately short, non-I/O critical sections.
+        self._prepared_guard = self._endpoint_guard
+        self._parse_cache: OrderedDict[str, Statement] = OrderedDict()
+        self._plan_cache: OrderedDict[_PreparedPlanKey, PlannedQuery] = OrderedDict()
+        # Public result detachment may take its fast path only for a root retained here by this
+        # exact engine. Counts handle one immutable plan admitted under more than one key.
+        self._owned_prepared_plans: dict[int, tuple[PlanNode, int]] = {}
         self._metrics = MetricEmitter(metrics)
         self._clock = clock
         if metrics.enabled:
@@ -2261,11 +2362,27 @@ class QueryEngine:
     def parse(self, text: str) -> Statement:
         """Return the statement one query text denotes (CONTRACT.md section 8.9)."""
         started = self._reading()
+        with self._prepared_guard:
+            cached = self._parse_cache.get(text)
+            if cached is not None:
+                self._parse_cache.move_to_end(text)
+        if cached is not None:
+            self._observe(PHASE_PARSE, started)
+            return cached
         try:
             statement = parse_text(text)
         except GrafxError as failure:
             self._count_error(failure)
             raise
+        with self._prepared_guard:
+            existing = self._parse_cache.get(text)
+            if existing is None:
+                self._parse_cache[text] = statement
+                if len(self._parse_cache) > _PARSE_CACHE_MAX_ENTRIES:
+                    self._parse_cache.popitem(last=False)
+            else:
+                statement = existing
+                self._parse_cache.move_to_end(text)
         self._observe(PHASE_PARSE, started)
         return statement
 
@@ -2283,10 +2400,25 @@ class QueryEngine:
 
     def explain(self, text: str) -> PlanNode:
         """Return the operator tree of one query text, without running it (SPEC-VEC AC-7)."""
-        return self.plan(self.parse(text))
+        statement = self.parse(text)
+        catalog = self._catalog.catalog
+        authority = self._statement_index_authority(catalog)
+        return self._planned_for(
+            statement,
+            None,
+            None,
+            authority=authority,
+            cache_text=text,
+        ).root
 
     def _planned_for(
-        self, statement: Statement, txn: object, working: Catalog | None
+        self,
+        statement: Statement,
+        txn: object,
+        working: Catalog | None,
+        *,
+        authority: _IndexAuthorityProjection | None = None,
+        cache_text: str | None = None,
     ) -> PlannedQuery:
         """Return the plan a statement RUNS with, seeing this transaction's own schema.
 
@@ -2298,20 +2430,34 @@ class QueryEngine:
         only a scan can be safely combined with pending inserts and changed primary keys.
         """
         dirty_tables = _intent_table_ids(txn)
-        if working is None and not dirty_tables:
-            return self.planned(statement)
+        catalog = working if working is not None else self._catalog.catalog
+        if authority is None:
+            authority = self._statement_index_authority(catalog, txn=txn)
         started = self._reading()
         try:
-            analysis = analyze(statement)
-            plan = build_plan(
-                statement,
-                catalog=working if working is not None else self._catalog.catalog,
-                indexes=self._index_definitions(
-                    catalog=working if working is not None else self._catalog.catalog,
-                    without_indexes_for=dirty_tables,
-                ),
-                analysis=analysis,
+            key = self._prepared_plan_key(
+                text=cache_text,
+                statement=statement,
+                catalog=catalog,
+                committed_catalog=working is None,
+                authority=authority,
+                dirty_tables=dirty_tables,
             )
+            plan = None if key is None else self._cached_prepared_plan(key)
+            if plan is None:
+                analysis = analyze(statement)
+                plan = build_plan(
+                    statement,
+                    catalog=catalog,
+                    indexes=self._index_definitions(
+                        catalog=catalog,
+                        without_indexes_for=dirty_tables,
+                        authority=authority,
+                    ),
+                    analysis=analysis,
+                )
+                if key is not None:
+                    plan = self._remember_prepared_plan(key, plan)
         except GrafxError as failure:
             self._count_error(failure)
             raise
@@ -2322,11 +2468,15 @@ class QueryEngine:
         """Return the plan together with the analysis it was built from."""
         started = self._reading()
         try:
+            catalog = self._catalog.catalog
+            authority = self._statement_index_authority(catalog)
             analysis = analyze(statement)
             plan = build_plan(
                 statement,
-                catalog=self._catalog.catalog,
-                indexes=self._index_definitions(catalog=self._catalog.catalog),
+                catalog=catalog,
+                indexes=self._index_definitions(
+                    catalog=catalog, authority=authority
+                ),
                 analysis=analysis,
             )
         except GrafxError as failure:
@@ -2342,7 +2492,9 @@ class QueryEngine:
         parameters: Mapping[str, object] | None = None,
     ) -> QueryResult:
         """Run one statement inside a transaction and return its rows."""
-        return self._execute_parsed(self.parse(text), txn, parameters)
+        return self._execute_parsed(
+            self.parse(text), txn, parameters, cache_text=text
+        )
 
     def create_index(
         self,
@@ -2372,6 +2524,8 @@ class QueryEngine:
         statement: Statement,
         txn: object,
         parameters: Mapping[str, object] | None = None,
+        *,
+        cache_text: str | None = None,
     ) -> QueryResult:
         """Run a parsed statement while still planning against current transaction state.
 
@@ -2382,11 +2536,23 @@ class QueryEngine:
         working = self._working.get(getattr(txn, "txn_id", None))
         if working is not None and not self._txn_stages_catalog(txn):
             working = None
-        plan = self._planned_for(statement, txn, working)
+        catalog = working if working is not None else self._catalog.catalog
+        authority = self._statement_index_authority(catalog, txn=txn)
+        plan = self._planned_for(
+            statement,
+            txn,
+            working,
+            authority=authority,
+            cache_text=cache_text,
+        )
         started = self._reading()
         try:
             result = self._run(
-                plan, txn, self._bind_parameters(plan, parameters), catalog=working
+                plan,
+                txn,
+                self._bind_parameters(plan, parameters),
+                catalog=working,
+                index_authority=authority,
             )
         except GrafxError as failure:
             self._count_error(failure)
@@ -2424,7 +2590,15 @@ class QueryEngine:
         working = self._working.get(getattr(txn, "txn_id", None))
         if working is not None and not self._txn_stages_catalog(txn):
             working = None
-        plan = self._planned_for(statement, txn, working)
+        catalog = working if working is not None else self._catalog.catalog
+        authority = self._statement_index_authority(catalog, txn=txn)
+        plan = self._planned_for(
+            statement,
+            txn,
+            working,
+            authority=authority,
+            cache_text=text,
+        )
         started = self._reading()
         try:
             root = plan.root
@@ -2458,6 +2632,7 @@ class QueryEngine:
                 catalog=working,
                 result_node=root.child,
                 union_coercions=_bound_union_columns(plan, bound),
+                index_authority=authority,
             )
             _bind_timestamp_values(plan, context)
             _validate_bound_subscript_types(plan, bound)
@@ -2493,6 +2668,7 @@ class QueryEngine:
         *,
         catalog: Catalog,
         without_indexes_for: frozenset[int] = frozenset(),
+        authority: _IndexAuthorityProjection | None = None,
     ) -> tuple[object, ...]:
         """Return usable index definitions, withholding tables that need an owner overlay."""
         if self._indexes is None:
@@ -2506,9 +2682,14 @@ class QueryEngine:
         # is slower and right. The index says so itself through `stale`, and `Database.
         # stale_indexes` is where an operator sees which ones need rebuilding.
         tables = {(table.table_id, table.name): table for table in catalog.tables()}
+        indexes = (
+            authority.planning_indexes
+            if authority is not None
+            else _catalog_active_indexes(self._indexes, catalog)
+        )
         return tuple(
             index.definition
-            for index in _catalog_active_indexes(self._indexes, catalog)
+            for index in indexes
             if not getattr(index, "stale", False)
             and index.definition.table_id not in without_indexes_for
             and (
@@ -2521,6 +2702,124 @@ class QueryEngine:
                 and index_definition_matches_table(index.definition, table)
             )
         )
+
+    def _statement_index_authority(
+        self, catalog: Catalog, *, txn: object | None = None
+    ) -> _IndexAuthorityProjection:
+        """Project catalog-selected stores once for planning and execution of one statement."""
+        manager = self._indexes
+        if manager is None:
+            return _IndexAuthorityProjection.build(())
+        txn_id = getattr(txn, "txn_id", None)
+        scoped_txn = (
+            txn
+            if isinstance(txn_id, int) and not isinstance(txn_id, bool) and txn_id >= 0
+            else None
+        )
+        statement_indexes = getattr(manager, "_statement_indexes", None)
+        if callable(statement_indexes):
+            planning, runtime = statement_indexes(txn=scoped_txn, catalog=catalog)
+            return _IndexAuthorityProjection.build(
+                tuple(runtime), planning_indexes=tuple(planning)
+            )
+        if scoped_txn is not None:
+            transaction_indexes = getattr(manager, "_transaction_indexes", None)
+        else:
+            transaction_indexes = None
+        if callable(transaction_indexes):
+            indexes = tuple(transaction_indexes(scoped_txn, catalog=catalog))
+        else:
+            indexes = _catalog_active_indexes(manager, catalog)
+        return _IndexAuthorityProjection.build(indexes)
+
+    def _prepared_plan_key(
+        self,
+        *,
+        text: str | None,
+        statement: Statement,
+        catalog: Catalog,
+        committed_catalog: bool,
+        authority: _IndexAuthorityProjection,
+        dirty_tables: frozenset[int],
+    ) -> _PreparedPlanKey | None:
+        """Return a pure cache key, or decline when exact text provenance is unavailable."""
+        if text is None:
+            return None
+        with self._prepared_guard:
+            # Hand-built statements and a private caller supplying mismatched text must never
+            # acquire the authority of an unrelated cached parse.
+            if self._parse_cache.get(text) is not statement:
+                return None
+
+        picture: list[tuple[IndexDefinition, bool]] = []
+        for index in authority.planning_indexes:
+            definition = getattr(index, "definition", None)
+            stale = getattr(index, "stale", None)
+            if not isinstance(definition, IndexDefinition) or type(stale) is not bool:
+                # A foreign index collaborator remains usable through the canonical planning
+                # path, but its dynamic protocol is not stable cache-key material.
+                return None
+            picture.append((definition, stale))
+
+        # The committed store already retains the exact immutable image it adopted from pages;
+        # using it is O(1). A transaction's working catalog is intentionally serialized because
+        # its uncommitted mutations have no durable image and must still split cache entries.
+        catalog_image = (
+            self._catalog.persisted_image()
+            if committed_catalog
+            else catalog.serialize()
+        )
+        return _PreparedPlanKey(
+            text=text,
+            catalog_identity=id(catalog),
+            catalog_image=catalog_image,
+            index_picture=tuple(picture),
+            dirty_tables=dirty_tables,
+        )
+
+    def _cached_prepared_plan(self, key: _PreparedPlanKey) -> PlannedQuery | None:
+        """Read and promote one LRU entry without exposing its runtime authority projection."""
+        with self._prepared_guard:
+            cached = self._plan_cache.get(key)
+            if cached is not None:
+                self._plan_cache.move_to_end(key)
+            return cached
+
+    def _remember_prepared_plan(
+        self, key: _PreparedPlanKey, plan: PlannedQuery
+    ) -> PlannedQuery:
+        """Publish one immutable prepared plan, preserving a concurrent winner."""
+        with self._prepared_guard:
+            existing = self._plan_cache.get(key)
+            if existing is not None:
+                self._plan_cache.move_to_end(key)
+                return existing
+            self._plan_cache[key] = plan
+            marker = id(plan.root)
+            owned = self._owned_prepared_plans.get(marker)
+            if owned is None or owned[0] is not plan.root:
+                self._owned_prepared_plans[marker] = (plan.root, 1)
+            else:
+                self._owned_prepared_plans[marker] = (owned[0], owned[1] + 1)
+            if len(self._plan_cache) > _PLAN_CACHE_MAX_ENTRIES:
+                _old_key, old_plan = self._plan_cache.popitem(last=False)
+                old_marker = id(old_plan.root)
+                old_owned = self._owned_prepared_plans.get(old_marker)
+                if old_owned is not None and old_owned[0] is old_plan.root:
+                    if old_owned[1] == 1:
+                        self._owned_prepared_plans.pop(old_marker, None)
+                    else:
+                        self._owned_prepared_plans[old_marker] = (
+                            old_owned[0],
+                            old_owned[1] - 1,
+                        )
+            return plan
+
+    def _owns_prepared_plan(self, plan: object) -> bool:
+        """Prove an exact root is retained by this engine's bounded prepared-plan cache."""
+        with self._prepared_guard:
+            owned = self._owned_prepared_plans.get(id(plan))
+            return owned is not None and owned[0] is plan
 
     def _bind_parameters(
         self, plan: PlannedQuery, parameters: Mapping[str, object] | None
@@ -2560,6 +2859,7 @@ class QueryEngine:
         txn: object,
         parameters: dict[str, Value],
         catalog: Catalog | None = None,
+        index_authority: _IndexAuthorityProjection | None = None,
     ) -> QueryResult:
         """Walk the plan and produce the result."""
         root = plan.root
@@ -2589,6 +2889,7 @@ class QueryEngine:
             catalog=catalog,
             result_node=root.child if root.columns else None,
             union_coercions=_bound_union_columns(plan, parameters),
+            index_authority=index_authority,
         )
         _bind_timestamp_values(plan, context)
         _validate_bound_subscript_types(plan, parameters)
@@ -4292,6 +4593,7 @@ def _index_seek(
                 node.index,
                 context.schema(),
                 txn=getattr(context, "txn", None),
+                projection=getattr(context, "index_authority", None),
             )
             index_resolved = True
         template: list[Value] = [None] * arity
@@ -4380,6 +4682,7 @@ def _edge_steps(
                 name,
                 catalog,
                 txn=getattr(context, "txn", None),
+                projection=getattr(context, "index_authority", None),
             )
         except GrafxError:
             return None
@@ -7952,6 +8255,7 @@ def _endpoint_identity_index(
         definition.name,
         catalog,
         txn=getattr(context, "txn", None),
+        projection=getattr(context, "index_authority", None),
     )
     if index is None or getattr(index, "definition", None) != definition:
         raise GrafxIndexError(
@@ -8594,6 +8898,7 @@ def _rows_carrying_key(
             name,
             context.schema(),
             txn=getattr(context, "txn", None),
+            projection=getattr(context, "index_authority", None),
         )
     except GrafxError:
         return None  # no index covers this table's key

@@ -2635,10 +2635,18 @@ class IndexStore:
             )
         pages: list[PageIndex] = []
         seen: set[PageIndex] = visited_pages()
-        limit = self._pool.storage.page_count(self.file) + 1
+        # Almost every bucket is one or two pages long. Asking the device for the file size on
+        # every such walk is pure fixed cost; defer that second, independent termination guard
+        # until a chain is unusually long. Once observed, the bound is frozen for this walk so
+        # concurrent growth cannot turn a corrupt chain into an unbounded one.
+        lazy_bound_after = 8
+        limit: int | None = None
         index: PageIndex = self._bucket_head(bucket)
         while index != NO_PAGE:
-            refuse_endless_chain(self.file, len(pages) + 1, limit)
+            if limit is None and len(pages) >= lazy_bound_after:
+                limit = self._pool.storage.page_count(self.file) + 1
+            if limit is not None:
+                refuse_endless_chain(self.file, len(pages) + 1, limit)
             if index in seen:
                 raise GrafxCorruptionDetected(
                     f"The bucket chain of {self.file!r} returns to page {index}, so it is a "
@@ -4174,7 +4182,24 @@ class IndexManager:
     def _transaction_indexes(
         self, txn: StagingTransaction, *, catalog: object | None = None
     ) -> tuple[IndexStore, ...]:
-        """Return ACTIVE stores plus speculative stores explicitly observed by ``txn``."""
+        """Return ACTIVE stores plus speculative stores explicitly observed by the transaction."""
+        _committed, selected = self._statement_indexes(txn=txn, catalog=catalog)
+        return selected
+
+    def _statement_indexes(
+        self,
+        *,
+        txn: StagingTransaction | None = None,
+        catalog: object | None = None,
+    ) -> tuple[tuple[IndexStore, ...], tuple[IndexStore, ...]]:
+        """Project committed and transaction-visible stores with one authority walk.
+
+        Query planning consumes only the first tuple. Runtime DML also sees stores this
+        transaction created through its schema journal, supplied by the second tuple.
+        """
+        active = self.active_indexes(catalog=catalog)
+        if txn is None:
+            return active, active
         txn_id = getattr(txn, "txn_id", None)
         if isinstance(txn_id, bool) or not isinstance(txn_id, int) or txn_id < 0:
             raise GrafxIndexError(
@@ -4182,9 +4207,8 @@ class IndexManager:
                 field="txn_id",
                 value=repr(txn_id),
             )
-        active = self.active_indexes(catalog=catalog)
         observed = tuple(self._schema_observed.get(txn_id, ()))
-        return tuple(dict.fromkeys((*active, *observed)))
+        return active, tuple(dict.fromkeys((*active, *observed)))
 
     def indexes_for(
         self,

@@ -175,6 +175,105 @@ def test_catalog_page_effect_flags_process_local_index_authority_refresh() -> No
     assert changes.catalog_changed is True
 
 
+def test_wal_only_catalog_composition_retains_catalog_for_proved_dml_delta() -> None:
+    stack = build_stack(catalog_changes_are_wal_logged=True)
+    previous = _ReadViewToken(last_committed_lsn=0, checkpoint_lsn=0)
+    stack.pool.begin_read_view(previous, unfenced_file=stack.catalog.file)
+    # Reload after the baseline view so catalog.dat has a resident derived view to preserve.
+    assert stack.catalog.catalog.is_empty()
+    drop_epoch = stack.pool.cache_drop_epoch(stack.catalog.file)
+    stack.manager._wal = _BoundedWal(
+        (
+            WalRecord(
+                record_type=int(WalRecordType.WRITE_PAGE),
+                payload=encode_page_write("heap.dat", 17, b"image"),
+                lsn=1,
+                epoch=7,
+                txn_id=9,
+            ),
+            WalRecord(
+                record_type=int(WalRecordType.COMMIT),
+                lsn=2,
+                epoch=7,
+                txn_id=9,
+            ),
+        )
+    )
+
+    may_have_changed = stack.manager._establish_read_view(
+        CommitState(last_committed_lsn=2, last_csn=2, checkpoint_lsn=0),
+        own=False,
+    )
+
+    assert may_have_changed is False
+    assert stack.pool.cache_drop_epoch(stack.catalog.file) == drop_epoch
+
+
+def test_legacy_catalog_composition_keeps_the_conservative_unfenced_refresh() -> None:
+    stack = build_stack()
+    previous = _ReadViewToken(last_committed_lsn=0, checkpoint_lsn=0)
+    stack.pool.begin_read_view(previous, unfenced_file=stack.catalog.file)
+    assert stack.catalog.catalog.is_empty()
+    drop_epoch = stack.pool.cache_drop_epoch(stack.catalog.file)
+    stack.manager._wal = _BoundedWal(
+        (
+            WalRecord(
+                record_type=int(WalRecordType.WRITE_PAGE),
+                payload=encode_page_write("heap.dat", 17, b"image"),
+                lsn=1,
+                epoch=7,
+                txn_id=9,
+            ),
+            WalRecord(
+                record_type=int(WalRecordType.COMMIT),
+                lsn=2,
+                epoch=7,
+                txn_id=9,
+            ),
+        )
+    )
+
+    stack.manager._establish_read_view(
+        CommitState(last_committed_lsn=2, last_csn=2, checkpoint_lsn=0),
+        own=False,
+    )
+
+    assert stack.pool.cache_drop_epoch(stack.catalog.file) > drop_epoch
+
+
+def test_wal_only_catalog_composition_still_discards_catalog_for_ddl_delta() -> None:
+    stack = build_stack(catalog_changes_are_wal_logged=True)
+    previous = _ReadViewToken(last_committed_lsn=0, checkpoint_lsn=0)
+    stack.pool.begin_read_view(previous, unfenced_file=stack.catalog.file)
+    assert stack.catalog.catalog.is_empty()
+    drop_epoch = stack.pool.cache_drop_epoch(stack.catalog.file)
+    stack.manager._wal = _BoundedWal(
+        (
+            WalRecord(
+                record_type=int(WalRecordType.WRITE_PAGE),
+                payload=encode_page_write("catalog.dat", 1, b"catalog-image"),
+                lsn=1,
+                epoch=7,
+                txn_id=9,
+            ),
+            WalRecord(
+                record_type=int(WalRecordType.COMMIT),
+                lsn=2,
+                epoch=7,
+                txn_id=9,
+            ),
+        )
+    )
+
+    may_have_changed = stack.manager._establish_read_view(
+        CommitState(last_committed_lsn=2, last_csn=2, checkpoint_lsn=0),
+        own=False,
+    )
+
+    assert may_have_changed is True
+    assert stack.pool.cache_drop_epoch(stack.catalog.file) > drop_epoch
+
+
 def test_unknown_record_checkpoint_movement_and_unregistered_index_decline_ce3() -> (
     None
 ):

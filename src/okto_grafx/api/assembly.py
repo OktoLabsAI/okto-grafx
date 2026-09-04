@@ -392,6 +392,10 @@ def assemble_database(
             indexes=indexes,
             exact_scan_threshold=config.vector_exact_scan_threshold,
             ef_search=config.vector_ef_search,
+            # Production schema changes use QueryEngine staging and the normal WAL commit.
+            # Closing the two legacy direct-save doors is the proof TXN-4 needs to retain a
+            # catalog view across a CE-3 interval containing only ordinary DML.
+            catalog_changes_are_wal_logged=True,
             # P0.5: the derived HNSW graph of every vector index is published under this
             # guard -- one complete picture per reference assignment, one build in flight per
             # index. Mechanism, so it is handed in here like the pool's guard above rather than
@@ -512,6 +516,7 @@ def assemble_database(
             control_format_version=identity.format_version,
             control_file_nonce=_new_control_file_nonce(),
             process_identity_provider=os.getpid,
+            catalog_changes_are_wal_logged=True,
         )
         # A writable open may create a missing accelerator only under the same artifact section
         # as DDL attach and commit publication.  That section first adopts existing files and

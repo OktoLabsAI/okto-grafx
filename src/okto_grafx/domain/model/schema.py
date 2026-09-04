@@ -27,6 +27,7 @@ from okto_grafx.domain.model.value import (
     VECTOR_VALUE_TYPES,
     Value,
     ValueType,
+    _decode_expected_value_body,
     _validate_value,
     decode_value,
     encode_value,
@@ -169,10 +170,11 @@ class ColumnDef:
 
 
 class _TableDefColumnCache:
-    """Reserve a non-domain slot for the derived column lookup table."""
+    """Reserve non-domain slots for immutable, derived column plans."""
 
-    __slots__ = ("_column_positions",)
+    __slots__ = ("_column_positions", "_decode_plan")
     _column_positions: Mapping[str, int]
+    _decode_plan: tuple[tuple[int, ValueType, bool, ColumnDef], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +251,14 @@ class TableDef(_TableDefColumnCache):
             "_column_positions",
             MappingProxyType(
                 {column.name: position for position, column in enumerate(self.columns)}
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_decode_plan",
+            tuple(
+                (int(column.type), column.type, column.nullable, column)
+                for column in self.columns
             ),
         )
         reserved_positions = {
@@ -683,11 +693,29 @@ def _decode_tuple(
     values: list[Value] = []
     offset = 0
     if materialized_positions is None:
-        for position, column in enumerate(table.columns):
+        for position, (expected_tag, expected_type, nullable, column) in enumerate(
+            table._decode_plan
+        ):
             tag_offset = offset
-            value, offset = decode_value(buf, offset)
+            if offset >= len(buf):
+                # Keep the generic oracle's classified short-tag refusal verbatim.
+                value, offset = decode_value(buf, offset)
+            else:
+                stored_tag = buf[offset]
+                if stored_tag == expected_tag:
+                    value, offset = _decode_expected_value_body(
+                        buf, offset + 1, expected_type
+                    )
+                elif stored_tag == int(ValueType.NULL):
+                    value = None
+                    offset += 1
+                else:
+                    # A mismatched value is still decoded completely before schema rejection.
+                    # This preserves the rule that malformed stored bytes are corruption rather
+                    # than being hidden by the schema mismatch they would otherwise reach first.
+                    value, offset = decode_value(buf, offset)
             if value is None:
-                if not column.nullable:
+                if not nullable:
                     raise _reject(
                         table,
                         column,
@@ -696,7 +724,7 @@ def _decode_tuple(
                     )
                 values.append(value)
                 continue
-            if buf[tag_offset] != int(column.type):
+            if buf[tag_offset] != expected_tag:
                 observed = value_type_of(value)
                 raise _reject(
                     table,

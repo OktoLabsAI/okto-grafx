@@ -21,9 +21,11 @@ from urllib.parse import urlsplit
 import pytest
 
 from okto_grafx import connect
-from okto_grafx.domain.errors import GrafxTransactionStateError
+from okto_grafx.domain.errors import GrafxTransactionStateError, GrafxUnsupportedOperation
 from okto_grafx.domain.index import index_file
+from okto_grafx.domain.model.schema import EmbeddingSpaceDef
 from okto_grafx.domain.page import Page, PageType
+from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.engine.database import Database
 from okto_grafx.engine.index_manager import primary_key_index_name
 from okto_grafx.engine.wal_manager import WalManager
@@ -361,38 +363,43 @@ def test_verification_walks_the_indexes_a_caller_registered_after_the_open(
 
 def _vector_schema(db: Database, space_name: str = "minilm_v2") -> object:
     """Declare one embedding space and one table with a column in it, and return the table."""
-    from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
-    from okto_grafx.domain.model.value import ValueType
-    from okto_grafx.domain.ports.vectormath import DistanceMetric
+    with db.transaction("write") as txn:
+        txn.execute(
+            f"CREATE VECTOR SPACE {space_name} "
+            "{dimension: 4, metric: 'cosine', normalized: true}"
+        )
+        txn.execute(
+            f"CREATE NODE TABLE Chunk(id INT64, embedding VECTOR({space_name}), "
+            "PRIMARY KEY(id))"
+        )
+    return db._catalog.catalog.table("Chunk")
 
-    catalog = db._catalog.catalog
-    db._vectors.create_space(
-        EmbeddingSpaceDef(
-            space_id=catalog.next_space_id(),
-            name=space_name,
+
+def test_a_composed_database_allows_catalog_mutation_only_through_wal_ddl(
+    tmp_path: Path,
+) -> None:
+    """TXN-4's catalog-view proof has no direct, non-WAL vector mutation door."""
+    with connect(tmp_path / "db", page_size=512) as db:
+        direct = EmbeddingSpaceDef(
+            space_id=db._catalog.catalog.next_space_id(),
+            name="direct",
             dimension=4,
             metric=DistanceMetric.COSINE,
-            normalized=True,
+            normalized=False,
             storage_dtype="float32",
             state="active",
-            created_at_wall=db._clock.wall(),
         )
-    )
-    table = TableDef(
-        table_id=catalog.next_table_id(),
-        name="Chunk",
-        kind="node",
-        columns=(
-            ColumnDef(name="id", type=ValueType.INT64, nullable=False),
-            ColumnDef(name="embedding", type=ValueType.VECTOR_F32, vector_space=space_name),
-        ),
-        primary_key="id",
-        from_table=None,
-        to_table=None,
-    )
-    catalog.add_table(table)
-    db._catalog.save()
-    return table
+        with pytest.raises(GrafxUnsupportedOperation):
+            db._vectors.create_space(direct)
+        assert db._catalog.catalog.spaces() == ()
+
+        with db.transaction("write") as txn:
+            txn.execute(
+                "CREATE VECTOR SPACE durable {dimension: 4, metric: 'cosine'}"
+            )
+        with pytest.raises(GrafxUnsupportedOperation):
+            db._vectors.retire_space("durable")
+        assert db._catalog.catalog.space("durable").is_active
 
 
 def test_a_vector_index_attaches_onto_the_paged_index_registry(tmp_path: Path) -> None:
@@ -424,7 +431,7 @@ def test_the_vector_engine_reaches_the_same_pool_and_registry_as_the_database(
     with connect(tmp_path / "db", page_size=512) as db:
         table = _vector_schema(db)
         db._vectors.attach(table, "minilm_v2")
-        assert db.indexes.indexes()[0].name.startswith("vector_")
+        assert any(index.name.startswith("vector_") for index in db.indexes.indexes())
         before = db.pool.used_bytes()
         assert before > 0
 

@@ -202,6 +202,32 @@ def test_case_and_subscript_survive_the_detached_public_plan_boundary() -> None:
     assert result.rows == ((20,),)
 
 
+def test_repeated_internal_plan_validation_is_memoized_but_public_trees_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import okto_grafx.engine.public_views as public_views
+
+    walks = 0
+    original = public_views._query_plan_nodes
+
+    def counted_nodes(value: object):
+        nonlocal walks
+        walks += 1
+        return original(value)
+
+    monkeypatch.setattr(public_views, "_query_plan_nodes", counted_nodes)
+    with connect(":memory:") as database:
+        first = database.explain("RETURN 1 AS value")
+        second = database.explain("RETURN 1 AS value")
+
+    assert walks == 1
+    assert first == second
+    assert first is not second
+    assert all(left is not right for left, right in zip(first.walk(), second.walk()))
+    object.__setattr__(first, "columns", ("changed",))
+    assert second.columns == ("value",)
+
+
 @pytest.mark.parametrize("character", ["\x00", "\U000e0001"])
 def test_maximum_nonprintable_string_literal_fits_rendered_query_bound(
     character: str,

@@ -658,6 +658,7 @@ class TransactionManager:
         "_index_authority_sync_required",
         "_heap_reclaim_capable",
         "_wal_record_v2_capable",
+        "_catalog_changes_are_wal_logged",
         "_partitions_per_table",
         "_identity_lease_size",
         "_identity_leases",
@@ -723,6 +724,7 @@ class TransactionManager:
         control_format_version: int = 1,
         control_file_nonce: int = 0,
         process_identity_provider: Callable[[], object] | None = None,
+        catalog_changes_are_wal_logged: bool = False,
     ) -> None:
         """Build a manager over one database.
 
@@ -747,6 +749,9 @@ class TransactionManager:
           integers.
         * ``max_index_build_entries`` -- the separate opt-in admission limit for detached exact
           generation batches; it does not change transaction row/byte accounting.
+        * ``catalog_changes_are_wal_logged`` -- a composition proof that every runtime catalog
+          mutation is staged on a transaction and therefore appears in the CE-3 WAL interval.
+          Direct compositions default to the conservative legacy answer.
         """
         if not isinstance(writable, bool):
             raise GrafxConfigurationError(
@@ -776,6 +781,13 @@ class TransactionManager:
         self._index_authority_sync_required: bool = False
         self._heap_reclaim_capable: bool = False
         self._wal_record_v2_capable: bool = False
+        if type(catalog_changes_are_wal_logged) is not bool:
+            raise GrafxConfigurationError(
+                "catalog_changes_are_wal_logged must be exactly True or False.",
+                field="catalog_changes_are_wal_logged",
+                value=repr(catalog_changes_are_wal_logged),
+            )
+        self._catalog_changes_are_wal_logged = catalog_changes_are_wal_logged
         self._refresh_heap_reclaim_capability()
         self._refresh_wal_record_v2_capability()
         self._partitions_per_table: int = validate_partitions_per_table(
@@ -2423,13 +2435,25 @@ class TransactionManager:
             ):
                 changes = self._read_view_changes(previous, token)
                 catalog_may_have_changed = changes is None or changes.catalog_changed
+            # A complete CE-3 interval that contains no catalog page is sufficient only for a
+            # composition that has closed every non-WAL catalog mutation door.  Legacy/direct
+            # compositions keep catalog.dat unfenced on every view, preserving their historical
+            # visibility rule.  First/own/same-token views and every declined CE-3 proof likewise
+            # retain the conservative whole-file refresh.
+            unfenced_catalog = (
+                None
+                if self._catalog_changes_are_wal_logged
+                and changes is not None
+                and not changes.catalog_changed
+                else self._file_ids.catalog_file
+            )
             if allow_writeback:
                 # Preserve the established call shape for deliberately narrow BufferPool test
                 # doubles and custom compositions.
                 self._pool.begin_read_view(
                     token,
                     own=effective_own,
-                    unfenced_file=self._file_ids.catalog_file,
+                    unfenced_file=unfenced_catalog,
                     changed_pages=None if changes is None else changes.pages,
                     changed_files=() if changes is None else changes.files,
                     expected_previous=previous,
@@ -2439,7 +2463,7 @@ class TransactionManager:
                     token,
                     own=effective_own,
                     allow_writeback=False,
-                    unfenced_file=self._file_ids.catalog_file,
+                    unfenced_file=unfenced_catalog,
                     changed_pages=None if changes is None else changes.pages,
                     changed_files=() if changes is None else changes.files,
                     expected_previous=previous,
@@ -2510,7 +2534,11 @@ class TransactionManager:
         )
 
     def _synchronize_committed_indexes(
-        self, txn: TransactionContext, published_lsn: Lsn
+        self,
+        txn: TransactionContext,
+        published_lsn: Lsn,
+        *,
+        authority_may_have_changed: bool = True,
     ) -> None:
         """Adopt foreign DDL before a row commit can build its WAL batch.
 
@@ -2536,17 +2564,17 @@ class TransactionManager:
             # pass has had the opportunity to reject a foreign winner at the original snapshot.
             return
 
-        catalog = self._catalog
-        refresh = getattr(catalog, "refresh", None)
-        if callable(refresh):
-            refresh()
-
         manager = self._index_manager
-        observe = getattr(manager, "observe_published_lsn", None)
-        if callable(observe):
-            observe(published_lsn)
-        if self._index_sync is not None:
-            self._index_sync()
+        catalog = self._catalog
+        if authority_may_have_changed:
+            refresh = getattr(catalog, "refresh", None)
+            if callable(refresh):
+                refresh()
+            observe = getattr(manager, "observe_published_lsn", None)
+            if callable(observe):
+                observe(published_lsn)
+            if self._index_sync is not None:
+                self._index_sync()
         if manager is None:
             return
 
@@ -2903,10 +2931,22 @@ class TransactionManager:
                 and not self._participant_pin.registration.closed
             )
             self._ensure_participant_pin(floor.last_committed_lsn)
+            refreshed = 0
             if standing:
-                self._refresh_due_readers(floor=floor.last_committed_lsn)
+                refreshed = self._refresh_due_readers(
+                    floor=floor.last_committed_lsn
+                )
             self._require_not_closed("begin a transaction")
-            selected = self._published_state_in_section()
+            # A standing pin still within its refresh interval was visible at or below floor
+            # before this begin and published nothing during it. CF-2 therefore needs no second
+            # control-record read in that stable regime. First publication, recreation and every
+            # due refresh retain the original second read because another writer may have
+            # committed while the pin was being published.
+            selected = (
+                floor
+                if standing and refreshed == 0
+                else self._published_state_in_section()
+            )
             self._require_not_closed("begin a transaction")
             view = (
                 selected
@@ -4129,7 +4169,9 @@ class TransactionManager:
                     # and a stale one makes a correct predicate decide against the wrong picture
                     # (defect E1, second half; LESSONS L22).
                     own_view = current == self._own_published_lsn
-                    self._establish_read_view(durable, own=own_view)
+                    index_authority_may_have_changed = self._establish_read_view(
+                        durable, own=own_view
+                    )
                     validated_through = current
                     # Validation has two tiers, and the first is not redundant. Caller-declared
                     # logical interests and pre-staged pages are known now, so validate them
@@ -4166,7 +4208,13 @@ class TransactionManager:
                         # persistent artifact here, before provenance validation,
                         # materialisation or a WAL byte.
                         with self._close_wait_hazard():
-                            self._synchronize_committed_indexes(txn, current)
+                            self._synchronize_committed_indexes(
+                                txn,
+                                current,
+                                authority_may_have_changed=(
+                                    index_authority_may_have_changed
+                                ),
+                            )
                     if conflict is None:
                         # Physical ownership is a second, pre-materialisation gate.  The first
                         # logical OCC above remains integral and decides every stale snapshot

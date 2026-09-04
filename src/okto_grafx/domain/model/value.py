@@ -268,7 +268,7 @@ class VectorValue:
                 value=type(self.values).__name__,
             )
         try:
-            components = tuple(float(component) for component in self.values)
+            components = tuple(map(float, self.values))
         except (TypeError, ValueError) as failure:
             raise GrafxVectorValidationError(
                 "A vector needs a sequence of numbers.",
@@ -282,6 +282,25 @@ class VectorValue:
                 value=repr(self.space_ref),
             )
         object.__setattr__(self, "values", components)
+
+    @classmethod
+    def _from_decoded(
+        cls, values: tuple[float, ...], space_ref: int, dtype: str
+    ) -> VectorValue:
+        """Build a vector from fields a page already holds, without judging them again.
+
+        The decoder hands over components that just came out of one ``struct`` unpack -- floats
+        by construction -- a space reference read from a 32-bit field, and a dtype it derived
+        from the value tag. Re-running the constructor's normalisation over them was the largest
+        per-row cost of reading a vector (VEC-3); this door skips it for exactly that input and
+        nothing else, the same way ``Page._from_decoded`` trusts a decoded page. A test holds a
+        vector built here to equality with one built through the public constructor.
+        """
+        vector = object.__new__(cls)
+        object.__setattr__(vector, "values", values)
+        object.__setattr__(vector, "space_ref", space_ref)
+        object.__setattr__(vector, "dtype", dtype)
+        return vector
 
     @property
     def dimension(self) -> int:
@@ -437,6 +456,30 @@ def _encode_vector(vector: VectorValue, kind: ValueType) -> bytes:
             value=vector.space_ref,
         )
     single = kind is ValueType.VECTOR_F32
+    components = vector.values
+    # Both guards are asked of the whole vector at once (VEC-3): one pass in C decides whether
+    # every component is finite, two more whether every component of a float32 vector is inside
+    # the range a slot can hold. Only a vector that fails walks its components one by one, so
+    # the refusal names the FIRST offending position with the reason it always named.
+    if not all(map(isfinite, components)) or (
+        single
+        and not (
+            -FLOAT32_OVERFLOW_THRESHOLD < min(components)
+            and max(components) < FLOAT32_OVERFLOW_THRESHOLD
+        )
+    ):
+        _refuse_first_unstorable_component(vector, single)
+    body = struct.pack(f"<{dimension}{'f' if single else 'd'}", *components)
+    return _TAG.pack(int(kind)) + _U32.pack(dimension) + _U32.pack(vector.space_ref) + body
+
+
+def _refuse_first_unstorable_component(vector: VectorValue, single: bool) -> None:
+    """Raise the refusal of the first component the block guards of the encoder rejected.
+
+    The per-component walk ``_encode_vector`` used to do for every vector, kept verbatim so the
+    position, the reason and the message of a refusal are unchanged: the block guards decide
+    THAT the walk is needed, never which component answers.
+    """
     for position, component in enumerate(vector.values):
         if not isfinite(component):
             raise GrafxVectorValidationError(
@@ -459,8 +502,9 @@ def _encode_vector(vector: VectorValue, kind: ValueType) -> bytes:
                 dtype=vector.dtype,
                 limit=MAX_FLOAT32,
             )
-    body = struct.pack(f"<{dimension}{'f' if single else 'd'}", *vector.values)
-    return _TAG.pack(int(kind)) + _U32.pack(dimension) + _U32.pack(vector.space_ref) + body
+    raise AssertionError(  # pragma: no cover - the block guards only send offenders here
+        "the block guards refused a vector whose components all pass the per-component walk"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,6 +543,69 @@ def decode_value(buf: bytes, offset: int = 0, *, depth: int = 0) -> tuple[Value,
     """
     value, following = _decode_value_mode(buf, offset, depth=depth, materialize=True)
     return cast(Value, value), following
+
+
+def _decode_expected_value_body(
+    buf: bytes, offset: int, kind: ValueType
+) -> tuple[Value, int]:
+    """Decode a body whose durable tag already matched a schema column.
+
+    Tuple decoding has a stable expected type for every position.  Avoiding the generic tag
+    dispatch for scalar columns removes a long Python branch chain from every materialized row;
+    compound values return to the single recursive oracle so their depth and MAP-key semantics
+    remain defined in exactly one place. ``offset`` points immediately after the proven tag.
+    """
+
+    # INT64 and STRING dominate graph rows, so keep them at the front of this already planned
+    # dispatch rather than making the common path walk the complete durable type catalogue.
+    if kind is ValueType.INT64:
+        _require(buf, offset, _I64.size, "int64")
+        return _I64.unpack_from(buf, offset)[0], offset + _I64.size
+    if kind is ValueType.STRING:
+        _require(buf, offset, _U32.size, "length")
+        length = _U32.unpack_from(buf, offset)[0]
+        offset += _U32.size
+        _require(buf, offset, length, "string")
+        following = offset + length
+        try:
+            return bytes(buf[offset:following]).decode("utf-8"), following
+        except UnicodeDecodeError as failure:
+            raise GrafxCorruptionDetected(
+                "A stored STRING is not valid UTF-8.",
+                field="string",
+                offset=offset,
+                length=length,
+            ) from failure
+    if kind is ValueType.BOOL:
+        _require(buf, offset, 1, "bool")
+        raw = buf[offset]
+        if raw > 1:
+            raise GrafxCorruptionDetected(
+                f"A stored BOOL must be 0 or 1; got {raw}.",
+                field="bool",
+                value=raw,
+                offset=offset,
+            )
+        return raw == 1, offset + 1
+    if kind is ValueType.DOUBLE:
+        _require(buf, offset, _F64.size, "double")
+        return _F64.unpack_from(buf, offset)[0], offset + _F64.size
+    if kind is ValueType.TIMESTAMP:
+        _require(buf, offset, _I64.size, "timestamp")
+        return Timestamp(_I64.unpack_from(buf, offset)[0]), offset + _I64.size
+    if kind is ValueType.UUID:
+        _require(buf, offset, _UUID_SIZE, "uuid")
+        return Uuid(bytes(buf[offset : offset + _UUID_SIZE])), offset + _UUID_SIZE
+    if kind is ValueType.BYTES:
+        _require(buf, offset, _U32.size, "length")
+        length = _U32.unpack_from(buf, offset)[0]
+        offset += _U32.size
+        _require(buf, offset, length, "bytes")
+        following = offset + length
+        return bytes(buf[offset:following]), following
+    # LIST, MAP and both vector encodings keep the recursive decoder as their sole oracle. The
+    # caller proved the tag at offset - 1, so this is observationally the ordinary decode door.
+    return decode_value(buf, offset - 1)
 
 
 def _validate_value(buf: bytes, offset: int = 0, *, depth: int = 0) -> int:
@@ -682,10 +789,8 @@ def _decode_vector_mode(
     if not materialize:
         return _VALIDATED_VECTOR, following
     components = struct.unpack_from(f"<{dimension}{'f' if single else 'd'}", buf, offset)
-    vector = VectorValue(
-        values=components,
-        space_ref=space_ref,
-        dtype="float32" if single else "float64",
+    vector = VectorValue._from_decoded(
+        components, space_ref, "float32" if single else "float64"
     )
     return vector, following
 

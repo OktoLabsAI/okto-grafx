@@ -97,6 +97,48 @@ def test_bootstrapping_creates_the_file_the_header_page_and_an_empty_catalog(
     assert header.root_page != NO_PAGE
 
 
+def test_internal_catalog_bootstrap_proof_expires_with_the_page_view(
+    pool: BufferPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = CatalogStore(pool)
+    store.bootstrap()
+    calls = 0
+    original = CatalogStore.is_bootstrapped
+
+    def counted(self: CatalogStore) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(self)
+
+    monkeypatch.setattr(CatalogStore, "is_bootstrapped", counted)
+    pool.invalidate(store.file)
+    store._require_bootstrapped()
+    store._require_bootstrapped()
+    assert calls == 1
+
+    pool.invalidate(store.file)
+    store._require_bootstrapped()
+    assert calls == 2, "a cache drop invalidates the internal physical-header proof"
+
+    assert store.is_bootstrapped() is True
+    assert calls == 3, "the public predicate always performs an authoritative probe"
+
+
+def test_internal_catalog_bootstrap_memo_still_validates_a_resident_header(
+    pool: BufferPool,
+) -> None:
+    store = CatalogStore(pool)
+    store.bootstrap()
+    store._require_bootstrapped()
+
+    with pool.pinned(store.file, HEADER_PAGE_INDEX) as page:
+        page.page_type = int(PageType.HEAP)
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        store._require_bootstrapped()
+    assert raised.value.details["page_type"] == int(PageType.HEAP)
+
+
 def test_bootstrapping_an_existing_catalog_loads_it_instead_of_replacing_it(
     pool: BufferPool,
 ) -> None:

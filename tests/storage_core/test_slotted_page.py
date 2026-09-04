@@ -79,6 +79,45 @@ def test_a_slot_view_is_read_only_and_names_the_live_payload_without_a_copy() ->
         view[0] = ord("P")
 
 
+def test_the_cached_slot_view_tracks_every_buffer_replacement() -> None:
+    page = build()
+    discarded = page.insert_slot(b"discarded")
+    kept = page.insert_slot(b"kept")
+    page.free_slot(discarded)
+    page.compact()
+    assert bytes(page.slot_view(kept)) == b"kept"
+
+    page.clear()
+    fresh = page.insert_slot(b"fresh")
+    assert bytes(page.slot_view(fresh)) == b"fresh"
+
+    replacement = build()
+    replacement.insert_slot(b"replacement")
+    page.replace_with(replacement)
+    assert bytes(page.slot_view(0)) == b"replacement"
+
+    clone = page.copy()
+    page.update_slot(0, b"changed")
+    assert bytes(page.slot_view(0)) == b"changed"
+    assert bytes(clone.slot_view(0)) == b"replacement"
+
+
+def test_iter_slot_views_skips_free_slots_and_reuses_read_only_page_views() -> None:
+    page = build()
+    first = page.insert_slot(b"first")
+    freed = page.insert_slot(b"gone")
+    last = page.insert_slot(b"last")
+    page.free_slot(freed)
+
+    views = list(page.iter_slot_views())
+
+    assert [(slot, bytes(view)) for slot, view in views] == [
+        (first, b"first"),
+        (last, b"last"),
+    ]
+    assert all(view.readonly for _slot, view in views)
+
+
 def test_the_free_counters_follow_every_insertion() -> None:
     page = build()
     page.insert_slot(b"x" * 10)

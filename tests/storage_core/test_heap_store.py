@@ -467,7 +467,7 @@ def test_a_bounded_scan_materializes_every_header_accepted_by_visibility(
     )
 
 
-def test_committed_high_water_still_reads_complete_headers(
+def test_committed_high_water_observes_stamps_without_materializing_headers(
     heap_store: HeapStore,
     person_table: TableDef,
     monkeypatch: pytest.MonkeyPatch,
@@ -485,7 +485,34 @@ def test_committed_high_water_still_reads_complete_headers(
     monkeypatch.setattr(RecordHeader, "__init__", counted)
 
     assert heap_store.committed_high_water(person_table) == 17
-    assert constructions == [1, 2]
+    assert constructions == [], "the watermark needs only the three fields exposed by peek"
+
+
+def test_internal_heap_bootstrap_proof_expires_with_the_page_view(
+    heap_store: HeapStore,
+    pool: BufferPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = HeapStore.is_bootstrapped
+
+    def counted(self: HeapStore) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(self)
+
+    monkeypatch.setattr(HeapStore, "is_bootstrapped", counted)
+    pool.invalidate(heap_store.file)
+    heap_store._require_bootstrapped()
+    heap_store._require_bootstrapped()
+    assert calls == 1
+
+    pool.invalidate(heap_store.file)
+    heap_store._require_bootstrapped()
+    assert calls == 2, "a cache drop invalidates the internal physical-header proof"
+
+    assert heap_store.is_bootstrapped() is True
+    assert calls == 3, "the public predicate always performs an authoritative probe"
 
 
 def test_scan_all_shows_what_a_snapshot_hides(

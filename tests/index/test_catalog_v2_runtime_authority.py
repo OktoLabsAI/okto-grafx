@@ -172,6 +172,50 @@ def test_planner_sees_only_the_catalog_active_exact_generation(
     assert definitions[0].artifact_nonce == scenario.active_nonce
 
 
+def test_one_statement_projection_serves_planning_and_runtime_authority(
+    authority_scenario: _AuthorityScenario, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Planning and execution share one catalog-to-registry authority walk."""
+
+    scenario = authority_scenario
+    engine = QueryEngine(
+        catalog=scenario.catalog,
+        heap=scenario.heap,
+        pool=scenario.pool,
+        metrics=scenario.metrics,
+        clock=SystemClock(),
+        indexes=scenario.manager,
+    )
+    original = IndexManager.active_indexes
+    calls = 0
+
+    def counted(
+        manager: IndexManager, *, catalog: object | None = None
+    ) -> tuple[object, ...]:
+        nonlocal calls
+        calls += 1
+        return original(manager, catalog=catalog)
+
+    monkeypatch.setattr(IndexManager, "active_indexes", counted)
+    projection = engine._statement_index_authority(
+        scenario.catalog.catalog, txn=TransactionDouble()
+    )
+    definitions = engine._index_definitions(
+        catalog=scenario.catalog.catalog,
+        authority=projection,
+    )
+    selected = query_engine_module._catalog_active_index(
+        scenario.manager,
+        _ACTIVE,
+        scenario.catalog.catalog,
+        projection=projection,
+    )
+
+    assert calls == 1
+    assert tuple(definition.name for definition in definitions) == (_ACTIVE,)
+    assert selected is projection.indexes[0]
+
+
 def test_row_staging_targets_only_the_catalog_active_exact_generation(
     authority_scenario: _AuthorityScenario,
 ) -> None:
@@ -323,6 +367,7 @@ def test_own_schema_transaction_resolves_primary_key_through_its_working_catalog
         catalog: Catalog,
         *,
         txn: object | None = None,
+        projection: query_engine_module._IndexAuthorityProjection | None = None,
     ) -> object | None:
         live = manager._heap.catalog.catalog  # type: ignore[attr-defined]
         observations.append(
@@ -332,7 +377,9 @@ def test_own_schema_transaction_resolves_primary_key_through_its_working_catalog
                 live.has_table("Fresh"),
             )
         )
-        return original(manager, name, catalog, txn=txn)
+        return original(
+            manager, name, catalog, txn=txn, projection=projection
+        )
 
     monkeypatch.setattr(query_engine_module, "_catalog_active_index", recording)
     with okto_grafx.connect(tmp_path / "db", page_size=512) as database:
@@ -381,9 +428,12 @@ def test_endpoint_bypass_resolves_its_store_through_catalog_authority(
             catalog: Catalog,
             *,
             txn: object | None = None,
+            projection: query_engine_module._IndexAuthorityProjection | None = None,
         ) -> object | None:
             selected.append(name)
-            return original(manager, name, catalog, txn=txn)
+            return original(
+                manager, name, catalog, txn=txn, projection=projection
+            )
 
         monkeypatch.setattr(query_engine_module, "_catalog_active_index", recording)
 

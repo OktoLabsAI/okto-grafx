@@ -235,6 +235,24 @@ def test_a_bucket_chain_that_returns_to_a_page_is_refused(database: Database) ->
     assert refused.value.details["page"] == pages[0]
 
 
+def test_a_short_bucket_walk_does_not_ask_the_device_for_its_page_count(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The anti-corruption size bound is lazy while the ordinary short-chain path stays cheap."""
+
+    calls = 0
+    original = database.device.page_count
+
+    def counted(file: str) -> int:
+        nonlocal calls
+        calls += 1
+        return original(file)
+
+    monkeypatch.setattr(database.device, "page_count", counted)
+    assert database.exact._bucket_pages(0) == (1,)
+    assert calls == 0
+
+
 def test_a_bucket_chain_that_does_not_end_is_refused_when_the_visited_set_is_defeated(
     database: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:

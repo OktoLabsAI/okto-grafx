@@ -75,6 +75,7 @@ from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxError,
     GrafxIndexError,
+    GrafxUnsupportedOperation,
     GrafxVectorValidationError,
 )
 from okto_grafx.domain.ids import NO_LSN, Csn, Lsn, RecordId, RecordRef
@@ -1325,6 +1326,7 @@ class VectorEngine:
         "_durable_by_space",
         "_maintained_at",
         "_guard",
+        "_catalog_changes_are_wal_logged",
     )
 
     def __init__(
@@ -1344,6 +1346,7 @@ class VectorEngine:
         ef_construction: int = DEFAULT_EF_CONSTRUCTION,
         ef_search: int = DEFAULT_EF_SEARCH,
         guard: GraphGuard | None = None,
+        catalog_changes_are_wal_logged: bool = False,
     ) -> None:
         """Build the engine over one catalog, one heap and one index registry.
 
@@ -1387,6 +1390,13 @@ class VectorEngine:
         self._durable_by_space: dict[str, VectorHnswIndex] = {}
         self._maintained_at: dict[str, float] = {}
         self._guard = guard
+        if type(catalog_changes_are_wal_logged) is not bool:
+            raise GrafxConfigurationError(
+                "catalog_changes_are_wal_logged must be exactly True or False.",
+                field="catalog_changes_are_wal_logged",
+                value=repr(catalog_changes_are_wal_logged),
+            )
+        self._catalog_changes_are_wal_logged = catalog_changes_are_wal_logged
 
     # --- spaces -------------------------------------------------------------------------------
 
@@ -1420,6 +1430,15 @@ class VectorEngine:
                 field="definition",
                 value=type(definition).__name__,
             )
+        if self._catalog_changes_are_wal_logged:
+            raise GrafxUnsupportedOperation(
+                "Direct VectorEngine.create_space() is disabled in this composition because "
+                "catalog changes must be staged through a write transaction; execute CREATE "
+                "VECTOR SPACE instead.",
+                operation="create_space",
+                field="catalog_mutation",
+                value="direct",
+            )
         self._catalog.catalog.add_space(definition)
         self._catalog.save()
         self._emit(
@@ -1430,6 +1449,14 @@ class VectorEngine:
 
     def retire_space(self, name: str) -> None:
         """Close the write door of one embedding space, leaving it readable forever (FR-3)."""
+        if self._catalog_changes_are_wal_logged:
+            raise GrafxUnsupportedOperation(
+                "Direct VectorEngine.retire_space() is disabled in this composition because "
+                "catalog changes must be staged through a write transaction.",
+                operation="retire_space",
+                field="catalog_mutation",
+                value="direct",
+            )
         retired = self._catalog.catalog.retire_space(name)
         self._catalog.save()
         self._metrics.increment(_SPACES_RETIRED)
@@ -2090,6 +2117,13 @@ class VectorEngine:
             candidates: list[tuple[int, tuple[float, ...]]] = []
             location: dict[int, RecordRef] = {}
             scanned: set[int] = set()
+
+            def wanted(record_id: int, xmin: int, xmax: int) -> bool:
+                """Decide from the header alone, visibility first and then the filter (VEC-2)."""
+                if not snapshot.visible(xmin, xmax):
+                    return False
+                return admits is None or admits(record_id)
+
             for entry in index.walk():
                 # Two entries may name one heap location -- an entry filed under a key the row no
                 # longer carries sits beside the one that matches it, and the walk yields both.
@@ -2099,10 +2133,11 @@ class VectorEngine:
                 if encoded in scanned:
                     continue
                 scanned.add(encoded)
-                version = self._heap.read(entry.ref)
-                if not snapshot.visible(version.xmin, version.xmax):
-                    continue
-                if admits is not None and not admits(version.record_id):
+                # Header first: a row the snapshot cannot see, or the filter refuses, is never
+                # decoded, so its vector is never materialised (VEC-2). The order of the two
+                # decisions is the one the full read kept: visibility, then the filter.
+                version = self._heap.read_if(entry.ref, wanted)
+                if version is None:
                     continue
                 stored = self._vector_of_version(space, version, entry.ref)
                 require_space_identity(space, stored.space_ref, origin="stored vector")

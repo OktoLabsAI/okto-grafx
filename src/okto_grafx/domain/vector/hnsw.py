@@ -35,12 +35,17 @@ id, so no result depends on the iteration order of a set or a dictionary.
 
 from __future__ import annotations
 
+from bisect import insort
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from math import log
 
 from okto_grafx.domain.errors import GrafxConfigurationError
-from okto_grafx.domain.ports.vectormath import DistanceMetric, VectorMath
+from okto_grafx.domain.ports.vectormath import (
+    DistanceMetric,
+    PreparedVectorMath,
+    VectorMath,
+)
 from okto_grafx.domain.rand import SplitMix64
 
 __all__ = [
@@ -121,26 +126,28 @@ class TraversalStats:
     exhaustive: bool
 
 
+def _rank_key(item: tuple[float, int]) -> tuple[float, int]:
+    """Return the sort key of one scored node: best score first, then the lower node id."""
+    return (-item[0], item[1])
+
+
 def _insert_ranked(
     ranked: list[tuple[float, int]], score: float, node: int, limit: int | None = None
 ) -> None:
     """Insert one scored node into a list ordered best first, keeping at most ``limit`` of them.
 
     Ordering is descending by score and ascending by node id, which is the tie rule of the
-    ``VectorMath`` port (CONTRACT.md section 4.6). Doing it by hand rather than by a heap keeps
-    the order total and observable: a heap would leave equal scores in whatever order the sift
-    happened to produce.
+    ``VectorMath`` port (CONTRACT.md section 4.6). The position is found by binary search on
+    exactly that key rather than by a heap, which keeps the order total and observable: a heap
+    would leave equal scores in whatever order the sift happened to produce, whereas this list
+    reads as the ranking it is. An entry equal to one already present goes after it, where the
+    linear scan this replaces put it (VEC-5); a test holds the two to the same list.
 
     ``limit`` of None means the list is not truncated. The beam of a traversal uses that,
     because a node dropped from the beam is a node that was marked visited and will never be
     expanded -- which would silently break the exhaustiveness the wide-beam case depends on.
     """
-    for position, existing in enumerate(ranked):
-        if score > existing[0] or (score == existing[0] and node < existing[1]):
-            ranked.insert(position, (score, node))
-            break
-    else:
-        ranked.append((score, node))
+    insort(ranked, (score, node), key=_rank_key)
     if limit is not None and len(ranked) > limit:
         del ranked[limit:]
 
@@ -155,6 +162,7 @@ class HnswGraph:
 
     __slots__ = (
         "_math",
+        "_prepare",
         "_metric",
         "_neighbours",
         "_neighbours_zero",
@@ -183,6 +191,7 @@ class HnswGraph:
     ) -> None:
         """Build an empty graph whose shape is decided by the seed and the neighbour count."""
         self._math = math
+        self._prepare = math.prepare if isinstance(math, PreparedVectorMath) else None
         self._metric = metric
         self._neighbours = _require_positive("neighbours", neighbours)
         self._neighbours_zero = self._neighbours * 2
@@ -301,12 +310,13 @@ class HnswGraph:
             self._entry_point = node
             self._top_level = level
             return
+        scorer = self._scorer(components)
         current = self._entry_point
         for layer in range(self._top_level, level, -1):
-            current = self._descend(components, current, layer)
+            current = self._descend(scorer, current, layer)
         for layer in range(min(level, self._top_level), -1, -1):
             found = self._search_layer(
-                components, (current,), self._ef_construction, layer, None
+                scorer, (current,), self._ef_construction, layer, None
             )
             capacity = self._capacity(layer)
             for _score, neighbour in found[:capacity]:
@@ -365,13 +375,13 @@ class HnswGraph:
             return (), TraversalStats(
                 visited=0, bridges=0, admitted=0, hops=0, exhaustive=True
             )
-        components = tuple(float(component) for component in query)
+        scorer = self._scorer(tuple(float(component) for component in query))
         current = self._entry_point
         hops = 0
         for layer in range(self._top_level, 0, -1):
-            current, layer_hops = self._descend_counted(components, current, layer)
+            current, layer_hops = self._descend_counted(scorer, current, layer)
             hops += layer_hops
-        ranked, stats = self._search_layer_counted(components, (current,), ef, 0, admits)
+        ranked, stats = self._search_layer_counted(scorer, (current,), ef, 0, admits)
         return ranked, TraversalStats(
             visited=stats.visited,
             bridges=stats.bridges,
@@ -410,9 +420,22 @@ class HnswGraph:
         level = int(-log(draw) * self._level_scale)
         return level if level < MAX_LEVEL else MAX_LEVEL
 
-    def _score(self, query: tuple[float, ...], node: int) -> float:
-        """Return the similarity of a stored node to the query, higher meaning closer."""
-        return self._math.score(query, self._values[node], self._metric)
+    def _scorer(self, query: tuple[float, ...]) -> Callable[[int], float]:
+        """Return a function scoring stored nodes against one query, prepared once (VEC-4).
+
+        A traversal scores one query against every node it visits, so whatever depends on the
+        query alone is computed once here and reused, when the math adapter declares the
+        ``PreparedVectorMath`` capability. An adapter that implements only ``VectorMath`` is
+        scored through ``score`` exactly as before. Both paths answer the same number for the
+        same pair, and a test holds them to identical graphs, rankings and traversal counts.
+        """
+        values = self._values
+        if self._prepare is not None:
+            prepared = self._prepare(query, self._metric)
+            return lambda node: prepared(values[node])
+        math = self._math
+        metric = self._metric
+        return lambda node: math.score(query, values[node], metric)
 
     def _link(self, left: int, right: int, layer: int) -> None:
         """Connect two nodes at one layer and trim both neighbourhoods back to capacity."""
@@ -441,10 +464,10 @@ class HnswGraph:
         capacity = self._capacity(layer)
         if peers is None or len(peers) <= capacity:
             return
-        values = self._values[node]
+        scorer = self._scorer(self._values[node])
         ranked: list[tuple[float, int]] = []
         for peer in peers:
-            _insert_ranked(ranked, self._score(values, peer), peer, capacity)
+            _insert_ranked(ranked, scorer(peer), peer, capacity)
         kept = [peer for _score, peer in ranked]
         adjacency[node] = kept
         retained = set(kept)
@@ -500,13 +523,13 @@ class HnswGraph:
         self._entry_point = best
         self._top_level = best_level if best is not None else 0
 
-    def _descend(self, query: tuple[float, ...], start: int, layer: int) -> int:
+    def _descend(self, scorer: Callable[[int], float], start: int, layer: int) -> int:
         """Return the closest node to the query reachable by greedy steps at one layer."""
-        node, _hops = self._descend_counted(query, start, layer)
+        node, _hops = self._descend_counted(scorer, start, layer)
         return node
 
     def _descend_counted(
-        self, query: tuple[float, ...], start: int, layer: int
+        self, scorer: Callable[[int], float], start: int, layer: int
     ) -> tuple[int, int]:
         """Greedily walk downhill at one layer, returning the arrival and the steps taken.
 
@@ -516,7 +539,7 @@ class HnswGraph:
         and a correct one never reaches.
         """
         current = start
-        current_score = self._score(query, current)
+        current_score = scorer(current)
         hops = 0
         budget = len(self._values) + 1
         while budget > 0:
@@ -524,7 +547,7 @@ class HnswGraph:
             best = current
             best_score = current_score
             for neighbour in sorted(self.neighbours_of(current, layer)):
-                score = self._score(query, neighbour)
+                score = scorer(neighbour)
                 if score > best_score or (score == best_score and neighbour < best):
                     best = neighbour
                     best_score = score
@@ -537,19 +560,21 @@ class HnswGraph:
 
     def _search_layer(
         self,
-        query: tuple[float, ...],
+        scorer: Callable[[int], float],
         entry_points: Iterable[int],
         ef: int,
         layer: int,
         admits: Callable[[int], bool] | None,
     ) -> tuple[tuple[float, int], ...]:
         """Return the best admitted nodes at one layer, discarding the traversal statistics."""
-        ranked, _stats = self._search_layer_counted(query, entry_points, ef, layer, admits)
+        ranked, _stats = self._search_layer_counted(
+            scorer, entry_points, ef, layer, admits
+        )
         return ranked
 
     def _search_layer_counted(
         self,
-        query: tuple[float, ...],
+        scorer: Callable[[int], float],
         entry_points: Iterable[int],
         ef: int,
         layer: int,
@@ -591,7 +616,7 @@ class HnswGraph:
             if node in visited or node not in self._values:
                 continue
             visited.add(node)
-            score = self._score(query, node)
+            score = scorer(node)
             _insert_ranked(beam, score, node)
             if admits is None or admits(node):
                 _insert_ranked(results, score, node, ef)
@@ -606,7 +631,7 @@ class HnswGraph:
                 if neighbour in visited:
                     continue
                 visited.add(neighbour)
-                neighbour_score = self._score(query, neighbour)
+                neighbour_score = scorer(neighbour)
                 if len(results) < ef or neighbour_score > results[-1][0]:
                     _insert_ranked(beam, neighbour_score, neighbour)
                     if admits is None or admits(neighbour):

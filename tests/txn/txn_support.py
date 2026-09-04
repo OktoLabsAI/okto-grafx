@@ -456,6 +456,7 @@ def build_stack(
     retain_lease: bool = False,
     identity_lease_size: int = 64,
     process_identity_provider: Callable[[], object] | None = None,
+    catalog_changes_are_wal_logged: bool = False,
 ) -> Stack:
     """Assemble a working database around a transaction manager."""
     device = storage if storage is not None else _device(root, page_size)
@@ -501,6 +502,7 @@ def build_stack(
         descriptor=f"hash-v1;partitions_per_table={partitions_per_table}",
         retain_lease=retain_lease,
         process_identity_provider=process_identity_provider,
+        catalog_changes_are_wal_logged=catalog_changes_are_wal_logged,
     )
     return Stack(
         root=root,

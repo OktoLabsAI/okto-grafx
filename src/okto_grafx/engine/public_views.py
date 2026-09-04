@@ -14,6 +14,7 @@ change bytes or engine bookkeeping are absent rather than hidden behind an ``uns
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, fields
 from enum import Enum
@@ -2400,9 +2401,24 @@ _QUERY_PLAN_AUXILIARY_TYPES: frozenset[type[object]] = frozenset(
 """Exact frozen dataclasses reachable from operator fields, excluding expressions."""
 
 
-def _query_plan_view(value: object) -> PlanNode:
-    """Rebuild a capability-free plan after checking its exact bounded grammar."""
+_OWNED_PLAN_VIEW_CACHE_MAX_ENTRIES: int = 128
+_OwnedPlanViewMemo = OrderedDict[int, tuple[PlanNode, PlanNode]]
+
+
+def _query_plan_view(
+    value: object,
+    *,
+    internally_owned: bool = False,
+    memo: _OwnedPlanViewMemo | None = None,
+) -> PlanNode:
+    """Rebuild a capability-free plan, memoizing only proven internal immutable roots."""
     try:
+        if internally_owned and memo is not None:
+            marker = id(value)
+            cached = memo.get(marker)
+            if cached is not None and cached[0] is value:
+                memo.move_to_end(marker)
+                return _query_owned_plan_clone(cached[1])
         nodes = _query_plan_nodes(value)
         detached: dict[int, PlanNode] = {}
         for node in reversed(nodes):
@@ -2415,7 +2431,16 @@ def _query_plan_view(value: object) -> PlanNode:
             )
             detached[id(node)] = clone  # type: ignore[assignment]
         root = detached[id(value)]
-        return validate_plan(root)
+        validated = validate_plan(root)
+        if internally_owned and memo is not None:
+            # Keep a template distinct from the first caller's result. Subsequent callers clone
+            # only this already validated, capability-free graph and never trust the raw root.
+            template = _query_owned_plan_clone(validated)
+            memo[id(value)] = (value, template)
+            memo.move_to_end(id(value))
+            if len(memo) > _OWNED_PLAN_VIEW_CACHE_MAX_ENTRIES:
+                memo.popitem(last=False)
+        return validated
     except GrafxPlanError:
         raise
     except Exception as failure:  # noqa: BLE001 - malformed collaborator output is a plan error
@@ -2426,6 +2451,58 @@ def _query_plan_view(value: object) -> PlanNode:
             value="malformed",
             cause=observed,
         ) from failure
+
+
+def _query_owned_plan_clone(value: PlanNode) -> PlanNode:
+    """Clone a previously validated closed-grammar plan without re-running hostile checks."""
+    cloned = _query_owned_plan_field_clone(value)
+    if type(cloned) not in _QUERY_PLAN_NODE_TYPES:  # pragma: no cover - closed helper grammar
+        raise GrafxPlanError(
+            "An internally owned plan template lost its operator root.",
+            field="plan",
+            value="internal_template",
+        )
+    return cloned  # type: ignore[return-value]
+
+
+def _query_owned_plan_field_clone(value: object) -> object:
+    """Reconstruct exact frozen plan dataclasses and tuples from a validated private template."""
+    exact = type(value)
+    if (
+        exact in _QUERY_PLAN_NODE_TYPES
+        or exact in _QUERY_PLAN_EXPRESSION_TYPES
+        or exact in _QUERY_PLAN_AUXILIARY_TYPES
+    ):
+        if exact is Literal:
+            return Literal(
+                value=_query_value_snapshot(
+                    _domain_field(value, Literal, "value"),
+                    field="plan.literal",
+                    depth=0,
+                    active=set(),
+                )
+            )
+        return exact(
+            **{
+                declared.name: _query_owned_plan_field_clone(
+                    _domain_field(value, exact, declared.name)
+                )
+                for declared in fields(exact)
+            }
+        )
+    if exact is tuple:
+        return tuple(
+            _query_owned_plan_field_clone(item) for item in tuple.__iter__(value)  # type: ignore[arg-type]
+        )
+    if exact in (str, bytes, int, float, bool, type(None)):
+        return value
+    if isinstance(value, Enum):
+        return exact(value.value)
+    raise GrafxPlanError(
+        "An internally owned plan template contains a field outside the closed grammar.",
+        field="plan",
+        value=_builtin_type_name(value),
+    )
 
 
 def _query_plan_nodes(value: object) -> tuple[PlanNode, ...]:
@@ -2729,11 +2806,16 @@ def _query_result_view(
     value: object,
     *,
     max_string_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+    internally_owned_plan: bool = False,
+    plan_memo: _OwnedPlanViewMemo | None = None,
 ) -> QueryResult:
     """Rebuild one result and normalize every malformed collaborator shape as a plan error."""
     try:
         return _query_result_snapshot(
-            value, max_string_characters=max_string_characters
+            value,
+            max_string_characters=max_string_characters,
+            internally_owned_plan=internally_owned_plan,
+            plan_memo=plan_memo,
         )
     except GrafxPlanError:
         raise
@@ -2751,6 +2833,8 @@ def _query_result_snapshot(
     value: object,
     *,
     max_string_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+    internally_owned_plan: bool = False,
+    plan_memo: _OwnedPlanViewMemo | None = None,
 ) -> QueryResult:
     """Rebuild one fully materialised query result outside the page-access section."""
     # Local import avoids making the query engine depend on the public-view module that rebuilds
@@ -2820,7 +2904,15 @@ def _query_result_snapshot(
         )
 
     raw_plan = _domain_field(source, QueryResult, "plan")
-    plan = None if raw_plan is None else _query_plan_view(raw_plan)
+    plan = (
+        None
+        if raw_plan is None
+        else _query_plan_view(
+            raw_plan,
+            internally_owned=internally_owned_plan,
+            memo=plan_memo,
+        )
+    )
     statistics = _query_statistics_snapshot(
         _domain_field(source, QueryResult, "statistics")
     )

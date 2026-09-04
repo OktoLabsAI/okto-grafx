@@ -51,7 +51,14 @@ MINIMUM_FRAMES: int = 2
 class CatalogStore:
     """Load, save and repair the catalog of one database through its own paged file."""
 
-    __slots__ = ("_pool", "_file", "_catalog", "_loaded_epoch", "_persisted_image")
+    __slots__ = (
+        "_pool",
+        "_file",
+        "_catalog",
+        "_loaded_epoch",
+        "_persisted_image",
+        "_bootstrapped_epoch",
+    )
 
     def __init__(self, pool: BufferPool, *, file: str = CATALOG_FILE) -> None:
         """Bind the store to a buffer pool and a file, starting from an empty catalog."""
@@ -78,6 +85,9 @@ class CatalogStore:
         # that the invariant is total -- a store that never read is still a store whose empty
         # catalog would overwrite whatever a replay put under it.
         self._loaded_epoch: int = self._pool.structure_epoch(self._file)
+        # This memo belongs only to internal require doors. ``is_bootstrapped`` remains an
+        # authoritative physical probe every time a public caller asks it.
+        self._bootstrapped_epoch: int | None = None
 
     def has_unsaved_changes(self) -> bool:
         """Return True when this store holds a catalog the pages do not.
@@ -169,11 +179,14 @@ class CatalogStore:
         """
         storage = self._pool.storage
         if not storage.exists(self._file) or storage.page_count(self._file) == 0:
+            self._bootstrapped_epoch = None
             return False
         with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
             if page.is_pristine():
+                self._bootstrapped_epoch = None
                 return False
             self._require_header_page(page)
+        self._bootstrapped_epoch = self._pool.derived_epoch(self._file)
         return True
 
     def bootstrap(self) -> Catalog:
@@ -652,6 +665,14 @@ class CatalogStore:
 
     def _require_bootstrapped(self) -> None:
         """Refuse to work against a catalog file that has not been created yet."""
+        if self._bootstrapped_epoch == self._pool.derived_epoch(self._file):
+            # Reuse only the device-existence/page-count proof.  A resident header can still be
+            # modified without moving the pool's derived epoch, so keep the cheap hot-frame pin
+            # and structural validation that prevents an in-memory corruption from being hidden
+            # behind this optimization.
+            with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
+                self._require_header_page(page)
+            return
         if not self.is_bootstrapped():
             raise GrafxCorruptionDetected(
                 f"The catalog file {self._file!r} has no header page; call bootstrap() first.",

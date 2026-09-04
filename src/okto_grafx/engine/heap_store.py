@@ -583,7 +583,13 @@ class _HeapBloatSample:
 class HeapStore:
     """Insert, update, delete, read and scan record versions over a paged heap file."""
 
-    __slots__ = ("_pool", "_catalog", "_file", "_tail_cache")
+    __slots__ = (
+        "_pool",
+        "_catalog",
+        "_file",
+        "_tail_cache",
+        "_bootstrapped_epoch",
+    )
 
     def __init__(
         self, pool: BufferPool, catalog: CatalogStore, *, file: str = HEAP_FILE
@@ -604,6 +610,9 @@ class HeapStore:
         # cache of this instance and of nothing else: the durable hint on page 0 is what a cold
         # start and another process read (A40.3).
         self._tail_cache: dict[int, tuple[PageIndex, int, int]] = {}
+        # Internal operations may reuse a successful header proof only while the exact page
+        # view it proved remains current. The public predicate never trusts this memo.
+        self._bootstrapped_epoch: int | None = None
 
     @property
     def catalog(self) -> CatalogStore:
@@ -650,11 +659,14 @@ class HeapStore:
         """
         storage = self._pool.storage
         if not storage.exists(self._file) or storage.page_count(self._file) == 0:
+            self._bootstrapped_epoch = None
             return False
         with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
             if page.is_pristine():
+                self._bootstrapped_epoch = None
                 return False
             self._require_header_page(page)
+        self._bootstrapped_epoch = self._pool.derived_epoch(self._file)
         return True
 
     def bootstrap(self) -> None:
@@ -1508,33 +1520,42 @@ class HeapStore:
         abandoned, unpublished attempts and therefore cannot raise the committed watermark.
         """
         high_water: Lsn = NO_LSN
-        for _ref, header, _content in self._walk(table, copy_content=False):
-            if is_committed_csn(header.xmin):
-                high_water = max(high_water, header.xmin)
-            elif header.xmin != NO_CSN and not is_provisional_csn(header.xmin):
+
+        def observe(record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+            nonlocal high_water
+            if is_committed_csn(xmin):
+                high_water = max(high_water, xmin)
+            elif xmin != NO_CSN and not is_provisional_csn(xmin):
                 raise GrafxCorruptionDetected(
-                    f"Record {header.record_id} of table {table.name!r} has invalid birth "
-                    f"stamp {header.xmin}.",
+                    f"Record {record_id} of table {table.name!r} has invalid birth "
+                    f"stamp {xmin}.",
                     file=self._file,
                     table=table.name,
                     table_id=table.table_id,
-                    record_id=header.record_id,
+                    record_id=record_id,
                     field="xmin",
-                    value=header.xmin,
+                    value=xmin,
                 )
-            if is_committed_csn(header.xmax):
-                high_water = max(high_water, header.xmax)
-            elif header.xmax != NO_CSN and not is_provisional_csn(header.xmax):
+            if is_committed_csn(xmax):
+                high_water = max(high_water, xmax)
+            elif xmax != NO_CSN and not is_provisional_csn(xmax):
                 raise GrafxCorruptionDetected(
-                    f"Record {header.record_id} of table {table.name!r} has invalid end "
-                    f"stamp {header.xmax}.",
+                    f"Record {record_id} of table {table.name!r} has invalid end "
+                    f"stamp {xmax}.",
                     file=self._file,
                     table=table.name,
                     table_id=table.table_id,
-                    record_id=header.record_id,
+                    record_id=record_id,
                     field="xmax",
-                    value=header.xmax,
+                    value=xmax,
                 )
+            # ``_walk`` performs the same fixed-header unpack before invoking this predicate.
+            # Rejecting every row avoids constructing RecordHeader values and per-page result
+            # lists while still walking and validating every page and both MVCC stamps.
+            return False
+
+        for _unused in self._walk(table, accept=observe, copy_content=False):
+            raise AssertionError("the high-water observer must not materialize heap versions")
         return high_water
 
     def read(self, ref: RecordRef) -> HeapVersion:
@@ -1542,6 +1563,30 @@ class HeapStore:
         table_id, content = self._read_slot(ref)
         table = self._catalog.catalog.table_by_id(table_id)
         return self._decode_version(table, content)
+
+    def read_if(
+        self,
+        ref: RecordRef,
+        accept: Callable[[RecordId, Csn, Csn], bool],
+    ) -> HeapVersion | None:
+        """Return the version at that location if the predicate accepts its header, else None.
+
+        The header-first sibling of :meth:`read` (VEC-2). The predicate sees ``record_id``,
+        ``xmin`` and ``xmax`` from one struct unpack of the raw slot -- the same three fields,
+        from the same unpack, that :meth:`_walk` offers its predicate -- and only a version it
+        accepts is decoded: the payload, and the vector inside it, are never materialised for a
+        row a snapshot cannot see or a filter refuses. Everything :meth:`read` checks before it
+        decodes is checked here in the same order: the location names a record slot of a data
+        page, and the table of that page is the table the version is decoded with.
+        """
+        table_id, content = self._read_slot(ref)
+        table = self._catalog.catalog.table_by_id(table_id)
+        fields = RecordHeader.peek(content)
+        if not accept(fields[4], fields[5], fields[6]):
+            return None
+        return self._decode_version_with_header(
+            table, RecordHeader._from_peek(fields), content
+        )
 
     def _revalidate_visible_ref(
         self,
@@ -2370,6 +2415,15 @@ class HeapStore:
 
     def _require_bootstrapped(self) -> None:
         """Refuse to work against a heap file that has not been created yet."""
+        if self._bootstrapped_epoch == self._pool.derived_epoch(self._file):
+            # The memo removes the repeated device-level ``exists`` and ``page_count`` probes,
+            # not the page-level integrity check.  The header may have been changed through a
+            # resident writable page without moving the pool's derived epoch; pinning that hot
+            # frame is cheap and preserves the rule that a damaged in-memory header is refused
+            # before any heap operation proceeds.
+            with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
+                self._require_header_page(page)
+            return
         if not self.is_bootstrapped():
             raise GrafxCorruptionDetected(
                 f"The heap file {self._file!r} has no header page; call bootstrap() first.",
@@ -2628,10 +2682,9 @@ class HeapStore:
             with self._pool.pinned(self._file, index) as page:
                 self._require_table_page(page, table)
                 items: list[tuple[SlotId, RecordHeader, bytes]] = []
-                for slot in page.live_slots():
+                for slot, view in page.iter_slot_views():
                     if slot < FIRST_RECORD_SLOT:
                         continue
-                    view = page.slot_view(slot)
                     if accept is None:
                         header = RecordHeader.decode(view)
                     else:

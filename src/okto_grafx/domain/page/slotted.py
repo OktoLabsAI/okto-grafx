@@ -18,7 +18,7 @@ the checksum field in the first four bytes.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from struct import calcsize
+from struct import Struct, calcsize, error as StructError
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -38,7 +38,6 @@ from okto_grafx.domain.page.layout import (
     SLOT_ENTRY_SIZE,
     PageHeader,
     PageType,
-    decode_slot_entry,
     encode_slot_entry,
     validate_page_size,
 )
@@ -47,6 +46,42 @@ __all__ = ["FREE_SLOT", "Page"]
 
 FREE_SLOT: tuple[int, int] = (0, 0)
 """The directory entry of a slot that has been freed: offset zero, length zero."""
+
+_MEMORYVIEW_OVERHEAD: int = memoryview(b"").__sizeof__()
+
+_DIRECTORY_STRUCTS: dict[int, Struct] = {}
+"""Bounded-by-page-size cache of the v1 slot-directory layouts.
+
+The directory is stored in reverse slot order. Packing or unpacking the whole directory with
+one ``Struct`` avoids one Python/C boundary crossing per slot while leaving the byte format and
+the structural proof unchanged. At most ``MAX_PAGE_SIZE // SLOT_ENTRY_SIZE`` distinct layouts
+can be reached from a valid page image, so corrupt input cannot grow this cache without bound.
+"""
+
+
+def _directory_struct(slot_count: int) -> Struct:
+    layout = _DIRECTORY_STRUCTS.get(slot_count)
+    if layout is None:
+        layout = Struct(f"<{slot_count * 2}H")
+        _DIRECTORY_STRUCTS[slot_count] = layout
+    return layout
+
+
+def _encode_directory(entries: list[tuple[int, int]]) -> bytes:
+    """Encode a complete v1 directory, retaining the scalar oracle for invalid state."""
+
+    flat: list[int] = []
+    for offset, length in reversed(entries):
+        # ``struct`` accepts bool while the public scalar encoder deliberately refuses it. A
+        # Page cannot acquire this shape through its API, but preserving the classified error
+        # for a privately damaged value keeps the optimized path observationally identical.
+        if isinstance(offset, bool) or isinstance(length, bool):
+            return b"".join(encode_slot_entry(*entry) for entry in reversed(entries))
+        flat.extend((offset, length))
+    try:
+        return _directory_struct(len(entries)).pack(*flat)
+    except (StructError, TypeError):
+        return b"".join(encode_slot_entry(*entry) for entry in reversed(entries))
 
 
 class Page:
@@ -69,6 +104,7 @@ class Page:
         "_reserved",
         "_slots",
         "_data",
+        "_data_view",
         "_free_start",
         "_dirty",
     )
@@ -95,6 +131,7 @@ class Page:
         self._reserved: int = 0
         self._slots: list[tuple[int, int]] = []
         self._data: bytearray = bytearray(self._page_size)
+        self._data_view: memoryview = memoryview(self._data).toreadonly()
         self._free_start: int = PAGE_HEADER_SIZE
         self._dirty: bool = False
 
@@ -281,7 +318,20 @@ class Page:
         decoder from bypassing the page's dirty tracking and slot geometry.
         """
         offset, length = self._entry(slot)
-        return memoryview(self._data)[offset : offset + length].toreadonly()
+        return self._data_view[offset : offset + length]
+
+    def iter_slot_views(self) -> Iterator[tuple[SlotId, memoryview]]:
+        """Yield live slot ids and read-only views without rebuilding a view per slot.
+
+        This is the zero-copy counterpart of :meth:`iter_slots`. The page owns one read-only
+        view of its fixed-size payload buffer and slices it for the duration of a pinned walk;
+        callers retain neither the iterator nor its views across mutation.
+        """
+
+        view = self._data_view
+        for slot, (offset, length) in enumerate(self._slots):
+            if (offset, length) != FREE_SLOT:
+                yield slot, view[offset : offset + length]
 
     def slot_length(self, slot: SlotId) -> int:
         """Return the payload length of the slot."""
@@ -395,6 +445,7 @@ class Page:
             + list_capacity * pointer
             + slots * slot_value
             + scalar_fields * integer_value
+            + _MEMORYVIEW_OVERHEAD
             + pointer
         )
 
@@ -417,6 +468,7 @@ class Page:
             rebuilt.append((cursor, length))
             cursor += length
         self._data = packed
+        self._data_view = memoryview(self._data).toreadonly()
         self._slots = rebuilt
         self._free_start = cursor
         reclaimed = before - cursor
@@ -451,6 +503,7 @@ class Page:
         """Drop every slot and every payload byte, keeping the header fields."""
         self._slots = []
         self._data = bytearray(self._page_size)
+        self._data_view = memoryview(self._data).toreadonly()
         self._free_start = PAGE_HEADER_SIZE
         self._dirty = True
 
@@ -475,6 +528,7 @@ class Page:
         self._reserved = other._reserved
         self._slots = list(other._slots)
         self._data = bytearray(other._data)
+        self._data_view = memoryview(self._data).toreadonly()
         self._free_start = other._free_start
         self._dirty = True
 
@@ -499,6 +553,7 @@ class Page:
         clone._reserved = self._reserved
         clone._slots = list(self._slots)
         clone._data = bytearray(self._data)
+        clone._data_view = memoryview(clone._data).toreadonly()
         clone._free_start = self._free_start
         clone._dirty = self._dirty
         return clone
@@ -511,12 +566,9 @@ class Page:
         image[PAGE_HEADER_SIZE : self._free_start] = self._data[
             PAGE_HEADER_SIZE : self._free_start
         ]
-        position = self._page_size
-        for offset, length in self._slots:
-            position -= SLOT_ENTRY_SIZE
-            image[position : position + SLOT_ENTRY_SIZE] = encode_slot_entry(
-                offset, length
-            )
+        if self._slots:
+            directory_start = self._page_size - len(self._slots) * SLOT_ENTRY_SIZE
+            image[directory_start:] = _encode_directory(self._slots)
         image[0:PAGE_HEADER_SIZE] = self.header().encode()
         checksum = crc32c(bytes(image[CHECKSUM_SIZE : self._page_size]))
         image[0:CHECKSUM_SIZE] = checksum.to_bytes(CHECKSUM_SIZE, "little")
@@ -783,9 +835,15 @@ def _decode_directory(
         )
     entries: list[tuple[int, int]] = []
     occupied: list[tuple[int, int]] = []
+    flat = (
+        _directory_struct(header.slot_count).unpack_from(raw, header.free_end)
+        if header.slot_count
+        else ()
+    )
     for slot in range(header.slot_count):
-        position = size - (slot + 1) * SLOT_ENTRY_SIZE
-        offset, length = decode_slot_entry(raw, position)
+        reversed_slot = header.slot_count - slot - 1
+        offset = flat[reversed_slot * 2]
+        length = flat[reversed_slot * 2 + 1]
         if (offset, length) == FREE_SLOT:
             entries.append(FREE_SLOT)
             continue

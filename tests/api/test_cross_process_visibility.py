@@ -323,6 +323,43 @@ def test_foreign_row_dml_does_not_rescan_the_index_inventory(
         publisher.close()
 
 
+def test_a_row_commit_with_unchanged_authority_skips_the_registry_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The commit keeps its final inventory proof without repeating catalog adoption."""
+
+    database = connect(
+        tmp_path / "unchanged-authority-commit",
+        checkpoint_interval_records=1_000_000,
+    )
+    pending = None
+    try:
+        with database.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")
+
+        pending = database.begin("write")
+        pending.execute("CREATE (:P {id: 1})")
+        original_sync = database._transactions._index_sync
+        sync_calls = 0
+
+        def counted_sync() -> object:
+            nonlocal sync_calls
+            sync_calls += 1
+            assert original_sync is not None
+            return original_sync()
+
+        monkeypatch.setattr(database._transactions, "_index_sync", counted_sync)
+
+        pending.commit()
+        assert sync_calls == 0
+        assert database.execute("MATCH (p:P) RETURN p.id").rows == ((1,),)
+        assert database.verify("all").clean is True
+    finally:
+        if pending is not None and pending.active:
+            pending.rollback()
+        database.close()
+
+
 def test_a_speculative_index_with_a_reused_table_id_never_indexes_foreign_rows(
     tmp_path: Path,
 ) -> None:

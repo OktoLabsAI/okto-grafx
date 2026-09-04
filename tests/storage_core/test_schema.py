@@ -301,6 +301,42 @@ def test_a_tuple_round_trips_through_its_schema() -> None:
     assert decode_tuple(table, raw) == values
 
 
+def test_scalar_tuple_decoding_uses_the_schema_plan_without_generic_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching scalar tag takes the planned decoder; compound and mismatched tags keep the oracle."""
+
+    table = TableDef(
+        table_id=77,
+        name="ScalarRow",
+        kind="node",
+        columns=(
+            ColumnDef(name="flag", type=ValueType.BOOL, nullable=False),
+            ColumnDef(name="count", type=ValueType.INT64, nullable=False),
+            ColumnDef(name="ratio", type=ValueType.DOUBLE, nullable=False),
+            ColumnDef(name="text", type=ValueType.STRING, nullable=False),
+            ColumnDef(name="raw", type=ValueType.BYTES, nullable=False),
+            ColumnDef(name="instant", type=ValueType.TIMESTAMP, nullable=False),
+            ColumnDef(name="uuid", type=ValueType.UUID, nullable=False),
+        ),
+    )
+    values = (
+        True,
+        -9,
+        0.25,
+        "planned",
+        b"bytes",
+        Timestamp(123),
+        Uuid(bytes(range(16))),
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("matching scalar columns must not use generic tag dispatch")
+
+    monkeypatch.setattr(schema_module, "decode_value", forbidden)
+    assert decode_tuple(table, encode_tuple(table, values)) == values
+
+
 def test_a_null_is_allowed_only_where_the_column_says_so() -> None:
     table = person_table()
     assert decode_tuple(table, encode_tuple(table, (7, None, 1.0))) == (7, None, 1.0)

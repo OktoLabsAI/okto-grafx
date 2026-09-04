@@ -32,6 +32,7 @@ detail is exactly the defect A47 was written about.
 from __future__ import annotations
 
 import struct
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -158,7 +159,7 @@ from okto_grafx.engine.public_views import (
     _vectors_view,
     _wal_view,
 )
-from okto_grafx.engine.query_engine import QueryResult
+from okto_grafx.engine.query_engine import QueryEngine, QueryResult
 from okto_grafx.engine.txn_manager import TransactionManager
 from okto_grafx.engine.vector_engine import VectorSearchResult
 from okto_grafx.engine.verifier import VERIFICATION_SCOPES
@@ -692,6 +693,11 @@ def _public_snapshot(value: Snapshot) -> Snapshot:
             value=_builtin_type_name(value),
         )
     return Snapshot(_builtin_int(_domain_field(value, Snapshot, "read_lsn")))
+
+
+def _engine_owns_prepared_plan(engine: object, plan: object) -> bool:
+    """Trust memoization only after the exact built-in engine proves root ownership."""
+    return type(engine) is QueryEngine and engine._owns_prepared_plan(plan)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1455,6 +1461,7 @@ class Database:
         "_pool",
         "_catalog",
         "_catalog_view_memo",
+        "_plan_view_memo",
         "_heap",
         "_wal",
         "_transactions",
@@ -1553,6 +1560,12 @@ class Database:
             tuple[bytes, int, dict[int, object], dict[int, object], CatalogStoreView]
             | None
         ) = None
+        # This cache lives behind the injected facade transition rather than owning a lock.
+        # Strong source identity prevents id reuse; bounded entries contain only immutable plan
+        # values and their already validated, capability-free templates.
+        self._plan_view_memo: OrderedDict[
+            int, tuple[PlanNode, PlanNode]
+        ] = OrderedDict()
         self._heap: HeapStore = heap
         self._wal: WalManager = wal
         self._transactions: TransactionManager = transactions
@@ -2170,6 +2183,8 @@ class Database:
                 metadata = _query_result_view(
                     QueryResult(columns=columns, plan=plan),  # type: ignore[arg-type]
                     max_string_characters=self._max_query_value_characters,
+                    internally_owned_plan=_engine_owns_prepared_plan(engine, plan),
+                    plan_memo=self._plan_view_memo,
                 )
                 if metadata.plan is None:
                     raise GrafxConfigurationError(
@@ -2296,7 +2311,11 @@ class Database:
                 # turn validation before canonicalisation into a stale permission to plan.
                 self._require_open()
                 raw_plan = engine.explain(statement)  # type: ignore[attr-defined]
-            return _query_plan_view(raw_plan)
+            return _query_plan_view(
+                raw_plan,
+                internally_owned=_engine_owns_prepared_plan(engine, raw_plan),
+                memo=self._plan_view_memo,
+            )
 
     def _run_statement(
         self,
@@ -2337,6 +2356,14 @@ class Database:
             return _query_result_view(
                 raw_result,
                 max_string_characters=self._max_query_value_characters,
+                internally_owned_plan=(
+                    type(raw_result) is QueryResult
+                    and _engine_owns_prepared_plan(
+                        engine,
+                        _domain_field(raw_result, QueryResult, "plan"),
+                    )
+                ),
+                plan_memo=self._plan_view_memo,
             )
 
     def _run_many(
@@ -2445,7 +2472,10 @@ class Database:
                                     batch_index=completed,
                                 )
                             raw_result = engine._execute_parsed(  # type: ignore[attr-defined]
-                                statement, context, detached_parameters
+                                statement,
+                                context,
+                                detached_parameters,
+                                cache_text=statement_text,
                             )
                     except GrafxError as failure:
                         _note_batch_index(failure, completed)
