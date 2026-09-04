@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Sequence
+from inspect import getattr_static
 from typing import Protocol, cast, runtime_checkable
 
 from okto_grafx.domain.errors import (
@@ -1984,14 +1985,33 @@ def _carried_body(body: bytes, entry_name: str, detail: str) -> tuple[bytes, str
 
 
 def _require_port(slot: str, instance: object, methods: Sequence[str]) -> None:
-    """Refuse a port or collaborator that cannot answer the doors recovery opens (G5)."""
-    missing = [name for name in methods if not hasattr(instance, name)]
+    """Refuse a port or collaborator that cannot answer the doors recovery opens (G5).
+
+    Inspect declared attributes without invoking descriptors.  In particular, ``damage`` is
+    scan-backed on a freshly opened native WAL (and may be on alternative implementations), so
+    ``hasattr`` would perform a full pass merely to validate the port shape.  A dynamic fallback
+    keeps transparent ``__getattr__`` wrappers compatible; as with ``hasattr``, only
+    ``AttributeError`` means that a door is absent and every other exception remains visible.
+    """
+    missing = [name for name in methods if not _port_has_attribute(instance, name)]
     if missing:
         raise GrafxPortNotConfigured(
             f"The {slot} port of recovery is missing {', '.join(missing)}.",
             slot=slot,
             missing=tuple(missing),
         )
+
+
+def _port_has_attribute(instance: object, name: str) -> bool:
+    """Return whether ``instance`` declares or dynamically supplies ``name`` without eager IO."""
+    try:
+        getattr_static(instance, name)
+    except AttributeError:
+        try:
+            getattr(instance, name)
+        except AttributeError:
+            return False
+    return True
 
 
 def _one_policy(recovery_policy: object, policy: object) -> object:
