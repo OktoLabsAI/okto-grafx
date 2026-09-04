@@ -233,6 +233,34 @@ def test_a_warm_planner_uses_the_exact_live_count_without_an_entry_walk(
     assert builds == [0]
 
 
+def test_exact_scan_and_space_metrics_use_header_only_index_paths(
+    metrics: RecordingMetrics, clock: StepClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-17: the remaining ref/count consumers do not rebuild complete entry DTOs."""
+    database, corpus = _corpus_database(metrics, clock, threshold=CORPUS)
+    index = database.engine.index("space")
+    index._discard_live_count()
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a header-only vector path constructed an IndexEntry DTO")
+
+    monkeypatch.setattr(IndexEntry, "decode", classmethod(forbidden))
+    monkeypatch.setattr(IndexEntry, "located_at", forbidden)
+
+    result = database.engine.search(
+        space="space", query=corpus[0], k=5, snapshot=SnapshotDouble(1000)
+    )
+    database.engine._publish_space_metrics()
+
+    assert result.regime == REGIME_EXACT
+    assert [hit.record_id for hit in result.hits] == _brute_force(
+        database, corpus, corpus[0], 5
+    )
+    assert metrics.snapshot()["oktografx_vector_index_entries{space=space}"] == float(
+        CORPUS
+    )
+
+
 def test_the_two_regime_labels_are_the_bounded_domain_of_the_metric_label() -> None:
     """The label domain is closed, so a third regime would have to be declared before it exists."""
     assert REGIMES == {"exact", "approximate"} == {REGIME_EXACT, REGIME_APPROXIMATE}

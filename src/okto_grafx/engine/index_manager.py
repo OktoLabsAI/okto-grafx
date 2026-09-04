@@ -87,7 +87,11 @@ from okto_grafx.domain.index.definition import (
     index_file,
     index_generation_file,
 )
-from okto_grafx.domain.index.entry import INDEX_ENTRY_HEADER_SIZE, IndexEntry
+from okto_grafx.domain.index.entry import (
+    INDEX_ENTRY_HEADER_SIZE,
+    IndexEntry,
+    _validated_image,
+)
 from okto_grafx.domain.index.header import (
     INDEX_HEADER_FORMAT_VERSION,
     INDEX_HEADER_SLOT,
@@ -2420,8 +2424,51 @@ class IndexStore:
             self._require_index_page(page, page_index)
             return tuple(
                 IndexEntry.decode(payload).located_at(page_index, slot)
-                for slot, payload in page.iter_slots()
+                for slot, payload in page.iter_slot_views()
             )
+
+    def _entry_counts_from_headers(self) -> tuple[int, int]:
+        """Return ``(stored, live)`` after validating every entry without DTOs.
+
+        This is a private cost path, not a weaker walk.  It visits buckets, chains and slots in
+        exactly the order :meth:`walk` does and runs the shared entry-image validator on every
+        live slot.  Only the validated ``dead_csn`` field is retained, so callers which need an
+        entry, its key or its physical index location must continue to use :meth:`walk`.
+        """
+        stored = 0
+        live = 0
+        for bucket in range(self._definition.bucket_count):
+            for page_index in self._bucket_pages(bucket):
+                with self._pool.pinned(self.file, page_index) as page:
+                    self._require_index_page(page, page_index)
+                    for _slot, image in page.iter_slot_views():
+                        _image, _ref, _born_csn, dead_csn, _versioned = (
+                            _validated_image(image)
+                        )
+                        stored += 1
+                        if dead_csn == NO_CSN:
+                            live += 1
+        return stored, live
+
+    def _entry_refs_from_headers(self) -> tuple[RecordRef, ...]:
+        """Materialise every validated heap reference without constructing index DTOs.
+
+        The tuple is complete before the method returns, so no page pin or memoryview escapes to
+        the caller.  This door is intentionally insufficient for verification and maintenance:
+        those consumers need keys and index locations and therefore retain the canonical full
+        :meth:`walk`.
+        """
+        refs: list[RecordRef] = []
+        for bucket in range(self._definition.bucket_count):
+            for page_index in self._bucket_pages(bucket):
+                with self._pool.pinned(self.file, page_index) as page:
+                    self._require_index_page(page, page_index)
+                    for _slot, image in page.iter_slot_views():
+                        _image, encoded_ref, _born_csn, _dead_csn, _versioned = (
+                            _validated_image(image)
+                        )
+                        refs.append(RecordRef.decode(encoded_ref))
+        return tuple(refs)
 
     def _matching_entries_on(
         self, page_index: PageIndex, key: bytes, ref: RecordRef | None = None

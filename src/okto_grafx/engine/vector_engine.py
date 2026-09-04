@@ -793,7 +793,7 @@ class VectorHnswIndex(ProximityIndex):
                 generation = self._graph_generation
             # No pool or store operation occurs while the graph guard is held.
             return (
-                sum(1 for entry in self.walk() if entry.live),
+                self._entry_counts_from_headers()[1],
                 mark,
                 generation,
             )
@@ -839,11 +839,11 @@ class VectorHnswIndex(ProximityIndex):
                 ):
                     return self._live_count, mark, self._graph_generation
                 generation = self._graph_generation
-            # No pool operation occurs while the graph guard is held.  ``walk`` materialises
-            # the first cold count exactly as ``live_count`` does; D-12 makes every later query
-            # at this generation O(1).
+            # No pool operation occurs while the graph guard is held.  The header pass validates
+            # every stored image but avoids materialising entry DTOs; D-12 makes every later
+            # query at this generation O(1).
             return (
-                sum(1 for entry in self.walk() if entry.live),
+                self._entry_counts_from_headers()[1],
                 mark,
                 generation,
             )
@@ -2363,18 +2363,18 @@ class VectorEngine:
                         return False
                     return admits is None or admits(record_id)
 
-                for entry in index.walk():
+                for ref in index._entry_refs_from_headers():
                     # Two entries may name one heap location -- an entry filed under a key the
                     # row no longer carries sits beside the matching one. Deduplicate locations;
                     # two DISTINCT visible locations for one record remain a refusal below.
-                    encoded = entry.ref.encode()
+                    encoded = ref.encode()
                     if encoded in scanned:
                         continue
                     scanned.add(encoded)
-                    version = self._heap.read_if(entry.ref, wanted)
+                    version = self._heap.read_if(ref, wanted)
                     if version is None:
                         continue
-                    stored = self._vector_of_version(space, version, entry.ref)
+                    stored = self._vector_of_version(space, version, ref)
                     require_space_identity(
                         space, stored.space_ref, origin="stored vector"
                     )
@@ -2382,10 +2382,10 @@ class VectorEngine:
                         raise _duplicate_version(
                             space,
                             version.record_id,
-                            entry.ref,
+                            ref,
                             location[version.record_id],
                         )
-                    location[version.record_id] = entry.ref
+                    location[version.record_id] = ref
                     candidates.append((version.record_id, stored.values))
                 return candidates, location
 
@@ -2618,7 +2618,9 @@ class VectorEngine:
             labels = {"space": name}
             self._publish(
                 lambda index=index, labels=labels: self._metrics.set_gauge(
-                    _INDEX_ENTRIES, float(len(index.walk())), labels
+                    _INDEX_ENTRIES,
+                    float(index._entry_counts_from_headers()[0]),
+                    labels,
                 )
             )
             share = (live[name] / total) if total else 0.0

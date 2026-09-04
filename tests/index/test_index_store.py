@@ -401,6 +401,50 @@ def test_candidate_search_still_refuses_a_corrupt_non_matching_entry(
     assert refused.value.details["field"] == "flags"
 
 
+def test_header_only_index_paths_match_the_full_walk_without_entry_dtos(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-17: count/ref consumers validate slots without decode/located allocations."""
+    _fill_bucket(database, 60)
+    entries = database.exact.walk()
+    expected_counts = (
+        len(entries),
+        sum(1 for entry in entries if entry.live),
+    )
+    expected_refs = tuple(entry.ref for entry in entries)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a header-only path constructed an IndexEntry DTO")
+
+    monkeypatch.setattr(IndexEntry, "decode", classmethod(forbidden))
+    monkeypatch.setattr(IndexEntry, "located_at", forbidden)
+
+    assert database.exact._entry_counts_from_headers() == expected_counts
+    assert database.exact._entry_refs_from_headers() == expected_refs
+
+
+@pytest.mark.parametrize(
+    "reader",
+    ["_entry_counts_from_headers", "_entry_refs_from_headers"],
+)
+def test_header_only_index_paths_refuse_damage_in_any_slot(
+    database: Database, reader: str
+) -> None:
+    """Skipping DTO construction never turns an unneeded corrupt entry into invisible data."""
+    _fill_bucket(database, 60)
+    damaged = database.exact.walk()[-1]
+    with database.pool.pinned(database.exact.file, damaged.page) as page:
+        image = bytearray(page.read_slot(damaged.slot))
+        image[0] |= 0x80
+        page.update_slot(damaged.slot, image)
+
+    with pytest.raises(GrafxCorruptionDetected) as refused:
+        getattr(database.exact, reader)()
+
+    assert refused.value.details["field"] == "flags"
+    assert refused.value.details["value"] == 0x80
+
+
 def test_a_live_entry_is_the_one_no_commit_has_ended(database: Database) -> None:
     """The predicate every path in this component asks, pinned where it is defined.
 
