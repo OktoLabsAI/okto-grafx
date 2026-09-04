@@ -32,6 +32,7 @@ from okto_grafx.domain.model.catalog import (
     CATALOG_LEGACY_FORMAT_VERSION,
     CATALOG_MAGIC,
     HEAP_RECLAIM_V1_CAPABILITY,
+    WAL_RECORD_V2_CAPABILITY,
     Catalog,
 )
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
@@ -50,6 +51,7 @@ _CHECKSUM = struct.Struct("<I")
 
 _CAPABILITY_IDENTITY = 1 << 0
 _CAPABILITY_HEAP_RECLAIM = 1 << 1
+_CAPABILITY_WAL_RECORD_V2 = 1 << 2
 _VISIBILITY_EXACT = 1
 _DERIVATION_COLUMNS = 1
 _DERIVATION_RECORD_ID = 2
@@ -388,6 +390,33 @@ def test_a_pre_reclaim_v2_build_refuses_the_new_required_capability(
     with pytest.raises(GrafxSchemaVersionMismatch) as raised:
         Catalog.deserialize(raw)
     assert raised.value.details["unsupported"] == _CAPABILITY_HEAP_RECLAIM
+
+
+def test_wal_record_v2_capability_is_one_way_and_fences_an_older_v2_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = _schema_catalog()
+    catalog.upgrade_index_catalog((_identity(),))
+
+    assert catalog.enable_wal_record_v2() is catalog
+    raw = catalog.serialize()
+    assert catalog.enable_wal_record_v2().serialize() == raw
+    assert Catalog.deserialize(raw).required_capabilities() == (
+        IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY,
+        WAL_RECORD_V2_CAPABILITY,
+    )
+    assert _V2_EXTENSION.unpack_from(raw, _PREAMBLE.size)[0] == (
+        _CAPABILITY_IDENTITY | _CAPABILITY_WAL_RECORD_V2
+    )
+
+    monkeypatch.setattr(
+        catalog_module,
+        "_KNOWN_CAPABILITY_BITS",
+        _CAPABILITY_IDENTITY | _CAPABILITY_HEAP_RECLAIM,
+    )
+    with pytest.raises(GrafxSchemaVersionMismatch) as raised:
+        Catalog.deserialize(raw)
+    assert raised.value.details["unsupported"] == _CAPABILITY_WAL_RECORD_V2
 
 
 def test_v2_layout_and_numeric_tags_are_pinned_independently() -> None:

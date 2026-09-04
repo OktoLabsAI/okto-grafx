@@ -32,6 +32,7 @@ from okto_grafx.domain.wal.record import (
     WAL_MAGIC,
     HEADER_LENGTHS,
     WalRecord,
+    v2_record_semantics_error,
 )
 
 __all__ = [
@@ -58,6 +59,7 @@ class FailureReason(str, Enum):
     TRUNCATED_TAIL = "truncated_tail"
     BAD_MAGIC = "bad_magic"
     UNSUPPORTED_VERSION = "unsupported_version"
+    UNSUPPORTED_REQUIRED_RECORD = "unsupported_required_record"
     BAD_HEADER = "bad_header"
     CHECKSUM_FAILURE = "checksum_failure"
     UNREADABLE_DESCRIPTOR = "unreadable_descriptor"
@@ -159,7 +161,9 @@ def decode_record(data: bytes, offset: int = 0) -> DecodeOutcome:
                 f"this record claims {header_length}."
             ),
         )
-    expected_total = header_length + descriptor_length + payload_length + CHECKSUM_LENGTH
+    expected_total = (
+        header_length + descriptor_length + payload_length + CHECKSUM_LENGTH
+    )
     if total_length != expected_total:
         return DecodeOutcome(
             consumed=0,
@@ -218,4 +222,13 @@ def decode_record(data: bytes, offset: int = 0) -> DecodeOutcome:
             detail=f"The record is outside what this build can hold: {failure.message}",
             checked=True,
         )
+    if format_version > 1:
+        semantic_error = v2_record_semantics_error(record_type, flags)
+        if semantic_error is not None:
+            return DecodeOutcome(
+                consumed=total_length,
+                reason=FailureReason.UNSUPPORTED_REQUIRED_RECORD,
+                detail=semantic_error,
+                checked=True,
+            )
     return DecodeOutcome(consumed=total_length, record=record, checked=True)

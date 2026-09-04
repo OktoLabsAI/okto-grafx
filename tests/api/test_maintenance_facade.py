@@ -40,6 +40,7 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
             "publish_metrics",
             "rebuild_vector_index",
             "ensure_identity_indexes",
+            "enable_wal_page_compression",
             "create_index",
             "rehash_index",
         }
@@ -57,6 +58,9 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
     assert get_type_hints(Maintenance.publish_metrics)["return"] is type(None)
     assert get_type_hints(Maintenance.rebuild_vector_index)["return"] is VectorIndexView
     assert get_type_hints(Maintenance.ensure_identity_indexes)["return"] is type(None)
+    assert get_type_hints(Maintenance.enable_wal_page_compression)["return"] is type(
+        None
+    )
     assert get_type_hints(Maintenance.create_index)["return"] is IndexView
     assert get_type_hints(Maintenance.rehash_index)["return"] is IndexView
 
@@ -123,6 +127,9 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
     def ensure_identity_indexes(_database: Database) -> None:
         calls.append(("ensure_identity_indexes", None))
 
+    def enable_wal_page_compression(_database: Database) -> None:
+        calls.append(("enable_wal_page_compression", None))
+
     def create_index(
         _database: Database,
         name: str,
@@ -164,6 +171,11 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
             boundary.setattr(
                 Database, "ensure_identity_indexes", ensure_identity_indexes
             )
+            boundary.setattr(
+                Database,
+                "enable_wal_page_compression",
+                enable_wal_page_compression,
+            )
             boundary.setattr(Database, "create_index", create_index)
             boundary.setattr(Database, "rehash_index", rehash_index)
             boundary.setattr(Database, "_bloat", bloat)
@@ -173,6 +185,7 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
             assert maintenance.recover() is recovery_result
             assert maintenance.publish_metrics() is None
             assert maintenance.ensure_identity_indexes() is None
+            assert maintenance.enable_wal_page_compression() is None
             assert maintenance.bloat("Person") is bloat_result
             assert (
                 maintenance.create_index(
@@ -199,6 +212,7 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
         ("recover", None),
         ("publish_metrics", None),
         ("ensure_identity_indexes", None),
+        ("enable_wal_page_compression", None),
         ("bloat", "Person"),
         (
             "create_index",
@@ -222,6 +236,7 @@ def test_a_retained_maintenance_facade_obeys_database_lifecycle() -> None:
         maintenance.recover,
         maintenance.publish_metrics,
         maintenance.ensure_identity_indexes,
+        maintenance.enable_wal_page_compression,
     )
     for call in calls:
         with pytest.raises(GrafxUnsupportedOperation) as raised:
@@ -253,7 +268,11 @@ def test_read_only_maintenance_refuses_only_its_writing_operations(
         assert maintenance.verify().findings == ()
         assert maintenance.publish_metrics() is None
 
-        for call in (maintenance.checkpoint, maintenance.recover):
+        for call in (
+            maintenance.checkpoint,
+            maintenance.recover,
+            maintenance.enable_wal_page_compression,
+        ):
             with pytest.raises(GrafxUnsupportedOperation) as raised:
                 call()
             assert raised.value.details["field"] == "read_only"

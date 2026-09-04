@@ -1390,6 +1390,10 @@ class Maintenance:
         """Delegate explicit persistent identity-index activation to the database."""
         self._database.ensure_identity_indexes()
 
+    def enable_wal_page_compression(self) -> None:
+        """Delegate explicit one-way WAL page-image compression activation."""
+        self._database.enable_wal_page_compression()
+
     def create_index(
         self,
         name: str,
@@ -3153,6 +3157,35 @@ class Database:
             self._refresh_index_inventory()
             return None
 
+    def enable_wal_page_compression(self) -> None:
+        """Persist the compatibility fence before emitting compressed WAL page images.
+
+        Activation is explicit and one way because a database that has retained WAL-v2 records
+        must never be opened by a build that understands only the legacy page-image grammar.
+        The catalog capability is committed in a v1-only transaction; only later commits may
+        select compressed records. Repeating the operation is a zero-write no-op.
+        """
+
+        with self._public_operation("enable_wal_page_compression"):
+            self._require_open()
+            self._require_writable("enable WAL page compression")
+            transaction = self.begin("write")
+            try:
+                self._transactions.prepare_wal_record_v2_activation(
+                    transaction._context
+                )
+                transaction.commit()
+            except BaseException as failure:
+                if transaction._context.active:
+                    try:
+                        transaction.rollback()
+                    except BaseException as cleanup_failure:
+                        _note_cleanup_failure(failure, cleanup_failure)
+                raise
+
+            self._refresh_index_inventory()
+            return None
+
     def _refresh_index_inventory(self) -> None:
         """Refresh cached operational names from the committed catalog authority."""
         manager = self._indexes
@@ -3175,6 +3208,13 @@ class Database:
         )
         if callable(refresh_reclaim):
             refresh_reclaim()
+        refresh_wal = getattr(
+            self._transactions,
+            "_refresh_wal_record_v2_capability",
+            None,
+        )
+        if callable(refresh_wal):
+            refresh_wal()
 
     def _committed_index_receipt(self, name: str) -> IndexView:
         """Return one ACTIVE view with page-zero horizons certified after its commit."""

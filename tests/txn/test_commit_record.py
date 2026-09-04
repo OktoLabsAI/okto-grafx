@@ -7,6 +7,7 @@ what is checked here is the part this component adds and the part it depends on 
 from __future__ import annotations
 
 import struct
+from random import Random
 
 import pytest
 
@@ -15,6 +16,7 @@ from okto_grafx.domain.errors import (
     GrafxCorruptionDetected,
     GrafxSchemaVersionMismatch,
 )
+from okto_grafx.domain.page.layout import MAX_PAGE_SIZE
 from okto_grafx.domain.txn import (
     CATALOG_FILE_ID,
     COMMIT_STATE_SIZE,
@@ -26,7 +28,15 @@ from okto_grafx.domain.txn import (
     FileIdMap,
     PageWrite,
     decode_page_write,
+    decode_page_write_location,
     encode_page_write,
+    encode_page_write_record,
+)
+from okto_grafx.domain.wal import (
+    WAL_FORMAT_VERSION,
+    WAL_LEGACY_FORMAT_VERSION,
+    WAL_V2_FLAG_PAGE_IMAGE_ZLIB1,
+    WAL_V2_FLAG_REQUIRED,
 )
 
 
@@ -101,6 +111,80 @@ def test_a_page_write_payload_round_trips_an_empty_image() -> None:
     assert decode_page_write(encode_page_write("heap.dat", 0, b"")).image == b""
 
 
+def test_a_compressible_page_uses_bounded_wal_v2_and_round_trips() -> None:
+    image = bytes(8192)
+
+    encoded = encode_page_write_record("heap.dat", 17, image, compress=True)
+
+    assert encoded.format_version == WAL_FORMAT_VERSION
+    assert encoded.flags == WAL_V2_FLAG_REQUIRED | WAL_V2_FLAG_PAGE_IMAGE_ZLIB1
+    assert encoded.compressed is True
+    assert len(encoded.payload) < len(encode_page_write("heap.dat", 17, image))
+    assert decode_page_write(
+        encoded.payload,
+        format_version=encoded.format_version,
+        flags=encoded.flags,
+    ) == PageWrite(file="heap.dat", page_index=17, image=image)
+
+
+def test_an_incompressible_page_falls_back_to_the_exact_legacy_grammar() -> None:
+    image = Random(731).randbytes(8192)
+
+    encoded = encode_page_write_record("heap.dat", 9, image, compress=True)
+
+    assert encoded.format_version == WAL_LEGACY_FORMAT_VERSION
+    assert encoded.flags == 0
+    assert encoded.compressed is False
+    assert encoded.payload == encode_page_write("heap.dat", 9, image)
+
+
+def test_the_cleartext_target_is_available_without_inflating_the_page() -> None:
+    encoded = encode_page_write_record("catalog.dat", 3, bytes(8192), compress=True)
+    damaged_body = encoded.payload[:-4] + b"xxxx"
+
+    assert decode_page_write_location(damaged_body).file == "catalog.dat"
+    assert decode_page_write_location(damaged_body).page_index == 3
+    with pytest.raises(GrafxCorruptionDetected):
+        decode_page_write(
+            damaged_body,
+            format_version=encoded.format_version,
+            flags=encoded.flags,
+        )
+
+
+def test_wal_v2_page_flags_are_required_and_closed() -> None:
+    encoded = encode_page_write_record("heap.dat", 1, bytes(8192), compress=True)
+
+    with pytest.raises(GrafxSchemaVersionMismatch) as raised:
+        decode_page_write(
+            encoded.payload,
+            format_version=encoded.format_version,
+            flags=WAL_V2_FLAG_PAGE_IMAGE_ZLIB1,
+        )
+
+    assert raised.value.details["field"] == "flags"
+
+
+@pytest.mark.parametrize("damage", ["oversize", "undersize", "trailing"])
+def test_compressed_page_inflate_is_bounded_and_exact(damage: str) -> None:
+    encoded = encode_page_write_record("heap.dat", 1, bytes(8192), compress=True)
+    raw = bytearray(encoded.payload)
+    length_offset = 2 + len("heap.dat".encode("utf-8")) + 4
+    if damage == "oversize":
+        struct.pack_into("<I", raw, length_offset, MAX_PAGE_SIZE + 1)
+    elif damage == "undersize":
+        struct.pack_into("<I", raw, length_offset, 16)
+    else:
+        raw.extend(b"trailing")
+
+    with pytest.raises(GrafxCorruptionDetected):
+        decode_page_write(
+            bytes(raw),
+            format_version=encoded.format_version,
+            flags=encoded.flags,
+        )
+
+
 def test_a_page_write_payload_that_is_truncated_is_refused() -> None:
     payload = encode_page_write("heap.dat", 3, b"abc")
     with pytest.raises(GrafxCorruptionDetected):
@@ -151,7 +235,9 @@ def test_the_commit_state_round_trips_with_its_checksum() -> None:
 
 
 def test_a_commit_state_with_a_flipped_byte_is_refused() -> None:
-    raw = bytearray(CommitState(last_committed_lsn=9, last_csn=9, checkpoint_lsn=4).encode())
+    raw = bytearray(
+        CommitState(last_committed_lsn=9, last_csn=9, checkpoint_lsn=4).encode()
+    )
     raw[10] ^= 0xFF
     with pytest.raises(GrafxCorruptionDetected) as raised:
         CommitState.decode(bytes(raw))

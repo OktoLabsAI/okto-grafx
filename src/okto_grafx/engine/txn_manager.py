@@ -87,6 +87,7 @@ from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
     CATALOG_LEGACY_FORMAT_VERSION,
     HEAP_RECLAIM_V1_CAPABILITY,
+    WAL_RECORD_V2_CAPABILITY,
     Catalog,
 )
 from okto_grafx.domain.ids import (
@@ -149,8 +150,9 @@ from okto_grafx.domain.txn.records import (
     WalRecord,
     WalRecordLike,
     WalRecordType,
-    decode_page_write,
+    decode_page_write_location,
     encode_page_write,
+    encode_page_write_record,
     is_redoable_page_file,
 )
 from okto_grafx.domain.wal.replay import RecycleReport
@@ -655,6 +657,7 @@ class TransactionManager:
         "_index_sync",
         "_index_authority_sync_required",
         "_heap_reclaim_capable",
+        "_wal_record_v2_capable",
         "_partitions_per_table",
         "_identity_lease_size",
         "_identity_leases",
@@ -772,7 +775,9 @@ class TransactionManager:
         self._index_sync: Callable[[], object] | None = index_sync
         self._index_authority_sync_required: bool = False
         self._heap_reclaim_capable: bool = False
+        self._wal_record_v2_capable: bool = False
         self._refresh_heap_reclaim_capability()
+        self._refresh_wal_record_v2_capability()
         self._partitions_per_table: int = validate_partitions_per_table(
             partitions_per_table
         )
@@ -1211,6 +1216,51 @@ class TransactionManager:
                     return False
                 candidate = Catalog.deserialize(source.serialize())
                 candidate.enable_heap_reclaim()
+                for page_index, image in self._catalog.stage(candidate):
+                    self._stage_page_image(
+                        txn,
+                        self._file_ids.catalog_file,
+                        page_index,
+                        image,
+                    )
+                return True
+
+    def prepare_wal_record_v2_activation(self, txn: TransactionContext) -> bool:
+        """Stage the durable capability fence before any compressed page record is emitted."""
+
+        operation = "prepare WAL-record-v2 activation"
+        self._require_fresh_index_catalog_transaction(
+            txn,
+            operation=operation,
+            purpose="WAL-record-v2 activation",
+        )
+        with self._participant_section():
+            self._require_not_closed(operation)
+            self._require_current_active(txn)
+            self._require_recovery_complete()
+            with self.schema_artifact_section(sync_if=lambda: True):
+                source = getattr(self._catalog, "catalog", None)
+                if not isinstance(source, Catalog):
+                    raise GrafxUnsupportedOperation(
+                        "WAL-record-v2 activation needs the concrete persistent catalog.",
+                        operation=operation,
+                        field="catalog",
+                        value=type(source).__name__,
+                    )
+                if source.format_version != CATALOG_FORMAT_VERSION:
+                    raise GrafxUnsupportedOperation(
+                        "WAL-record-v2 activation requires catalog v2; run "
+                        "maintenance.ensure_identity_indexes() first.",
+                        operation=operation,
+                        field="format_version",
+                        value=source.format_version,
+                        required=CATALOG_FORMAT_VERSION,
+                        remedy="maintenance.ensure_identity_indexes",
+                    )
+                if source.requires_capability(WAL_RECORD_V2_CAPABILITY):
+                    return False
+                candidate = Catalog.deserialize(source.serialize())
+                candidate.enable_wal_record_v2()
                 for page_index, image in self._catalog.stage(candidate):
                     self._stage_page_image(
                         txn,
@@ -2252,7 +2302,7 @@ class TransactionManager:
             catalog_changed = False
             for record in replay.effects:
                 if record.record_type == int(WalRecordType.WRITE_PAGE):
-                    write = decode_page_write(record.payload)
+                    write = decode_page_write_location(record.payload)
                     if (
                         not isinstance(write.file, str)
                         or not write.file
@@ -2436,6 +2486,7 @@ class TransactionManager:
             if self._index_sync is not None and not authority_unchanged:
                 self._index_sync()
             self._refresh_heap_reclaim_capability()
+            self._refresh_wal_record_v2_capability()
         self._index_authority_sync_required = False
 
     def _refresh_heap_reclaim_capability(self) -> None:
@@ -2446,6 +2497,16 @@ class TransactionManager:
             isinstance(source, Catalog)
             and source.format_version == CATALOG_FORMAT_VERSION
             and source.requires_capability(HEAP_RECLAIM_V1_CAPABILITY)
+        )
+
+    def _refresh_wal_record_v2_capability(self) -> None:
+        """Cache the persisted WAL-v2 fence without adding I/O to commit materialisation."""
+
+        source = getattr(self._catalog, "catalog", None)
+        self._wal_record_v2_capable = bool(
+            isinstance(source, Catalog)
+            and source.format_version == CATALOG_FORMAT_VERSION
+            and source.requires_capability(WAL_RECORD_V2_CAPABILITY)
         )
 
     def _synchronize_committed_indexes(
@@ -3805,7 +3866,8 @@ class TransactionManager:
         # decoded before the first page moves; only registry-dependent checks for a name the
         # catalog pages introduce are deferred to the strict index-only preflight after sync.
         touched_catalog = any(
-            decode_page_write(record.payload).file == self._file_ids.catalog_file
+            decode_page_write_location(record.payload).file
+            == self._file_ids.catalog_file
             for record in page_records
         )
         self._commit_redo.preflight(
@@ -4233,9 +4295,9 @@ class TransactionManager:
                                     txn, lease.epoch, rows
                                 )
                             txn.validate_budgets()
-                            self._validate_wal_batch_budget(txn, records)
                             with self._close_wait_hazard():
                                 planned_csn = self._wal.planned_terminal_lsn(records)
+                            raw_batch_rolls = planned_csn != materialized_csn
                             if planned_csn != materialized_csn:
                                 with self._close_wait_hazard():
                                     records, images = self._retarget_commit_batch(
@@ -4250,6 +4312,8 @@ class TransactionManager:
                                 if commit_trace is not None:
                                     commit_trace.increment(COMMIT_RETARGETS_TOTAL)
                             self._materialized = None
+                            if not raw_batch_rolls:
+                                records = self._compress_page_records(records, images)
                             self._validate_wal_batch_budget(txn, records)
                             if commit_trace is not None and (
                                 txn.txn_id in self._index_catalog_activation_plans
@@ -4830,6 +4894,59 @@ class TransactionManager:
             observed=observed,
             txn_id=txn.txn_id,
         )
+
+    def _compress_page_records(
+        self,
+        records: Sequence[WalRecordLike],
+        images: Sequence[tuple[str, PageIndex, bytes]],
+    ) -> list[WalRecordLike]:
+        """Use WAL-v2 zlib images only after the durable capability fence is visible.
+
+        The caller offers this helper only when the exact raw batch stays in its current WAL
+        segment. Compression can only shorten that batch, so it cannot change the segment-roll
+        decision or the terminal LSN already stamped into every page and logical effect. A raw
+        batch that rolls deliberately remains v1; that bounded fallback avoids a compressed-size
+        feedback loop while retargeting pages to the roll header's additional LSN.
+        """
+
+        if not self._wal_record_v2_capable or not images:
+            return list(records)
+        page_count = len(images)
+        if len(records) <= page_count:
+            raise GrafxTransactionStateError(
+                "A materialised commit batch must end in COMMIT after its page effects.",
+                field="records",
+                value=len(records),
+                page_records=page_count,
+            )
+        compressed_records: list[WalRecordLike] = []
+        for position, (file, page_index, image) in enumerate(images):
+            source = records[position]
+            if not isinstance(source, WalRecord) or source.record_type != int(
+                WalRecordType.WRITE_PAGE
+            ):
+                raise GrafxTransactionStateError(
+                    "Materialised page images and WRITE_PAGE records lost their shared order.",
+                    field="record_type",
+                    value=getattr(source, "record_type", None),
+                    position=position,
+                )
+            encoded = encode_page_write_record(
+                file,
+                page_index,
+                image,
+                compress=True,
+            )
+            compressed_records.append(
+                replace(
+                    source,
+                    payload=encoded.payload,
+                    format_version=encoded.format_version,
+                    flags=encoded.flags,
+                )
+            )
+        compressed_records.extend(records[page_count:])
+        return compressed_records
 
     def _build_records(
         self,
@@ -5823,9 +5940,9 @@ class TransactionManager:
                 records, images, materialized_csn = self._build_records(
                     reservation, epoch
                 )
-            self._validate_wal_batch_budget(reservation, records)
             with self._close_wait_hazard():
                 planned_csn = self._wal.planned_terminal_lsn(records)
+            raw_batch_rolls = planned_csn != materialized_csn
             if planned_csn != materialized_csn:
                 with self._close_wait_hazard():
                     records, images = self._retarget_commit_batch(
@@ -5840,6 +5957,8 @@ class TransactionManager:
                 if trace is not None:
                     trace.increment(COMMIT_RETARGETS_TOTAL)
             self._materialized = None
+            if not raw_batch_rolls:
+                records = self._compress_page_records(records, images)
             self._validate_wal_batch_budget(reservation, records)
             self._validate_lease(lease)
             if trace is not None:

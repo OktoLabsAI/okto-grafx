@@ -247,8 +247,10 @@ contract rather than a careless caller. **Routed to C1**, with A66.1 applied: ev
 §6.6 freezes **six** reason codes; C4's `FailureReason` has **seven** verdicts. C6 read the codes as
 naming *why work was discarded*, not the shape of the damage: `CHECKSUM_FAILURE` -> 2, every other
 undecodable range -> `1 truncated_tail` (it **is** the tail being cut), with the exact decoder verdict
-travelling in the payload envelope. `UNSUPPORTED_VERSION` maps to nothing and instead **stops
-recovery** with `schema_version_mismatch`, rather than truncating intact bytes a newer build wrote.
+travelling in the payload envelope. `UNSUPPORTED_VERSION` and
+`UNSUPPORTED_REQUIRED_RECORD` map to nothing and instead **stop recovery** with
+`schema_version_mismatch`, rather than truncating intact bytes or required semantics another build
+wrote.
 That last choice is the important one and it is right: recovery must not destroy data it merely fails
 to understand.
 

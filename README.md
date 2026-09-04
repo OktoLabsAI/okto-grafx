@@ -451,6 +451,21 @@ identities. Restart application processes after the maintenance window so their 
 adopts the new capability, floor and index authority. See
 [`docs/architecture/MVCC_VACUUM_V1.md`](docs/architecture/MVCC_VACUUM_V1.md).
 
+WAL page-image compression is a separate explicit, one-way activation:
+
+```python
+db.maintenance.ensure_identity_indexes()
+db.maintenance.enable_wal_page_compression()
+```
+
+The first call ensures catalog v2 exists; the second publishes required capability
+`wal_record_v2` in a v1-only transaction. Later commits use bounded zlib level 1 only when the
+complete page image becomes strictly smaller. Incompressible images and batches that roll to a new
+WAL segment retain the exact v1 full-image grammar. `max_wal_batch_bytes` measures the final encoded
+records. Current participants adopt the capability at their next protected boundary; older builds
+fail closed on the catalog capability or retained WAL v2. There is no disable/downgrade door. See
+[`WAL_PAGE_COMPRESSION_V1.md`](docs/architecture/WAL_PAGE_COMPRESSION_V1.md).
+
 ### In memory
 
 `connect(":memory:")` selects the in-memory device, which has the same transactional semantics as

@@ -9,6 +9,11 @@ including the on-disk format.
 
 ### Added
 
+- Added explicit, one-way `db.maintenance.enable_wal_page_compression()` activation. A catalog-v2
+  required capability is published in a v1-only transaction before later commits may store
+  strictly-smaller zlib level-1 full-page images in `WRITE_PAGE` v2. Bounded inflation, closed
+  type/flag semantics, mixed-writer adoption and typed downgrade refusal preserve fail-closed
+  recovery; incompressible images and segment-roll batches retain the v1 grammar.
 - Added manual, foreground `db.maintenance.vacuum(...)` for process-quiescent MVCC reclamation.
   A one-way catalog-v2 capability guards a durable monotonic snapshot floor; one ordinary
   WAL-before-data commit relinks retained chains, removes eligible inline version slots and

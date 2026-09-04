@@ -12,7 +12,7 @@ from okto_grafx.domain.index import IndexChange, IndexOperation, wal_record_for
 from okto_grafx.domain.page.layout import PageType
 from okto_grafx.domain.page.slotted import Page
 from okto_grafx.domain.recovery.decision import CommittedReplay
-from okto_grafx.domain.txn.records import encode_page_write
+from okto_grafx.domain.txn.records import encode_page_write, encode_page_write_record
 from okto_grafx.domain.wal.record import WalRecord, WalRecordType
 from okto_grafx.engine import commit_redo as commit_redo_module
 from okto_grafx.engine.buffer_pool import MAX_REDO_GAP_PAGES
@@ -220,7 +220,9 @@ def test_a_required_logical_effect_without_an_index_manager_refuses_before_pages
     assert page_calls == []
 
 
-def test_multiple_required_logical_effects_without_an_index_manager_refuse_typed() -> None:
+def test_multiple_required_logical_effects_without_an_index_manager_refuse_typed() -> (
+    None
+):
     """A later logical effect cannot turn the preflight refusal into an assertion failure."""
     redo = CommitRedo(_PoolDouble())  # type: ignore[arg-type]
 
@@ -313,9 +315,7 @@ def test_a_late_damaged_page_image_refuses_before_an_earlier_page_moves(
     )
     page_calls: list[int] = []
 
-    def apply_page(
-        _pool: object, _file: str, page_index: int, _image: bytes
-    ) -> bool:
+    def apply_page(_pool: object, _file: str, page_index: int, _image: bytes) -> bool:
         page_calls.append(page_index)
         return True
 
@@ -342,9 +342,7 @@ def test_a_late_index_visibility_mismatch_refuses_before_a_page_moves(
         last_committed_lsn=3,
     )
 
-    def apply_page(
-        _pool: object, _file: str, page_index: int, _image: bytes
-    ) -> bool:
+    def apply_page(_pool: object, _file: str, page_index: int, _image: bytes) -> bool:
         page_calls.append(page_index)
         return True
 
@@ -396,9 +394,7 @@ def test_a_late_impossible_redo_gap_refuses_before_an_earlier_page_moves(
     )
     page_calls: list[int] = []
 
-    def apply_page(
-        _pool: object, _file: str, page_index: int, _image: bytes
-    ) -> bool:
+    def apply_page(_pool: object, _file: str, page_index: int, _image: bytes) -> bool:
         page_calls.append(page_index)
         return True
 
@@ -446,3 +442,71 @@ def test_reapplying_a_page_effect_is_an_idempotent_no_op(memory_device: object) 
     )
     assert persisted.page_lsn == 7
     assert persisted.read_slot(0) == b"durable"
+
+
+def test_reapplying_a_compressed_page_effect_is_an_idempotent_no_op(
+    memory_device: object,
+) -> None:
+    stack = build_stack(memory_device)
+    image = make_page_image(stack.codec, (b"compressed",), page_index=0, page_lsn=7)
+    encoded = encode_page_write_record("heap.dat", 0, image, compress=True)
+    assert encoded.compressed is True
+    effect = WalRecord(
+        record_type=int(WalRecordType.WRITE_PAGE),
+        payload=encoded.payload,
+        descriptor=DESCRIPTOR,
+        epoch=1,
+        txn_id=8,
+        lsn=7,
+        format_version=encoded.format_version,
+        flags=encoded.flags,
+    )
+    replay = CommittedReplay(effects=(effect,), last_committed_lsn=8)
+    redo = CommitRedo(stack.pool)
+
+    first = redo.apply(replay)
+    second = redo.apply(replay)
+
+    assert first.page_images_applied == 1
+    assert second.page_images_applied == 0
+    assert redo.flush(first) == 1
+    persisted = stack.codec.decode_page(
+        stack.storage.read_page("heap.dat", 0),
+        page_index=0,  # type: ignore[attr-defined]
+    )
+    assert persisted.page_lsn == 7
+    assert persisted.read_slot(0) == b"compressed"
+
+
+def test_corrupted_compressed_body_refuses_before_any_page_mutation(
+    memory_device: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = build_stack(memory_device)
+    image = make_page_image(stack.codec, (b"valid",), page_index=0, page_lsn=7)
+    encoded = encode_page_write_record("heap.dat", 0, image, compress=True)
+    damaged = encoded.payload[:-3] + b"bad"
+    effect = WalRecord(
+        record_type=int(WalRecordType.WRITE_PAGE),
+        payload=damaged,
+        descriptor=DESCRIPTOR,
+        epoch=1,
+        txn_id=8,
+        lsn=7,
+        format_version=encoded.format_version,
+        flags=encoded.flags,
+    )
+    calls: list[int] = []
+
+    def apply_page(_pool: object, _file: str, page_index: int, _image: bytes) -> bool:
+        calls.append(page_index)
+        return True
+
+    monkeypatch.setattr(commit_redo_module, "apply_page_image", apply_page)
+
+    with pytest.raises(GrafxCorruptionDetected):
+        CommitRedo(stack.pool).apply(
+            CommittedReplay(effects=(effect,), last_committed_lsn=8)
+        )
+
+    assert calls == []

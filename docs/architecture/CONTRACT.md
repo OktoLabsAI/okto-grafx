@@ -672,7 +672,7 @@ Payload = positional tuple encoded per the table schema (see §7.2).
 | off | type | field |
 |---|---|---|
 | 0 | u32 | `magic` = `0x5852474F` |
-| 4 | u16 | `format_version` = 1 |
+| 4 | u16 | `format_version` = 1 or 2 |
 | 6 | u16 | `record_type` |
 | 8 | u16 | `header_len` = 48 |
 | 10 | u16 | `flags` |
@@ -690,9 +690,25 @@ Record types: `1 BEGIN · 2 WRITE_PAGE · 3 COMMIT · 4 ABORT · 5 CHECKPOINT ·
 7 INDEX_RECONCILE · 8 LEDGER_APPEND · 9 CATALOG_WRITE · 10 SPACE_DDL · 11 VECTOR_WRITE ·
 12 SEGMENT_HEADER · 13 PAGE_ALLOC`.
 
-**Decoder rule:** the decoder must accept every `format_version <= CURRENT`. Round-trip tests per
-version are mandatory (TR-4). Changing `partitions_per_table` changes only the descriptor string,
-never the format — no migration.
+**Decoder rule:** the decoder accepts every declared supported header version, then applies the
+closed record-type/flags grammar for that version. Round-trip tests per supported version are
+mandatory (TR-4). WAL v1 flags remain opaque and gain no retrospective meaning. In WAL v2, bit
+`0x0001` means REQUIRED, bit `0x0004` means `PAGE_IMAGE_ZLIB1` and bit `0x0008` means
+SKIPPABLE; the only v2 grammar currently emitted is `WRITE_PAGE` with the first two bits set. An
+unknown v2 type is skippable only with exactly `0x0008`; flags zero are fail-closed so forgetting to
+mark a future required type cannot silently drop it. Unsupported semantics and a known type without
+a v2 grammar are typed schema-version refusals and must not be truncated, appended past or recycled.
+Changing `partitions_per_table`
+changes only the descriptor string, never the format.
+
+The compressed `WRITE_PAGE` v2 payload retains the v1 clear prefix
+`file_name_length u16 | file_name | page_index u32`, followed by
+`uncompressed_image_length u32 | zlib-level-1 bytes`. Inflation is bounded to `MAX_PAGE_SIZE`, must
+consume exactly one complete stream and must produce exactly the declared length before the normal
+page codec validates the image. Emission requires the persistent catalog-v2 capability
+`wal_record_v2`, activated in a preceding v1-only transaction. A raw batch that would roll to a new
+segment remains entirely v1 so compression cannot change the `SEGMENT_HEADER`/terminal-CSN plan.
+See `WAL_PAGE_COMPRESSION_V1.md`.
 
 `COMMIT` payload (canonical, versioned): `snapshot_lsn u64 | read_partition_count u32 |
 write_partition_count u32 | read_partitions[u64...] | write_partitions[u64...] | page_touch_count u32 |

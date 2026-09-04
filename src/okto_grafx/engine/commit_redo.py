@@ -108,7 +108,11 @@ class CommitRedo:
         for record in replay.effects:
             if record.record_type == _PAGE_EFFECT:
                 page_effects += 1
-                write = decode_page_write(record.payload)
+                write = decode_page_write(
+                    record.payload,
+                    format_version=record.format_version,
+                    flags=record.flags,
+                )
                 # Offered files are flushed even when their image is already current.  A prior
                 # attempt may have installed the image into this same pool and failed before
                 # flushing; page_lsn then makes this attempt a no-op, but publication still owes
@@ -227,7 +231,11 @@ class CommitRedo:
             if record.record_type == _PAGE_EFFECT:
                 # Decode every payload before mutating the first page, so corruption late in a
                 # batch cannot leave a prefix applied and then be mistaken for a complete run.
-                write = decode_page_write(record.payload)
+                write = decode_page_write(
+                    record.payload,
+                    format_version=record.format_version,
+                    flags=record.flags,
+                )
                 if not is_redoable_page_file(write.file):
                     raise GrafxRecoveryRefused(
                         f"Committed page record {record.lsn} names non-data file "
@@ -260,9 +268,7 @@ class CommitRedo:
                         page_count=present,
                         limit=MAX_REDO_GAP_PAGES,
                     )
-                simulated_page_counts[write.file] = max(
-                    present, write.page_index + 1
-                )
+                simulated_page_counts[write.file] = max(present, write.page_index + 1)
             if record.record_type in _INDEX_EFFECTS:
                 change = change_of(record)
                 manager = self._index_manager
@@ -300,10 +306,7 @@ class CommitRedo:
                         lsn=record.lsn,
                     )
                 max_key_bytes = getattr(index, "max_key_bytes", None)
-                if (
-                    isinstance(max_key_bytes, int)
-                    and len(change.key) > max_key_bytes
-                ):
+                if isinstance(max_key_bytes, int) and len(change.key) > max_key_bytes:
                     raise GrafxCorruptionDetected(
                         f"A record for index {change.index!r} carries a key of "
                         f"{len(change.key)} bytes, but this index stores at most "

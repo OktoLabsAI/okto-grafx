@@ -28,6 +28,10 @@ from okto_grafx.domain.page.checksum import crc32c
 __all__ = [
     "WAL_MAGIC",
     "WAL_FORMAT_VERSION",
+    "WAL_LEGACY_FORMAT_VERSION",
+    "WAL_V2_FLAG_REQUIRED",
+    "WAL_V2_FLAG_SKIPPABLE",
+    "WAL_V2_FLAG_PAGE_IMAGE_ZLIB1",
     "WAL_HEADER_LENGTH",
     "CHECKSUM_LENGTH",
     "SUPPORTED_FORMAT_VERSIONS",
@@ -41,13 +45,26 @@ __all__ = [
     "WalRecord",
     "header_length_of",
     "is_known_record_type",
+    "v2_record_semantics_error",
 ]
 
 WAL_MAGIC: int = 0x5852474F
 """First four bytes of every record, little-endian, so a scanner can find one inside a hole."""
 
-WAL_FORMAT_VERSION: int = 1
-"""The version this build writes. It reads this one and every earlier one."""
+WAL_LEGACY_FORMAT_VERSION: int = 1
+"""The legacy format retained for records whose payload grammar did not change."""
+
+WAL_FORMAT_VERSION: int = 2
+"""The highest record version this build can emit, not a global automatic selection."""
+
+WAL_V2_FLAG_REQUIRED: int = 0x0001
+"""The v2 record carries semantics that a reader must understand before continuing."""
+
+WAL_V2_FLAG_SKIPPABLE: int = 0x0008
+"""An unknown v2 record is explicitly safe for an older decoder to skip."""
+
+WAL_V2_FLAG_PAGE_IMAGE_ZLIB1: int = 0x0004
+"""The WRITE_PAGE image body uses bounded zlib level-1 compression."""
 
 WAL_HEADER_LENGTH: int = 48
 """Bytes of fixed header in a version 1 record."""
@@ -55,7 +72,10 @@ WAL_HEADER_LENGTH: int = 48
 CHECKSUM_LENGTH: int = 4
 """Bytes of CRC-32C that close every record."""
 
-SUPPORTED_FORMAT_VERSIONS: tuple[int, ...] = (1,)
+SUPPORTED_FORMAT_VERSIONS: tuple[int, ...] = (
+    WAL_LEGACY_FORMAT_VERSION,
+    WAL_FORMAT_VERSION,
+)
 """Every version this build can decode, oldest first.
 
 The decoder rule of CONTRACT.md section 6.5 is that a reader accepts every version at or below
@@ -63,7 +83,10 @@ its own, so this tuple is the closed set the round-trip suite walks, and a versi
 refused rather than guessed at.
 """
 
-HEADER_LENGTHS: dict[int, int] = {1: WAL_HEADER_LENGTH}
+HEADER_LENGTHS: dict[int, int] = {
+    WAL_LEGACY_FORMAT_VERSION: WAL_HEADER_LENGTH,
+    WAL_FORMAT_VERSION: WAL_HEADER_LENGTH,
+}
 """Header length declared by each supported version.
 
 The decoder reads the header length out of the record rather than assuming it, so a later
@@ -113,6 +136,29 @@ _KNOWN_TYPES: frozenset[int] = frozenset(int(member) for member in WalRecordType
 def is_known_record_type(record_type: int) -> bool:
     """Return True when this build knows what the record type means."""
     return record_type in _KNOWN_TYPES
+
+
+def v2_record_semantics_error(record_type: int, flags: int) -> str | None:
+    """Return why a v2 type/flags pair is unsupported, or ``None`` when it is closed-safe."""
+
+    compressed_page_flags = WAL_V2_FLAG_REQUIRED | WAL_V2_FLAG_PAGE_IMAGE_ZLIB1
+    if record_type == int(WalRecordType.WRITE_PAGE):
+        if flags == compressed_page_flags:
+            return None
+        return (
+            f"WRITE_PAGE v2 requires flags 0x{compressed_page_flags:04x}; got "
+            f"0x{flags:04x}."
+        )
+    if not is_known_record_type(record_type):
+        if flags == WAL_V2_FLAG_SKIPPABLE:
+            return None
+        return (
+            f"Unknown WAL-v2 record type {record_type} must carry exactly the explicit "
+            f"SKIPPABLE flag 0x{WAL_V2_FLAG_SKIPPABLE:04x}; got 0x{flags:04x}."
+        )
+    return (
+        f"Known WAL record type {record_type} has no format-v2 grammar in this build."
+    )
 
 
 def header_length_of(format_version: int) -> int:
@@ -166,7 +212,7 @@ class WalRecord:
     epoch: Epoch = 0
     txn_id: TxnId = 0
     flags: int = 0
-    format_version: int = WAL_FORMAT_VERSION
+    format_version: int = WAL_LEGACY_FORMAT_VERSION
 
     def __post_init__(self) -> None:
         """Check every field against the width the format gives it, before any packing.
@@ -269,6 +315,16 @@ class WalRecord:
                 field="record_type",
                 value=self.record_type,
             )
+        if self.format_version == WAL_FORMAT_VERSION:
+            semantic_error = v2_record_semantics_error(self.record_type, self.flags)
+            if semantic_error is not None:
+                raise GrafxConfigurationError(
+                    semantic_error,
+                    field="flags",
+                    value=self.flags,
+                    record_type=self.record_type,
+                    format_version=self.format_version,
+                )
         descriptor = self._encoded_descriptor()
         total = header_length + len(descriptor) + len(self.payload) + CHECKSUM_LENGTH
         if total > MAX_TOTAL_LENGTH:

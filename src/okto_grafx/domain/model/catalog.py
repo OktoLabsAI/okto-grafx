@@ -60,6 +60,7 @@ __all__ = [
     "CATALOG_MAGIC",
     "CATALOG_FORMAT_VERSION",
     "HEAP_RECLAIM_V1_CAPABILITY",
+    "WAL_RECORD_V2_CAPABILITY",
     "Catalog",
 ]
 
@@ -75,6 +76,9 @@ CATALOG_FORMAT_VERSION: int = 2
 HEAP_RECLAIM_V1_CAPABILITY: str = "heap_reclaim_v1"
 """Required capability guarding the durable heap snapshot floor and physical reclamation."""
 
+WAL_RECORD_V2_CAPABILITY: str = "wal_record_v2"
+"""Required capability allowing compressed WRITE_PAGE records in retained WAL."""
+
 _PREAMBLE = struct.Struct("<8sHHIIII")
 _V2_EXTENSION = struct.Struct("<QII")
 _INDEX_META = struct.Struct("<BBBBHHQ")
@@ -89,10 +93,14 @@ _MAX_TEXT = 0xFFFF
 
 _IDENTITY_SECONDARY_INDEXES_V1_BIT = 1 << 0
 _HEAP_RECLAIM_V1_BIT = 1 << 1
-_KNOWN_CAPABILITY_BITS = _IDENTITY_SECONDARY_INDEXES_V1_BIT | _HEAP_RECLAIM_V1_BIT
+_WAL_RECORD_V2_BIT = 1 << 2
+_KNOWN_CAPABILITY_BITS = (
+    _IDENTITY_SECONDARY_INDEXES_V1_BIT | _HEAP_RECLAIM_V1_BIT | _WAL_RECORD_V2_BIT
+)
 _CAPABILITY_TO_BIT = {
     IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY: _IDENTITY_SECONDARY_INDEXES_V1_BIT,
     HEAP_RECLAIM_V1_CAPABILITY: _HEAP_RECLAIM_V1_BIT,
+    WAL_RECORD_V2_CAPABILITY: _WAL_RECORD_V2_BIT,
 }
 _VISIBILITY_TO_TAG = {IndexVisibility.EXACT: 1}
 _TAG_TO_VISIBILITY = {value: key for key, value in _VISIBILITY_TO_TAG.items()}
@@ -404,6 +412,15 @@ class Catalog:
         self._require_index_catalog()
         self._required_capabilities = frozenset(
             (*self._required_capabilities, HEAP_RECLAIM_V1_CAPABILITY)
+        )
+        return self
+
+    def enable_wal_record_v2(self) -> Catalog:
+        """Add the one-way capability required before emitting any WAL-v2 record."""
+
+        self._require_index_catalog()
+        self._required_capabilities = frozenset(
+            (*self._required_capabilities, WAL_RECORD_V2_CAPABILITY)
         )
         return self
 

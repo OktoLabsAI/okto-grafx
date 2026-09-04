@@ -14,6 +14,7 @@ from okto_grafx.domain.model.catalog import (
     CATALOG_LEGACY_FORMAT_VERSION,
     CATALOG_MAGIC,
     HEAP_RECLAIM_V1_CAPABILITY,
+    WAL_RECORD_V2_CAPABILITY,
     Catalog,
 )
 from okto_grafx.domain.model.errors import SchemaMismatchError
@@ -66,6 +67,7 @@ __all__ = [
     "CATALOG_LEGACY_FORMAT_VERSION",
     "CATALOG_MAGIC",
     "HEAP_RECLAIM_V1_CAPABILITY",
+    "WAL_RECORD_V2_CAPABILITY",
     "INT64_MAX",
     "INT64_MIN",
     "MAX_IDENTIFIER_LENGTH",

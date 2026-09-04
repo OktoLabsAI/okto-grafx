@@ -76,7 +76,10 @@ class ScanFailure:
             "expected_lsn": self.expected_lsn,
         }
         message = f"{self.detail} Segment {self.segment!r} at byte {self.offset}."
-        if self.reason is FailureReason.UNSUPPORTED_VERSION:
+        if self.reason in {
+            FailureReason.UNSUPPORTED_VERSION,
+            FailureReason.UNSUPPORTED_REQUIRED_RECORD,
+        }:
             return GrafxSchemaVersionMismatch(message, **details)
         return GrafxCorruptionDetected(message, **details)
 

@@ -111,7 +111,7 @@ from okto_grafx.domain.recovery.report import (
 )
 from okto_grafx.domain.recovery.retry import RETRYABLE_KEY, is_retryable
 from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FORMAT_VERSION, CommitState
-from okto_grafx.domain.txn.records import decode_page_write
+from okto_grafx.domain.txn.records import decode_page_write_location
 from okto_grafx.domain.wal.record import WalRecordType
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.commit_redo import CommitRedo, is_redoable_page_file
@@ -1364,7 +1364,7 @@ class RecoveryManager:
         and the index-only subplan is preflighted strictly after adoption inside :meth:`_redo`.
         """
         touched_catalog = any(
-            decode_page_write(record.payload).file == _CATALOG_FILE
+            decode_page_write_location(record.payload).file == _CATALOG_FILE
             for record in replay.effects
             if record.record_type == int(WalRecordType.WRITE_PAGE)
         )
@@ -1409,7 +1409,7 @@ class RecoveryManager:
         )
         touched_catalog = False
         for record in page_records:
-            write = decode_page_write(record.payload)
+            write = decode_page_write_location(record.payload)
             if not is_redoable_page_file(write.file):
                 findings.append(
                     RecoveryFinding(

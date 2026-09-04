@@ -36,6 +36,14 @@
 > `ROUND7-PLAN.md` §4 e ao Option 1 de `W6-WRITE-CEILING.md`. Até esse ACCEPT, nenhum writer,
 > upgrade, migração ou leasing v2 pode ser implementado ou habilitado.
 
+> **Reserva WAL v2 posterior:** o ADR aceito
+> [`WAL_PAGE_COMPRESSION_V1.md`](WAL_PAGE_COMPRESSION_V1.md) atribui `0x0004` a
+> `PAGE_IMAGE_ZLIB1`, `0x0008` a SKIPPABLE e admite hoje somente `WRITE_PAGE` v2 com
+> `REQUIRED | PAGE_IMAGE_ZLIB1`.
+> Qualquer retomada desta proposta V7 deve compor seu mask/gramática com esse formato já publicado
+> ou selecionar uma versão WAL posterior; não pode reinterpretar o bit nem emitir outro tipo v2
+> sem atualizar o classificador fechado e a capability persistente.
+
 ## 0. Fechamento normativo V7 — SUBSTITUI V6
 
 Esta revisão fecha blockers objetivos encontrados contra o SHA-base e não relaxa nenhuma garantia
@@ -4178,6 +4186,13 @@ inteiramente WAL format v2 com `CommitPayloadV2`; payload V1 retido é validado 
 nunca recebe manifest vazio inventado.
 
 ### 5.3 Fence durável WAL v2; flags v1 permanecem opacos — SUBSTITUI V6
+
+> **SUPERADA PARCIALMENTE pelo ADR aceito de compressão:** a tabela/mask proposta nesta seção não é
+> mais implementável como escrita. O formato publicado reserva também `0x0004=PAGE_IMAGE_ZLIB1` e
+> `0x0008=SKIPPABLE`; `WRITE_PAGE` v2 usa `0x0005`, e tipo desconhecido só é pulável com `0x0008`
+> exato, nunca flags zero. Ao retomar V7, toda ocorrência abaixo de mask `0x0003`, unknown/zero
+> skippable ou `0x0005` malformed deve ser rebased sobre `WAL_PAGE_COMPRESSION_V1.md`. As regras V7
+> específicas de manifest/tipo 14 continuam proposta, não autoridade do runtime atual.
 
 `flags` de WAL format v1 já são domínio persistido do usuário interno, não espaço reservado V7.
 Todos os 65.536 valores continuam round-trippable e **nenhum bit v1** significa required, manifest ou
