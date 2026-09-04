@@ -955,3 +955,30 @@ Status: **finite NO-GO for the current row/cursor representation; no production 
 The outcome preserves the existing API and all integrity checks. A future contiguous exact-search
 representation may revisit the whole materialization boundary, but this round does not ship the
 isolated decoder optimization.
+
+## Scale-removal batch 12 — decoded vector projection and NumPy scoring scope
+
+Status: **completed in `cd32623`; independent adversarial review
+`hof_c5ee0c49b2ec43beb0406f77e6f8eebf` verified PASS**.
+
+- Public result projection recognizes only an exact built-in tuple whose every component is an
+  exact built-in `float`. That decoder-owned, immutable and capability-free tuple can be retained
+  by the new exact `VectorValue` snapshot instead of calling the public component validator and
+  `float` constructor once per dimension. A tuple subclass or any `bool`, `int`, `Decimal` or
+  `float` subclass takes the former path verbatim. Caller-supplied search queries never select the
+  shortcut.
+- The existing NumPy cosine scorer used two consecutive `numpy.errstate` scopes with the same
+  policy per candidate. Right-norm evaluation, the zero-length decision and dot/division now run
+  in one scope, in their former order. Result, refusal and warning parity was checked for ordinary,
+  zero, overflow, NaN, infinity and denormal inputs.
+- At 2,048 rows x 384 dimensions, the isolated projection path measured
+  `243.053 -> 36.198 ms` (`6.71x`). Two complete `scan_rows_v1` runs measured
+  `330.1 -> 156.7 ms` (`2.11x`) and `535.0 -> 186.6 ms` (`2.87x`). An alternating five-by-five
+  256 x 64 HNSW build comparison measured `3.751 -> 3.254 s` (`1.153x`) from the consolidated
+  NumPy scope.
+
+Focused validation covered the exact and empty tuples, every position of all four foreign
+component classes, unchanged caller-query validation, public scan/collaborator boundaries,
+vector-value ownership, NumPy parity and ranking invariants. The combined affected slices passed
+(`223` public/view cases and `31` NumPy cases), as did Ruff and diff-check. This batch changes no
+page, catalog or WAL format and no OCC, lock, publication, multiwriter or multireader rule.
