@@ -3662,17 +3662,23 @@ class QueryEngine:
             for definition in catalog.index_definitions()
             for generation in definition.generations
         }
-        listing = getattr(manager, "indexes", None)
-        if callable(listing):
-            for index in listing():
-                header = index.open()
-                artifact_nonce = getattr(header, "artifact_nonce", 0)
-                if (
-                    isinstance(artifact_nonce, int)
-                    and not isinstance(artifact_nonce, bool)
-                    and artifact_nonce > 0
-                ):
-                    occupied.add(artifact_nonce)
+        projected = getattr(manager, "_registered_artifact_nonces", None)
+        if callable(projected):
+            occupied.update(projected())
+        else:
+            # Compatibility for a narrow/alternative registry without the optimized v2
+            # projection. Its registered objects retain the original validating header route.
+            listing = getattr(manager, "indexes", None)
+            if callable(listing):
+                for index in listing():
+                    header = index.open()
+                    artifact_nonce = getattr(header, "artifact_nonce", 0)
+                    if (
+                        isinstance(artifact_nonce, int)
+                        and not isinstance(artifact_nonce, bool)
+                        and artifact_nonce > 0
+                    ):
+                        occupied.add(artifact_nonce)
         return int(allocate(occupied))
 
     def _automatic_index_namespace_available(

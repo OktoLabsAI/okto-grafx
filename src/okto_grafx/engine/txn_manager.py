@@ -2123,12 +2123,19 @@ class TransactionManager:
             for definition in catalog.index_definitions()
             for generation in definition.generations
         }
-        indexes = getattr(self._index_manager, "indexes", None)
-        if callable(indexes):
-            for index in indexes():
-                header = index.open()
-                if header.artifact_nonce:
-                    occupied.add(header.artifact_nonce)
+        projected = getattr(self._index_manager, "_registered_artifact_nonces", None)
+        if callable(projected):
+            occupied.update(projected())
+        else:
+            # Compatibility for narrow/alternative registry implementations predating the
+            # projection.  Their definitions cannot be assumed to carry catalog-v2 authority,
+            # so retain the validating header route they implemented.
+            indexes = getattr(self._index_manager, "indexes", None)
+            if callable(indexes):
+                for index in indexes():
+                    header = index.open()
+                    if header.artifact_nonce:
+                        occupied.add(header.artifact_nonce)
         return occupied
 
     @staticmethod
@@ -2945,9 +2952,7 @@ class TransactionManager:
             self._ensure_participant_pin(floor.last_committed_lsn)
             refreshed = 0
             if standing:
-                refreshed = self._refresh_due_readers(
-                    floor=floor.last_committed_lsn
-                )
+                refreshed = self._refresh_due_readers(floor=floor.last_committed_lsn)
             self._require_not_closed("begin a transaction")
             # A standing pin still within its refresh interval was visible at or below floor
             # before this begin and published nothing during it. CF-2 therefore needs no second

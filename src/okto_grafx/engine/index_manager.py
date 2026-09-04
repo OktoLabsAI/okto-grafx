@@ -343,9 +343,9 @@ class _EmptyIndexBuild:
     """State derived only after every bucket page was proved empty for this one batch."""
 
     buckets: dict[int, _FirstFitPages] = field(default_factory=dict)
-    entries: dict[
-        tuple[bytes, RecordRef], tuple[PageIndex, SlotId, IndexEntry]
-    ] = field(default_factory=dict)
+    entries: dict[tuple[bytes, RecordRef], tuple[PageIndex, SlotId, IndexEntry]] = (
+        field(default_factory=dict)
+    )
     valid: bool = True
 
 
@@ -1708,11 +1708,7 @@ class IndexStore:
                 else:
                     moved = accelerated
                 moved_any = moved or moved_any
-                if (
-                    change.operation is IndexOperation.RESET
-                    and moved
-                    and applied == 0
-                ):
+                if change.operation is IndexOperation.RESET and moved and applied == 0:
                     # RESET just validated and cleared every reachable bucket page while this
                     # rebuild holds the whole-file fence.  The remaining changes may therefore
                     # use an ephemeral directory without trusting state from another generation.
@@ -2682,7 +2678,11 @@ class IndexStore:
                 self._invalidate_tombstone_backlog()
                 raise
             if moved:
-                build.entries[identity] = (page_index, slot, ended.located_at(page_index, slot))
+                build.entries[identity] = (
+                    page_index,
+                    slot,
+                    ended.located_at(page_index, slot),
+                )
                 self._adjust_tombstone_backlog(1)
             return moved
         try:
@@ -4220,6 +4220,24 @@ class IndexManager:
         """Return every registered index, in the order names sort, so a report is reproducible."""
         return tuple(self._indexes[key] for key in sorted(self._indexes))
 
+    def _registered_artifact_nonces(self) -> frozenset[int]:
+        """Project physical identities without reopening catalog-v2 generations.
+
+        A non-zero nonce in the registered definition is the physical identity already proved
+        when that registry object was admitted.  Legacy definitions do not carry that identity,
+        so their header remains the only conservative source and is opened through the existing
+        validating door.  Zero is never an occupied generation identity.
+        """
+
+        occupied: set[int] = set()
+        for index in self.indexes():
+            nonce = index.definition.artifact_nonce
+            if nonce == 0:
+                nonce = index.open().artifact_nonce
+            if nonce != 0:
+                occupied.add(nonce)
+        return frozenset(occupied)
+
     def index(self, name: str) -> IndexStore:
         """Return the index of that name, refusing a name nothing was registered under."""
         if not isinstance(name, str):
@@ -5455,9 +5473,7 @@ class IndexManager:
                 if not snapshot.visible(version.xmin, version.xmax):
                     continue
                 if (
-                    definition.entry_key_for_record(
-                        version.record_id, version.values
-                    )
+                    definition.entry_key_for_record(version.record_id, version.values)
                     != entry.key
                 ):
                     continue
@@ -5570,9 +5586,7 @@ class IndexManager:
                 staged += 1
         return staged
 
-    def _allocate_detached_generation_nonce(
-        self, occupied: Collection[int]
-    ) -> int:
+    def _allocate_detached_generation_nonce(self, occupied: Collection[int]) -> int:
         """Return one provider nonce absent from catalog inventory and physical storage.
 
         This is discovery, not reservation.  The later detached build's exclusive create is the
@@ -5754,13 +5768,10 @@ class IndexManager:
     ) -> int:
         """Count final entries, stopping at ``remaining + 1`` when admission is bounded."""
 
-        if (
-            remaining is not None
-            and (
-                isinstance(remaining, bool)
-                or not isinstance(remaining, int)
-                or remaining < 0
-            )
+        if remaining is not None and (
+            isinstance(remaining, bool)
+            or not isinstance(remaining, int)
+            or remaining < 0
         ):
             raise GrafxIndexError(
                 "A detached-generation entry remainder must be zero or more.",
@@ -5975,8 +5986,7 @@ class IndexManager:
         """
         authority = self._catalog_authority()
         legacy = authority is not None and (
-            getattr(authority, "format_version", None)
-            == CATALOG_LEGACY_FORMAT_VERSION
+            getattr(authority, "format_version", None) == CATALOG_LEGACY_FORMAT_VERSION
         )
         # Catalog v1 had no persistent access-path authority.  Its verifier historically
         # inspected the raw registry so that it could diagnose, among other things, an index
@@ -5986,9 +5996,7 @@ class IndexManager:
             indexes = self.indexes() if name is None else (self.index(name),)
         else:
             indexes = (
-                self.active_indexes()
-                if name is None
-                else (self.active_index(name),)
+                self.active_indexes() if name is None else (self.active_index(name),)
             )
         findings: list[IndexFinding] = []
         for index in indexes:
