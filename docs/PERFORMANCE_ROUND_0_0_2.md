@@ -793,3 +793,30 @@ Status: **no production change selected after bounded prototypes and adversarial
 These decisions apply the agreed precedence rule: a locally fast prototype is not promoted when
 its authority is narrower than the canonical read or when the safe repair removes most of the
 gain. Multiwriter/multireader, WAL/OCC, durability and fail-closed behavior remain unchanged.
+
+## Scale-removal batch 6 — header-only index cost paths
+
+Status: **D-17 completed through `82ea61b` on `feature/v0.0.2`; compact resident HNSW storage is
+the next isolated milestone**.
+
+- `b7fb52d` keeps the canonical full `walk()` for public inventory, verification, reconcile and
+  HNSW construction, but gives count-only and ref-only vector consumers private readers that
+  validate slot images without allocating `IndexEntry`/located DTOs. Exact broad scans retain
+  reference order and deduplication, all migrated calls remain inside their existing stable-view
+  certificates, and page pins/views are exhausted before returning. The public full walk also
+  stops copying slot payloads before `IndexEntry.decode`; the decoded key still owns its bytes.
+- Adversarial review found that the first count reader validated the entry header but omitted
+  `RecordRef.decode`'s 48-bit range check. `82ea61b` centralizes that check in
+  `_require_decodable_ref`, reused by both the DTO decoder and the allocation-free counter. A
+  discriminating test now corrupts the always-zero high 16 bits of the stored u64 reference as
+  well as flags, and both private readers fail closed.
+- On 20,000 synthetic entry images after the fix, the count and ref paths measured `5.03x` and
+  `2.53x` versus full DTO decoding (`166.87 -> 33.20 / 65.98 ms` median). Constructing and
+  discarding a `RecordRef` in the count path had retained only `2.49x` in the preceding comparison.
+  On a page-backed 2,048-entry sample before the
+  final range check, count and ref walks measured `2.33x` and `1.97x` versus full walk; these are
+  component receipts, not end-to-end gates.
+
+Focused validation covered index storage, vector planner regimes, first-use concurrency and warm
+cross-process graph adoption, plus Ruff and diff checks. No page/WAL/catalog format, OCC,
+durability or multiwriter/multireader rule changed.

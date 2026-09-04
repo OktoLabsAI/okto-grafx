@@ -2041,6 +2041,28 @@ Adicionar:
 - recusa fail-closed para tipo obrigatório desconhecido;
 - fixtures de compatibilidade n−1/n/n+1.
 
+### P2.10 — Mesma marca certificada não implica mesma figura HNSW
+
+A abertura fria constrói a figura em ordem canônica: `_build` insere
+`sorted(walk(), key=(born_csn, ref.encode()))` em
+[`vector_engine.py`](src/okto_grafx/engine/vector_engine.py#L1041). O caminho quente **não**
+reconstrói: `commit` ([`vector_engine.py`](src/okto_grafx/engine/vector_engine.py#L1230)) e `apply`
+([`vector_engine.py`](src/okto_grafx/engine/vector_engine.py#L1260)) chamam `_note` por mudança
+encenada, inserindo na figura **viva em ordem de encenação**, e só então `_certify` avança a marca.
+
+Como o HNSW é sensível à ordem de inserção, **dois handles na mesma marca certificada podem manter
+grafos diferentes** e responder rankings diferentes para a mesma consulta no mesmo snapshot. Isso
+já é verdade hoje, sem parametrizar nada, e é a premissa que mata a opção C de P1.16.
+
+Não é necessariamente defeito. O docstring de `HnswGraph` promete determinismo para "a mesma
+semente e as mesmas inserções", e "as mesmas inserções" inclui a ordem, portanto é literalmente
+correto; e o contrato já recusa prometer recall para uma consulta individual. **A lacuna é de
+documentação no nível do engine**, e é ali que precisa ser escrita: mesma marca e mesmo conjunto
+não implicam mesma figura.
+
+Distinto de P1.2: lá o problema é frescor, um processo que não percebe que outro marcou o índice
+stale. Aqui nada está stale — as duas figuras estão corretas e atualizadas, e mesmo assim divergem.
+
 ## 5. Performance e escalabilidade
 
 ### P1.5 — A busca vetorial aproximada ainda possui custo O(N)
@@ -2208,6 +2230,19 @@ São necessários:
 - índices compostos;
 - B+tree para range, prefix e `ORDER BY`.
 
+
+Ressalva medida na rodada de escala de 2026-09-04, a considerar antes de aumentar buckets por
+padrão: `walk()` custa O(buckets + entradas) e **piora com diretório esparso** — 73,5 ms com 1.024
+buckets para apenas 1.000 entradas. `walk()` é o caminho de `verify('indexes')`, de `reconcile` e
+da reconstrução, então dimensionar por cardinalidade esperada precisa vir junto de um percurso que
+não pague pelos buckets vazios. O `CREATE INDEX` já aceita as duas opções de dimensionamento
+([`parser.py`](src/okto_grafx/domain/query/parser.py#L384)) e o valor é persistido. Os índices de
+identidade v2 também são uma exceção já entregue: `identity_index_sizing(visible_rows)` escolhe o
+diretório a partir da cardinalidade cercada. O gap remanescente está nos índices automáticos
+legados de PK/endpoint criados por `automatic_index_definitions`
+([`definition.py`](src/okto_grafx/domain/index/definition.py#L410)), que ainda omitem o
+dimensionamento e herdam `DEFAULT_BUCKET_COUNT`.
+
 ### P1.13 — Traversal ainda paga landing scan
 
 Quando o destino é livre, o motor constrói um mapa da tabela de destino. A limitação está registrada em [`PERFORMANCE.md`](docs/PERFORMANCE.md#L127).
@@ -2270,6 +2305,47 @@ Recomenda-se:
 - exigir `allow_remote_metrics=True` para override;
 - emitir aviso de segurança;
 - testar binds reais IPv4 e IPv6, não apenas parsing da configuração.
+
+### P1.16 — Os três parâmetros de construção do HNSW são inalcançáveis
+
+Levantamento de 2026-09-04 (base `de24b7b`, reconferido em `22d9694`). `DEFAULT_NEIGHBOURS = 16` e
+`DEFAULT_EF_CONSTRUCTION = 200` estão em [`hnsw.py`](src/okto_grafx/domain/vector/hnsw.py#L61) e
+[`hnsw.py`](src/okto_grafx/domain/vector/hnsw.py#L70); `DEFAULT_INDEX_SEED` está em
+[`vector_engine.py`](src/okto_grafx/engine/vector_engine.py#L154). O `VectorEngine` aceita os três
+na assinatura ([`vector_engine.py`](src/okto_grafx/engine/vector_engine.py#L583)), mas
+[`assembly.py`](src/okto_grafx/api/assembly.py#L378) nunca os passa: são alcançados por omissão e
+não existe caminho público para nenhum deles. Ao lado, `vector_ef_search` e
+`vector_exact_scan_threshold` são configuráveis em
+[`config.py`](src/okto_grafx/runtime/config.py#L290).
+
+Quatro desenhos foram avaliados com adversário dedicado e os quatro morreram:
+
+| Opção | Por que não sobrevive |
+|---|---|
+| A — campo imutável no catálogo, com bit de capacidade | O default de compatibilidade referencia a própria constante, então todo espaço já existente continua preso a ela; e o bit só existe em catálogo v2, enquanto um banco nasce em v1. Só se justifica como pré-requisito de **persistir o grafo**, não como botão. |
+| B — derivar de campos já presentes no catálogo | Não dá alavanca ao usuário e transforma a fórmula em parte do build: duas versões do Grafx divergiriam sobre o mesmo banco sem bit de capacidade que detecte. |
+| C — configuração por processo com prova de acordo | O conjunto de entradas **não é função** de `built_through_lsn` (ver P2.10), então a prova certificaria a proposição errada. Nenhum dos três mecanismos existentes — registro de leitores, lease de escritor, digest de cabeçalho — serve. |
+| D — heurística na criação, gravada uma vez | No `CREATE` a cardinalidade é zero, e o espaço existe antes de qualquer tabela declarar coluna nele. A metade que resolve é a opção A; a metade exclusiva de D quebra a compatibilidade preguiçosa. |
+
+**Recomendação registrada.** Expor `ef_construction` e `neighbours` como controle **operacional do
+processo**, exatamente como `vector_ef_search` já é exposto — o que a §7 deste plano já prevê na
+linha `VectorOptions` —, acrescentando teto superior (hoje a validação só exige `>= 1`) e mantendo
+o `HNSW_FROZEN` do arnês de recall independente da configuração pública. Custo de formato: zero.
+O fundamento é duplo: o contrato já recusa prometer recall por consulta
+([`CONTRACT.md`](docs/architecture/CONTRACT.md#L576)), e a concordância entre processos que
+justificaria travar o valor **já não existe** na forma que se supunha (P2.10).
+
+**Condição de entrada acordada com o Codex, antes de expor qualquer botão:** perfil completo de
+recall em 8.192 × 384 medido nos dois valores candidatos e recongelamento deliberado do
+`HNSW_FROZEN` em `bench/harness/recall_worker.py`. A divergência entre as duas posições é de
+**sequência**, não de mérito: um parâmetro exposto sem perfil convida a ser girado, e o custo cai
+em recall, que é o que menos se percebe quando degrada.
+
+**Retirado por medição cega, não repropor sem experimento novo:** a medição que sugeria
+`ef_construction = 64` equivalente a 200 (recall@10 de 0,915 contra 0,910) usou 2.000 vetores
+uniformes em dimensão 64, faixa em que a travessia visita 97,6% do grafo. Com a busca praticamente
+exaustiva a qualidade das vizinhanças não influencia o recall, então o experimento estava cego
+para o efeito que deveria medir.
 
 ### P2.4 — Contrato de adapters customizados é ambíguo
 
@@ -2361,6 +2437,12 @@ Ao abrir um banco existente, esses valores devem ser descobertos da identidade. 
 
 O alvo de recall pertence a `bench.harness.gate --recall-target`, não a `DatabaseConfig`: é um SLO
 de benchmark, não uma promessa que cada query possa garantir sem um oracle exato.
+
+
+A linha `VectorOptions` carrega hoje um item bloqueado: `neighbours` e `ef_construction` não têm
+caminho público nenhum, e a decisão de expô-los está registrada em P1.16 com condição de entrada
+explícita (perfil de recall 8.192 × 384 antes do botão). A semente do índice fica fora dessa lista:
+mudá-la muda a figura, e P2.10 mostra que a figura já não é única entre processos.
 
 ## 8. Novas capacidades recomendadas
 
@@ -3488,7 +3570,8 @@ evita split-brain e retrabalho no Core do Pulse.
 5. implementar bulk ingest;
 6. corrigir publicação Windows;
 7. adicionar group commit;
-8. adicionar vacuum, índice de identidade e rehash/rebuild de índices.
+8. adicionar vacuum, índice de identidade e rehash/rebuild de índices;
+9. decidir P1.16 (parâmetros de construção do HNSW) depois do perfil de recall exigido.
 
 #### Gate de saída
 

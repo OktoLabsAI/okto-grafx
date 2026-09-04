@@ -340,7 +340,8 @@ Testes focados rodam por item. Suítes longas podem ser acumuladas após P1.2–
 | D-10 | candidata P2-DIRTY após P1.1 e desenho formal |
 | D-11 | deferida; corrigir contagem 4→3 e autoridade do subplano antes de repropor |
 | D-12 | promovida sem formato: cardinalidade derivada cercada, exata após primeira leitura e incremental em `(key, ref)` |
-| D-13..D-17 | lane vetorial futura; D-15 cache persistida explicitamente removida |
+| D-13..D-16 | lane vetorial seguinte; D-15 cache persistida explicitamente removida |
+| D-17 | promovida em `b7fb52d` + correção fail-closed `82ea61b`: walks privados de count/ref sem DTO, mantendo `walk()` autoritativo |
 | D-18 | experimento de cota após P1, não gate nem escopo obrigatório |
 | D-19..D-22 | lane NT-1 futura; só após call counts, microbench e microprotótipo ABI real; adapter por instância |
 | D-23 | P0.3, somente pós-drain em cópia e sem `--locals` |
@@ -455,6 +456,7 @@ O consenso não autoriza mudança de formato, redução das garantias concorrent
 | 2026-09-04 | HNSW / ordem de construção e knobs | propriedade registrada; knobs adiados | cold build canônico e apply incremental podem produzir grafos aproximados diferentes para sequências de inserção diferentes, dentro do contrato atual. `ef_construction`/neighbours só serão considerados após perfil 8.192×384 e recall harness deliberado; não são gate desta rodada |
 | 2026-09-04 | lote de escala 5 — TXN-1 / observação decodificada do WAL | protótipo recusado e removido antes de commit | O micro de nove runs media 754→250 decodes e `30,211→11,156 ms` (`2,71x`), mas a observação cobria somente o delta novo e não o prefixo físico exigido pela marca esparsa de `read_from`; podia ocultar dano antigo/quente. Também alterava o budget físico de `read_bounded`. O handoff `hof_0dc74badf8504e09af643bd9ae4357bd` confirmou NO-GO; reautenticar o plano consumiria o ganho, então o worktree voltou integralmente a `22d9694` |
 | 2026-09-04 | lote de escala 5 — CAT-4 / inventário de diretório | cache por lifetime recusado; recorte efêmero não selecionado | Cache por `LocalStorageDevice` não enxerga publicação/remoção/corrupção de outro processo. A única foto admissível vive numa mesma `COMMIT_SECTION`, não cruza catalog apply e mantém a primeira caminhada O(N). Economia direcional estimada: ~4 ms em 16 entradas e ~73 ms em 4.096; no porte do Pulse, poucos ms e fora do steady state já corrigido por `592fd22`. Esforço médio e ganho baixo: nenhum código introduzido |
+| 2026-09-04 | lote de escala 6 — D-17 / walks de índice sem DTO | concluído e publicado | `b7fb52d` migra somente contagem, refs de exact scan e métrica para leitores privados header-only; `walk()` integral continua autoritativo para verifier/reconcile/build. A revisão adversarial encontrou a faixa u64→48-bit omitida no contador; `82ea61b` compartilha a mesma validação de `RecordRef.decode` sem alocar DTO e congela corrupção nos bits altos. Micro final de 20 mil imagens: full/count/refs `166,87/33,20/65,98 ms` (`5,03x`/`2,53x`); diferencial de 40.010 imagens sem divergência e mutante discriminante; fatia focal de índice/vetor/concurrency/cross-process, Ruff e diff-check verdes; formato, WAL/OCC e concorrência inalterados |
 
 Esta seção registra fatos concluídos e trabalho explicitamente em andamento. H5 e os itens 12--13
 foram fechados. Por
