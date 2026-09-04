@@ -370,6 +370,33 @@ class _EmptyIndexBuild:
     valid: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class _CommonReplayItem:
+    """One fully decoded item in an ephemeral common index-only replay plan."""
+
+    store: IndexStore
+    change: IndexChange
+    position: Lsn
+
+
+@dataclass(frozen=True, slots=True)
+class _CommonReplayStore:
+    """One store's single seeded header and monotonically composed final image."""
+
+    store: IndexStore
+    initial: IndexHeader
+    final: IndexHeader
+
+
+@dataclass(frozen=True, slots=True)
+class _CommonReplayBatch:
+    """Passage-local proof for the narrow non-vector, non-rebuild replay fast path."""
+
+    owner: IndexManager
+    items: tuple[_CommonReplayItem, ...]
+    stores: tuple[_CommonReplayStore, ...]
+
+
 _ReadResult = TypeVar("_ReadResult")
 
 
@@ -5472,6 +5499,156 @@ class IndexManager:
             return False
         found.apply(record)
         return True
+
+    def _prepare_common_replay_batch(
+        self, records: Sequence[WalRecord]
+    ) -> _CommonReplayBatch | None:
+        """Preflight the narrow common index-only replay path without mutating an index.
+
+        The returned value is deliberately opaque outside this module and belongs to exactly
+        this call.  It is never cached on the manager or a store.  A caller gets ``None`` for any
+        shape whose existing per-record protocol carries extra semantics: RESET, an active
+        rebuild, or a subclass such as ``VectorHnswIndex`` that overrides :meth:`IndexStore.apply`.
+
+        Every record is decoded and resolved before page 0 of the first store is seeded.  Header
+        transitions are then composed in WAL order with the same monotonic value objects used by
+        the legacy path.  Consequently a bad position or horizon discovered at the end of the
+        batch refuses before the first bucket mutation.
+        """
+        if not records:
+            return None
+        items: list[_CommonReplayItem] = []
+        ordered_stores: list[IndexStore] = []
+        seen: set[IndexStore] = set()
+        for record in records:
+            change = change_of(record)
+            if change.operation is IndexOperation.RESET:
+                return None
+            try:
+                store = self.active_index(change.index)
+            except GrafxIndexError:
+                # CommitRedo's mandatory preflight normally turns this into its more useful
+                # recovery-level refusal.  Retain the legacy dispatch result if a custom caller
+                # invokes the capability directly.
+                return None
+            if (
+                type(store).apply is not IndexStore.apply
+                or store._rebuild_authority is not None
+                or store._replaying
+            ):
+                return None
+            if change.versioned != store.definition.versioned:
+                raise GrafxCorruptionDetected(
+                    f"A record for index {change.index!r} describes a "
+                    f"{'versioned' if change.versioned else 'unversioned'} entry and this index "
+                    f"stores {'versioned' if store.definition.versioned else 'unversioned'} "
+                    "ones, so batched replay was refused before any effect was applied.",
+                    field="versioned",
+                    value=change.versioned,
+                    index=change.index,
+                    file=store.file,
+                    operation=change.operation.name,
+                    lsn=record.lsn,
+                )
+            if len(change.key) > store.max_key_bytes:
+                raise GrafxCorruptionDetected(
+                    f"A record for index {change.index!r} carries a key of "
+                    f"{len(change.key)} bytes, but this index stores at most "
+                    f"{store.max_key_bytes}; batched replay was refused before any effect was "
+                    "applied.",
+                    field="key",
+                    value=len(change.key),
+                    limit=store.max_key_bytes,
+                    index=change.index,
+                    file=store.file,
+                    operation=change.operation.name,
+                    lsn=record.lsn,
+                )
+            item = _CommonReplayItem(store, change, lsn_of(record))
+            items.append(item)
+            if store not in seen:
+                seen.add(store)
+                ordered_stores.append(store)
+
+        initial_by_store: dict[IndexStore, IndexHeader] = {}
+        final_by_store: dict[IndexStore, IndexHeader] = {}
+        for store in ordered_stores:
+            # A process-local stale verdict makes legacy _advance return before reading page 0;
+            # preserve that ordering and do not introduce a new fallible read. A durable STALE
+            # bit not reflected in this handle is still an ordinary immutable header value here:
+            # legacy replay advances/reconciles it without clearing the bit, which composition
+            # below reproduces exactly. Active rebuild authority was rejected above.
+            if store._stale_reason is not None:
+                return None
+            header = store._read_header()
+            initial_by_store[store] = header
+            final_by_store[store] = header
+
+        for item in items:
+            final = final_by_store[item.store].advanced_to(item.position)
+            if item.change.operation is IndexOperation.REMOVE:
+                final = final.reconciled_to(item.change.csn)
+            final_by_store[item.store] = final
+        stores = tuple(
+            _CommonReplayStore(store, initial_by_store[store], final_by_store[store])
+            for store in ordered_stores
+        )
+        return _CommonReplayBatch(self, tuple(items), stores)
+
+    def apply_common_replay_batch(
+        self, records: Sequence[WalRecord]
+    ) -> tuple[str, ...] | None:
+        """Try one common replay as a private, single-use plan.
+
+        ``None`` asks the caller to dispatch the *whole* replay through the legacy per-record
+        protocol.  Keeping preparation and application inside one call prevents a captured
+        header image from being retained and replayed after a later generation or STALE mark.
+        """
+        prepared = self._prepare_common_replay_batch(records)
+        if prepared is None:
+            return None
+        moved_by_store: dict[IndexStore, bool] = {
+            state.store: False for state in prepared.stores
+        }
+        touched: list[IndexStore] = []
+        touched_set: set[IndexStore] = set()
+        try:
+            for item in prepared.items:
+                store = item.store
+                if store not in touched_set:
+                    touched_set.add(store)
+                    touched.append(store)
+                store._replaying = True
+                try:
+                    item_moved = store._apply_change(item.change, item.position)
+                finally:
+                    store._replaying = False
+                moved_by_store[store] = moved_by_store[store] or item_moved
+
+            for state in prepared.stores:
+                store_moved = moved_by_store[state.store]
+                if state.final != state.initial or store_moved:
+                    # One composed header image is both the monotonic built/reconciled advance
+                    # and, when a bucket moved, the final page-0 clock the caller's existing
+                    # flush boundary publishes after those buckets.
+                    state.store._write_header(state.final)
+                    if store_moved:
+                        state.store._cache_certificate = None
+            return tuple(store.file for store in touched)
+        except Exception as failure:
+            for store in touched:
+                try:
+                    store._mark_stale_after_failure(
+                        f"Batched logical replay into index {store.name!r} failed after a "
+                        "possibly partial prefix, so the current handle cannot prove the index "
+                        f"complete: {failure!r}"
+                    )
+                except Exception as stale_failure:  # noqa: BLE001 - preserve root failure
+                    failure.add_note(
+                        f"Marking touched index {store.name!r} stale also failed: "
+                        f"{stale_failure!r}"
+                    )
+            raise
 
     # --- reading ----------------------------------------------------------------------------
 

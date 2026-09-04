@@ -160,6 +160,27 @@ class CommitRedo:
                 touched_set.add(file)
                 touched.append(file)
 
+        manager = self._index_manager
+        if (
+            replay.effects
+            and not prepared_pages
+            and manager is not None
+            and all(record.record_type in _INDEX_EFFECTS for record in replay.effects)
+        ):
+            apply_batch = getattr(manager, "apply_common_replay_batch", None)
+            if callable(apply_batch):
+                batch_files = apply_batch(replay.effects)
+                if batch_files is not None:
+                    for file in batch_files:
+                        remember(file)
+                    return CommitRedoResult(
+                        effects_replayed=len(replay.effects),
+                        index_effects_replayed=len(replay.effects),
+                        index_effects_dispatched=len(replay.effects),
+                        last_committed_lsn=replay.last_committed_lsn,
+                        touched_files=tuple(touched),
+                    )
+
         page_only = len(prepared_pages) == len(replay.effects)
         may_coalesce = (
             proof.allow_page_coalescing if proof is not None else page_only
