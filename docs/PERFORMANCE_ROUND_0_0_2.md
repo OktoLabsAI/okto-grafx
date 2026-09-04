@@ -874,3 +874,29 @@ after two corrections to the original proposal. D-14 is a finite NO-GO for this 
 not an open gate. A future exact-search storage redesign may revisit contiguous residency as its
 own initiative; it is not smuggled into this batch. No format, WAL/OCC, durability or
 multiwriter/multireader rule changed.
+
+## Scale-removal batch 9 — D-15 foreign HNSW delta decision
+
+Status: **the bounded WAL-delta prototype was rejected and removed before commit; no production
+change was selected**.
+
+- Reusing CE-3's authenticated WAL interval is insufficient when the logical index delta is empty
+  but a heap page changed. Sparse or missing vector observations can advance an index header
+  without emitting a replayable `INDEX_WRITE`; the existing conservative refresh accounts for
+  that physical effect and an incremental adopter cannot infer its absence from the logical log.
+- Applying `_note`/`_install` to the warm picture would mutate the already published HNSW graph and
+  its maps while same-process readers traverse that object outside the graph guard. Copy-on-write
+  would restore atomic publication, but the current mutable graph has no sublinear clone: copying
+  it is `O(N)` and removes the proposed `O(i)` advantage. Fencing readers would weaken the intended
+  multireader behavior and can make contention pay both adoption and rebuild.
+- Incremental insertion calls the host `VectorMath` port from `begin`; its possible re-entry is not
+  covered by the search-only `_building` escape. WAL-order adoption would also turn the currently
+  transient, canonically rebuilt topology difference between processes into a permanent function
+  of each process's adoption history.
+
+The implementation draft and its tests were removed completely, leaving no tracked worktree
+change. Independent review `hof_52f3f82fe7f34175ab704d40a9bbd1e8` was verified PASS. D-15(b) is
+therefore a finite NO-GO for the current mutable HNSW architecture, not an unfinished gate. It may
+be reconsidered only with a safely copyable immutable graph representation and an explicit
+cross-process topology/re-entry contract. No format, WAL/OCC, durability or
+multiwriter/multireader rule changed.
