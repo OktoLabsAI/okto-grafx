@@ -7,10 +7,17 @@ from collections.abc import Sequence
 import pytest
 
 from okto_grafx.adapters.vectormath_pure import PureVectorMath
-from okto_grafx.domain.errors import GrafxIndexError
+from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxIndexError
 from okto_grafx.domain.ids import PROVISIONAL_CSN, RecordRef
-from okto_grafx.domain.index import IndexChange, IndexOperation, wal_record_for
+from okto_grafx.domain.index import (
+    IndexChange,
+    IndexEntry,
+    IndexOperation,
+    wal_record_for,
+)
 from okto_grafx.domain.index.header import IndexHeader
+from okto_grafx.domain.index.keys import bucket_of
+from okto_grafx.domain.page import Page, PageFullError
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.recovery.decision import CommittedReplay
 from okto_grafx.domain.txn.records import encode_page_write
@@ -22,6 +29,7 @@ from okto_grafx.engine.index_manager import (
     IndexStore,
 )
 from okto_grafx.engine.vector_engine import VectorHnswIndex
+import okto_grafx.engine.index_manager as index_manager_module
 
 from .conftest import build_database
 
@@ -73,6 +81,50 @@ def _replay(records: Sequence[WalRecord]) -> CommittedReplay:
         effects=tuple(records),
         last_committed_lsn=max(record.lsn for record in records) + 1,
     )
+
+
+def _keys_in_bucket(
+    store: IndexStore,
+    bucket: int,
+    count: int,
+    *,
+    prefix: bytes = b"replay-key-",
+    width: int = 0,
+) -> tuple[bytes, ...]:
+    keys: list[bytes] = []
+    candidate = 0
+    while len(keys) < count:
+        key = prefix + str(candidate).encode()
+        if width:
+            key = key.ljust(width, b"x")
+        if bucket_of(key, store.definition.bucket_count) == bucket:
+            keys.append(key)
+        candidate += 1
+    return tuple(keys)
+
+
+def _effect_for(
+    store: IndexStore,
+    operation: IndexOperation,
+    lsn: int,
+    key: bytes,
+    ref: RecordRef,
+) -> WalRecord:
+    return wal_record_for(
+        IndexChange(
+            index=store.name,
+            operation=operation,
+            key=key,
+            ref=ref,
+            csn=(
+                lsn
+                if store.definition.versioned
+                or operation is not IndexOperation.INSERT
+                else 0
+            ),
+            versioned=store.definition.versioned,
+        )
+    ).with_lsn(lsn)
 
 
 def test_common_batch_seeds_and_writes_page_zero_once_per_interleaved_store(
@@ -415,3 +467,331 @@ def test_reset_active_rebuild_and_vector_store_fall_back_for_the_whole_replay(
     monkeypatch.setattr(VectorHnswIndex, "apply", counted_vector_apply)
     CommitRedo(database.pool, database.manager).apply(_replay((vector_record,)))
     assert vector_calls == 1
+
+
+def test_only_buckets_at_the_eight_effect_threshold_bypass_scalar_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = build_database()
+    hot_keys = _keys_in_bucket(database.exact, 0, 8, prefix=b"hot-")
+    cold_keys = _keys_in_bucket(database.exact, 1, 7, prefix=b"cold-")
+    records = tuple(
+        _effect_for(
+            database.exact,
+            IndexOperation.INSERT,
+            10 + offset,
+            key,
+            RecordRef(offset + 1, 1),
+        )
+        for offset, key in enumerate((*hot_keys, *cold_keys))
+    )
+    scalar_calls: list[bytes] = []
+    original = IndexStore._apply_change
+
+    def counted(store: IndexStore, change: IndexChange, lsn: int) -> bool:
+        scalar_calls.append(change.key)
+        return original(store, change, lsn)
+
+    monkeypatch.setattr(IndexStore, "_apply_change", counted)
+
+    CommitRedo(database.pool, database.manager).apply(_replay(records))
+
+    assert scalar_calls == list(cold_keys)
+    assert len(tuple(database.exact.walk())) == 15
+
+
+def test_hot_buckets_preserve_global_wal_order_across_interleaved_stores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = build_database()
+    exact_keys = _keys_in_bucket(database.exact, 0, 8, prefix=b"ordered-exact-")
+    proximity_keys = _keys_in_bucket(
+        database.proximity, 0, 8, prefix=b"ordered-proximity-"
+    )
+    records: list[WalRecord] = []
+    expected: list[tuple[str, bytes]] = []
+    for ordinal, (exact_key, proximity_key) in enumerate(
+        zip(exact_keys, proximity_keys, strict=True)
+    ):
+        for store, key in (
+            (database.exact, exact_key),
+            (database.proximity, proximity_key),
+        ):
+            records.append(
+                _effect_for(
+                    store,
+                    IndexOperation.INSERT,
+                    10 + len(records),
+                    key,
+                    RecordRef(ordinal + 1, 1),
+                )
+            )
+            expected.append((store.name, key))
+    observed: list[tuple[str, bytes]] = []
+    original = IndexStore._apply_common_replay_hot_change
+
+    def ordered(
+        store: IndexStore,
+        bucket: object,
+        change: IndexChange,
+        lsn: int,
+    ) -> bool:
+        observed.append((store.name, change.key))
+        return original(store, bucket, change, lsn)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(IndexStore, "_apply_common_replay_hot_change", ordered)
+
+    CommitRedo(database.pool, database.manager).apply(_replay(records))
+
+    assert observed == expected
+
+
+def test_hot_bucket_matches_legacy_bytes_first_fit_and_derived_counters() -> None:
+    batched = build_database(name="hot-batched", budget_pages=64)
+    legacy = build_database(name="hot-legacy", budget_pages=64)
+    keys = _keys_in_bucket(
+        batched.proximity,
+        0,
+        20,
+        prefix=b"wide-hot-",
+        width=96,
+    )
+    refs = tuple(RecordRef(100 + ordinal, 1) for ordinal in range(len(keys)))
+    operations: list[tuple[IndexOperation, int]] = [
+        *((IndexOperation.INSERT, ordinal) for ordinal in range(12)),
+        *((IndexOperation.TOMBSTONE, ordinal) for ordinal in range(4)),
+        *((IndexOperation.REMOVE, ordinal) for ordinal in range(4)),
+        *((IndexOperation.INSERT, ordinal) for ordinal in range(12, 16)),
+        (IndexOperation.TOMBSTONE, 16),
+        (IndexOperation.REMOVE, 17),
+    ]
+
+    def records_for(store: IndexStore) -> tuple[WalRecord, ...]:
+        return tuple(
+            _effect_for(store, operation, 10 + offset, keys[ordinal], refs[ordinal])
+            for offset, (operation, ordinal) in enumerate(operations)
+        )
+
+    # Seed the lazy diagnostic so every live/dead transition must maintain it incrementally.
+    assert batched.proximity._tombstone_backlog() == 0  # noqa: SLF001
+    assert legacy.proximity._tombstone_backlog() == 0  # noqa: SLF001
+    batched_redo = CommitRedo(batched.pool, batched.manager)
+    legacy_redo = CommitRedo(legacy.pool, _LegacyManager(legacy.manager))  # type: ignore[arg-type]
+    batched_result = batched_redo.apply(_replay(records_for(batched.proximity)))
+    legacy_result = legacy_redo.apply(_replay(records_for(legacy.proximity)))
+    batched_redo.flush(batched_result)
+    legacy_redo.flush(legacy_result)
+    once = batched.entries()
+    batched_redo.flush(
+        batched_redo.apply(_replay(records_for(batched.proximity)))
+    )
+    legacy_redo.flush(legacy_redo.apply(_replay(records_for(legacy.proximity))))
+
+    assert batched.entries() == once == legacy.entries()
+    assert batched.proximity.header == legacy.proximity.header
+    assert batched.proximity.missing_targets == legacy.proximity.missing_targets == 4
+    assert batched.proximity._tombstone_backlog_count == 0  # noqa: SLF001
+    assert legacy.proximity._tombstone_backlog_count == 0  # noqa: SLF001
+    assert batched.device.page_count(batched.proximity.file) == legacy.device.page_count(
+        legacy.proximity.file
+    )
+    assert tuple(
+        batched.device.raw_page(batched.proximity.file, page)
+        for page in range(batched.device.page_count(batched.proximity.file))
+    ) == tuple(
+        legacy.device.raw_page(legacy.proximity.file, page)
+        for page in range(legacy.device.page_count(legacy.proximity.file))
+    )
+
+
+def test_duplicate_physical_target_declines_the_hot_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = build_database()
+    key = _keys_in_bucket(database.exact, 0, 1, prefix=b"duplicate-")[0]
+    ref = RecordRef(77, 1)
+    entry = IndexEntry(key=key, ref=ref, versioned=False)
+    pages = database.exact._bucket_pages(0)  # noqa: SLF001
+    assert database.exact._place(pages, entry, 1) is True  # noqa: SLF001
+    assert database.exact._place(pages, entry, 2) is True  # noqa: SLF001
+    records = tuple(
+        _effect_for(database.exact, IndexOperation.TOMBSTONE, 10 + offset, key, ref)
+        for offset in range(8)
+    )
+    scalar_calls = 0
+    original = IndexStore._apply_change
+
+    def counted(store: IndexStore, change: IndexChange, lsn: int) -> bool:
+        nonlocal scalar_calls
+        scalar_calls += 1
+        return original(store, change, lsn)
+
+    monkeypatch.setattr(IndexStore, "_apply_change", counted)
+
+    CommitRedo(database.pool, database.manager).apply(_replay(records))
+
+    assert scalar_calls == len(records)
+    matching = tuple(entry for entry in database.exact.walk() if entry.matches(key, ref))
+    assert len(matching) == 2
+    assert sum(entry.live for entry in matching) == 1
+
+
+def test_late_hot_bucket_corruption_refuses_before_an_earlier_bucket_mutates() -> None:
+    database = build_database()
+    first_keys = _keys_in_bucket(database.exact, 0, 8, prefix=b"first-hot-")
+    corrupt_keys = _keys_in_bucket(database.exact, 1, 8, prefix=b"corrupt-hot-")
+    records = tuple(
+        _effect_for(
+            database.exact,
+            IndexOperation.INSERT,
+            10 + offset,
+            key,
+            RecordRef(offset + 1, 1),
+        )
+        for offset, key in enumerate((*first_keys, *corrupt_keys))
+    )
+    corrupt_page = database.exact._bucket_head(1)  # noqa: SLF001
+    with database.pool.pinned(database.exact.file, corrupt_page) as page:
+        page.insert_slot(b"not-an-index-entry")
+
+    with pytest.raises(GrafxCorruptionDetected):
+        CommitRedo(database.pool, database.manager).apply(_replay(records))
+
+    for page_index in database.exact._bucket_pages(0):  # noqa: SLF001
+        with database.pool.pinned(database.exact.file, page_index) as page:
+            assert not page.live_slots()
+
+
+def test_hot_bucket_partial_failure_marks_stale_without_scalar_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = build_database()
+    keys = _keys_in_bucket(database.exact, 0, 8, prefix=b"fail-hot-")
+    records = tuple(
+        _effect_for(
+            database.exact,
+            IndexOperation.INSERT,
+            10 + offset,
+            key,
+            RecordRef(offset + 1, 1),
+        )
+        for offset, key in enumerate(keys)
+    )
+    original_hot = IndexStore._apply_common_replay_hot_change
+    hot_calls = 0
+    scalar_calls = 0
+
+    def fail_second(
+        store: IndexStore,
+        bucket: object,
+        change: IndexChange,
+        lsn: int,
+    ) -> bool:
+        nonlocal hot_calls
+        hot_calls += 1
+        if hot_calls == 2:
+            raise GrafxIndexError("injected hot replay failure", field="injected")
+        return original_hot(store, bucket, change, lsn)  # type: ignore[arg-type]
+
+    def unexpected_scalar(
+        _store: IndexStore, _change: IndexChange, _lsn: int
+    ) -> bool:
+        nonlocal scalar_calls
+        scalar_calls += 1
+        return False
+
+    monkeypatch.setattr(IndexStore, "_apply_common_replay_hot_change", fail_second)
+    monkeypatch.setattr(IndexStore, "_apply_change", unexpected_scalar)
+
+    with pytest.raises(GrafxIndexError, match="injected hot replay failure"):
+        CommitRedo(database.pool, database.manager).apply(_replay(records))
+
+    assert hot_calls == 2
+    assert scalar_calls == 0
+    assert database.exact.stale is True
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit"),
+    (
+        ("_COMMON_REPLAY_HOT_TARGET_LIMIT", 7),
+        ("_COMMON_REPLAY_HOT_PAGE_LIMIT", 0),
+        ("_COMMON_REPLAY_HOT_BUCKET_LIMIT", 0),
+    ),
+)
+def test_hot_directory_budget_declines_before_scalar_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit: int,
+) -> None:
+    database = build_database()
+    keys = _keys_in_bucket(database.exact, 0, 8, prefix=b"bounded-hot-")
+    records = tuple(
+        _effect_for(
+            database.exact,
+            IndexOperation.INSERT,
+            10 + offset,
+            key,
+            RecordRef(offset + 1, 1),
+        )
+        for offset, key in enumerate(keys)
+    )
+    scalar_calls = 0
+    original = IndexStore._apply_change
+
+    def counted(store: IndexStore, change: IndexChange, lsn: int) -> bool:
+        nonlocal scalar_calls
+        scalar_calls += 1
+        return original(store, change, lsn)
+
+    monkeypatch.setattr(index_manager_module, limit_name, limit)
+    monkeypatch.setattr(IndexStore, "_apply_change", counted)
+
+    CommitRedo(database.pool, database.manager).apply(_replay(records))
+
+    assert scalar_calls == len(records)
+    assert len(tuple(database.exact.walk())) == len(records)
+
+
+def test_pagefull_remains_authoritative_for_a_hot_first_fit_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = build_database()
+    keys = _keys_in_bucket(database.exact, 0, 8, prefix=b"pagefull-hot-")
+    records = tuple(
+        _effect_for(
+            database.exact,
+            IndexOperation.INSERT,
+            10 + offset,
+            key,
+            RecordRef(offset + 1, 1),
+        )
+        for offset, key in enumerate(keys)
+    )
+    head = database.exact._bucket_head(0)  # noqa: SLF001
+    original_insert = Page.insert_slot
+    refused = False
+    scalar_calls = 0
+
+    def refuse_first_hint(page: Page, payload: bytes) -> int:
+        nonlocal refused
+        if not refused and page.page_index == head:
+            refused = True
+            raise PageFullError("injected authoritative page refusal", page=head)
+        return original_insert(page, payload)
+
+    def unexpected_scalar(
+        _store: IndexStore, _change: IndexChange, _lsn: int
+    ) -> bool:
+        nonlocal scalar_calls
+        scalar_calls += 1
+        return False
+
+    monkeypatch.setattr(Page, "insert_slot", refuse_first_hint)
+    monkeypatch.setattr(IndexStore, "_apply_change", unexpected_scalar)
+
+    CommitRedo(database.pool, database.manager).apply(_replay(records))
+
+    assert refused is True
+    assert scalar_calls == 0
+    assert len(tuple(database.exact.walk())) == len(records)

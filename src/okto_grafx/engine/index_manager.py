@@ -180,6 +180,18 @@ _DETACHED_GENERATION_NONCE_ATTEMPTS: int = 64
 _DEFINITION_MATCH_MEMO_LIMIT: int = 1024
 """Per-manager ceiling for immutable schema-provenance comparisons."""
 
+_COMMON_REPLAY_HOT_BUCKET_MIN_EFFECTS: int = 8
+"""Smallest per-bucket replay run worth pre-indexing for this one recovery call."""
+
+_COMMON_REPLAY_HOT_TARGET_LIMIT: int = 65_536
+"""Hard ceiling on target identities retained by all hot directories in one replay."""
+
+_COMMON_REPLAY_HOT_PAGE_LIMIT: int = 16_384
+"""Hard ceiling on bucket pages retained by all hot directories in one replay."""
+
+_COMMON_REPLAY_HOT_BUCKET_LIMIT: int = 16_384
+"""Hard ceiling on distinct bucket identities considered by the replay accelerator."""
+
 TOMBSTONE_BACKLOG: str = "oktografx_vector_tombstone_backlog"
 RECONCILIATION_TOTAL: str = "oktografx_vector_reconciliation_total"
 
@@ -301,11 +313,14 @@ class _FirstFitPages:
     chain from its head.  It is never retained across a commit, recovery call or certificate.
     """
 
-    __slots__ = ("pages", "_capacities", "_leaf_count", "_tree")
+    __slots__ = ("pages", "_capacities", "_leaf_count", "_positions", "_tree")
 
     def __init__(self, pages: Sequence[PageIndex], capacities: Sequence[int]) -> None:
         self.pages: list[PageIndex] = list(pages)
         self._capacities: list[int] = list(capacities)
+        self._positions: dict[PageIndex, int] = {
+            page: position for position, page in enumerate(self.pages)
+        }
         self._leaf_count = 1
         while self._leaf_count < len(self.pages):
             self._leaf_count *= 2
@@ -335,6 +350,7 @@ class _FirstFitPages:
 
     def append(self, page: PageIndex, capacity: int) -> None:
         """Add a new tail page, growing the tree geometrically."""
+        self._positions[page] = len(self.pages)
         self.pages.append(page)
         self._capacities.append(capacity)
         if len(self.pages) > self._leaf_count:
@@ -345,11 +361,8 @@ class _FirstFitPages:
         self.update(len(self.pages) - 1, capacity)
 
     def position(self, page: PageIndex) -> int | None:
-        """Return one page's chain position; build chains are intentionally short metadata."""
-        try:
-            return self.pages.index(page)
-        except ValueError:
-            return None
+        """Return one page's chain position without rescanning a replay-hot chain."""
+        return self._positions.get(page)
 
     def _rebuild_tree(self) -> None:
         """Recreate the max tree after geometric growth."""
@@ -377,6 +390,18 @@ class _CommonReplayItem:
     store: IndexStore
     change: IndexChange
     position: Lsn
+    bucket: int
+
+
+@dataclass(slots=True)
+class _CommonReplayHotBucket:
+    """One fully validated, call-local directory over a replay-hot bucket."""
+
+    pages: _FirstFitPages
+    entries: dict[
+        tuple[bytes, RecordRef],
+        tuple[PageIndex, SlotId, IndexEntry] | None,
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,6 +420,7 @@ class _CommonReplayBatch:
     owner: IndexManager
     items: tuple[_CommonReplayItem, ...]
     stores: tuple[_CommonReplayStore, ...]
+    hot_buckets: Mapping[tuple[IndexStore, int], _CommonReplayHotBucket]
 
 
 _ReadResult = TypeVar("_ReadResult")
@@ -2697,6 +2723,203 @@ class IndexStore:
     def _page_insert_capacity(page: Page) -> int:
         """Return the largest payload one additional slot can hold after compaction."""
         return page.compactable_space() - SLOT_ENTRY_SIZE
+
+    def _prepare_common_replay_hot_bucket(
+        self,
+        bucket: int,
+        targets: Collection[tuple[bytes, RecordRef]],
+        *,
+        page_limit: int,
+    ) -> _CommonReplayHotBucket | None:
+        """Validate one hot bucket and retain locations only for this replay's targets.
+
+        A duplicate target makes scalar lookup semantics significant (the legacy path chooses
+        the first match), so that bucket declines acceleration.  Malformed pages or entries are
+        not hidden behind a decline: preparation propagates their typed refusal while the batch
+        is still mutation-free.
+        """
+        if page_limit < 1:
+            return None
+        pages: list[PageIndex] = []
+        entries: dict[
+            tuple[bytes, RecordRef],
+            tuple[PageIndex, SlotId, IndexEntry] | None,
+        ] = dict.fromkeys(targets)
+        capacities: list[int] = []
+        duplicate_target = False
+        seen: set[PageIndex] = visited_pages()
+        lazy_bound_after = 8
+        chain_limit: int | None = None
+        page_index: PageIndex = self._bucket_head(bucket)
+        while page_index != NO_PAGE:
+            # A larger chain is not an error, but it is outside this bounded accelerator.  The
+            # scalar path remains authoritative and will validate the rest as it applies.
+            if len(pages) >= page_limit:
+                return None
+            if chain_limit is None and len(pages) >= lazy_bound_after:
+                chain_limit = self._pool.storage.page_count(self.file) + 1
+            if chain_limit is not None:
+                refuse_endless_chain(self.file, len(pages) + 1, chain_limit)
+            if page_index in seen:
+                raise GrafxCorruptionDetected(
+                    f"The bucket chain of {self.file!r} returns to page {page_index}, so it "
+                    "is a cycle.",
+                    file=self.file,
+                    page=page_index,
+                    field="cycle",
+                )
+            seen.add(page_index)
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                capacities.append(self._page_insert_capacity(page))
+                for slot, image in page.iter_slot_views():
+                    entry = IndexEntry.decode(image)
+                    identity = (entry.key, entry.ref)
+                    if identity not in entries:
+                        continue
+                    if entries[identity] is not None:
+                        duplicate_target = True
+                        continue
+                    entries[identity] = (
+                        page_index,
+                        slot,
+                        entry.located_at(page_index, slot),
+                    )
+                following = page.next_page
+            pages.append(page_index)
+            page_index = following
+        if duplicate_target:
+            return None
+        return _CommonReplayHotBucket(_FirstFitPages(pages, capacities), entries)
+
+    def _place_during_common_replay(
+        self,
+        bucket: _CommonReplayHotBucket,
+        entry: IndexEntry,
+        lsn: Lsn,
+    ) -> tuple[PageIndex, SlotId, IndexEntry]:
+        """Place through one accepted hot-bucket directory without an ambiguous fallback."""
+        payload = entry.encode()
+        position = bucket.pages.first_fit(len(payload))
+        while position is not None:
+            page_index = bucket.pages.pages[position]
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                try:
+                    slot = page.insert_slot(payload)
+                except PageFullError:
+                    # The tree is only a selection hint. Page.insert_slot remains the authority
+                    # and promises a refused insertion is mutation-free, so excluding this hint
+                    # and trying the next candidate preserves _place's ordering and semantics.
+                    bucket.pages.update(
+                        position,
+                        min(self._page_insert_capacity(page), len(payload) - 1),
+                    )
+                else:
+                    self._stamp(page, lsn)
+                    bucket.pages.update(position, self._page_insert_capacity(page))
+                    return page_index, slot, entry.located_at(page_index, slot)
+            position = bucket.pages.first_fit(len(payload))
+
+        if not bucket.pages.pages:
+            raise GrafxCorruptionDetected(
+                f"A bucket of {self.file!r} has no head page, so an entry has nowhere to go.",
+                file=self.file,
+                field="bucket",
+            )
+        fresh = self._pool.allocate(self.file, self.page_type)
+        page_index = fresh.page_index
+        try:
+            slot = fresh.insert_slot(payload)
+            self._stamp(fresh, lsn)
+            capacity = self._page_insert_capacity(fresh)
+        finally:
+            self._pool.unpin(self.file, page_index, dirty=True)
+        # Preserve _place_on_new_page's failure ordering: fill the new page before linking it.
+        tail_index = bucket.pages.pages[-1]
+        with self._pool.pinned(self.file, tail_index) as tail:
+            self._require_index_page(tail, tail_index)
+            tail.next_page = page_index
+            tail.dirty = True
+        bucket.pages.append(page_index, capacity)
+        return page_index, slot, entry.located_at(page_index, slot)
+
+    def _apply_common_replay_hot_change(
+        self,
+        bucket: _CommonReplayHotBucket,
+        change: IndexChange,
+        lsn: Lsn,
+    ) -> bool:
+        """Apply one ordered replay effect through a fully prepared hot-bucket directory."""
+        identity = (change.key, change.ref)
+        if identity not in bucket.entries:
+            raise GrafxCorruptionDetected(
+                f"The ephemeral replay directory for index {self.name!r} does not contain an "
+                "identity from its prepared batch.",
+                field="replay_bucket_identity",
+                index=self.name,
+                file=self.file,
+            )
+        located = bucket.entries[identity]
+        if change.operation is IndexOperation.INSERT:
+            self._require_key(change.key)
+            if located is not None:
+                return False
+            entry = IndexEntry(
+                key=change.key,
+                ref=change.ref,
+                versioned=change.versioned,
+                born_csn=change.csn if change.versioned else NO_CSN,
+            )
+            bucket.entries[identity] = self._place_during_common_replay(
+                bucket, entry, lsn
+            )
+            return True
+        if located is None:
+            self._missing_targets += 1
+            return False
+        page_index, slot, entry = located
+        if change.operation is IndexOperation.TOMBSTONE:
+            if not entry.live:
+                return False
+            ended = entry.ended_at(change.csn)
+            try:
+                moved = self._rewrite(page_index, slot, ended, lsn)
+            except BaseException:
+                self._invalidate_tombstone_backlog()
+                raise
+            if moved:
+                bucket.entries[identity] = (
+                    page_index,
+                    slot,
+                    ended.located_at(page_index, slot),
+                )
+                self._adjust_tombstone_backlog(1)
+            return moved
+
+        position = bucket.pages.position(page_index)
+        if position is None:
+            raise GrafxCorruptionDetected(
+                f"The ephemeral replay directory for index {self.name!r} lost page "
+                f"{page_index} before removing its target.",
+                field="replay_bucket_page",
+                index=self.name,
+                file=self.file,
+                page=page_index,
+            )
+        try:
+            moved = self._erase(page_index, slot, lsn)
+        except BaseException:
+            self._invalidate_tombstone_backlog()
+            raise
+        if moved:
+            bucket.entries[identity] = None
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                bucket.pages.update(position, self._page_insert_capacity(page))
+            if not entry.live:
+                self._adjust_tombstone_backlog(-1)
+        return moved
 
     def _empty_build_bucket(
         self, build: _EmptyIndexBuild, bucket: int
@@ -5564,7 +5787,12 @@ class IndexManager:
                     operation=change.operation.name,
                     lsn=record.lsn,
                 )
-            item = _CommonReplayItem(store, change, lsn_of(record))
+            item = _CommonReplayItem(
+                store,
+                change,
+                lsn_of(record),
+                bucket_of(change.key, store.definition.bucket_count),
+            )
             items.append(item)
             if store not in seen:
                 seen.add(store)
@@ -5589,11 +5817,63 @@ class IndexManager:
             if item.change.operation is IndexOperation.REMOVE:
                 final = final.reconciled_to(item.change.csn)
             final_by_store[item.store] = final
+
+        bucket_counts: Counter[tuple[IndexStore, int]] = Counter()
+        bounded_bucket_census = True
+        for item in items:
+            identity = (item.store, item.bucket)
+            if (
+                identity not in bucket_counts
+                and len(bucket_counts) >= _COMMON_REPLAY_HOT_BUCKET_LIMIT
+            ):
+                # Counting an unbounded number of cold buckets would make the accelerator's
+                # metadata grow with the WAL.  Decline the whole directory optimization while
+                # retaining the already-prepared common header batch and its scalar semantics.
+                bucket_counts.clear()
+                bounded_bucket_census = False
+                break
+            bucket_counts[identity] += 1
+        bucket_targets: dict[tuple[IndexStore, int], set[tuple[bytes, RecordRef]]] = {}
+        declined_buckets: set[tuple[IndexStore, int]] = set()
+        retained_targets = 0
+        for item in items if bounded_bucket_census else ():
+            identity = (item.store, item.bucket)
+            if (
+                bucket_counts[identity] < _COMMON_REPLAY_HOT_BUCKET_MIN_EFFECTS
+                or identity in declined_buckets
+            ):
+                continue
+            targets = bucket_targets.setdefault(identity, set())
+            target = (item.change.key, item.change.ref)
+            if target in targets:
+                continue
+            if retained_targets >= _COMMON_REPLAY_HOT_TARGET_LIMIT:
+                retained_targets -= len(targets)
+                bucket_targets.pop(identity)
+                declined_buckets.add(identity)
+                continue
+            targets.add(target)
+            retained_targets += 1
+
+        hot_buckets: dict[
+            tuple[IndexStore, int], _CommonReplayHotBucket
+        ] = {}
+        remaining_pages = _COMMON_REPLAY_HOT_PAGE_LIMIT
+        for identity, targets in bucket_targets.items():
+            store, bucket = identity
+            prepared_bucket = store._prepare_common_replay_hot_bucket(
+                bucket,
+                targets,
+                page_limit=remaining_pages,
+            )
+            if prepared_bucket is not None:
+                hot_buckets[identity] = prepared_bucket
+                remaining_pages -= len(prepared_bucket.pages.pages)
         stores = tuple(
             _CommonReplayStore(store, initial_by_store[store], final_by_store[store])
             for store in ordered_stores
         )
-        return _CommonReplayBatch(self, tuple(items), stores)
+        return _CommonReplayBatch(self, tuple(items), stores, hot_buckets)
 
     def apply_common_replay_batch(
         self, records: Sequence[WalRecord]
@@ -5603,6 +5883,12 @@ class IndexManager:
         ``None`` asks the caller to dispatch the *whole* replay through the legacy per-record
         protocol.  Keeping preparation and application inside one call prevents a captured
         header image from being retained and replayed after a later generation or STALE mark.
+
+        The production caller reaches this door during committed redo while holding its local
+        participant section and the cross-process ``COMMIT_SECTION``.  Readers only pin these
+        pages; every local or foreign page mutation needs those writer sections.  A prepared
+        capacity/location therefore cannot change before this call finishes, and the ephemeral
+        directory needs neither persistence nor another concurrency premise.
         """
         prepared = self._prepare_common_replay_batch(records)
         if prepared is None:
@@ -5620,7 +5906,14 @@ class IndexManager:
                     touched.append(store)
                 store._replaying = True
                 try:
-                    item_moved = store._apply_change(item.change, item.position)
+                    hot_bucket = prepared.hot_buckets.get((store, item.bucket))
+                    item_moved = (
+                        store._apply_change(item.change, item.position)
+                        if hot_bucket is None
+                        else store._apply_common_replay_hot_change(
+                            hot_bucket, item.change, item.position
+                        )
+                    )
                 finally:
                     store._replaying = False
                 moved_by_store[store] = moved_by_store[store] or item_moved
