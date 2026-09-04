@@ -2281,7 +2281,22 @@ class _Planner:
         seek, remaining = self._index_seek(pipeline, variable, table, terms)
         if seek is not None:
             return seek, remaining, variable
-        return NodeScan(child=pipeline, variable=variable, table=table), terms, variable
+        scan: PlanNode = NodeScan(child=pipeline, variable=variable, table=table)
+        local = [
+            term
+            for term in terms
+            if self._equality_on(term, variable, table) is not None
+        ]
+        predicate = _conjoin(local)
+        if predicate is not None:
+            # An equality whose value is accepted by ``_seekable_key`` cannot read another
+            # MATCH variable.  It is therefore safe to discard non-matching rows as soon as
+            # this scan binds the owner instead of first materialising the Cartesian product
+            # with every later pattern.  Keep every wider expression residual: correlated
+            # equality, OR and non-equality still run at their canonical position.
+            scan = FilterRows(child=scan, predicate=predicate)
+        remaining = [term for term in terms if term not in local]
+        return scan, remaining, variable
 
     def _match_every_node(
         self,
