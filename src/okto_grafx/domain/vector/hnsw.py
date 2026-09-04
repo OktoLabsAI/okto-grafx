@@ -45,6 +45,7 @@ from math import log
 from okto_grafx.domain.errors import GrafxConfigurationError
 from okto_grafx.domain.ports.vectormath import (
     DistanceMetric,
+    PreparedCosineVectorMath,
     PreparedVectorMath,
     VectorMath,
 )
@@ -174,6 +175,7 @@ class HnswGraph:
     __slots__ = (
         "_math",
         "_prepare",
+        "_prepare_cosine_with_norm",
         "_metric",
         "_neighbours",
         "_neighbours_zero",
@@ -182,6 +184,7 @@ class HnswGraph:
         "_random",
         "_level_scale",
         "_values",
+        "_norms",
         "_levels",
         "_links",
         "_chain_next",
@@ -212,6 +215,11 @@ class HnswGraph:
         """
         self._math = math
         self._prepare = math.prepare if isinstance(math, PreparedVectorMath) else None
+        self._prepare_cosine_with_norm = (
+            math.prepare_cosine_with_norm
+            if isinstance(math, PreparedCosineVectorMath)
+            else None
+        )
         self._metric = metric
         self._neighbours = _require_positive("neighbours", neighbours)
         self._neighbours_zero = self._neighbours * 2
@@ -227,6 +235,10 @@ class HnswGraph:
         self._random = SplitMix64(seed)
         self._level_scale = 1.0 / log(self._neighbours) if self._neighbours > 1 else 1.0
         self._values: dict[int, tuple[float, ...] | bytes] = {}
+        # Successful candidate norms are exact, process-local derivatives of immutable graph
+        # components.  They are populated only after the ordinary scorer succeeds, so a failed
+        # score retains its established timing and never leaves a cached authorization behind.
+        self._norms: dict[int, tuple[tuple[float, ...] | bytes, float]] = {}
         self._levels: dict[int, int] = {}
         self._links: list[dict[int, list[int]]] = [{}]
         self._chain_next: dict[int, int] = {}
@@ -388,6 +400,7 @@ class HnswGraph:
                 self._link(orphans[position], orphans[position + 1], layer)
         self._splice_from_chain(node)
         del self._values[node]
+        self._norms.pop(node, None)
         del self._levels[node]
         if self._entry_point == node:
             self._elect_entry_point()
@@ -467,7 +480,12 @@ class HnswGraph:
 
     def _components(self, node: int) -> Sequence[float]:
         """Return one node's tuple or a fresh compact view safe for a host to release."""
-        stored = self._values[node]
+        return self._stored_components(self._values[node])
+
+    def _stored_components(
+        self, stored: tuple[float, ...] | bytes
+    ) -> Sequence[float]:
+        """Return a fresh view over one captured immutable backing generation."""
         return stored if isinstance(stored, tuple) else self._view(stored)
 
     def _scorer(self, query: Sequence[float]) -> Callable[[int], float]:
@@ -479,6 +497,34 @@ class HnswGraph:
         scored through ``score`` exactly as before. Both paths answer the same number for the
         same pair, and a test holds them to identical graphs, rankings and traversal counts.
         """
+        if (
+            self._metric is DistanceMetric.COSINE
+            and self._prepare_cosine_with_norm is not None
+        ):
+            measured, cached = self._prepare_cosine_with_norm(query)
+
+            def cosine(node: int) -> float:
+                stored = self._values[node]
+                retained = self._norms.get(node)
+                if retained is not None and retained[0] is stored:
+                    return cached(self._stored_components(stored), retained[1])
+                # The measuring scorer follows the legacy operation order and returns the norm
+                # it actually used.  Publish only if re-entry did not replace this node's
+                # immutable backing while host math was running; a refusal returns no pair and
+                # therefore caches nothing.
+                result, right_norm = measured(self._stored_components(stored))
+                if self._values.get(node) is stored:
+                    self._norms[node] = (stored, right_norm)
+                    # A thread may remove this generation between the comparison and the cache
+                    # write.  Revalidate after publication and retire only our own stale value;
+                    # this keeps churn bounded without holding a lock across host vector math.
+                    if self._values.get(node) is not stored:
+                        published = self._norms.get(node)
+                        if published is not None and published[0] is stored:
+                            self._norms.pop(node, None)
+                return result
+
+            return cosine
         if self._prepare is not None:
             prepared = self._prepare(query, self._metric)
             return lambda node: prepared(self._components(node))

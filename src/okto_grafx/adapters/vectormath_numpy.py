@@ -165,6 +165,20 @@ class NumpyVectorMath:
                 numpy.dot(left, right) / (length_a * length_b), "cosine similarity"
             )
 
+    @staticmethod
+    def _cosine_with_norm_from_arrays(
+        left: numpy.ndarray,
+        length_a: float,
+        right: numpy.ndarray,
+        length_b: float,
+    ) -> float:
+        """Finish cosine scoring with the candidate norm already proved finite."""
+        if length_a == 0.0 or length_b == 0.0:
+            return 0.0
+        return _require_finite(
+            numpy.dot(left, right) / (length_a * length_b), "cosine similarity"
+        )
+
     def euclidean(self, a: Sequence[float], b: Sequence[float]) -> float:
         """Return the Euclidean distance between two vectors of equal length."""
         require_same_length(a, b)
@@ -281,6 +295,58 @@ class NumpyVectorMath:
                 )
 
         return euclidean
+
+    def prepare_cosine_with_norm(
+        self, query: Sequence[float]
+    ) -> tuple[
+        Callable[[Sequence[float]], tuple[float, float]],
+        Callable[[Sequence[float], float], float],
+    ]:
+        """Prepare exact cosine scoring while reusing a proved stored-vector norm.
+
+        Query conversion and measurement stay lazy so merely preparing an unused search cannot
+        introduce a refusal.  Candidate length and conversion retain the ordinary prepared
+        scorer's order; only the already successful right-norm calculation is skipped.
+        """
+        prepared: tuple[numpy.ndarray, float] | None = None
+
+        def converted(
+            values: Sequence[float],
+        ) -> tuple[numpy.ndarray, float, numpy.ndarray]:
+            nonlocal prepared
+            require_same_length(query, values)
+            if prepared is None:
+                left = _as_array(query)
+                right = _as_array(values)
+                with _quiet():
+                    length_query = _require_finite(
+                        numpy.sqrt(numpy.dot(left, left)), "norm"
+                    )
+                prepared = (left, length_query)
+            else:
+                left, length_query = prepared
+                right = _as_array(values)
+            return left, length_query, right
+
+        def measured(values: Sequence[float]) -> tuple[float, float]:
+            left, length_query, right = converted(values)
+            with _quiet():
+                right_norm = _require_finite(
+                    numpy.sqrt(numpy.dot(right, right)), "norm"
+                )
+                score = self._cosine_with_norm_from_arrays(
+                    left, length_query, right, right_norm
+                )
+            return score, right_norm
+
+        def cosine(values: Sequence[float], right_norm: float) -> float:
+            left, length_query, right = converted(values)
+            with _quiet():
+                return self._cosine_with_norm_from_arrays(
+                    left, length_query, right, right_norm
+                )
+
+        return measured, cosine
 
     def __repr__(self) -> str:
         return f"NumpyVectorMath(name={NUMPY_ADAPTER_NAME!r})"

@@ -11,7 +11,12 @@ from collections.abc import Callable, Sequence
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
-__all__ = ["DistanceMetric", "PreparedVectorMath", "VectorMath"]
+__all__ = [
+    "DistanceMetric",
+    "PreparedCosineVectorMath",
+    "PreparedVectorMath",
+    "VectorMath",
+]
 
 
 class DistanceMetric(str, Enum):
@@ -88,4 +93,27 @@ class PreparedVectorMath(Protocol):
         self, query: Sequence[float], metric: DistanceMetric
     ) -> Callable[[Sequence[float]], float]:
         """Return a scorer of stored vectors against ``query`` under ``metric``."""
+        ...
+
+
+@runtime_checkable
+class PreparedCosineVectorMath(Protocol):
+    """Optional exact cosine scorer accepting a previously proved candidate norm.
+
+    A graph can see the same stored vector hundreds of times across construction and searches.
+    Its norm depends only on those immutable components, so an adapter may expose this narrow
+    capability to reuse a norm the graph already computed successfully.  The returned scorers
+    must share one lazy preparation of ``query``.  The first returns the ordinary exact score
+    together with the candidate norm that same operation used; the second must answer exactly
+    the same score when offered that proved norm.  Adapters which do not opt in retain the
+    ordinary :class:`PreparedVectorMath` or :class:`VectorMath` path unchanged.
+    """
+
+    def prepare_cosine_with_norm(
+        self, query: Sequence[float]
+    ) -> tuple[
+        Callable[[Sequence[float]], tuple[float, float]],
+        Callable[[Sequence[float], float], float],
+    ]:
+        """Return measuring and norm-reusing scorers sharing lazy query preparation."""
         ...
