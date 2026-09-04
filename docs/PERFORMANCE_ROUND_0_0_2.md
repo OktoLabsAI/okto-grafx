@@ -711,3 +711,43 @@ recovery/refusal cases, 70 transaction materialization cases, 117 heap/commit/re
 checkpoint/recycling cases passed, with scoped Ruff and diff checks green. A pre-existing catalog
 page-type failure in `test_three_participants_writing_one_catalog_page_cannot_all_commit` remains
 explicitly outside these deltas and is not presented as passing.
+
+## Scale-removal batch 4 — selective vectors and registered identities
+
+Status: **VEC-4 and CAT-5 completed; the first EDGE prototype was rejected and reverted before the
+milestone could be closed**.
+
+- `c77d414` lets an exact vector query pass an immutable, engine-sealed candidate certificate into
+  the vector engine only when it belongs to the same owner, space, table, column and `read_lsn`.
+  Selected rows are revalidated against heap MVCC and `(key, ref)` is authenticated once per
+  touched bucket. Any incomplete proof, NULL, deletion, duplicate, wrong reference or metadata
+  drift falls back to the canonical walk before scoring or output. The conservative gate is
+  `4R <= min(E, B)`: in the focal case the path used 4 heap reads instead of 64 and performed zero
+  full `index.walk()`. This is a structural selective gain, not an `O(K)` claim; with fixed bucket
+  count the authentication remains `Θ(U·E/B)`, and corruption outside visited rows/buckets remains
+  covered by full scan/`verify`.
+- `40552df` obtains v2 artifact nonces directly from their already registered immutable definitions.
+  Only legacy nonce-zero artifacts open and validate the header; alternate/narrow registries retain
+  that fallback. The allocator sample at 64 generations measured about `352 -> 61 ms` (`5.8x`),
+  while the sampled DDL path measured `1,085 -> 789 ms` (`1.37x`). These are component receipts.
+- `b236697` attempted to move local equalities below Cartesian scans and was rejected by adversarial
+  validation. It changed the observable error channel, could hide an inner scan failure and could
+  turn `GrafxQueryBudgetExceeded` into a committed relationship write. `030b39d` removes the
+  transformation and freezes those cases in regression tests. The measured cliff remains real:
+  two unindexed endpoints cause repeated inner scans and `N + N²` logical rows. Its replacement
+  must reduce physical work without changing predicate order, logical `rows_scanned`, budget
+  refusal or statement atomicity.
+
+Focused evidence was grouped: VEC-4 passed its 28-case final/query slice plus 57 adjacent cases and
+an independent adversarial review; CAT-5 passed 20 allocator cases plus 15 schema/index cases; the
+EDGE corrective slice passed 15 dedicated and 95 planner cases. Ruff lint and diff checks passed.
+
+### Deferred HNSW construction tuning
+
+The cold builder sorts entries canonically, while same-process incremental `commit/apply` inserts
+in staging order. Approximate graph shape and ranking may therefore differ between those lifecycle
+paths even for the same final exact set. This does not change exact results or the existing HNSW
+contract, which promises reproducibility only for the same seed and insertion sequence. Public
+`ef_construction`/neighbour-count knobs are deliberately deferred until a full 8,192 x 384 profile
+and a recall harness that does not visit nearly the entire graph establish a material gain. They
+are not a gate for the current scale-removal work.

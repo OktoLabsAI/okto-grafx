@@ -56,6 +56,21 @@ including the on-disk format.
 
 ### Changed
 
+- Exact vector searches fed by a small, engine-sealed materialized candidate set now authenticate
+  only the selected heap rows and their index buckets. Any incomplete proof, metadata drift, NULL,
+  deletion, duplicate or wrong reference falls back to the canonical full scan before ranking; a
+  public filter or custom snapshot cannot activate the path. With fixed bucket count the cost is
+  `Θ(U·E/B)`, not `O(K)`; corruption outside visited candidates remains the responsibility of a
+  full scan or `verify`.
+- V2 index-generation nonce allocation now reuses the immutable nonce already certified by each
+  registered definition. Legacy nonce-zero artifacts still open and validate their physical
+  header, and collisions retain the same bounded refusal. A 64-generation component sample moved
+  from roughly `352 ms` to `61 ms`; end-to-end DDL moved from `1,085 ms` to `789 ms`.
+- A local-equality Cartesian pushdown prototype was removed after adversarial tests proved that it
+  could suppress predicate errors, persistent inner-scan failures and query-budget refusals, in
+  the latter case allowing a write that the canonical plan refused. The regressions now freeze
+  predicate order, logical row accounting and statement atomicity while a dedicated operator is
+  designed.
 - Empty exact-index generations now use an ephemeral first-fit directory while they are built.
   The durable index pages remain byte-identical to the canonical allocator, including removes and
   tombstones, while reset/detached builds avoid repeatedly walking empty buckets and data pages.
