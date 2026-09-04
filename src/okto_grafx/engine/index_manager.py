@@ -4431,8 +4431,7 @@ class IndexManager:
             getattr(authority, "format_version", CATALOG_LEGACY_FORMAT_VERSION)
             != CATALOG_LEGACY_FORMAT_VERSION
         )
-        persisted = frozenset(self._pool.storage.list_files(f"{INDEX_DIRECTORY}/"))
-        missing: list[str] = []
+        relevant: list[IndexDefinition] = []
         seen: set[str] = set()
         for definition in definitions:
             if (definition.table_id, definition.table_name) not in identities:
@@ -4441,14 +4440,34 @@ class IndexManager:
             if file in seen:
                 continue
             seen.add(file)
+            relevant.append(definition)
+
+        unresolved = tuple(
+            definition
+            for definition in relevant
+            if (
+                (current := self._indexes.get(definition.registry_key)) is None
+                or current.definition != definition
+            )
+        )
+        if not unresolved:
+            # Registry equality proves the logical staging target. Physical ownership is still
+            # revalidated through the fresh certificate in validate_staged_artifacts before WAL;
+            # repeating a directory inventory here adds no authority to that stronger proof.
+            return ()
+
+        # Materialise at most once, and only when an unresolved catalog promise requires the
+        # legacy existence/mismatch classification below. Per-definition exists() calls would
+        # retain the same directory-scan cost on local storage.
+        persisted = frozenset(self._pool.storage.list_files(f"{INDEX_DIRECTORY}/"))
+        missing: list[str] = []
+        for definition in unresolved:
+            file = definition.file
             strict_generation = is_v2 and definition.artifact_nonce != 0
             exists = file in persisted
             if not exists:
                 if strict_generation:
                     missing.append(definition.name)
-                continue
-            current = self._indexes.get(definition.registry_key)
-            if current is not None and current.definition == definition:
                 continue
             try:
                 page = self._pool.read_fresh_page(file, HEADER_PAGE_INDEX)
