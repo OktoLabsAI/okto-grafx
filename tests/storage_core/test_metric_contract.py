@@ -20,6 +20,7 @@ from okto_grafx.engine.buffer_pool import (
     BUFFER_BUDGET_EXCEEDED_TOTAL,
     BUFFER_BUDGET_USED_BYTES,
     BUFFER_POOL_METRICS,
+    BUFFER_RETAINED_ESTIMATE_BYTES,
     CHECKSUM_FAILURES_TOTAL,
     CHECKSUM_VERIFICATIONS_TOTAL,
     FSYNC_DURATION_SECONDS,
@@ -30,6 +31,7 @@ from .conftest import MemoryDevice, RecordingMetrics, make_pool
 
 EMITTED_NAMES: tuple[str, ...] = (
     BUFFER_BUDGET_USED_BYTES,
+    BUFFER_RETAINED_ESTIMATE_BYTES,
     BUFFER_BUDGET_EXCEEDED_TOTAL,
     CHECKSUM_VERIFICATIONS_TOTAL,
     CHECKSUM_FAILURES_TOTAL,
@@ -38,6 +40,8 @@ EMITTED_NAMES: tuple[str, ...] = (
 )
 """Every metric the storage core emits.
 
+The retained-estimate gauge is the bounded buffer telemetry of 283cffa (CONTRACT.md section 9,
+``estimator=python-v2``), emitted beside the budget gauge whenever the pool re-measures itself.
 The last two are the data-file half of amendment A25. They are listed here because a roster that
 omits a metric a component owns does not merely fail to test it: it ratifies the gap, and the
 dashboard gate cannot catch it, because that gate checks that a panel exists and not that a
