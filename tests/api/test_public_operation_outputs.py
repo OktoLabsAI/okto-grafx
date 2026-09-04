@@ -931,7 +931,7 @@ def test_checkpoint_refuses_contradictory_recycle_reports(
         ("snapshot_metrics", (ContainedMetricsSink, "snapshot")),
         ("verify", (Verifier, "verify")),
         ("checkpoint", (TransactionManager, "checkpoint")),
-        ("inspect_index", (IndexManager, "index")),
+        ("inspect_index", (IndexManager, "active_index")),
         ("search_vectors", (VectorEngine, "search")),
     ),
 )
