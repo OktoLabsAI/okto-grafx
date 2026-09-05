@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from okto_grafx.domain.errors import GrafxTransactionStateError
 from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
     CATALOG_LEGACY_FORMAT_VERSION,
@@ -139,6 +140,11 @@ def test_an_unsaved_live_v2_catalog_cannot_promote_an_unrelated_heap_commit(
     stack.catalog.catalog.upgrade_index_catalog()
     assert stack.catalog.has_unsaved_changes() is True
 
+    def refuse_redundant_index_sync() -> None:
+        raise AssertionError("unchanged durable catalog must not synchronize the index")
+
+    stack.manager._index_sync = refuse_redundant_index_sync
+
     _commit_heap_page(stack, 3)
 
     assert (
@@ -149,6 +155,25 @@ def test_an_unsaved_live_v2_catalog_cannot_promote_an_unrelated_heap_commit(
         == COMMIT_STATE_LEGACY_FORMAT_VERSION
     )
     assert stack.manager.recovery_required is False
+
+
+def test_an_unsaved_catalog_still_refuses_a_different_durable_authority(
+    stack: Stack,
+) -> None:
+    """The cache-drop rebase cannot conceal a real foreign catalog change."""
+    stack.catalog.catalog.upgrade_index_catalog()
+    assert stack.catalog.has_unsaved_changes() is True
+
+    other = CatalogStore(stack.pool)
+    other.load()
+    durable = other.read_from_pages()
+    durable.upgrade_index_catalog()
+    other.adopt(durable)
+    other.save()
+
+    with pytest.raises(GrafxTransactionStateError) as raised:
+        stack.manager.begin("write")
+    assert raised.value.details["field"] == "structure_epoch"
 
 
 def test_checkpoint_and_later_data_commit_preserve_the_v2_fence(

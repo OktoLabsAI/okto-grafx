@@ -2585,7 +2585,20 @@ class TransactionManager:
             before = image_of() if callable(image_of) else None
             refresh = getattr(self._catalog, "refresh", None)
             if callable(refresh):
-                refresh()
+                # The first/unproved read view may have dropped clean catalog frames without
+                # changing durable authority.  Preserve an unsaved live catalog only when the
+                # concrete store proves from the newly attached pages that its complete
+                # persisted image is unchanged.  Unknown collaborators retain the historical
+                # refresh protocol, and a real foreign catalog change still reaches its
+                # fail-closed refusal instead of discarding local work.
+                rebase_unsaved = getattr(
+                    self._catalog,
+                    "rebase_unsaved_view_if_persisted_unchanged",
+                    None,
+                )
+                rebased = callable(rebase_unsaved) and rebase_unsaved()
+                if not rebased:
+                    refresh()
             after = image_of() if callable(image_of) else None
             observe = getattr(self._index_manager, "observe_published_lsn", None)
             if callable(observe):

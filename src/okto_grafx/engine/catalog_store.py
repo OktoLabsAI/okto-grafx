@@ -107,6 +107,34 @@ class CatalogStore:
 
         return self._persisted_image
 
+    def rebase_unsaved_view_if_persisted_unchanged(self) -> bool:
+        """Rebase a dirty live catalog only when durable authority is unchanged.
+
+        Establishing a first or unproved read view may discard clean catalog frames even when
+        no catalog page changed.  That cache event moves :meth:`_view_epoch`, and the ordinary
+        :meth:`refresh` door must then refuse a live catalog with unsaved changes because
+        replacing it would lose the caller's work.
+
+        Transaction authority synchronization has one safe narrower answer: read the newly
+        attached pages without adopting them and compare their complete canonical image with
+        the image this live catalog was derived from.  Equality proves that only the local view
+        changed, so advancing the view epoch preserves the unsaved delta.  A different image,
+        malformed pages, or any read failure is never converted into permission; the caller
+        proceeds through the established refusing refresh path (or propagates corruption).
+
+        This door deliberately does nothing for a clean catalog.  Clean state belongs to
+        :meth:`refresh`, which must adopt the newly read object rather than merely move a token.
+        """
+
+        current = self._view_epoch()
+        if current == self._loaded_epoch or not self.has_unsaved_changes():
+            return False
+        observed = self.read_from_pages().serialize()
+        if observed != self._persisted_image:
+            return False
+        self._loaded_epoch = current
+        return True
+
     def refresh(self) -> bool:
         """Re-read the catalog when the pages under it may have moved, and say whether it did.
 
