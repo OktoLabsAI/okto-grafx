@@ -101,7 +101,7 @@ from okto_grafx.domain.ids import (
     RecordRef,
     TxnId,
 )
-from okto_grafx.domain.index.records import change_of
+from okto_grafx.domain.index.records import IndexOperation, change_of
 from okto_grafx.domain.index.catalog import (
     CatalogIndexDefinition,
     IndexGenerationDescriptor,
@@ -354,6 +354,20 @@ class _CheckpointTarget:
     target_csn: Csn
     base_checkpoint_lsn: Lsn
     barrier_files: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalAppliedPrefix:
+    """One checkpoint-based WAL prefix this process already applied and flushed.
+
+    This is an advisory, process-local proof only.  It never replaces WAL lineage, the
+    checkpoint control record, or any cross-process authority.  A generic publication or a
+    foreign read view revokes it, and checkpoint consumes it only for the exact interval from
+    ``checkpoint_lsn`` through ``last_committed_lsn``.
+    """
+
+    checkpoint_lsn: Lsn
+    applied_through_lsn: Lsn
 
 
 class _DisabledCommitTrace:
@@ -697,6 +711,7 @@ class TransactionManager:
         "_participant_pin",
         "_published_high_water",
         "_own_published_lsn",
+        "_local_applied_prefix",
         "_recovery_required",
         "_page_staging_capability",
         "_mode_counts",
@@ -924,6 +939,10 @@ class TransactionManager:
         # Compared by equality only -- recovery can republish a smaller number and a foreign
         # checkpoint republishes the same one.
         self._own_published_lsn: Lsn | None = None
+        # A bounded, revocable witness that this exact process applied and flushed every
+        # ordinary DML effect after one completed checkpoint.  It is deliberately absent on
+        # open and is never persisted: another participant remains authoritative through WAL.
+        self._local_applied_prefix: _LocalAppliedPrefix | None = None
         self._recovery_required: bool = False
         self._closed: bool = False
         self._close_quiesced: bool = False
@@ -1035,6 +1054,7 @@ class TransactionManager:
     def request_close(self) -> None:
         """Publish the terminal latch without trying to interrupt an in-flight transition."""
         self._require_process_owner("request close")
+        self._local_applied_prefix = None
         self._closed = True
 
     @contextmanager
@@ -1061,6 +1081,7 @@ class TransactionManager:
         with self._participant_section():
             self._require_not_closed("require recovery")
             self._identity_leases.clear()
+            self._local_applied_prefix = None
             self._recovery_required = True
 
     def recovery_completed(self) -> None:
@@ -1078,6 +1099,9 @@ class TransactionManager:
                     required_lsn=self._published_high_water,
                 )
             self._identity_leases.clear()
+            # Recovery is deliberately never a source of process-local checkpoint authority.
+            # The next completed checkpoint may seed a fresh witness.
+            self._local_applied_prefix = None
             self._recovery_required = False
 
     # --- snapshots --------------------------------------------------------------------------
@@ -2524,6 +2548,15 @@ class TransactionManager:
             # A foreign view consumes any previous own-publication provenance. A later numeric
             # coincidence is not proof that the resident frames came from this participant.
             self._own_published_lsn = None
+            prefix = self._local_applied_prefix
+            checkpoint_seed_is_current = (
+                prefix is not None
+                and prefix.checkpoint_lsn == state.checkpoint_lsn
+                and prefix.applied_through_lsn == state.last_committed_lsn
+                and state.checkpoint_lsn == state.last_committed_lsn
+            )
+            if not checkpoint_seed_is_current:
+                self._local_applied_prefix = None
         return catalog_may_have_changed or self._index_authority_sync_required
 
     def _synchronize_read_index_authority(self, published_lsn: Lsn) -> None:
@@ -2559,6 +2592,12 @@ class TransactionManager:
                 and after is not None
                 and before == after
             )
+            if not authority_unchanged:
+                # A real or unprovable registry boundary revokes local replay provenance.
+                # Byte-identical immutable catalog authority performs no sync and may retain an
+                # exact checkpoint seed; eviction of that advisory seed would be harmless but
+                # would make every newly completed checkpoint unusable on its first statement.
+                self._local_applied_prefix = None
             if self._index_sync is not None and not authority_unchanged:
                 self._index_sync()
             self._refresh_heap_reclaim_capability()
@@ -3421,7 +3460,11 @@ class TransactionManager:
         """
         manager = self._index_manager
         transition = None if manager is None else manager.open
-        return self._checkpoint(transition, concurrent_data_barrier=True)[0]
+        return self._checkpoint(
+            transition,
+            concurrent_data_barrier=True,
+            seed_local_applied_prefix=True,
+        )[0]
 
     def refresh_index_inventory(
         self, *, persist_stale: bool = True
@@ -3514,6 +3557,7 @@ class TransactionManager:
         *,
         transition_is_commit_point: bool = False,
         concurrent_data_barrier: bool = False,
+        seed_local_applied_prefix: bool = False,
     ) -> tuple[RecycleReport, Any]:
         """Run the checkpoint, keeping a completed commit point above its own cleanup.
 
@@ -3529,8 +3573,12 @@ class TransactionManager:
                 state,
                 transition_is_commit_point,
                 concurrent_data_barrier,
+                seed_local_applied_prefix,
             )
         except BaseException as failure:
+            # A failed checkpoint never carries advisory local redo authority into a retry.
+            # WAL and the published checkpoint remain the only recovery proof.
+            self._local_applied_prefix = None
             if (
                 transition_is_commit_point
                 and state["completed"]
@@ -3547,6 +3595,7 @@ class TransactionManager:
         state: dict[str, Any],
         transition_is_commit_point: bool,
         concurrent_data_barrier: bool = False,
+        seed_local_applied_prefix: bool = False,
     ) -> tuple[RecycleReport, Any]:
         """Run the checkpoint, running one index transition before the section is left.
 
@@ -3567,7 +3616,7 @@ class TransactionManager:
             # has no live snapshot to protect, takes the concurrent path.
             if concurrent_data_barrier and not self._open:
                 return self._checkpoint_with_concurrent_barrier_in_section(
-                    transition, state
+                    transition, state, seed_local_applied_prefix
                 )
             lease = self._hold_lease()
             try:
@@ -3644,12 +3693,20 @@ class TransactionManager:
                 # Same rule, the ordinary exit: the lease is in doubt but the commit
                 # point stands, so latch the doubt and return the success that happened.
                 self._recovery_required = True
+            if seed_local_applied_prefix and not self._recovery_required:
+                # A completed checkpoint is the only seed. Later ordinary local DML may extend
+                # this empty prefix; open/recovery or an arbitrary existing WAL interval may not.
+                self._local_applied_prefix = _LocalAppliedPrefix(
+                    checkpoint_lsn=published.last_committed_lsn,
+                    applied_through_lsn=published.last_committed_lsn,
+                )
         return state["recycled"], state["outcome"]
 
     def _checkpoint_with_concurrent_barrier_in_section(
         self,
         transition: Callable[[int], Any] | None,
         state: dict[str, Any],
+        seed_local_applied_prefix: bool = False,
     ) -> tuple[RecycleReport, Any]:
         """Barrier one frozen prefix without blocking foreign writers on the device wait.
 
@@ -3804,7 +3861,20 @@ class TransactionManager:
             raise
         cleanup_failure = self._drop_lease(lease)
         if cleanup_failure is not None:
+            self._local_applied_prefix = None
             raise cleanup_failure
+        if (
+            seed_local_applied_prefix
+            and not self._recovery_required
+            and checkpoint_lsn == current.last_committed_lsn
+        ):
+            # Phase C saw no commit beyond the prefix phase B barriered.  Seed only that exact
+            # empty suffix; a foreign commit during B leaves last_committed above checkpoint and
+            # deliberately gets no certificate.
+            self._local_applied_prefix = _LocalAppliedPrefix(
+                checkpoint_lsn=checkpoint_lsn,
+                applied_through_lsn=checkpoint_lsn,
+            )
         return state["recycled"], state["outcome"]
 
     def _complete_committed_gap(self) -> CommitState:
@@ -3904,6 +3974,42 @@ class TransactionManager:
                     pass
             raise
 
+    def _can_skip_locally_applied_redo(
+        self,
+        checkpoint: Lsn,
+        through: Lsn,
+        *,
+        touched_catalog: bool,
+        index_records: Sequence[WalRecord],
+    ) -> bool:
+        """Say whether an exact checkpoint suffix was already applied by this process.
+
+        The witness is deliberately narrower than idempotence. It begins only at a checkpoint,
+        extends only across ordinary local DML, and is consumed only for that exact
+        ``checkpoint -> published`` pair after WAL lineage and payloads have been preflighted.
+        Any uncertainty returns ``False`` and leaves the canonical replay untouched.
+        """
+
+        prefix = self._local_applied_prefix
+        if (
+            prefix is None
+            or self._recovery_required
+            or touched_catalog
+            or through <= checkpoint
+            or prefix.checkpoint_lsn != checkpoint
+            or prefix.applied_through_lsn != through
+            or self._own_published_lsn != through
+            or self._index_authority_sync_required
+            or type(self._index_manager) is not IndexManager
+        ):
+            return False
+        if any(change_of(record).operation is IndexOperation.RESET for record in index_records):
+            return False
+        # Live commit flushes heap and index files before publishing. A dirty resident frame is
+        # evidence that some later/local work escaped that completed prefix, so it revokes the
+        # shortcut rather than being folded into the checkpoint by assumption.
+        return not self._pool.has_dirty_pages()
+
     def _redo_onto_device_unchecked(self, checkpoint: Lsn, through: Lsn) -> int:
         """Install every committed effect above the checkpoint and at or below ``through``.
 
@@ -3987,23 +4093,31 @@ class TransactionManager:
             allow_unregistered_indexes=touched_catalog,
             _passage=redo_passage,
         )
-        page_preflight = self._commit_redo._project_page_preflight(
-            replay,
-            page_replay,
-            full_preflight,
-            allow_unregistered_indexes=touched_catalog,
-            passage=redo_passage,
+        skip_reapply = self._can_skip_locally_applied_redo(
+            checkpoint,
+            through,
+            touched_catalog=touched_catalog,
+            index_records=index_records,
         )
-        if page_preflight is None:
-            raise GrafxRecoveryRefused(
-                "The checkpoint page subplan no longer matches its complete preflight.",
-                field="preflighted_replay",
+        page_result = None
+        if not skip_reapply:
+            page_preflight = self._commit_redo._project_page_preflight(
+                replay,
+                page_replay,
+                full_preflight,
+                allow_unregistered_indexes=touched_catalog,
+                passage=redo_passage,
             )
-        page_result = self._commit_redo.apply(
-            page_replay,
-            _preflighted=page_preflight,
-            _passage=redo_passage,
-        )
+            if page_preflight is None:
+                raise GrafxRecoveryRefused(
+                    "The checkpoint page subplan no longer matches its complete preflight.",
+                    field="preflighted_replay",
+                )
+            page_result = self._commit_redo.apply(
+                page_replay,
+                _preflighted=page_preflight,
+                _passage=redo_passage,
+            )
         if touched_catalog:
             self._catalog.adopt(self._catalog.read_from_pages())
         if self._index_sync is not None:
@@ -4018,11 +4132,22 @@ class TransactionManager:
             # and the completion mark below (ST-7).
             watermarks = manager.table_watermark_photo()
             manager.check_replay_floor(checkpoint, watermarks=watermarks)
-        index_result = self._commit_redo.apply(index_replay)
-        for result in (page_result, index_result):
-            self._commit_redo.flush(result)
+        index_result = None
+        if skip_reapply:
+            # The complete preflight above validates page images and the permissive catalog-DDL
+            # shape. This strict subplan proof retains the canonical index-name/generation
+            # validation without dispatching effects the live commit already flushed.
+            self._commit_redo.preflight(index_replay)
+        else:
+            index_result = self._commit_redo.apply(index_replay)
+            assert page_result is not None
+            for result in (page_result, index_result):
+                self._commit_redo.flush(result)
         if manager is not None and replay.last_committed_lsn > NO_LSN:
             manager.mark_built_through(replay.last_committed_lsn, watermarks=watermarks)
+        if skip_reapply:
+            return len(replay.effects)
+        assert page_result is not None and index_result is not None
         return page_result.effects_replayed + index_result.effects_replayed
 
     def close(self) -> None:
@@ -4208,6 +4333,9 @@ class TransactionManager:
         post_barrier_failure: BaseException | None = None
         cleanup_failure: BaseException | None = None
         identities: _IdentityPlan | None = None
+        catalog_touched = False
+        local_prefix_candidate: _LocalAppliedPrefix | None = None
+        local_commit_can_extend_prefix = False
         instrumentation = (
             _CommitTrace(self._metrics, self._pool)
             if not self._retain_lease and _metrics_are_enabled(self._metrics)
@@ -4472,6 +4600,26 @@ class TransactionManager:
                                 commit_trace.phase("index")
                             with self._close_wait_hazard():
                                 self._build_index_catalog_activation(txn, current)
+                            catalog_touched = any(
+                                file == self._file_ids.catalog_file
+                                for file, _page_index, _image in images
+                            )
+                            local_commit_can_extend_prefix = (
+                                not catalog_touched
+                                and activation_plan is None
+                                and identities is not None
+                                and type(self._index_manager) is IndexManager
+                                and not any(
+                                    record.record_type
+                                    in (
+                                        int(WalRecordType.INDEX_WRITE),
+                                        int(WalRecordType.INDEX_RECONCILE),
+                                    )
+                                    and change_of(record).operation
+                                    is IndexOperation.RESET
+                                    for record in records
+                                )
+                            )
                             self._validate_lease(lease)
                             if commit_trace is not None:
                                 commit_trace.phase("append")
@@ -4540,10 +4688,6 @@ class TransactionManager:
                         self._published_high_water = _larger(
                             self._published_high_water, committed
                         )
-                        catalog_touched = any(
-                            file == self._file_ids.catalog_file
-                            for file, _page_index, _image in images
-                        )
                         try:
                             if commit_trace is not None:
                                 commit_trace.phase("apply")
@@ -4571,12 +4715,30 @@ class TransactionManager:
                                         self._index_sync()
                             if commit_trace is not None:
                                 commit_trace.phase("publish")
+                            if local_commit_can_extend_prefix:
+                                # _publish revokes every advisory proof before touching the
+                                # control record. Retain the candidate only in this stack frame;
+                                # it is restored below solely after publication succeeds.
+                                local_prefix_candidate = self._local_applied_prefix
                             with self._close_wait_hazard():
                                 self._publish_commit_state(
                                     durable,
                                     committed,
                                     catalog_touched=catalog_touched,
                                 )  # step 3.7
+                            if (
+                                local_prefix_candidate is not None
+                                and local_prefix_candidate.checkpoint_lsn
+                                == durable.checkpoint_lsn
+                                and local_prefix_candidate.applied_through_lsn
+                                == durable.last_committed_lsn
+                            ):
+                                self._local_applied_prefix = _LocalAppliedPrefix(
+                                    checkpoint_lsn=(
+                                        local_prefix_candidate.checkpoint_lsn
+                                    ),
+                                    applied_through_lsn=committed,
+                                )
                         except BaseException as failure:
                             if commit_trace is not None:
                                 commit_trace.phase("other")
@@ -4605,6 +4767,7 @@ class TransactionManager:
                             if not recovered:
                                 self._recovery_required = True
             except BaseException as failure:
+                self._local_applied_prefix = None
                 lease_failure = self._drop_lease(lease)
                 if lease_failure is not None:
                     self._recovery_required = True
@@ -4621,6 +4784,8 @@ class TransactionManager:
                 txn.mark_conflicted()
             lease_failure = self._drop_lease(lease)
             cleanup_failure = _first_failure(cleanup_failure, lease_failure)
+            if cleanup_failure is not None or post_barrier_failure is not None:
+                self._local_applied_prefix = None
             if lease_failure is not None and conflict is not None:
                 # This is still a pre-barrier refusal.  An interrupted foreign lease cleanup may
                 # have left the writer authority uncertain, so the handle cannot immediately
@@ -6192,6 +6357,11 @@ class TransactionManager:
             raise
 
         self._published_high_water = _larger(self._published_high_water, committed)
+        local_prefix_candidate = (
+            self._local_applied_prefix
+            if type(self._index_manager) is IndexManager
+            else None
+        )
         try:
             if trace is not None:
                 trace.phase("apply")
@@ -6201,6 +6371,25 @@ class TransactionManager:
                 trace.phase("publish")
             with self._close_wait_hazard():
                 self._publish_commit_state(previous, committed)
+            if (
+                local_prefix_candidate is not None
+                and not self._recovery_required
+                and not self._index_authority_sync_required
+                and not self._pool.has_dirty_pages()
+                and local_prefix_candidate.checkpoint_lsn
+                == previous.checkpoint_lsn
+                and local_prefix_candidate.applied_through_lsn
+                == previous.last_committed_lsn
+            ):
+                # The CN-1 floor reservation is itself a complete local heap-only commit: its
+                # WAL is durable, its one page is applied and flushed, and its state is now
+                # published under the same COMMIT_SECTION as the caller's row commit. Preserve
+                # that exact prefix so large INSERT batches do not make the checkpoint shortcut
+                # permanently unreachable merely because they crossed an identity lease.
+                self._local_applied_prefix = _LocalAppliedPrefix(
+                    checkpoint_lsn=local_prefix_candidate.checkpoint_lsn,
+                    applied_through_lsn=committed,
+                )
         except BaseException as failure:
             if trace is not None:
                 trace.phase("other")
@@ -6907,6 +7096,7 @@ class TransactionManager:
         returned, for the one number this manager provably produced itself.
         """
         self._own_published_lsn = None
+        self._local_applied_prefix = None
         with self._close_wait_hazard():
             self._commit_state_store.publish(state, previous=previous)
 

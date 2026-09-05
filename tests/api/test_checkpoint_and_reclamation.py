@@ -27,6 +27,7 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.page import PageType
 from okto_grafx.domain.txn.commit_state import CommitState
 from okto_grafx.engine.buffer_pool import BufferPool
+from okto_grafx.engine.commit_redo import CommitRedo
 from okto_grafx.engine.commit_state_store import CommitStateStore
 from okto_grafx.engine.index_manager import IndexManager
 
@@ -48,6 +49,255 @@ def _people(database: object, *, at_least: int = 0) -> int:
 def _schema(database: object) -> None:
     with database.begin("write") as txn:
         txn.execute("CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))")
+
+
+def _seed_local_checkpoint_prefix(database: object) -> None:
+    """Leave one ordinary local update above a checkpoint-based applied-prefix seed."""
+    _schema(database)
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:P {id: 1, name: 'before'})")
+    database.checkpoint()
+    assert database._transactions._local_applied_prefix is not None, type(
+        database._transactions._index_manager
+    )
+    with database.begin("write") as txn:
+        txn.execute("MATCH (p:P {id: 1}) SET p.name = 'after'")
+
+
+def test_checkpoint_validates_but_does_not_reapply_its_exact_local_dml_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A checkpoint-based local witness removes only redundant physical/logical dispatch."""
+    root = tmp_path / "db"
+    database = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    preflighted: list[int] = []
+    applied: list[int] = []
+    real_preflight = CommitRedo.preflight
+    real_apply = CommitRedo.apply
+    try:
+        _seed_local_checkpoint_prefix(database)
+        prefix = database._transactions._local_applied_prefix
+        assert prefix is not None
+        assert prefix.applied_through_lsn == database.transactions.published_lsn()
+
+        def observe_preflight(
+            redo: CommitRedo, replay: object, *args: object, **kwargs: object
+        ) -> object:
+            preflighted.append(len(replay.effects))
+            return real_preflight(redo, replay, *args, **kwargs)
+
+        def observe_apply(
+            redo: CommitRedo, replay: object, *args: object, **kwargs: object
+        ) -> object:
+            applied.append(len(replay.effects))
+            return real_apply(redo, replay, *args, **kwargs)
+
+        monkeypatch.setattr(CommitRedo, "preflight", observe_preflight)
+        monkeypatch.setattr(CommitRedo, "apply", observe_apply)
+
+        database.checkpoint()
+
+        assert any(count > 0 for count in preflighted), (
+            "the shortcut must retain complete payload preflight"
+        )
+        assert not any(count > 0 for count in applied), (
+            "the already-applied local prefix must not be dispatched again"
+        )
+        assert database.execute("MATCH (p:P {id: 1}) RETURN p.name").rows == (
+            ("after",),
+        )
+        assert database.verify("all").findings == ()
+    finally:
+        database.close()
+
+    reopened = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        assert reopened.execute("MATCH (p:P {id: 1}) RETURN p.name").rows == (
+            ("after",),
+        )
+        assert reopened.verify("all").findings == ()
+    finally:
+        reopened.close()
+
+
+def test_identity_refill_extends_the_exact_local_checkpoint_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local CN-1 subcommit remains eligible after its flushed row commit follows it."""
+    root = tmp_path / "db"
+    database = connect(
+        str(root),
+        wal_segment_bytes=SEGMENT_BYTES,
+        checkpoint_interval_records=1_000_000,
+    )
+    nonempty_applies: list[int] = []
+    real_apply = CommitRedo.apply
+    try:
+        _schema(database)
+        with database.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 1, name: 'seed'})")
+        database.checkpoint()
+
+        # More than the default 64-record identity lease forces the private CN-1 floor
+        # reservation before this one public transaction can materialise all rows.
+        with database.begin("write") as txn:
+            txn.executemany(
+                "CREATE (:P {id: $id, name: $name})",
+                (
+                    {"id": identity, "name": f"row-{identity}"}
+                    for identity in range(2, 82)
+                ),
+            )
+
+        prefix = database._transactions._local_applied_prefix
+        assert prefix is not None
+        assert prefix.applied_through_lsn == database.transactions.published_lsn()
+
+        local_redo = database._transactions._commit_redo
+
+        def observe_apply(
+            redo: CommitRedo, replay: object, *args: object, **kwargs: object
+        ) -> object:
+            if redo is local_redo and replay.effects:
+                nonempty_applies.append(len(replay.effects))
+            return real_apply(redo, replay, *args, **kwargs)
+
+        monkeypatch.setattr(CommitRedo, "apply", observe_apply)
+        database.checkpoint()
+
+        assert nonempty_applies == []
+        assert len(database.execute("MATCH (p:P) RETURN p.id").rows) == 81
+        assert database.verify("all").findings == ()
+    finally:
+        database.close()
+
+    reopened = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        assert len(reopened.execute("MATCH (p:P) RETURN p.id").rows) == 81
+        assert reopened.verify("all").findings == ()
+    finally:
+        reopened.close()
+
+
+def test_foreign_commit_revokes_the_local_checkpoint_replay_shortcut(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A foreign suffix takes the unchanged complete replay path."""
+    root = tmp_path / "db"
+    local = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    foreign = None
+    nonempty_applies: list[int] = []
+    real_apply = CommitRedo.apply
+    try:
+        _seed_local_checkpoint_prefix(local)
+        foreign = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+        with foreign.begin("write") as txn:
+            txn.execute("MATCH (p:P {id: 1}) SET p.name = 'foreign'")
+
+        local_redo = local._transactions._commit_redo
+
+        def observe_apply(
+            redo: CommitRedo, replay: object, *args: object, **kwargs: object
+        ) -> object:
+            if redo is local_redo and replay.effects:
+                nonempty_applies.append(len(replay.effects))
+            return real_apply(redo, replay, *args, **kwargs)
+
+        monkeypatch.setattr(CommitRedo, "apply", observe_apply)
+        local.checkpoint()
+
+        assert nonempty_applies
+        assert local.execute("MATCH (p:P {id: 1}) RETURN p.name").rows == (
+            ("foreign",),
+        )
+        assert local.verify("all").findings == ()
+    finally:
+        if foreign is not None:
+            foreign.close()
+        local.close()
+
+
+def test_catalog_commit_revokes_the_local_checkpoint_replay_shortcut(
+    tmp_path: Path,
+) -> None:
+    """DDL cannot inherit a DML-only physical-application witness."""
+    database = connect(str(tmp_path / "db"), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        _seed_local_checkpoint_prefix(database)
+        assert database._transactions._local_applied_prefix is not None
+
+        with database.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE Q(id INT64, PRIMARY KEY(id))")
+
+        assert database._transactions._local_applied_prefix is None
+        database.checkpoint()
+        assert database.verify("all").findings == ()
+    finally:
+        database.close()
+
+
+def test_failed_data_barrier_revokes_the_local_checkpoint_replay_shortcut(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed checkpoint retry always returns to canonical redo."""
+    database = connect(str(tmp_path / "db"), wal_segment_bytes=SEGMENT_BYTES)
+    original_barrier = BufferPool.durability_barrier
+    refused = False
+    try:
+        _seed_local_checkpoint_prefix(database)
+        assert database._transactions._local_applied_prefix is not None
+
+        def fail_first_barrier(pool: BufferPool, file: str | None = None) -> None:
+            nonlocal refused
+            if pool is database._pool and not refused:
+                refused = True
+                raise GrafxDeviceFull("The checkpoint data barrier was refused.", file=file)
+            original_barrier(pool, file)
+
+        monkeypatch.setattr(BufferPool, "durability_barrier", fail_first_barrier)
+        with pytest.raises(GrafxDeviceFull):
+            database.checkpoint()
+
+        assert refused
+        assert database._transactions._local_applied_prefix is None
+    finally:
+        database.close()
+
+
+def test_local_applied_prefix_never_replaces_missing_wal_lineage(tmp_path: Path) -> None:
+    """Even an exact local witness refuses before publishing over a missing segment."""
+    root = tmp_path / "db"
+    database = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        _schema(database)
+        with database.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 1, name: 'seed'})")
+        database.checkpoint()
+        for revision in range(12):
+            with database.begin("write") as txn:
+                txn.execute(
+                    "MATCH (p:P {id: 1}) SET p.name = $name",
+                    {"name": f"revision-{revision}"},
+                )
+        assert database._transactions._local_applied_prefix is not None
+        segments = _segments(root)
+        assert len(segments) >= 3
+        victim = root / "wal" / segments[1]
+        state_path = root / "control" / "commit.state"
+        state_before = state_path.read_bytes()
+
+        victim.unlink()
+        with pytest.raises(GrafxError):
+            database.checkpoint()
+
+        assert state_path.read_bytes() == state_before
+        assert database.transactions.recovery_required is True
+    finally:
+        database.close()
 
 
 def test_a_checkpoint_reclaims_the_segments_the_database_no_longer_needs(
