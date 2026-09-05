@@ -1261,7 +1261,7 @@ multiwriter/multireader premise changed.
 
 ## Scale-removal batch 21 — reuse of the final no-follow identity
 
-Status: **completed in `b5cff4a`; independent adversarial review PASS**.
+Status: **completed in `b5cff4a`; independent and Nexus adversarial reviews PASS**.
 
 `LocalStorageDevice._require_safe_path` now returns the fresh `lstat` observation of the final
 component, or `None` when the final component or an earlier suffix is absent. A warm cached
@@ -1286,3 +1286,15 @@ capacity, recycle and durability/platform groups passed, with Ruff and diff chec
 regular nonredirected file `lstat` and `stat` name the same physical identity; redirects, junctions,
 reparse points and unsupported entries are still refused before comparison. The observation is
 not cached across calls, so WAL/OCC, durability and multiwriter/multireader premises are unchanged.
+The nine POSIX-only discriminants for symlink exchange, redirect under a cached descriptor,
+cross-participant publication and the warm-hit syscall contract also passed under Ubuntu/WSL;
+the unrelated complete namespace-cost file retains a pre-existing WSL/DrvFS counting assumption
+(`lstat <= 4`) that does not hold when Python's `realpath` itself performs counted `lstat` calls.
+
+The broader STOR-1 interval design is now **closed as NO-GO**, not deferred. A corrected profile
+found all 1,786 path proofs inside participant sections, but distributed them across 1,018
+top-level sections (mean `1.8` proofs). Even selecting only dense sections could reduce proof
+count by at most `1.65x`; because path proof was about `7.6%` of the measured write chain, the
+optimistic aggregate gain is about `1.02x`. Entry/exit proof on every section would make the count
+worse (`2,036` versus `1,786`). This is marginal and cannot justify a new authority interval;
+multiwriter freshness stays unchanged (`hof_1c88b59f2a4d4cba99e26b40a4c3eb81`).
