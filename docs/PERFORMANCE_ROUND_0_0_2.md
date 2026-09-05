@@ -1285,6 +1285,33 @@ small cumulative optimization, not a gate or a transformative claim. No filesyst
 path containment proof, descriptor validation, format, WAL/OCC, durability, locking, writer lease
 or multiwriter/multireader rule changed.
 
+## Scale-removal batch 32 — one unlocked descriptor per autocommit read
+
+Status: **completed in `1038ddb`; local and Nexus
+`hof_6b1f9e6b31b54c5a97ebed76a2214a32` adversarial reviews PASS**.
+
+`Database.execute` now bounds the already-audited participant descriptor scope around its complete
+`begin -> execute -> commit/rollback` lifecycle. The scope retains only the permanent lock-file
+descriptor and never the lock itself. A deterministic probe reduced participant `os.open` calls
+from four to one while retaining exactly four operating-system lock acquisitions and four
+releases. The preliminary closed-database refusal stays before the scope, and a second check inside
+an outer public transition closes the race with concurrent dependency release.
+
+The lifecycle work also closed two exception defects required by this wider use. A commit failure
+rolls back only while the context is still ACTIVE; a terminal or post-outcome context is never
+reverted. If rollback itself fails and leaves an otherwise unreachable ACTIVE context, the facade
+is sealed and its transition drains readers, descriptors and dependencies. A custom descriptor
+scope may no longer suppress a primary failure by returning true, and an exception from its exit
+is attached as cleanup evidence instead of replacing that primary failure.
+
+The focused API/descriptor/lifecycle group passed **80 tests**. The coordination lock group passed
+29 tests with one declared platform skip, and the multiprocess slice passed 5/5; Ruff, compileall
+and diff checks passed. An alternating six-pair sample of 500 public PK seeks observed about
+`1.11x` median paired improvement, but the promoted performance claim is the deterministic
+`os.open 4 -> 1` with lock/unlock `4/4`, not the noisy wall-clock ratio. No lock duration,
+isolation, filesystem authority, format, WAL/OCC, durability, writer lease or
+multiwriter/multireader premise changed.
+
 ## Scale-removal batch 21 — reuse of the final no-follow identity
 
 Status: **completed in `b5cff4a`; independent and Nexus adversarial reviews PASS**.
