@@ -1416,3 +1416,27 @@ showed about `1.06x` conservatively after an earlier `1.24x` sample, so this is 
 cumulative fixed-cost saving rather than a performance gate. All 572 `executemany` and coordination
 cases passed, plus Ruff and diff checks. Format, WAL/OCC, durability, writer-lease and
 multiwriter/multireader semantics remain unchanged.
+
+## Scale-removal batch 26 — sentinel-aligned scores across underfull HNSW adjacency
+
+Status: **completed in `8602abf`; independent local and Nexus
+`hof_157e6798ef814a778409b1aa57b72549` reviews PASS**.
+
+The transient cold-build score cache now stays positionally aligned when reciprocal unlinking
+leaves an adjacency underfull. New peers receive a `None` placeholder without being scored early;
+only a later overflow resolves missing scores, in canonical peer order, and keeps all refreshed
+values local until every scorer succeeds. A pre-existing length mismatch discards only the
+optimization and performs the complete canonical scoring path. Remove/reinsert churn deletes the
+score at the exact peer position. The cache is still bounded by adjacency capacity outside the
+link/trim frame and is discarded in `finally` before graph publication or failure.
+
+At N=256/d64 with Pure math, score calls fell from `71,173` after batch 24 to `48,332`
+(`-32.1%`). A conservative repeated wall-clock comparison records about `1.20x` over batch 24;
+the lower isolated samples were intentionally not promoted as a universal claim. The Nexus
+adversarial harness observed that 94% of overflow trims used the cache and about 20 proved scores
+were reused per resolved placeholder. It also confirmed bit-for-bit topology, hex scores, search
+results and traversal statistics for Pure and NumPy at N=200/600, including aggressive churn, and
+detected deliberately wrong peer/score association mutants. The grouped 167-test vector/query/
+rebuild slice, focused 72-test slice, Ruff and diff checks passed. No durable format, query
+semantics, WAL/OCC rule, publication order, durability guarantee or multiwriter/multireader
+premise changed.
