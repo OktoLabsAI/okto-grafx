@@ -113,7 +113,11 @@ from okto_grafx.domain.index.definition import (
     IndexDefinition,
     automatic_index_definitions,
 )
-from okto_grafx.domain.index.keys import identity_index_sizing, rehash_index_sizing
+from okto_grafx.domain.index.keys import (
+    custom_index_sizing,
+    identity_index_sizing,
+    rehash_index_sizing,
+)
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.index.visibility import ReconcileReport
 from okto_grafx.domain.ports.clock import Clock
@@ -700,6 +704,8 @@ class TransactionManager:
         "_max_transaction_bytes",
         "_max_wal_batch_bytes",
         "_max_index_build_entries",
+        "_automatic_index_expected_cardinality",
+        "_automatic_index_bucket_count",
         "_writable",
         "_closed",
         "_close_quiesced",
@@ -731,6 +737,7 @@ class TransactionManager:
         max_transaction_bytes: int | None = None,
         max_wal_batch_bytes: int | None = None,
         max_index_build_entries: int | None = None,
+        automatic_index_expected_cardinality: int | None = None,
         database_uuid: bytes | None = None,
         control_format_version: int = 1,
         control_file_nonce: int = 0,
@@ -799,6 +806,12 @@ class TransactionManager:
                 value=repr(catalog_changes_are_wal_logged),
             )
         self._catalog_changes_are_wal_logged = catalog_changes_are_wal_logged
+        (
+            self._automatic_index_bucket_count,
+            self._automatic_index_expected_cardinality,
+        ) = custom_index_sizing(
+            expected_cardinality=automatic_index_expected_cardinality
+        )
         self._refresh_heap_reclaim_capability()
         self._refresh_wal_record_v2_capability()
         self._partitions_per_table: int = validate_partitions_per_table(
@@ -1920,6 +1933,11 @@ class TransactionManager:
             logical_definitions: list[CatalogIndexDefinition] = []
             indexed_tables: dict[int, TableDef] = {}
             for definition in self._automatic_exact_activation_definitions(source):
+                if self._automatic_index_expected_cardinality is not None:
+                    definition = replace(
+                        definition,
+                        bucket_count=self._automatic_index_bucket_count,
+                    )
                 table = source.table_by_id(definition.table_id)
                 nonce = allocate()
                 generation = IndexGenerationDescriptor(
@@ -1935,6 +1953,7 @@ class TransactionManager:
                     visibility=definition.visibility,
                     key_derivation=definition.key_derivation,
                     automatic=True,
+                    expected_cardinality=(self._automatic_index_expected_cardinality),
                     generations=(generation,),
                 )
                 logical_definitions.append(logical)
@@ -1946,7 +1965,10 @@ class TransactionManager:
                 visible_rows = sum(
                     1 for _ref, _version in self._heap.scan(table, snapshot)
                 )
-                expected, bucket_count = identity_index_sizing(visible_rows)
+                expected, bucket_count = identity_index_sizing(
+                    visible_rows,
+                    expected_cardinality=self._automatic_index_expected_cardinality,
+                )
                 nonce = allocate()
                 generation = IndexGenerationDescriptor(
                     artifact_nonce=nonce,
@@ -2011,7 +2033,10 @@ class TransactionManager:
                 continue
 
             visible_rows = sum(1 for _ref, _version in self._heap.scan(table, snapshot))
-            expected, sized_bucket_count = identity_index_sizing(visible_rows)
+            expected, sized_bucket_count = identity_index_sizing(
+                visible_rows,
+                expected_cardinality=self._automatic_index_expected_cardinality,
+            )
             if logical is None:
                 bucket_count = sized_bucket_count
                 generations: tuple[IndexGenerationDescriptor, ...] = ()
@@ -4591,9 +4616,7 @@ class TransactionManager:
                     self._release_reader(txn),
                 )
                 open_now, descriptor_failure = self._forget(txn, mode)
-                cleanup_failure = _first_failure(
-                    cleanup_failure, descriptor_failure
-                )
+                cleanup_failure = _first_failure(cleanup_failure, descriptor_failure)
             else:
                 txn.mark_conflicted()
             lease_failure = self._drop_lease(lease)
@@ -5125,11 +5148,7 @@ class TransactionManager:
         # is what breaks that circle; `_stage_index_changes` refuses if the count was wrong.
         index_record_count = self._index_record_count(txn, rows)
         predicted = (
-            base
-            + len(staged)
-            + len(txn.pending_records)
-            + index_record_count
-            + 1
+            base + len(staged) + len(txn.pending_records) + index_record_count + 1
         )
         if predicted >= PROVISIONAL_CSN:
             raise GrafxTransactionStateError(
@@ -5143,7 +5162,9 @@ class TransactionManager:
             type(manager) is IndexManager
             and getattr(self._index_record_count, "__func__", self._index_record_count)
             is TransactionManager._index_record_count
-            and getattr(self._stage_index_changes, "__func__", self._stage_index_changes)
+            and getattr(
+                self._stage_index_changes, "__func__", self._stage_index_changes
+            )
             is TransactionManager._stage_index_changes
         )
         if uses_canonical_index_staging:

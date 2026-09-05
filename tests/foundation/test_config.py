@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from okto_grafx.domain.errors import GrafxConfigurationError
+from okto_grafx.domain.index import MAX_EXPECTED_CARDINALITY
 from okto_grafx.domain.page import validate_page_size
 from okto_grafx.domain.query.limits import (
     DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
@@ -59,6 +60,7 @@ def test_defaults_match_the_contract() -> None:
     assert config.max_transaction_bytes is None
     assert config.max_wal_batch_bytes is None
     assert config.max_index_build_entries is None
+    assert config.automatic_index_expected_cardinality is None
     assert config.metrics == "noop"
     assert config.metrics_destination is None
     assert config.allow_remote_metrics is False
@@ -71,6 +73,30 @@ def test_defaults_match_the_contract() -> None:
     }
     assert config.read_only is False
     assert config.descriptor_revalidation == "strict"
+
+
+def test_automatic_index_expected_cardinality_is_keyword_only_and_bounded() -> None:
+    definition = next(
+        field
+        for field in dataclasses.fields(DatabaseConfig)
+        if field.name == "automatic_index_expected_cardinality"
+    )
+    assert definition.kw_only
+    assert (
+        DatabaseConfig(
+            path=":memory:",
+            automatic_index_expected_cardinality=MAX_EXPECTED_CARDINALITY,
+        ).automatic_index_expected_cardinality
+        == MAX_EXPECTED_CARDINALITY
+    )
+
+    for rejected in (0, -1, MAX_EXPECTED_CARDINALITY + 1, True, 1.5):
+        with pytest.raises(GrafxConfigurationError) as caught:
+            DatabaseConfig(
+                path=":memory:",
+                automatic_index_expected_cardinality=rejected,  # type: ignore[arg-type]
+            )
+        assert caught.value.details["field"] == "automatic_index_expected_cardinality"
 
 
 def test_descriptor_revalidation_extends_the_positional_surface_only_at_its_tail() -> (

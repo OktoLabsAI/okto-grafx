@@ -12,6 +12,7 @@ from ipaddress import ip_address
 from math import isfinite
 
 from okto_grafx.domain.errors import GrafxConfigurationError
+from okto_grafx.domain.index.keys import MAX_EXPECTED_CARDINALITY
 from okto_grafx.domain.page import MAX_PAGE_SIZE as CORE_MAX_PAGE_SIZE
 from okto_grafx.domain.page import MIN_PAGE_SIZE as CORE_MIN_PAGE_SIZE
 from okto_grafx.domain.page import validate_page_size
@@ -281,6 +282,9 @@ class DatabaseConfig:
     max_transaction_bytes: int | None = None
     max_wal_batch_bytes: int | None = None
     max_index_build_entries: int | None = dataclass_field(default=None, kw_only=True)
+    automatic_index_expected_cardinality: int | None = dataclass_field(
+        default=None, kw_only=True
+    )
     metrics: str = "noop"
     metrics_destination: str | None = None
     allow_remote_metrics: bool = False
@@ -370,10 +374,21 @@ class DatabaseConfig:
             "max_transaction_bytes",
             "max_wal_batch_bytes",
             "max_index_build_entries",
+            "automatic_index_expected_cardinality",
         ):
             value = getattr(self, field)
             if value is not None:
                 object.__setattr__(self, field, _require_positive_int(field, value))
+        if (
+            self.automatic_index_expected_cardinality is not None
+            and self.automatic_index_expected_cardinality > MAX_EXPECTED_CARDINALITY
+        ):
+            raise _reject(
+                "automatic_index_expected_cardinality",
+                self.automatic_index_expected_cardinality,
+                f"a value of at most {MAX_EXPECTED_CARDINALITY} is required by the eager "
+                "hash directory.",
+            )
 
         threshold = _require_int(
             "vector_exact_scan_threshold", self.vector_exact_scan_threshold

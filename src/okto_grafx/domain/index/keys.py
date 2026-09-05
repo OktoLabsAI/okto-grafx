@@ -196,13 +196,19 @@ def rehash_index_sizing(
     return resolved, retained_expected
 
 
-def identity_index_sizing(visible_rows: object) -> tuple[int, int]:
+def identity_index_sizing(
+    visible_rows: object,
+    *,
+    expected_cardinality: object | None = None,
+) -> tuple[int, int]:
     """Return ``(expected_cardinality, bucket_count)`` for an automatic identity index.
 
     The P2-ID v1 policy reserves one growth interval by doubling the rows visible in the fenced
-    build view, with the established 4096-entry floor.  Sixty-four expected entries share each
-    eagerly allocated bucket and the directory rounds upward to a power of two.  A request beyond
-    the finite eager-directory bound is refused rather than silently capped.
+    build view, with the established 4096-entry floor.  A configured expected cardinality is an
+    additional floor for a load whose future size is known; it never replaces the fenced count.
+    Sixty-four expected entries share each eagerly allocated bucket and the directory rounds
+    upward to a power of two.  A request beyond the finite eager-directory bound is refused
+    rather than silently capped.
     """
 
     if isinstance(visible_rows, bool) or not isinstance(visible_rows, int):
@@ -221,6 +227,12 @@ def identity_index_sizing(visible_rows: object) -> tuple[int, int]:
         )
 
     expected = max(_AUTOMATIC_IDENTITY_MIN_EXPECTED, 2 * visible_rows)
+    if expected_cardinality is not None:
+        _hinted_bucket_count, hinted_expected = custom_index_sizing(
+            expected_cardinality=expected_cardinality
+        )
+        assert hinted_expected is not None
+        expected = max(expected, hinted_expected)
     if expected > MAX_EXPECTED_CARDINALITY:
         raise GrafxIndexError(
             "Automatic identity-index sizing exceeds the eager hash-directory limit: "

@@ -512,6 +512,9 @@ def assemble_database(
             max_transaction_bytes=config.max_transaction_bytes,
             max_wal_batch_bytes=config.max_wal_batch_bytes,
             max_index_build_entries=config.max_index_build_entries,
+            automatic_index_expected_cardinality=(
+                config.automatic_index_expected_cardinality
+            ),
             database_uuid=identity.database_uuid,
             control_format_version=identity.format_version,
             control_file_nonce=_new_control_file_nonce(),
@@ -549,6 +552,9 @@ def assemble_database(
             max_traversal_expansions=config.max_traversal_expansions,
             max_traversal_paths=config.max_traversal_paths,
             max_index_build_entries=config.max_index_build_entries,
+            automatic_index_expected_cardinality=(
+                config.automatic_index_expected_cardinality
+            ),
         )
         attached = tuple(attached_names)
         adopted = set(attached)
@@ -711,9 +717,7 @@ def _attach_primary_key_indexes(
     """
     catalog_value = catalog.catalog
     selected = (
-        catalog_value.active_index_definitions()
-        if definitions is None
-        else definitions
+        catalog_value.active_index_definitions() if definitions is None else definitions
     )
     catalog_managed = catalog_value.format_version == CATALOG_FORMAT_VERSION
     attached: list[str] = []

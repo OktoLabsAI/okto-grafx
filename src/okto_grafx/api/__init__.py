@@ -72,6 +72,9 @@ def connect(
     dropped is a configuration a caller believes it applied. Descriptor revalidation defaults
     to ``"strict"``; the ``"generation"`` opt-in is for a local directory exclusively managed
     by Grafx/Pulse and is documented in ``ST2_DESCRIPTOR_REVALIDATION.md``.
+    ``automatic_index_expected_cardinality`` sizes only automatic exact generations created
+    after the option is supplied; it activates an empty writable catalog to v2, requires explicit
+    v2 activation for a non-empty legacy catalog, and never resizes an existing index implicitly.
 
     ``registry`` composes the database over adapters the caller built. The default is None, which
     builds the adapters the configuration selects; either way every required port slot is

@@ -39,9 +39,14 @@ def test_automatic_identity_sizing_refuses_the_first_unsupported_row_count() -> 
 
     assert raised.value.details["field"] == "visible_rows"
     assert raised.value.details["expected_cardinality"] == 262_146
-    assert (
-        raised.value.details["max_expected_cardinality"]
-        == MAX_EXPECTED_CARDINALITY
+    assert raised.value.details["max_expected_cardinality"] == MAX_EXPECTED_CARDINALITY
+
+
+def test_automatic_identity_sizing_uses_the_hint_only_as_a_floor() -> None:
+    assert identity_index_sizing(10, expected_cardinality=16_000) == (16_000, 256)
+    assert identity_index_sizing(10_000, expected_cardinality=16_000) == (
+        20_000,
+        512,
     )
 
 

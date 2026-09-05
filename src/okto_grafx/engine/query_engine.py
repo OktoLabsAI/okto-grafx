@@ -86,6 +86,7 @@ from okto_grafx.domain.index.definition import (
     index_definition_matches_table,
 )
 from okto_grafx.domain.index.keys import (
+    custom_index_sizing,
     identity_index_sizing,
     index_key,
     record_id_key,
@@ -2426,6 +2427,8 @@ class QueryEngine:
         "_max_traversal_expansions",
         "_max_traversal_paths",
         "_max_index_build_entries",
+        "_automatic_index_expected_cardinality",
+        "_automatic_index_bucket_count",
         "_prepared_guard",
         "_parse_cache",
         "_plan_cache",
@@ -2454,6 +2457,7 @@ class QueryEngine:
         max_traversal_expansions: int | None = None,
         max_traversal_paths: int | None = None,
         max_index_build_entries: int | None = None,
+        automatic_index_expected_cardinality: int | None = None,
     ) -> None:
         """Adopt one catalog, one heap, one pool and whichever engines this composition has."""
         self._catalog = catalog
@@ -2538,6 +2542,12 @@ class QueryEngine:
         )
         self._max_index_build_entries = _require_optional_positive_limit(
             "max_index_build_entries", max_index_build_entries
+        )
+        (
+            self._automatic_index_bucket_count,
+            self._automatic_index_expected_cardinality,
+        ) = custom_index_sizing(
+            expected_cardinality=automatic_index_expected_cardinality
         )
         # The composition root supplies one re-entrant process-local guard. Reusing that port
         # keeps the pure engine free of threading mechanism while protecting both bounded memo
@@ -3311,6 +3321,20 @@ class QueryEngine:
         undo: list[_SchemaEffect],
     ) -> None:
         """Apply one schema statement to the working CLONE, journalling external effects."""
+        if (
+            self._automatic_index_expected_cardinality is not None
+            and catalog.format_version == CATALOG_LEGACY_FORMAT_VERSION
+            and isinstance(node, (CreateNodeTable, CreateRelTable))
+        ):
+            raise GrafxUnsupportedOperation(
+                "Automatic-index sizing requires catalog v2 for table DDL on a non-empty "
+                "legacy catalog; run maintenance.ensure_identity_indexes() first.",
+                operation="create table",
+                field="format_version",
+                value=catalog.format_version,
+                required=CATALOG_FORMAT_VERSION,
+                remedy="maintenance.ensure_identity_indexes",
+            )
         if isinstance(node, CreateVectorSpace):
             catalog.add_space(
                 EmbeddingSpaceDef(
@@ -3764,6 +3788,18 @@ class QueryEngine:
             )
         return True
 
+    def _sized_automatic_exact_definition(
+        self, definition: IndexDefinition
+    ) -> IndexDefinition:
+        """Apply this connection's hint only to a new automatic exact generation."""
+
+        if self._automatic_index_expected_cardinality is None:
+            return definition
+        return replace(
+            definition,
+            bucket_count=self._automatic_index_bucket_count,
+        )
+
     def _plan_catalog_exact_generation(
         self,
         definition: IndexDefinition,
@@ -4026,7 +4062,10 @@ class QueryEngine:
                         committed, Snapshot(published)
                     )
                 )
-            expected, sized_bucket_count = identity_index_sizing(visible_rows)
+            expected, sized_bucket_count = identity_index_sizing(
+                visible_rows,
+                expected_cardinality=self._automatic_index_expected_cardinality,
+            )
             bucket_count = (
                 active_generation.bucket_count
                 if active_generation is not None
@@ -4090,7 +4129,7 @@ class QueryEngine:
             return
         if catalog is not None and catalog.format_version == CATALOG_FORMAT_VERSION:
             definitions = tuple(
-                definition
+                self._sized_automatic_exact_definition(definition)
                 for definition in automatic_index_definitions(table)
                 if definition.visibility is IndexVisibility.EXACT
             )
@@ -4105,7 +4144,11 @@ class QueryEngine:
             if not accepted:
                 return
             planned = tuple(
-                self._plan_catalog_exact_generation(definition, catalog)
+                self._plan_catalog_exact_generation(
+                    definition,
+                    catalog,
+                    expected_cardinality=self._automatic_index_expected_cardinality,
+                )
                 for definition in accepted
             )
             # Prove the complete catalog value before the first physical artifact is created.
@@ -4181,7 +4224,7 @@ class QueryEngine:
         """
         if catalog is not None and catalog.format_version == CATALOG_FORMAT_VERSION:
             endpoint_definitions = tuple(
-                definition
+                self._sized_automatic_exact_definition(definition)
                 for definition in automatic_index_definitions(table)
                 if definition.visibility is IndexVisibility.EXACT
             )
@@ -4191,7 +4234,11 @@ class QueryEngine:
                 if self._automatic_index_namespace_available(definition, catalog)
             )
             endpoint_generations = tuple(
-                self._plan_catalog_exact_generation(definition, catalog)
+                self._plan_catalog_exact_generation(
+                    definition,
+                    catalog,
+                    expected_cardinality=self._automatic_index_expected_cardinality,
+                )
                 for definition in accepted_endpoint_definitions
             )
             identity_generations = self._plan_endpoint_identity_generations(
