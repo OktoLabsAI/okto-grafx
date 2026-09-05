@@ -14,6 +14,7 @@ import pytest
 
 from conftest import CoordinatorFactory
 from coordination_support import ManualClock
+from okto_grafx.adapters import coordination_local
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxLeaseTimeout
 
 
@@ -176,6 +177,103 @@ def test_another_thread_of_the_same_coordinator_contends_for_real(
         worker.join(timeout=5.0)
     assert worker.is_alive() is False
     assert outcome == ["timeout"]
+
+
+def test_an_idle_reusable_descriptor_does_not_exclude_another_thread(
+    make_coordinator: CoordinatorFactory,
+) -> None:
+    coordinator = make_coordinator(owner_id="p1-aaaa")
+    outcome: list[str] = []
+
+    with coordinator.reuse_unlocked_section_descriptor("commit"):
+        with coordinator.exclusive("commit", timeout=1.0):
+            pass
+
+        def acquire() -> None:
+            with coordinator.exclusive("commit", timeout=1.0):
+                outcome.append("granted")
+
+        worker = threading.Thread(target=acquire, name="descriptor-contender")
+        worker.start()
+        worker.join(timeout=5.0)
+        assert worker.is_alive() is False
+        assert outcome == ["granted"]
+
+    assert coordinator._descriptor_scopes == {}
+
+
+def test_failed_acquire_and_unlock_both_evict_a_reusable_descriptor(
+    make_coordinator: CoordinatorFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = make_coordinator(owner_id="p1-aaaa")
+    second = make_coordinator(owner_id="p2-bbbb", monotonic_origin=50.0)
+    real_release = coordination_local._release_os_lock
+    release_attempts = 0
+
+    def fail_first_release(descriptor: int) -> None:
+        nonlocal release_attempts
+        release_attempts += 1
+        if release_attempts == 1:
+            raise OSError("injected unlock failure")
+        real_release(descriptor)
+
+    with first.reuse_unlocked_section_descriptor("commit"):
+        with monkeypatch.context() as patch:
+            patch.setattr(coordination_local, "_release_os_lock", fail_first_release)
+            with first.exclusive("commit", timeout=1.0):
+                pass
+        key = (threading.get_ident(), "commit")
+        assert first._descriptor_scopes[key].descriptor is None
+
+        with second.exclusive("commit", timeout=0.5):
+            with pytest.raises(GrafxLeaseTimeout):
+                with first.exclusive("commit", timeout=0.2):
+                    pass
+        assert first._descriptor_scopes[key].descriptor is None
+
+        with first.exclusive("commit", timeout=0.5):
+            pass
+
+    assert first._descriptor_scopes == {}
+
+
+def test_base_exception_closes_an_idle_reusable_descriptor(
+    make_coordinator: CoordinatorFactory,
+) -> None:
+    first = make_coordinator(owner_id="p1-aaaa")
+    second = make_coordinator(owner_id="p2-bbbb", monotonic_origin=50.0)
+
+    with pytest.raises(KeyboardInterrupt):
+        with first.reuse_unlocked_section_descriptor("commit"):
+            with first.exclusive("commit", timeout=1.0):
+                pass
+            raise KeyboardInterrupt
+
+    assert first._descriptor_scopes == {}
+    with second.exclusive("commit", timeout=0.5):
+        pass
+
+
+def test_base_exception_after_os_acquire_closes_the_locked_descriptor(
+    make_coordinator: CoordinatorFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even failure to wrap an acquired descriptor must release cross-process authority."""
+    first = make_coordinator(owner_id="p1-aaaa")
+    second = make_coordinator(owner_id="p2-bbbb", monotonic_origin=50.0)
+
+    def fail_to_wrap(*_args: object, **_kwargs: object) -> object:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        with first.reuse_unlocked_section_descriptor("commit"):
+            with monkeypatch.context() as patch:
+                patch.setattr(coordination_local, "_FileSectionHandle", fail_to_wrap)
+                with first.exclusive("commit", timeout=1.0):
+                    pass
+
+    assert first._descriptor_scopes == {}
+    with second.exclusive("commit", timeout=0.5):
+        pass
 
 
 def test_a_coordinator_without_a_lock_directory_still_serialises_itself(

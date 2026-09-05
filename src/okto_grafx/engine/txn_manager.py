@@ -7047,6 +7047,43 @@ class TransactionManager:
             yield
 
     @contextmanager
+    def _participant_descriptor_scope(self) -> Iterator[None]:
+        """Reuse only an unlocked participant-section descriptor for one bounded batch.
+
+        The concrete local coordinator offers this optional optimization. Narrow collaborator
+        doubles and alternate coordinators keep their existing behavior. As with section entry,
+        only foreign context-protocol callbacks are close hazards; the yielded body deliberately
+        is not, so lazy input and mapping callbacks may close without deadlocking.
+        """
+        with self._close_wait_hazard():
+            capability = getattr(
+                self._coordinator, "reuse_unlocked_section_descriptor", None
+            )
+            scope = (
+                capability(self._participant_section_name)
+                if callable(capability)
+                else None
+            )
+        if scope is None:
+            yield
+            return
+
+        with self._close_wait_hazard():
+            entered = scope.__enter__()
+        try:
+            yield entered
+        except BaseException as failure:
+            with self._close_wait_hazard():
+                suppressed = bool(
+                    scope.__exit__(type(failure), failure, failure.__traceback__)
+                )
+            if not suppressed:
+                raise
+        else:
+            with self._close_wait_hazard():
+                scope.__exit__(None, None, None)
+
+    @contextmanager
     def _participant_section(self) -> Iterator[None]:
         """Enter the section that serialises the THREADS of this participant.
 

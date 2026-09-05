@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import os
+import threading
 from collections.abc import Callable, ItemsView, Iterator, Mapping
 from pathlib import Path
 
 import pytest
 
 from okto_grafx import ExecuteManyReport, connect
+from okto_grafx.adapters import coordination_local
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxPlanError,
@@ -23,9 +26,16 @@ _INSERT = "CREATE (:Person {id: $id, name: $name})"
 
 
 class _ObservedParameters(Mapping[str, object]):
-    def __init__(self, database: object, values: Mapping[str, object]) -> None:
+    def __init__(
+        self,
+        database: object,
+        values: Mapping[str, object],
+        *,
+        on_items: Callable[[], None] | None = None,
+    ) -> None:
         self._database = database
         self._values = dict(values)
+        self._on_items = on_items
         self.observations: list[bool] = []
 
     def __getitem__(self, name: str) -> object:
@@ -39,6 +49,8 @@ class _ObservedParameters(Mapping[str, object]):
 
     def items(self) -> ItemsView[str, object]:
         self.observations.append(self._database._metrics.page_access_active)
+        if self._on_items is not None:
+            self._on_items()
         return self._values.items()
 
 
@@ -138,6 +150,84 @@ def test_committed_batch_survives_cold_reopen_and_verifies_clean(
     with connect(root) as reopened:
         assert _rows(reopened) == ((1, "Ada"), (2, "Grace"))
         assert reopened.verify("all").findings == ()
+
+
+def test_durable_batch_reuses_one_descriptor_but_locks_each_page_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "descriptor-count"
+    with connect(root) as database:
+        _install_schema(database)
+        coordinator = database._transactions._coordinator
+        participant = database._transactions._participant_section_name
+        participant_suffix = f"{participant}.lock"
+        real_open = os.open
+        real_acquire = coordination_local._acquire_os_lock
+        real_release = coordination_local._release_os_lock
+        opened: list[str] = []
+        participant_descriptors: set[int] = set()
+        acquired = 0
+        released = 0
+
+        def counted_open(path, flags, mode=0o777, *, dir_fd=None):
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if str(path).endswith(participant_suffix):
+                opened.append(str(path))
+                participant_descriptors.add(descriptor)
+            return descriptor
+
+        def counted_acquire(descriptor: int) -> None:
+            nonlocal acquired
+            if descriptor in participant_descriptors:
+                acquired += 1
+            real_acquire(descriptor)
+
+        def counted_release(descriptor: int) -> None:
+            nonlocal released
+            if descriptor in participant_descriptors:
+                released += 1
+            real_release(descriptor)
+
+        transaction = database.begin("write")
+        with monkeypatch.context() as patch:
+            patch.setattr(coordination_local.os, "open", counted_open)
+            patch.setattr(coordination_local, "_acquire_os_lock", counted_acquire)
+            patch.setattr(coordination_local, "_release_os_lock", counted_release)
+            report = transaction.executemany(
+                _INSERT,
+                (
+                    {"id": 1, "name": "one"},
+                    {"id": 2, "name": "two"},
+                    {"id": 3, "name": "three"},
+                ),
+            )
+
+        assert report.statements == 3
+        assert len(opened) == 1
+        assert acquired == 5
+        assert released == 5
+        assert coordinator._descriptor_scopes == {}
+        transaction.rollback()
+
+
+def test_batch_falls_back_for_a_coordinator_without_descriptor_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with connect(":memory:") as database:
+        _install_schema(database)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                coordination_local.LocalProcessCoordinator,
+                "reuse_unlocked_section_descriptor",
+                None,
+            )
+            with database.begin("write") as transaction:
+                report = transaction.executemany(
+                    _INSERT, ({"id": 1, "name": "fallback"},)
+                )
+
+        assert report.statements == 1
+        assert _rows(database) == ((1, "fallback"),)
 
 
 def test_mid_batch_parameter_failure_discards_the_prefix_before_later_commit() -> None:
@@ -272,21 +362,47 @@ def test_empty_batch_still_requires_write_mode() -> None:
         transaction.rollback()
 
 
-def test_generator_callbacks_run_outside_page_access_and_cannot_reenter_transaction() -> (
-    None
-):
-    with connect(":memory:") as database:
+def test_generator_callbacks_run_outside_page_access_and_cannot_reenter_transaction(
+    tmp_path: Path,
+) -> None:
+    with connect(tmp_path / "callback-lock") as database:
         _install_schema(database)
         transaction = database.begin("write")
         page_access_observations: list[bool] = []
         refusals: dict[str, GrafxTransactionStateError] = {}
-        first = _ObservedParameters(database, {"id": 1, "name": "one"})
-        second = _ObservedParameters(database, {"id": 2, "name": "two"})
+        coordinator = database._transactions._coordinator
+        participant = database._transactions._participant_section_name
+
+        def prove_participant_lock_is_free() -> None:
+            outcome: list[str] = []
+
+            def acquire_from_another_thread() -> None:
+                with coordinator.exclusive(participant, timeout=1.0):
+                    outcome.append("granted")
+
+            worker = threading.Thread(target=acquire_from_another_thread)
+            worker.start()
+            worker.join(timeout=5.0)
+            assert worker.is_alive() is False
+            assert outcome == ["granted"]
+
+        first = _ObservedParameters(
+            database,
+            {"id": 1, "name": "one"},
+            on_items=prove_participant_lock_is_free,
+        )
+        second = _ObservedParameters(
+            database,
+            {"id": 2, "name": "two"},
+            on_items=prove_participant_lock_is_free,
+        )
 
         def parameter_sets() -> Iterator[Mapping[str, object]]:
             page_access_observations.append(database._metrics.page_access_active)
+            prove_participant_lock_is_free()
             yield first
             page_access_observations.append(database._metrics.page_access_active)
+            prove_participant_lock_is_free()
             attempts: tuple[tuple[str, Callable[[], object]], ...] = (
                 (
                     "execute",
@@ -334,6 +450,7 @@ def test_reentrant_close_aborts_the_batch_without_publishing_its_prefix(
     database = connect(root)
     _install_schema(database)
     transaction = database.begin("write")
+    coordinator = database._transactions._coordinator
 
     def parameter_sets() -> Iterator[Mapping[str, object]]:
         yield {"id": 1, "name": "prefix"}
@@ -343,6 +460,7 @@ def test_reentrant_close_aborts_the_batch_without_publishing_its_prefix(
     with pytest.raises(GrafxTransactionStateError):
         transaction.executemany(_INSERT, parameter_sets())
 
+    assert coordinator._descriptor_scopes == {}
     with connect(root) as reopened:
         assert _rows(reopened) == ()
 

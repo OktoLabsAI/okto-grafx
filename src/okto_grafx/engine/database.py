@@ -2373,7 +2373,7 @@ class Database:
         parameter_sets: Iterable[Mapping[str, object]],
     ) -> ExecuteManyReport:
         """Run one parsed updating statement over a streaming, atomic parameter batch."""
-        with self._public_operation("executemany"):
+        with self._executemany_operation():
             self._require_open()
             engine = self._require_component(
                 "queries", self._queries, "the query engine (C10)"
@@ -2524,6 +2524,15 @@ class Database:
                     _note_cleanup_failure(failure, cleanup_failure)
                 raise
             return report
+
+    @contextmanager
+    def _executemany_operation(self) -> Iterator[None]:
+        """Enter the public batch transition, then bound unlocked descriptor reuse inside it."""
+        with self._public_operation("executemany"):
+            # Every page_access_section in _run_many still takes and drops the operating-system
+            # lock. Only its permanent lock-file descriptor survives between batch items.
+            with self._transactions._participant_descriptor_scope():
+                yield
 
     def _scan_rows_v1(
         self,
