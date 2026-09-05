@@ -689,6 +689,7 @@ class TransactionManager:
         "_lease_guard",
         "_next_txn_id",
         "_open",
+        "_transaction_descriptor_scopes",
         "_participant_pin",
         "_published_high_water",
         "_own_published_lsn",
@@ -891,6 +892,12 @@ class TransactionManager:
         )
         self._next_txn_id: TxnId = 1
         self._open: dict[TxnId, TransactionContext] = {}
+        # Long-lived descriptor reuse is owned by the same manager that owns transaction
+        # settlement.  The values carry no lock or durable authority between operations: the
+        # concrete coordinator parks only a proved-unlocked participant lock-file descriptor.
+        # Keeping the map here lets commit, rollback, retry and terminal close all converge on
+        # the same drain even when no public Transaction wrapper survives.
+        self._transaction_descriptor_scopes: dict[TxnId, Any] = {}
         # CE-2: ONE reader registration per participant, opened lazily by the first begin and
         # withdrawn only by close. Its pin is deferred and monotone -- it follows the oldest
         # open snapshot, never passes it (BR-10), and is republished on the refresh cadence
@@ -2735,6 +2742,7 @@ class TransactionManager:
         *,
         fresh_read_view: bool = False,
         allow_writeback: bool = True,
+        transaction: TransactionContext | None = None,
     ) -> Iterator[None]:
         """Keep the recovery latch stable for one page-touching public operation.
 
@@ -2754,6 +2762,13 @@ class TransactionManager:
         without opening a synthetic transaction or changing reader/writer concurrency.
         ``allow_writeback=False`` is for observational maintenance: an unproved refresh refuses
         dirty resident state instead of implicitly publishing it.
+
+        ``transaction`` is a private performance hint used only by the public statement door.
+        After the first participant access it may retain this exact section's file descriptor in
+        an unlocked, identity-revalidated scope.  The current access was acquired before that
+        scope exists and stays entirely canonical; later accesses still take and release the
+        operating-system lock.  Unknown/custom coordinators simply have no qualifying private
+        capability and keep this method's historical path.
         """
         page_access = getattr(self._metrics, "page_access", None)
         boundary = page_access() if callable(page_access) else nullcontext()
@@ -2776,6 +2791,12 @@ class TransactionManager:
                         self._synchronize_read_index_authority(
                             published.last_committed_lsn
                         )
+                if transaction is not None:
+                    self._retain_transaction_descriptor_scope_in_section(transaction)
+                    # The concrete capability is callback-free, but retain the lifecycle guard
+                    # beside the optional boundary: a deliberately hostile direct composition
+                    # must never turn a re-entrant close into permission to touch a page.
+                    self._require_not_closed("access database pages")
                 yield
 
     @contextmanager
@@ -3172,7 +3193,8 @@ class TransactionManager:
             cleanup_failure,
             self._release_reader(txn),
         )
-        open_now = self._forget(txn, mode)
+        open_now, descriptor_failure = self._forget(txn, mode)
+        cleanup_failure = _first_failure(cleanup_failure, descriptor_failure)
         return mode, open_now, cleanup_failure
 
     def _abort_for_close_in_section(
@@ -3214,6 +3236,10 @@ class TransactionManager:
                 txn._staging_marks.clear()
         reader_failure = self._release_reader(txn)
         failure = _accumulate_failure(failure, reader_failure)
+        failure = _accumulate_failure(
+            failure,
+            self._drain_transaction_descriptor_scope(txn.txn_id),
+        )
         self._index_catalog_activation_plans.pop(txn.txn_id, None)
         self._open.pop(txn.txn_id, None)
         mode = txn.mode.value
@@ -4034,7 +4060,21 @@ class TransactionManager:
                                 self._index_catalog_activation_plans.pop(
                                     txn.txn_id, None
                                 )
+                                failure = _accumulate_failure(
+                                    failure,
+                                    self._drain_transaction_descriptor_scope(
+                                        txn.txn_id
+                                    ),
+                                )
                             failure = _accumulate_failure(failure, txn_failure)
+                        # Defence in depth for a monkeypatched abort helper: every retained
+                        # descriptor scope is transaction-owned and terminal close must attempt
+                        # all of them before lower resources are released.
+                        for txn_id in tuple(self._transaction_descriptor_scopes):
+                            failure = _accumulate_failure(
+                                failure,
+                                self._drain_transaction_descriptor_scope(txn_id),
+                            )
                         pin = self._participant_pin
                         if pin is not None:
                             failure = _accumulate_failure(
@@ -4120,7 +4160,7 @@ class TransactionManager:
             # has a TTL; surfacing a foreign cleanup exception here would invite a caller to
             # retry an operation this transaction has already completed.
             self._release_reader(txn)
-            open_now = self._forget(txn, mode)
+            open_now, _descriptor_failure = self._forget(txn, mode)
         self._publish_gauge(mode, open_now)
         return CommitReport(csn=csn, durable=True, wrote=False)
 
@@ -4550,7 +4590,10 @@ class TransactionManager:
                     cleanup_failure,
                     self._release_reader(txn),
                 )
-                open_now = self._forget(txn, mode)
+                open_now, descriptor_failure = self._forget(txn, mode)
+                cleanup_failure = _first_failure(
+                    cleanup_failure, descriptor_failure
+                )
             else:
                 txn.mark_conflicted()
             lease_failure = self._drop_lease(lease)
@@ -7083,6 +7126,65 @@ class TransactionManager:
             with self._close_wait_hazard():
                 scope.__exit__(None, None, None)
 
+    def _retain_transaction_descriptor_scope_in_section(
+        self, txn: TransactionContext
+    ) -> None:
+        """Install one identity-revalidated unlocked descriptor scope for a live transaction.
+
+        The caller already owns the participant section, which makes the first installation
+        single-flight without adding an engine lock.  Discovery deliberately uses the concrete
+        class dictionary: inheriting from the local coordinator is not enough to inherit this
+        long-lived, callback-free capability.  A custom subclass must explicitly implement the
+        private method again and accept the same no-authority/no-failure contract.
+
+        Installation happens after the current section was acquired.  Consequently the first
+        operation remains canonical, the second can park its freshly opened descriptor, and only
+        the third and later operations reuse it.  Retrofitting the already-locked current handle
+        would save one fixed open at the cost of broadening the borrow protocol.
+        """
+        txn_id = txn.txn_id
+        if txn_id in self._transaction_descriptor_scopes:
+            return
+        if self._open.get(txn_id) is not txn or not txn.active:
+            return
+        capability = type(self._coordinator).__dict__.get(
+            "_reuse_revalidated_unlocked_section_descriptor"
+        )
+        if not callable(capability):
+            return
+        with self._close_wait_hazard():
+            scope = capability(self._coordinator, self._participant_section_name)
+            if scope is None:
+                return
+            scope.__enter__()
+        if self._closed or self._open.get(txn_id) is not txn or not txn.active:
+            # A hostile explicit opt-in may request close from its enter callback.  It receives
+            # no chance to strand the just-entered scope or resurrect the terminal transaction.
+            with self._close_wait_hazard():
+                scope.__exit__(None, None, None)
+            return
+        self._transaction_descriptor_scopes[txn_id] = scope
+
+    def _drain_transaction_descriptor_scope(
+        self, txn_id: TxnId
+    ) -> BaseException | None:
+        """Pop and close one transaction's unlocked descriptor scope, fail-completely.
+
+        Pop precedes foreign protocol exit so a re-entrant or failing explicit custom opt-in
+        cannot make a terminal transaction look live in this map.  The concrete local scope
+        closes descriptors quietly.  Retaining a returned failure is defence in depth for direct
+        compositions that deliberately re-declare the private capability.
+        """
+        scope = self._transaction_descriptor_scopes.pop(txn_id, None)
+        if scope is None:
+            return None
+        try:
+            with self._close_wait_hazard():
+                scope.__exit__(None, None, None)
+        except BaseException as failure:
+            return failure
+        return None
+
     @contextmanager
     def _participant_section(self) -> Iterator[None]:
         """Enter the section that serialises the THREADS of this participant.
@@ -7233,18 +7335,23 @@ class TransactionManager:
         del txn  # the pin is per-participant; nothing per-transaction remains to detach
         return None
 
-    def _forget(self, txn: TransactionContext, mode: str) -> int:
-        """Drop a finished transaction and return how many of its mode are still open.
+    def _forget(
+        self, txn: TransactionContext, mode: str
+    ) -> tuple[int, BaseException | None]:
+        """Drop a finished transaction and return its remaining count plus cleanup evidence.
 
         The count is RETURNED rather than published here so the caller can emit it once the
         participant section is released: a metrics sink is host code and must never be called
-        while this component holds anything (A91).
+        while this component holds anything (A91).  Descriptor-scope cleanup is returned beside
+        it so rollback/retry can report cleanup failure while a durable commit keeps its already
+        final outcome non-retryable.
         """
+        descriptor_failure = self._drain_transaction_descriptor_scope(txn.txn_id)
         self._open.pop(txn.txn_id, None)
         self._index_catalog_activation_plans.pop(txn.txn_id, None)
         if self._mode_counts[mode] > 0:
             self._mode_counts[mode] -= 1
-        return self._mode_counts[mode]
+        return self._mode_counts[mode], descriptor_failure
 
     def _publish_gauge(self, mode: str, open_now: int) -> None:
         """Publish one gauge without letting telemetry change a lifecycle outcome."""

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import errno
 import os
+import stat
 import struct
 import threading
 import time
@@ -540,6 +541,22 @@ class _ReusableDescriptorScope:
     descriptor: int | None = None
     borrowed: bool = False
     closing: bool = False
+    # How many nested intervals asked for the revalidated variant. A parked descriptor names
+    # the file it was opened through, never the path: a lock file replaced between two
+    # operations leaves the descriptor on an orphaned inode, and locking an orphan always
+    # succeeds while another process locks the live file. Counting rather than flagging keeps
+    # the guard while ANY long interval is open, including one nested inside a short one.
+    revalidations: int = 0
+    # Once a long interval has touched this scope the guard stays for the rest of its life. A
+    # long interval nested inside a short one has already stretched real time across the short
+    # one, so letting the outer frame reuse that descriptor unproved would restore exactly the
+    # window the guard exists to close.
+    ever_revalidated: bool = False
+
+    @property
+    def revalidated(self) -> bool:
+        """Return whether a parked descriptor must be re-proved before it is locked again."""
+        return self.revalidations > 0 or self.ever_revalidated
 
 
 @dataclass(frozen=True, slots=True)
@@ -1432,8 +1449,39 @@ class LocalProcessCoordinator:
         normalized = _validate_identifier("section name", name.lower())
         return self._reuse_unlocked_section_descriptor(normalized)
 
+    def _reuse_revalidated_unlocked_section_descriptor(
+        self, name: str
+    ) -> AbstractContextManager[None] | None:
+        """Keep an unlocked descriptor across an interval whose length the CALLER decides.
+
+        The short variant above lives inside one engine call, so the window in which the lock
+        file could be replaced is bounded by that call. This one may span separate statements of
+        one transaction, and a caller may hold it open for as long as it likes. Over that window
+        the descriptor's file may be unlinked and recreated, and a descriptor kept from before
+        the replacement names an orphaned inode: locking it always succeeds while another
+        process locks the live file, so mutual exclusion would be lost with no error anywhere.
+
+        The longer window is therefore paid for with a proof rather than with trust. Before a
+        parked descriptor is locked again its physical identity is compared with the identity
+        the path names now, and any mismatch or any doubt closes it and opens the file afresh.
+        Every ``exclusive`` still takes and releases the real operating-system lock; only the
+        open descriptor is reused, and only while it is still provably the same file.
+
+        ``None`` means this coordinator has nothing to reuse -- it holds no lock directory, so
+        its sections are process-local. Answering with a live no-op context would make a caller
+        pay a frame per statement to enter an interval that can never park anything.
+        """
+        if not isinstance(name, str):
+            raise _reject("The section name must be a string.", value=repr(name))
+        normalized = _validate_identifier("section name", name.lower())
+        if self._lock_directory is None:
+            return None
+        return self._reuse_unlocked_section_descriptor(normalized, revalidated=True)
+
     @contextmanager
-    def _reuse_unlocked_section_descriptor(self, name: str) -> Iterator[None]:
+    def _reuse_unlocked_section_descriptor(
+        self, name: str, *, revalidated: bool = False
+    ) -> Iterator[None]:
         """Bound descriptor reuse to one thread and one exact section name."""
         if self._lock_directory is None:
             yield
@@ -1447,6 +1495,9 @@ class LocalProcessCoordinator:
                 self._descriptor_scopes[key] = scope
             else:
                 scope.depth += 1
+            if revalidated:
+                scope.revalidations += 1
+                scope.ever_revalidated = True
         try:
             yield
         finally:
@@ -1454,6 +1505,8 @@ class LocalProcessCoordinator:
             with self._state_lock:
                 current = self._descriptor_scopes.get(key)
                 if current is scope:
+                    if revalidated:
+                        scope.revalidations -= 1
                     scope.depth -= 1
                     if scope.depth == 0:
                         scope.closing = True
@@ -1922,6 +1975,7 @@ class LocalProcessCoordinator:
         key = (threading.get_ident(), name)
         scope: _ReusableDescriptorScope | None = None
         handle: int | None = None
+        revalidate = False
         with self._state_lock:
             candidate = self._descriptor_scopes.get(key)
             if (
@@ -1933,7 +1987,23 @@ class LocalProcessCoordinator:
                 scope.borrowed = True
                 handle = scope.descriptor
                 scope.descriptor = None
+                revalidate = scope.revalidated
         try:
+            if (
+                handle is not None
+                and revalidate
+                and not self._descriptor_names(handle, path)
+            ):
+                # The parked descriptor no longer names what the path names, or the answer could
+                # not be obtained. Either way it is not the file this section is about, and
+                # locking it would report exclusion this coordinator does not have. Closing
+                # before the retake makes the fallback a plain cold open, not a second chance.
+                #
+                # The proof itself is inside this frame because it is fallible like every other
+                # step here: a host interrupt or an injected failure while proving must leave the
+                # borrow released and the descriptor closed, exactly as a failed open would.
+                self._close_file_descriptor(handle)
+                handle = None
             if handle is None:
                 handle = self._open_lock_file(path, name, deadline)
             self._wait_for_os_lock(handle, name, timeout, deadline)
@@ -2062,6 +2132,27 @@ class LocalProcessCoordinator:
         release = getattr(handle, "release", None)
         if release is not None:
             release()
+
+    @staticmethod
+    def _descriptor_names(descriptor: int, path: str) -> bool:
+        """Return whether an open descriptor still is the file the path names right now.
+
+        Identity is ``(st_dev, st_ino)`` on both families -- on Windows Python reports the volume
+        serial and the 64-bit file index -- so a lock file unlinked and recreated between two
+        operations answers with a different identity even though the name did not change. The
+        path is inspected WITHOUT being followed: a name that became a link is not the file this
+        descriptor was opened through, whatever it now leads to. Anything that cannot be
+        examined at all is treated the same way, because a descriptor that cannot be proved is
+        exactly as unusable as one that is proved wrong.
+        """
+        try:
+            held = os.fstat(descriptor)
+            named = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return False
+        if not (stat.S_ISREG(held.st_mode) and stat.S_ISREG(named.st_mode)):
+            return False
+        return (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
 
     def _finish_descriptor_borrow(
         self,

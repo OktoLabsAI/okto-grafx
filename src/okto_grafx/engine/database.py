@@ -2334,7 +2334,7 @@ class Database:
                 parameters,
                 max_string_characters=self._max_query_value_characters,
             )
-            with self._transactions.page_access_section():
+            with self._transactions.page_access_section(transaction=context):
                 self._require_open()
                 if not context.active:
                     raise GrafxTransactionStateError(

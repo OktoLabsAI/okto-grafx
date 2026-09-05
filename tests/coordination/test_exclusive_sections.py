@@ -8,6 +8,7 @@ process -- contends for real.
 
 from __future__ import annotations
 
+import os
 import threading
 
 import pytest
@@ -374,3 +375,215 @@ def test_a_lock_file_that_never_opens_is_not_reported_as_a_busy_section(
     monkeypatch.undo()
     assert not isinstance(failure.value, GrafxLeaseTimeout)
     assert "cannot access" in str(failure.value.details["detail"])
+
+
+def _count_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, int], None]:
+    """Count cold opens and identity proofs of the section lock file."""
+    counters = {"opened": 0, "proved": 0}
+    coordinator_class = coordination_local.LocalProcessCoordinator
+    real_open = coordinator_class._open_lock_file
+    real_names = coordinator_class._descriptor_names
+
+    def counting_open(self, path, name, deadline):  # type: ignore[no-untyped-def]
+        counters["opened"] += 1
+        return real_open(self, path, name, deadline)
+
+    def counting_names(descriptor, path):  # type: ignore[no-untyped-def]
+        counters["proved"] += 1
+        return real_names(descriptor, path)
+
+    monkeypatch.setattr(coordinator_class, "_open_lock_file", counting_open)
+    monkeypatch.setattr(
+        coordinator_class, "_descriptor_names", staticmethod(counting_names)
+    )
+    return counters, None
+
+
+def test_only_the_long_scope_reproves_a_parked_descriptor(
+    make_coordinator: CoordinatorFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The short interval keeps its old cost; the long one pays one proof per reuse."""
+    coordinator = make_coordinator(owner_id="p1-aaaa")
+    counters, _ = _count_probes(monkeypatch)
+
+    with coordinator.reuse_unlocked_section_descriptor("commit"):
+        for _entry in range(3):
+            with coordinator.exclusive("commit", timeout=1.0):
+                pass
+    short = dict(counters)
+
+    counters["opened"] = counters["proved"] = 0
+    with coordinator._reuse_revalidated_unlocked_section_descriptor("commit"):
+        for _entry in range(3):
+            with coordinator.exclusive("commit", timeout=1.0):
+                pass
+    long_scope = dict(counters)
+
+    # Both park a descriptor after the first entry, so both open the file exactly once.
+    assert short["opened"] == 1
+    assert long_scope["opened"] == 1
+    # The short interval never pays the guard. The long one proves every reuse -- the two
+    # entries that followed the first. A revalidation that stopped being wired would make this
+    # count zero and the test would fail here.
+    assert short["proved"] == 0
+    assert long_scope["proved"] == 2
+
+
+def test_a_long_scope_nested_in_a_short_one_keeps_the_proof_after_it_leaves(
+    make_coordinator: CoordinatorFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long interval stretches real time across its outer frame, so the guard outlives it."""
+    coordinator = make_coordinator(owner_id="p1-aaaa")
+    counters, _ = _count_probes(monkeypatch)
+
+    with coordinator.reuse_unlocked_section_descriptor("commit"):
+        with coordinator.exclusive("commit", timeout=1.0):
+            pass
+        with coordinator._reuse_revalidated_unlocked_section_descriptor("commit"):
+            with coordinator.exclusive("commit", timeout=1.0):
+                pass
+        proved_inside = counters["proved"]
+        with coordinator.exclusive("commit", timeout=1.0):
+            pass
+
+    assert proved_inside == 1
+    # The entry AFTER the long interval left still proves: the outer frame does not inherit a
+    # descriptor that a long interval may have kept open across arbitrary caller time.
+    assert counters["proved"] == 2
+
+
+def test_a_long_scope_still_admits_a_contender(
+    make_coordinator: CoordinatorFactory,
+) -> None:
+    """A parked descriptor is unlocked, so it never excludes anybody by merely existing."""
+    coordinator = make_coordinator(owner_id="p1-aaaa")
+    outcome: list[str] = []
+
+    with coordinator._reuse_revalidated_unlocked_section_descriptor("commit"):
+        with coordinator.exclusive("commit", timeout=1.0):
+            pass
+
+        def acquire() -> None:
+            with coordinator.exclusive("commit", timeout=1.0):
+                outcome.append("granted")
+
+        worker = threading.Thread(target=acquire, name="revalidated-contender")
+        worker.start()
+        worker.join(timeout=5.0)
+        assert worker.is_alive() is False
+        assert outcome == ["granted"]
+
+    assert coordinator._descriptor_scopes == {}
+
+
+def test_a_descriptor_of_another_file_is_never_accepted_as_this_section(
+    tmp_path,
+) -> None:
+    """The proof itself, on every platform: identity, not the name, decides."""
+    coordinator_class = coordination_local.LocalProcessCoordinator
+    here = tmp_path / "here.lock"
+    elsewhere = tmp_path / "elsewhere.lock"
+    held = os.open(str(here), os.O_RDWR | os.O_CREAT, 0o600)
+    other = os.open(str(elsewhere), os.O_RDWR | os.O_CREAT, 0o600)
+    os.close(other)
+    try:
+        assert coordinator_class._descriptor_names(held, str(here)) is True
+        assert coordinator_class._descriptor_names(held, str(elsewhere)) is False
+        assert coordinator_class._descriptor_names(held, str(tmp_path / "gone")) is False
+        assert coordinator_class._descriptor_names(held, str(tmp_path)) is False
+    finally:
+        os.close(held)
+    # A descriptor that cannot be examined at all is as unusable as one proved wrong.
+    assert coordinator_class._descriptor_names(held, str(here)) is False
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "Windows refuses to unlink a file that holds an open handle, so the lock file cannot "
+        "be replaced under a parked descriptor there; on POSIX it can, and the long scope "
+        "must catch it."
+    ),
+)
+def test_a_replaced_lock_file_is_never_locked_through_the_old_descriptor(
+    make_coordinator: CoordinatorFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The window this guard exists for: unlink and recreate between two operations."""
+    coordinator = make_coordinator(owner_id="p1-aaaa")
+    counters, _ = _count_probes(monkeypatch)
+    directory = coordinator._lock_directory
+    assert directory is not None
+    path = os.path.join(
+        directory, f"commit{coordination_local.LOCK_FILE_SUFFIX}"
+    )
+
+    with coordinator._reuse_revalidated_unlocked_section_descriptor("commit"):
+        with coordinator.exclusive("commit", timeout=1.0):
+            pass
+        before = os.stat(path)
+        os.unlink(path)
+        replacement = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        os.close(replacement)
+        assert os.stat(path).st_ino != before.st_ino
+
+        with coordinator.exclusive("commit", timeout=1.0):
+            pass
+
+    # The parked descriptor named the orphan, so the section was retaken through a cold open of
+    # the live file. Without the proof it would have locked the orphan and reported an exclusion
+    # it did not hold.
+    assert counters["opened"] == 2
+    assert counters["proved"] == 1
+
+
+def test_a_failed_identity_proof_releases_the_borrow_and_the_descriptor(
+    make_coordinator: CoordinatorFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The proof is fallible like every other step, so it unwinds like every other step."""
+    coordinator = make_coordinator(owner_id="p1-aaaa")
+    coordinator_class = coordination_local.LocalProcessCoordinator
+
+    def refuse_to_answer(descriptor, path):  # type: ignore[no-untyped-def]
+        raise KeyboardInterrupt("interrupted while proving the descriptor")
+
+    scope = coordinator._reuse_revalidated_unlocked_section_descriptor("commit")
+    assert scope is not None
+    with scope:
+        with coordinator.exclusive("commit", timeout=1.0):
+            pass
+        key = (threading.get_ident(), "commit")
+        assert coordinator._descriptor_scopes[key].descriptor is not None
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                coordinator_class, "_descriptor_names", staticmethod(refuse_to_answer)
+            )
+            with pytest.raises(KeyboardInterrupt):
+                with coordinator.exclusive("commit", timeout=1.0):
+                    pytest.fail("the section was granted through an unproved descriptor")
+
+        # The borrow was released, so the interval can still park a descriptor afterwards.
+        assert coordinator._descriptor_scopes[key].borrowed is False
+        with coordinator.exclusive("commit", timeout=1.0):
+            pass
+
+    # A borrow left outstanding would keep the scope in the map and leak its descriptor: the
+    # exit only reclaims what is not borrowed.
+    assert coordinator._descriptor_scopes == {}
+
+
+def test_a_coordinator_without_a_lock_directory_offers_no_long_scope(
+    make_coordinator: CoordinatorFactory,
+) -> None:
+    """Nothing can be parked without a lock file, so the caller is told not to pay for a frame."""
+    coordinator = make_coordinator(owner_id="p1-aaaa")
+    monkeypatched = coordinator._lock_directory
+    assert monkeypatched is not None
+    coordinator._lock_directory = None
+    try:
+        assert coordinator._reuse_revalidated_unlocked_section_descriptor("commit") is None
+    finally:
+        coordinator._lock_directory = monkeypatched
