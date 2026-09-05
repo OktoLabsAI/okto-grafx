@@ -1461,3 +1461,36 @@ reached `1.209x`. This is a small constant-cost improvement, not a new performan
 reversal of batch 11's rejection of a broad vector-decoder redesign. The 485-test adjacent slice,
 Ruff and diff checks passed. Format, corruption policy, query semantics, WAL/OCC, durability and
 multiwriter/multireader premises remain unchanged.
+
+## Scale-removal batch 28 — revalidated unlocked descriptor across statements
+
+Status: **completed in `764c546`; local and Nexus adversarial reviews PASS**.
+
+Separate statements in one live transaction now reuse only the participant lock file's open
+descriptor. The descriptor is always unlocked between operations: every statement, commit and
+settlement section still performs a real operating-system acquire and release. The first access
+installs the scope after its canonical section has already been entered; later borrows prove with
+`fstat` plus no-follow `stat` that the parked descriptor still names the current regular lock
+file. A mismatch, missing name, replacement or failed proof closes it and follows the cold-open
+path. The optimization is private to the exact local coordinator class; memory, subclasses and
+custom coordinators retain the historical path.
+
+Lifecycle ownership stays with `TransactionManager`. Read and write commit, rollback, retry,
+post-barrier failure, OCC refusal and terminal database close converge on a fail-complete drain.
+An OCC-refused transaction remains ACTIVE and retains the scope until retry or rollback; a durable
+commit never becomes retryable because descriptor cleanup failed. Scopes are thread-keyed, and a
+thread hop uses cold descriptors instead of transferring a handle. A `KeyboardInterrupt` injected
+into identity proof exposed and fixed a borrow/fd leak before promotion. POSIX replacement is
+covered by a platform-specific inode test; Windows refuses that replacement while the handle is
+open. Interleaving probes admitted a second thread between statements and inside nested
+`executemany`, proving that no transaction-duration lock was introduced.
+
+The deterministic participant-section count for four statements plus commit/settlement is
+`os.open: 6 -> 3`, while real lock acquires/releases remain `6/6`; for `n >= 2` statements the
+open count is `n + 2 -> 3`, with identity proof replacing each warm reopen. An alternating
+1,000-PK-seek sample on this Windows host observed median `1.547 -> 1.376 s` (`1.124x`), but it is
+illustrative rather than a release gate because short wall-clock runs were noisy. The structural
+syscall reduction is the promoted claim. The composed relevant slice passed 203 tests with one
+declared platform skip; Ruff and diff checks passed. Two stale tests already failing at `48d4672`
+were corrected separately in `674e420` without changing engine code. Format, WAL/OCC, durability,
+writer-lease and multiwriter/multireader premises remain unchanged.
