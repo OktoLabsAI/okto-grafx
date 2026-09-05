@@ -2033,3 +2033,35 @@ immutable `bytes` image per live exact catalog snapshot. It is never shared as m
 or across snapshot ownership; the first serialization still performs every validation and emits
 byte-identical persisted format. WAL, OCC, durability, writer ordering and the original
 multiwriter/multireader premises are unchanged.
+
+## Scale-removal batch 50 — lazy private public-plan clone
+
+Status: **implemented on `feature/v0.0.2`; Nexus delivery independently hardened and verified**.
+
+The exact engine's prepared-plan cache already retained a bounded, identity-checked clone recipe,
+but every `execute` immediately ran that recipe while publishing `QueryResult`, including Pulse
+ingestion paths that consume only rows and statistics. The prepared root is now still eagerly
+rebuilt, validated and compiled once. Each exact-engine result receives a private sealed door to
+that capability-free recipe and materializes its own operator tree only on the first `.plan`
+read. The door is then replaced by the tree in that result's physical field.
+
+Five repeated executes over one prepared root produced one recipe compilation and zero recipe
+runs until a plan was inspected; the old eager path ran one clone per result. Distinct results
+build disjoint operator/expression/schema objects and independently detach mutable literals.
+Adversarial mutation of one materialized tree did not affect an already-materialized sibling or
+a sibling opened later. A result-local lock also proves that concurrent readers of the same
+result run the recipe once and receive the same stable tree.
+
+The door cannot enter through the public constructor. `explain()`, subclasses, collaborators and
+any root not proven to belong to the exact engine keep the complete eager hostile rebuild and
+validation. Dataclass fields, equality, representation, replacement and frozen assignment remain
+compatible; focused copy, deepcopy and pickle probes materialize an ordinary plan rather than
+exposing the internal callable.
+
+The broad plan-consuming slice passed 1,047 cases; 88 focused cases passed after the concurrent
+hardening, with Ruff, compileall and diff checks green. The pre-change profile bounds the
+opportunity at about 5.5–7.3% of transfer and 33–40% of the profiled runtime-read latency. Those
+are prioritization ceilings, not post-change timing claims. Each unopened result retains one
+small door and result-local lock referencing the bounded shared recipe; it never shares a public
+plan tree. Persisted format, WAL, OCC, durability and multiwriter/multireader premises are
+unchanged.

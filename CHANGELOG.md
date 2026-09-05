@@ -61,6 +61,11 @@ including the on-disk format.
 
 ### Changed
 
+- Results produced by the exact built-in engine now defer their independent public plan clone
+  until `QueryResult.plan` is first read. The prepared root is still eagerly rebuilt and
+  validated once into a bounded recipe; results never share plan nodes, concurrent readers of
+  one result receive the same materialized tree, and foreign/unproved roots retain the complete
+  eager hostile-publication path.
 - Exact built-in catalog snapshots now retain their own immutable, checksummed serialized image
   until the next sanctioned schema, space, index-generation or required-capability mutation.
   This removes repeated whole-catalog validation and encoding from DDL and prepared-plan keys;

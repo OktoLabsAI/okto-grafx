@@ -2471,45 +2471,77 @@ def _query_plan_view(
     """Rebuild a capability-free plan, memoizing only proven internal immutable roots."""
     try:
         if internally_owned and memo is not None:
-            marker = id(value)
-            cached = memo.get(marker)
-            if cached is not None and cached[0] is value:
-                memo.move_to_end(marker)
-                return cached[1]()
-        nodes = _query_plan_nodes(value)
-        detached: dict[int, PlanNode] = {}
-        for node in reversed(nodes):
-            clone = _query_plan_dataclass_snapshot(
-                node,
-                expected=type(node),
-                detached_nodes=detached,
-                active=set(),
-                expression_depth=0,
-            )
-            detached[id(node)] = clone  # type: ignore[assignment]
-        root = detached[id(value)]
-        validated = validate_plan(root)
-        if internally_owned and memo is not None:
-            # Compile only this already validated, capability-free graph.  The resulting clone
-            # recipe captures immutable leaves and its own copy of a mutable literal, never the
-            # first caller's result.  Subsequent callers therefore avoid repeating dataclass
-            # reflection and validation while still receiving an entirely independent tree.
-            clone = _query_owned_plan_clone_factory(validated)
-            memo[id(value)] = (value, clone)
-            memo.move_to_end(id(value))
-            if len(memo) > _OWNED_PLAN_VIEW_CACHE_MAX_ENTRIES:
-                memo.popitem(last=False)
-        return validated
+            return _query_owned_plan_recipe(value, memo)()
+        return _query_plan_rebuild(value)
     except GrafxPlanError:
         raise
     except Exception as failure:  # noqa: BLE001 - malformed collaborator output is a plan error
-        observed = _builtin_type_name(failure)
-        raise GrafxPlanError(
-            f"The query collaborator returned a malformed plan field ({observed}).",
-            field="plan",
-            value="malformed",
-            cause=observed,
-        ) from failure
+        raise _malformed_plan_error(failure) from failure
+
+
+def _query_owned_plan_door(value: object, memo: _OwnedPlanViewMemo) -> object:
+    """Seal one proven internal root's clone recipe into a door for exactly one result.
+
+    The door defers the clone until the result's plan is actually read, so a caller that only
+    consumes rows never pays for a tree it never looks at.  Compilation -- the one hostile-shaped
+    rebuild and validation of the root -- still happens here, before the result exists, so a
+    malformed root refuses at execute time exactly as the eager path does.
+    """
+    from okto_grafx.engine.query_engine import _OwnedPlanDoor
+
+    try:
+        return _OwnedPlanDoor(_query_owned_plan_recipe(value, memo))
+    except GrafxPlanError:
+        raise
+    except Exception as failure:  # noqa: BLE001 - malformed collaborator output is a plan error
+        raise _malformed_plan_error(failure) from failure
+
+
+def _query_owned_plan_recipe(
+    value: object, memo: _OwnedPlanViewMemo
+) -> _OwnedPlanClone:
+    """Return the compiled clone recipe of one proven internal immutable root, compiling once."""
+    marker = id(value)
+    cached = memo.get(marker)
+    if cached is not None and cached[0] is value:
+        memo.move_to_end(marker)
+        return cached[1]
+    # Compile only this already validated, capability-free graph.  The resulting clone recipe
+    # captures immutable leaves and its own copy of a mutable literal, never any caller's result.
+    # Every later caller therefore avoids repeating dataclass reflection and validation while
+    # still receiving an entirely independent tree from each run of the recipe.
+    clone = _query_owned_plan_clone_factory(_query_plan_rebuild(value))
+    memo[marker] = (value, clone)
+    memo.move_to_end(marker)
+    if len(memo) > _OWNED_PLAN_VIEW_CACHE_MAX_ENTRIES:
+        memo.popitem(last=False)
+    return clone
+
+
+def _query_plan_rebuild(value: object) -> PlanNode:
+    """Detach and validate one collaborator plan without trusting any of its doors."""
+    nodes = _query_plan_nodes(value)
+    detached: dict[int, PlanNode] = {}
+    for node in reversed(nodes):
+        clone = _query_plan_dataclass_snapshot(
+            node,
+            expected=type(node),
+            detached_nodes=detached,
+            active=set(),
+            expression_depth=0,
+        )
+        detached[id(node)] = clone  # type: ignore[assignment]
+    return validate_plan(detached[id(value)])
+
+
+def _malformed_plan_error(failure: Exception) -> GrafxPlanError:
+    observed = _builtin_type_name(failure)
+    return GrafxPlanError(
+        f"The query collaborator returned a malformed plan field ({observed}).",
+        field="plan",
+        value="malformed",
+        cause=observed,
+    )
 
 
 def _query_owned_plan_clone_factory(value: PlanNode) -> _OwnedPlanClone:
@@ -2518,7 +2550,9 @@ def _query_owned_plan_clone_factory(value: PlanNode) -> _OwnedPlanClone:
 
     def clone_plan() -> PlanNode:
         cloned = clone_field()
-        if type(cloned) not in _QUERY_PLAN_NODE_TYPES:  # pragma: no cover - closed helper grammar
+        if (
+            type(cloned) not in _QUERY_PLAN_NODE_TYPES
+        ):  # pragma: no cover - closed helper grammar
             raise GrafxPlanError(
                 "An internally owned plan template lost its operator root.",
                 field="plan",
@@ -3020,15 +3054,16 @@ def _query_result_snapshot(
         )
 
     raw_plan = _domain_field(source, QueryResult, "plan")
-    plan = (
-        None
-        if raw_plan is None
-        else _query_plan_view(
-            raw_plan,
-            internally_owned=internally_owned_plan,
-            memo=plan_memo,
-        )
-    )
+    if raw_plan is None:
+        plan: object = None
+    elif internally_owned_plan and plan_memo is not None:
+        # A root the exact engine proved it owns is sealed behind a door: the result carries the
+        # compiled recipe and builds its own independent tree only if someone reads the plan.
+        plan = _query_owned_plan_door(raw_plan, plan_memo)
+    else:
+        # Everything else keeps the eager hostile rebuild: the tree is validated and detached
+        # here, before the result exists, and no collaborator callable is ever kept.
+        plan = _query_plan_view(raw_plan)
     statistics = _query_statistics_snapshot(
         _domain_field(source, QueryResult, "statistics")
     )

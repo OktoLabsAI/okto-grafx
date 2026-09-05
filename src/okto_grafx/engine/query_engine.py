@@ -52,11 +52,13 @@ its chain, which is exactly what section 8.5 step 4 needs in order to log the wr
 
 from __future__ import annotations
 
+from _thread import LockType
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 from math import isnan
+from threading import Lock
 from typing import cast
 
 from okto_grafx.domain.errors import (
@@ -434,6 +436,40 @@ class _PathValue:
     relationships: tuple[_PathRelationshipValue]
 
 
+@dataclass(slots=True)
+class _OwnedPlanDoor:
+    """One result's not-yet-materialised public plan: a compiled, capability-free clone recipe.
+
+    Only :func:`_owned_query_result` installs a door, and only after the public facade proved that
+    the exact engine owns the prepared plan root and compiled that root's clone recipe.  The public
+    constructor refuses a door, so a collaborator cannot smuggle a callable into the hostile path.
+    The first read of :attr:`QueryResult.plan` runs the recipe once, stores the independent tree in
+    this result's own slot and drops the door.  A result whose plan is never read never clones one;
+    two results never share a node, because every read of a door builds its own tree.  The lock
+    belongs to this one door, so concurrent readers of the same result wait for the single run
+    instead of each building a tree and racing for the slot.
+    """
+
+    clone: Callable[[], PlanNode]
+    _lock: LockType = field(default_factory=Lock, init=False, repr=False, compare=False)
+    _materialised: PlanNode | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    def materialise(self) -> PlanNode:
+        """Build this result's tree once, including when readers arrive concurrently."""
+
+        materialised = self._materialised
+        if materialised is not None:
+            return materialised
+        with self._lock:
+            materialised = self._materialised
+            if materialised is None:
+                materialised = self.clone()
+                self._materialised = materialised
+            return materialised
+
+
 @dataclass(frozen=True, slots=True)
 class QueryResult:
     """The rows one statement produced, with the plan that produced them.
@@ -456,6 +492,15 @@ class QueryResult:
         DTO itself nevertheless owns its exact outer tuples and statistics dictionary and refuses
         malformed arity before :meth:`dictionaries` could silently truncate it with ``zip``.
         """
+        if type(_QUERY_RESULT_PLAN_SLOT.__get__(self, QueryResult)) is _OwnedPlanDoor:
+            # The door is engine-private: it may only enter through _owned_query_result, which
+            # never runs this constructor.  Refusing it here keeps the hostile publication path
+            # free of any callable a collaborator could hand in as a plan.
+            raise GrafxPlanError(
+                "Query result plans must be operator trees; a sealed plan door is engine-private.",
+                field="plan",
+                value="sealed_door",
+            )
         if not issubclass(type(self.columns), tuple):
             raise GrafxPlanError(
                 "Query result columns must be a tuple.",
@@ -608,18 +653,47 @@ class QueryResult:
         return f"{len(self.rows)} rows over columns {', '.join(self.columns) or 'none'}"
 
 
+_QUERY_RESULT_PLAN_SLOT = QueryResult.__dict__["plan"]
+"""The physical ``plan`` slot; the class attribute below becomes the lazy door over it."""
+
+
+def _read_query_result_plan(result: QueryResult) -> PlanNode | None:
+    """Return this result's plan, materialising a sealed door exactly once and only for it."""
+    stored = _QUERY_RESULT_PLAN_SLOT.__get__(result, QueryResult)
+    if type(stored) is not _OwnedPlanDoor:
+        return stored
+    materialised = stored.materialise()
+    _QUERY_RESULT_PLAN_SLOT.__set__(result, materialised)
+    return materialised
+
+
+def _write_query_result_plan(result: QueryResult, value: object) -> None:
+    """Store a plan (or a door) in the physical slot; the frozen dataclass still refuses users."""
+    _QUERY_RESULT_PLAN_SLOT.__set__(result, value)
+
+
+# ``plan`` stays a dataclass field for fields()/replace()/__eq__/__repr__; only its descriptor
+# changes, so every read -- including the base-class descriptor read the public facade performs
+# -- goes through the door, and the frozen __setattr__ keeps refusing user assignment.
+setattr(  # noqa: B010 - the slot descriptor is deliberately replaced after class creation
+    QueryResult, "plan", property(_read_query_result_plan, _write_query_result_plan)
+)
+
+
 def _owned_query_result(
     *,
     columns: tuple[str, ...] = (),
     rows: tuple[tuple[Value, ...], ...] = (),
-    plan: PlanNode | None = None,
+    plan: PlanNode | _OwnedPlanDoor | None = None,
     statistics: dict[str, int] | None = None,
 ) -> QueryResult:
     """Build a result whose exact fields were already validated and privately materialised.
 
     This is not a second public constructor.  The query engine calls it only with the output of
     its validated immutable plan, and the public boundary calls it only after rebuilding every
-    collaborator field.  All other callers keep :class:`QueryResult`'s hostile validation.
+    collaborator field -- or, for a plan root the exact engine proved it owns, with a sealed
+    :class:`_OwnedPlanDoor` that materialises this result's own tree on first read.  All other
+    callers keep :class:`QueryResult`'s hostile validation.
     """
     result = object.__new__(QueryResult)
     object.__setattr__(result, "columns", columns)
