@@ -249,7 +249,9 @@ class HnswGraph:
         # the graph is being derived; ``_finish_construction`` drops the complete cache before the
         # picture can be published.  Ordinary/public HnswGraph construction keeps the historical
         # callback behaviour unless its caller explicitly selects this private capability.
-        self._construction_link_scores: list[dict[int, list[float]]] | None = (
+        self._construction_link_scores: list[
+            dict[int, list[float | None]]
+        ] | None = (
             [{}] if _cache_construction_link_scores else None
         )
         self._chain_next: dict[int, int] = {}
@@ -562,10 +564,26 @@ class HnswGraph:
         if left == right or left not in self._values or right not in self._values:
             return
         adjacency = self._links[layer]
+        cached_by_node = (
+            None
+            if self._construction_link_scores is None
+            else self._construction_link_scores[layer]
+        )
         for owner, other in ((left, right), (right, left)):
             peers = adjacency.setdefault(owner, [])
             if other not in peers:
+                cached = None if cached_by_node is None else cached_by_node.get(owner)
+                if cached is not None and len(cached) != len(peers):
+                    # Only an exactly aligned prefix is reusable.  Forget an uncertain cache
+                    # before mutating the adjacency rather than guessing which score belongs to
+                    # which peer.
+                    cached_by_node.pop(owner, None)
+                    cached = None
                 peers.append(other)
+                if cached is not None:
+                    # Underfull adjacencies are not scored early.  The placeholder keeps the
+                    # positional proof until a later overflow actually needs this pair.
+                    cached.append(None)
         self._trim(left, layer)
         self._trim(right, layer)
 
@@ -591,11 +609,14 @@ class HnswGraph:
             else self._construction_link_scores[layer]
         )
         cached = None if cached_by_node is None else cached_by_node.get(node)
-        if cached is not None and len(cached) == len(peers) - 1:
-            # A cached adjacency was full before _link appended exactly one new peer.  Its old
-            # scores remain aligned with the unchanged prefix; compute only the appended value.
-            ranked = list(zip(cached, peers[:-1], strict=True))
-            ranked.append((scorer(peers[-1]), peers[-1]))
+        if cached is not None and len(cached) == len(peers):
+            # Reuse every proved score and resolve only placeholders, in the canonical peer
+            # order.  ``ranked`` is local: if a later scorer fails, no partially refreshed cache
+            # is published into the disposable graph picture.
+            ranked = [
+                (scorer(peer) if known is None else known, peer)
+                for known, peer in zip(cached, peers, strict=True)
+            ]
         else:
             # The first overflow and every uncertain alignment retain the canonical complete
             # scoring order.  A failed score publishes no cache and leaves the caller to discard
@@ -623,20 +644,19 @@ class HnswGraph:
             position = peers.index(peer)
         except ValueError:
             return
-        peers.pop(position)
         scores = self._construction_link_scores
-        if scores is None:
-            return
-        cached_by_node = scores[layer]
-        cached = cached_by_node.get(owner)
+        cached_by_node = None if scores is None else scores[layer]
+        cached = None if cached_by_node is None else cached_by_node.get(owner)
+        aligned = cached is not None and len(cached) == len(peers)
+        peers.pop(position)
         if cached is None:
             return
-        # A just-appended peer may not have been scored yet.  Removing that final item restores
-        # the aligned cached prefix.  Any other mismatch is conservative: forget and rescore at
-        # the next overflow rather than associate a value with the wrong neighbour.
-        if position < len(cached):
+        if aligned:
             cached.pop(position)
-        if len(cached) != len(peers) or len(peers) < self._capacity(layer):
+        else:
+            # Mismatch predates this removal.  The adjacency remains authoritative; only the
+            # uncertain optimization is discarded.
+            assert cached_by_node is not None
             cached_by_node.pop(owner, None)
 
     def _append_to_chain(self, node: int) -> None:

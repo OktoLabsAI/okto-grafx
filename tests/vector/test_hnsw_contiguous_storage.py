@@ -72,6 +72,27 @@ class _ReleasingBufferMath:
         return self._inner.top_k(query, candidates, k, metric)
 
 
+class _CountingScoreMath:
+    """A score-only adapter that can fail on one exact call without a prepared fast path."""
+
+    def __init__(self, *, fail_on: int | None = None) -> None:
+        self._inner = PureVectorMath()
+        self.fail_on = fail_on
+        self.peers: list[float] = []
+
+    @property
+    def name(self) -> str:
+        return "counting-score"
+
+    def score(
+        self, a: Sequence[float], b: Sequence[float], metric: DistanceMetric
+    ) -> float:
+        self.peers.append(float(b[0]))
+        if self.fail_on == len(self.peers):
+            raise RuntimeError("injected score failure")
+        return self._inner.score(a, b, metric)
+
+
 def _rounded(
     corpus: Sequence[Sequence[float]], typecode: str
 ) -> list[tuple[float, ...]]:
@@ -358,11 +379,77 @@ def test_transient_construction_scores_preserve_the_default_pure_graph(
     for node, values in enumerate(corpus, 1):
         canonical.insert(node, values)
         accelerated.insert(node, values)
+
+    # Exercise underfull cached adjacencies while the transient construction proof is live.
+    for victim in (7, 29, 61):
+        canonical.remove(victim)
+        accelerated.remove(victim)
+    extra = seeded_vectors(3, 16, seed=0xA66)
+    for node, values in enumerate(extra, 100):
+        canonical.insert(node, values)
+        accelerated.insert(node, values)
+
+    retained = accelerated._construction_link_scores
+    assert retained is not None
+    for layer, by_node in enumerate(retained):
+        capacity = accelerated._capacity(layer)
+        assert all(len(scores) <= capacity for scores in by_node.values())
     accelerated._finish_construction()
 
     assert _shape(accelerated) == _shape(canonical)
     for query in corpus[::13]:
         assert accelerated.search(query, 24) == canonical.search(query, 24)
+
+
+def test_underfull_cache_uses_placeholders_without_scoring_before_overflow() -> None:
+    """Missing peers stay positional and a failed overflow publishes no partial refresh."""
+    math = _CountingScoreMath(fail_on=2)
+    graph = HnswGraph(
+        math,
+        DistanceMetric.DOT,
+        seed=0xD13,
+        neighbours=1,
+        _cache_construction_link_scores=True,
+    )
+    graph._values.update({node: (float(node),) for node in range(1, 5)})
+    graph._levels.update({node: 0 for node in range(1, 5)})
+    graph._links[0].update({1: [2], 2: [1]})
+    retained = graph._construction_link_scores
+    assert retained is not None
+    retained[0][1] = [2.0]
+
+    graph._link(1, 3, 0)
+    assert math.peers == []
+    assert retained[0][1] == [2.0, None]
+
+    with pytest.raises(RuntimeError, match="injected score failure"):
+        graph._link(1, 4, 0)
+    assert math.peers == [3.0, 4.0]
+    assert retained[0][1] == [2.0, None, None]
+
+
+def test_misaligned_construction_cache_falls_back_to_complete_ordered_scoring() -> None:
+    """An uncertain positional proof is dropped before the adjacency is extended."""
+    math = _CountingScoreMath()
+    graph = HnswGraph(
+        math,
+        DistanceMetric.DOT,
+        seed=0xD13,
+        neighbours=1,
+        _cache_construction_link_scores=True,
+    )
+    graph._values.update({node: (float(node),) for node in range(1, 5)})
+    graph._levels.update({node: 0 for node in range(1, 5)})
+    graph._links[0].update({1: [2, 3], 2: [1], 3: [1]})
+    retained = graph._construction_link_scores
+    assert retained is not None
+    retained[0][1] = [2.0]
+
+    graph._link(1, 4, 0)
+
+    assert math.peers == [2.0, 3.0, 4.0]
+    assert all(score is not None for score in retained[0][1])
+    assert len(retained[0][1]) == graph._capacity(0)
 
 
 def test_pure_adapter_declares_stable_pairs_but_a_subclass_must_opt_in_again() -> None:
