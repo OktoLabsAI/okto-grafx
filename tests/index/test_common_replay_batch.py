@@ -469,6 +469,94 @@ def test_reset_active_rebuild_and_vector_store_fall_back_for_the_whole_replay(
     assert vector_calls == 1
 
 
+def test_vector_store_stays_scalar_without_poisoning_canonical_store_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = build_database()
+    vector = VectorHnswIndex(
+        database.proximity.definition,
+        database.pool,
+        database.metrics,
+        space_id=1,
+        space_name="test",
+        dimension=2,
+        metric_of_space=DistanceMetric.COSINE,
+        storage_dtype="f32",
+        normalized=False,
+        math=PureVectorMath(),
+        resolve=lambda _ref: (1, (1.0, 0.0)),
+    )
+    database.manager._indexes[vector.definition.registry_key] = vector  # noqa: SLF001
+    records = (
+        _effect(database.exact, IndexOperation.INSERT, 10, ordinal=1),
+        _effect(vector, IndexOperation.INSERT, 11, ordinal=2),
+        _effect(database.exact, IndexOperation.INSERT, 12, ordinal=3),
+    )
+    header_reads = 0
+    header_writes = 0
+    vector_calls = 0
+    events: list[str] = []
+    original_read = IndexStore._read_header
+    original_write = IndexStore._write_header
+    original_change = IndexStore._apply_change
+    original_scalar = IndexStore.apply
+    original_vector = VectorHnswIndex.apply
+
+    def counted_read(store: IndexStore, *, proved_present: bool = False) -> IndexHeader:
+        nonlocal header_reads
+        if store is database.exact:
+            header_reads += 1
+            events.append("exact.seed")
+        return original_read(store, proved_present=proved_present)
+
+    def counted_write(store: IndexStore, header: IndexHeader) -> None:
+        nonlocal header_writes
+        if store is database.exact:
+            header_writes += 1
+            events.append("exact.publish")
+        original_write(store, header)
+
+    def counted_change(
+        store: IndexStore, change: IndexChange, lsn: int
+    ) -> bool:
+        if store is database.exact:
+            events.append("exact.change")
+        return original_change(store, change, lsn)
+
+    def scalar_guard(store: IndexStore, record: WalRecord) -> None:
+        if store is database.exact:
+            pytest.fail("canonical store fell back to scalar replay")
+        original_scalar(store, record)
+
+    def counted_vector(store: VectorHnswIndex, record: WalRecord) -> None:
+        nonlocal vector_calls
+        vector_calls += 1
+        events.append("vector.scalar")
+        original_vector(store, record)
+
+    monkeypatch.setattr(IndexStore, "_read_header", counted_read)
+    monkeypatch.setattr(IndexStore, "_write_header", counted_write)
+    monkeypatch.setattr(IndexStore, "_apply_change", counted_change)
+    monkeypatch.setattr(IndexStore, "apply", scalar_guard)
+    monkeypatch.setattr(VectorHnswIndex, "apply", counted_vector)
+
+    report = CommitRedo(database.pool, database.manager).apply(_replay(records))
+
+    assert header_reads == 1
+    assert header_writes == 1
+    assert vector_calls == 1
+    assert len(tuple(database.exact.walk())) == 2
+    assert report.index_effects_dispatched == len(records)
+    assert report.touched_files == (database.exact.file, vector.file)
+    assert events == [
+        "exact.seed",
+        "exact.change",
+        "vector.scalar",
+        "exact.change",
+        "exact.publish",
+    ]
+
+
 def test_only_buckets_at_the_eight_effect_threshold_bypass_scalar_apply(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

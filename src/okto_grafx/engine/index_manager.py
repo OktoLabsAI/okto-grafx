@@ -6719,6 +6719,145 @@ class IndexManager:
                     )
             raise
 
+    def apply_partitioned_replay_batch(
+        self, records: Sequence[WalRecord]
+    ) -> tuple[str, ...] | None:
+        """Batch canonical stores without forcing specialised stores through that path.
+
+        A single HNSW generation, RESET, active rebuild or locally stale store must retain its
+        complete scalar ``apply`` protocol.  It must not, however, make unrelated canonical
+        stores repeat page-zero reads and writes for every record in the same committed replay.
+        This door excludes an incompatible store as a whole, prepares the remaining stores with
+        the existing all-or-nothing common proof, and then applies every item in original WAL
+        order.  Canonical bucket mutations remain ordered; only their already-supported composed
+        header publication is delayed to the end of the call.
+
+        ``None`` means there was no canonical subset to accelerate, or that its existing common
+        proof declined before any mutation.  The caller then retains the scalar replay unchanged.
+        Production reaches this private capability only after ``CommitRedo`` has preflighted the
+        complete replay and while the ordinary participant/commit sections remain held.
+        """
+        if not records:
+            return None
+
+        resolved: list[tuple[WalRecord, IndexStore, IndexChange]] = []
+        excluded: set[IndexStore] = set()
+        for record in records:
+            change = change_of(record)
+            try:
+                store = self.active_index(change.index)
+            except GrafxIndexError:
+                return None
+            if change.versioned != store.definition.versioned:
+                raise GrafxCorruptionDetected(
+                    f"A record for index {change.index!r} describes a "
+                    f"{'versioned' if change.versioned else 'unversioned'} entry and this "
+                    f"index stores {'versioned' if store.definition.versioned else 'unversioned'} "
+                    "ones, so partitioned replay was refused before any effect was applied.",
+                    field="versioned",
+                    value=change.versioned,
+                    index=change.index,
+                    file=store.file,
+                    operation=change.operation.name,
+                    lsn=record.lsn,
+                )
+            if len(change.key) > store.max_key_bytes:
+                raise GrafxCorruptionDetected(
+                    f"A record for index {change.index!r} carries a key of "
+                    f"{len(change.key)} bytes, but this index stores at most "
+                    f"{store.max_key_bytes}; partitioned replay was refused before any effect "
+                    "was applied.",
+                    field="key",
+                    value=len(change.key),
+                    limit=store.max_key_bytes,
+                    index=change.index,
+                    file=store.file,
+                    operation=change.operation.name,
+                    lsn=record.lsn,
+                )
+            resolved.append((record, store, change))
+            if (
+                change.operation is IndexOperation.RESET
+                or type(store).apply is not IndexStore.apply
+                or store._rebuild_authority is not None
+                or store._replaying
+                or store._stale_reason is not None
+            ):
+                # Exclusion is store-wide.  Mixing a scalar RESET or generation fence with a
+                # composed header for another record of the same store would reuse stale
+                # authority even if the two records are far apart in WAL order.
+                excluded.add(store)
+
+        common_records = tuple(
+            record for record, store, _change in resolved if store not in excluded
+        )
+        if not common_records:
+            return None
+        if not excluded:
+            return self.apply_common_replay_batch(records)
+
+        prepared = self._prepare_common_replay_batch(common_records)
+        if prepared is None:
+            return None
+
+        moved_by_store: dict[IndexStore, bool] = {
+            state.store: False for state in prepared.stores
+        }
+        common_items = iter(prepared.items)
+        touched: list[IndexStore] = []
+        touched_set: set[IndexStore] = set()
+        try:
+            for record, store, _change in resolved:
+                if store not in touched_set:
+                    touched_set.add(store)
+                    touched.append(store)
+                if store in excluded:
+                    if not self.apply(record):
+                        raise GrafxIndexError(
+                            f"Partitioned replay could no longer resolve index {store.name!r}.",
+                            field="index",
+                            index=store.name,
+                            lsn=record.lsn,
+                        )
+                    continue
+
+                item = next(common_items)
+                store._replaying = True
+                try:
+                    hot_bucket = prepared.hot_buckets.get((store, item.bucket))
+                    moved = (
+                        store._apply_change(item.change, item.position)
+                        if hot_bucket is None
+                        else store._apply_common_replay_hot_change(
+                            hot_bucket, item.change, item.position
+                        )
+                    )
+                finally:
+                    store._replaying = False
+                moved_by_store[store] = moved_by_store[store] or moved
+
+            for state in prepared.stores:
+                store_moved = moved_by_store[state.store]
+                if state.final != state.initial or store_moved:
+                    state.store._write_header(state.final)
+                    if store_moved:
+                        state.store._cache_certificate = None
+            return tuple(store.file for store in touched)
+        except Exception as failure:
+            for store in touched:
+                try:
+                    store._mark_stale_after_failure(
+                        f"Partitioned logical replay into index {store.name!r} failed after a "
+                        "possibly partial prefix, so the current handle cannot prove the index "
+                        f"complete: {failure!r}"
+                    )
+                except Exception as stale_failure:  # noqa: BLE001 - preserve root failure
+                    failure.add_note(
+                        f"Marking touched index {store.name!r} stale also failed: "
+                        f"{stale_failure!r}"
+                    )
+            raise
+
     # --- reading ----------------------------------------------------------------------------
 
     def lookup(

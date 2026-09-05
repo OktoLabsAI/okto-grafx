@@ -1951,3 +1951,30 @@ in this workload and is not a new moving target. Thirteen dedicated root-proof t
 grouped checkpoint/reclamation, open-freshness, recovery/redo and WAL-integration slice passed all
 112 cases; every measured database also passed `verify("all")`. No format, WAL ordering, OCC pass,
 durability barrier, lease duration, or multiwriter/multireader premise changed.
+
+## Scale-removal batch 47 — store-partitioned heterogeneous logical replay
+
+Status: **implemented on `feature/v0.0.2`; focused correctness gate green**.
+
+The Pulse-shaped Amdahl profile found 18,181 scalar index applications during checkpoint. A
+single HNSW store made the previous all-or-nothing common batch decline, even though 14,881
+effects (82%) targeted canonical exact stores. `CommitRedo` now offers the complete logical replay
+to a private partitioning capability. The preflight excludes an incompatible physical store as a
+whole when it contains RESET, overrides scalar apply, owns active rebuild/replay authority or is
+locally stale. Those stores keep the original scalar protocol and WAL order; unrelated canonical
+stores retain the existing common batch.
+
+Every common header is read before the first bucket mutation. Effects are still applied in
+original WAL order, and canonical headers are composed only after all scalar effects have
+finished, so there is no durable-state window with a newly composed common header followed by a
+pending specialized effect. A declined common proof returns before mutation and restores the
+whole scalar path. Any ordinary partial failure marks every touched store stale; process-control
+signals retain the pre-existing crash/recovery contract. RESET, generation, key-size and
+versioned-shape validation remain fail-closed.
+
+The focused suite proves one seed and one publication for the canonical store, scalar HNSW
+dispatch, original effect order, idempotent retry and the existing failure/staleness boundaries;
+all 25 cases passed with Ruff clean. The pre-change profile bounds the expected transfer-level
+opportunity at about 7–10% (`~1.08–1.11x`). This is a prioritization ceiling, not a post-change
+performance claim or gate. On-disk format, WAL/OCC, recovery barriers, writer ordering and the
+multiwriter/multireader premises are unchanged.

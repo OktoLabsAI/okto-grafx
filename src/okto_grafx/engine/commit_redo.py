@@ -171,7 +171,9 @@ class CommitRedo:
             and manager is not None
             and all(record.record_type in _INDEX_EFFECTS for record in replay.effects)
         ):
-            apply_batch = getattr(manager, "apply_common_replay_batch", None)
+            apply_batch = getattr(manager, "apply_partitioned_replay_batch", None)
+            if not callable(apply_batch):
+                apply_batch = getattr(manager, "apply_common_replay_batch", None)
             if callable(apply_batch):
                 batch_files = apply_batch(replay.effects)
                 if batch_files is not None:

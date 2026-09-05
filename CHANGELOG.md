@@ -61,6 +61,13 @@ including the on-disk format.
 
 ### Changed
 
+- Committed logical replay now partitions heterogeneous index batches by physical store. Exact
+  built-in stores retain their single-seed/single-publication batch even when the same replay
+  contains HNSW, RESET, rebuild, replaying or locally stale stores; each excluded store keeps its
+  complete scalar protocol in original WAL order. The common header is still seeded before its
+  first bucket mutation and published only after every scalar effect has finished. A refused
+  common preflight falls back before mutation, and a partial failure marks every touched store
+  stale without changing WAL, recovery, durability or multiwriter/multireader semantics.
 - `Database.transaction()` now retains only the participant section's unlocked file descriptor
   for its lexical lifetime and revalidates physical identity before every reuse. One-statement
   scoped transactions therefore replace four Windows lock-file opens with one open plus three
