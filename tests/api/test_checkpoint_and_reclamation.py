@@ -101,6 +101,9 @@ def test_checkpoint_validates_but_does_not_reapply_its_exact_local_dml_prefix(
         assert any(count > 0 for count in preflighted), (
             "the shortcut must retain complete payload preflight"
         )
+        assert sum(count > 0 for count in preflighted) == 1, (
+            "the complete strict preflight already validates every index effect"
+        )
         assert not any(count > 0 for count in applied), (
             "the already-applied local prefix must not be dispatched again"
         )

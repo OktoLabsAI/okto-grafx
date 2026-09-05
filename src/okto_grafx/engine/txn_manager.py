@@ -4133,16 +4133,14 @@ class TransactionManager:
             watermarks = manager.table_watermark_photo()
             manager.check_replay_floor(checkpoint, watermarks=watermarks)
         index_result = None
-        if skip_reapply:
-            # The complete preflight above validates page images and the permissive catalog-DDL
-            # shape. This strict subplan proof retains the canonical index-name/generation
-            # validation without dispatching effects the live commit already flushed.
-            self._commit_redo.preflight(index_replay)
-        else:
+        if not skip_reapply:
             index_result = self._commit_redo.apply(index_replay)
             assert page_result is not None
             for result in (page_result, index_result):
                 self._commit_redo.flush(result)
+        # A skipped replay necessarily has ``touched_catalog is False``. The complete preflight
+        # above therefore already used strict index registration/generation validation; running
+        # a second preflight over ``index_replay`` would only decode every logical effect again.
         if manager is not None and replay.last_committed_lsn > NO_LSN:
             manager.mark_built_through(replay.last_committed_lsn, watermarks=watermarks)
         if skip_reapply:
