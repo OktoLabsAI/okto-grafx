@@ -62,7 +62,7 @@ participants cannot hold one section each and wait for the other. Proved by
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, is_dataclass, replace
 from time import perf_counter_ns
 from types import TracebackType
@@ -212,6 +212,11 @@ COMMIT_RETARGETS_TOTAL: str = "oktografx_commit_retargets_total"
 
 _CANONICAL_VALIDATE_STAGED_RECORDS = IndexManager.validate_staged_records
 """Exact validator whose decoded RESET fact may cross the private build-records boundary."""
+
+_CANONICAL_COMMIT_INDEX_PROJECTION_SCOPE = (
+    IndexManager._commit_index_projection_scope
+)
+"""Exact post-rebase projection door; subclasses retain their observable selection calls."""
 
 TRANSACTION_MANAGER_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
@@ -2675,9 +2680,6 @@ class TransactionManager:
             return
 
         committed_catalog = getattr(catalog, "catalog", None)
-        tables_of = getattr(committed_catalog, "tables", None)
-        if not callable(tables_of):
-            return
         written_table_identities = {
             (
                 getattr(intent.table, "table_id", None),
@@ -2685,15 +2687,33 @@ class TransactionManager:
             )
             for intent in reduced_intents
         }
-        written_tables = tuple(
-            table
-            for table in tables_of()
-            if (
-                getattr(table, "table_id", None),
-                getattr(table, "name", None),
+        if type(committed_catalog) is Catalog:
+            selected: list[object] = []
+            for table_id, table_name in written_table_identities:
+                if (
+                    isinstance(table_id, bool)
+                    or not isinstance(table_id, int)
+                    or not isinstance(table_name, str)
+                    or not committed_catalog.has_table(table_name)
+                ):
+                    continue
+                table = committed_catalog.table(table_name)
+                if table.table_id == table_id:
+                    selected.append(table)
+            written_tables = tuple(selected)
+        else:
+            tables_of = getattr(committed_catalog, "tables", None)
+            if not callable(tables_of):
+                return
+            written_tables = tuple(
+                table
+                for table in tables_of()
+                if (
+                    getattr(table, "table_id", None),
+                    getattr(table, "name", None),
+                )
+                in written_table_identities
             )
-            in written_table_identities
-        )
         missing_for = getattr(manager, "unregistered_persistent_indexes_for", None)
         if not written_tables or not callable(missing_for):
             return
@@ -4403,6 +4423,7 @@ class TransactionManager:
                         timeout=self._commit_lock_timeout,
                     ),
                     self._hold_wal_tail(),
+                    ExitStack() as commit_index_projection_stack,
                 ):
                     self._validate_lease(lease)  # step 3.1
                     durable = self._complete_committed_gap()
@@ -4458,6 +4479,33 @@ class TransactionManager:
                                 authority_may_have_changed=(
                                     index_authority_may_have_changed
                                 ),
+                            )
+                        manager = self._index_manager
+                        projection_scope = getattr(
+                            manager, "_commit_index_projection_scope", None
+                        )
+                        if (
+                            type(self) is TransactionManager
+                            and type(manager) is IndexManager
+                            and callable(projection_scope)
+                            and getattr(projection_scope, "__func__", None)
+                            is _CANONICAL_COMMIT_INDEX_PROJECTION_SCOPE
+                        ):
+                            row_tables: dict[tuple[object, object], object] = {}
+                            for intent in reduce_row_intents(txn.row_intents):
+                                table = intent.table
+                                row_tables[
+                                    (
+                                        getattr(table, "table_id", None),
+                                        getattr(table, "name", None),
+                                    )
+                                ] = table
+                            commit_index_projection_stack.enter_context(
+                                projection_scope(
+                                    txn,
+                                    catalog=getattr(self._catalog, "catalog", None),
+                                    row_tables=tuple(row_tables.values()),
+                                )
                             )
                     if conflict is None:
                         # Physical ownership is a second, pre-materialisation gate.  The first

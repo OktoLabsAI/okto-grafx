@@ -143,19 +143,29 @@ from okto_grafx.domain.query.ast import (
     Direction,
     BinaryOperation,
     CaseExpression,
+    CreateClause,
     CreateIndexStatement,
+    DeleteClause,
     Expression,
     FunctionCall,
     ListExpression,
     Literal,
     MapExpression,
+    MatchClause,
+    MergeClause,
+    NodePattern,
     NullCheck,
     Parameter,
+    PatternPath,
     Property,
+    Query,
+    RelationshipPattern,
+    SetClause,
     SortItem,
     Statement,
     Subscript,
     UnaryOperation,
+    UnionQuery,
     Variable,
     free_variables,
     walk,
@@ -2258,6 +2268,185 @@ def _catalog_active_indexes(manager: object, catalog: Catalog) -> tuple[object, 
     return tuple(listing()) if callable(listing) else ()
 
 
+def _closed_statement_tables(
+    statement: Statement, catalog: Catalog
+) -> tuple[TableDef, ...] | None:
+    """Return every table one statically closed query can reach, else ``None``.
+
+    A named node label identifies one table. A named relationship type identifies its own table
+    and both endpoint tables, including label-free endpoint variables. A standalone,
+    label-free node can be scoped only when an earlier pattern already bound its variable.
+    Anything less precise keeps the established global authority projection.
+
+    The returned set may conservatively contain an endpoint that the direction later excludes;
+    it must never omit a reachable table. That one-sided rule makes this an optimisation only:
+    planning and execution still receive the exact catalog-authorised stores for every table
+    they can use.
+    """
+    queries: tuple[Query, ...]
+    if type(statement) is Query:
+        queries = (statement,)
+    elif (
+        type(statement) is UnionQuery
+        and type(statement.left) is Query
+        and type(statement.right) is Query
+    ):
+        queries = (statement.left, statement.right)
+    else:
+        return None
+
+    selected: dict[tuple[int, str], TableDef] = {}
+    for query in queries:
+        if (
+            type(query.match_clauses) is not tuple
+            or type(query.updating_clauses) is not tuple
+            or type(query.with_clauses) is not tuple
+        ):
+            return None
+        bound: dict[str, set[str]] = {}
+
+        def add_table(name: str) -> TableDef | None:
+            if type(name) is not str:
+                return None
+            try:
+                table = catalog.table(name)
+            except GrafxConfigurationError:
+                return None
+            selected[(table.table_id, table.name)] = table
+            return table
+
+        def visit(pattern: PatternPath) -> bool:
+            if (
+                type(pattern) is not PatternPath
+                or type(pattern.nodes) is not tuple
+                or type(pattern.relationships) is not tuple
+                or not pattern.nodes
+                or any(type(node) is not NodePattern for node in pattern.nodes)
+                or any(
+                    type(relationship) is not RelationshipPattern
+                    for relationship in pattern.relationships
+                )
+            ):
+                return False
+            inferred: list[set[str]] = [set() for _ in pattern.nodes]
+            if len(pattern.relationships) != len(pattern.nodes) - 1:
+                return False
+            for position, relationship in enumerate(pattern.relationships):
+                if (
+                    type(relationship.types) is not tuple
+                    or len(relationship.types) != 1
+                    or type(relationship.types[0]) is not str
+                    or type(relationship.variable) not in {str, type(None)}
+                    or type(relationship.direction) is not Direction
+                ):
+                    return False
+                relation = add_table(relationship.types[0])
+                if (
+                    relation is None
+                    or relation.kind != "rel"
+                    or relation.from_table is None
+                    or relation.to_table is None
+                ):
+                    return False
+                source = add_table(relation.from_table)
+                target = add_table(relation.to_table)
+                if source is None or target is None:
+                    return False
+                if relationship.direction is Direction.OUTGOING:
+                    inferred[position].add(source.name)
+                    inferred[position + 1].add(target.name)
+                elif relationship.direction is Direction.INCOMING:
+                    inferred[position].add(target.name)
+                    inferred[position + 1].add(source.name)
+                else:
+                    inferred[position].update((source.name, target.name))
+                    inferred[position + 1].update((source.name, target.name))
+                if relationship.variable is not None:
+                    previous = bound.get(relationship.variable)
+                    relation_names = {relation.name}
+                    bound[relationship.variable] = (
+                        relation_names
+                        if previous is None
+                        else previous | relation_names
+                    )
+
+            for position, node in enumerate(pattern.nodes):
+                if (
+                    type(node.labels) is not tuple
+                    or any(type(label) is not str for label in node.labels)
+                    or type(node.variable) not in {str, type(None)}
+                ):
+                    return False
+                candidates: set[str]
+                if node.labels:
+                    if len(node.labels) != 1:
+                        return False
+                    candidates = {node.labels[0]}
+                elif node.variable is not None and node.variable in bound:
+                    candidates = set(bound[node.variable])
+                else:
+                    candidates = inferred[position]
+                if not candidates:
+                    return False
+                for name in candidates:
+                    if add_table(name) is None:
+                        return False
+                if node.variable is not None:
+                    previous = bound.get(node.variable)
+                    bound[node.variable] = (
+                        set(candidates) if previous is None else previous | candidates
+                    )
+            return True
+
+        for clause in query.match_clauses:
+            if type(clause) is not MatchClause or type(clause.patterns) is not tuple:
+                return None
+            for pattern in clause.patterns:
+                if not visit(pattern):
+                    return None
+        for clause in query.updating_clauses:
+            if type(clause) is CreateClause:
+                if type(clause.patterns) is not tuple:
+                    return None
+                for pattern in clause.patterns:
+                    if not visit(pattern):
+                        return None
+            elif type(clause) is MergeClause:
+                if not visit(clause.pattern):
+                    return None
+            elif type(clause) is SetClause:
+                if type(clause.items) is not tuple or any(
+                    type(item.target) is not Property
+                    or type(item.target.subject) is not Variable
+                    or item.target.subject.name not in bound
+                    for item in clause.items
+                ):
+                    return None
+            elif type(clause) is DeleteClause:
+                if (
+                    type(clause.targets) is not tuple
+                    or type(clause.detach) is not bool
+                    or any(
+                    type(target) is not Variable or target.name not in bound
+                    for target in clause.targets
+                    )
+                ):
+                    return None
+                if clause.detach:
+                    detached_from = {
+                        name for target in clause.targets for name in bound[target.name]
+                    }
+                    for table in catalog.tables():
+                        if table.kind == "rel" and (
+                            table.from_table in detached_from
+                            or table.to_table in detached_from
+                        ):
+                            selected[(table.table_id, table.name)] = table
+            else:
+                return None
+    return tuple(selected[key] for key in sorted(selected))
+
+
 @dataclass(slots=True, frozen=True)
 class _IndexAuthorityProjection:
     """The exact index stores selected once for one statement's catalog picture."""
@@ -2609,7 +2798,7 @@ class QueryEngine:
         """Return the operator tree of one query text, without running it (SPEC-VEC AC-7)."""
         statement = self.parse(text)
         catalog = self._catalog.catalog
-        authority = self._statement_index_authority(catalog)
+        authority = self._statement_index_authority(catalog, statement=statement)
         return self._planned_for(
             statement,
             None,
@@ -2639,7 +2828,9 @@ class QueryEngine:
         dirty_tables = _intent_table_ids(self, txn)
         catalog = working if working is not None else self._catalog.catalog
         if authority is None:
-            authority = self._statement_index_authority(catalog, txn=txn)
+            authority = self._statement_index_authority(
+                catalog, txn=txn, statement=statement
+            )
         started = self._reading()
         try:
             key = self._prepared_plan_key(
@@ -2676,7 +2867,7 @@ class QueryEngine:
         started = self._reading()
         try:
             catalog = self._catalog.catalog
-            authority = self._statement_index_authority(catalog)
+            authority = self._statement_index_authority(catalog, statement=statement)
             analysis = analyze(statement)
             plan = build_plan(
                 statement,
@@ -2740,7 +2931,9 @@ class QueryEngine:
         if working is not None and not self._txn_stages_catalog(txn):
             working = None
         catalog = working if working is not None else self._catalog.catalog
-        authority = self._statement_index_authority(catalog, txn=txn)
+        authority = self._statement_index_authority(
+            catalog, txn=txn, statement=statement
+        )
         plan = self._planned_for(
             statement,
             txn,
@@ -2794,7 +2987,9 @@ class QueryEngine:
         if working is not None and not self._txn_stages_catalog(txn):
             working = None
         catalog = working if working is not None else self._catalog.catalog
-        authority = self._statement_index_authority(catalog, txn=txn)
+        authority = self._statement_index_authority(
+            catalog, txn=txn, statement=statement
+        )
         plan = self._planned_for(
             statement,
             txn,
@@ -2884,12 +3079,34 @@ class QueryEngine:
         # exist. Withholding it plans the scan the engine planned before any index existed, which
         # is slower and right. The index says so itself through `stale`, and `Database.
         # stale_indexes` is where an operator sees which ones need rebuilding.
-        tables = {(table.table_id, table.name): table for table in catalog.tables()}
         indexes = (
             authority.planning_indexes
             if authority is not None
             else _catalog_active_indexes(self._indexes, catalog)
         )
+        if type(catalog) is Catalog and type(self._indexes) is IndexManager:
+            usable: list[object] = []
+            for index in indexes:
+                definition = index.definition
+                if (
+                    getattr(index, "stale", False)
+                    or definition.table_id in without_indexes_for
+                ):
+                    continue
+                if not catalog.has_table(definition.table_name):
+                    continue
+                table = catalog.table(definition.table_name)
+                if (
+                    table.table_id == definition.table_id
+                    and index_definition_matches_table(definition, table)
+                ):
+                    usable.append(definition)
+            return tuple(usable)
+
+        # Catalog subclasses and compatibility collaborators keep their observable whole-schema
+        # projection. The concrete built-in path above uses the O(1) id directory for only the
+        # already scoped indexes selected by this statement.
+        tables = {(table.table_id, table.name): table for table in catalog.tables()}
         return tuple(
             index.definition
             for index in indexes
@@ -2907,7 +3124,11 @@ class QueryEngine:
         )
 
     def _statement_index_authority(
-        self, catalog: Catalog, *, txn: object | None = None
+        self,
+        catalog: Catalog,
+        *,
+        txn: object | None = None,
+        statement: Statement | None = None,
     ) -> _IndexAuthorityProjection:
         """Project catalog-selected stores once for planning and execution of one statement."""
         manager = self._indexes
@@ -2919,6 +3140,21 @@ class QueryEngine:
             if isinstance(txn_id, int) and not isinstance(txn_id, bool) and txn_id >= 0
             else None
         )
+        closed_tables = (
+            None if statement is None else _closed_statement_tables(statement, catalog)
+        )
+        scoped_indexes = getattr(manager, "_statement_indexes_for_tables", None)
+        if (
+            type(manager) is IndexManager
+            and closed_tables is not None
+            and callable(scoped_indexes)
+        ):
+            planning, runtime = scoped_indexes(
+                closed_tables, txn=scoped_txn, catalog=catalog
+            )
+            return _IndexAuthorityProjection.build(
+                tuple(runtime), planning_indexes=tuple(planning)
+            )
         statement_indexes = getattr(manager, "_statement_indexes", None)
         if callable(statement_indexes):
             planning, runtime = statement_indexes(txn=scoped_txn, catalog=catalog)

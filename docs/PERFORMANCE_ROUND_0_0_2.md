@@ -40,6 +40,17 @@ Installed measurement dependencies at capture time: NumPy 2.5.1, psutil 7.2.2, p
 pytest 8.3.4. An official run must repeat this inventory rather than inheriting these versions by
 assumption.
 
+### Pulse candidate activation
+
+The Pulse 0.3.3 consumer integration activates catalog v2 with
+`database.ensure_identity_indexes()` only on the newly created, exclusive and still-empty Grafx
+candidate, before physical schema DDL. Existing graph paths are never adopted or migrated by this
+door. Activation failure is classified in the import phase, closes the handle and removes only the
+candidate owned by that attempt. Pulse keeps explicit overrides, uses
+`checkpoint_interval_records=1_000_000` and `descriptor_revalidation="generation"` for that
+candidate, and still performs its terminal checkpoint. This makes the persistent identity paths
+used by batch 41 available to the current Pulse rebuild without changing Grafx's global defaults.
+
 ### Isolation decision
 
 The live Pulse backfill is still consuming CPU in the default data home. P0.3 profiling and P0.4
@@ -1785,3 +1796,36 @@ cover a truly empty two-process race, failure before the first user WAL append f
 and one commit mixing an absent first extent with an existing CN-1 range. No wall-clock threshold
 was introduced. WAL ordering, both OCC passes, recovery, durability, writer ordering and the
 multiwriter/multireader premises remain unchanged.
+
+## Scale-removal batch 41 — statement- and commit-local index authority
+
+Status: **completed on `feature/v0.0.2`; independent structural and correctness reviews GO**.
+
+The exact built-in query engine computes a closed statement footprint for typed node and
+relationship patterns, CREATE/MERGE/SET/DELETE and direction-aware endpoints. `DETACH DELETE`
+adds the incident relationship tables. Unknown, untyped, polymorphic, custom or malformed shapes
+fall back to global authority; catalog corruption still propagates. The statement fast path is
+restricted to the concrete built-in `IndexManager`, so subclass and proxy policies remain
+observable.
+
+The canonical transaction manager now creates one mutable but sealed commit projection only after
+the first OCC pass, rebase and committed-index synchronization, inside the existing writer lease,
+WAL-tail lock and `COMMIT_SECTION`. It contains the touched-table siblings plus indexes observed by
+the transaction. Registry revision, schema observations, new-table observations and detached
+claims are revalidated; the scope is revoked by `ExitStack` on success, conflict or exception.
+Pre-staged records and noncanonical collaborators keep the complete global path. Exact quota,
+artifact, staged-record multiset, RESET, retarget and rebuild-generation validation still run.
+
+Three adjacent schema-wide scans were removed from the same canonical path: index-definition
+validation resolves only already-scoped definitions, committed-index synchronization resolves only
+written identities, and unregistered persistent-index discovery asks the catalog only for touched
+tables. With either 1 or 80 catalog tables, v1/v2 Pulse-like `CREATE Person + commit` recorded zero
+`Catalog.tables()`, zero global catalog-definition scans and zero global registry walks. Table-local
+lookups remained constant and referenced only `Person`. The earlier statement probe changed
+definition checks `80→2`; its short timing was about 29% lower but remains informational.
+
+Focused statement/commit tests, DDL v1/v2, subclasses, wiring and rehash passed 30 cases; rebuild
+and multiprocess rehash passed 6. The final grouped query/index/DDL/recovery/multiprocess regression
+passed all 321 collected cases in about 94 seconds. The Pulse candidate/transfer consumer slice
+passed 57 cases. Ruff, compileall and diff checks were clean. No on-disk format, WAL order, OCC
+pass, durability barrier, writer ordering or multiwriter/multireader premise changed.

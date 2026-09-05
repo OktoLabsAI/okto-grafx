@@ -54,6 +54,7 @@ from __future__ import annotations
 import hashlib
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -116,7 +117,7 @@ from okto_grafx.domain.index.visibility import (
     is_reclaimable,
 )
 from okto_grafx.domain.model.record import HeapVersion
-from okto_grafx.domain.model.catalog import CATALOG_LEGACY_FORMAT_VERSION
+from okto_grafx.domain.model.catalog import CATALOG_LEGACY_FORMAT_VERSION, Catalog
 from okto_grafx.domain.model.schema import TableDef
 from okto_grafx.domain.page import (
     HEADER_PAGE_INDEX,
@@ -209,6 +210,14 @@ _LIVE_COMMIT_AUTHORITY: ContextVar[object | None] = ContextVar(
     "okto_grafx_live_commit_authority", default=None
 )
 """Call-local authority whose mutable scope is revoked before its context is reset."""
+
+_COMMIT_INDEX_PROJECTION_SEAL: object = object()
+"""Module-private proof for one post-rebase index selection inside COMMIT_SECTION."""
+
+_COMMIT_INDEX_PROJECTION: ContextVar[object | None] = ContextVar(
+    "okto_grafx_commit_index_projection", default=None
+)
+"""Attempt-local immutable index selection; never retained across commit-section exit."""
 
 _LIVE_HOT_HOOK_NAMES: tuple[str, ...] = (
     "_apply_change",
@@ -312,6 +321,25 @@ class _LiveCommitAuthority:
     manager: IndexManager
     txn: object
     store: IndexStore | None = None
+    active: bool = True
+
+
+@dataclass(slots=True)
+class _CommitIndexProjection:
+    """Revocable post-rebase snapshot reused only by one canonical commit attempt."""
+
+    seal: object
+    manager: IndexManager
+    txn: object
+    txn_id: int
+    catalog: object | None
+    indexes: tuple[IndexStore, ...]
+    row_indexes: tuple[IndexStore, ...]
+    rebuild_indexes: tuple[IndexStore, ...]
+    registry_revision: int
+    schema_observed: tuple[tuple[IndexStore, int], ...]
+    new_table_observed: frozenset[IndexStore]
+    detached_claims: tuple[tuple[IndexStore, frozenset[object]], ...]
     active: bool = True
 
 
@@ -4081,6 +4109,7 @@ class IndexManager:
         "_detached_speculative_indexes",
         "_schema_observed",
         "_schema_new_table_observed",
+        "_registry_revision",
         "_definition_match",
     )
 
@@ -4111,6 +4140,7 @@ class IndexManager:
         self._detached_speculative_indexes: set[IndexStore] = set()
         self._schema_observed: dict[int, dict[IndexStore, int]] = {}
         self._schema_new_table_observed: dict[int, set[IndexStore]] = {}
+        self._registry_revision = 0
         # This is schema normalization, not index authority.  The complete immutable physical
         # definition (including generation nonce/bucket count) and complete immutable TableDef
         # form the key, so DDL or rehash cannot inherit a prior answer.  The manager lifetime and
@@ -4132,6 +4162,7 @@ class IndexManager:
         self._indexes[key] = index
         identity = (index.definition.table_id, index.definition.table_name)
         self._index_keys_by_table.setdefault(identity, set()).add(key)
+        self._registry_revision += 1
 
     def _remove_registered_index(
         self, key: str, *, expected: IndexStore | None = None
@@ -4148,6 +4179,7 @@ class IndexManager:
             table_keys.discard(key)
             if not table_keys:
                 self._index_keys_by_table.pop(identity, None)
+        self._registry_revision += 1
         return removed
 
     def _registered_indexes_for(
@@ -4783,14 +4815,19 @@ class IndexManager:
         staged_indexes = tuple(
             index for index in self._transaction_indexes(txn) if index.observed(txn)
         )
-        row_indexes = tuple(
-            index
-            for table in row_tables
-            for index in self.active_indexes_for(
-                getattr(table, "table_id", -1),
-                table_name=getattr(table, "name", None),
-                table=table,
-                txn=txn,
+        projection = self._active_commit_index_projection(txn)
+        row_indexes = (
+            projection.row_indexes
+            if projection is not None
+            else tuple(
+                index
+                for table in row_tables
+                for index in self.active_indexes_for(
+                    getattr(table, "table_id", -1),
+                    table_name=getattr(table, "name", None),
+                    table=table,
+                    txn=txn,
+                )
             )
         )
         for index in dict.fromkeys((*schema_indexes, *staged_indexes, *row_indexes)):
@@ -5198,8 +5235,199 @@ class IndexManager:
         self, txn: StagingTransaction, *, catalog: object | None = None
     ) -> tuple[IndexStore, ...]:
         """Return ACTIVE stores plus speculative stores explicitly observed by the transaction."""
+        projection = self._active_commit_index_projection(txn)
+        if projection is not None:
+            return projection.indexes
         _committed, selected = self._statement_indexes(txn=txn, catalog=catalog)
         return selected
+
+    def _active_commit_index_projection(
+        self, txn: StagingTransaction
+    ) -> _CommitIndexProjection | None:
+        """Return this call's valid projection, or None outside its exact transaction scope."""
+        projection = _COMMIT_INDEX_PROJECTION.get()
+        if not (
+            isinstance(projection, _CommitIndexProjection)
+            and projection.active
+            and projection.seal is _COMMIT_INDEX_PROJECTION_SEAL
+            and projection.manager is self
+            and projection.txn is txn
+        ):
+            return None
+        self._validate_commit_index_projection(projection)
+        return projection
+
+    @contextmanager
+    def _commit_index_projection_scope(
+        self,
+        txn: StagingTransaction,
+        *,
+        catalog: object | None = None,
+        row_tables: Sequence[object] = (),
+    ) -> Iterator[_CommitIndexProjection]:
+        """Select index authority once after rebase and revoke it at commit-section exit.
+
+        This is deliberately neither a database cache nor a transaction-lifetime cache. The
+        transaction manager enters it only after its first OCC pass and committed-catalog sync,
+        while holding ``COMMIT_SECTION``. Repeated artifact, WAL-multiset, retarget and live-apply
+        checks keep their full semantics but consume the same immutable selection.
+        """
+        if type(self) is not IndexManager:
+            raise GrafxIndexError(
+                "A commit index projection is available only to the canonical IndexManager.",
+                field="index_authority",
+                value=type(self).__name__,
+            )
+        txn_id = getattr(txn, "txn_id", None)
+        if isinstance(txn_id, bool) or not isinstance(txn_id, int) or txn_id < 0:
+            raise GrafxIndexError(
+                "A commit index projection needs a non-negative integer txn_id.",
+                field="txn_id",
+                value=repr(txn_id),
+            )
+        authority = self._catalog_authority(catalog)
+        if authority is not self._catalog_authority():
+            raise GrafxIndexError(
+                "A commit index projection must use the manager's current committed catalog.",
+                field="index_authority",
+                txn_id=txn_id,
+            )
+        observed = self._schema_observed.get(txn_id, {})
+        identities: dict[tuple[int, str], object] = {}
+        for table in row_tables:
+            table_id = getattr(table, "table_id", None)
+            table_name = getattr(table, "name", None)
+            if (
+                isinstance(table_id, bool)
+                or not isinstance(table_id, int)
+                or table_id < 0
+                or not isinstance(table_name, str)
+            ):
+                raise GrafxIndexError(
+                    "A commit index projection needs complete row-table identities.",
+                    field="table_identity",
+                    value=repr((table_id, table_name)),
+                )
+            identities.setdefault((table_id, table_name), table)
+
+        pending = getattr(txn, "pending_records", ())
+        scoped = bool(identities or observed) and not pending
+        if scoped:
+            committed = tuple(
+                sorted(
+                    dict.fromkeys(
+                        index
+                        for (table_id, table_name), table in identities.items()
+                        for index in self.active_indexes_for(
+                            table_id,
+                            table_name=table_name,
+                            table=table,
+                            catalog=authority,
+                        )
+                    ),
+                    key=lambda index: index.definition.registry_key,
+                )
+            )
+            indexes = tuple(dict.fromkeys((*committed, *observed)))
+            row_indexes = tuple(
+                dict.fromkeys(
+                    (
+                        *committed,
+                        *(
+                            index
+                            for index in observed
+                            if (
+                                index.definition.table_id,
+                                index.definition.table_name,
+                            )
+                            in identities
+                        ),
+                    )
+                )
+            )
+            rebuild_indexes = indexes
+        else:
+            # Rebuild and other direct low-level staging have no row intent from which a closed
+            # footprint can be proved. Preserve their global authority walk, but take it once.
+            indexes = self._transaction_indexes(txn, catalog=authority)
+            row_indexes = tuple(
+                dict.fromkeys(
+                    index
+                    for (table_id, table_name), table in identities.items()
+                    for index in self.active_indexes_for(
+                        table_id,
+                        table_name=table_name,
+                        table=table,
+                        txn=txn,
+                        catalog=authority,
+                    )
+                )
+            )
+            rebuild_indexes = tuple(self._indexes.values()) if pending else indexes
+        projection = _CommitIndexProjection(
+            seal=_COMMIT_INDEX_PROJECTION_SEAL,
+            manager=self,
+            txn=txn,
+            txn_id=txn_id,
+            catalog=authority,
+            indexes=indexes,
+            row_indexes=row_indexes,
+            rebuild_indexes=rebuild_indexes,
+            registry_revision=self._registry_revision,
+            schema_observed=tuple(observed.items()),
+            new_table_observed=frozenset(
+                self._schema_new_table_observed.get(txn_id, ())
+            ),
+            detached_claims=tuple(
+                (index, frozenset(self._artifact_claims.get(index, ())))
+                for index in observed
+                if index in self._detached_speculative_indexes
+            ),
+        )
+        token = _COMMIT_INDEX_PROJECTION.set(projection)
+        try:
+            yield projection
+        finally:
+            projection.active = False
+            _COMMIT_INDEX_PROJECTION.reset(token)
+
+    def _validate_commit_index_projection(
+        self, projection: _CommitIndexProjection
+    ) -> None:
+        """Refuse reuse when any fact underlying an active commit projection drifted."""
+        txn_id = getattr(projection.txn, "txn_id", None)
+        if txn_id != projection.txn_id:
+            raise GrafxIndexError(
+                "The transaction identity changed inside its commit index projection.",
+                field="txn_id",
+                value=repr(txn_id),
+                expected=projection.txn_id,
+            )
+        if self._registry_revision != projection.registry_revision:
+            raise GrafxIndexError(
+                "The registered index inventory changed inside its commit projection.",
+                field="index_registry",
+                txn_id=projection.txn_id,
+                retryable=True,
+            )
+        observed = self._schema_observed.get(projection.txn_id, {})
+        new_tables = self._schema_new_table_observed.get(projection.txn_id, set())
+        claims = tuple(
+            (index, frozenset(self._artifact_claims.get(index, ())))
+            for index in observed
+            if index in self._detached_speculative_indexes
+        )
+        if (
+            tuple(observed.items()) != projection.schema_observed
+            or frozenset(new_tables) != projection.new_table_observed
+            or claims != projection.detached_claims
+        ):
+            raise GrafxIndexError(
+                "Schema staging changed inside its commit index projection.",
+                field="index_registry",
+                txn_id=projection.txn_id,
+                retryable=True,
+            )
 
     def _statement_indexes(
         self,
@@ -5224,6 +5452,89 @@ class IndexManager:
             )
         observed = tuple(self._schema_observed.get(txn_id, ()))
         return active, tuple(dict.fromkeys((*active, *observed)))
+
+    def _statement_indexes_for_tables(
+        self,
+        tables: Sequence[object],
+        *,
+        txn: StagingTransaction | None = None,
+        catalog: object | None = None,
+    ) -> tuple[tuple[IndexStore, ...], tuple[IndexStore, ...]]:
+        """Project one statement's closed table footprint without a global registry walk.
+
+        ``QueryEngine`` calls this door only after proving that every table a statement can
+        reach is present in ``tables``. Each per-table projection retains the same v1/v2 and
+        transaction-observation rules as :meth:`active_indexes_for`; this method merely unions
+        those authoritative buckets. An unprovable footprint never reaches this door and keeps
+        the conservative global :meth:`_statement_indexes` path.
+        """
+        identities: dict[tuple[int, str], object] = {}
+        for table in tables:
+            table_id = getattr(table, "table_id", None)
+            table_name = getattr(table, "name", None)
+            if (
+                isinstance(table_id, bool)
+                or not isinstance(table_id, int)
+                or table_id < 0
+                or not isinstance(table_name, str)
+            ):
+                raise GrafxIndexError(
+                    "A scoped statement index projection needs complete table identities.",
+                    field="table_identity",
+                    value=repr((table_id, table_name)),
+                )
+            identities.setdefault((table_id, table_name), table)
+
+        committed = tuple(
+            sorted(
+                dict.fromkeys(
+                    index
+                    for (table_id, table_name), table in identities.items()
+                    for index in self.active_indexes_for(
+                        table_id,
+                        table_name=table_name,
+                        table=table,
+                        catalog=catalog,
+                    )
+                ),
+                key=lambda index: index.definition.registry_key,
+            )
+        )
+        if txn is None:
+            return committed, committed
+        txn_id = getattr(txn, "txn_id", None)
+        if isinstance(txn_id, bool) or not isinstance(txn_id, int) or txn_id < 0:
+            raise GrafxIndexError(
+                "Transaction-scoped index authority needs a non-negative integer txn_id.",
+                field="txn_id",
+                value=repr(txn_id),
+            )
+        observed = tuple(self._schema_observed.get(txn_id, ()))
+        if not any(
+            (index.definition.table_id, index.definition.table_name) in identities
+            for index in observed
+        ):
+            # The common DML transaction has no speculative DDL.  Its runtime and planning
+            # authority are therefore the same immutable tuple; repeating every table-local
+            # catalog projection would prove no additional fact.
+            return committed, committed
+        runtime = tuple(
+            sorted(
+                dict.fromkeys(
+                    index
+                    for (table_id, table_name), table in identities.items()
+                    for index in self.active_indexes_for(
+                        table_id,
+                        table_name=table_name,
+                        table=table,
+                        txn=txn,
+                        catalog=catalog,
+                    )
+                ),
+                key=lambda index: index.definition.registry_key,
+            )
+        )
+        return committed, runtime
 
     def indexes_for(
         self,
@@ -5369,13 +5680,22 @@ class IndexManager:
                 authority = self._heap.catalog.catalog
             except AttributeError:
                 authority = None
-        definitions = self._catalog_active_definitions(authority)
-        if definitions is None:
-            definitions = tuple(index.definition for index in self.indexes())
         identities = {
             (getattr(table, "table_id", None), getattr(table, "name", None))
             for table in tables
         }
+        table_projection = getattr(authority, "active_index_definitions_for", None)
+        if type(authority) is Catalog and callable(table_projection):
+            definitions = tuple(
+                definition
+                for table_id, table_name in identities
+                if isinstance(table_id, int) and not isinstance(table_id, bool)
+                for definition in table_projection(table_id, table_name=table_name)
+            )
+        else:
+            definitions = self._catalog_active_definitions(authority)
+            if definitions is None:
+                definitions = tuple(index.definition for index in self.indexes())
         is_v2 = (
             getattr(authority, "format_version", CATALOG_LEGACY_FORMAT_VERSION)
             != CATALOG_LEGACY_FORMAT_VERSION
@@ -6876,7 +7196,13 @@ class IndexManager:
         reopen after it. Catching it here costs a retryable refusal; not catching it costs
         a database that will not open.
         """
-        for index in tuple(self._indexes.values()):
+        projection = self._active_commit_index_projection(txn)
+        indexes = (
+            projection.rebuild_indexes
+            if projection is not None
+            else tuple(self._indexes.values())
+        )
+        for index in indexes:
             for change in index.pending(txn):
                 if change.operation is not IndexOperation.RESET:
                     continue

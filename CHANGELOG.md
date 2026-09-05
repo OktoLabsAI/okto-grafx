@@ -61,6 +61,14 @@ including the on-disk format.
 
 ### Changed
 
+- Exact built-in statements with a closed table footprint and their canonical commit path now
+  derive index authority only from the tables actually touched. The commit-local projection is
+  created after OCC/rebase and index synchronization, under the existing writer lease and
+  `COMMIT_SECTION`, and is revoked on every exit. Unknown/polymorphic statements, pre-staged WAL
+  records and custom managers retain the global conservative path. Structural probes with 1 and
+  80 tables produced identical work: zero global catalog/index enumerations and only the `Person`
+  definitions were inspected. Exact artifact, multiset, retarget, rebuild, WAL and apply
+  validations remain unchanged.
 - First materialization of an empty table now installs the transaction's complete planned
   identity floor with its first row, so the remainder uses the existing reserved-insert path
   without rewriting heap page zero per row. Reserved inserts share a commit-local, sealed extent

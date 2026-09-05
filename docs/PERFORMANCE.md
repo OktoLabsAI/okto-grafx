@@ -72,6 +72,24 @@ floor, a modified first-page hint, an empty-table two-writer race, pre-WAL failu
 mixed empty/existing-table commit. WAL/OCC, durability and multiwriter/multireader behavior are
 unchanged.
 
+### 0.0.2 statement- and commit-local index authority (batch 41)
+
+Exact built-in statements whose table footprint is closed now resolve ACTIVE indexes only for
+those tables. The canonical commit path captures the same bounded authority after the first OCC,
+catalog rebase and committed-index synchronization, while already holding the writer lease,
+WAL-tail lock and `COMMIT_SECTION`. It is transient and revoked on success, conflict or exception.
+Untyped/polymorphic/custom statements, custom managers and pre-staged records preserve the global
+fallback.
+
+In the structural probe, growing the catalog from 1 to 80 tables left the work of a Pulse-like
+`CREATE Person` unchanged in catalog v1 and v2: zero `Catalog.tables()`, zero global ACTIVE-index
+enumerations and zero global registry walks. Only `Person` was inspected; the statement performed
+one table-local lookup and commit performed four, while the unregistered-artifact check inspected
+one table and one definition. This removes dependence on unrelated schema size from the canonical
+path. The earlier statement-only probe reduced definition checks from 80 to 2 (`40x` structurally);
+short timings were informational and are not promoted as a gate. WAL, both OCC passes, durability,
+rebuild/retarget validation and multiwriter/multireader behavior are unchanged.
+
 ---
 
 ## 1. Test machine and build
